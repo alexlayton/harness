@@ -1,18 +1,20 @@
-use crate::input::{InputAction, classify};
+use crate::input::{InputAction, classify, history_next, history_previous, push_history};
 use crate::render;
+use crate::render::{TailTool, ToolRecord};
 use crate::{TuiEvent, UiEvent};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyEventKind,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::{cursor, execute, terminal};
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -22,6 +24,17 @@ use tui_textarea::TextArea;
 const MAX_LIVE_ROWS: u16 = 10;
 const MAX_INPUT_ROWS: u16 = 10;
 const VIEWPORT_ROWS: u16 = 22;
+const MAX_TAIL_TOOLS: usize = 5;
+const MAX_RECENT_TOOLS: usize = 20;
+const MAX_HISTORY: usize = 1_000;
+const PLACEHOLDER: &str = "Type your message...";
+
+#[derive(Clone, Debug)]
+struct RunningTool {
+    name: String,
+    summary: String,
+    arguments: String,
+}
 
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -30,10 +43,19 @@ pub struct Tui {
     textarea: TextArea<'static>,
     pending_text: String,
     pending_reasoning: String,
-    running_tool: Option<String>,
+    running_tool: Option<RunningTool>,
+    tail: Vec<TailTool>,
+    recent_tools: VecDeque<ToolRecord>,
+    focused_tool: Option<usize>,
     spinner: usize,
     busy: bool,
     retrying: Option<u32>,
+    status_flash: Option<String>,
+    needs_model_label: bool,
+    header_printed: bool,
+    history: Vec<String>,
+    history_pos: Option<usize>,
+    draft: String,
     restored: bool,
 }
 
@@ -65,13 +87,22 @@ impl Tui {
             terminal,
             model: model.to_owned(),
             provider: provider.to_owned(),
-            textarea: TextArea::default(),
+            textarea: new_textarea(),
             pending_text: String::new(),
             pending_reasoning: String::new(),
             running_tool: None,
+            tail: Vec::new(),
+            recent_tools: VecDeque::new(),
+            focused_tool: None,
             spinner: 0,
             busy: false,
             retrying: None,
+            status_flash: None,
+            needs_model_label: false,
+            header_printed: false,
+            history: Vec::new(),
+            history_pos: None,
+            draft: String::new(),
             restored: false,
         })
     }
@@ -131,8 +162,8 @@ impl Tui {
                 }
                 _ = cancel.cancelled(), if !self.busy => {
                     // Cancellation while idle is the application's shutdown
-                    // path.  During a turn the agent sends TurnFinished and
-                    // the input handler remains available for a final redraw.
+                    // path. During a turn the agent sends TurnFinished and the
+                    // input handler remains available for a final redraw.
                     return Ok(());
                 }
             }
@@ -150,82 +181,282 @@ impl Tui {
         {
             return Ok(false);
         }
+
+        // Application quit always wins over a tool-focus binding.
+        if matches!(classify(&event), InputAction::Quit) {
+            cancel.cancel();
+            return Ok(true);
+        }
+
+        if !self.busy && self.focused_tool.is_some() && self.handle_tool_focus(&event)? {
+            return Ok(false);
+        }
+
         match classify(&event) {
             InputAction::Quit => {
                 cancel.cancel();
                 return Ok(true);
             }
             InputAction::Interrupt => {
+                if self.focused_tool.take().is_some() && !self.busy {
+                    // Esc exits tool focus while idle rather than interrupting
+                    // a future turn.
+                    return Ok(false);
+                }
                 if self.busy {
                     // Esc is a turn-local interrupt. The agent receives this
                     // control message and creates a fresh token for the next
-                    // queued turn; Ctrl+C/D below remain application quit.
+                    // queued turn; Ctrl+C/D remain application quit.
                     let _ = input_tx.send(crate::INTERRUPT_MESSAGE.to_owned());
                 }
             }
             InputAction::Newline => {
-                self.textarea.insert_newline();
+                self.history_pos = None;
+                self.textarea.input(event);
             }
             InputAction::Submit => {
                 let input = self.textarea.lines().join("\n");
                 if input.trim().is_empty() {
                     return Ok(false);
                 }
+                // A queued user message must come after any model content that
+                // is currently in the redrawable area, and after finished tail
+                // tools. The running tool itself remains live at the bottom.
+                self.flush_everything()?;
+                self.commit_tail()?;
                 let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
                 render::insert_user(&mut self.terminal, &input, width)
                     .context("echo user message")?;
+                push_history(&mut self.history, &input, MAX_HISTORY);
+                self.history_pos = None;
+                self.draft.clear();
                 input_tx
                     .send(input)
                     .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
-                self.textarea = TextArea::default();
+                self.textarea = new_textarea();
+                self.needs_model_label = true;
                 self.busy = true;
                 self.retrying = None;
+                self.status_flash = None;
+            }
+            InputAction::ExpandDetails => {
+                if !self.busy && !self.tail.is_empty() {
+                    self.focused_tool = Some(
+                        self.focused_tool
+                            .unwrap_or(0)
+                            .min(self.tail.len().saturating_sub(1)),
+                    );
+                } else {
+                    self.expand_latest_tool()?;
+                }
+            }
+            InputAction::FocusTools => {
+                if !self.busy && !self.tail.is_empty() {
+                    self.focused_tool = Some(0);
+                } else {
+                    // Tab remains a normal textarea insertion while a turn is
+                    // running (or before any tool exists).
+                    self.history_pos = None;
+                    self.draft.clear();
+                    self.textarea.input(event);
+                }
             }
             InputAction::Edit => {
-                self.textarea.input(event);
+                let history_navigation = match &event {
+                    Event::Key(key) if key.code == KeyCode::Up => self.navigate_history_up(),
+                    Event::Key(key) if key.code == KeyCode::Down => self.navigate_history_down(),
+                    _ => false,
+                };
+                if !history_navigation {
+                    self.history_pos = None;
+                    self.draft.clear();
+                    self.textarea.input(event);
+                }
             }
             InputAction::Ignore => {}
         }
         Ok(false)
     }
 
+    fn handle_tool_focus(&mut self, event: &Event) -> Result<bool> {
+        let Event::Key(key) = event else {
+            self.focused_tool = None;
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.focused_tool = None;
+                Ok(true)
+            }
+            KeyCode::Up => {
+                if let Some(index) = self.focused_tool.as_mut() {
+                    *index = index.saturating_sub(1);
+                }
+                Ok(true)
+            }
+            KeyCode::Down => {
+                if let Some(index) = self.focused_tool.as_mut() {
+                    *index = (*index + 1).min(self.tail.len().saturating_sub(1));
+                }
+                Ok(true)
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(index) = self.focused_tool
+                    && let Some(entry) = self.tail.get_mut(index)
+                {
+                    entry.expanded = !entry.expanded;
+                }
+                Ok(true)
+            }
+            KeyCode::Char(value)
+                if value.eq_ignore_ascii_case(&'o')
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                // Ctrl+O while focused is the fallback dump action. Enter or
+                // Space remains the in-place expand/collapse action.
+                self.dump_focused_tool()?;
+                Ok(true)
+            }
+            KeyCode::Tab => {
+                if !self.tail.is_empty() {
+                    let index = self.focused_tool.unwrap_or(0);
+                    self.focused_tool = Some((index + 1) % self.tail.len());
+                }
+                Ok(true)
+            }
+            _ => {
+                // Leave focus and let ordinary input handling process the key.
+                self.focused_tool = None;
+                Ok(false)
+            }
+        }
+    }
+
+    fn navigate_history_up(&mut self) -> bool {
+        let (line, _) = self.textarea.cursor();
+        if line != 0 {
+            return false;
+        }
+        let current = self.textarea.lines().join("\n");
+        let Some(value) = history_previous(
+            &self.history,
+            &mut self.history_pos,
+            &mut self.draft,
+            &current,
+        ) else {
+            return false;
+        };
+        self.replace_textarea(&value);
+        true
+    }
+
+    fn navigate_history_down(&mut self) -> bool {
+        let (line, _) = self.textarea.cursor();
+        if line + 1 < self.textarea.lines().len() {
+            return false;
+        }
+        let Some(value) = history_next(&self.history, &mut self.history_pos, &self.draft) else {
+            return false;
+        };
+        self.replace_textarea(&value);
+        true
+    }
+
+    fn replace_textarea(&mut self, value: &str) {
+        self.textarea = textarea_with_text(value);
+    }
+
     fn apply_event(&mut self, event: UiEvent) -> Result<()> {
+        self.status_flash = None;
         match event {
             UiEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    return Ok(());
+                }
                 self.busy = true;
                 self.retrying = None;
+                // Reasoning is committed immediately before the first text
+                // delta so the two streams remain interleaved.
+                self.flush_pending_reasoning()?;
+                self.ensure_model_label()?;
                 self.pending_text.push_str(&delta);
                 self.flush_stable_text()?;
                 self.flush_overflow_text()?;
             }
             UiEvent::ReasoningDelta(delta) => {
+                if delta.is_empty() {
+                    return Ok(());
+                }
                 self.busy = true;
                 self.retrying = None;
+                // A provider normally sends reasoning before text. If a
+                // provider interleaves the other way, commit the text already
+                // received before placing reasoning above it.
+                if !self.pending_text.is_empty() {
+                    self.flush_pending_text_all()?;
+                }
+                self.ensure_model_label()?;
                 self.pending_reasoning.push_str(&delta);
             }
-            UiEvent::ToolCallStarted { summary, .. } => {
+            UiEvent::ToolCallStarted {
+                name,
+                summary,
+                arguments,
+            } => {
                 self.busy = true;
                 self.retrying = None;
-                self.running_tool = Some(summary);
+                // Everything already streamed belongs before the running tool.
+                self.flush_everything()?;
+                self.commit_tail()?;
+                self.running_tool = Some(RunningTool {
+                    name,
+                    summary,
+                    arguments,
+                });
                 self.spinner = 0;
             }
             UiEvent::ToolCallFinished {
+                name,
                 summary,
                 ok,
                 duration_ms,
+                output,
                 error,
-                ..
             } => {
-                let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-                render::insert_tool_finished(
-                    &mut self.terminal,
-                    &summary,
+                self.busy = true;
+                let arguments = self
+                    .running_tool
+                    .take()
+                    .map(|tool| tool.arguments)
+                    .unwrap_or_else(|| "{}".into());
+                let record = ToolRecord {
+                    name,
+                    args: arguments,
+                    summary,
                     ok,
                     duration_ms,
-                    error.as_deref(),
-                    width,
-                )?;
-                self.running_tool = None;
+                    output,
+                    error,
+                };
+                self.recent_tools.push_back(record.clone());
+                while self.recent_tools.len() > MAX_RECENT_TOOLS {
+                    self.recent_tools.pop_front();
+                }
+
+                // Keep only a small interactive tail. Overflow is committed in
+                // chronological order before the new entry is made live.
+                if self.tail.len() >= MAX_TAIL_TOOLS {
+                    let oldest = self.tail.remove(0);
+                    self.commit_tool_record(&oldest.record)?;
+                }
+                self.tail.push(TailTool {
+                    record,
+                    expanded: false,
+                });
+                self.focused_tool = None;
+                self.retrying = None;
+                // The next assistant text after a tool begins a new segment.
+                self.needs_model_label = true;
             }
             UiEvent::Retrying { attempt, .. } => {
                 self.busy = true;
@@ -238,12 +469,27 @@ impl Tui {
                 self.busy = false;
             }
             UiEvent::TurnFinished => {
+                // Do not commit an otherwise idle tail here: it remains
+                // interactively expandable until newer content needs the
+                // scrollback position.
                 self.flush_everything()?;
                 self.running_tool = None;
                 self.retrying = None;
                 self.busy = false;
+                self.focused_tool = None;
             }
         }
+        Ok(())
+    }
+
+    fn ensure_model_label(&mut self) -> Result<()> {
+        if !self.needs_model_label {
+            return Ok(());
+        }
+        self.commit_tail()?;
+        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
+        render::insert_model_label(&mut self.terminal, width).context("insert model label")?;
+        self.needs_model_label = false;
         Ok(())
     }
 
@@ -253,9 +499,7 @@ impl Tui {
             return Ok(());
         }
         self.pending_text = pending;
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_markdown(&mut self.terminal, &stable, width).context("insert markdown")?;
-        Ok(())
+        self.insert_markdown(&stable)
     }
 
     fn flush_overflow_text(&mut self) -> Result<()> {
@@ -271,51 +515,132 @@ impl Tui {
         };
         let prefix = self.pending_text[..=index].to_owned();
         self.pending_text = self.pending_text[index + 1..].to_owned();
+        self.insert_markdown(&prefix)
+    }
+
+    fn insert_markdown(&mut self, markdown: &str) -> Result<()> {
+        if markdown.is_empty() {
+            return Ok(());
+        }
+        self.ensure_model_label()?;
+        self.commit_tail()?;
         let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_markdown(&mut self.terminal, &prefix, width)
-            .context("insert streaming markdown")?;
+        render::insert_markdown(&mut self.terminal, markdown, width).context("insert markdown")?;
         Ok(())
     }
 
-    fn flush_everything(&mut self) -> Result<()> {
+    fn flush_pending_reasoning(&mut self) -> Result<()> {
+        if self.pending_reasoning.is_empty() {
+            return Ok(());
+        }
+        let reasoning = std::mem::take(&mut self.pending_reasoning);
+        self.ensure_model_label()?;
+        self.commit_tail()?;
         let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        if !self.pending_reasoning.is_empty() {
-            let reasoning = std::mem::take(&mut self.pending_reasoning);
-            render::insert_reasoning(&mut self.terminal, &reasoning, width)
-                .context("insert reasoning")?;
+        render::insert_reasoning(&mut self.terminal, &reasoning, width)
+            .context("insert reasoning")?;
+        Ok(())
+    }
+
+    fn flush_pending_text_all(&mut self) -> Result<()> {
+        if self.pending_text.is_empty() {
+            return Ok(());
         }
-        if !self.pending_text.is_empty() {
-            let text = std::mem::take(&mut self.pending_text);
-            render::insert_markdown(&mut self.terminal, &text, width).context("insert markdown")?;
+        let text = std::mem::take(&mut self.pending_text);
+        self.insert_markdown(&text)
+    }
+
+    fn flush_everything(&mut self) -> Result<()> {
+        self.flush_pending_reasoning()?;
+        self.flush_pending_text_all()?;
+        Ok(())
+    }
+
+    /// Commit all finished live-tail tools in their original order.  Every
+    /// path that writes a new scrollback block calls this first.
+    fn commit_tail(&mut self) -> Result<()> {
+        while !self.tail.is_empty() {
+            let entry = self.tail.remove(0);
+            self.commit_tool_record(&entry.record)?;
         }
+        self.focused_tool = None;
+        Ok(())
+    }
+
+    fn commit_tool_record(&mut self, record: &ToolRecord) -> Result<()> {
+        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
+        render::insert_tool_finished(
+            &mut self.terminal,
+            &record.name,
+            &record.summary,
+            record.ok,
+            record.duration_ms,
+            record.error.as_deref(),
+            width,
+        )
+        .context("insert completed tool")?;
+        self.needs_model_label = true;
         Ok(())
     }
 
     fn insert_error(&mut self, error: &str) -> Result<()> {
+        self.commit_tail()?;
         let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        let text = format!("✗ {error}");
-        let height = render::wrap_count(&text, width as usize) as u16;
-        self.terminal.insert_before(height.max(1), |buffer| {
-            Paragraph::new(Line::from(Span::styled(
-                text,
-                Style::default().fg(Color::Red),
-            )))
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .render(buffer.area, buffer);
-        })?;
+        render::insert_error(&mut self.terminal, error, width).context("insert error")?;
+        Ok(())
+    }
+
+    fn expand_latest_tool(&mut self) -> Result<()> {
+        let Some(record) = self.recent_tools.back().cloned() else {
+            self.status_flash = Some("no tool calls yet".into());
+            return Ok(());
+        };
+        self.append_tool_detail(record)
+    }
+
+    fn dump_focused_tool(&mut self) -> Result<()> {
+        let record = self
+            .focused_tool
+            .and_then(|index| self.tail.get(index))
+            .map(|entry| entry.record.clone())
+            .or_else(|| self.recent_tools.back().cloned());
+        let Some(record) = record else {
+            self.status_flash = Some("no tool calls yet".into());
+            return Ok(());
+        };
+        self.append_tool_detail(record)
+    }
+
+    fn append_tool_detail(&mut self, record: ToolRecord) -> Result<()> {
+        self.flush_everything()?;
+        self.commit_tail()?;
+        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
+        render::insert_tool_detail(&mut self.terminal, &record, width)
+            .context("insert tool details")?;
         Ok(())
     }
 
     fn draw(&mut self) -> Result<()> {
+        if !self.header_printed {
+            let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
+            render::insert_header(&mut self.terminal, width).context("insert welcome header")?;
+            self.header_printed = true;
+        }
+
         let model = self.model.clone();
         let provider = self.provider.clone();
         let pending_text = self.pending_text.clone();
         let pending_reasoning = self.pending_reasoning.clone();
         let running_tool = self.running_tool.clone();
+        let tail = self.tail.clone();
+        let focused_tool = self.focused_tool;
         let spinner = self.spinner;
         let busy = self.busy;
         let retrying = self.retrying;
+        let status_flash = self.status_flash.clone();
         let textarea = &self.textarea;
+        let clear_flash = self.status_flash.is_some();
+
         self.terminal.draw(|frame| {
             let area = frame.area();
             let input_rows = (textarea.lines().len() as u16 + 1)
@@ -324,56 +649,55 @@ impl Tui {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),
                     Constraint::Min(1),
+                    Constraint::Length(1),
                     Constraint::Length(input_rows),
                 ])
                 .split(area);
 
+            let running = running_tool
+                .as_ref()
+                .map(|tool| (tool.name.as_str(), tool.summary.as_str(), spinner));
+            render::render_live_with_tail(
+                chunks[0],
+                &tail,
+                focused_tool,
+                &pending_reasoning,
+                &pending_text,
+                running,
+                frame,
+            );
+
+            let left = format!("{provider} · {model}");
+            let right = if let Some(flash) = status_flash.as_deref() {
+                flash.to_owned()
+            } else if let Some(attempt) = retrying {
+                format!("↻ retrying (attempt {attempt})")
+            } else if busy {
+                "… generating".to_owned()
+            } else {
+                String::new()
+            };
             let status_style = Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM);
             let status = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
-                    Constraint::Length(model.len() as u16 + 1),
+                    Constraint::Length(left.chars().count().min(u16::MAX as usize) as u16),
                     Constraint::Min(1),
-                    Constraint::Length(provider.len() as u16 + 1),
+                    Constraint::Length(right.chars().count().min(u16::MAX as usize) as u16),
                 ])
-                .split(chunks[0]);
-            frame.render_widget(
-                Paragraph::new(model.as_str()).style(status_style),
-                status[0],
-            );
-            if let Some(attempt) = retrying {
+                .split(chunks[1]);
+            frame.render_widget(Paragraph::new(left).style(status_style), status[0]);
+            if !right.is_empty() {
                 frame.render_widget(
-                    Paragraph::new(format!("↻ retrying (attempt {attempt})"))
-                        .alignment(Alignment::Center)
+                    Paragraph::new(right)
+                        .alignment(ratatui::layout::Alignment::Right)
                         .style(status_style),
-                    status[1],
-                );
-            } else if busy {
-                frame.render_widget(
-                    Paragraph::new("… generating")
-                        .alignment(Alignment::Center)
-                        .style(status_style),
-                    status[1],
+                    status[2],
                 );
             }
-            frame.render_widget(
-                Paragraph::new(provider.as_str())
-                    .alignment(Alignment::Right)
-                    .style(status_style),
-                status[2],
-            );
-
-            render::render_live(
-                chunks[1],
-                &pending_reasoning,
-                &pending_text,
-                running_tool.as_deref().map(|summary| (summary, spinner)),
-                frame,
-            );
 
             let input = Layout::default()
                 .direction(Direction::Horizontal)
@@ -385,6 +709,9 @@ impl Tui {
             );
             frame.render_widget(textarea, input[1]);
         })?;
+        if clear_flash {
+            self.status_flash = None;
+        }
         Ok(())
     }
 
@@ -402,6 +729,21 @@ impl Tui {
         .context("restore terminal input")?;
         Ok(())
     }
+}
+
+fn new_textarea() -> TextArea<'static> {
+    textarea_with_text("")
+}
+
+fn textarea_with_text(value: &str) -> TextArea<'static> {
+    let mut textarea = TextArea::new(value.split('\n').map(str::to_owned).collect());
+    textarea.set_placeholder_text(PLACEHOLDER);
+    textarea.set_placeholder_style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    );
+    textarea
 }
 
 impl Drop for Tui {
@@ -422,6 +764,6 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     // The terminal lifecycle needs a real tty; pure key/render behavior is
-    // tested in input.rs and render.rs.  Keeping this module documents that
-    // no alternate-screen teardown is used.
+    // tested in input.rs and render.rs. Keeping this module documents that no
+    // alternate-screen teardown is used.
 }

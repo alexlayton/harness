@@ -18,12 +18,18 @@ pub enum AgentEvent {
     ToolCallStarted {
         name: String,
         summary: String,
+        /// Pretty-printed and bounded before it is sent to the serde-free TUI.
+        arguments: String,
     },
     ToolCallFinished {
         name: String,
         summary: String,
         ok: bool,
         duration_ms: u64,
+        /// The complete tool result, retained for optional expansion.
+        output: String,
+        /// The complete error text when the tool failed. The compact renderer
+        /// is responsible for showing only a one-line preview.
         error: Option<String>,
     },
     Retrying {
@@ -237,6 +243,7 @@ impl Agent {
                         AgentEvent::ToolCallStarted {
                             name: call.name.clone(),
                             summary: summary.clone(),
+                            arguments: format_tool_arguments(&call.arguments),
                         },
                     );
                     let started = Instant::now();
@@ -270,6 +277,7 @@ impl Agent {
                                 summary,
                                 ok: false,
                                 duration_ms: started.elapsed().as_millis() as u64,
+                                output: String::new(),
                                 error: Some("cancelled".into()),
                             },
                         );
@@ -280,11 +288,8 @@ impl Agent {
                         end_turn = true;
                         break;
                     };
-                    let error = if result.is_error {
-                        Some(first_line(&result.content).to_owned())
-                    } else {
-                        None
-                    };
+                    let output = result.content.clone();
+                    let error = result.is_error.then(|| output.clone());
                     send(
                         &events,
                         AgentEvent::ToolCallFinished {
@@ -292,6 +297,7 @@ impl Agent {
                             summary: result.summary.clone(),
                             ok: !result.is_error,
                             duration_ms: started.elapsed().as_millis() as u64,
+                            output,
                             error,
                         },
                     );
@@ -335,8 +341,24 @@ fn append_assistant(history: &mut Vec<Message>, reasoning: &str, text: &str, cal
     });
 }
 
-fn first_line(value: &str) -> &str {
-    value.lines().next().unwrap_or(value)
+const MAX_TOOL_ARGUMENT_BYTES: usize = 2 * 1024;
+
+fn format_tool_arguments(arguments: &serde_json::Value) -> String {
+    let formatted =
+        serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string());
+    cap_utf8(&formatted, MAX_TOOL_ARGUMENT_BYTES)
+}
+
+fn cap_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let suffix = "…";
+    let mut end = max_bytes.saturating_sub(suffix.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &value[..end])
 }
 
 fn send(events: &mpsc::UnboundedSender<AgentEvent>, event: AgentEvent) {
@@ -450,6 +472,18 @@ mod tests {
                 got.push(event);
             }
             assert!(got.contains(&AgentEvent::TextDelta("done".into())));
+            assert!(got.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCallStarted { arguments, .. } if arguments == "{}"
+            )));
+            assert!(got.iter().any(|event| matches!(
+                event,
+                AgentEvent::ToolCallFinished {
+                    output,
+                    error: Some(error),
+                    ..
+                } if output == "unknown tool: missing" && error == "unknown tool: missing"
+            )));
         });
     }
 }

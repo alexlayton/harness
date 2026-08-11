@@ -33,10 +33,24 @@ Use `--provider opencode-go|openrouter` and `--model <model-id>` to override the
 
 ## Keys
 
-- **Enter** — send the current message
-- **Shift+Enter** or **Alt+Enter** — insert a newline
-- **Esc** — interrupt generation or a running tool
-- **Ctrl+C** / **Ctrl+D** — quit and restore the terminal
+The welcome header and this list use the same keymap:
+
+- **Enter** — Send message
+- **Shift+Enter** — Newline
+- **↑ / ↓** — History
+- **Esc** — Interrupt
+- **Ctrl+O** — Expand tool call
+- **Ctrl+C** — Quit
+
+Alt+Enter is an undocumented newline fallback for terminals that do not report Shift+Enter, and
+Ctrl+D remains a legacy quit alias.
+
+Finished tool calls are compact by default. While idle, press **Ctrl+O** (or **Tab**) to focus the
+live tool tail, use **↑ / ↓** to select a call, and press **Enter** or **Space** to expand it. In
+focus, **Ctrl+O** dumps the selected detail block to scrollback; with no live tail it dumps the
+most recent completed call.
+Mouse expansion is intentionally out of scope for the inline viewport: immutable terminal
+scrollback cannot provide reliable click regions for historical blocks.
 
 The available tools are `read`, `write`, and `bash`. Relative paths and shell commands use the
 process working directory.

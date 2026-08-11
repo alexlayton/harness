@@ -10,20 +10,28 @@ impl tui::TuiEvent for AgentEvent {
         match self {
             AgentEvent::TextDelta(value) => tui::UiEvent::TextDelta(value),
             AgentEvent::ReasoningDelta(value) => tui::UiEvent::ReasoningDelta(value),
-            AgentEvent::ToolCallStarted { name, summary } => {
-                tui::UiEvent::ToolCallStarted { name, summary }
-            }
+            AgentEvent::ToolCallStarted {
+                name,
+                summary,
+                arguments,
+            } => tui::UiEvent::ToolCallStarted {
+                name,
+                summary,
+                arguments,
+            },
             AgentEvent::ToolCallFinished {
                 name,
                 summary,
                 ok,
                 duration_ms,
+                output,
                 error,
             } => tui::UiEvent::ToolCallFinished {
                 name,
                 summary,
                 ok,
                 duration_ms,
+                output,
                 error,
             },
             AgentEvent::Retrying { attempt, message } => {
