@@ -1,3 +1,4 @@
+use crate::commands::Candidate;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::layout::Rect;
@@ -21,6 +22,7 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("↑ / ↓", "History"),
     ("Esc", "Interrupt"),
     ("Ctrl+O", "Expand tool call"),
+    ("/", "Commands"),
     ("Ctrl+C", "Quit"),
 ];
 
@@ -261,6 +263,30 @@ pub fn build_tool_compact(record: &ToolRecord) -> Text<'static> {
     )
 }
 
+/// Build an informational command/agent notice block.
+pub fn build_notice(notice: &str) -> Text<'static> {
+    let mut lines = Vec::new();
+    push_blank_lines(&mut lines, BLOCK_GAP);
+    let mut notice_lines = notice.split('\n');
+    if let Some(first) = notice_lines.next() {
+        lines.push(plain_line(format!("· {first}"), dim_style()));
+    } else {
+        lines.push(plain_line("·", dim_style()));
+    }
+    lines.extend(notice_lines.map(|line| plain_line(format!("  {line}"), dim_style())));
+    push_blank_lines(&mut lines, BLOCK_GAP);
+    text(lines)
+}
+
+/// Build the one-line echo for a command submitted from the editor.
+pub fn build_command_echo(command: &str) -> Text<'static> {
+    let mut lines = Vec::new();
+    push_blank_lines(&mut lines, BLOCK_GAP);
+    lines.push(plain_line(format!("⌘ {command}"), dim_style()));
+    push_blank_lines(&mut lines, BLOCK_GAP);
+    text(lines)
+}
+
 /// Build an error block.  The complete error is retained in scrollback while
 /// the first line receives the compact red marker used by the UI.
 pub fn build_error(error: &str) -> Text<'static> {
@@ -414,6 +440,25 @@ pub fn insert_reasoning<B: Backend>(
     insert_text(terminal, build_reasoning(reasoning), width)
 }
 
+pub fn insert_notice<B: Backend>(
+    terminal: &mut Terminal<B>,
+    notice: &str,
+    width: u16,
+) -> std::io::Result<()> {
+    if notice.is_empty() {
+        return Ok(());
+    }
+    insert_text(terminal, build_notice(notice), width)
+}
+
+pub fn insert_command_echo<B: Backend>(
+    terminal: &mut Terminal<B>,
+    command: &str,
+    width: u16,
+) -> std::io::Result<()> {
+    insert_text(terminal, build_command_echo(command), width)
+}
+
 pub fn insert_tool_finished<B: Backend>(
     terminal: &mut Terminal<B>,
     name: &str,
@@ -444,6 +489,62 @@ pub fn insert_error<B: Backend>(
     width: u16,
 ) -> std::io::Result<()> {
     insert_text(terminal, build_error(error), width)
+}
+
+/// Render the completion popup below the editor.  The app keeps the complete
+/// candidate set and supplies an offset so this function only has to render
+/// the visible window.
+pub fn render_completion(
+    area: Rect,
+    candidates: &[Candidate],
+    selected: usize,
+    offset: usize,
+    frame: &mut ratatui::Frame<'_>,
+) {
+    if area.height == 0 || candidates.is_empty() {
+        return;
+    }
+    let visible = candidates
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(area.height as usize)
+        .collect::<Vec<_>>();
+    if visible.is_empty() {
+        return;
+    }
+    let value_width = candidates
+        .iter()
+        .map(|candidate| candidate.value.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines = visible
+        .into_iter()
+        .map(|(index, candidate)| {
+            let selected_style = if index == selected {
+                Modifier::REVERSED
+            } else {
+                Modifier::empty()
+            };
+            let value_style =
+                Style::default()
+                    .add_modifier(selected_style)
+                    .add_modifier(if index == selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    });
+            let description_style = dim_style().add_modifier(selected_style);
+            let padding =
+                " ".repeat(value_width.saturating_sub(candidate.value.chars().count()) + 2);
+            Line::from(vec![
+                Span::styled(candidate.value.clone(), value_style),
+                Span::styled(padding, description_style),
+                Span::styled(candidate.description.clone(), description_style),
+            ])
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];

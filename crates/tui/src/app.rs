@@ -1,7 +1,8 @@
+use crate::commands::{self, Candidate, ParsedCommand};
 use crate::input::{InputAction, classify, history_next, history_previous, push_history};
 use crate::render;
 use crate::render::{TailTool, ToolRecord};
-use crate::{TuiEvent, UiEvent};
+use crate::{InputMessage, ModelEntry, TuiEvent, UiEvent};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
@@ -14,7 +15,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::{Terminal, TerminalOptions, Viewport};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -36,10 +37,20 @@ struct RunningTool {
     arguments: String,
 }
 
+#[derive(Clone, Debug)]
+struct Completion {
+    candidates: Vec<Candidate>,
+    selected: usize,
+    offset: usize,
+}
+
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     model: String,
     provider: String,
+    providers: Vec<String>,
+    model_lists: HashMap<String, Vec<ModelEntry>>,
+    completion: Option<Completion>,
     textarea: TextArea<'static>,
     pending_text: String,
     pending_reasoning: String,
@@ -60,7 +71,7 @@ pub struct Tui {
 }
 
 impl Tui {
-    pub fn new(model: &str, provider: &str) -> Result<Self> {
+    pub fn new(model: &str, provider: &str, providers: Vec<String>) -> Result<Self> {
         install_panic_hook();
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
@@ -87,6 +98,9 @@ impl Tui {
             terminal,
             model: model.to_owned(),
             provider: provider.to_owned(),
+            providers,
+            model_lists: HashMap::new(),
+            completion: None,
             textarea: new_textarea(),
             pending_text: String::new(),
             pending_reasoning: String::new(),
@@ -110,7 +124,7 @@ impl Tui {
     pub async fn run<E>(
         mut self,
         mut events: mpsc::UnboundedReceiver<E>,
-        input_tx: mpsc::UnboundedSender<String>,
+        input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()>
     where
@@ -124,7 +138,7 @@ impl Tui {
     async fn run_inner<E>(
         &mut self,
         events: &mut mpsc::UnboundedReceiver<E>,
-        input_tx: mpsc::UnboundedSender<String>,
+        input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()>
     where
@@ -173,7 +187,7 @@ impl Tui {
     fn handle_input(
         &mut self,
         event: Event,
-        input_tx: &mpsc::UnboundedSender<String>,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
         cancel: &CancellationToken,
     ) -> Result<bool> {
         if let Event::Key(key) = &event
@@ -186,6 +200,11 @@ impl Tui {
         if matches!(classify(&event), InputAction::Quit) {
             cancel.cancel();
             return Ok(true);
+        }
+
+        // Completion navigation has precedence over history and tool focus.
+        if self.handle_completion_input(&event, input_tx)? {
+            return Ok(false);
         }
 
         if !self.busy && self.focused_tool.is_some() && self.handle_tool_focus(&event)? {
@@ -207,16 +226,21 @@ impl Tui {
                     // Esc is a turn-local interrupt. The agent receives this
                     // control message and creates a fresh token for the next
                     // queued turn; Ctrl+C/D remain application quit.
-                    let _ = input_tx.send(crate::INTERRUPT_MESSAGE.to_owned());
+                    let _ = input_tx.send(InputMessage::Interrupt);
                 }
             }
             InputAction::Newline => {
                 self.history_pos = None;
                 self.textarea.input(event);
+                self.refresh_completion();
             }
             InputAction::Submit => {
                 let input = self.textarea.lines().join("\n");
                 if input.trim().is_empty() {
+                    return Ok(false);
+                }
+                if commands::is_command_input(&input) {
+                    self.submit_command(&input, input_tx)?;
                     return Ok(false);
                 }
                 // A queued user message must come after any model content that
@@ -231,9 +255,10 @@ impl Tui {
                 self.history_pos = None;
                 self.draft.clear();
                 input_tx
-                    .send(input)
+                    .send(InputMessage::Message(input))
                     .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
                 self.textarea = new_textarea();
+                self.completion = None;
                 self.needs_model_label = true;
                 self.busy = true;
                 self.retrying = None;
@@ -259,6 +284,7 @@ impl Tui {
                     self.history_pos = None;
                     self.draft.clear();
                     self.textarea.input(event);
+                    self.refresh_completion();
                 }
             }
             InputAction::Edit => {
@@ -272,10 +298,224 @@ impl Tui {
                     self.draft.clear();
                     self.textarea.input(event);
                 }
+                self.refresh_completion();
             }
             InputAction::Ignore => {}
         }
         Ok(false)
+    }
+
+    fn handle_completion_input(
+        &mut self,
+        event: &Event,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<bool> {
+        let Some(completion) = self.completion.as_ref() else {
+            return Ok(false);
+        };
+        let Event::Key(key) = event else {
+            return Ok(false);
+        };
+        match key.code {
+            KeyCode::Up => {
+                if !completion.candidates.is_empty() {
+                    self.move_completion(-1);
+                }
+                Ok(true)
+            }
+            KeyCode::Down => {
+                if !completion.candidates.is_empty() {
+                    self.move_completion(1);
+                }
+                Ok(true)
+            }
+            KeyCode::Tab => {
+                self.accept_completion(input_tx)?;
+                Ok(true)
+            }
+            KeyCode::Esc if !self.busy => {
+                self.completion = None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn move_completion(&mut self, direction: isize) {
+        let Some(completion) = self.completion.as_mut() else {
+            return;
+        };
+        let length = completion.candidates.len();
+        if length == 0 {
+            return;
+        }
+        completion.selected = if direction < 0 {
+            if completion.selected == 0 {
+                length - 1
+            } else {
+                completion.selected - 1
+            }
+        } else {
+            (completion.selected + 1) % length
+        };
+        self.keep_completion_visible();
+    }
+
+    fn keep_completion_visible(&mut self) {
+        let Some(completion) = self.completion.as_mut() else {
+            return;
+        };
+        const VISIBLE: usize = 8;
+        if completion.selected < completion.offset {
+            completion.offset = completion.selected;
+        } else if completion.selected >= completion.offset + VISIBLE {
+            completion.offset = completion.selected + 1 - VISIBLE;
+        }
+        completion.offset = completion
+            .offset
+            .min(completion.candidates.len().saturating_sub(VISIBLE));
+    }
+
+    fn accept_completion(&mut self, input_tx: &mpsc::UnboundedSender<InputMessage>) -> Result<()> {
+        let Some(candidate) = self
+            .completion
+            .as_ref()
+            .and_then(|completion| completion.candidates.get(completion.selected))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let input = self.textarea.lines().join("\n");
+        let replacement = replace_current_command_token(&input, &candidate.value);
+        self.replace_textarea(&replacement);
+        let provider_to_fetch = candidate
+            .value
+            .strip_suffix(':')
+            .filter(|provider| {
+                self.providers
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(provider))
+            })
+            .map(str::to_owned);
+        self.refresh_completion();
+        if let Some(provider) = provider_to_fetch
+            && !self.model_lists.contains_key(&provider)
+        {
+            input_tx
+                .send(InputMessage::ListModels {
+                    provider: provider.clone(),
+                })
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+            self.status_flash = Some("model list still loading…".into());
+            // Keep the completion state alive while the asynchronous list is
+            // on its way, even though there are no model rows to render yet.
+            if self.completion.is_none() {
+                self.completion = Some(Completion {
+                    candidates: Vec::new(),
+                    selected: 0,
+                    offset: 0,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_completion(&mut self) {
+        let input = self.textarea.lines().join("\n");
+        if !commands::is_command_input(&input) {
+            self.completion = None;
+            return;
+        }
+        let candidates =
+            commands::candidates(&input, &self.providers, &self.model_lists, &self.provider);
+        if candidates.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let old_value = self.completion.as_ref().and_then(|completion| {
+            completion
+                .candidates
+                .get(completion.selected)
+                .map(|candidate| candidate.value.as_str())
+        });
+        let selected = old_value
+            .and_then(|value| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.value == value)
+            })
+            .unwrap_or(0)
+            .min(candidates.len().saturating_sub(1));
+        self.completion = Some(Completion {
+            candidates,
+            selected,
+            offset: 0,
+        });
+        self.keep_completion_visible();
+    }
+
+    fn submit_command(
+        &mut self,
+        input: &str,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<()> {
+        let command = match commands::parse_command(input) {
+            Ok(command) => command,
+            Err(error) => {
+                self.status_flash = Some(error);
+                return Ok(());
+            }
+        };
+        if let ParsedCommand::SetModel {
+            provider: None,
+            model,
+        } = &command
+            && model.is_empty()
+        {
+            self.status_flash = Some(format!(
+                "usage: /model [<provider>:]<model> (current: {} · {})",
+                self.provider, self.model
+            ));
+            return Ok(());
+        }
+
+        self.flush_everything()?;
+        self.commit_tail()?;
+        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
+        render::insert_command_echo(&mut self.terminal, input, width).context("echo command")?;
+        push_history(&mut self.history, input, MAX_HISTORY);
+        self.history_pos = None;
+        self.draft.clear();
+        self.textarea = new_textarea();
+        self.completion = None;
+        self.status_flash = None;
+
+        match command {
+            ParsedCommand::New => input_tx
+                .send(InputMessage::NewConversation)
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,
+            ParsedCommand::SetModel { provider, model } => {
+                let provider_for_fetch = provider.clone().and_then(|name| {
+                    self.providers
+                        .iter()
+                        .find(|known| known.eq_ignore_ascii_case(&name))
+                        .cloned()
+                });
+                input_tx
+                    .send(InputMessage::SetModel { provider, model })
+                    .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+                if let Some(provider) = provider_for_fetch
+                    && !self.model_lists.contains_key(&provider)
+                {
+                    input_tx
+                        .send(InputMessage::ListModels {
+                            provider: provider.clone(),
+                        })
+                        .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn handle_tool_focus(&mut self, event: &Event) -> Result<bool> {
@@ -333,6 +573,9 @@ impl Tui {
     }
 
     fn navigate_history_up(&mut self) -> bool {
+        if commands::is_command_input(&self.textarea.lines().join("\n")) {
+            return false;
+        }
         let (line, _) = self.textarea.cursor();
         if line != 0 {
             return false;
@@ -351,6 +594,9 @@ impl Tui {
     }
 
     fn navigate_history_down(&mut self) -> bool {
+        if commands::is_command_input(&self.textarea.lines().join("\n")) {
+            return false;
+        }
         let (line, _) = self.textarea.cursor();
         if line + 1 < self.textarea.lines().len() {
             return false;
@@ -477,6 +723,26 @@ impl Tui {
                 self.retrying = None;
                 self.busy = false;
                 self.focused_tool = None;
+            }
+            UiEvent::Notice(notice) => {
+                self.flush_everything()?;
+                self.commit_tail()?;
+                let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
+                render::insert_notice(&mut self.terminal, &notice, width)
+                    .context("insert notice")?;
+            }
+            UiEvent::ModelChanged { provider, model } => {
+                self.provider = provider;
+                self.model = model;
+                if commands::is_command_input(&self.textarea.lines().join("\n")) {
+                    self.refresh_completion();
+                }
+            }
+            UiEvent::ModelList { provider, models } => {
+                self.model_lists.insert(provider, models);
+                if commands::is_command_input(&self.textarea.lines().join("\n")) {
+                    self.refresh_completion();
+                }
             }
         }
         Ok(())
@@ -638,21 +904,31 @@ impl Tui {
         let busy = self.busy;
         let retrying = self.retrying;
         let status_flash = self.status_flash.clone();
+        let completion = self.completion.clone();
         let textarea = &self.textarea;
         let clear_flash = self.status_flash.is_some();
 
         self.terminal.draw(|frame| {
             let area = frame.area();
+            let requested_completion_rows = completion
+                .as_ref()
+                .map(|completion| completion.candidates.len().min(8) as u16)
+                .unwrap_or(0);
+            let completion_rows = requested_completion_rows.min(area.height.saturating_sub(3));
             let input_rows = (textarea.lines().len() as u16 + 1)
                 .clamp(1, MAX_INPUT_ROWS)
-                .min(area.height.saturating_sub(2).max(1));
+                .min(area.height.saturating_sub(2 + completion_rows).max(1));
+            let mut constraints = vec![
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(input_rows),
+            ];
+            if completion.is_some() {
+                constraints.push(Constraint::Length(completion_rows));
+            }
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                    Constraint::Length(input_rows),
-                ])
+                .constraints(constraints)
                 .split(area);
 
             let running = running_tool
@@ -708,6 +984,16 @@ impl Tui {
                 input[0],
             );
             frame.render_widget(textarea, input[1]);
+
+            if let Some(completion) = completion.as_ref() {
+                render::render_completion(
+                    chunks[3],
+                    &completion.candidates,
+                    completion.selected,
+                    completion.offset,
+                    frame,
+                );
+            }
         })?;
         if clear_flash {
             self.status_flash = None;
@@ -729,6 +1015,21 @@ impl Tui {
         .context("restore terminal input")?;
         Ok(())
     }
+}
+
+fn replace_current_command_token(input: &str, value: &str) -> String {
+    let Some(command_end) = input.find(char::is_whitespace) else {
+        return value.to_owned();
+    };
+    let token_start = input[command_end..]
+        .find(|character: char| !character.is_whitespace())
+        .map(|offset| command_end + offset)
+        .unwrap_or(input.len());
+    let token_end = input[token_start..]
+        .find(char::is_whitespace)
+        .map(|offset| token_start + offset)
+        .unwrap_or(input.len());
+    format!("{}{}{}", &input[..token_start], value, &input[token_end..])
 }
 
 fn new_textarea() -> TextArea<'static> {

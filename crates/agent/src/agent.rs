@@ -1,3 +1,4 @@
+use crate::config::{build_provider, save_settings};
 use crate::prompt::current_system_prompt;
 use crate::tools::{ToolRegistry, call_summary};
 use futures_util::StreamExt;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::INTERRUPT_MESSAGE;
+use tui::InputMessage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -38,6 +39,15 @@ pub enum AgentEvent {
     },
     TurnFinished,
     Error(String),
+    Notice(String),
+    ModelChanged {
+        provider: String,
+        model: String,
+    },
+    ModelList {
+        provider: String,
+        models: Vec<llm::ModelInfo>,
+    },
 }
 
 pub struct Agent {
@@ -74,7 +84,7 @@ impl Agent {
     /// the mpsc queue and is consumed after the current turn finishes.
     pub async fn run(
         mut self,
-        mut input: mpsc::UnboundedReceiver<String>,
+        mut input: mpsc::UnboundedReceiver<InputMessage>,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) {
         let mut queued = VecDeque::new();
@@ -96,12 +106,29 @@ impl Agent {
                     _ = self.cancel.cancelled() => None,
                 }
             };
-            let Some(user_text) = next_message else {
+            let Some(message) = next_message else {
                 break;
             };
-            if user_text == INTERRUPT_MESSAGE || user_text.trim().is_empty() {
-                continue;
-            }
+            let user_text = match message {
+                InputMessage::Message(text) if !text.trim().is_empty() => text,
+                InputMessage::Message(_) | InputMessage::Interrupt => continue,
+                InputMessage::NewConversation => {
+                    self.history.clear();
+                    send(
+                        &events,
+                        AgentEvent::Notice("Started a new conversation".into()),
+                    );
+                    continue;
+                }
+                InputMessage::SetModel { provider, model } => {
+                    self.handle_set_model(provider, model, &events);
+                    continue;
+                }
+                InputMessage::ListModels { provider } => {
+                    self.handle_list_models(provider, &events);
+                    continue;
+                }
+            };
 
             self.history.push(Message::user(user_text));
             let turn_cancel = CancellationToken::new();
@@ -132,7 +159,7 @@ impl Agent {
                     tokio::select! {
                         result = &mut provider_future => break Some(result),
                         message = input.recv(), if input_open => match message {
-                            Some(message) if message == INTERRUPT_MESSAGE => {
+                            Some(InputMessage::Interrupt) => {
                                 turn_cancel.cancel();
                                 break None;
                             }
@@ -191,7 +218,7 @@ impl Agent {
                             }
                         }
                         message = input.recv(), if input_open => match message {
-                            Some(message) if message == INTERRUPT_MESSAGE => {
+                            Some(InputMessage::Interrupt) => {
                                 turn_cancel.cancel();
                                 cancelled = true;
                                 break;
@@ -255,7 +282,7 @@ impl Agent {
                         tokio::select! {
                             result = &mut tool_future => break Some(result),
                             message = input.recv(), if input_open => match message {
-                                Some(message) if message == INTERRUPT_MESSAGE => {
+                                Some(InputMessage::Interrupt) => {
                                     turn_cancel.cancel();
                                     break None;
                                 }
@@ -321,6 +348,109 @@ impl Agent {
             }
         }
     }
+
+    fn handle_set_model(
+        &mut self,
+        provider: Option<String>,
+        model: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        self.handle_set_model_with_factory(provider, model, events, build_provider);
+    }
+
+    fn handle_set_model_with_factory<F>(
+        &mut self,
+        provider: Option<String>,
+        model: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        factory: F,
+    ) where
+        F: Fn(&str) -> anyhow::Result<Arc<dyn Provider>>,
+    {
+        let explicit_provider = provider.is_some();
+        let requested = provider.unwrap_or_else(|| self.provider.name().to_owned());
+        let known_provider = crate::config::ProviderArg::ALL
+            .iter()
+            .find(|known| known.to_string().eq_ignore_ascii_case(&requested));
+        let canonical = known_provider
+            .map(ToString::to_string)
+            .unwrap_or_else(|| requested.clone());
+        let current = self.provider.name().to_owned();
+        let provider_changed =
+            (explicit_provider && known_provider.is_none()) || current != canonical;
+        let next_provider = if provider_changed {
+            match factory(&canonical) {
+                Ok(provider) => Some(provider),
+                Err(error) => {
+                    send(events, AgentEvent::Error(error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(provider) = next_provider {
+            self.provider = provider;
+        }
+        self.model = model.clone();
+        if let Err(error) = save_settings(&canonical, &model) {
+            tracing::warn!(error = %error, "could not persist model settings");
+        }
+        send(
+            events,
+            AgentEvent::ModelChanged {
+                provider: canonical.clone(),
+                model: model.clone(),
+            },
+        );
+        send(
+            events,
+            AgentEvent::Notice(format!("Using {canonical} · {model}")),
+        );
+        spawn_model_list(canonical, self.provider.clone(), events.clone());
+    }
+
+    fn handle_list_models(&self, provider: String, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let provider_name = crate::config::ProviderArg::ALL
+            .iter()
+            .find(|known| known.to_string().eq_ignore_ascii_case(&provider))
+            .map(ToString::to_string)
+            .unwrap_or(provider.clone());
+        let provider = match build_provider(&provider_name) {
+            Ok(provider) => provider,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Notice(format!("could not fetch model list: {error}")),
+                );
+                return;
+            }
+        };
+        spawn_model_list(provider_name, provider, events.clone());
+    }
+}
+
+fn spawn_model_list(
+    provider_name: String,
+    provider: Arc<dyn Provider>,
+    events: mpsc::UnboundedSender<AgentEvent>,
+) {
+    tokio::spawn(async move {
+        match provider.list_models().await {
+            Ok(models) => send(
+                &events,
+                AgentEvent::ModelList {
+                    provider: provider_name,
+                    models,
+                },
+            ),
+            Err(error) => send(
+                &events,
+                AgentEvent::Notice(format!("could not fetch model list: {error}")),
+            ),
+        }
+    });
 }
 
 fn append_assistant(history: &mut Vec<Message>, reasoning: &str, text: &str, calls: Vec<ToolCall>) {
@@ -403,7 +533,9 @@ mod tests {
             let cancel = CancellationToken::new();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
             let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-            input_tx.send("hello".into()).unwrap();
+            input_tx
+                .send(InputMessage::Message("hello".into()))
+                .unwrap();
             drop(input_tx);
             let agent = Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel);
             let history = agent.history.clone();
@@ -462,7 +594,9 @@ mod tests {
             let cancel = CancellationToken::new();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
             let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-            input_tx.send("use tool".into()).unwrap();
+            input_tx
+                .send(InputMessage::Message("use tool".into()))
+                .unwrap();
             drop(input_tx);
             Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel)
                 .run(input_rx, event_tx)

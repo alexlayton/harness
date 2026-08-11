@@ -39,6 +39,21 @@ impl tui::TuiEvent for AgentEvent {
             }
             AgentEvent::TurnFinished => tui::UiEvent::TurnFinished,
             AgentEvent::Error(value) => tui::UiEvent::Error(value),
+            AgentEvent::Notice(value) => tui::UiEvent::Notice(value),
+            AgentEvent::ModelChanged { provider, model } => {
+                tui::UiEvent::ModelChanged { provider, model }
+            }
+            AgentEvent::ModelList { provider, models } => tui::UiEvent::ModelList {
+                provider,
+                models: models
+                    .into_iter()
+                    .map(|model| tui::ModelEntry {
+                        id: model.id,
+                        name: model.name,
+                        context_length: model.context_length,
+                    })
+                    .collect(),
+            },
         }
     }
 }

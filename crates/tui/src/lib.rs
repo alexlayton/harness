@@ -2,15 +2,39 @@
 //! independent from the agent crate, avoiding a library dependency cycle.
 
 mod app;
+pub mod commands;
 mod input;
 pub mod render;
 
 pub use app::Tui;
 pub use render::{TailTool, ToolRecord};
 
-/// Internal input-channel control message used for a resettable Esc interrupt.
-/// It is intentionally impossible to type through the normal text editor.
-pub const INTERRUPT_MESSAGE: &str = "\0harness:interrupt";
+/// Messages sent from the terminal UI to the agent. Keeping this protocol in
+/// the serde-free TUI crate avoids a dependency cycle while allowing commands
+/// to travel through the same queue as ordinary user input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputMessage {
+    /// Normal user text for the model.
+    Message(String),
+    /// Turn-local Esc interrupt.
+    Interrupt,
+    /// Clear the current conversation history.
+    NewConversation,
+    /// Switch model, and provider when `provider` is present.
+    SetModel {
+        provider: Option<String>,
+        model: String,
+    },
+    /// Ask the agent to fetch a provider's model list for completion.
+    ListModels { provider: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelEntry {
+    pub id: String,
+    pub name: Option<String>,
+    pub context_length: Option<u64>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
@@ -40,6 +64,18 @@ pub enum UiEvent {
     },
     TurnFinished,
     Error(String),
+    /// Informational command feedback committed to scrollback.
+    Notice(String),
+    /// Confirmed provider/model labels for the status line.
+    ModelChanged {
+        provider: String,
+        model: String,
+    },
+    /// Cached completion models for a provider.
+    ModelList {
+        provider: String,
+        models: Vec<ModelEntry>,
+    },
 }
 
 pub trait TuiEvent: Send {

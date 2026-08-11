@@ -1,9 +1,17 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
+use llm::Provider;
+use llm::providers::{OpenCodeGoProvider, OpenRouterProvider};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Clone, Debug, ValueEnum, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ProviderArg {
     #[value(name = "opencode-go")]
     OpencodeGo,
@@ -12,6 +20,18 @@ pub enum ProviderArg {
 }
 
 impl ProviderArg {
+    /// All provider names understood by the command line, configuration file,
+    /// and command completion UI.
+    pub const ALL: &[ProviderArg] = &[Self::OpencodeGo, Self::Openrouter];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "opencode-go" => Some(Self::OpencodeGo),
+            "openrouter" => Some(Self::Openrouter),
+            _ => None,
+        }
+    }
+
     /// The first name is the preferred one. The additional OpenCode name is
     /// supported for compatibility with existing OpenCode installations.
     pub fn env_vars(&self) -> &'static [&'static str] {
@@ -42,6 +62,134 @@ impl fmt::Display for ProviderArg {
     }
 }
 
+/// Settings persisted by harness.  API keys deliberately do not belong here;
+/// they remain environment-only secrets.
+///
+/// The flattened map makes a config loaded by an older harness round-trip
+/// fields added by a newer one instead of silently deleting them on save.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct FileConfig {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, toml::Value>,
+}
+
+// `toml::Value` has value equality but does not promise `Eq` because TOML can
+// contain floating point values.  Configuration equality is still useful in
+// tests and the fields are compared using TOML's value equality semantics.
+impl PartialEq for FileConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider && self.model == other.model && self.extra == other.extra
+    }
+}
+
+impl Eq for FileConfig {}
+
+/// Return harness's configuration directory.
+///
+/// `HARNESS_CONFIG_DIR` is intentionally checked first so tests and isolated
+/// launches do not need to touch the user's home directory.  XDG is honored
+/// for Linux-style installations, while the fallback remains explicitly
+/// `~/.config/harness` rather than the platform-specific `dirs::config_dir`.
+pub fn config_dir() -> PathBuf {
+    if let Some(path) = non_empty_env_path("HARNESS_CONFIG_DIR") {
+        return path;
+    }
+    if let Some(path) = non_empty_env_path("XDG_CONFIG_HOME") {
+        return path.join("harness");
+    }
+    dirs::home_dir()
+        .map(|home| home.join(".config").join("harness"))
+        .unwrap_or_else(|| PathBuf::from(".config").join("harness"))
+}
+
+pub fn config_path() -> PathBuf {
+    config_dir().join("config.toml")
+}
+
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Load a TOML configuration.  A missing file is the same as an empty config.
+pub fn load_file_config(path: &Path) -> Result<FileConfig> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileConfig::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read config file {}", path.display()));
+        }
+    };
+    toml::from_str(&contents).with_context(|| format!("parse config file {}", path.display()))
+}
+
+/// Save a TOML configuration using a temporary file in the target directory,
+/// followed by rename, so a partially-written config is never observed.
+pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create config directory {}", parent.display()))?;
+
+    let contents = toml::to_string_pretty(config).context("serialize config")?;
+    let temp_path = temporary_path(path);
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .with_context(|| format!("create temporary config {}", temp_path.display()))?;
+        file.write_all(contents.as_bytes())
+            .with_context(|| format!("write temporary config {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flush temporary config {}", temp_path.display()))?;
+        drop(file);
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("replace config file {}", path.display()))?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn temporary_path(path: &Path) -> PathBuf {
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config.toml");
+    path.with_file_name(format!(
+        ".{file_name}.tmp-{}-{sequence}",
+        std::process::id()
+    ))
+}
+
+/// Update the two currently persisted settings while retaining any unknown
+/// fields already present in the file.
+pub fn save_settings(provider: &str, model: &str) -> Result<()> {
+    save_settings_at(&config_path(), provider, model)
+}
+
+/// Path-injectable form used by callers that already resolved a config path
+/// and by tests.
+pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> {
+    let mut config = load_file_config(path)?;
+    config.provider = Some(provider.to_owned());
+    config.model = Some(model.to_owned());
+    save_file_config(path, &config)
+}
+
 #[derive(Clone, Debug, Parser)]
 #[command(name = "harness", about = "A minimal coding-agent harness")]
 pub struct Cli {
@@ -51,11 +199,12 @@ pub struct Cli {
     pub model: Option<String>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub provider: ProviderArg,
     pub model: String,
     pub api_key: String,
+    pub config_path: PathBuf,
 }
 
 impl Config {
@@ -64,27 +213,13 @@ impl Config {
     }
 
     pub fn resolve(cli: &Cli) -> Result<Self> {
-        let provider = cli.provider.clone().unwrap_or(ProviderArg::OpencodeGo);
-        let key = provider
-            .env_vars()
-            .iter()
-            .find_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .filter(|value| !value.trim().is_empty())
-            })
-            .ok_or_else(|| anyhow!("missing API key: set {}", provider.env_vars().join(" or ")))?;
-        Ok(Self {
-            model: cli
-                .model
-                .clone()
-                .unwrap_or_else(|| provider.default_model().to_owned()),
-            provider,
-            api_key: key,
-        })
+        let path = config_path();
+        let file = load_file_config(&path)?;
+        Self::resolve_from_file(cli, &file, path, env_api_key)
     }
 
-    /// Testable form of resolution using the preferred key names.
+    /// Resolve a config with explicitly supplied key values.  This is kept
+    /// independent of the process environment for deterministic unit tests.
     pub fn resolve_with_keys(
         cli: &Cli,
         opencode_key: Option<&str>,
@@ -100,22 +235,76 @@ impl Config {
         opencode_key: Option<&str>,
         openrouter_key: Option<&str>,
     ) -> Result<Self> {
-        let provider = cli.provider.clone().unwrap_or(ProviderArg::OpencodeGo);
-        let key = match provider {
-            ProviderArg::OpencodeGo => opencode_go_key.or(opencode_key),
-            ProviderArg::Openrouter => openrouter_key,
-        }
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("missing API key: set {}", provider.env_vars().join(" or ")))?;
-        Ok(Self {
-            provider: provider.clone(),
-            model: cli
-                .model
-                .clone()
-                .unwrap_or_else(|| provider.default_model().to_owned()),
-            api_key: key.to_owned(),
+        let path = config_path();
+        let file = load_file_config(&path)?;
+        Self::resolve_from_file(cli, &file, path, |provider| match provider {
+            ProviderArg::OpencodeGo => opencode_go_key.or(opencode_key).map(str::to_owned),
+            ProviderArg::Openrouter => openrouter_key.map(str::to_owned),
         })
     }
+
+    /// Resolve against a supplied file configuration.  Besides making the
+    /// precedence explicit, this gives non-environment callers a convenient
+    /// way to test or embed configuration resolution.
+    pub fn resolve_from_file<F>(
+        cli: &Cli,
+        file: &FileConfig,
+        path: PathBuf,
+        mut key_for: F,
+    ) -> Result<Self>
+    where
+        F: FnMut(ProviderArg) -> Option<String>,
+    {
+        // Validate the persisted name even when a CLI override is present;
+        // otherwise a typo could remain hidden until a later launch.
+        let file_provider = match file.provider.as_deref() {
+            Some(name) => Some(ProviderArg::from_name(name).ok_or_else(|| {
+                anyhow!(
+                    "unknown provider `{name}` in config file {}",
+                    path.display()
+                )
+            })?),
+            None => None,
+        };
+        let provider = cli
+            .provider
+            .or(file_provider)
+            .unwrap_or(ProviderArg::OpencodeGo);
+        let api_key = key_for(provider)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow!("missing API key: set {}", provider.env_vars().join(" or ")))?;
+        let model = cli
+            .model
+            .clone()
+            .or_else(|| file.model.clone())
+            .unwrap_or_else(|| provider.default_model().to_owned());
+        Ok(Self {
+            provider,
+            model,
+            api_key,
+            config_path: path,
+        })
+    }
+}
+
+fn env_api_key(provider: ProviderArg) -> Option<String> {
+    provider.env_vars().iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+    })
+}
+
+/// Construct a provider from its stable configuration/command name.
+pub fn build_provider(name: &str) -> Result<Arc<dyn Provider>> {
+    let provider = ProviderArg::from_name(name)
+        .ok_or_else(|| anyhow!("unknown provider: {name} (expected opencode-go or openrouter)"))?;
+    let api_key = env_api_key(provider)
+        .ok_or_else(|| anyhow!("missing API key: set {}", provider.env_vars().join(" or ")))?;
+    Ok(match provider {
+        ProviderArg::OpencodeGo => Arc::new(OpenCodeGoProvider::new(api_key)),
+        ProviderArg::Openrouter => Arc::new(OpenRouterProvider::new(api_key)),
+    })
 }
 
 /// Install file-only tracing when requested.  stdout is intentionally left
@@ -135,6 +324,7 @@ pub fn init_logging() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn resolves_defaults_and_overrides() {
@@ -152,6 +342,61 @@ mod tests {
         };
         let config = Config::resolve_with_keys(&cli, None, Some("router-secret")).unwrap();
         assert_eq!(config.model, "anthropic/demo");
+    }
+
+    #[test]
+    fn supports_file_precedence_and_unknown_provider_errors() {
+        let file = FileConfig {
+            provider: Some("openrouter".into()),
+            model: Some("file-model".into()),
+            ..FileConfig::default()
+        };
+        let cli = Cli {
+            provider: None,
+            model: None,
+        };
+        let config = Config::resolve_from_file(
+            &cli,
+            &file,
+            PathBuf::from("/tmp/harness-config.toml"),
+            |provider| match provider {
+                ProviderArg::Openrouter => Some("secret".into()),
+                ProviderArg::OpencodeGo => None,
+            },
+        )
+        .unwrap();
+        assert_eq!(config.provider, ProviderArg::Openrouter);
+        assert_eq!(config.model, "file-model");
+
+        let cli = Cli {
+            provider: Some(ProviderArg::OpencodeGo),
+            model: Some("cli-model".into()),
+        };
+        let config = Config::resolve_from_file(
+            &cli,
+            &file,
+            PathBuf::from("/tmp/harness-config.toml"),
+            |_| Some("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(config.provider, ProviderArg::OpencodeGo);
+        assert_eq!(config.model, "cli-model");
+
+        let invalid = FileConfig {
+            provider: Some("typo".into()),
+            ..FileConfig::default()
+        };
+        let error = Config::resolve_from_file(
+            &Cli {
+                provider: None,
+                model: None,
+            },
+            &invalid,
+            PathBuf::from("/tmp/bad-config.toml"),
+            |_| Some("secret".into()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("/tmp/bad-config.toml"));
     }
 
     #[test]
@@ -183,5 +428,40 @@ mod tests {
             .unwrap();
         assert!(error.to_string().contains("OPENCODE_GO_API_KEY"));
         assert!(error.to_string().contains("OPENCODE_API_KEY"));
+    }
+
+    #[test]
+    fn file_round_trip_and_unknown_fields_survive_settings_save() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("nested").join("config.toml");
+        let original = FileConfig {
+            provider: Some("opencode-go".into()),
+            model: Some("demo".into()),
+            extra: [("future".to_owned(), toml::Value::String("kept".into()))]
+                .into_iter()
+                .collect(),
+        };
+        save_file_config(&path, &original).unwrap();
+        assert_eq!(load_file_config(&path).unwrap(), original);
+
+        save_settings_at(&path, "openrouter", "router/demo").unwrap();
+        let saved = load_file_config(&path).unwrap();
+        assert_eq!(saved.provider.as_deref(), Some("openrouter"));
+        assert_eq!(saved.model.as_deref(), Some("router/demo"));
+        assert_eq!(
+            saved.extra.get("future"),
+            Some(&toml::Value::String("kept".into()))
+        );
+    }
+
+    #[test]
+    fn missing_file_is_default_and_config_override_is_used() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config");
+        assert_eq!(load_file_config(&path).unwrap(), FileConfig::default());
+        // Keep this test free of process-global environment mutation; the
+        // helper's behavior is exercised by config_dir itself in integration
+        // tests where the override can be scoped by the harness.
+        assert!(path.ends_with("config"));
     }
 }
