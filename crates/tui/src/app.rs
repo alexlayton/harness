@@ -1,49 +1,35 @@
 use crate::attachments;
 use crate::commands::{self, Candidate, CandidateKind, ParsedCommand};
+use crate::environment::EnvironmentInfo;
 use crate::input::{InputAction, classify, history_next, history_previous, push_history};
-use crate::render;
-use crate::render::{TailTool, ToolRecord};
-use crate::{InputMessage, ModelEntry, TuiEvent, UiEvent};
+use crate::render::{self, Theme};
+use crate::state::{EntryId, Focus, ScrollState, ToolRecord, ToolStatus, TranscriptEntry};
+use crate::{InputMessage, ModelEntry, SessionSnapshotEntry, TuiEvent, UiEvent};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
     KeyModifiers,
 };
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute, terminal};
 use futures_util::StreamExt;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::widgets::Paragraph;
-use ratatui::{Terminal, TerminalOptions, Viewport};
-use std::collections::{HashMap, VecDeque};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::{Block, Paragraph};
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthStr;
 
-const MAX_LIVE_ROWS: u16 = 10;
-const MAX_INPUT_ROWS: u16 = 10;
-const VIEWPORT_ROWS: u16 = 22;
-const MAX_TAIL_TOOLS: usize = 5;
-const MAX_RECENT_TOOLS: usize = 20;
+const MAX_INPUT_FRACTION: usize = 30;
 const MAX_HISTORY: usize = 1_000;
 const PLACEHOLDER: &str = "Type your message...";
-
-#[derive(Clone, Debug)]
-struct RunningTool {
-    name: String,
-    summary: String,
-    arguments: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompletionKind {
-    Slash,
-    Files,
-}
 
 #[derive(Clone, Debug)]
 struct Completion {
@@ -51,6 +37,12 @@ struct Completion {
     selected: usize,
     offset: usize,
     kind: CompletionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionKind {
+    Slash,
+    Files,
 }
 
 #[derive(Debug)]
@@ -62,81 +54,87 @@ struct FileCompletionResult {
 
 pub struct Tui {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    theme: Theme,
     model: String,
     provider: String,
     providers: Vec<String>,
     model_lists: HashMap<String, Vec<ModelEntry>>,
     workspace_root: PathBuf,
+    environment: EnvironmentInfo,
+
     completion: Option<Completion>,
     file_completion_tx: mpsc::UnboundedSender<FileCompletionResult>,
     file_completion_rx: mpsc::UnboundedReceiver<FileCompletionResult>,
     file_completion_generation: u64,
     file_completion_query: Option<String>,
     file_completion_cancel: Option<CancellationToken>,
+
     textarea: TextArea<'static>,
-    pending_text: String,
-    pending_reasoning: String,
-    running_tool: Option<RunningTool>,
-    tail: Vec<TailTool>,
-    recent_tools: VecDeque<ToolRecord>,
-    focused_tool: Option<usize>,
-    spinner: usize,
-    busy: bool,
-    retrying: Option<u32>,
-    status_flash: Option<String>,
-    needs_section_break: bool,
-    header_printed: bool,
+    prompt_scroll: usize,
     history: Vec<String>,
     history_pos: Option<usize>,
     draft: String,
+
+    transcript: Vec<TranscriptEntry>,
+    next_entry_id: EntryId,
+    streaming_assistant: Option<EntryId>,
+    running_tool: Option<EntryId>,
+    focused_tool: Option<usize>,
+    scroll: ScrollState,
+    transcript_dirty: bool,
+    focus: Focus,
+
+    spinner: usize,
+    busy: bool,
+    retrying: Option<u32>,
     restored: bool,
     session_id: Option<String>,
     session_title: Option<String>,
-    usage: Option<UsageState>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct UsageState {
-    input_tokens: u64,
-    output_tokens: u64,
-    cached_tokens: u64,
-    reasoning_tokens: u64,
-    cost: String,
 }
 
 impl Tui {
     pub fn new(model: &str, provider: &str, providers: Vec<String>) -> Result<Self> {
         install_panic_hook();
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let environment = EnvironmentInfo::discover(workspace_root.clone());
+
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(stdout, EnableBracketedPaste, cursor::Hide) {
+        if let Err(error) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            cursor::Hide
+        ) {
             let _ = terminal::disable_raw_mode();
             return Err(error).context("configure terminal input");
         }
-        let (_, rows) = terminal::size().unwrap_or((80, 24));
-        let viewport_rows = rows.clamp(4, VIEWPORT_ROWS);
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let (file_completion_tx, file_completion_rx) = mpsc::unbounded_channel();
+
         let backend = CrosstermBackend::new(stdout);
-        let terminal = match Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Inline(viewport_rows),
-            },
-        ) {
+        let mut terminal = match Terminal::new(backend) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = terminal::disable_raw_mode();
-                return Err(error).context("create inline terminal viewport");
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                return Err(error).context("create fullscreen terminal");
             }
         };
+        if let Err(error) = terminal.clear() {
+            let _ = terminal::disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            return Err(error).context("clear fullscreen terminal");
+        }
+
+        let (file_completion_tx, file_completion_rx) = mpsc::unbounded_channel();
         Ok(Self {
             terminal,
+            theme: Theme::default(),
             model: model.to_owned(),
             provider: provider.to_owned(),
             providers,
             model_lists: HashMap::new(),
             workspace_root,
+            environment,
             completion: None,
             file_completion_tx,
             file_completion_rx,
@@ -144,25 +142,24 @@ impl Tui {
             file_completion_query: None,
             file_completion_cancel: None,
             textarea: new_textarea(),
-            pending_text: String::new(),
-            pending_reasoning: String::new(),
-            running_tool: None,
-            tail: Vec::new(),
-            recent_tools: VecDeque::new(),
-            focused_tool: None,
-            spinner: 0,
-            busy: false,
-            retrying: None,
-            status_flash: None,
-            needs_section_break: false,
-            header_printed: false,
+            prompt_scroll: 0,
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
+            transcript: Vec::new(),
+            next_entry_id: 1,
+            streaming_assistant: None,
+            running_tool: None,
+            focused_tool: None,
+            scroll: ScrollState::default(),
+            transcript_dirty: true,
+            focus: Focus::Prompt,
+            spinner: 0,
+            busy: false,
+            retrying: None,
             restored: false,
             session_id: None,
             session_title: None,
-            usage: None,
         })
     }
 
@@ -208,6 +205,11 @@ impl Tui {
                         Some(Err(error)) => return Err(error).context("read terminal event"),
                         None => return Ok(()),
                     };
+                    if let Event::Resize(_, _) = event {
+                        self.handle_resize();
+                        self.draw()?;
+                        continue;
+                    }
                     if self.handle_input(event, &input_tx, &cancel)? {
                         return Ok(());
                     }
@@ -226,9 +228,6 @@ impl Tui {
                     }
                 }
                 _ = cancel.cancelled(), if !self.busy => {
-                    // Cancellation while idle is the application's shutdown
-                    // path. During a turn the agent sends TurnFinished and the
-                    // input handler remains available for a final redraw.
                     return Ok(());
                 }
             }
@@ -247,13 +246,6 @@ impl Tui {
             return Ok(false);
         }
 
-        // Application quit always wins over a tool-focus binding.
-        if matches!(classify(&event), InputAction::Quit) {
-            cancel.cancel();
-            return Ok(true);
-        }
-
-        // Completion navigation has precedence over history and tool focus.
         if self.handle_completion_input(&event, input_tx)? {
             return Ok(false);
         }
@@ -268,20 +260,35 @@ impl Tui {
                 return Ok(true);
             }
             InputAction::Interrupt => {
-                if self.focused_tool.take().is_some() && !self.busy {
-                    // Esc exits tool focus while idle rather than interrupting
-                    // a future turn.
-                    return Ok(false);
-                }
-                if self.busy {
-                    // Esc is a turn-local interrupt. The agent receives this
-                    // control message and creates a fresh token for the next
-                    // queued turn; Ctrl+C/D remain application quit.
+                let ctrl_c = matches!(
+                    &event,
+                    Event::Key(key)
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                );
+                if ctrl_c {
+                    if self.busy {
+                        let _ = input_tx.send(InputMessage::Interrupt);
+                    } else {
+                        cancel.cancel();
+                        return Ok(true);
+                    }
+                } else if self.completion.is_some() {
+                    self.close_completion();
+                } else if self.focused_tool.take().is_some() {
+                    self.focus = Focus::Prompt;
+                } else if self.busy {
                     let _ = input_tx.send(InputMessage::Interrupt);
+                } else {
+                    self.focus = Focus::Prompt;
                 }
             }
+            InputAction::PageUp => self.scroll_transcript(-(self.scroll.page_size() as isize)),
+            InputAction::PageDown => self.scroll_transcript(self.scroll.page_size() as isize),
+            InputAction::Bottom => self.scroll_to_bottom(),
             InputAction::Newline => {
                 self.history_pos = None;
+                self.draft.clear();
                 self.textarea.input(event);
                 self.refresh_completion();
             }
@@ -294,46 +301,17 @@ impl Tui {
                     self.submit_command(&input, input_tx)?;
                     return Ok(false);
                 }
-                // A queued user message must come after any model content that
-                // is currently in the redrawable area, and after finished tail
-                // tools. The running tool itself remains live at the bottom.
-                self.flush_everything()?;
-                self.commit_tail()?;
-                let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-                render::insert_user(&mut self.terminal, &input, width)
-                    .context("echo user message")?;
-                push_history(&mut self.history, &input, MAX_HISTORY);
-                self.history_pos = None;
-                self.draft.clear();
-                input_tx
-                    .send(InputMessage::Message(input))
-                    .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
-                self.textarea = new_textarea();
-                self.close_completion();
-                self.needs_section_break = true;
-                self.busy = true;
-                self.retrying = None;
-                self.status_flash = None;
+                self.submit_message(input, input_tx)?;
             }
             InputAction::ExpandDetails => {
-                // Pi-style toggle: expand/collapse the focused tool call, or
-                // the most recent one still in the live tail.  Once every
-                // tool has been committed to scrollback, fall back to dumping
-                // the latest call's full detail view.
-                if self.focused_tool.is_some() {
-                    self.toggle_focused_tool();
-                } else if let Some(entry) = self.tail.last_mut() {
-                    entry.expanded = !entry.expanded;
-                } else {
-                    self.expand_latest_tool()?;
-                }
+                self.toggle_selected_or_latest_tool();
             }
             InputAction::FocusTools => {
-                if !self.busy && !self.tail.is_empty() {
-                    self.focused_tool = Some(0);
+                if !self.busy && !self.tool_indices().is_empty() {
+                    let indices = self.tool_indices();
+                    self.focused_tool = Some(indices[0]);
+                    self.focus = Focus::Tool;
                 } else {
-                    // Tab remains a normal textarea insertion while a turn is
-                    // running (or before any tool exists).
                     self.history_pos = None;
                     self.draft.clear();
                     self.textarea.input(event);
@@ -341,21 +319,62 @@ impl Tui {
                 }
             }
             InputAction::Edit => {
-                let history_navigation = match &event {
-                    Event::Key(key) if key.code == KeyCode::Up => self.navigate_history_up(),
-                    Event::Key(key) if key.code == KeyCode::Down => self.navigate_history_down(),
-                    _ => false,
-                };
-                if !history_navigation {
+                if !self.handle_navigation_edit(&event) {
                     self.history_pos = None;
                     self.draft.clear();
                     self.textarea.input(event);
+                    self.focus = Focus::Prompt;
                 }
                 self.refresh_completion();
             }
             InputAction::Ignore => {}
         }
         Ok(false)
+    }
+
+    fn handle_navigation_edit(&mut self, event: &Event) -> bool {
+        let Event::Key(key) = event else {
+            return false;
+        };
+        match key.code {
+            KeyCode::Up => {
+                let (line, _) = self.textarea.cursor();
+                if line > 0 {
+                    self.history_pos = None;
+                    self.draft.clear();
+                    self.textarea.input(event.clone());
+                    return true;
+                }
+                if self.navigate_history_up() {
+                    return true;
+                }
+                self.scroll_transcript(-1);
+                true
+            }
+            KeyCode::Down => {
+                let (line, _) = self.textarea.cursor();
+                if line + 1 < self.textarea.lines().len() {
+                    self.history_pos = None;
+                    self.draft.clear();
+                    self.textarea.input(event.clone());
+                    return true;
+                }
+                if self.navigate_history_down() {
+                    return true;
+                }
+                self.scroll_transcript(1);
+                true
+            }
+            KeyCode::Char('k') if key.modifiers.is_empty() && self.textarea.is_empty() => {
+                self.scroll_transcript(-1);
+                true
+            }
+            KeyCode::Char('j') if key.modifiers.is_empty() && self.textarea.is_empty() => {
+                self.scroll_transcript(1);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn handle_completion_input(
@@ -386,7 +405,7 @@ impl Tui {
                 self.accept_completion(input_tx)?;
                 Ok(true)
             }
-            KeyCode::Esc if !self.busy => {
+            KeyCode::Esc => {
                 self.close_completion();
                 Ok(true)
             }
@@ -466,9 +485,6 @@ impl Tui {
                     provider: provider.clone(),
                 })
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
-            self.status_flash = Some("model list still loading…".into());
-            // Keep the completion state alive while the asynchronous list is
-            // on its way, even though there are no model rows to render yet.
             if self.completion.is_none() {
                 self.completion = Some(Completion {
                     candidates: Vec::new(),
@@ -511,16 +527,15 @@ impl Tui {
                 return;
             }
             let old_value = self.completion.as_ref().and_then(|completion| {
-                (completion.kind == CompletionKind::Slash)
-                    .then(|| {
-                        completion
-                            .candidates
-                            .get(completion.selected)
-                            .map(|candidate| candidate.value.as_str())
-                    })
-                    .flatten()
+                (completion.kind == CompletionKind::Slash).then(|| {
+                    completion
+                        .candidates
+                        .get(completion.selected)
+                        .map(|candidate| candidate.value.as_str())
+                })
             });
             let selected = old_value
+                .flatten()
                 .and_then(|value| {
                     candidates
                         .iter()
@@ -577,8 +592,6 @@ impl Tui {
         });
 
         tokio::spawn(async move {
-            // Avoid starting a filesystem walk for every individual character
-            // when the user is typing quickly.
             tokio::time::sleep(Duration::from_millis(20)).await;
             if cancel.is_cancelled() {
                 return;
@@ -656,7 +669,7 @@ impl Tui {
         let command = match commands::parse_command(input) {
             Ok(command) => command,
             Err(error) => {
-                self.status_flash = Some(error);
+                self.add_error(error);
                 return Ok(());
             }
         };
@@ -666,24 +679,15 @@ impl Tui {
         } = &command
             && model.is_empty()
         {
-            self.status_flash = Some(format!(
+            self.add_notice(format!(
                 "usage: /model [<provider>:]<model> (current: {} · {})",
                 self.provider, self.model
             ));
             return Ok(());
         }
 
-        self.flush_everything()?;
-        self.commit_tail()?;
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_command_echo(&mut self.terminal, input, width).context("echo command")?;
-        push_history(&mut self.history, input, MAX_HISTORY);
-        self.history_pos = None;
-        self.draft.clear();
-        self.textarea = new_textarea();
-        self.close_completion();
-        self.status_flash = None;
-
+        self.add_notice(format!("⌘ {input}"));
+        self.push_history_and_clear_input(input);
         match command {
             ParsedCommand::New => input_tx
                 .send(InputMessage::NewConversation)
@@ -714,9 +718,7 @@ impl Tui {
                     && !self.model_lists.contains_key(&provider)
                 {
                     input_tx
-                        .send(InputMessage::ListModels {
-                            provider: provider.clone(),
-                        })
+                        .send(InputMessage::ListModels { provider })
                         .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
                 }
             }
@@ -727,65 +729,56 @@ impl Tui {
     fn handle_tool_focus(&mut self, event: &Event) -> Result<bool> {
         let Event::Key(key) = event else {
             self.focused_tool = None;
+            self.focus = Focus::Prompt;
             return Ok(false);
         };
+        let indices = self.tool_indices();
+        if indices.is_empty() {
+            self.focused_tool = None;
+            self.focus = Focus::Prompt;
+            return Ok(false);
+        }
+        let current_position = self
+            .focused_tool
+            .and_then(|index| indices.iter().position(|candidate| *candidate == index))
+            .unwrap_or(0);
         match key.code {
             KeyCode::Esc => {
                 self.focused_tool = None;
+                self.focus = Focus::Prompt;
                 Ok(true)
             }
             KeyCode::Up => {
-                if let Some(index) = self.focused_tool.as_mut() {
-                    *index = index.saturating_sub(1);
-                }
+                let position = current_position.saturating_sub(1);
+                self.focused_tool = Some(indices[position]);
                 Ok(true)
             }
             KeyCode::Down => {
-                if let Some(index) = self.focused_tool.as_mut() {
-                    *index = (*index + 1).min(self.tail.len().saturating_sub(1));
-                }
+                let position = (current_position + 1).min(indices.len().saturating_sub(1));
+                self.focused_tool = Some(indices[position]);
                 Ok(true)
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.toggle_focused_tool();
+                self.focused_tool = Some(indices[current_position]);
+                self.toggle_tool_at(indices[current_position]);
                 Ok(true)
             }
-            KeyCode::Char('d') if key.modifiers.is_empty() => {
-                // Dump the focused call's full detail into scrollback, then
-                // hand focus back to the editor.
-                self.dump_focused_tool()?;
-                self.focused_tool = None;
-                Ok(true)
-            }
-            KeyCode::Char(value)
-                if value.eq_ignore_ascii_case(&'o')
-                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            KeyCode::Char('o')
+                if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.is_empty() =>
             {
-                // Ctrl+O expands/collapses in place, matching the global
-                // binding; Enter or Space work too.
-                self.toggle_focused_tool();
+                self.focused_tool = Some(indices[current_position]);
+                self.toggle_tool_at(indices[current_position]);
                 Ok(true)
             }
             KeyCode::Tab => {
-                if !self.tail.is_empty() {
-                    let index = self.focused_tool.unwrap_or(0);
-                    self.focused_tool = Some((index + 1) % self.tail.len());
-                }
+                self.focused_tool = Some(indices[(current_position + 1) % indices.len()]);
                 Ok(true)
             }
             _ => {
-                // Leave focus and let ordinary input handling process the key.
                 self.focused_tool = None;
+                self.focus = Focus::Prompt;
                 Ok(false)
             }
-        }
-    }
-
-    fn toggle_focused_tool(&mut self) {
-        if let Some(index) = self.focused_tool
-            && let Some(entry) = self.tail.get_mut(index)
-        {
-            entry.expanded = !entry.expanded;
         }
     }
 
@@ -794,7 +787,7 @@ impl Tui {
             return false;
         }
         let (line, _) = self.textarea.cursor();
-        if line != 0 {
+        if self.textarea.lines().len() > 1 || line != 0 || self.history_pos == Some(0) {
             return false;
         }
         let current = self.textarea.lines().join("\n");
@@ -815,7 +808,7 @@ impl Tui {
             return false;
         }
         let (line, _) = self.textarea.cursor();
-        if line + 1 < self.textarea.lines().len() {
+        if self.textarea.lines().len() > 1 || line + 1 < self.textarea.lines().len() {
             return false;
         }
         let Some(value) = history_next(&self.history, &mut self.history_pos, &self.draft) else {
@@ -829,8 +822,35 @@ impl Tui {
         self.textarea = textarea_with_text(value);
     }
 
+    fn push_history_and_clear_input(&mut self, input: &str) {
+        push_history(&mut self.history, input, MAX_HISTORY);
+        self.history_pos = None;
+        self.draft.clear();
+        self.textarea = new_textarea();
+        self.close_completion();
+        self.focus = Focus::Prompt;
+    }
+
+    fn submit_message(
+        &mut self,
+        input: String,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<()> {
+        let id = self.allocate_id();
+        self.add_entry(TranscriptEntry::User {
+            id,
+            text: input.clone(),
+        });
+        self.push_history_and_clear_input(&input);
+        input_tx
+            .send(InputMessage::Message(input))
+            .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+        self.busy = true;
+        self.retrying = None;
+        Ok(())
+    }
+
     fn apply_event(&mut self, event: UiEvent) -> Result<()> {
-        self.status_flash = None;
         match event {
             UiEvent::TextDelta(delta) => {
                 if delta.is_empty() {
@@ -838,13 +858,10 @@ impl Tui {
                 }
                 self.busy = true;
                 self.retrying = None;
-                // Reasoning is committed immediately before the first text
-                // delta so the two streams remain interleaved.
-                self.flush_pending_reasoning()?;
-                self.ensure_section_break()?;
-                self.pending_text.push_str(&delta);
-                self.flush_stable_text()?;
-                self.flush_overflow_text()?;
+                if let TranscriptEntry::Assistant { markdown, .. } = self.ensure_assistant() {
+                    markdown.push_str(&delta);
+                }
+                self.transcript_changed();
             }
             UiEvent::ReasoningDelta(delta) => {
                 if delta.is_empty() {
@@ -852,14 +869,10 @@ impl Tui {
                 }
                 self.busy = true;
                 self.retrying = None;
-                // A provider normally sends reasoning before text. If a
-                // provider interleaves the other way, commit the text already
-                // received before placing reasoning above it.
-                if !self.pending_text.is_empty() {
-                    self.flush_pending_text_all()?;
+                if let TranscriptEntry::Assistant { reasoning, .. } = self.ensure_assistant() {
+                    reasoning.push_str(&delta);
                 }
-                self.ensure_section_break()?;
-                self.pending_reasoning.push_str(&delta);
+                self.transcript_changed();
             }
             UiEvent::ToolCallStarted {
                 name,
@@ -868,14 +881,23 @@ impl Tui {
             } => {
                 self.busy = true;
                 self.retrying = None;
-                // Everything already streamed belongs before the running tool.
-                self.flush_everything()?;
-                self.commit_tail()?;
-                self.running_tool = Some(RunningTool {
-                    name,
-                    summary,
-                    arguments,
+                self.streaming_assistant = None;
+                let id = self.allocate_id();
+                self.add_entry(TranscriptEntry::Tool {
+                    id,
+                    record: ToolRecord {
+                        name,
+                        args: arguments,
+                        summary,
+                        ok: false,
+                        duration_ms: 0,
+                        output: String::new(),
+                        error: None,
+                        status: ToolStatus::Running,
+                    },
+                    expanded: false,
                 });
+                self.running_tool = Some(id);
                 self.spinner = 0;
             }
             UiEvent::ToolCallFinished {
@@ -887,67 +909,77 @@ impl Tui {
                 error,
             } => {
                 self.busy = true;
-                let arguments = self
+                let id = self
                     .running_tool
                     .take()
-                    .map(|tool| tool.arguments)
-                    .unwrap_or_else(|| "{}".into());
-                let record = ToolRecord {
-                    name,
-                    args: arguments,
-                    summary,
-                    ok,
-                    duration_ms,
-                    output,
-                    error,
-                };
-                self.recent_tools.push_back(record.clone());
-                while self.recent_tools.len() > MAX_RECENT_TOOLS {
-                    self.recent_tools.pop_front();
+                    .unwrap_or_else(|| self.allocate_id());
+                let mut updated = false;
+                if let Some(entry) = self.transcript.iter_mut().find(|entry| entry.id() == id)
+                    && let Some(record) = entry.tool_record_mut()
+                {
+                    record.name = name.clone();
+                    record.summary = summary.clone();
+                    record.ok = ok;
+                    record.duration_ms = duration_ms;
+                    record.output = output.clone();
+                    record.error = error.clone();
+                    record.status = if ok {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Failure
+                    };
+                    updated = true;
                 }
-
-                // Keep only a small interactive tail. Overflow is committed in
-                // chronological order before the new entry is made live.
-                if self.tail.len() >= MAX_TAIL_TOOLS {
-                    let oldest = self.tail.remove(0);
-                    self.commit_tool_record(&oldest.record)?;
+                if !updated {
+                    self.add_entry(TranscriptEntry::Tool {
+                        id,
+                        record: ToolRecord {
+                            name,
+                            args: "{}".into(),
+                            summary,
+                            ok,
+                            duration_ms,
+                            output,
+                            error,
+                            status: if ok {
+                                ToolStatus::Success
+                            } else {
+                                ToolStatus::Failure
+                            },
+                        },
+                        expanded: false,
+                    });
+                } else {
+                    self.transcript_changed();
                 }
-                self.tail.push(TailTool {
-                    record,
-                    expanded: false,
-                });
                 self.focused_tool = None;
                 self.retrying = None;
-                // The next assistant text after a tool begins a new segment.
-                self.needs_section_break = true;
             }
             UiEvent::Retrying { attempt, .. } => {
                 self.busy = true;
                 self.retrying = Some(attempt);
             }
             UiEvent::Error(error) => {
-                self.flush_everything()?;
-                self.insert_error(&error)?;
+                self.add_error(error);
                 self.running_tool = None;
+                self.streaming_assistant = None;
                 self.busy = false;
+                self.retrying = None;
             }
             UiEvent::TurnFinished => {
-                // Do not commit an otherwise idle tail here: it remains
-                // interactively expandable until newer content needs the
-                // scrollback position.
-                self.flush_everything()?;
+                if let Some(id) = self.streaming_assistant.take()
+                    && let Some(entry) = self.transcript.iter_mut().find(|entry| entry.id() == id)
+                    && let TranscriptEntry::Assistant { streaming, .. } = entry
+                {
+                    *streaming = false;
+                }
                 self.running_tool = None;
                 self.retrying = None;
                 self.busy = false;
                 self.focused_tool = None;
+                self.focus = Focus::Prompt;
             }
-            UiEvent::Notice(notice) => {
-                self.flush_everything()?;
-                self.commit_tail()?;
-                let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-                render::insert_notice(&mut self.terminal, &notice, width)
-                    .context("insert notice")?;
-            }
+            UiEvent::Notice(notice) => self.add_notice(notice),
             UiEvent::ModelChanged { provider, model } => {
                 self.provider = provider;
                 self.model = model;
@@ -964,18 +996,66 @@ impl Tui {
             UiEvent::SessionChanged { id, title, loaded } => {
                 self.session_id = Some(id.clone());
                 self.session_title = title;
-                self.usage = None;
-                self.flush_everything()?;
-                self.commit_tail()?;
-                self.status_flash = Some(if loaded {
-                    format!("loaded session {}", &id[..id.len().min(8)])
-                } else {
-                    format!("session {}", &id[..id.len().min(8)])
-                });
+                self.transcript.clear();
+                self.streaming_assistant = None;
+                self.running_tool = None;
+                self.focused_tool = None;
+                self.scroll = ScrollState::default();
+                self.transcript_dirty = true;
+                if loaded {
+                    self.add_notice(format!("loaded session {}", &id[..id.len().min(8)]));
+                }
+            }
+            UiEvent::SessionSnapshot { entries } => {
+                self.transcript.clear();
+                self.streaming_assistant = None;
+                self.running_tool = None;
+                self.focused_tool = None;
+                for snapshot in entries {
+                    let id = self.allocate_id();
+                    let entry = match snapshot {
+                        SessionSnapshotEntry::User { text } => TranscriptEntry::User { id, text },
+                        SessionSnapshotEntry::Assistant {
+                            markdown,
+                            reasoning,
+                        } => TranscriptEntry::Assistant {
+                            id,
+                            markdown,
+                            reasoning,
+                            streaming: false,
+                        },
+                        SessionSnapshotEntry::Tool {
+                            name,
+                            summary,
+                            arguments,
+                            ok,
+                            duration_ms,
+                            output,
+                            error,
+                        } => TranscriptEntry::Tool {
+                            id,
+                            record: ToolRecord {
+                                name,
+                                args: arguments,
+                                summary,
+                                ok,
+                                duration_ms,
+                                output,
+                                error,
+                                status: if ok {
+                                    ToolStatus::Success
+                                } else {
+                                    ToolStatus::Failure
+                                },
+                            },
+                            expanded: false,
+                        },
+                    };
+                    self.transcript.push(entry);
+                }
+                self.transcript_changed();
             }
             UiEvent::SessionList { sessions } => {
-                self.flush_everything()?;
-                self.commit_tail()?;
                 let notice = if sessions.is_empty() {
                     "No sessions for this workspace".to_owned()
                 } else {
@@ -993,323 +1073,258 @@ impl Tui {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-                render::insert_notice(&mut self.terminal, &notice, width)
-                    .context("insert session list")?;
+                self.add_notice(notice);
             }
             UiEvent::SessionExported { path } => {
-                self.status_flash = Some(format!("exported to {path}"));
+                self.add_notice(format!("exported session to {path}"));
             }
-            UiEvent::UsageUpdated {
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-                reasoning_tokens,
-                cost,
-            } => {
-                self.usage = Some(UsageState {
-                    input_tokens,
-                    output_tokens,
-                    cached_tokens,
-                    reasoning_tokens,
-                    cost,
-                });
-            }
+            UiEvent::UsageUpdated { .. } => {}
             UiEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
-            } => {
-                self.status_flash = Some(format!(
-                    "compacted through event {compacted_through} ({summary_bytes} bytes)"
-                ));
-            }
+            } => self.add_notice(format!(
+                "compacted through event {compacted_through} ({summary_bytes} bytes)"
+            )),
         }
         Ok(())
     }
 
-    fn ensure_section_break(&mut self) -> Result<()> {
-        if !self.needs_section_break {
-            return Ok(());
-        }
-        self.commit_tail()?;
-        render::insert_section_gap(&mut self.terminal).context("insert section gap")?;
-        self.needs_section_break = false;
-        Ok(())
-    }
-
-    fn flush_stable_text(&mut self) -> Result<()> {
-        let (stable, pending) = render::split_stable_prefix(&self.pending_text);
-        if stable.is_empty() {
-            return Ok(());
-        }
-        self.pending_text = pending;
-        self.insert_markdown(&stable)
-    }
-
-    fn flush_overflow_text(&mut self) -> Result<()> {
-        if render::wrap_count(
-            &self.pending_text,
-            self.terminal.size().map(|size| size.width).unwrap_or(80) as usize,
-        ) <= MAX_LIVE_ROWS as usize
-        {
-            return Ok(());
-        }
-        let Some(index) = self.pending_text.rfind('\n') else {
-            return Ok(());
+    fn ensure_assistant(&mut self) -> &mut TranscriptEntry {
+        let id = if let Some(id) = self.streaming_assistant {
+            id
+        } else {
+            let id = self.allocate_id();
+            self.add_entry(TranscriptEntry::Assistant {
+                id,
+                markdown: String::new(),
+                reasoning: String::new(),
+                streaming: true,
+            });
+            self.streaming_assistant = Some(id);
+            id
         };
-        let prefix = self.pending_text[..=index].to_owned();
-        self.pending_text = self.pending_text[index + 1..].to_owned();
-        self.insert_markdown(&prefix)
+        self.transcript
+            .iter_mut()
+            .find(|entry| entry.id() == id)
+            .expect("streaming assistant entry exists")
     }
 
-    fn insert_markdown(&mut self, markdown: &str) -> Result<()> {
-        if markdown.is_empty() {
-            return Ok(());
+    fn add_notice(&mut self, text: impl Into<String>) {
+        let id = self.allocate_id();
+        self.add_entry(TranscriptEntry::Notice {
+            id,
+            text: text.into(),
+        });
+    }
+
+    fn add_error(&mut self, text: impl Into<String>) {
+        let id = self.allocate_id();
+        self.add_entry(TranscriptEntry::Error {
+            id,
+            text: text.into(),
+        });
+    }
+
+    fn add_entry(&mut self, entry: TranscriptEntry) {
+        self.transcript.push(entry);
+        self.transcript_changed();
+    }
+
+    fn allocate_id(&mut self) -> EntryId {
+        let id = self.next_entry_id;
+        self.next_entry_id = self.next_entry_id.wrapping_add(1).max(1);
+        id
+    }
+
+    fn transcript_changed(&mut self) {
+        if !self.scroll.follow_latest && !self.scroll.at_bottom() {
+            self.scroll.new_content_below = true;
         }
-        self.ensure_section_break()?;
-        self.commit_tail()?;
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_markdown(&mut self.terminal, markdown, width).context("insert markdown")?;
-        Ok(())
+        self.transcript_dirty = true;
     }
 
-    fn flush_pending_reasoning(&mut self) -> Result<()> {
-        if self.pending_reasoning.is_empty() {
-            return Ok(());
-        }
-        let reasoning = std::mem::take(&mut self.pending_reasoning);
-        self.ensure_section_break()?;
-        self.commit_tail()?;
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_reasoning(&mut self.terminal, &reasoning, width)
-            .context("insert reasoning")?;
-        Ok(())
+    fn tool_indices(&self) -> Vec<usize> {
+        self.transcript
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.tool_record().map(|_| index))
+            .collect()
     }
 
-    fn flush_pending_text_all(&mut self) -> Result<()> {
-        if self.pending_text.is_empty() {
-            return Ok(());
-        }
-        let text = std::mem::take(&mut self.pending_text);
-        self.insert_markdown(&text)
-    }
-
-    fn flush_everything(&mut self) -> Result<()> {
-        self.flush_pending_reasoning()?;
-        self.flush_pending_text_all()?;
-        Ok(())
-    }
-
-    /// Commit all finished live-tail tools in their original order.  Every
-    /// path that writes a new scrollback block calls this first.
-    fn commit_tail(&mut self) -> Result<()> {
-        while !self.tail.is_empty() {
-            let entry = self.tail.remove(0);
-            self.commit_tool_record(&entry.record)?;
-        }
-        self.focused_tool = None;
-        Ok(())
-    }
-
-    fn commit_tool_record(&mut self, record: &ToolRecord) -> Result<()> {
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_tool_finished(
-            &mut self.terminal,
-            &record.name,
-            &record.summary,
-            record.ok,
-            record.duration_ms,
-            record.error.as_deref(),
-            width,
-        )
-        .context("insert completed tool")?;
-        self.needs_section_break = true;
-        Ok(())
-    }
-
-    fn insert_error(&mut self, error: &str) -> Result<()> {
-        self.commit_tail()?;
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_error(&mut self.terminal, error, width).context("insert error")?;
-        Ok(())
-    }
-
-    fn expand_latest_tool(&mut self) -> Result<()> {
-        let Some(record) = self.recent_tools.back().cloned() else {
-            self.status_flash = Some("no tool calls yet".into());
-            return Ok(());
-        };
-        self.append_tool_detail(record)
-    }
-
-    fn dump_focused_tool(&mut self) -> Result<()> {
-        let record = self
+    fn toggle_selected_or_latest_tool(&mut self) {
+        let index = self
             .focused_tool
-            .and_then(|index| self.tail.get(index))
-            .map(|entry| entry.record.clone())
-            .or_else(|| self.recent_tools.back().cloned());
-        let Some(record) = record else {
-            self.status_flash = Some("no tool calls yet".into());
-            return Ok(());
-        };
-        self.append_tool_detail(record)
+            .or_else(|| self.tool_indices().last().copied());
+        if let Some(index) = index {
+            self.toggle_tool_at(index);
+        }
     }
 
-    fn append_tool_detail(&mut self, record: ToolRecord) -> Result<()> {
-        self.flush_everything()?;
-        self.commit_tail()?;
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_tool_detail(&mut self.terminal, &record, width)
-            .context("insert tool details")?;
-        Ok(())
+    fn toggle_tool_at(&mut self, index: usize) {
+        if let Some(TranscriptEntry::Tool { expanded, .. }) = self.transcript.get_mut(index) {
+            *expanded = !*expanded;
+            self.transcript_changed();
+        }
+    }
+
+    fn scroll_transcript(&mut self, delta: isize) {
+        self.scroll.scroll_by(delta);
+        self.focus = Focus::Transcript;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll.go_bottom();
+        self.focus = Focus::Transcript;
+    }
+
+    fn handle_resize(&mut self) {
+        self.prompt_scroll = 0;
+        self.transcript_dirty = true;
     }
 
     fn draw(&mut self) -> Result<()> {
-        if !self.header_printed {
-            let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-            render::insert_header(&mut self.terminal, width).context("insert welcome header")?;
-            self.header_printed = true;
+        let size = self.terminal.size().context("read terminal size")?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let horizontal = if area.width >= 80 {
+            2
+        } else if area.width >= 40 {
+            1
+        } else {
+            0
+        };
+        let vertical = if area.height >= 8 { 1 } else { 0 };
+        let outer = area.inner(Margin {
+            horizontal,
+            vertical,
+        });
+        if outer.width == 0 || outer.height == 0 {
+            return Ok(());
         }
 
-        self.textarea.set_block(render::input_block());
-        let model = self.model.clone();
-        let provider = self.provider.clone();
-        let pending_text = self.pending_text.clone();
-        let pending_reasoning = self.pending_reasoning.clone();
-        let running_tool = self.running_tool.clone();
-        let tail = self.tail.clone();
-        let focused_tool = self.focused_tool;
-        let spinner = self.spinner;
-        let busy = self.busy;
-        let retrying = self.retrying;
-        let status_flash = self.status_flash.clone();
-        let session_id = self.session_id.clone();
-        let session_title = self.session_title.clone();
-        let usage = self.usage.clone();
+        let show_welcome = !self.transcript.iter().any(TranscriptEntry::is_meaningful);
+        let transcript_lines = render::transcript_lines(
+            &self.transcript,
+            show_welcome,
+            outer.width as usize,
+            self.theme,
+        );
+        let content_height = transcript_lines.len();
+        let prompt_content_width = outer.width.saturating_sub(4).max(1) as usize;
+        let prompt_layout = render::prompt_layout(&self.textarea, prompt_content_width, self.theme);
+        let desired_prompt_rows = prompt_layout.lines.len().saturating_add(2) as u16;
+        let requested_completion_rows = self
+            .completion
+            .as_ref()
+            .map(|completion| render::completion_rows(&completion.candidates))
+            .unwrap_or(0);
+        let requested_indicator_rows = u16::from(self.scroll.new_content_below);
+        let minimum_layout_rows = 1u16.saturating_add(3).saturating_add(1);
+        let indicator_rows = if outer.height >= minimum_layout_rows.saturating_add(1) {
+            requested_indicator_rows
+        } else {
+            0
+        };
+        let completion_capacity = outer
+            .height
+            .saturating_sub(indicator_rows)
+            .saturating_sub(minimum_layout_rows);
+        let completion_rows = requested_completion_rows.min(completion_capacity);
+        let fixed_rows = indicator_rows
+            .saturating_add(completion_rows)
+            .saturating_add(1);
+        let available = outer.height.saturating_sub(fixed_rows);
+        let max_prompt = ((outer.height as usize * MAX_INPUT_FRACTION) / 100)
+            .max(3)
+            .min(u16::MAX as usize) as u16;
+        let prompt_rows = desired_prompt_rows
+            .max(3)
+            .min(max_prompt)
+            .min(available.saturating_sub(1).max(1));
+        let transcript_rows = available.saturating_sub(prompt_rows).max(1);
+
+        let was_following = self.scroll.follow_latest || self.scroll.at_bottom();
+        self.scroll.content_height = content_height;
+        self.scroll.viewport_height = transcript_rows as usize;
+        if self.transcript_dirty {
+            self.scroll.on_content_changed(was_following);
+            self.transcript_dirty = false;
+        } else {
+            self.scroll.clamp();
+        }
+        if show_welcome {
+            self.scroll.offset = 0;
+        }
+
+        let prompt_inner_height = prompt_rows.saturating_sub(2).max(1) as usize;
+        let prompt_max_scroll = prompt_layout
+            .lines
+            .len()
+            .saturating_sub(prompt_inner_height);
+        if prompt_layout.cursor_row < self.prompt_scroll {
+            self.prompt_scroll = prompt_layout.cursor_row;
+        } else if prompt_layout.cursor_row >= self.prompt_scroll + prompt_inner_height {
+            self.prompt_scroll = prompt_layout
+                .cursor_row
+                .saturating_add(1)
+                .saturating_sub(prompt_inner_height);
+        }
+        self.prompt_scroll = self.prompt_scroll.min(prompt_max_scroll);
+
+        let transcript = &transcript_lines;
+        let offset = self.scroll.offset;
         let completion = self.completion.clone();
+        let provider = self.provider.clone();
+        let model = self.model.clone();
+        let cwd = self.environment.cwd_display.clone();
+        let branch = self.environment.branch.clone();
         let textarea = &self.textarea;
-        let clear_flash = self.status_flash.is_some();
+        let prompt_scroll = self.prompt_scroll;
+        let theme = self.theme;
+        let new_content = self.scroll.new_content_below;
 
         self.terminal.draw(|frame| {
-            let area = frame.area();
-            let requested_completion_rows = completion
-                .as_ref()
-                .map(|completion| {
-                    completion.candidates.len().min(render::MAX_COMPLETION_ROWS) as u16
-                })
-                .unwrap_or(0);
-            // Reserve the status line and the input box (text + 2 border rows).
-            let completion_rows = requested_completion_rows.min(area.height.saturating_sub(4));
-            let inner_rows = (textarea.lines().len() as u16)
-                .clamp(1, MAX_INPUT_ROWS)
-                .min(area.height.saturating_sub(3 + completion_rows).max(1));
-            let input_rows = inner_rows + 2;
-            let mut constraints = vec![
-                Constraint::Min(1),
+            let full = frame.area();
+            frame.render_widget(
+                Block::default().style(Style::default().bg(theme.background)),
+                full,
+            );
+            let constraints = vec![
+                Constraint::Length(transcript_rows),
+                Constraint::Length(indicator_rows),
+                Constraint::Length(completion_rows),
                 Constraint::Length(1),
-                Constraint::Length(input_rows),
+                Constraint::Length(prompt_rows),
             ];
-            if completion.is_some() {
-                constraints.push(Constraint::Length(completion_rows));
-            }
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(constraints)
-                .split(area);
+                .split(outer);
 
-            let running = running_tool
-                .as_ref()
-                .map(|tool| (tool.name.as_str(), tool.summary.as_str(), spinner));
-            render::render_live_with_tail(
-                chunks[0],
-                &tail,
-                focused_tool,
-                &pending_reasoning,
-                &pending_text,
-                running,
-                frame,
-            );
-
-            let dim_style = Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::DIM);
-            let session_label = session_id
-                .as_deref()
-                .map(|id| format!(" · session {}", &id[..id.len().min(8)]))
-                .unwrap_or_default();
-            let title_label = session_title
-                .as_deref()
-                .filter(|title| !title.is_empty())
-                .map(|title| format!(" · {title}"))
-                .unwrap_or_default();
-            let left = format!("{provider} · {model}{session_label}{title_label}");
-            let (right, right_style) = if let Some(flash) = status_flash.as_deref() {
-                (flash.to_owned(), Style::default().fg(Color::Cyan))
-            } else if let Some(attempt) = retrying {
-                (
-                    format!("↻ retrying (attempt {attempt})"),
-                    Style::default().fg(Color::Yellow),
-                )
-            } else if busy {
-                ("… generating".to_owned(), dim_style)
-            } else if let Some(usage) = usage {
-                let cost = if usage.cost != "0" {
-                    format!(" · ${}", usage.cost)
-                } else {
-                    String::new()
-                };
-                (
-                    format!(
-                        "{} in · {} out · {} cached · {} reasoning{cost}",
-                        usage.input_tokens,
-                        usage.output_tokens,
-                        usage.cached_tokens,
-                        usage.reasoning_tokens,
-                    ),
-                    dim_style,
-                )
-            } else if focused_tool.is_some() {
-                (
-                    "↑/↓ select · enter expand · d dump · esc close".to_owned(),
-                    dim_style,
-                )
-            } else {
-                (String::new(), dim_style)
-            };
-            let status = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Length(left.chars().count().min(u16::MAX as usize) as u16),
-                    Constraint::Min(1),
-                    Constraint::Length(right.chars().count().min(u16::MAX as usize) as u16),
-                ])
-                .split(chunks[1]);
-            frame.render_widget(Paragraph::new(left).style(dim_style), status[0]);
-            if !right.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(right)
-                        .alignment(ratatui::layout::Alignment::Right)
-                        .style(right_style),
-                    status[2],
-                );
+            render::render_transcript_lines(chunks[0], transcript, offset, theme, frame);
+            if new_content {
+                render::render_new_content_indicator(chunks[1], theme, frame);
             }
-
-            // The bordered input box renders the textarea (block included).
-            frame.render_widget(textarea, chunks[2]);
-
             if let Some(completion) = completion.as_ref() {
                 render::render_completion(
-                    chunks[3],
+                    chunks[2],
                     &completion.candidates,
                     completion.selected,
                     completion.offset,
+                    theme,
                     frame,
                 );
             }
+            render_metadata(
+                chunks[3],
+                &cwd,
+                branch.as_deref(),
+                &provider,
+                &model,
+                theme,
+                frame,
+            );
+            render::render_prompt(chunks[4], textarea, prompt_scroll, theme, frame);
         })?;
-        if clear_flash {
-            self.status_flash = None;
-        }
         Ok(())
     }
 
@@ -1323,11 +1338,77 @@ impl Tui {
         execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
-            cursor::Show
+            cursor::Show,
+            LeaveAlternateScreen
         )
         .context("restore terminal input")?;
         Ok(())
     }
+}
+
+fn render_metadata(
+    area: Rect,
+    cwd: &str,
+    branch: Option<&str>,
+    provider: &str,
+    model: &str,
+    theme: Theme,
+    frame: &mut ratatui::Frame<'_>,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let left = match branch {
+        Some(branch) => format!("{cwd}  ({branch})"),
+        None => cwd.to_owned(),
+    };
+    let right = format!("{provider} · {model}");
+    let left_width = UnicodeWidthStr::width(left.as_str()).min(area.width as usize / 2);
+    let right_width = UnicodeWidthStr::width(right.as_str()).min(area.width as usize / 2);
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(left_width as u16),
+            Constraint::Min(1),
+            Constraint::Length(right_width as u16),
+        ])
+        .split(area);
+    let style = Style::default()
+        .fg(theme.dim_text)
+        .add_modifier(Modifier::DIM);
+    frame.render_widget(
+        Paragraph::new(truncate_display(&left, left_width)).style(style),
+        layout[0],
+    );
+    frame.render_widget(
+        Paragraph::new(truncate_display(&right, right_width))
+            .alignment(ratatui::layout::Alignment::Right)
+            .style(style),
+        layout[2],
+    );
+}
+
+fn truncate_display(value: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(value) <= width {
+        return value.to_owned();
+    }
+    if width <= 1 {
+        return "…".to_owned();
+    }
+    let mut result = String::new();
+    let mut used = 0usize;
+    for character in value.chars() {
+        let character_width = unicode_width::UnicodeWidthChar::width(character)
+            .unwrap_or(1)
+            .max(1);
+        if used + character_width + 1 > width {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push('…');
+    result
 }
 
 fn replace_current_command_token(input: &str, value: &str) -> String {
@@ -1364,12 +1445,10 @@ fn textarea_with_text_at_cursor(value: &str, line: usize, column: usize) -> Text
     textarea.set_placeholder_text(PLACEHOLDER);
     textarea.set_placeholder_style(
         Style::default()
-            .fg(Color::DarkGray)
+            .fg(Theme::default().dim_text)
             .add_modifier(Modifier::DIM),
     );
-    // Main input text is white; the bordered box already marks the active
-    // line, so the default underline cursor-line styling is dropped.
-    textarea.set_style(Style::default().fg(Color::White));
+    textarea.set_style(Style::default().fg(Theme::default().primary_text));
     textarea.set_cursor_line_style(Style::default());
     textarea
 }
@@ -1384,14 +1463,22 @@ fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, cursor::Show);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            cursor::Show,
+            LeaveAlternateScreen
+        );
         previous(panic);
     }));
 }
 
 #[cfg(test)]
 mod tests {
-    // The terminal lifecycle needs a real tty; pure key/render behavior is
-    // tested in input.rs and render.rs. Keeping this module documents that no
-    // alternate-screen teardown is used.
+    #[test]
+    fn fullscreen_ui_keeps_terminal_lifecycle_outside_pure_render_tests() {
+        // The real terminal lifecycle is intentionally exercised manually;
+        // render.rs, input.rs, state.rs, and environment.rs contain the pure
+        // behavior tests that do not require a TTY.
+    }
 }

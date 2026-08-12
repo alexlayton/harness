@@ -7,6 +7,9 @@ pub enum InputAction {
     Interrupt,
     Quit,
     ExpandDetails,
+    PageUp,
+    PageDown,
+    Bottom,
     FocusTools,
     Edit,
     Ignore,
@@ -19,7 +22,7 @@ pub fn classify(event: &Event) -> InputAction {
             code: KeyCode::Char('c'),
             modifiers,
             ..
-        }) if modifiers.contains(KeyModifiers::CONTROL) => InputAction::Quit,
+        }) if modifiers.contains(KeyModifiers::CONTROL) => InputAction::Interrupt,
         Event::Key(KeyEvent {
             code: KeyCode::Char('d'),
             modifiers,
@@ -49,12 +52,23 @@ pub fn classify(event: &Event) -> InputAction {
             code: KeyCode::Enter,
             ..
         }) => InputAction::Submit,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageUp,
+            ..
+        }) => InputAction::PageUp,
+        Event::Key(KeyEvent {
+            code: KeyCode::PageDown,
+            ..
+        }) => InputAction::PageDown,
+        Event::Key(KeyEvent {
+            code: KeyCode::End, ..
+        }) => InputAction::Bottom,
         Event::Key(_) => InputAction::Edit,
         _ => InputAction::Ignore,
     }
 }
 
-/// Recall the previous history entry.  `current` is used only on the first
+/// Recall the previous history entry. `current` is used only on the first
 /// recall to preserve the user's draft for the eventual downward navigation.
 pub fn history_previous(
     entries: &[String],
@@ -94,7 +108,7 @@ pub fn history_next(
     }
 }
 
-/// Add a submitted message to bounded history.  Consecutive duplicate
+/// Add a submitted message to bounded history. Consecutive duplicate
 /// submissions are intentionally collapsed.
 pub fn push_history(entries: &mut Vec<String>, value: &str, cap: usize) {
     if entries.last().is_some_and(|last| last == value) {
@@ -116,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_submit_newline_interrupt_quit_and_tools() {
+    fn classifies_submit_newline_interrupt_quit_tools_and_scrolling() {
         assert_eq!(
             classify(&key(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::Submit
@@ -131,11 +145,23 @@ mod tests {
         );
         assert_eq!(
             classify(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            InputAction::Interrupt
+        );
+        assert_eq!(
+            classify(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
             InputAction::Quit
         );
         assert_eq!(
             classify(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
             InputAction::ExpandDetails
+        );
+        assert_eq!(
+            classify(&key(KeyCode::PageUp, KeyModifiers::NONE)),
+            InputAction::PageUp
+        );
+        assert_eq!(
+            classify(&key(KeyCode::End, KeyModifiers::CONTROL)),
+            InputAction::Bottom
         );
         assert_eq!(
             classify(&key(KeyCode::Tab, KeyModifiers::NONE)),

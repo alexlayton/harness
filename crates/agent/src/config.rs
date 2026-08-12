@@ -317,8 +317,8 @@ pub fn build_provider(name: &str) -> Result<Arc<dyn Provider>> {
     })
 }
 
-/// Install file-only tracing when requested.  stdout is intentionally left
-/// untouched because the inline terminal owns it.
+/// Install file-only tracing when requested. stdout is intentionally left
+/// untouched because the fullscreen terminal owns it.
 pub fn init_logging() -> Result<()> {
     let Some(path) = std::env::var_os("HARNESS_LOG") else {
         return Ok(());

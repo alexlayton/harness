@@ -7,9 +7,9 @@ use llm::{
 };
 use session::{
     CompactionPolicy, ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore,
-    StoredMessage, StoredToolCall, export_jsonl, usage_summary,
+    StoredContent, StoredMessage, StoredToolCall, export_jsonl, usage_summary,
 };
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -58,6 +58,9 @@ pub enum AgentEvent {
         title: Option<String>,
         loaded: bool,
     },
+    SessionSnapshot {
+        entries: Vec<SessionSnapshotEntry>,
+    },
     SessionList {
         sessions: Vec<SessionListItem>,
     },
@@ -74,6 +77,26 @@ pub enum AgentEvent {
     CompactionFinished {
         compacted_through: u64,
         summary_bytes: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionSnapshotEntry {
+    User {
+        text: String,
+    },
+    Assistant {
+        markdown: String,
+        reasoning: String,
+    },
+    Tool {
+        name: String,
+        summary: String,
+        arguments: String,
+        ok: bool,
+        duration_ms: u64,
+        output: String,
+        error: Option<String>,
     },
 }
 
@@ -269,6 +292,12 @@ impl Agent {
                     id: session.session.id().to_string(),
                     title: session.session.metadata.title.clone(),
                     loaded: false,
+                },
+            );
+            send(
+                &events,
+                AgentEvent::SessionSnapshot {
+                    entries: snapshot_entries(&session.session),
                 },
             );
             send(&events, usage_event(&session.session.metadata.usage));
@@ -667,6 +696,12 @@ impl Agent {
         );
         send(
             events,
+            AgentEvent::SessionSnapshot {
+                entries: Vec::new(),
+            },
+        );
+        send(
+            events,
             AgentEvent::Notice("Started a new conversation".into()),
         );
     }
@@ -722,6 +757,7 @@ impl Agent {
         let id = session.id().to_string();
         let title = session.metadata.title.clone();
         self.history = session.context_messages();
+        let snapshot = snapshot_entries(&session);
         self.session = Some(crate::agent::AgentSessionState { store, session });
         send(
             events,
@@ -731,6 +767,7 @@ impl Agent {
                 loaded: true,
             },
         );
+        send(events, AgentEvent::SessionSnapshot { entries: snapshot });
         if let Some(state) = self.session.as_ref() {
             send(events, usage_event(&state.session.metadata.usage));
         }
@@ -944,6 +981,130 @@ fn spawn_model_list(
             ),
         }
     });
+}
+
+fn snapshot_entries(session: &Session) -> Vec<SessionSnapshotEntry> {
+    let mut entries = Vec::new();
+    let mut tool_indices = HashMap::<String, usize>::new();
+
+    for record in &session.events {
+        match &record.event {
+            SessionEvent::UserMessage { message } => {
+                let text = message.content.iter().find_map(|content| match content {
+                    StoredContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                });
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    entries.push(SessionSnapshotEntry::User { text });
+                }
+            }
+            SessionEvent::AssistantMessage { message } => {
+                let mut markdown = String::new();
+                let mut reasoning = String::new();
+                for content in &message.content {
+                    match content {
+                        StoredContent::Text { text } => {
+                            if !markdown.is_empty() {
+                                markdown.push('\n');
+                            }
+                            markdown.push_str(text);
+                        }
+                        StoredContent::Reasoning { text } => {
+                            if !reasoning.is_empty() {
+                                reasoning.push('\n');
+                            }
+                            reasoning.push_str(text);
+                        }
+                        StoredContent::ToolCall { .. } | StoredContent::ToolResult { .. } => {}
+                    }
+                }
+                if !markdown.is_empty() || !reasoning.is_empty() {
+                    entries.push(SessionSnapshotEntry::Assistant {
+                        markdown,
+                        reasoning,
+                    });
+                }
+            }
+            SessionEvent::ToolCall { call } => {
+                let index = entries.len();
+                tool_indices.insert(call.id.clone(), index);
+                entries.push(SessionSnapshotEntry::Tool {
+                    name: call.name.clone(),
+                    summary: call_summary(&call.name, &call.arguments),
+                    arguments: format_tool_arguments(&call.arguments),
+                    ok: false,
+                    duration_ms: 0,
+                    output: String::new(),
+                    error: None,
+                });
+            }
+            SessionEvent::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                tool_name,
+            } => {
+                if let Some(index) = tool_indices.get(tool_call_id).copied()
+                    && let Some(SessionSnapshotEntry::Tool {
+                        name,
+                        summary,
+                        ok,
+                        output,
+                        error,
+                        ..
+                    }) = entries.get_mut(index)
+                {
+                    if let Some(tool_name) = tool_name {
+                        *name = tool_name.clone();
+                    }
+                    if summary.is_empty() {
+                        *summary = name.clone();
+                    }
+                    *ok = !is_error;
+                    *output = content.clone();
+                    *error = is_error.then(|| content.clone());
+                } else {
+                    entries.push(SessionSnapshotEntry::Tool {
+                        name: tool_name.clone().unwrap_or_else(|| "tool".into()),
+                        summary: tool_name.clone().unwrap_or_else(|| "tool".into()),
+                        arguments: "{}".into(),
+                        ok: !is_error,
+                        duration_ms: 0,
+                        output: content.clone(),
+                        error: is_error.then(|| content.clone()),
+                    });
+                }
+            }
+            SessionEvent::Reasoning { text } => {
+                if let Some(SessionSnapshotEntry::Assistant { reasoning, .. }) = entries.last_mut()
+                {
+                    if !reasoning.is_empty() {
+                        reasoning.push('\n');
+                    }
+                    reasoning.push_str(text);
+                } else {
+                    entries.push(SessionSnapshotEntry::Assistant {
+                        markdown: String::new(),
+                        reasoning: text.clone(),
+                    });
+                }
+            }
+            SessionEvent::CompactionSummary { summary, .. } => {
+                entries.push(SessionSnapshotEntry::Assistant {
+                    markdown: format!("_Session summary:_\n\n{summary}"),
+                    reasoning: String::new(),
+                });
+            }
+            SessionEvent::ModelChange { .. }
+            | SessionEvent::Usage { .. }
+            | SessionEvent::MetadataChange { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::Error { .. }
+            | SessionEvent::Unknown { .. } => {}
+        }
+    }
+
+    entries
 }
 
 fn content_is_empty(message: &Message) -> bool {

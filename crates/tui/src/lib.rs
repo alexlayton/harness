@@ -1,14 +1,17 @@
-//! A small inline-viewport terminal UI.  The event adapter keeps this crate
-//! independent from the agent crate, avoiding a library dependency cycle.
+//! A retained-mode terminal UI for Harness. The event adapter keeps this
+//! crate independent from the agent crate, avoiding a library dependency cycle.
 
 mod app;
 pub mod attachments;
 pub mod commands;
+mod environment;
 mod input;
 pub mod render;
+mod state;
 
 pub use app::Tui;
-pub use render::{TailTool, ToolRecord};
+pub use render::TailTool;
+pub use state::{ToolRecord, ToolStatus};
 
 /// Messages sent from the terminal UI to the agent. Keeping this protocol in
 /// the serde-free TUI crate avoids a dependency cycle while allowing commands
@@ -17,7 +20,7 @@ pub use render::{TailTool, ToolRecord};
 pub enum InputMessage {
     /// Normal user text for the model.
     Message(String),
-    /// Turn-local Esc interrupt.
+    /// Turn-local interrupt.
     Interrupt,
     /// Start and persist a new conversation without deleting the old one.
     NewConversation,
@@ -47,6 +50,26 @@ pub struct ModelEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionSnapshotEntry {
+    User {
+        text: String,
+    },
+    Assistant {
+        markdown: String,
+        reasoning: String,
+    },
+    Tool {
+        name: String,
+        summary: String,
+        arguments: String,
+        ok: bool,
+        duration_ms: u64,
+        output: String,
+        error: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
     TextDelta(String),
     ReasoningDelta(String),
@@ -62,10 +85,9 @@ pub enum UiEvent {
         summary: String,
         ok: bool,
         duration_ms: u64,
-        /// Tool output is retained for the optional detail view.
+        /// Tool output is retained for optional expansion.
         output: String,
-        /// Full error text.  The compact renderer displays only its first
-        /// line.
+        /// Full error text. The compact renderer displays only a small preview.
         error: Option<String>,
     },
     Retrying {
@@ -74,9 +96,9 @@ pub enum UiEvent {
     },
     TurnFinished,
     Error(String),
-    /// Informational command feedback committed to scrollback.
+    /// Informational command feedback committed to the retained transcript.
     Notice(String),
-    /// Confirmed provider/model labels for the status line.
+    /// Confirmed provider/model labels for the metadata line.
     ModelChanged {
         provider: String,
         model: String,
@@ -90,6 +112,9 @@ pub enum UiEvent {
         id: String,
         title: Option<String>,
         loaded: bool,
+    },
+    SessionSnapshot {
+        entries: Vec<SessionSnapshotEntry>,
     },
     SessionList {
         sessions: Vec<SessionListEntry>,

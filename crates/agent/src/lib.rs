@@ -57,6 +57,40 @@ impl tui::TuiEvent for AgentEvent {
             AgentEvent::SessionChanged { id, title, loaded } => {
                 tui::UiEvent::SessionChanged { id, title, loaded }
             }
+            AgentEvent::SessionSnapshot { entries } => tui::UiEvent::SessionSnapshot {
+                entries: entries
+                    .into_iter()
+                    .map(|entry| match entry {
+                        crate::agent::SessionSnapshotEntry::User { text } => {
+                            tui::SessionSnapshotEntry::User { text }
+                        }
+                        crate::agent::SessionSnapshotEntry::Assistant {
+                            markdown,
+                            reasoning,
+                        } => tui::SessionSnapshotEntry::Assistant {
+                            markdown,
+                            reasoning,
+                        },
+                        crate::agent::SessionSnapshotEntry::Tool {
+                            name,
+                            summary,
+                            arguments,
+                            ok,
+                            duration_ms,
+                            output,
+                            error,
+                        } => tui::SessionSnapshotEntry::Tool {
+                            name,
+                            summary,
+                            arguments,
+                            ok,
+                            duration_ms,
+                            output,
+                            error,
+                        },
+                    })
+                    .collect(),
+            },
             AgentEvent::SessionList { sessions } => tui::UiEvent::SessionList {
                 sessions: sessions
                     .into_iter()
