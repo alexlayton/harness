@@ -71,6 +71,11 @@ impl fmt::Display for ProviderArg {
 pub struct FileConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Opt-in RTK integration: rewrite supported bash commands to their
+    /// token-optimized `rtk` equivalents before execution.  Off unless the
+    /// user explicitly sets `rtk = true`.
+    #[serde(default)]
+    pub rtk: bool,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -80,7 +85,10 @@ pub struct FileConfig {
 // tests and the fields are compared using TOML's value equality semantics.
 impl PartialEq for FileConfig {
     fn eq(&self, other: &Self) -> bool {
-        self.provider == other.provider && self.model == other.model && self.extra == other.extra
+        self.provider == other.provider
+            && self.model == other.model
+            && self.rtk == other.rtk
+            && self.extra == other.extra
     }
 }
 
@@ -205,6 +213,7 @@ pub struct Config {
     pub model: String,
     pub api_key: String,
     pub config_path: PathBuf,
+    pub rtk: bool,
 }
 
 impl Config {
@@ -283,6 +292,7 @@ impl Config {
             model,
             api_key,
             config_path: path,
+            rtk: file.rtk,
         })
     }
 }
@@ -328,11 +338,22 @@ mod tests {
 
     #[test]
     fn resolves_defaults_and_overrides() {
+        // Resolve against an explicit file config so the developer's real
+        // ~/.config/harness/config.toml cannot leak into the assertions.
         let cli = Cli {
             provider: None,
             model: None,
         };
-        let config = Config::resolve_with_keys(&cli, Some("secret"), None).unwrap();
+        let config = Config::resolve_from_file(
+            &cli,
+            &FileConfig::default(),
+            PathBuf::from("/tmp/harness-config.toml"),
+            |provider| match provider {
+                ProviderArg::OpencodeGo => Some("secret".into()),
+                ProviderArg::Openrouter => None,
+            },
+        )
+        .unwrap();
         assert_eq!(config.provider, ProviderArg::OpencodeGo);
         assert_eq!(config.model, "gpt-5.6-luna");
 
@@ -340,7 +361,14 @@ mod tests {
             provider: Some(ProviderArg::Openrouter),
             model: Some("anthropic/demo".into()),
         };
-        let config = Config::resolve_with_keys(&cli, None, Some("router-secret")).unwrap();
+        let config = Config::resolve_from_file(
+            &cli,
+            &FileConfig::default(),
+            PathBuf::from("/tmp/harness-config.toml"),
+            |_| Some("router-secret".into()),
+        )
+        .unwrap();
+        assert_eq!(config.provider, ProviderArg::Openrouter);
         assert_eq!(config.model, "anthropic/demo");
     }
 
@@ -437,6 +465,7 @@ mod tests {
         let original = FileConfig {
             provider: Some("opencode-go".into()),
             model: Some("demo".into()),
+            rtk: true,
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),
@@ -448,10 +477,50 @@ mod tests {
         let saved = load_file_config(&path).unwrap();
         assert_eq!(saved.provider.as_deref(), Some("openrouter"));
         assert_eq!(saved.model.as_deref(), Some("router/demo"));
+        assert!(saved.rtk);
         assert_eq!(
             saved.extra.get("future"),
             Some(&toml::Value::String("kept".into()))
         );
+    }
+
+    #[test]
+    fn rtk_defaults_off_and_requires_explicit_opt_in() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        assert!(!load_file_config(&path).unwrap().rtk);
+
+        fs::write(&path, "rtk = true\n").unwrap();
+        assert!(load_file_config(&path).unwrap().rtk);
+    }
+
+    #[test]
+    fn rtk_flag_flows_from_file_into_resolved_config() {
+        let cli = Cli {
+            provider: None,
+            model: None,
+        };
+        let file = FileConfig {
+            rtk: true,
+            ..FileConfig::default()
+        };
+        let config = Config::resolve_from_file(
+            &cli,
+            &file,
+            PathBuf::from("/tmp/harness-config.toml"),
+            |_| Some("secret".into()),
+        )
+        .unwrap();
+        assert!(config.rtk);
+
+        let config = Config::resolve_from_file(
+            &cli,
+            &FileConfig::default(),
+            PathBuf::from("/tmp/harness-config.toml"),
+            |_| Some("secret".into()),
+        )
+        .unwrap();
+        assert!(!config.rtk);
     }
 
     #[test]

@@ -50,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
 
     let agent = Agent::new(
         provider,
-        default_registry(),
+        default_registry(config.rtk),
         config.model.clone(),
         cancel.clone(),
     );

@@ -57,6 +57,6 @@ impl ToolRegistry {
 
 impl Default for ToolRegistry {
     fn default() -> Self {
-        super::default_registry()
+        super::default_registry(false)
     }
 }

@@ -8,11 +8,19 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
-pub struct BashTool;
+pub struct BashTool {
+    rtk: bool,
+}
 
 impl BashTool {
     pub fn new() -> Self {
-        Self
+        Self { rtk: false }
+    }
+
+    /// A tool that rewrites supported commands to their token-optimized `rtk`
+    /// equivalents before execution (see [`rtk_rewrite`]).
+    pub fn with_rtk(rtk: bool) -> Self {
+        Self { rtk }
     }
 }
 
@@ -24,6 +32,35 @@ impl Default for BashTool {
 
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
+const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
+/// signals support by printing the rewritten command on stdout; unsupported
+/// commands, a missing rtk binary, and timeouts all degrade to `None`, in
+/// which case the caller runs the original command unchanged.  The exit code
+/// is deliberately ignored: rtk documents 0 for a successful rewrite but
+/// 0.45.0 exits 3, so non-empty stdout is the only reliable signal.
+async fn rtk_rewrite(command: &str) -> Option<String> {
+    let output = tokio::time::timeout(
+        RTK_REWRITE_TIMEOUT,
+        Command::new("rtk")
+            .arg("rewrite")
+            .arg(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if rewritten.is_empty() {
+        None
+    } else {
+        Some(rewritten)
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -59,6 +96,15 @@ impl Tool for BashTool {
             return error(&format!("bash: {}", first_line(&command)), "cancelled");
         }
 
+        // With rtk enabled, supported commands run through their compact rtk
+        // equivalent; anything else runs verbatim.  The summary keeps naming
+        // the original command the model asked for.
+        let run_command = if self.rtk {
+            rtk_rewrite(&command).await.unwrap_or_else(|| command.clone())
+        } else {
+            command.clone()
+        };
+
         let cwd = match std::env::current_dir() {
             Ok(cwd) => cwd,
             Err(io_error) => {
@@ -70,7 +116,7 @@ impl Tool for BashTool {
         };
         let mut child = match Command::new("sh")
             .arg("-c")
-            .arg(&command)
+            .arg(&run_command)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -229,7 +275,7 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stderr_and_exit_code() {
-        let output = BashTool
+        let output = BashTool::new()
             .execute(
                 json!({"command":"printf out; printf err >&2; exit 3"}),
                 CancellationToken::new(),
@@ -243,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_command() {
-        let output = BashTool
+        let output = BashTool::new()
             .execute(
                 json!({"command":"sleep 2", "timeout": 1}),
                 CancellationToken::new(),
@@ -260,5 +306,82 @@ mod tests {
         assert!(output.starts_with("[truncated:"));
         assert!(output.contains("2099"));
         assert!(!output.contains("\n0\n"));
+    }
+
+    /// rtk is an optional external binary; tests that need it skip silently
+    /// when it is not installed.
+    async fn rtk_available() -> bool {
+        Command::new("rtk")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn rtk_rewrite_rewrites_supported_commands_only() {
+        if !rtk_available().await {
+            return;
+        }
+        assert_eq!(
+            rtk_rewrite("git status").await.as_deref(),
+            Some("rtk git status")
+        );
+        assert_eq!(rtk_rewrite("echo hi").await, None);
+    }
+
+    /// The end-to-end rewrite test runs `git status` in the crate directory,
+    /// so it also needs to be inside a git work tree.
+    async fn git_work_tree_available() -> bool {
+        Command::new("git")
+            .arg("status")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn rtk_enabled_tool_executes_rewritten_command() {
+        if !rtk_available().await || !git_work_tree_available().await {
+            return;
+        }
+        let output = BashTool::with_rtk(true)
+            .execute(json!({"command": "git status"}), CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        // `rtk git status` prints a compact `* <branch>` header instead of
+        // git's "On branch", proving the rewrite path ran.
+        assert!(output.content.starts_with("* "), "{}", output.content);
+        // The summary still names the command the model asked for.
+        assert_eq!(output.summary, "bash: git status");
+    }
+
+    #[tokio::test]
+    async fn rtk_enabled_tool_falls_back_for_unsupported_commands() {
+        if !rtk_available().await {
+            return;
+        }
+        let output = BashTool::with_rtk(true)
+            .execute(json!({"command": "echo hi"}), CancellationToken::new())
+            .await;
+        assert!(!output.is_error);
+        assert_eq!(output.content.trim(), "hi");
+    }
+
+    #[tokio::test]
+    async fn rtk_disabled_tool_runs_command_verbatim() {
+        let output = BashTool::new()
+            .execute(json!({"command": "echo hi"}), CancellationToken::new())
+            .await;
+        assert!(!output.is_error);
+        assert_eq!(output.content.trim(), "hi");
     }
 }

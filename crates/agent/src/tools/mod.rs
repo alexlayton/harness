@@ -27,11 +27,11 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput;
 }
 
-pub fn default_registry() -> ToolRegistry {
+pub fn default_registry(rtk: bool) -> ToolRegistry {
     ToolRegistry::new(vec![
         Box::new(ReadTool),
         Box::new(WriteTool),
-        Box::new(BashTool),
+        Box::new(BashTool::with_rtk(rtk)),
     ])
 }
 
