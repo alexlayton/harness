@@ -1,5 +1,5 @@
 use crate::config::{build_provider, save_settings};
-use crate::prompt::current_system_prompt;
+use crate::prompt::system_prompt_with_tools;
 use crate::tools::{ToolRegistry, call_summary};
 use futures_util::StreamExt;
 use llm::{
@@ -339,7 +339,10 @@ impl Agent {
             while !end_turn {
                 let request = CompletionRequest {
                     model: self.model.clone(),
-                    system: Some(current_system_prompt()),
+                    system: Some(system_prompt_with_tools(
+                        &self.tools.workspace_root().display().to_string(),
+                        &self.tools.prompt_context(),
+                    )),
                     messages: self.history.clone(),
                     tools: self.tools.definitions(),
                     max_tokens: None,

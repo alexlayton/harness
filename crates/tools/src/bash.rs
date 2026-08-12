@@ -1,7 +1,8 @@
-use super::{Tool, ToolOutput};
+use super::{Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -10,17 +11,38 @@ use tokio_util::sync::CancellationToken;
 
 pub struct BashTool {
     rtk: bool,
+    cwd: PathBuf,
 }
 
 impl BashTool {
     pub fn new() -> Self {
-        Self { rtk: false }
+        Self {
+            rtk: false,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
     }
 
     /// A tool that rewrites supported commands to their token-optimized `rtk`
     /// equivalents before execution (see [`rtk_rewrite`]).
     pub fn with_rtk(rtk: bool) -> Self {
-        Self { rtk }
+        Self {
+            rtk,
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        }
+    }
+
+    pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            rtk: false,
+            cwd: normalize_workspace_root(root),
+        }
+    }
+
+    pub fn with_rtk_and_workspace_root(rtk: bool, root: impl Into<PathBuf>) -> Self {
+        Self {
+            rtk,
+            cwd: normalize_workspace_root(root),
+        }
     }
 }
 
@@ -64,8 +86,9 @@ async fn rtk_rewrite(command: &str) -> Option<String> {
 
 #[async_trait]
 impl Tool for BashTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            definition: ToolDefinition {
             name: "bash".into(),
             description: "Run a shell command in the working directory.".into(),
             parameters: json!({
@@ -77,6 +100,11 @@ impl Tool for BashTool {
                 "required": ["command"],
                 "additionalProperties": false
             }),
+            },
+            prompt: ToolPrompt::new(
+                "Execute commands and project operations",
+                ["Use bash for tests, builds, git, and operations not covered by a dedicated tool.".to_owned()],
+            ),
         }
     }
 
@@ -107,15 +135,7 @@ impl Tool for BashTool {
             command.clone()
         };
 
-        let cwd = match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(io_error) => {
-                return error(
-                    "bash",
-                    &format!("cannot determine working directory: {io_error}"),
-                );
-            }
-        };
+        let cwd = self.cwd.clone();
         let mut child = match Command::new("sh")
             .arg("-c")
             .arg(&run_command)

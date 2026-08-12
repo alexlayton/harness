@@ -10,21 +10,20 @@ path = "src/main.rs"
 [dependencies]
 tui = { path = "../tui" }
 anyhow = "1"
-async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 llm = { path = "../llm" }
 session = { path = "../session" }
+tools = { path = "../tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 dirs = "6"
-diff = "0.1"
-unicode-normalization = "0.1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 tempfile = "3"

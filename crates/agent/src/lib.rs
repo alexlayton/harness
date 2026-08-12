@@ -1,7 +1,7 @@
 pub mod agent;
 pub mod config;
 pub mod prompt;
-pub mod tools;
+pub use tools;
 
 pub use agent::{Agent, AgentEvent};
 

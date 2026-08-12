@@ -1,5 +1,7 @@
 use super::file_mutation::{atomic_write, with_file_mutation_lock};
-use super::{Tool, ToolOutput};
+use super::{
+    Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
+};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
@@ -47,11 +49,23 @@ struct DiffSummary {
     removed_lines: usize,
 }
 
-pub struct EditTool;
+pub struct EditTool {
+    workspace_root: Option<PathBuf>,
+}
 
 impl EditTool {
+    /// Compatibility constructor retaining the historical process-cwd and
+    /// absolute-path behavior.
     pub fn new() -> Self {
-        Self
+        Self {
+            workspace_root: None,
+        }
+    }
+
+    pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: Some(normalize_workspace_root(root)),
+        }
     }
 }
 
@@ -63,8 +77,9 @@ impl Default for EditTool {
 
 #[async_trait]
 impl Tool for EditTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            definition: ToolDefinition {
             name: "edit".into(),
             description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".into(),
             parameters: json!({
@@ -98,6 +113,11 @@ impl Tool for EditTool {
                 "required": ["path", "edits"],
                 "additionalProperties": false
             }),
+            },
+            prompt: ToolPrompt::new(
+                "Make precise file edits with exact text replacement",
+                ["Use edit for targeted changes; match oldText against the original file.".to_owned()],
+            ),
         }
     }
 
@@ -111,7 +131,11 @@ impl Tool for EditTool {
             return error(&summary, "cancelled");
         }
 
-        let requested_path = resolve_path(&path);
+        let requested_path =
+            match resolve_workspace_path(&path, self.workspace_root.as_deref(), true).await {
+                Ok(path) => path,
+                Err(message) => return error(&summary, &format!("cannot edit {path}: {message}")),
+            };
         let target_path = match fs::canonicalize(&requested_path).await {
             Ok(path) => path,
             Err(io_error) => {
@@ -785,17 +809,6 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> String {
     format!("{}…", &value[..end])
 }
 
-fn resolve_path(path: &str) -> PathBuf {
-    let path = PathBuf::from(path.strip_prefix('@').unwrap_or(path));
-    if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
-}
-
 fn error(summary: &str, content: &str) -> ToolOutput {
     ToolOutput {
         content: content.to_owned(),
@@ -825,7 +838,7 @@ mod tests {
         let path = directory.path().join("main.rs");
         fs::write(&path, "fn main() {\n    println!(\"old\");\n}\n").unwrap();
 
-        let output = EditTool
+        let output = EditTool::new()
             .execute(
                 json!({
                     "path": path,
@@ -862,7 +875,7 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
 
-        let output = EditTool
+        let output = EditTool::new()
             .execute(
                 json!({
                     "path": path,
@@ -905,7 +918,7 @@ mod tests {
         ];
 
         for (edits, expected) in cases {
-            let output = EditTool
+            let output = EditTool::new()
                 .execute(
                     json!({"path": path, "edits": edits}),
                     CancellationToken::new(),
@@ -923,7 +936,7 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "\u{feff}first\r\nsecond\r\n").unwrap();
 
-        let output = EditTool
+        let output = EditTool::new()
             .execute(
                 json!({
                     "path": path,
@@ -945,7 +958,7 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "before").unwrap();
 
-        let output = EditTool
+        let output = EditTool::new()
             .execute(
                 json!({"path": path, "oldText":"before", "newText":"after"}),
                 CancellationToken::new(),

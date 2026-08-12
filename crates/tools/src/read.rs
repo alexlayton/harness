@@ -1,4 +1,6 @@
-use super::{Tool, ToolOutput};
+use super::{
+    Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
+};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
@@ -6,11 +8,23 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
-pub struct ReadTool;
+pub struct ReadTool {
+    workspace_root: Option<PathBuf>,
+}
 
 impl ReadTool {
+    /// Compatibility constructor: relative paths use the process cwd and
+    /// absolute paths retain the historical behavior.
     pub fn new() -> Self {
-        Self
+        Self {
+            workspace_root: None,
+        }
+    }
+
+    pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: Some(normalize_workspace_root(root)),
+        }
     }
 }
 
@@ -25,20 +39,26 @@ const MAX_BYTES: usize = 50 * 1024;
 
 #[async_trait]
 impl Tool for ReadTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "read".into(),
-            description: "Read a text file, optionally selecting a range of lines.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path relative to the working directory" },
-                    "offset": { "type": "integer", "minimum": 1, "description": "First 1-indexed line" },
-                    "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines" }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            definition: ToolDefinition {
+                name: "read".into(),
+                description: "Read a text file, optionally selecting a range of lines.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path relative to the working directory" },
+                        "offset": { "type": "integer", "minimum": 1, "description": "First 1-indexed line" },
+                        "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            },
+            prompt: ToolPrompt::new(
+                "Read file contents, optionally selecting a range of lines",
+                ["Use read to examine file contents instead of cat or sed.".to_owned()],
+            ),
         }
     }
 
@@ -59,7 +79,16 @@ impl Tool for ReadTool {
             return error(&format!("read {path}"), "cancelled");
         }
 
-        let full_path = resolve_path(&path);
+        let full_path =
+            match resolve_workspace_path(&path, self.workspace_root.as_deref(), false).await {
+                Ok(path) => path,
+                Err(message) => {
+                    return error(
+                        &format!("read {path}"),
+                        &format!("cannot read {path}: {message}"),
+                    );
+                }
+            };
         let metadata = match fs::metadata(&full_path).await {
             Ok(metadata) => metadata,
             Err(io_error) => {
@@ -149,17 +178,6 @@ fn optional_positive(args: &Value, name: &str) -> Result<Option<usize>, String> 
     Ok(Some(number as usize))
 }
 
-fn resolve_path(path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
-}
-
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
@@ -192,7 +210,7 @@ mod tests {
         std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
         let old = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
-        let output = ReadTool
+        let output = ReadTool::new()
             .execute(
                 json!({"path":"file.txt", "offset":2, "limit":2}),
                 CancellationToken::new(),
@@ -209,7 +227,7 @@ mod tests {
         let path = dir.path().join("binary");
         let mut file = std::fs::File::create(path).unwrap();
         file.write_all(b"ok\0no").unwrap();
-        let output = ReadTool
+        let output = ReadTool::new()
             .execute(
                 json!({"path": dir.path().join("binary")}),
                 CancellationToken::new(),

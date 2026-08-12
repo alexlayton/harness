@@ -1,5 +1,7 @@
 use super::file_mutation::with_file_mutation_lock;
-use super::{Tool, ToolOutput};
+use super::{
+    Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
+};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
@@ -7,11 +9,23 @@ use std::path::PathBuf;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
-pub struct WriteTool;
+pub struct WriteTool {
+    workspace_root: Option<PathBuf>,
+}
 
 impl WriteTool {
+    /// Compatibility constructor retaining the historical process-cwd and
+    /// absolute-path behavior.
     pub fn new() -> Self {
-        Self
+        Self {
+            workspace_root: None,
+        }
+    }
+
+    pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_root: Some(normalize_workspace_root(root)),
+        }
     }
 }
 
@@ -23,19 +37,25 @@ impl Default for WriteTool {
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "write".into(),
-            description: "Create or fully overwrite a text file.".into(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Path relative to the working directory" },
-                    "content": { "type": "string", "description": "Complete file contents" }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            definition: ToolDefinition {
+                name: "write".into(),
+                description: "Create or fully overwrite a text file.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Path relative to the working directory" },
+                        "content": { "type": "string", "description": "Complete file contents" }
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }),
+            },
+            prompt: ToolPrompt::new(
+                "Create or overwrite files with complete contents",
+                ["Use write only for new files or complete rewrites.".to_owned()],
+            ),
         }
     }
 
@@ -54,7 +74,16 @@ impl Tool for WriteTool {
             return error(&format!("write {path}"), "cancelled");
         }
 
-        let full_path = resolve_path(&path);
+        let full_path =
+            match resolve_workspace_path(&path, self.workspace_root.as_deref(), false).await {
+                Ok(path) => path,
+                Err(message) => {
+                    return error(
+                        &format!("write {path}"),
+                        &format!("cannot write {path}: {message}"),
+                    );
+                }
+            };
         let summary = format!("write {path}");
         let Some(result) = with_file_mutation_lock(&full_path, &cancel, || async {
             if let Some(parent) = full_path.parent()
@@ -81,17 +110,6 @@ impl Tool for WriteTool {
     }
 }
 
-fn resolve_path(path: &str) -> PathBuf {
-    let path = PathBuf::from(path);
-    if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
-}
-
 fn error(summary: &str, content: &str) -> ToolOutput {
     ToolOutput {
         content: content.to_owned(),
@@ -109,7 +127,7 @@ mod tests {
     async fn creates_parents_and_overwrites() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a/b/file.txt");
-        let output = WriteTool
+        let output = WriteTool::new()
             .execute(
                 json!({"path": path, "content":"first"}),
                 CancellationToken::new(),
@@ -117,7 +135,7 @@ mod tests {
             .await;
         assert!(!output.is_error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
-        WriteTool
+        WriteTool::new()
             .execute(
                 json!({"path": path, "content":"second"}),
                 CancellationToken::new(),
