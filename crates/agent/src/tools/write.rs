@@ -1,3 +1,4 @@
+use super::file_mutation::with_file_mutation_lock;
 use super::{Tool, ToolOutput};
 use async_trait::async_trait;
 use llm::ToolDefinition;
@@ -54,24 +55,28 @@ impl Tool for WriteTool {
         }
 
         let full_path = resolve_path(&path);
-        if let Some(parent) = full_path.parent()
-            && let Err(io_error) = fs::create_dir_all(parent).await
-        {
-            return error(
-                &format!("write {path}"),
-                &format!("cannot create parent directory: {io_error}"),
-            );
-        }
-        if let Err(io_error) = fs::write(&full_path, content.as_bytes()).await {
-            return error(
-                &format!("write {path}"),
-                &format!("cannot write {path}: {io_error}"),
-            );
+        let summary = format!("write {path}");
+        let Some(result) = with_file_mutation_lock(&full_path, &cancel, || async {
+            if let Some(parent) = full_path.parent()
+                && let Err(io_error) = fs::create_dir_all(parent).await
+            {
+                return Err(format!("cannot create parent directory: {io_error}"));
+            }
+            fs::write(&full_path, content.as_bytes())
+                .await
+                .map_err(|io_error| format!("cannot write {path}: {io_error}"))
+        })
+        .await
+        else {
+            return error(&summary, "cancelled");
+        };
+        if let Err(message) = result {
+            return error(&summary, &message);
         }
         ToolOutput {
             content: format!("wrote {} bytes to {path}", content.len()),
             is_error: false,
-            summary: format!("write {path}"),
+            summary,
         }
     }
 }

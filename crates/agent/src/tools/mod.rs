@@ -1,9 +1,12 @@
 mod bash;
+mod edit;
+mod file_mutation;
 mod read;
 mod registry;
 mod write;
 
 pub use bash::{BashTool, truncate_command_output};
+pub use edit::EditTool;
 pub use read::ReadTool;
 pub use registry::ToolRegistry;
 pub use write::WriteTool;
@@ -30,6 +33,7 @@ pub trait Tool: Send + Sync {
 pub fn default_registry(rtk: bool) -> ToolRegistry {
     ToolRegistry::new(vec![
         Box::new(ReadTool),
+        Box::new(EditTool),
         Box::new(WriteTool),
         Box::new(BashTool::with_rtk(rtk)),
     ])
@@ -45,6 +49,11 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             .and_then(Value::as_str)
             .map(|path| format!("read {path}"))
             .unwrap_or_else(|| "read".into()),
+        "edit" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("edit {path}"))
+            .unwrap_or_else(|| "edit".into()),
         "write" => args
             .get("path")
             .and_then(Value::as_str)
