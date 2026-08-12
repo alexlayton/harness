@@ -34,21 +34,24 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            background: Color::Rgb(16, 17, 20),
-            primary_text: Color::Rgb(232, 235, 241),
-            assistant_text: Color::Rgb(190, 197, 210),
-            secondary_text: Color::Rgb(164, 173, 188),
-            muted_text: Color::Rgb(128, 136, 151),
-            dim_text: Color::Rgb(100, 107, 120),
-            accent: Color::Rgb(126, 164, 218),
-            code_background: Color::Rgb(29, 32, 39),
-            tool_background: Color::Rgb(29, 31, 37),
-            tool_running_border: Color::Rgb(92, 99, 113),
-            tool_success_border: Color::Rgb(91, 164, 112),
-            tool_failure_border: Color::Rgb(193, 91, 91),
-            selection: Color::Rgb(54, 64, 82),
-            focus: Color::Rgb(111, 168, 220),
-            error: Color::Rgb(220, 104, 104),
+            // Use the terminal's default colours for most backgrounds/text so
+            // the UI respects the user's terminal theme instead of imposing a
+            // dark background everywhere.
+            background: Color::Reset,
+            primary_text: Color::Reset,
+            assistant_text: Color::Reset,
+            secondary_text: Color::Reset,
+            muted_text: Color::DarkGray,
+            dim_text: Color::DarkGray,
+            accent: Color::Cyan,
+            code_background: Color::Reset,
+            tool_background: Color::Reset,
+            tool_running_border: Color::DarkGray,
+            tool_success_border: Color::Green,
+            tool_failure_border: Color::Red,
+            selection: Color::Blue,
+            focus: Color::Blue,
+            error: Color::Red,
         }
     }
 }
@@ -445,26 +448,22 @@ fn tool_border_style(record: &ToolRecord, theme: Theme) -> Style {
         ToolStatus::Success => theme.tool_success_border,
         ToolStatus::Failure => theme.tool_failure_border,
     };
-    Style::default().fg(color).bg(theme.tool_background)
+    Style::default().fg(color)
 }
 
 fn tool_text_style(theme: Theme) -> Style {
-    Style::default()
-        .fg(theme.secondary_text)
-        .bg(theme.tool_background)
+    Style::default().fg(theme.secondary_text)
 }
 
 fn tool_header_style(theme: Theme) -> Style {
     Style::default()
         .fg(theme.primary_text)
-        .bg(theme.tool_background)
         .add_modifier(Modifier::BOLD)
 }
 
 fn tool_hint_style(theme: Theme) -> Style {
     Style::default()
         .fg(theme.dim_text)
-        .bg(theme.tool_background)
         .add_modifier(Modifier::DIM)
 }
 
@@ -761,10 +760,7 @@ pub fn render_transcript_lines(
         Block::default().style(Style::default().bg(theme.background)),
         area,
     );
-    frame.render_widget(
-        Paragraph::new(Text::from(visible)).style(Style::default().bg(theme.background)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Text::from(visible)), area);
 }
 
 pub fn render_transcript(
@@ -811,7 +807,6 @@ pub fn input_block(theme: Theme, focused: bool) -> Block<'static> {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
-        .style(Style::default().bg(theme.background))
         .padding(Padding::horizontal(1))
 }
 
@@ -966,10 +961,7 @@ pub fn render_prompt(
         .take(inner.height as usize)
         .cloned()
         .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(Text::from(visible)).style(Style::default().bg(theme.background)),
-        inner,
-    );
+    frame.render_widget(Paragraph::new(Text::from(visible)), inner);
     layout
 }
 
@@ -1002,20 +994,14 @@ pub fn render_completion(
     let mut lines = Vec::new();
     for (index, candidate) in visible {
         let selected = index == selected;
-        let background = if selected {
-            theme.selection
-        } else {
-            theme.tool_background
-        };
         let value_style = Style::default()
-            .fg(theme.primary_text)
-            .bg(background)
+            .fg(if selected { theme.focus } else { theme.primary_text })
             .add_modifier(if selected {
                 Modifier::BOLD
             } else {
                 Modifier::empty()
             });
-        let description_style = Style::default().fg(theme.muted_text).bg(background);
+        let description_style = Style::default().fg(theme.muted_text);
         let padding =
             value_width.saturating_sub(UnicodeWidthStr::width(candidate.value.as_str())) + 2;
         let used = value_width + padding + UnicodeWidthStr::width(candidate.description.as_str());
@@ -1027,15 +1013,12 @@ pub fn render_completion(
         if used < area.width as usize {
             spans.push(Span::styled(
                 " ".repeat(area.width as usize - used),
-                Style::default().bg(background),
+                Style::default(),
             ));
         }
         lines.push(Line::from(spans));
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(lines)).style(Style::default().bg(theme.tool_background)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 #[cfg(test)]

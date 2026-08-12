@@ -17,7 +17,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::Paragraph;
 use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
@@ -1283,11 +1283,6 @@ impl Tui {
         let new_content = self.scroll.new_content_below;
 
         self.terminal.draw(|frame| {
-            let full = frame.area();
-            frame.render_widget(
-                Block::default().style(Style::default().bg(theme.background)),
-                full,
-            );
             let constraints = vec![
                 Constraint::Length(transcript_rows),
                 Constraint::Length(indicator_rows),
@@ -1386,6 +1381,15 @@ fn render_metadata(
             .style(style),
         layout[2],
     );
+    // Fill any remaining middle space with the default background so the
+    // metadata line does not inherit leftover characters from the terminal.
+    let middle_width = layout[1].width as usize;
+    if middle_width > 0 {
+        frame.render_widget(
+            Paragraph::new(" ".repeat(middle_width)).style(style),
+            layout[1],
+        );
+    }
 }
 
 fn truncate_display(value: &str, width: usize) -> String {
