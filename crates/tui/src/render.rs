@@ -23,6 +23,8 @@ pub const THINKING_BG: Color = Color::Rgb(30, 28, 38);
 /// Background of the completion popup; the selected row is brighter.
 pub const COMPLETION_BG: Color = Color::Rgb(28, 29, 34);
 pub const COMPLETION_SELECTED_BG: Color = Color::Rgb(58, 60, 74);
+/// Shared number of completion rows visible below the editor.
+pub const MAX_COMPLETION_ROWS: usize = 8;
 
 /// The key descriptions are deliberately kept in one place so the welcome
 /// header doubles as the keybinding reference.
@@ -34,6 +36,7 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("Esc", "Interrupt"),
     ("Ctrl+O", "Expand / collapse tool"),
     ("/", "Commands"),
+    ("@", "File references"),
     ("Ctrl+C", "Quit"),
 ];
 
@@ -591,7 +594,7 @@ pub fn render_completion(
         .iter()
         .enumerate()
         .skip(offset)
-        .take(area.height as usize)
+        .take((area.height as usize).min(MAX_COMPLETION_ROWS))
         .collect::<Vec<_>>();
     if visible.is_empty() {
         return;

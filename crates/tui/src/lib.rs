@@ -2,6 +2,7 @@
 //! independent from the agent crate, avoiding a library dependency cycle.
 
 mod app;
+pub mod attachments;
 pub mod commands;
 mod input;
 pub mod render;

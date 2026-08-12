@@ -27,10 +27,18 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateKind {
+    Slash,
+    File,
+    Directory,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     pub value: String,
     pub description: String,
+    pub kind: CandidateKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +123,7 @@ pub fn candidates(
             .map(|command| Candidate {
                 value: command.name.to_owned(),
                 description: command.description.to_owned(),
+                kind: CandidateKind::Slash,
             })
             .collect();
     };
@@ -164,6 +173,7 @@ pub fn candidates(
                         Candidate {
                             value,
                             description: "provider".into(),
+                            kind: CandidateKind::Slash,
                         },
                     ));
                 }
@@ -193,6 +203,7 @@ pub fn candidates(
                     Candidate {
                         value,
                         description: model_description(model),
+                        kind: CandidateKind::Slash,
                     },
                 ));
             }

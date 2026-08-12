@@ -100,7 +100,9 @@ impl Tool for BashTool {
         // equivalent; anything else runs verbatim.  The summary keeps naming
         // the original command the model asked for.
         let run_command = if self.rtk {
-            rtk_rewrite(&command).await.unwrap_or_else(|| command.clone())
+            rtk_rewrite(&command)
+                .await
+                .unwrap_or_else(|| command.clone())
         } else {
             command.clone()
         };
