@@ -1,10 +1,11 @@
 use crate::commands::Candidate;
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph, Widget, Wrap};
 use textwrap::wrap;
 
 /// The amount of whitespace used before a new conversation section.
@@ -13,15 +14,25 @@ pub const SECTION_GAP: usize = 2;
 /// reasoning.
 pub const BLOCK_GAP: usize = 1;
 
-/// The key descriptions are deliberately kept in one place.  The welcome
-/// header is rendered from this table and the same table is mirrored in the
-/// README's keys section.
+/// Subtle background grouping everything that belongs to a tool call.
+pub const TOOL_BG: Color = Color::Rgb(34, 35, 41);
+/// Brighter variant marking the keyboard-focused tool call.
+pub const TOOL_FOCUSED_BG: Color = Color::Rgb(46, 48, 58);
+/// Faint violet background grouping model reasoning separately from tools.
+pub const THINKING_BG: Color = Color::Rgb(30, 28, 38);
+/// Background of the completion popup; the selected row is brighter.
+pub const COMPLETION_BG: Color = Color::Rgb(28, 29, 34);
+pub const COMPLETION_SELECTED_BG: Color = Color::Rgb(58, 60, 74);
+
+/// The key descriptions are deliberately kept in one place so the welcome
+/// header doubles as the keybinding reference.
 pub const KEYMAP: &[(&str, &str)] = &[
     ("Enter", "Send message"),
     ("Shift+Enter", "Newline"),
     ("↑ / ↓", "History"),
+    ("Tab", "Focus tool calls"),
     ("Esc", "Interrupt"),
-    ("Ctrl+O", "Expand tool call"),
+    ("Ctrl+O", "Expand / collapse tool"),
     ("/", "Commands"),
     ("Ctrl+C", "Quit"),
 ];
@@ -59,13 +70,6 @@ pub fn split_stable_prefix(input: &str) -> (String, String) {
     (input[..split].to_owned(), input[split..].to_owned())
 }
 
-pub fn stable_prefix(input: &str) -> Option<(&str, &str)> {
-    input.rfind("\n\n").map(|index| {
-        let split = index + 2;
-        (&input[..split], &input[split..])
-    })
-}
-
 /// Number of terminal rows needed for a plain string at `width` columns.
 pub fn wrap_count(input: &str, width: usize) -> usize {
     let width = width.max(1);
@@ -82,24 +86,24 @@ pub fn wrap_count(input: &str, width: usize) -> usize {
         .max(1)
 }
 
+fn plain_line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>()
+}
+
 /// Number of terminal rows needed for the final styled text block.
 ///
 /// Heights must be calculated from the same `Text` that is passed to
 /// `Paragraph`; counting the source string separately is especially error
-/// prone for labels, indentation, blank lines, and wrapped spans.
+/// prone for prefixes, indentation, blank lines, and wrapped spans.
 pub fn text_height<W: TryInto<usize>>(text: &Text<'_>, width: W) -> u16 {
     let width = width.try_into().ok().unwrap_or(1).max(1);
     let rows = text
         .lines
         .iter()
-        .map(|line| {
-            let plain = line
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            wrap_count(&plain, width)
-        })
+        .map(|line| wrap_count(&plain_line_text(line), width))
         .sum::<usize>()
         .max(1);
     rows.min(u16::MAX as usize) as u16
@@ -107,6 +111,15 @@ pub fn text_height<W: TryInto<usize>>(text: &Text<'_>, width: W) -> u16 {
 
 fn label_style() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn user_text_style() -> Style {
+    Style::default().fg(Color::White)
+}
+
+/// Base foreground color for assistant output.
+fn model_text_style() -> Style {
+    Style::default().fg(Color::Rgb(170, 178, 192))
 }
 
 fn dim_style() -> Style {
@@ -121,6 +134,37 @@ fn reasoning_style() -> Style {
 
 fn error_style() -> Style {
     Style::default().fg(Color::Red)
+}
+
+/// Base style of a tool block; applied to the whole render area so the
+/// background band spans the full terminal width.
+pub fn tool_bg_style() -> Style {
+    Style::default().bg(TOOL_BG)
+}
+
+/// The bordered box around the message editor.
+pub fn input_block() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .padding(Padding::horizontal(1))
+}
+
+fn tool_name_style() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn tool_summary_style() -> Style {
+    Style::default().fg(Color::Gray)
+}
+
+fn tool_section_style() -> Style {
+    Style::default()
+        .fg(Color::Gray)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn blank_line() -> Line<'static> {
@@ -158,23 +202,13 @@ pub fn build_header(_width: u16) -> Text<'static> {
     text(lines)
 }
 
-/// Build a user message with a bold role label and regular message text.
+/// Build a user message with a white foreground.
 pub fn build_user(input: &str) -> Text<'static> {
     let mut lines = Vec::new();
     push_blank_lines(&mut lines, SECTION_GAP);
-    lines.push(plain_line("User", label_style()));
     for line in input.split('\n') {
-        lines.push(plain_line(line.to_owned(), Style::default()));
+        lines.push(plain_line(line.to_owned(), user_text_style()));
     }
-    text(lines)
-}
-
-/// Build the role label for an assistant/model segment.  The label is kept
-/// separate from markdown so it can be committed exactly once per segment.
-pub fn build_model_label() -> Text<'static> {
-    let mut lines = Vec::new();
-    push_blank_lines(&mut lines, SECTION_GAP);
-    lines.push(plain_line("Model", label_style()));
     text(lines)
 }
 
@@ -183,23 +217,19 @@ fn reasoning_lines(reasoning: &str) -> Vec<Line<'static>> {
         .split('\n')
         .enumerate()
         .map(|(index, line)| {
-            let prefix = if index == 0 { "thinking · " } else { "  " };
+            let prefix = if index == 0 { "" } else { "  " };
             plain_line(format!("{prefix}{line}"), reasoning_style())
         })
         .collect()
 }
 
-/// Build a subdued reasoning block.  Reasoning is intentionally separated
-/// from primary model text by one blank line on either side.
+/// Build the body of a subdued reasoning block.  Spacing and the background
+/// band are added by the insertion/live-area paths so they stay consistent.
 pub fn build_reasoning(reasoning: &str) -> Text<'static> {
     if reasoning.is_empty() {
         return Text::default();
     }
-    let mut lines = Vec::new();
-    push_blank_lines(&mut lines, BLOCK_GAP);
-    lines.extend(reasoning_lines(reasoning));
-    push_blank_lines(&mut lines, BLOCK_GAP);
-    text(lines)
+    text(reasoning_lines(reasoning))
 }
 
 fn duration_text(duration_ms: u64) -> String {
@@ -210,6 +240,26 @@ fn duration_text(duration_ms: u64) -> String {
     }
 }
 
+/// Drop a redundant `<name>:` / `<name> ` prefix so a compact line reads
+/// "● bash · cargo test" rather than "● bash · bash: cargo test".
+fn summary_tail<'a>(name: &str, summary: &'a str) -> &'a str {
+    match summary.strip_prefix(name) {
+        Some(rest) => rest.strip_prefix(':').unwrap_or(rest).trim_start(),
+        None => summary,
+    }
+}
+
+fn status_dot(ok: bool) -> (&'static str, Style) {
+    if ok {
+        ("●", Style::default().fg(Color::Green))
+    } else {
+        ("●", Style::default().fg(Color::Red))
+    }
+}
+
+/// The compact representation of a completed tool call: a single status line,
+/// plus a one-line error preview for failures.  No outer gap lines are
+/// included so the caller can shade the block as a unit.
 fn tool_compact_lines(
     name: &str,
     summary: &str,
@@ -217,50 +267,27 @@ fn tool_compact_lines(
     duration_ms: u64,
     error: Option<&str>,
 ) -> Vec<Line<'static>> {
-    let header_style = if ok { Style::default() } else { error_style() };
-    let marker = if ok { "" } else { "✗ " };
-    let header = format!("{marker}Tool · {name}");
-    vec![
-        Line::from(vec![
-            Span::styled(header, header_style),
-            Span::styled(format!(" ({})", duration_text(duration_ms)), dim_style()),
-        ]),
-        plain_line(format!("  {summary}"), dim_style()),
-    ]
-    .into_iter()
-    .chain(error.filter(|_| !ok).map(|value| {
-        plain_line(
-            format!("  {}", value.lines().next().unwrap_or(value)),
-            dim_style(),
-        )
-    }))
-    .collect()
-}
-
-/// Build the compact representation of a completed tool call.
-pub fn build_tool_finished(
-    name: &str,
-    summary: &str,
-    ok: bool,
-    duration_ms: u64,
-    error: Option<&str>,
-) -> Text<'static> {
-    let mut lines = Vec::new();
-    push_blank_lines(&mut lines, BLOCK_GAP);
-    lines.extend(tool_compact_lines(name, summary, ok, duration_ms, error));
-    push_blank_lines(&mut lines, BLOCK_GAP);
-    text(lines)
-}
-
-/// Build the compact representation from a stored tool record.
-pub fn build_tool_compact(record: &ToolRecord) -> Text<'static> {
-    build_tool_finished(
-        &record.name,
-        &record.summary,
-        record.ok,
-        record.duration_ms,
-        record.error.as_deref(),
-    )
+    let (dot, dot_style) = status_dot(ok);
+    let mut header = vec![
+        Span::styled(format!(" {dot} "), dot_style),
+        Span::styled(name.to_owned(), tool_name_style()),
+    ];
+    let tail = summary_tail(name, summary);
+    if !tail.is_empty() {
+        header.push(Span::styled(format!(" · {tail}"), tool_summary_style()));
+    }
+    header.push(Span::styled(
+        format!(" · {}", duration_text(duration_ms)),
+        dim_style(),
+    ));
+    let mut lines = vec![Line::from(header)];
+    if !ok && let Some(error) = error {
+        lines.push(plain_line(
+            format!("    {}", error.lines().next().unwrap_or(error)),
+            error_style(),
+        ));
+    }
+    lines
 }
 
 /// Build an informational command/agent notice block.
@@ -335,17 +362,18 @@ fn push_indented(lines: &mut Vec<Line<'static>>, value: &str, indent: &str) {
     }
 }
 
-/// Build the optional full detail view for a completed tool call.
-pub fn build_tool_detail(record: &ToolRecord, _width: u16) -> Text<'static> {
-    let mut lines = Vec::new();
-    push_blank_lines(&mut lines, BLOCK_GAP);
-    lines.push(plain_line(
-        format!("Tool · {} — details", record.name),
-        dim_style(),
-    ));
-    lines.push(plain_line("  args", dim_style()));
+/// Body of the full detail view for a completed tool call.  No outer gap
+/// lines are included so the block can be shaded as a unit.
+fn tool_detail_lines(record: &ToolRecord) -> Vec<Line<'static>> {
+    let (dot, dot_style) = status_dot(record.ok);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!(" {dot} "), dot_style),
+        Span::styled(record.name.clone(), tool_name_style()),
+        Span::styled(" — details".to_owned(), dim_style()),
+    ])];
+    lines.push(plain_line("  args", tool_section_style()));
     push_indented(&mut lines, &record.args, "    ");
-    lines.push(plain_line("  output", dim_style()));
+    lines.push(plain_line("  output", tool_section_style()));
     let output = capped_output_lines(&record.output);
     if output.is_empty() {
         lines.push(plain_line("    (empty)", dim_style()));
@@ -355,9 +383,22 @@ pub fn build_tool_detail(record: &ToolRecord, _width: u16) -> Text<'static> {
         }
     }
     if let Some(error) = &record.error {
-        lines.push(plain_line("  error", dim_style()));
-        push_indented(&mut lines, error, "    ");
+        lines.push(plain_line("  error", tool_section_style()));
+        lines.extend(
+            error
+                .split('\n')
+                .map(|line| plain_line(format!("    {line}"), error_style())),
+        );
     }
+    lines
+}
+
+/// Build the gapped detail view.  Used by tests and as documentation of the
+/// committed layout; live and scrollback paths shade `tool_detail_lines`.
+pub fn build_tool_detail(record: &ToolRecord, _width: u16) -> Text<'static> {
+    let mut lines = Vec::new();
+    push_blank_lines(&mut lines, BLOCK_GAP);
+    lines.extend(tool_detail_lines(record));
     push_blank_lines(&mut lines, BLOCK_GAP);
     text(lines)
 }
@@ -368,15 +409,53 @@ pub fn insert_text<'a, B: Backend>(
     text: Text<'a>,
     width: u16,
 ) -> std::io::Result<()> {
+    insert_text_styled(terminal, text, width, Style::default())
+}
+
+/// Insert a text block whose base style fills the whole render area.  Span
+/// styles patch over the base style, so a background color set here becomes a
+/// full-width band behind every (including wrapped) row.
+pub fn insert_text_styled<'a, B: Backend>(
+    terminal: &mut Terminal<B>,
+    text: Text<'a>,
+    width: u16,
+    base: Style,
+) -> std::io::Result<()> {
     if text.lines.is_empty() {
         return Ok(());
     }
     let height = text_height(&text, width).max(1);
     terminal.insert_before(height, move |buffer| {
         Paragraph::new(text)
+            .style(base)
             .wrap(Wrap { trim: false })
             .render(buffer.area, buffer);
     })
+}
+
+/// Insert plain (unshaded) blank separator rows into scrollback.
+fn insert_gap<B: Backend>(terminal: &mut Terminal<B>, count: usize) -> std::io::Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    terminal.insert_before(count.min(u16::MAX as usize) as u16, |_| {})
+}
+
+/// Insert the blank rows separating a user turn from the next transcript block.
+pub fn insert_section_gap<B: Backend>(terminal: &mut Terminal<B>) -> std::io::Result<()> {
+    insert_gap(terminal, SECTION_GAP)
+}
+
+/// Insert a tool block: unshaded gap rows around a full-width shaded body.
+fn insert_shaded_block<B: Backend>(
+    terminal: &mut Terminal<B>,
+    body: Vec<Line<'static>>,
+    width: u16,
+    base_style: Style,
+) -> std::io::Result<()> {
+    insert_gap(terminal, BLOCK_GAP)?;
+    insert_text_styled(terminal, text(body), width, base_style)?;
+    insert_gap(terminal, BLOCK_GAP)
 }
 
 pub fn insert_header<B: Backend>(terminal: &mut Terminal<B>, width: u16) -> std::io::Result<()> {
@@ -391,7 +470,12 @@ pub fn insert_markdown<B: Backend>(
     if markdown.is_empty() {
         return Ok(());
     }
-    insert_text(terminal, build_markdown(markdown), width)
+    insert_text_styled(
+        terminal,
+        build_markdown(markdown),
+        width,
+        model_text_style(),
+    )
 }
 
 /// Convert markdown to owned ratatui text.  The conversion at this crate
@@ -422,13 +506,6 @@ pub fn insert_user<B: Backend>(
     insert_text(terminal, build_user(input), width)
 }
 
-pub fn insert_model_label<B: Backend>(
-    terminal: &mut Terminal<B>,
-    width: u16,
-) -> std::io::Result<()> {
-    insert_text(terminal, build_model_label(), width)
-}
-
 pub fn insert_reasoning<B: Backend>(
     terminal: &mut Terminal<B>,
     reasoning: &str,
@@ -437,7 +514,12 @@ pub fn insert_reasoning<B: Backend>(
     if reasoning.is_empty() {
         return Ok(());
     }
-    insert_text(terminal, build_reasoning(reasoning), width)
+    insert_shaded_block(
+        terminal,
+        reasoning_lines(reasoning),
+        width,
+        Style::default().bg(THINKING_BG),
+    )
 }
 
 pub fn insert_notice<B: Backend>(
@@ -468,10 +550,11 @@ pub fn insert_tool_finished<B: Backend>(
     error: Option<&str>,
     width: u16,
 ) -> std::io::Result<()> {
-    insert_text(
+    insert_shaded_block(
         terminal,
-        build_tool_finished(name, summary, ok, duration_ms, error),
+        tool_compact_lines(name, summary, ok, duration_ms, error),
         width,
+        tool_bg_style(),
     )
 }
 
@@ -480,7 +563,7 @@ pub fn insert_tool_detail<B: Backend>(
     record: &ToolRecord,
     width: u16,
 ) -> std::io::Result<()> {
-    insert_text(terminal, build_tool_detail(record, width), width)
+    insert_shaded_block(terminal, tool_detail_lines(record), width, tool_bg_style())
 }
 
 pub fn insert_error<B: Backend>(
@@ -521,84 +604,80 @@ pub fn render_completion(
     let lines = visible
         .into_iter()
         .map(|(index, candidate)| {
-            let selected_style = if index == selected {
-                Modifier::REVERSED
+            let is_selected = index == selected;
+            let row_bg = if is_selected {
+                COMPLETION_SELECTED_BG
+            } else {
+                COMPLETION_BG
+            };
+            let value_style = Style::default().bg(row_bg).add_modifier(if is_selected {
+                Modifier::BOLD
             } else {
                 Modifier::empty()
+            });
+            let value_style = if is_selected {
+                value_style.fg(Color::White)
+            } else {
+                value_style
             };
-            let value_style =
-                Style::default()
-                    .add_modifier(selected_style)
-                    .add_modifier(if index == selected {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    });
-            let description_style = dim_style().add_modifier(selected_style);
+            let description_style = dim_style().bg(row_bg);
             let padding =
                 " ".repeat(value_width.saturating_sub(candidate.value.chars().count()) + 2);
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(candidate.value.clone(), value_style),
                 Span::styled(padding, description_style),
                 Span::styled(candidate.description.clone(), description_style),
-            ])
+            ];
+            if is_selected {
+                // Extend the selected row's brighter background to the edge.
+                let used = value_width + 2 + candidate.description.chars().count();
+                let rest = (area.width as usize).saturating_sub(used);
+                spans.push(Span::styled(" ".repeat(rest), Style::default().bg(row_bg)));
+            }
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(Text::from(lines)), area);
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(COMPLETION_BG)),
+        area,
+    );
 }
 
 const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-fn is_blank(line: &Line<'_>) -> bool {
-    line.spans.iter().all(|span| span.content.is_empty())
-}
-
-fn without_outer_gaps(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
-    while lines.first().is_some_and(is_blank) {
-        lines.remove(0);
-    }
-    while lines.last().is_some_and(is_blank) {
-        lines.pop();
-    }
-    lines
-}
-
-fn focused_line(line: Line<'static>, focused: bool) -> Line<'static> {
-    if !focused {
-        return line;
-    }
+fn focused_line(line: Line<'static>) -> Line<'static> {
     let mut spans = vec![Span::styled("> ", Style::default().fg(Color::Cyan))];
     spans.extend(line.spans);
     Line::from(spans)
 }
 
 fn live_tool_lines(entry: &TailTool, focused: bool, width: u16) -> Vec<Line<'static>> {
-    if !entry.expanded {
-        let mut lines = tool_compact_lines(
+    let mut lines = if !entry.expanded {
+        tool_compact_lines(
             &entry.record.name,
             &entry.record.summary,
             entry.record.ok,
             entry.record.duration_ms,
             entry.record.error.as_deref(),
-        );
-        if let Some(first) = lines.first_mut() {
-            let current = std::mem::take(first);
-            *first = focused_line(current, focused);
-        }
-        return lines;
+        )
+    } else {
+        capped_live_detail_lines(&entry.record, width)
+    };
+    if focused && let Some(first) = lines.first_mut() {
+        let current = std::mem::take(first);
+        *first = focused_line(current);
     }
+    lines
+}
 
-    let lines = without_outer_gaps(build_tool_detail(&entry.record, width).lines.to_vec());
+/// The expanded in-place view is capped so a chatty tool cannot push the rest
+/// of the live area off screen; the full dump remains available via Tab + d.
+fn capped_live_detail_lines(record: &ToolRecord, width: u16) -> Vec<Line<'static>> {
     let mut visible = Vec::new();
     let mut rows = 0usize;
     let mut truncated = false;
-    for line in lines {
-        let plain = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let line_rows = wrap_count(&plain, width as usize);
+    for line in tool_detail_lines(record) {
+        let line_rows = wrap_count(&plain_line_text(&line), width as usize);
         if rows + line_rows > MAX_LIVE_DETAIL_ROWS {
             truncated = true;
             break;
@@ -607,54 +686,105 @@ fn live_tool_lines(entry: &TailTool, focused: bool, width: u16) -> Vec<Line<'sta
         visible.push(line);
     }
     if truncated {
-        let note = plain_line("    … more details; Ctrl+O to dump", dim_style());
-        let note_plain = note
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        let note_rows = wrap_count(&note_plain, width as usize);
+        let note = plain_line("    … truncated — Tab, then d for full output", dim_style());
+        let note_rows = wrap_count(&plain_line_text(&note), width as usize);
         while rows + note_rows > MAX_LIVE_DETAIL_ROWS && !visible.is_empty() {
             let removed = visible.pop().expect("visible is non-empty");
-            let removed_plain = removed
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>();
-            rows = rows.saturating_sub(wrap_count(&removed_plain, width as usize));
+            rows = rows.saturating_sub(wrap_count(&plain_line_text(&removed), width as usize));
         }
         visible.push(note);
     }
-    let mut lines = visible;
-    if let Some(first) = lines.first_mut() {
-        let current = std::mem::take(first);
-        *first = focused_line(current, focused);
-    }
-    lines
+    visible
 }
 
-fn append_pending_reasoning(lines: &mut Vec<Line<'static>>, reasoning: &str) {
+fn append_pending_reasoning(
+    lines: &mut Vec<Line<'static>>,
+    flags: &mut Vec<RowKind>,
+    reasoning: &str,
+) {
     if reasoning.is_empty() {
         return;
     }
-    push_blank_lines(lines, BLOCK_GAP);
-    lines.extend(reasoning_lines(reasoning));
-    push_blank_lines(lines, BLOCK_GAP);
+    push_gap_flags(lines, flags, BLOCK_GAP);
+    push_flagged(lines, flags, reasoning_lines(reasoning), RowKind::Thinking);
+    push_gap_flags(lines, flags, BLOCK_GAP);
 }
 
-fn append_pending_text(lines: &mut Vec<Line<'static>>, pending_text: &str) {
+fn append_pending_text(
+    lines: &mut Vec<Line<'static>>,
+    flags: &mut Vec<RowKind>,
+    pending_text: &str,
+) {
     if pending_text.is_empty() {
         return;
     }
-    lines.extend(
-        pending_text
-            .split('\n')
-            .map(|line| plain_line(line.to_owned(), Style::default())),
-    );
+    let text = pending_text
+        .split('\n')
+        .map(|line| plain_line(line.to_owned(), model_text_style()))
+        .collect();
+    push_flagged(lines, flags, text, RowKind::Plain);
+}
+
+/// Patches a background style onto whole rows.  Rendered after the text so
+/// glyphs and foreground colors are preserved while the background band is
+/// extended to the full width.
+struct RowShade {
+    rows: Vec<bool>,
+    style: Style,
+}
+
+impl Widget for RowShade {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        for (offset, shaded) in self.rows.iter().enumerate() {
+            let Ok(offset) = u16::try_from(offset) else {
+                break;
+            };
+            if offset >= area.height {
+                break;
+            }
+            if !shaded {
+                continue;
+            }
+            buf.set_style(
+                Rect {
+                    y: area.y + offset,
+                    height: 1,
+                    ..area
+                },
+                self.style,
+            );
+        }
+    }
+}
+
+fn push_gap_flags(lines: &mut Vec<Line<'static>>, flags: &mut Vec<RowKind>, count: usize) {
+    for _ in 0..count {
+        lines.push(blank_line());
+        flags.push(RowKind::Plain);
+    }
+}
+
+fn push_flagged(
+    lines: &mut Vec<Line<'static>>,
+    flags: &mut Vec<RowKind>,
+    added: Vec<Line<'static>>,
+    kind: RowKind,
+) {
+    flags.extend(std::iter::repeat_n(kind, added.len()));
+    lines.extend(added);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    Plain,
+    Tool,
+    FocusedTool,
+    Thinking,
 }
 
 /// Render the redrawable bottom live area.  Finished tail entries are placed
-/// before pending reasoning/text, and a running tool is always last.
+/// before pending reasoning/text, and a running tool is always last.  Tool and
+/// reasoning rows are shaded so secondary blocks stand out from the transcript.
 pub fn render_live_with_tail(
     area: Rect,
     tail: &[TailTool],
@@ -665,74 +795,91 @@ pub fn render_live_with_tail(
     frame: &mut ratatui::Frame<'_>,
 ) {
     let mut lines = Vec::new();
+    let mut flags = Vec::new();
     for (index, entry) in tail.iter().enumerate() {
-        push_blank_lines(&mut lines, BLOCK_GAP);
-        lines.extend(live_tool_lines(
-            entry,
-            focused_tool == Some(index),
-            area.width,
-        ));
-        push_blank_lines(&mut lines, BLOCK_GAP);
+        push_gap_flags(&mut lines, &mut flags, BLOCK_GAP);
+        let focused = focused_tool == Some(index);
+        let kind = if focused {
+            RowKind::FocusedTool
+        } else {
+            RowKind::Tool
+        };
+        push_flagged(
+            &mut lines,
+            &mut flags,
+            live_tool_lines(entry, focused, area.width),
+            kind,
+        );
+        push_gap_flags(&mut lines, &mut flags, BLOCK_GAP);
     }
-    append_pending_reasoning(&mut lines, pending_reasoning);
-    append_pending_text(&mut lines, pending_text);
+    append_pending_reasoning(&mut lines, &mut flags, pending_reasoning);
+    append_pending_text(&mut lines, &mut flags, pending_text);
     if let Some((name, summary, spinner)) = running_tool {
-        push_blank_lines(&mut lines, BLOCK_GAP);
-        lines.push(Line::from(vec![Span::styled(
-            format!("{} Tool · {name}", FRAMES[spinner % FRAMES.len()]),
-            Style::default().fg(Color::Yellow),
-        )]));
-        lines.push(plain_line(format!("  {summary}"), dim_style()));
+        push_gap_flags(&mut lines, &mut flags, BLOCK_GAP);
+        let tail = summary_tail(name, summary);
+        let mut spans = vec![
+            Span::styled(
+                format!(" {} ", FRAMES[spinner % FRAMES.len()]),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(name.to_owned(), tool_name_style()),
+        ];
+        if !tail.is_empty() {
+            spans.push(Span::styled(format!(" · {tail}"), tool_summary_style()));
+        }
+        push_flagged(
+            &mut lines,
+            &mut flags,
+            vec![Line::from(spans)],
+            RowKind::Tool,
+        );
     }
     if lines.is_empty() {
         return;
     }
 
-    let visible = lines
-        .into_iter()
-        .rev()
-        .take(area.height as usize)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(area.height as usize);
+    let visible_lines: Vec<Line<'static>> = lines.split_off(start);
+    let visible_flags: Vec<RowKind> = flags.split_off(start);
+
+    // Map line flags onto wrapped terminal rows so the shading covers the
+    // same wrapped layout the Paragraph produces.
+    let mut tool_rows = Vec::new();
+    let mut focused_rows = Vec::new();
+    let mut thinking_rows = Vec::new();
+    for (line, flag) in visible_lines.iter().zip(visible_flags.iter()) {
+        let rows = wrap_count(&plain_line_text(line), area.width as usize);
+        tool_rows.extend(std::iter::repeat_n(
+            matches!(*flag, RowKind::Tool | RowKind::FocusedTool),
+            rows,
+        ));
+        focused_rows.extend(std::iter::repeat_n(*flag == RowKind::FocusedTool, rows));
+        thinking_rows.extend(std::iter::repeat_n(*flag == RowKind::Thinking, rows));
+    }
+
     frame.render_widget(
-        Paragraph::new(Text::from(visible)).wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(visible_lines)).wrap(Wrap { trim: false }),
         area,
     );
-}
-
-/// Compatibility wrapper for callers that only have the pre-tail running tool
-/// representation.
-pub fn render_live(
-    area: Rect,
-    pending_reasoning: &str,
-    pending_text: &str,
-    running_tool: Option<(&str, usize)>,
-    frame: &mut ratatui::Frame<'_>,
-) {
-    let mut lines = Vec::new();
-    append_pending_reasoning(&mut lines, pending_reasoning);
-    append_pending_text(&mut lines, pending_text);
-    if let Some((summary, spinner)) = running_tool {
-        lines.push(Line::from(Span::styled(
-            format!("{} {summary}", FRAMES[spinner % FRAMES.len()]),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-    if lines.is_empty() {
-        return;
-    }
-    let visible = lines
-        .into_iter()
-        .rev()
-        .take(area.height as usize)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(Text::from(visible)).wrap(Wrap { trim: false }),
+        RowShade {
+            rows: tool_rows,
+            style: tool_bg_style(),
+        },
+        area,
+    );
+    frame.render_widget(
+        RowShade {
+            rows: focused_rows,
+            style: Style::default().bg(TOOL_FOCUSED_BG),
+        },
+        area,
+    );
+    frame.render_widget(
+        RowShade {
+            rows: thinking_rows,
+            style: Style::default().bg(THINKING_BG),
+        },
         area,
     );
 }
@@ -744,12 +891,15 @@ mod tests {
     fn plain(text: &Text<'_>) -> String {
         text.lines
             .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
+            .map(|line| plain_line_text(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn plain_lines(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| plain_line_text(line))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -769,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn header_uses_keymap_and_styles_roles() {
+    fn header_uses_keymap_and_styles_labels() {
         let header = build_header(80);
         let value = plain(&header);
         assert!(value.starts_with("Harness\n\n"));
@@ -784,27 +934,54 @@ mod tests {
     }
 
     #[test]
-    fn user_and_reasoning_have_labels_and_gaps() {
+    fn user_and_reasoning_use_colour_without_markers() {
         let user = build_user("hello\nworld");
-        assert_eq!(plain(&user), "\n\nUser\nhello\nworld");
+        assert_eq!(plain(&user), "\n\nhello\nworld");
+        assert_eq!(
+            user.lines[2].spans[0].style.fg,
+            Some(Color::White),
+            "user text is white"
+        );
         let reasoning = build_reasoning("checking\nfiles");
-        assert_eq!(plain(&reasoning), "\nthinking · checking\n  files\n");
+        assert_eq!(plain(&reasoning), "checking\n  files");
+        assert_eq!(
+            reasoning.lines[0].spans[0].style.fg,
+            Some(Color::DarkGray),
+            "reasoning text remains dim"
+        );
     }
 
     #[test]
-    fn compact_tool_has_name_summary_duration_and_error_preview() {
-        let tool = build_tool_finished(
+    fn summary_tail_strips_redundant_name_prefix() {
+        assert_eq!(summary_tail("bash", "bash: cargo test"), "cargo test");
+        assert_eq!(summary_tail("read", "read src/main.rs"), "src/main.rs");
+        assert_eq!(summary_tail("bash", "bash"), "");
+        assert_eq!(summary_tail("bash", "unrelated"), "unrelated");
+    }
+
+    #[test]
+    fn compact_tool_is_single_status_line_plus_error_preview() {
+        let ok = tool_compact_lines("bash", "bash: cargo test", true, 1_300, None);
+        assert_eq!(ok.len(), 1);
+        let value = plain_lines(&ok);
+        assert!(
+            value.contains("● bash · cargo test · 1.3s"),
+            "got: {value:?}"
+        );
+
+        let failed = tool_compact_lines(
             "bash",
             "bash: cargo test",
             false,
-            1_300,
+            10,
             Some("first line\nsecond line"),
         );
-        let value = plain(&tool);
-        assert!(value.contains("✗ Tool · bash (1.3s)"));
-        assert!(value.contains("  bash: cargo test"));
-        assert!(value.contains("  first line"));
+        assert_eq!(failed.len(), 2);
+        let value = plain_lines(&failed);
+        assert!(value.contains("first line"));
         assert!(!value.contains("second line"));
+        assert_eq!(failed[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(ok[0].spans[0].style.fg, Some(Color::Green));
     }
 
     #[test]
@@ -823,7 +1000,7 @@ mod tests {
             error: Some("complete error\nwith context".into()),
         };
         let detail = plain(&build_tool_detail(&record, 80));
-        assert!(detail.contains("Tool · bash — details"));
+        assert!(detail.contains("bash — details"));
         assert!(detail.contains("line 0"));
         assert!(detail.contains("line 204"));
         assert!(detail.contains("… 5 lines omitted"));
@@ -831,8 +1008,97 @@ mod tests {
     }
 
     #[test]
+    fn live_expansion_is_capped_and_points_at_dump() {
+        let record = ToolRecord {
+            name: "bash".into(),
+            args: "{}".into(),
+            summary: "cargo test".into(),
+            ok: true,
+            duration_ms: 10,
+            output: (0..100)
+                .map(|index| format!("line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            error: None,
+        };
+        let lines = capped_live_detail_lines(&record, 80);
+        let value = plain_lines(&lines);
+        assert!(value.contains("truncated"), "got: {value:?}");
+        assert!(lines.len() <= MAX_LIVE_DETAIL_ROWS);
+    }
+
+    #[test]
+    fn row_shade_patches_background_without_touching_text() {
+        let area = Rect::new(0, 0, 10, 3);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new("hi").render(area, &mut buffer);
+        RowShade {
+            rows: vec![true, false, true],
+            style: tool_bg_style(),
+        }
+        .render(area, &mut buffer);
+        assert_eq!(buffer[(0, 0)].bg, TOOL_BG);
+        assert_eq!(buffer[(0, 0)].symbol(), "h");
+        assert_ne!(buffer[(0, 1)].bg, TOOL_BG);
+        assert_eq!(buffer[(9, 2)].bg, TOOL_BG, "band spans full width");
+    }
+
+    #[test]
     fn text_height_counts_final_text_lines_and_gaps() {
         let user = build_user("abcdefgh");
-        assert_eq!(text_height(&user, 4), 2 + 1 + 2);
+        assert_eq!(text_height(&user, 4), 2 + 2);
+    }
+
+    #[test]
+    fn live_tail_shades_tool_rows_and_marks_focus() {
+        use ratatui::backend::TestBackend;
+
+        let record = |name: &str| ToolRecord {
+            name: name.into(),
+            args: "{}".into(),
+            summary: format!("{name}: do things"),
+            ok: true,
+            duration_ms: 12,
+            output: String::new(),
+            error: None,
+        };
+        let tail = vec![
+            TailTool {
+                record: record("read"),
+                expanded: false,
+            },
+            TailTool {
+                record: record("bash"),
+                expanded: false,
+            },
+        ];
+
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_live_with_tail(
+                    frame.area(),
+                    &tail,
+                    Some(1),
+                    "",
+                    "hello",
+                    Some(("write", "write x.rs", 0)),
+                    frame,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let bg_at = |row: u16| buffer[(0, row)].bg;
+        // gap, tool, gap, gap, focused tool, gap, text, gap, running tool.
+        assert_eq!(bg_at(1), TOOL_BG, "first tail tool shaded");
+        assert_eq!(bg_at(4), TOOL_FOCUSED_BG, "focused tail tool highlighted");
+        assert_eq!(buffer[(0, 4)].symbol(), ">", "focus marker present");
+        assert_ne!(bg_at(6), TOOL_BG, "pending text not shaded");
+        assert_eq!(bg_at(8), TOOL_BG, "running tool shaded");
+        assert_eq!(buffer[(39, 1)].bg, TOOL_BG, "band spans the full width");
+        assert_eq!(buffer[(3, 4)].symbol(), "●", "dot shifted by focus marker");
+        assert_eq!(buffer[(3, 4)].fg, Color::Green);
     }
 }

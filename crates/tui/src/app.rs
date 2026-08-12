@@ -62,7 +62,7 @@ pub struct Tui {
     busy: bool,
     retrying: Option<u32>,
     status_flash: Option<String>,
-    needs_model_label: bool,
+    needs_section_break: bool,
     header_printed: bool,
     history: Vec<String>,
     history_pos: Option<usize>,
@@ -112,7 +112,7 @@ impl Tui {
             busy: false,
             retrying: None,
             status_flash: None,
-            needs_model_label: false,
+            needs_section_break: false,
             header_printed: false,
             history: Vec::new(),
             history_pos: None,
@@ -259,18 +259,20 @@ impl Tui {
                     .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
                 self.textarea = new_textarea();
                 self.completion = None;
-                self.needs_model_label = true;
+                self.needs_section_break = true;
                 self.busy = true;
                 self.retrying = None;
                 self.status_flash = None;
             }
             InputAction::ExpandDetails => {
-                if !self.busy && !self.tail.is_empty() {
-                    self.focused_tool = Some(
-                        self.focused_tool
-                            .unwrap_or(0)
-                            .min(self.tail.len().saturating_sub(1)),
-                    );
+                // Pi-style toggle: expand/collapse the focused tool call, or
+                // the most recent one still in the live tail.  Once every
+                // tool has been committed to scrollback, fall back to dumping
+                // the latest call's full detail view.
+                if self.focused_tool.is_some() {
+                    self.toggle_focused_tool();
+                } else if let Some(entry) = self.tail.last_mut() {
+                    entry.expanded = !entry.expanded;
                 } else {
                     self.expand_latest_tool()?;
                 }
@@ -541,20 +543,23 @@ impl Tui {
                 Ok(true)
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if let Some(index) = self.focused_tool
-                    && let Some(entry) = self.tail.get_mut(index)
-                {
-                    entry.expanded = !entry.expanded;
-                }
+                self.toggle_focused_tool();
+                Ok(true)
+            }
+            KeyCode::Char('d') if key.modifiers.is_empty() => {
+                // Dump the focused call's full detail into scrollback, then
+                // hand focus back to the editor.
+                self.dump_focused_tool()?;
+                self.focused_tool = None;
                 Ok(true)
             }
             KeyCode::Char(value)
                 if value.eq_ignore_ascii_case(&'o')
                     && key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                // Ctrl+O while focused is the fallback dump action. Enter or
-                // Space remains the in-place expand/collapse action.
-                self.dump_focused_tool()?;
+                // Ctrl+O expands/collapses in place, matching the global
+                // binding; Enter or Space work too.
+                self.toggle_focused_tool();
                 Ok(true)
             }
             KeyCode::Tab => {
@@ -569,6 +574,14 @@ impl Tui {
                 self.focused_tool = None;
                 Ok(false)
             }
+        }
+    }
+
+    fn toggle_focused_tool(&mut self) {
+        if let Some(index) = self.focused_tool
+            && let Some(entry) = self.tail.get_mut(index)
+        {
+            entry.expanded = !entry.expanded;
         }
     }
 
@@ -624,7 +637,7 @@ impl Tui {
                 // Reasoning is committed immediately before the first text
                 // delta so the two streams remain interleaved.
                 self.flush_pending_reasoning()?;
-                self.ensure_model_label()?;
+                self.ensure_section_break()?;
                 self.pending_text.push_str(&delta);
                 self.flush_stable_text()?;
                 self.flush_overflow_text()?;
@@ -641,7 +654,7 @@ impl Tui {
                 if !self.pending_text.is_empty() {
                     self.flush_pending_text_all()?;
                 }
-                self.ensure_model_label()?;
+                self.ensure_section_break()?;
                 self.pending_reasoning.push_str(&delta);
             }
             UiEvent::ToolCallStarted {
@@ -702,7 +715,7 @@ impl Tui {
                 self.focused_tool = None;
                 self.retrying = None;
                 // The next assistant text after a tool begins a new segment.
-                self.needs_model_label = true;
+                self.needs_section_break = true;
             }
             UiEvent::Retrying { attempt, .. } => {
                 self.busy = true;
@@ -748,14 +761,13 @@ impl Tui {
         Ok(())
     }
 
-    fn ensure_model_label(&mut self) -> Result<()> {
-        if !self.needs_model_label {
+    fn ensure_section_break(&mut self) -> Result<()> {
+        if !self.needs_section_break {
             return Ok(());
         }
         self.commit_tail()?;
-        let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
-        render::insert_model_label(&mut self.terminal, width).context("insert model label")?;
-        self.needs_model_label = false;
+        render::insert_section_gap(&mut self.terminal).context("insert section gap")?;
+        self.needs_section_break = false;
         Ok(())
     }
 
@@ -788,7 +800,7 @@ impl Tui {
         if markdown.is_empty() {
             return Ok(());
         }
-        self.ensure_model_label()?;
+        self.ensure_section_break()?;
         self.commit_tail()?;
         let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
         render::insert_markdown(&mut self.terminal, markdown, width).context("insert markdown")?;
@@ -800,7 +812,7 @@ impl Tui {
             return Ok(());
         }
         let reasoning = std::mem::take(&mut self.pending_reasoning);
-        self.ensure_model_label()?;
+        self.ensure_section_break()?;
         self.commit_tail()?;
         let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
         render::insert_reasoning(&mut self.terminal, &reasoning, width)
@@ -845,7 +857,7 @@ impl Tui {
             width,
         )
         .context("insert completed tool")?;
-        self.needs_model_label = true;
+        self.needs_section_break = true;
         Ok(())
     }
 
@@ -893,6 +905,7 @@ impl Tui {
             self.header_printed = true;
         }
 
+        self.textarea.set_block(render::input_block());
         let model = self.model.clone();
         let provider = self.provider.clone();
         let pending_text = self.pending_text.clone();
@@ -914,10 +927,12 @@ impl Tui {
                 .as_ref()
                 .map(|completion| completion.candidates.len().min(8) as u16)
                 .unwrap_or(0);
-            let completion_rows = requested_completion_rows.min(area.height.saturating_sub(3));
-            let input_rows = (textarea.lines().len() as u16 + 1)
+            // Reserve the status line and the input box (text + 2 border rows).
+            let completion_rows = requested_completion_rows.min(area.height.saturating_sub(4));
+            let inner_rows = (textarea.lines().len() as u16)
                 .clamp(1, MAX_INPUT_ROWS)
-                .min(area.height.saturating_sub(2 + completion_rows).max(1));
+                .min(area.height.saturating_sub(3 + completion_rows).max(1));
+            let input_rows = inner_rows + 2;
             let mut constraints = vec![
                 Constraint::Min(1),
                 Constraint::Length(1),
@@ -944,19 +959,27 @@ impl Tui {
                 frame,
             );
 
-            let left = format!("{provider} · {model}");
-            let right = if let Some(flash) = status_flash.as_deref() {
-                flash.to_owned()
-            } else if let Some(attempt) = retrying {
-                format!("↻ retrying (attempt {attempt})")
-            } else if busy {
-                "… generating".to_owned()
-            } else {
-                String::new()
-            };
-            let status_style = Style::default()
+            let dim_style = Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM);
+            let left = format!("{provider} · {model}");
+            let (right, right_style) = if let Some(flash) = status_flash.as_deref() {
+                (flash.to_owned(), Style::default().fg(Color::Cyan))
+            } else if let Some(attempt) = retrying {
+                (
+                    format!("↻ retrying (attempt {attempt})"),
+                    Style::default().fg(Color::Yellow),
+                )
+            } else if busy {
+                ("… generating".to_owned(), dim_style)
+            } else if focused_tool.is_some() {
+                (
+                    "↑/↓ select · enter expand · d dump · esc close".to_owned(),
+                    dim_style,
+                )
+            } else {
+                (String::new(), dim_style)
+            };
             let status = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -965,25 +988,18 @@ impl Tui {
                     Constraint::Length(right.chars().count().min(u16::MAX as usize) as u16),
                 ])
                 .split(chunks[1]);
-            frame.render_widget(Paragraph::new(left).style(status_style), status[0]);
+            frame.render_widget(Paragraph::new(left).style(dim_style), status[0]);
             if !right.is_empty() {
                 frame.render_widget(
                     Paragraph::new(right)
                         .alignment(ratatui::layout::Alignment::Right)
-                        .style(status_style),
+                        .style(right_style),
                     status[2],
                 );
             }
 
-            let input = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(2), Constraint::Min(1)])
-                .split(chunks[2]);
-            frame.render_widget(
-                Paragraph::new("> ").style(Style::default().add_modifier(Modifier::BOLD)),
-                input[0],
-            );
-            frame.render_widget(textarea, input[1]);
+            // The bordered input box renders the textarea (block included).
+            frame.render_widget(textarea, chunks[2]);
 
             if let Some(completion) = completion.as_ref() {
                 render::render_completion(
@@ -1044,6 +1060,10 @@ fn textarea_with_text(value: &str) -> TextArea<'static> {
             .fg(Color::DarkGray)
             .add_modifier(Modifier::DIM),
     );
+    // Main input text is white; the bordered box already marks the active
+    // line, so the default underline cursor-line styling is dropped.
+    textarea.set_style(Style::default().fg(Color::White));
+    textarea.set_cursor_line_style(Style::default());
     textarea
 }
 
