@@ -1,4 +1,4 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent", "crates/llm", "crates/tui"]
+members = ["crates/agent", "crates/llm", "crates/session", "crates/tui"]
 default-members = ["crates/agent"]

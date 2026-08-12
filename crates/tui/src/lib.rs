@@ -19,8 +19,17 @@ pub enum InputMessage {
     Message(String),
     /// Turn-local Esc interrupt.
     Interrupt,
-    /// Clear the current conversation history.
+    /// Start and persist a new conversation without deleting the old one.
     NewConversation,
+    /// Load a session by ID, unique prefix, `latest`, or path.
+    LoadSession { selector: String },
+    /// Ask the agent to list sessions for the current workspace.
+    ListSessions,
+    /// Export the current session to JSONL. `None` means the current directory
+    /// and a generated filename.
+    ExportSession { destination: Option<String> },
+    /// Run the deterministic local compactor.
+    CompactSession,
     /// Switch model, and provider when `provider` is present.
     SetModel {
         provider: Option<String>,
@@ -77,6 +86,39 @@ pub enum UiEvent {
         provider: String,
         models: Vec<ModelEntry>,
     },
+    SessionChanged {
+        id: String,
+        title: Option<String>,
+        loaded: bool,
+    },
+    SessionList {
+        sessions: Vec<SessionListEntry>,
+    },
+    SessionExported {
+        path: String,
+    },
+    UsageUpdated {
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        reasoning_tokens: u64,
+        cost: String,
+    },
+    CompactionFinished {
+        compacted_through: u64,
+        summary_bytes: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionListEntry {
+    pub id: String,
+    pub short_id: String,
+    pub title: Option<String>,
+    pub updated_at: String,
+    pub workspace: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 pub trait TuiEvent: Send {

@@ -54,6 +54,44 @@ impl tui::TuiEvent for AgentEvent {
                     })
                     .collect(),
             },
+            AgentEvent::SessionChanged { id, title, loaded } => {
+                tui::UiEvent::SessionChanged { id, title, loaded }
+            }
+            AgentEvent::SessionList { sessions } => tui::UiEvent::SessionList {
+                sessions: sessions
+                    .into_iter()
+                    .map(|session| tui::SessionListEntry {
+                        id: session.id,
+                        short_id: session.short_id,
+                        title: session.title,
+                        updated_at: session.updated_at,
+                        workspace: session.workspace,
+                        provider: session.provider,
+                        model: session.model,
+                    })
+                    .collect(),
+            },
+            AgentEvent::SessionExported { path } => tui::UiEvent::SessionExported { path },
+            AgentEvent::UsageUpdated {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                reasoning_tokens,
+                cost,
+            } => tui::UiEvent::UsageUpdated {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                reasoning_tokens,
+                cost,
+            },
+            AgentEvent::CompactionFinished {
+                compacted_through,
+                summary_bytes,
+            } => tui::UiEvent::CompactionFinished {
+                compacted_through,
+                summary_bytes,
+            },
         }
     }
 }

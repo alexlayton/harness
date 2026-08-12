@@ -90,6 +90,18 @@ pub struct Tui {
     history_pos: Option<usize>,
     draft: String,
     restored: bool,
+    session_id: Option<String>,
+    session_title: Option<String>,
+    usage: Option<UsageState>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageState {
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+    reasoning_tokens: u64,
+    cost: String,
 }
 
 impl Tui {
@@ -148,6 +160,9 @@ impl Tui {
             history_pos: None,
             draft: String::new(),
             restored: false,
+            session_id: None,
+            session_title: None,
+            usage: None,
         })
     }
 
@@ -673,6 +688,18 @@ impl Tui {
             ParsedCommand::New => input_tx
                 .send(InputMessage::NewConversation)
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,
+            ParsedCommand::Load { selector } => input_tx
+                .send(InputMessage::LoadSession { selector })
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,
+            ParsedCommand::Sessions => input_tx
+                .send(InputMessage::ListSessions)
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,
+            ParsedCommand::Export { destination } => input_tx
+                .send(InputMessage::ExportSession { destination })
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,
+            ParsedCommand::Compact => input_tx
+                .send(InputMessage::CompactSession)
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,
             ParsedCommand::SetModel { provider, model } => {
                 let provider_for_fetch = provider.clone().and_then(|name| {
                     self.providers
@@ -934,6 +961,68 @@ impl Tui {
                     self.refresh_completion();
                 }
             }
+            UiEvent::SessionChanged { id, title, loaded } => {
+                self.session_id = Some(id.clone());
+                self.session_title = title;
+                self.usage = None;
+                self.flush_everything()?;
+                self.commit_tail()?;
+                self.status_flash = Some(if loaded {
+                    format!("loaded session {}", &id[..id.len().min(8)])
+                } else {
+                    format!("session {}", &id[..id.len().min(8)])
+                });
+            }
+            UiEvent::SessionList { sessions } => {
+                self.flush_everything()?;
+                self.commit_tail()?;
+                let notice = if sessions.is_empty() {
+                    "No sessions for this workspace".to_owned()
+                } else {
+                    sessions
+                        .into_iter()
+                        .take(12)
+                        .map(|session| {
+                            let title = session.title.unwrap_or_else(|| "(untitled)".into());
+                            let model = session.model.unwrap_or_else(|| "(model unknown)".into());
+                            format!(
+                                "{} · {} · {} · {}",
+                                session.short_id, title, model, session.updated_at
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                let width = self.terminal.size().map(|size| size.width).unwrap_or(80);
+                render::insert_notice(&mut self.terminal, &notice, width)
+                    .context("insert session list")?;
+            }
+            UiEvent::SessionExported { path } => {
+                self.status_flash = Some(format!("exported to {path}"));
+            }
+            UiEvent::UsageUpdated {
+                input_tokens,
+                output_tokens,
+                cached_tokens,
+                reasoning_tokens,
+                cost,
+            } => {
+                self.usage = Some(UsageState {
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                    reasoning_tokens,
+                    cost,
+                });
+            }
+            UiEvent::CompactionFinished {
+                compacted_through,
+                summary_bytes,
+            } => {
+                self.status_flash = Some(format!(
+                    "compacted through event {compacted_through} ({summary_bytes} bytes)"
+                ));
+            }
         }
         Ok(())
     }
@@ -1094,6 +1183,9 @@ impl Tui {
         let busy = self.busy;
         let retrying = self.retrying;
         let status_flash = self.status_flash.clone();
+        let session_id = self.session_id.clone();
+        let session_title = self.session_title.clone();
+        let usage = self.usage.clone();
         let completion = self.completion.clone();
         let textarea = &self.textarea;
         let clear_flash = self.status_flash.is_some();
@@ -1141,7 +1233,16 @@ impl Tui {
             let dim_style = Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::DIM);
-            let left = format!("{provider} · {model}");
+            let session_label = session_id
+                .as_deref()
+                .map(|id| format!(" · session {}", &id[..id.len().min(8)]))
+                .unwrap_or_default();
+            let title_label = session_title
+                .as_deref()
+                .filter(|title| !title.is_empty())
+                .map(|title| format!(" · {title}"))
+                .unwrap_or_default();
+            let left = format!("{provider} · {model}{session_label}{title_label}");
             let (right, right_style) = if let Some(flash) = status_flash.as_deref() {
                 (flash.to_owned(), Style::default().fg(Color::Cyan))
             } else if let Some(attempt) = retrying {
@@ -1151,6 +1252,22 @@ impl Tui {
                 )
             } else if busy {
                 ("… generating".to_owned(), dim_style)
+            } else if let Some(usage) = usage {
+                let cost = if usage.cost != "0" {
+                    format!(" · ${}", usage.cost)
+                } else {
+                    String::new()
+                };
+                (
+                    format!(
+                        "{} in · {} out · {} cached · {} reasoning{cost}",
+                        usage.input_tokens,
+                        usage.output_tokens,
+                        usage.cached_tokens,
+                        usage.reasoning_tokens,
+                    ),
+                    dim_style,
+                )
             } else if focused_tool.is_some() {
                 (
                     "↑/↓ select · enter expand · d dump · esc close".to_owned(),

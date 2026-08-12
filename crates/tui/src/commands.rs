@@ -17,8 +17,28 @@ pub struct CommandSpec {
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "/new",
-        description: "Reset the current conversation",
+        description: "Start a new persisted conversation",
         usage: "/new",
+    },
+    CommandSpec {
+        name: "/load",
+        description: "Load a session by ID, path, or latest",
+        usage: "/load [<id>|latest|<path>]",
+    },
+    CommandSpec {
+        name: "/sessions",
+        description: "List sessions for this workspace",
+        usage: "/sessions",
+    },
+    CommandSpec {
+        name: "/export",
+        description: "Export the current session to JSONL",
+        usage: "/export [<path>]",
+    },
+    CommandSpec {
+        name: "/compact",
+        description: "Compact older local session context",
+        usage: "/compact",
     },
     CommandSpec {
         name: "/model",
@@ -44,6 +64,14 @@ pub struct Candidate {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedCommand {
     New,
+    Load {
+        selector: String,
+    },
+    Sessions,
+    Export {
+        destination: Option<String>,
+    },
+    Compact,
     SetModel {
         provider: Option<String>,
         model: String,
@@ -69,6 +97,40 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /new".into())
             } else {
                 Ok(ParsedCommand::New)
+            }
+        }
+        "/load" => {
+            let selector = words.collect::<Vec<_>>();
+            if selector.len() > 1 {
+                Err("usage: /load [<id>|latest|<path>]".into())
+            } else {
+                Ok(ParsedCommand::Load {
+                    selector: selector.first().copied().unwrap_or("latest").to_owned(),
+                })
+            }
+        }
+        "/sessions" => {
+            if words.next().is_some() {
+                Err("usage: /sessions".into())
+            } else {
+                Ok(ParsedCommand::Sessions)
+            }
+        }
+        "/export" => {
+            let destination = words.collect::<Vec<_>>();
+            if destination.len() > 1 {
+                Err("usage: /export [<path>]".into())
+            } else {
+                Ok(ParsedCommand::Export {
+                    destination: destination.first().map(|value| (*value).to_owned()),
+                })
+            }
+        }
+        "/compact" => {
+            if words.next().is_some() {
+                Err("usage: /compact".into())
+            } else {
+                Ok(ParsedCommand::Compact)
             }
         }
         "/model" => {
@@ -274,7 +336,7 @@ mod tests {
     fn command_candidates_filter_the_command_token_case_insensitively() {
         let lists = HashMap::new();
         let all = candidates("/", &providers(), &lists, "opencode-go");
-        assert_eq!(all.len(), 2);
+        assert!(all.len() >= 6);
         assert_eq!(
             candidates("/NE", &providers(), &lists, "opencode-go")[0].value,
             "/new"
@@ -342,6 +404,26 @@ mod tests {
     #[test]
     fn parses_success_and_usage_errors() {
         assert_eq!(parse_command("/new"), Ok(ParsedCommand::New));
+        assert_eq!(
+            parse_command("/load"),
+            Ok(ParsedCommand::Load {
+                selector: "latest".into()
+            })
+        );
+        assert_eq!(
+            parse_command("/load 1234"),
+            Ok(ParsedCommand::Load {
+                selector: "1234".into()
+            })
+        );
+        assert_eq!(parse_command("/sessions"), Ok(ParsedCommand::Sessions));
+        assert_eq!(
+            parse_command("/export transcript.jsonl"),
+            Ok(ParsedCommand::Export {
+                destination: Some("transcript.jsonl".into())
+            })
+        );
+        assert_eq!(parse_command("/compact"), Ok(ParsedCommand::Compact));
         assert_eq!(
             parse_command("/model gpt-5.6-luna"),
             Ok(ParsedCommand::SetModel {

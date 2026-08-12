@@ -3,6 +3,7 @@ use agent::config::{Cli, Config, ProviderArg, build_provider, init_logging};
 use agent::tools::default_registry;
 use clap::Parser;
 use llm::Provider;
+use session::{SessionCreateOptions, SessionStore};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -16,6 +17,13 @@ async fn main() -> anyhow::Result<()> {
 
     let provider: Arc<dyn Provider> = build_provider(&config.provider.to_string())?;
     let provider_name = provider.name().to_owned();
+    let workspace_root = std::env::current_dir()?;
+    let session_store = SessionStore::default_for_workspace(&workspace_root)?;
+    let session = session_store.create(SessionCreateOptions {
+        provider: Some(provider_name.clone()),
+        model: Some(config.model.clone()),
+        ..SessionCreateOptions::default()
+    })?;
     let providers = ProviderArg::ALL
         .iter()
         .map(ToString::to_string)
@@ -53,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
         default_registry(config.rtk),
         config.model.clone(),
         cancel.clone(),
-    );
+    )
+    .with_session(session_store, session);
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     let tui = Tui::new(&config.model, &provider_name, providers)?;

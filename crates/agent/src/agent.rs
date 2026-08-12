@@ -5,7 +5,12 @@ use futures_util::StreamExt;
 use llm::{
     CompletionRequest, Content, Message, Provider, RetryCallback, Role, StreamEvent, ToolCall,
 };
+use session::{
+    CompactionPolicy, ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore,
+    StoredMessage, StoredToolCall, export_jsonl, usage_summary,
+};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -48,14 +53,58 @@ pub enum AgentEvent {
         provider: String,
         models: Vec<llm::ModelInfo>,
     },
+    SessionChanged {
+        id: String,
+        title: Option<String>,
+        loaded: bool,
+    },
+    SessionList {
+        sessions: Vec<SessionListItem>,
+    },
+    SessionExported {
+        path: String,
+    },
+    UsageUpdated {
+        input_tokens: u64,
+        output_tokens: u64,
+        cached_tokens: u64,
+        reasoning_tokens: u64,
+        cost: String,
+    },
+    CompactionFinished {
+        compacted_through: u64,
+        summary_bytes: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionListItem {
+    pub id: String,
+    pub short_id: String,
+    pub title: Option<String>,
+    pub updated_at: String,
+    pub workspace: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+/// Durable session state owned by the agent.  The TUI only receives status
+/// events; it never reads or writes session files directly.
+pub struct AgentSessionState {
+    pub store: SessionStore,
+    pub session: Session,
 }
 
 pub struct Agent {
     pub provider: Arc<dyn Provider>,
     pub tools: ToolRegistry,
     pub model: String,
+    /// Kept public as a short-term compatibility path for existing callers.
+    /// When a durable session is attached it is rebuilt from the session
+    /// events whenever a session is loaded or created.
     pub history: Vec<Message>,
     pub cancel: CancellationToken,
+    pub session: Option<AgentSessionState>,
 }
 
 impl Agent {
@@ -71,12 +120,136 @@ impl Agent {
             model: model.into(),
             history: Vec::new(),
             cancel,
+            session: None,
         }
     }
 
     pub fn with_history(mut self, history: Vec<Message>) -> Self {
         self.history = history;
         self
+    }
+
+    /// Attach a loaded/new durable session.  Active provider/model selection
+    /// remains the caller's choice; saved metadata is informational only.
+    pub fn with_session(mut self, store: SessionStore, mut session: Session) -> Self {
+        if let Err(error) = store.repair_incomplete_tool_calls(&mut session) {
+            tracing::warn!(error = %error, "could not repair incomplete session tool calls");
+        }
+        self.history = session.context_messages();
+        self.session = Some(AgentSessionState { store, session });
+        self
+    }
+
+    pub fn session(&self) -> Option<&Session> {
+        self.session.as_ref().map(|state| &state.session)
+    }
+
+    fn persist_event(
+        &mut self,
+        event: SessionEvent,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> bool {
+        let Some(state) = self.session.as_mut() else {
+            return true;
+        };
+        match state.store.append_event(&mut state.session, event) {
+            Ok(_) => true,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(format!("session persistence failed: {error}")),
+                );
+                false
+            }
+        }
+    }
+
+    fn persist_user_message(
+        &mut self,
+        message: &Message,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> bool {
+        self.persist_event(
+            SessionEvent::UserMessage {
+                message: StoredMessage::from_llm(message),
+            },
+            events,
+        )
+    }
+
+    fn persist_assistant(
+        &mut self,
+        reasoning: &str,
+        text: &str,
+        calls: &[ToolCall],
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> bool {
+        if reasoning.is_empty() && text.is_empty() && calls.is_empty() {
+            return true;
+        }
+        let mut content = Vec::new();
+        if !reasoning.is_empty() {
+            content.push(Content::Reasoning(reasoning.to_owned()));
+        }
+        if !text.is_empty() {
+            content.push(Content::Text(text.to_owned()));
+        }
+        // Tool calls have their own durable events.  Keeping them out of this
+        // message avoids duplicate calls while still making the event stream
+        // explicit and easy to inspect/export.
+        let message = Message::assistant(content);
+        if !content_is_empty(&message)
+            && !self.persist_event(
+                SessionEvent::AssistantMessage {
+                    message: StoredMessage::from_llm(&message),
+                },
+                events,
+            )
+        {
+            return false;
+        }
+        for call in calls {
+            if !self.persist_event(
+                SessionEvent::ToolCall {
+                    call: StoredToolCall::from(call),
+                },
+                events,
+            ) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn persist_tool_result(
+        &mut self,
+        call: &ToolCall,
+        content: &str,
+        is_error: bool,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> bool {
+        self.persist_event(
+            SessionEvent::ToolResult {
+                tool_call_id: call.id.clone(),
+                content: content.to_owned(),
+                is_error,
+                tool_name: Some(call.name.clone()),
+            },
+            events,
+        )
+    }
+
+    fn persist_cancelled(
+        &mut self,
+        reason: impl Into<String>,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let _ = self.persist_event(
+            SessionEvent::TurnCancelled {
+                reason: reason.into(),
+            },
+            events,
+        );
     }
 
     /// Run until the input channel closes or the application cancellation
@@ -89,6 +262,17 @@ impl Agent {
     ) {
         let mut queued = VecDeque::new();
         let mut input_open = true;
+        if let Some(session) = self.session.as_ref() {
+            send(
+                &events,
+                AgentEvent::SessionChanged {
+                    id: session.session.id().to_string(),
+                    title: session.session.metadata.title.clone(),
+                    loaded: false,
+                },
+            );
+            send(&events, usage_event(&session.session.metadata.usage));
+        }
 
         loop {
             let next_message = if let Some(message) = queued.pop_front() {
@@ -113,11 +297,23 @@ impl Agent {
                 InputMessage::Message(text) if !text.trim().is_empty() => text,
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
-                    self.history.clear();
-                    send(
-                        &events,
-                        AgentEvent::Notice("Started a new conversation".into()),
-                    );
+                    self.handle_new_session(&events);
+                    continue;
+                }
+                InputMessage::LoadSession { selector } => {
+                    self.handle_load_session(selector, &events);
+                    continue;
+                }
+                InputMessage::ListSessions => {
+                    self.handle_list_sessions(&events);
+                    continue;
+                }
+                InputMessage::ExportSession { destination } => {
+                    self.handle_export_session(destination, &events);
+                    continue;
+                }
+                InputMessage::CompactSession => {
+                    self.handle_compact_session(&events);
                     continue;
                 }
                 InputMessage::SetModel { provider, model } => {
@@ -130,7 +326,12 @@ impl Agent {
                 }
             };
 
-            self.history.push(Message::user(user_text));
+            let user_message = Message::user(user_text);
+            self.history.push(user_message.clone());
+            if !self.persist_user_message(&user_message, &events) {
+                send(&events, AgentEvent::TurnFinished);
+                continue;
+            }
             let turn_cancel = CancellationToken::new();
             let mut iteration = 0u32;
             let mut end_turn = false;
@@ -153,7 +354,11 @@ impl Agent {
                         message: error.to_string(),
                     });
                 });
-                let provider_future = self.provider.stream_with_retry(&request, on_retry);
+                // Clone the provider handle before constructing the future so
+                // the future does not hold an immutable borrow of `self`
+                // while durable events are appended below.
+                let provider = self.provider.clone();
+                let provider_future = provider.stream_with_retry(&request, on_retry);
                 tokio::pin!(provider_future);
                 let stream_result = loop {
                     tokio::select! {
@@ -168,12 +373,14 @@ impl Agent {
                         },
                         _ = turn_cancel.cancelled() => break None,
                         _ = self.cancel.cancelled() => {
+                            self.persist_cancelled("application shutdown", &events);
                             send(&events, AgentEvent::TurnFinished);
                             return;
                         }
                     }
                 };
                 let Some(stream_result) = stream_result else {
+                    self.persist_cancelled("turn interrupted before response", &events);
                     send(&events, AgentEvent::TurnFinished);
                     end_turn = true;
                     continue;
@@ -181,7 +388,14 @@ impl Agent {
                 let mut stream = match stream_result {
                     Ok(stream) => stream,
                     Err(error) => {
-                        send(&events, AgentEvent::Error(error.to_string()));
+                        let message = error.to_string();
+                        let _ = self.persist_event(
+                            SessionEvent::Error {
+                                message: message.clone(),
+                            },
+                            &events,
+                        );
+                        send(&events, AgentEvent::Error(message));
                         send(&events, AgentEvent::TurnFinished);
                         end_turn = true;
                         continue;
@@ -210,7 +424,22 @@ impl Agent {
                                     send(&events, AgentEvent::ReasoningDelta(delta));
                                 }
                                 Ok(StreamEvent::ToolCallComplete(call)) => tool_calls.push(call),
-                                Ok(StreamEvent::Done { .. }) => {}
+                                Ok(StreamEvent::Done { usage: done_usage, .. }) => {
+                                    if let Some(done_usage) = done_usage {
+                                        let summary = usage_summary(&done_usage);
+                                        let _ = self.persist_event(
+                                            SessionEvent::Usage {
+                                                usage: summary.clone(),
+                                            },
+                                            &events,
+                                        );
+                                        if let Some(state) = self.session.as_ref() {
+                                            send(&events, usage_event(&state.session.metadata.usage));
+                                        } else {
+                                            send(&events, usage_event(&summary));
+                                        }
+                                    }
+                                }
                                 Err(error) => {
                                     stream_error = Some(error.to_string());
                                     break;
@@ -238,7 +467,18 @@ impl Agent {
                 }
 
                 if cancelled {
-                    append_assistant(&mut self.history, &reasoning, &text, tool_calls);
+                    append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
+                    let _ = self.persist_assistant(&reasoning, &text, &tool_calls, &events);
+                    for call in &tool_calls {
+                        let cancelled_result = "cancelled before tool execution";
+                        self.history.push(Message::tool_result(
+                            call.id.clone(),
+                            cancelled_result,
+                            true,
+                        ));
+                        let _ = self.persist_tool_result(call, cancelled_result, true, &events);
+                    }
+                    self.persist_cancelled("turn interrupted", &events);
                     send(&events, AgentEvent::TurnFinished);
                     if self.cancel.is_cancelled() {
                         return;
@@ -248,8 +488,24 @@ impl Agent {
                 }
 
                 append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
+                let _ = self.persist_assistant(&reasoning, &text, &tool_calls, &events);
 
                 if let Some(error) = stream_error {
+                    for call in &tool_calls {
+                        let error_result = format!("provider stream interrupted: {error}");
+                        self.history.push(Message::tool_result(
+                            call.id.clone(),
+                            error_result.clone(),
+                            true,
+                        ));
+                        let _ = self.persist_tool_result(call, &error_result, true, &events);
+                    }
+                    let _ = self.persist_event(
+                        SessionEvent::Error {
+                            message: error.clone(),
+                        },
+                        &events,
+                    );
                     send(&events, AgentEvent::Error(error));
                     send(&events, AgentEvent::TurnFinished);
                     end_turn = true;
@@ -274,29 +530,40 @@ impl Agent {
                         },
                     );
                     let started = Instant::now();
-                    let tool_future =
-                        self.tools
-                            .execute(&call.name, call.arguments.clone(), turn_cancel.clone());
-                    tokio::pin!(tool_future);
-                    let result = loop {
-                        tokio::select! {
-                            result = &mut tool_future => break Some(result),
-                            message = input.recv(), if input_open => match message {
-                                Some(InputMessage::Interrupt) => {
+                    let result = {
+                        let tool_future = self.tools.execute(
+                            &call.name,
+                            call.arguments.clone(),
+                            turn_cancel.clone(),
+                        );
+                        tokio::pin!(tool_future);
+                        loop {
+                            tokio::select! {
+                                result = &mut tool_future => break Some(result),
+                                message = input.recv(), if input_open => match message {
+                                    Some(InputMessage::Interrupt) => {
+                                        turn_cancel.cancel();
+                                        break None;
+                                    }
+                                    Some(message) => queued.push_back(message),
+                                    None => input_open = false,
+                                },
+                                _ = turn_cancel.cancelled() => break None,
+                                _ = self.cancel.cancelled() => {
                                     turn_cancel.cancel();
                                     break None;
                                 }
-                                Some(message) => queued.push_back(message),
-                                None => input_open = false,
-                            },
-                            _ = turn_cancel.cancelled() => break None,
-                            _ = self.cancel.cancelled() => {
-                                turn_cancel.cancel();
-                                break None;
                             }
                         }
                     };
                     let Some(result) = result else {
+                        let cancelled_output = "cancelled".to_owned();
+                        self.history.push(Message::tool_result(
+                            call.id.clone(),
+                            cancelled_output.clone(),
+                            true,
+                        ));
+                        let _ = self.persist_tool_result(&call, &cancelled_output, true, &events);
                         send(
                             &events,
                             AgentEvent::ToolCallFinished {
@@ -305,9 +572,10 @@ impl Agent {
                                 ok: false,
                                 duration_ms: started.elapsed().as_millis() as u64,
                                 output: String::new(),
-                                error: Some("cancelled".into()),
+                                error: Some(cancelled_output),
                             },
                         );
+                        self.persist_cancelled("tool execution interrupted", &events);
                         send(&events, AgentEvent::TurnFinished);
                         if self.cancel.is_cancelled() {
                             return;
@@ -328,24 +596,239 @@ impl Agent {
                             error,
                         },
                     );
+                    let result_content = result.content.clone();
+                    let result_is_error = result.is_error;
                     self.history.push(Message {
                         role: Role::Tool,
                         content: vec![Content::ToolResult {
-                            tool_call_id: call.id,
-                            content: result.content,
-                            is_error: result.is_error,
+                            tool_call_id: call.id.clone(),
+                            content: result_content.clone(),
+                            is_error: result_is_error,
                         }],
                     });
+                    let _ =
+                        self.persist_tool_result(&call, &result_content, result_is_error, &events);
                 }
 
                 if !end_turn && iteration >= 100 {
                     let note = "max tool iterations reached";
                     self.history.push(Message::user(note));
+                    let _ = self.persist_event(
+                        SessionEvent::Error {
+                            message: note.into(),
+                        },
+                        &events,
+                    );
                     send(&events, AgentEvent::TextDelta(note.into()));
                     send(&events, AgentEvent::TurnFinished);
                     end_turn = true;
                 }
             }
+        }
+    }
+
+    fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let Some(store) = self.session.as_ref().map(|state| state.store.clone()) else {
+            self.history.clear();
+            send(
+                events,
+                AgentEvent::Notice("Started a new conversation".into()),
+            );
+            return;
+        };
+        let session = match store.create(SessionCreateOptions {
+            provider: Some(self.provider.name().to_owned()),
+            model: Some(self.model.clone()),
+            ..SessionCreateOptions::default()
+        }) {
+            Ok(session) => session,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(format!("could not create session: {error}")),
+                );
+                return;
+            }
+        };
+        let id = session.id().to_string();
+        let title = session.metadata.title.clone();
+        self.history.clear();
+        self.session = Some(crate::agent::AgentSessionState { store, session });
+        send(
+            events,
+            AgentEvent::SessionChanged {
+                id,
+                title,
+                loaded: false,
+            },
+        );
+        send(
+            events,
+            AgentEvent::Notice("Started a new conversation".into()),
+        );
+    }
+
+    fn handle_load_session(
+        &mut self,
+        selector: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let Some(store) = self.session.as_ref().map(|state| state.store.clone()) else {
+            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            return;
+        };
+        let mut session = match store.load(&selector) {
+            Ok(session) => session,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(format!("could not load session: {error}")),
+                );
+                return;
+            }
+        };
+        if !session
+            .file_path()
+            .is_some_and(|path| store.is_path_in_store(path))
+        {
+            match store.adopt(&session) {
+                Ok(adopted) => session = adopted,
+                Err(error) => {
+                    send(
+                        events,
+                        AgentEvent::Error(format!("could not adopt loaded session: {error}")),
+                    );
+                    return;
+                }
+            }
+        }
+        if let Err(error) = store.repair_incomplete_tool_calls(&mut session) {
+            send(
+                events,
+                AgentEvent::Error(format!("could not repair loaded session: {error}")),
+            );
+            return;
+        }
+        if let Err(error) = store.set_current(&session) {
+            send(
+                events,
+                AgentEvent::Error(format!("could not update current session: {error}")),
+            );
+            return;
+        }
+        let id = session.id().to_string();
+        let title = session.metadata.title.clone();
+        self.history = session.context_messages();
+        self.session = Some(crate::agent::AgentSessionState { store, session });
+        send(
+            events,
+            AgentEvent::SessionChanged {
+                id,
+                title,
+                loaded: true,
+            },
+        );
+        if let Some(state) = self.session.as_ref() {
+            send(events, usage_event(&state.session.metadata.usage));
+        }
+        send(
+            events,
+            AgentEvent::Notice(format!(
+                "Loaded session; active model remains {} · {}",
+                self.provider.name(),
+                self.model
+            )),
+        );
+    }
+
+    fn handle_list_sessions(&self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let Some(store) = self.session.as_ref().map(|state| state.store.clone()) else {
+            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            return;
+        };
+        match store.list() {
+            Ok(entries) => send(
+                events,
+                AgentEvent::SessionList {
+                    sessions: entries
+                        .into_iter()
+                        .map(|entry| SessionListItem {
+                            id: entry.id.to_string(),
+                            short_id: entry.short_id,
+                            title: entry.title,
+                            updated_at: entry.updated_at,
+                            workspace: entry.workspace_root.display().to_string(),
+                            provider: entry.provider,
+                            model: entry.model,
+                        })
+                        .collect(),
+                },
+            ),
+            Err(error) => send(
+                events,
+                AgentEvent::Error(format!("could not list sessions: {error}")),
+            ),
+        }
+    }
+
+    fn handle_export_session(
+        &self,
+        destination: Option<String>,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let Some(session) = self.session.as_ref().map(|state| state.session.clone()) else {
+            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            return;
+        };
+        let destination = destination.map(PathBuf::from);
+        match export_jsonl(&session, destination.as_deref(), &ExportOptions::default()) {
+            Ok(path) => {
+                let path = path.display().to_string();
+                send(events, AgentEvent::SessionExported { path: path.clone() });
+                send(
+                    events,
+                    AgentEvent::Notice(format!("Exported session to {path}")),
+                );
+            }
+            Err(error) => send(
+                events,
+                AgentEvent::Error(format!("could not export session: {error}")),
+            ),
+        }
+    }
+
+    fn handle_compact_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let Some(state) = self.session.as_mut() else {
+            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            return;
+        };
+        let policy = CompactionPolicy::default();
+        let Some(result) = state.session.compact(&policy) else {
+            send(
+                events,
+                AgentEvent::Notice("session does not need compaction yet".into()),
+            );
+            return;
+        };
+        let summary_bytes = result.summary.len();
+        match state.store.append_event(
+            &mut state.session,
+            SessionEvent::CompactionSummary {
+                summary: result.summary,
+                compacted_through: result.compacted_through,
+            },
+        ) {
+            Ok(_) => send(
+                events,
+                AgentEvent::CompactionFinished {
+                    compacted_through: result.compacted_through,
+                    summary_bytes,
+                },
+            ),
+            Err(error) => send(
+                events,
+                AgentEvent::Error(format!("could not compact session: {error}")),
+            ),
         }
     }
 
@@ -394,6 +877,13 @@ impl Agent {
             self.provider = provider;
         }
         self.model = model.clone();
+        let _ = self.persist_event(
+            SessionEvent::ModelChange {
+                provider: canonical.clone(),
+                model: model.clone(),
+            },
+            events,
+        );
         if let Err(error) = save_settings(&canonical, &model) {
             tracing::warn!(error = %error, "could not persist model settings");
         }
@@ -453,6 +943,10 @@ fn spawn_model_list(
     });
 }
 
+fn content_is_empty(message: &Message) -> bool {
+    message.content.is_empty()
+}
+
 fn append_assistant(history: &mut Vec<Message>, reasoning: &str, text: &str, calls: Vec<ToolCall>) {
     if reasoning.is_empty() && text.is_empty() && calls.is_empty() {
         return;
@@ -491,6 +985,24 @@ fn cap_utf8(value: &str, max_bytes: usize) -> String {
     format!("{}{suffix}", &value[..end])
 }
 
+fn usage_event(usage: &session::UsageSummary) -> AgentEvent {
+    AgentEvent::UsageUpdated {
+        input_tokens: usage.input_tokens,
+        output_tokens: usage.output_tokens,
+        cached_tokens: usage.cached_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        cost: format_cost(usage.cost),
+    }
+}
+
+fn format_cost(cost: f64) -> String {
+    if cost == 0.0 {
+        "0".into()
+    } else {
+        format!("{cost:.6}")
+    }
+}
+
 fn send(events: &mpsc::UnboundedSender<AgentEvent>, event: AgentEvent) {
     let _ = events.send(event);
 }
@@ -504,6 +1016,7 @@ mod tests {
     use llm::{EventStream, LlmError, ModelInfo, Usage};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tempfile::tempdir;
 
     struct MockProvider {
         calls: AtomicUsize,
@@ -562,6 +1075,58 @@ mod tests {
         });
         assert!(events.contains(&AgentEvent::TextDelta("hello".into())));
         assert!(events.contains(&AgentEvent::TurnFinished));
+    }
+
+    #[test]
+    fn durable_session_can_be_loaded_after_a_turn() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = store
+                .create(SessionCreateOptions {
+                    provider: Some("mock".into()),
+                    model: Some("demo".into()),
+                    ..SessionCreateOptions::default()
+                })
+                .unwrap();
+            let provider = MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![vec![
+                    StreamEvent::ReasoningDelta("thinking".into()),
+                    StreamEvent::TextDelta("answer".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: Some(Usage {
+                            input_tokens: 3,
+                            output_tokens: 2,
+                            ..Usage::default()
+                        }),
+                    },
+                ]],
+            };
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, _event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("hello".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel)
+                .with_session(store.clone(), session.clone())
+                .run(input_rx, event_tx)
+                .await;
+            let loaded = store.open(&session.id()).unwrap();
+            assert_eq!(loaded.context_messages().len(), 2);
+            assert_eq!(loaded.metadata.usage.input_tokens, 3);
+            assert!(
+                loaded
+                    .events
+                    .iter()
+                    .any(|record| matches!(record.event, SessionEvent::AssistantMessage { .. }))
+            );
+        });
     }
 
     #[test]
