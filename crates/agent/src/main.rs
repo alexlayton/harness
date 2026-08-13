@@ -1,6 +1,7 @@
 use agent::agent::{Agent, AgentEvent};
-use agent::config::{Cli, Config, ProviderArg, build_provider, init_logging};
+use agent::config::{Cli, Config, ProviderArg, build_provider_with_auth, init_logging};
 use agent::tools::{ToolConfig, default_registry};
+use auth::CopilotAuth;
 use clap::Parser;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
@@ -15,7 +16,16 @@ async fn main() -> anyhow::Result<()> {
     init_logging()?;
     let config = Config::resolve(&cli)?;
 
-    let provider: Arc<dyn Provider> = build_provider(&config.provider.to_string())?;
+    // Keep one auth handle shared by the provider and agent.  Other providers
+    // do not touch auth.json, while Copilot remains constructible without a
+    // credential so the first `/auth` can run.
+    let copilot_auth = if config.provider == ProviderArg::GithubCopilot {
+        Some(Arc::new(CopilotAuth::from_default()?))
+    } else {
+        None
+    };
+    let provider: Arc<dyn Provider> =
+        build_provider_with_auth(&config.provider.to_string(), copilot_auth.clone())?;
     let provider_name = provider.name().to_owned();
     let workspace_root = std::fs::canonicalize(std::env::current_dir()?)?;
     let tools = default_registry(ToolConfig::new(&workspace_root, config.rtk))?;
@@ -57,8 +67,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
-        .with_session(session_store, session);
+    let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone());
+    let agent = if let Some(auth) = copilot_auth {
+        agent.with_copilot_auth(auth)
+    } else {
+        agent
+    };
+    let agent = agent.with_session(session_store, session);
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     let tui = Tui::new(&config.model, &provider_name, providers)?;

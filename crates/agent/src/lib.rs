@@ -8,6 +8,22 @@ pub use agent::{Agent, AgentEvent};
 impl tui::TuiEvent for AgentEvent {
     fn into_ui_event(self) -> tui::UiEvent {
         match self {
+            AgentEvent::AuthStarted => tui::UiEvent::AuthStarted,
+            AgentEvent::AuthPrompt { message } => tui::UiEvent::AuthPrompt { message },
+            AgentEvent::AuthDeviceCode {
+                verification_url,
+                user_code,
+                expires_in,
+                interval,
+            } => tui::UiEvent::AuthDeviceCode {
+                verification_url,
+                user_code,
+                expires_in,
+                interval,
+            },
+            AgentEvent::AuthProgress { message } => tui::UiEvent::AuthProgress { message },
+            AgentEvent::AuthFinished => tui::UiEvent::AuthFinished,
+            AgentEvent::AuthFailed { message } => tui::UiEvent::AuthFailed { message },
             AgentEvent::TextDelta(value) => tui::UiEvent::TextDelta(value),
             AgentEvent::ReasoningDelta(value) => tui::UiEvent::ReasoningDelta(value),
             AgentEvent::ToolCallStarted {

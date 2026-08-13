@@ -16,6 +16,7 @@ pub struct AnthropicMessagesClient {
     pub base_url: String,
     pub api_key: String,
     extra_headers: HeaderMap,
+    send_api_key_header: bool,
 }
 
 impl AnthropicMessagesClient {
@@ -33,6 +34,23 @@ impl AnthropicMessagesClient {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
             extra_headers,
+            send_api_key_header: true,
+        }
+    }
+
+    /// Construct an Anthropic Messages client for Copilot.  Copilot accepts
+    /// the bearer token but rejects the normal Anthropic `x-api-key` header.
+    pub fn with_bearer_only(
+        base_url: impl Into<String>,
+        bearer_token: impl Into<String>,
+        extra_headers: HeaderMap,
+    ) -> Self {
+        Self {
+            http: Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            api_key: bearer_token.into(),
+            extra_headers,
+            send_api_key_header: false,
         }
     }
 
@@ -69,7 +87,9 @@ impl AnthropicMessagesClient {
         if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.api_key)) {
             headers.insert(AUTHORIZATION, value);
         }
-        if let Ok(value) = HeaderValue::from_str(&self.api_key) {
+        if self.send_api_key_header
+            && let Ok(value) = HeaderValue::from_str(&self.api_key)
+        {
             headers.insert(HeaderName::from_static("x-api-key"), value);
         }
         headers.insert(
@@ -447,6 +467,18 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_only_auth_does_not_send_x_api_key() {
+        let client = AnthropicMessagesClient::with_bearer_only(
+            "https://example.test",
+            "copilot-token",
+            HeaderMap::new(),
+        );
+        let headers = client.headers();
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer copilot-token");
+        assert!(headers.get("x-api-key").is_none());
+    }
 
     #[test]
     fn groups_consecutive_tool_results() {

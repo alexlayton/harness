@@ -16,6 +16,11 @@ pub struct CommandSpec {
 
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        name: "/auth",
+        description: "Authenticate GitHub Copilot",
+        usage: "/auth",
+    },
+    CommandSpec {
         name: "/new",
         description: "Start a new persisted conversation",
         usage: "/new",
@@ -63,6 +68,7 @@ pub struct Candidate {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedCommand {
+    Auth,
     New,
     Load {
         selector: String,
@@ -92,6 +98,13 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
     let mut words = input.split_whitespace();
     let command = words.next().unwrap_or("");
     match command.to_ascii_lowercase().as_str() {
+        "/auth" => {
+            if words.next().is_some() {
+                Err("usage: /auth".into())
+            } else {
+                Ok(ParsedCommand::Auth)
+            }
+        }
         "/new" => {
             if words.next().is_some() {
                 Err("usage: /new".into())
@@ -336,7 +349,7 @@ mod tests {
     fn command_candidates_filter_the_command_token_case_insensitively() {
         let lists = HashMap::new();
         let all = candidates("/", &providers(), &lists, "opencode-go");
-        assert!(all.len() >= 6);
+        assert!(all.len() >= 7);
         assert_eq!(
             candidates("/NE", &providers(), &lists, "opencode-go")[0].value,
             "/new"
@@ -403,6 +416,8 @@ mod tests {
 
     #[test]
     fn parses_success_and_usage_errors() {
+        assert_eq!(parse_command("/auth"), Ok(ParsedCommand::Auth));
+        assert_eq!(parse_command("/auth now"), Err("usage: /auth".into()));
         assert_eq!(parse_command("/new"), Ok(ParsedCommand::New));
         assert_eq!(
             parse_command("/load"),

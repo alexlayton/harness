@@ -689,6 +689,12 @@ impl Tui {
         self.add_notice(format!("⌘ {input}"));
         self.push_history_and_clear_input(input);
         match command {
+            ParsedCommand::Auth => {
+                self.busy = true;
+                input_tx
+                    .send(InputMessage::Authenticate)
+                    .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+            }
             ParsedCommand::New => input_tx
                 .send(InputMessage::NewConversation)
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,
@@ -852,6 +858,44 @@ impl Tui {
 
     fn apply_event(&mut self, event: UiEvent) -> Result<()> {
         match event {
+            UiEvent::AuthStarted => {
+                self.busy = true;
+                self.retrying = None;
+                self.add_notice(
+                    "GitHub Copilot login\nWaiting for authorization...\nPress Ctrl+C to cancel.",
+                );
+            }
+            UiEvent::AuthPrompt { message } => {
+                self.busy = true;
+                self.add_notice(message);
+            }
+            UiEvent::AuthDeviceCode {
+                verification_url,
+                user_code,
+                expires_in,
+                interval,
+            } => {
+                self.busy = true;
+                self.add_notice(format!(
+                    "GitHub Copilot login\n\nOpen:\n{verification_url}\n\nEnter code:\n{user_code}\n\nWaiting for authorization...\nExpires in {expires_in}s · polling every {interval}s\nPress Ctrl+C to cancel."
+                ));
+            }
+            UiEvent::AuthProgress { message } => {
+                self.busy = true;
+                self.add_notice(message);
+            }
+            UiEvent::AuthFinished => {
+                self.busy = false;
+                self.retrying = None;
+                self.add_notice(
+                    "GitHub Copilot authentication complete. Use /model to choose a model.",
+                );
+            }
+            UiEvent::AuthFailed { message } => {
+                self.busy = false;
+                self.retrying = None;
+                self.add_error(message);
+            }
             UiEvent::TextDelta(delta) => {
                 if delta.is_empty() {
                     return Ok(());

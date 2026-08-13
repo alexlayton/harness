@@ -1,6 +1,7 @@
-use crate::config::{build_provider, save_settings};
+use crate::config::{build_provider_with_auth, save_settings};
 use crate::prompt::system_prompt_with_tools;
 use crate::tools::{ToolRegistry, call_summary};
+use auth::{AuthEvent, CopilotAuth};
 use futures_util::StreamExt;
 use llm::{
     CompletionRequest, Content, Message, Provider, RetryCallback, Role, StreamEvent, ToolCall,
@@ -19,6 +20,23 @@ use tui::InputMessage;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
+    AuthStarted,
+    AuthPrompt {
+        message: String,
+    },
+    AuthDeviceCode {
+        verification_url: String,
+        user_code: String,
+        expires_in: u64,
+        interval: u64,
+    },
+    AuthProgress {
+        message: String,
+    },
+    AuthFinished,
+    AuthFailed {
+        message: String,
+    },
     TextDelta(String),
     ReasoningDelta(String),
     ToolCallStarted {
@@ -128,6 +146,9 @@ pub struct Agent {
     pub history: Vec<Message>,
     pub cancel: CancellationToken,
     pub session: Option<AgentSessionState>,
+    /// Shared with the Copilot provider so `/auth` and automatic refreshes are
+    /// visible without rebuilding the agent.
+    pub copilot_auth: Option<Arc<CopilotAuth>>,
 }
 
 impl Agent {
@@ -144,12 +165,22 @@ impl Agent {
             history: Vec::new(),
             cancel,
             session: None,
+            copilot_auth: None,
         }
     }
 
     pub fn with_history(mut self, history: Vec<Message>) -> Self {
         self.history = history;
         self
+    }
+
+    pub fn with_copilot_auth(mut self, auth: Arc<CopilotAuth>) -> Self {
+        self.copilot_auth = Some(auth);
+        self
+    }
+
+    pub fn with_auth(self, auth: Arc<CopilotAuth>) -> Self {
+        self.with_copilot_auth(auth)
     }
 
     /// Attach a loaded/new durable session.  Active provider/model selection
@@ -323,6 +354,15 @@ impl Agent {
                 break;
             };
             let user_text = match message {
+                InputMessage::Authenticate => {
+                    if self
+                        .handle_authentication(&mut input, &mut queued, &mut input_open, &events)
+                        .await
+                    {
+                        return;
+                    }
+                    continue;
+                }
                 InputMessage::Message(text) if !text.trim().is_empty() => text,
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
@@ -659,6 +699,104 @@ impl Agent {
         }
     }
 
+    /// Run device authentication while retaining ordinary input in the
+    /// in-memory queue.  Ctrl+C cancels only the auth token; application
+    /// shutdown remains the separate `self.cancel` path.
+    async fn handle_authentication(
+        &mut self,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+        queued: &mut VecDeque<InputMessage>,
+        input_open: &mut bool,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> bool {
+        let auth = if let Some(auth) = self.copilot_auth.clone() {
+            auth
+        } else {
+            match CopilotAuth::from_default() {
+                Ok(auth) => {
+                    let auth = Arc::new(auth);
+                    self.copilot_auth = Some(auth.clone());
+                    auth
+                }
+                Err(error) => {
+                    send(
+                        events,
+                        AgentEvent::AuthFailed {
+                            message: format!("could not open GitHub Copilot auth store: {error}"),
+                        },
+                    );
+                    return false;
+                }
+            }
+        };
+
+        send(events, AgentEvent::AuthStarted);
+        let enterprise_domain = std::env::var("HARNESS_GITHUB_ENTERPRISE_DOMAIN").ok();
+        let auth_cancel = CancellationToken::new();
+        let worker_cancel = auth_cancel.clone();
+        let worker_events = events.clone();
+        let worker_auth = auth.clone();
+        let mut worker = tokio::spawn(async move {
+            worker_auth
+                .login_with_events(enterprise_domain.as_deref(), &worker_cancel, |event| {
+                    if let Some(event) = auth_event_to_agent(event) {
+                        send(&worker_events, event);
+                    }
+                })
+                .await
+        });
+
+        let outcome = loop {
+            tokio::select! {
+                result = &mut worker => break Some(result),
+                message = input.recv(), if *input_open => match message {
+                    Some(InputMessage::Interrupt) => auth_cancel.cancel(),
+                    Some(message) => queued.push_back(message),
+                    None => *input_open = false,
+                },
+                _ = self.cancel.cancelled() => {
+                    auth_cancel.cancel();
+                    worker.abort();
+                    let _ = worker.await;
+                    return true;
+                }
+            }
+        };
+
+        match outcome {
+            Some(Ok(Ok(_credential))) => {
+                send(events, AgentEvent::AuthFinished);
+                match build_provider_with_auth("github-copilot", Some(auth)) {
+                    Ok(provider) => {
+                        spawn_model_list("github-copilot".into(), provider, events.clone())
+                    }
+                    Err(error) => send(
+                        events,
+                        AgentEvent::Notice(format!(
+                            "authenticated, but could not refresh Copilot models: {error}"
+                        )),
+                    ),
+                }
+            }
+            Some(Ok(Err(error))) => {
+                send(
+                    events,
+                    AgentEvent::AuthFailed {
+                        message: error.to_string(),
+                    },
+                );
+            }
+            Some(Err(error)) => send(
+                events,
+                AgentEvent::AuthFailed {
+                    message: format!("authentication task failed: {error}"),
+                },
+            ),
+            None => {}
+        }
+        false
+    }
+
     fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
         let Some(store) = self.session.as_ref().map(|state| state.store.clone()) else {
             self.history.clear();
@@ -878,7 +1016,35 @@ impl Agent {
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        self.handle_set_model_with_factory(provider, model, events, build_provider);
+        let needs_auth = provider
+            .as_deref()
+            .and_then(crate::config::ProviderArg::from_name)
+            == Some(crate::config::ProviderArg::GithubCopilot)
+            || self.provider.name() == "github-copilot";
+        let mut auth = self.copilot_auth.clone();
+        if needs_auth && auth.is_none() {
+            match CopilotAuth::from_default() {
+                Ok(value) => {
+                    let value = Arc::new(value);
+                    self.copilot_auth = Some(value.clone());
+                    auth = Some(value);
+                }
+                Err(error) => {
+                    send(events, AgentEvent::Error(error.to_string()));
+                    return;
+                }
+            }
+        }
+        self.handle_set_model_with_factory(provider, model, events, move |name| {
+            let copilot_auth = if crate::config::ProviderArg::from_name(name)
+                == Some(crate::config::ProviderArg::GithubCopilot)
+            {
+                auth.clone()
+            } else {
+                None
+            };
+            build_provider_with_auth(name, copilot_auth)
+        });
     }
 
     fn handle_set_model_with_factory<F>(
@@ -947,7 +1113,12 @@ impl Agent {
             .find(|known| known.to_string().eq_ignore_ascii_case(&provider))
             .map(ToString::to_string)
             .unwrap_or(provider.clone());
-        let provider = match build_provider(&provider_name) {
+        let auth = if provider_name == "github-copilot" {
+            self.copilot_auth.clone()
+        } else {
+            None
+        };
+        let provider = match build_provider_with_auth(&provider_name, auth) {
             Ok(provider) => provider,
             Err(error) => {
                 send(
@@ -958,6 +1129,28 @@ impl Agent {
             }
         };
         spawn_model_list(provider_name, provider, events.clone());
+    }
+}
+
+fn auth_event_to_agent(event: AuthEvent) -> Option<AgentEvent> {
+    match event {
+        AuthEvent::DeviceCode {
+            verification_url,
+            user_code,
+            expires_in,
+            interval,
+        } => Some(AgentEvent::AuthDeviceCode {
+            verification_url,
+            user_code,
+            expires_in,
+            interval,
+        }),
+        AuthEvent::Prompt { message } => Some(AgentEvent::AuthPrompt { message }),
+        AuthEvent::Progress { message } => Some(AgentEvent::AuthProgress { message }),
+        // The worker result is translated once below, after persistence has
+        // succeeded or failed.  Ignoring this callback event avoids rendering
+        // duplicate failure notices.
+        AuthEvent::Failed { .. } | AuthEvent::Started | AuthEvent::Finished => None,
     }
 }
 

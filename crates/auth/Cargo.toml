@@ -1,22 +1,17 @@
 [package]
-name = "llm"
+name = "auth"
 version = "0.1.0"
 edition = "2024"
+description = "GitHub Copilot authentication and private credential storage for Harness"
 
 [dependencies]
-auth = { path = "../auth" }
-async-stream = "0.3"
-async-trait = "0.1"
-bytes = "1"
-eventsource-stream = "0.2"
-futures-core = "0.3"
-futures-util = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "time"] }
-tracing = "0.1"
+tokio-util = "0.7"
+url = "2"
 
 [dev-dependencies]
 tempfile = "3"

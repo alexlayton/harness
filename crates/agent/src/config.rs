@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow};
+use auth::CopilotAuth;
 use clap::{Parser, ValueEnum};
 use llm::Provider;
-use llm::providers::{OpenCodeGoProvider, OpenRouterProvider};
+use llm::providers::{GithubCopilotProvider, OpenCodeGoProvider, OpenRouterProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -17,17 +18,20 @@ pub enum ProviderArg {
     OpencodeGo,
     #[value(name = "openrouter")]
     Openrouter,
+    #[value(name = "github-copilot")]
+    GithubCopilot,
 }
 
 impl ProviderArg {
     /// All provider names understood by the command line, configuration file,
     /// and command completion UI.
-    pub const ALL: &[ProviderArg] = &[Self::OpencodeGo, Self::Openrouter];
+    pub const ALL: &[ProviderArg] = &[Self::OpencodeGo, Self::Openrouter, Self::GithubCopilot];
 
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "opencode-go" => Some(Self::OpencodeGo),
             "openrouter" => Some(Self::Openrouter),
+            "github-copilot" | "githubcopilot" => Some(Self::GithubCopilot),
             _ => None,
         }
     }
@@ -38,6 +42,11 @@ impl ProviderArg {
         match self {
             Self::OpencodeGo => &["OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"],
             Self::Openrouter => &["OPENROUTER_API_KEY"],
+            // Copilot credentials are stored in auth.json rather than in the
+            // environment or config.toml.  This value is retained as a
+            // compatibility hint for embedders that display provider help;
+            // resolution itself does not require it.
+            Self::GithubCopilot => &["COPILOT_GITHUB_TOKEN"],
         }
     }
 
@@ -49,6 +58,7 @@ impl ProviderArg {
         match self {
             Self::OpencodeGo => "gpt-5.6-luna",
             Self::Openrouter => "openai/gpt-5.6-luna",
+            Self::GithubCopilot => "gpt-5.4",
         }
     }
 }
@@ -58,6 +68,7 @@ impl fmt::Display for ProviderArg {
         formatter.write_str(match self {
             Self::OpencodeGo => "opencode-go",
             Self::Openrouter => "openrouter",
+            Self::GithubCopilot => "github-copilot",
         })
     }
 }
@@ -249,6 +260,7 @@ impl Config {
         Self::resolve_from_file(cli, &file, path, |provider| match provider {
             ProviderArg::OpencodeGo => opencode_go_key.or(opencode_key).map(str::to_owned),
             ProviderArg::Openrouter => openrouter_key.map(str::to_owned),
+            ProviderArg::GithubCopilot => None,
         })
     }
 
@@ -279,9 +291,18 @@ impl Config {
             .provider
             .or(file_provider)
             .unwrap_or(ProviderArg::OpencodeGo);
+        // GitHub Copilot authenticates through the private auth store and is
+        // intentionally constructible before the first login.  Existing API
+        // key providers retain their old environment-only requirement.
         let api_key = key_for(provider)
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow!("missing API key: set {}", provider.env_vars().join(" or ")))?;
+            .unwrap_or_default();
+        if provider != ProviderArg::GithubCopilot && api_key.is_empty() {
+            return Err(anyhow!(
+                "missing API key: set {}",
+                provider.env_vars().join(" or ")
+            ));
+        }
         let model = cli
             .model
             .clone()
@@ -307,13 +328,39 @@ fn env_api_key(provider: ProviderArg) -> Option<String> {
 
 /// Construct a provider from its stable configuration/command name.
 pub fn build_provider(name: &str) -> Result<Arc<dyn Provider>> {
-    let provider = ProviderArg::from_name(name)
-        .ok_or_else(|| anyhow!("unknown provider: {name} (expected opencode-go or openrouter)"))?;
-    let api_key = env_api_key(provider)
-        .ok_or_else(|| anyhow!("missing API key: set {}", provider.env_vars().join(" or ")))?;
+    build_provider_with_auth(name, None)
+}
+
+/// Construct a provider while reusing the auth state owned by the agent.  The
+/// shared handle is important for first-login and token refreshes: rebuilding
+/// a Copilot provider must not hide a credential written by `/auth`.
+pub fn build_provider_with_auth(
+    name: &str,
+    copilot_auth: Option<Arc<CopilotAuth>>,
+) -> Result<Arc<dyn Provider>> {
+    let provider = ProviderArg::from_name(name).ok_or_else(|| {
+        anyhow!("unknown provider: {name} (expected opencode-go, openrouter, or github-copilot)")
+    })?;
     Ok(match provider {
-        ProviderArg::OpencodeGo => Arc::new(OpenCodeGoProvider::new(api_key)),
-        ProviderArg::Openrouter => Arc::new(OpenRouterProvider::new(api_key)),
+        ProviderArg::OpencodeGo => {
+            let api_key = env_api_key(provider).ok_or_else(|| {
+                anyhow!("missing API key: set {}", provider.env_vars().join(" or "))
+            })?;
+            Arc::new(OpenCodeGoProvider::new(api_key)) as Arc<dyn Provider>
+        }
+        ProviderArg::Openrouter => {
+            let api_key = env_api_key(provider).ok_or_else(|| {
+                anyhow!("missing API key: set {}", provider.env_vars().join(" or "))
+            })?;
+            Arc::new(OpenRouterProvider::new(api_key)) as Arc<dyn Provider>
+        }
+        ProviderArg::GithubCopilot => {
+            let auth = match copilot_auth {
+                Some(auth) => auth,
+                None => Arc::new(CopilotAuth::from_default()?),
+            };
+            Arc::new(GithubCopilotProvider::new(auth)) as Arc<dyn Provider>
+        }
     })
 }
 
@@ -350,7 +397,7 @@ mod tests {
             PathBuf::from("/tmp/harness-config.toml"),
             |provider| match provider {
                 ProviderArg::OpencodeGo => Some("secret".into()),
-                ProviderArg::Openrouter => None,
+                ProviderArg::Openrouter | ProviderArg::GithubCopilot => None,
             },
         )
         .unwrap();
@@ -373,6 +420,24 @@ mod tests {
     }
 
     #[test]
+    fn copilot_resolves_without_an_api_key() {
+        let cli = Cli {
+            provider: Some(ProviderArg::GithubCopilot),
+            model: None,
+        };
+        let config = Config::resolve_from_file(
+            &cli,
+            &FileConfig::default(),
+            PathBuf::from("/tmp/harness-config.toml"),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(config.provider, ProviderArg::GithubCopilot);
+        assert_eq!(config.model, "gpt-5.4");
+        assert!(config.api_key.is_empty());
+    }
+
+    #[test]
     fn supports_file_precedence_and_unknown_provider_errors() {
         let file = FileConfig {
             provider: Some("openrouter".into()),
@@ -389,7 +454,7 @@ mod tests {
             PathBuf::from("/tmp/harness-config.toml"),
             |provider| match provider {
                 ProviderArg::Openrouter => Some("secret".into()),
-                ProviderArg::OpencodeGo => None,
+                ProviderArg::OpencodeGo | ProviderArg::GithubCopilot => None,
             },
         )
         .unwrap();

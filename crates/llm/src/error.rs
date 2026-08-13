@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum LlmError {
     #[error("http {status}: {body}")]
     Http { status: u16, body: String },
+    #[error("authentication: {0}")]
+    Auth(String),
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
     #[error("stream: {0}")]
@@ -20,7 +22,7 @@ impl LlmError {
             // is therefore safe to retry it (and covers connect and timeout errors).
             Self::Network(_) => true,
             Self::Http { status, .. } => *status == 429 || (500..=599).contains(status),
-            Self::Stream(_) | Self::Parse(_) => false,
+            Self::Auth(_) | Self::Stream(_) | Self::Parse(_) => false,
         }
     }
 
