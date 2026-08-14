@@ -4,46 +4,67 @@
 //! owns the editor and cached lists, while the agent remains responsible for
 //! validating providers and executing the resulting semantic messages.
 
-use crate::ModelEntry;
+use crate::{ModelEntry, SessionListEntry};
 use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgumentKind {
+    None,
+    Model,
+    Session,
+    Path,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub description: &'static str,
     pub usage: &'static str,
+    pub argument_kind: ArgumentKind,
 }
 
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        name: "/auth",
+        description: "Authenticate GitHub Copilot",
+        usage: "/auth",
+        argument_kind: ArgumentKind::None,
+    },
+    CommandSpec {
         name: "/new",
         description: "Start a new persisted conversation",
         usage: "/new",
+        argument_kind: ArgumentKind::None,
     },
     CommandSpec {
         name: "/load",
         description: "Load a session by ID, path, or latest",
         usage: "/load [<id>|latest|<path>]",
+        argument_kind: ArgumentKind::Session,
     },
     CommandSpec {
         name: "/sessions",
         description: "List sessions for this workspace",
         usage: "/sessions",
+        argument_kind: ArgumentKind::None,
     },
     CommandSpec {
         name: "/export",
         description: "Export the current session to JSONL",
         usage: "/export [<path>]",
+        argument_kind: ArgumentKind::Path,
     },
     CommandSpec {
         name: "/compact",
         description: "Compact older local session context",
         usage: "/compact",
+        argument_kind: ArgumentKind::None,
     },
     CommandSpec {
         name: "/model",
         description: "Set the model (and provider) to use",
         usage: "/model [<provider>:]<model>",
+        argument_kind: ArgumentKind::Model,
     },
 ];
 
@@ -59,6 +80,28 @@ pub struct Candidate {
     pub value: String,
     pub description: String,
     pub kind: CandidateKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionTarget {
+    Command,
+    Argument(ArgumentKind),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionContext {
+    pub target: CompletionTarget,
+    /// Byte offsets into the single-line command being completed.
+    pub token_start: usize,
+    pub token_end: usize,
+    /// Text in the active token before the cursor.
+    pub query: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionResult {
+    pub context: CompletionContext,
+    pub candidates: Vec<Candidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,33 +209,39 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
     }
 }
 
-/// Return completion candidates for the current single-line editor value.
-pub fn candidates(
-    input: &str,
-    providers: &[String],
-    model_lists: &HashMap<String, Vec<ModelEntry>>,
-    current_provider: &str,
-) -> Vec<Candidate> {
+/// Find the command completion context at a character-based cursor column.
+///
+/// `tui-textarea` reports character columns while Rust string slicing uses
+/// byte offsets, so the context deliberately stores byte offsets and performs
+/// the conversion in one place.
+pub fn completion_context(input: &str, cursor_col: usize) -> Option<CompletionContext> {
     if !is_command_input(input) {
-        return Vec::new();
+        return None;
     }
 
+    let cursor_byte = byte_index_at_char(input, cursor_col);
     let Some(command_end) = input.find(char::is_whitespace) else {
-        let token = input.to_ascii_lowercase();
-        return COMMANDS
-            .iter()
-            .filter(|command| command.name.to_ascii_lowercase().starts_with(&token))
-            .map(|command| Candidate {
-                value: command.name.to_owned(),
-                description: command.description.to_owned(),
-                kind: CandidateKind::Slash,
-            })
-            .collect();
+        return Some(CompletionContext {
+            target: CompletionTarget::Command,
+            token_start: 0,
+            token_end: input.len(),
+            query: input[..cursor_byte].to_owned(),
+        });
     };
 
+    if cursor_byte <= command_end {
+        return Some(CompletionContext {
+            target: CompletionTarget::Command,
+            token_start: 0,
+            token_end: command_end,
+            query: input[..cursor_byte].to_owned(),
+        });
+    }
+
     let command = &input[..command_end];
-    if !command.eq_ignore_ascii_case("/model") {
-        return Vec::new();
+    let spec = command_spec(command)?;
+    if spec.argument_kind == ArgumentKind::None {
+        return None;
     }
 
     let token_start = input[command_end..]
@@ -203,8 +252,142 @@ pub fn candidates(
         .find(char::is_whitespace)
         .map(|offset| token_start + offset)
         .unwrap_or(input.len());
-    let token = &input[token_start..token_end];
 
+    // These commands accept one argument. Once the cursor has moved into a
+    // later argument, it is better to close completion than to replace the
+    // wrong token.
+    if cursor_byte > token_end {
+        return None;
+    }
+
+    let query_start = cursor_byte.clamp(token_start, token_end);
+    Some(CompletionContext {
+        target: CompletionTarget::Argument(spec.argument_kind),
+        token_start,
+        token_end,
+        query: input[token_start..query_start].to_owned(),
+    })
+}
+
+/// Return completion candidates for a cursor-aware command input.
+pub fn candidates_at_cursor(
+    input: &str,
+    cursor_col: usize,
+    providers: &[String],
+    model_lists: &HashMap<String, Vec<ModelEntry>>,
+    current_provider: &str,
+    sessions: &[SessionListEntry],
+) -> Option<CompletionResult> {
+    let context = completion_context(input, cursor_col)?;
+    let cursor_byte = byte_index_at_char(input, cursor_col);
+    let query = token_prefix(input, &context, cursor_byte);
+    let candidates = match context.target {
+        CompletionTarget::Command => command_candidates(query),
+        CompletionTarget::Argument(ArgumentKind::Model) => {
+            model_candidates(query, providers, model_lists, current_provider)
+        }
+        CompletionTarget::Argument(ArgumentKind::Session) => session_candidates(query, sessions),
+        CompletionTarget::Argument(ArgumentKind::Path)
+        | CompletionTarget::Argument(ArgumentKind::None) => Vec::new(),
+    };
+
+    Some(CompletionResult {
+        context,
+        candidates,
+    })
+}
+
+/// Compatibility wrapper for callers that only need candidates at the end of
+/// the input and do not have cached session data.
+pub fn candidates(
+    input: &str,
+    providers: &[String],
+    model_lists: &HashMap<String, Vec<ModelEntry>>,
+    current_provider: &str,
+) -> Vec<Candidate> {
+    candidates_at_cursor(
+        input,
+        input.chars().count(),
+        providers,
+        model_lists,
+        current_provider,
+        &[],
+    )
+    .map(|result| result.candidates)
+    .unwrap_or_default()
+}
+
+pub fn command_spec(name: &str) -> Option<&'static CommandSpec> {
+    COMMANDS
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(name))
+}
+
+/// Apply a slash-command candidate and return the new line plus a character
+/// cursor column. The command name gets a separator only when its command
+/// accepts arguments; file candidates get a separator when completed at the
+/// end of their token.
+pub fn apply_completion(
+    line: &str,
+    cursor_col: usize,
+    context: &CompletionContext,
+    candidate: &Candidate,
+) -> Option<(String, usize)> {
+    if context.token_start > context.token_end
+        || context.token_end > line.len()
+        || !line.is_char_boundary(context.token_start)
+        || !line.is_char_boundary(context.token_end)
+    {
+        return None;
+    }
+
+    let cursor_byte = byte_index_at_char(line, cursor_col);
+    let before = &line[..context.token_start];
+    let after = &line[context.token_end..];
+    let next_is_whitespace = after.chars().next().is_some_and(char::is_whitespace);
+    let at_token_end = cursor_byte == context.token_end;
+
+    let separator = match context.target {
+        CompletionTarget::Command => command_spec(&candidate.value)
+            .is_some_and(|command| command.argument_kind != ArgumentKind::None)
+            .then_some(" ")
+            .filter(|_| !next_is_whitespace)
+            .unwrap_or(""),
+        CompletionTarget::Argument(_) if candidate.kind == CandidateKind::File && at_token_end => {
+            if next_is_whitespace {
+                ""
+            } else {
+                " "
+            }
+        }
+        CompletionTarget::Argument(_) => "",
+    };
+
+    let replacement = format!("{}{}{}{}", before, candidate.value, separator, after);
+    let new_cursor =
+        before.chars().count() + candidate.value.chars().count() + separator.chars().count();
+    Some((replacement, new_cursor))
+}
+
+fn command_candidates(query: &str) -> Vec<Candidate> {
+    let query = query.to_ascii_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|command| command.name.to_ascii_lowercase().starts_with(&query))
+        .map(|command| Candidate {
+            value: command.name.to_owned(),
+            description: command.description.to_owned(),
+            kind: CandidateKind::Slash,
+        })
+        .collect()
+}
+
+fn model_candidates(
+    token: &str,
+    providers: &[String],
+    model_lists: &HashMap<String, Vec<ModelEntry>>,
+    current_provider: &str,
+) -> Vec<Candidate> {
     let mut results = Vec::<(bool, Candidate)>::new();
     let mut seen = HashSet::new();
 
@@ -289,6 +472,68 @@ pub fn candidates(
         .collect()
 }
 
+fn session_candidates(query: &str, sessions: &[SessionListEntry]) -> Vec<Candidate> {
+    let query = query.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    if "latest".starts_with(&query) {
+        candidates.push(Candidate {
+            value: "latest".into(),
+            description: "most recent non-empty session".into(),
+            kind: CandidateKind::Slash,
+        });
+    }
+
+    let mut seen = HashSet::from(["latest".to_owned()]);
+    for session in sessions {
+        let value = if session.short_id.is_empty() {
+            session.id.clone()
+        } else {
+            session.short_id.clone()
+        };
+        if value.is_empty()
+            || !value.to_ascii_lowercase().starts_with(&query)
+            || !seen.insert(value.clone())
+        {
+            continue;
+        }
+        let title = session
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("untitled");
+        candidates.push(Candidate {
+            value,
+            description: format!("{title} · {}", session.updated_at),
+            kind: CandidateKind::Slash,
+        });
+    }
+    candidates.sort_by(|a, b| {
+        (a.value != "latest")
+            .cmp(&(b.value != "latest"))
+            .then_with(|| {
+                a.value
+                    .to_ascii_lowercase()
+                    .cmp(&b.value.to_ascii_lowercase())
+            })
+            .then_with(|| a.value.cmp(&b.value))
+    });
+    candidates
+}
+
+fn token_prefix<'a>(input: &'a str, context: &CompletionContext, cursor_byte: usize) -> &'a str {
+    let start = context.token_start.min(input.len());
+    let end = cursor_byte.clamp(start, context.token_end.min(input.len()));
+    &input[start..end]
+}
+
+fn byte_index_at_char(input: &str, column: usize) -> usize {
+    input
+        .char_indices()
+        .nth(column)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len())
+}
+
 fn model_description(model: &ModelEntry) -> String {
     let label = model
         .name
@@ -332,6 +577,18 @@ mod tests {
         vec!["opencode-go".into(), "openrouter".into()]
     }
 
+    fn session(short_id: &str, title: Option<&str>) -> SessionListEntry {
+        SessionListEntry {
+            id: format!("{short_id}-full"),
+            short_id: short_id.into(),
+            title: title.map(str::to_owned),
+            updated_at: "2026-08-13 12:00".into(),
+            workspace: "/workspace".into(),
+            provider: Some("openrouter".into()),
+            model: Some("demo".into()),
+        }
+    }
+
     #[test]
     fn command_candidates_filter_the_command_token_case_insensitively() {
         let lists = HashMap::new();
@@ -361,6 +618,171 @@ mod tests {
         assert!(values.contains(&"opencode-go:".into()));
         assert!(values.contains(&"openrouter:".into()));
         assert!(values.contains(&"gpt-5.6-luna".into()));
+    }
+
+    #[test]
+    fn command_completion_adds_the_argument_space_and_keeps_the_cursor_after_it() {
+        let lists = HashMap::new();
+        let result = candidates_at_cursor(
+            "/mod",
+            "/mod".chars().count(),
+            &providers(),
+            &lists,
+            "opencode-go",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(result.context.target, CompletionTarget::Command);
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "/model")
+            .unwrap();
+        let (line, cursor) = apply_completion("/mod", 4, &result.context, candidate).unwrap();
+        assert_eq!(line, "/model ");
+        assert_eq!(cursor, 7);
+
+        let result =
+            candidates_at_cursor("/au", 3, &providers(), &lists, "opencode-go", &[]).unwrap();
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "/auth")
+            .unwrap();
+        let (line, cursor) = apply_completion("/au", 3, &result.context, candidate).unwrap();
+        assert_eq!(line, "/auth");
+        assert_eq!(cursor, 5);
+    }
+
+    #[test]
+    fn argument_completion_replaces_only_the_active_token_and_preserves_suffix() {
+        let lists = HashMap::from([(
+            "opencode-go".into(),
+            vec![model("gpt-new", Some("GPT New"), None)],
+        )]);
+        let input = "/model gpt tail";
+        let cursor = "/model gpt".chars().count();
+        let result =
+            candidates_at_cursor(input, cursor, &providers(), &lists, "opencode-go", &[]).unwrap();
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "gpt-new")
+            .unwrap();
+        let (line, new_cursor) =
+            apply_completion(input, cursor, &result.context, candidate).unwrap();
+        assert_eq!(line, "/model gpt-new tail");
+        assert_eq!(new_cursor, "/model gpt-new".chars().count());
+    }
+
+    #[test]
+    fn provider_completion_leaves_the_cursor_after_the_colon() {
+        let lists = HashMap::new();
+        let input = "/model open";
+        let result = candidates_at_cursor(
+            input,
+            input.chars().count(),
+            &providers(),
+            &lists,
+            "opencode-go",
+            &[],
+        )
+        .unwrap();
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "openrouter:")
+            .unwrap();
+        let (line, cursor) =
+            apply_completion(input, input.chars().count(), &result.context, candidate).unwrap();
+        assert_eq!(line, "/model openrouter:");
+        assert_eq!(cursor, line.chars().count());
+    }
+
+    #[test]
+    fn path_completion_adds_a_space_after_a_file_but_not_a_directory() {
+        let lists = HashMap::new();
+        let input = "/export src/ma";
+        let result = candidates_at_cursor(
+            input,
+            input.chars().count(),
+            &providers(),
+            &lists,
+            "opencode-go",
+            &[],
+        )
+        .unwrap();
+        let file = Candidate {
+            value: "src/main.rs".into(),
+            description: "file".into(),
+            kind: CandidateKind::File,
+        };
+        let (line, cursor) =
+            apply_completion(input, input.chars().count(), &result.context, &file).unwrap();
+        assert_eq!(line, "/export src/main.rs ");
+        assert_eq!(cursor, line.chars().count());
+
+        let directory = Candidate {
+            value: "src/".into(),
+            description: "directory".into(),
+            kind: CandidateKind::Directory,
+        };
+        let (line, cursor) =
+            apply_completion(input, input.chars().count(), &result.context, &directory).unwrap();
+        assert_eq!(line, "/export src/");
+        assert_eq!(cursor, line.chars().count());
+    }
+
+    #[test]
+    fn session_candidates_include_latest_and_cached_sessions() {
+        let lists = HashMap::new();
+        let sessions = vec![session("abc123", Some("Fix completion"))];
+        let result = candidates_at_cursor(
+            "/load ",
+            "/load ".chars().count(),
+            &providers(),
+            &lists,
+            "opencode-go",
+            &sessions,
+        )
+        .unwrap();
+        let values = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(values.first(), Some(&"latest"));
+        assert!(values.contains(&"abc123"));
+        assert!(
+            result
+                .candidates
+                .iter()
+                .any(|candidate| candidate.description.contains("Fix completion"))
+        );
+    }
+
+    #[test]
+    fn unicode_cursor_columns_are_kept_character_based() {
+        let lists = HashMap::new();
+        let input = "/model ☃";
+        let result = candidates_at_cursor(
+            input,
+            input.chars().count(),
+            &providers(),
+            &lists,
+            "opencode-go",
+            &[],
+        )
+        .unwrap();
+        let candidate = Candidate {
+            value: "replacement".into(),
+            description: String::new(),
+            kind: CandidateKind::Slash,
+        };
+        let (line, cursor) =
+            apply_completion(input, input.chars().count(), &result.context, &candidate).unwrap();
+        assert_eq!(line, "/model replacement");
+        assert_eq!(cursor, line.chars().count());
     }
 
     #[test]

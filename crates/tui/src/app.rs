@@ -4,7 +4,7 @@ use crate::environment::EnvironmentInfo;
 use crate::input::{InputAction, classify, history_next, history_previous, push_history};
 use crate::render::{self, Theme};
 use crate::state::{EntryId, Focus, ScrollState, ToolRecord, ToolStatus, TranscriptEntry};
-use crate::{InputMessage, ModelEntry, SessionSnapshotEntry, TuiEvent, UiEvent};
+use crate::{InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, TuiEvent, UiEvent};
 use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Paragraph;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -37,12 +37,14 @@ struct Completion {
     selected: usize,
     offset: usize,
     kind: CompletionKind,
+    context: Option<commands::CompletionContext>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionKind {
     Slash,
     Files,
+    Paths,
 }
 
 #[derive(Debug)]
@@ -50,6 +52,8 @@ struct FileCompletionResult {
     generation: u64,
     query: String,
     candidates: Vec<Candidate>,
+    kind: CompletionKind,
+    context: Option<commands::CompletionContext>,
 }
 
 pub struct Tui {
@@ -59,6 +63,8 @@ pub struct Tui {
     provider: String,
     providers: Vec<String>,
     model_lists: HashMap<String, Vec<ModelEntry>>,
+    session_candidates: Vec<SessionListEntry>,
+    session_completion_requested: bool,
     workspace_root: PathBuf,
     environment: EnvironmentInfo,
 
@@ -133,6 +139,8 @@ impl Tui {
             provider: provider.to_owned(),
             providers,
             model_lists: HashMap::new(),
+            session_candidates: Vec::new(),
+            session_completion_requested: false,
             workspace_root,
             environment,
             completion: None,
@@ -291,6 +299,7 @@ impl Tui {
                 self.draft.clear();
                 self.textarea.input(event);
                 self.refresh_completion();
+                self.request_session_completion(input_tx)?;
             }
             InputAction::Submit => {
                 let input = self.textarea.lines().join("\n");
@@ -316,6 +325,7 @@ impl Tui {
                     self.draft.clear();
                     self.textarea.input(event);
                     self.refresh_completion();
+                    self.request_session_completion(input_tx)?;
                 }
             }
             InputAction::Edit => {
@@ -326,6 +336,7 @@ impl Tui {
                     self.focus = Focus::Prompt;
                 }
                 self.refresh_completion();
+                self.request_session_completion(input_tx)?;
             }
             InputAction::Ignore => {}
         }
@@ -449,12 +460,12 @@ impl Tui {
     }
 
     fn accept_completion(&mut self, input_tx: &mpsc::UnboundedSender<InputMessage>) -> Result<()> {
-        let Some((candidate, kind)) = self.completion.as_ref().and_then(|completion| {
+        let Some((candidate, kind, context)) = self.completion.as_ref().and_then(|completion| {
             completion
                 .candidates
                 .get(completion.selected)
                 .cloned()
-                .map(|candidate| (candidate, completion.kind))
+                .map(|candidate| (candidate, completion.kind, completion.context.clone()))
         }) else {
             return Ok(());
         };
@@ -463,10 +474,27 @@ impl Tui {
             self.accept_file_completion(&candidate);
             return Ok(());
         }
+        let Some(context) = context else {
+            return Ok(());
+        };
 
-        let input = self.textarea.lines().join("\n");
-        let replacement = replace_current_command_token(&input, &candidate.value);
-        self.replace_textarea(&replacement);
+        let (line_index, cursor_col) = self.textarea.cursor();
+        let Some(line) = self.textarea.lines().get(line_index) else {
+            return Ok(());
+        };
+        let Some((replacement, new_cursor_col)) =
+            commands::apply_completion(line, cursor_col, &context, &candidate)
+        else {
+            return Ok(());
+        };
+        let mut lines = self.textarea.lines().to_vec();
+        lines[line_index] = replacement;
+        let text = lines.join("\n");
+        self.textarea = textarea_with_text_at_cursor(&text, line_index, new_cursor_col);
+
+        let no_argument_command = matches!(context.target, commands::CompletionTarget::Command)
+            && commands::command_spec(&candidate.value)
+                .is_some_and(|command| command.argument_kind == commands::ArgumentKind::None);
         let provider_to_fetch = candidate
             .value
             .strip_suffix(':')
@@ -476,7 +504,14 @@ impl Tui {
                     .any(|known| known.eq_ignore_ascii_case(provider))
             })
             .map(str::to_owned);
+
         self.refresh_completion();
+        self.request_session_completion(input_tx)?;
+        if no_argument_command {
+            self.close_completion();
+            return Ok(());
+        }
+
         if let Some(provider) = provider_to_fetch
             && !self.model_lists.contains_key(&provider)
         {
@@ -491,6 +526,7 @@ impl Tui {
                     selected: 0,
                     offset: 0,
                     kind: CompletionKind::Slash,
+                    context: self.current_command_context(),
                 });
             }
         }
@@ -519,40 +555,63 @@ impl Tui {
     fn refresh_completion(&mut self) {
         let input = self.textarea.lines().join("\n");
         if commands::is_command_input(&input) {
+            let old_value = self.completion.as_ref().and_then(|completion| {
+                completion
+                    .candidates
+                    .get(completion.selected)
+                    .map(|candidate| candidate.value.clone())
+            });
             self.cancel_file_completion();
-            let candidates =
-                commands::candidates(&input, &self.providers, &self.model_lists, &self.provider);
-            if candidates.is_empty() {
+            let (_, cursor_col) = self.textarea.cursor();
+            let Some(result) = commands::candidates_at_cursor(
+                &input,
+                cursor_col,
+                &self.providers,
+                &self.model_lists,
+                &self.provider,
+                &self.session_candidates,
+            ) else {
+                self.completion = None;
+                return;
+            };
+
+            let path_completion = matches!(
+                result.context.target,
+                commands::CompletionTarget::Argument(
+                    commands::ArgumentKind::Session | commands::ArgumentKind::Path
+                )
+            );
+            if path_completion {
+                self.request_command_path_completion(result.context, result.candidates, old_value);
+                return;
+            }
+
+            if result.candidates.is_empty() {
                 self.completion = None;
                 return;
             }
-            let old_value = self.completion.as_ref().and_then(|completion| {
-                (completion.kind == CompletionKind::Slash).then(|| {
-                    completion
-                        .candidates
-                        .get(completion.selected)
-                        .map(|candidate| candidate.value.as_str())
-                })
-            });
             let selected = old_value
-                .flatten()
+                .as_deref()
                 .and_then(|value| {
-                    candidates
+                    result
+                        .candidates
                         .iter()
                         .position(|candidate| candidate.value == value)
                 })
                 .unwrap_or(0)
-                .min(candidates.len().saturating_sub(1));
+                .min(result.candidates.len().saturating_sub(1));
             self.completion = Some(Completion {
-                candidates,
+                candidates: result.candidates,
                 selected,
                 offset: 0,
                 kind: CompletionKind::Slash,
+                context: Some(result.context),
             });
             self.keep_completion_visible();
             return;
         }
 
+        self.session_completion_requested = false;
         let (line_index, cursor_col) = self.textarea.cursor();
         let Some(line) = self.textarea.lines().get(line_index) else {
             self.close_completion();
@@ -563,6 +622,37 @@ impl Tui {
             return;
         };
         self.request_file_completion(prefix.query);
+    }
+
+    fn request_session_completion(
+        &mut self,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<()> {
+        let Some(context) = self.current_command_context() else {
+            self.session_completion_requested = false;
+            return Ok(());
+        };
+        let is_session_context = matches!(
+            context.target,
+            commands::CompletionTarget::Argument(commands::ArgumentKind::Session)
+        );
+        if !is_session_context {
+            self.session_completion_requested = false;
+            return Ok(());
+        }
+        if self.session_candidates.is_empty() && !self.session_completion_requested {
+            input_tx
+                .send(InputMessage::ListSessions)
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+            self.session_completion_requested = true;
+        }
+        Ok(())
+    }
+
+    fn current_command_context(&self) -> Option<commands::CompletionContext> {
+        let input = self.textarea.lines().join("\n");
+        let (_, cursor_col) = self.textarea.cursor();
+        commands::completion_context(&input, cursor_col)
     }
 
     fn request_file_completion(&mut self, query: String) {
@@ -589,6 +679,7 @@ impl Tui {
             selected: 0,
             offset: 0,
             kind: CompletionKind::Files,
+            context: None,
         });
 
         tokio::spawn(async move {
@@ -608,6 +699,74 @@ impl Tui {
                 generation,
                 query,
                 candidates,
+                kind: CompletionKind::Files,
+                context: None,
+            });
+        });
+    }
+
+    fn request_command_path_completion(
+        &mut self,
+        context: commands::CompletionContext,
+        initial_candidates: Vec<Candidate>,
+        preferred_value: Option<String>,
+    ) {
+        let query = context.query.clone();
+        if self.file_completion_query.as_deref() == Some(query.as_str())
+            && self.completion.as_ref().is_some_and(|completion| {
+                completion.kind == CompletionKind::Paths
+                    && completion.context.as_ref() == Some(&context)
+            })
+        {
+            return;
+        }
+
+        self.cancel_file_completion();
+        let generation = self.file_completion_generation;
+        let cancel = CancellationToken::new();
+        let scan_cancel = cancel.clone();
+        let root = self.workspace_root.clone();
+        let sender = self.file_completion_tx.clone();
+        let scan_query = query.clone();
+        let selected = preferred_value
+            .as_deref()
+            .and_then(|value| {
+                initial_candidates
+                    .iter()
+                    .position(|candidate| candidate.value == value)
+            })
+            .unwrap_or(0)
+            .min(initial_candidates.len().saturating_sub(1));
+        self.file_completion_cancel = Some(cancel.clone());
+        self.file_completion_query = Some(query.clone());
+        self.completion = Some(Completion {
+            candidates: initial_candidates,
+            selected,
+            offset: 0,
+            kind: CompletionKind::Paths,
+            context: Some(context.clone()),
+        });
+        self.keep_completion_visible();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            let candidates = tokio::task::spawn_blocking(move || {
+                attachments::find_path_candidates(&root, &scan_query, &scan_cancel)
+            })
+            .await
+            .unwrap_or_default();
+            if cancel.is_cancelled() {
+                return;
+            }
+            let _ = sender.send(FileCompletionResult {
+                generation,
+                query,
+                candidates,
+                kind: CompletionKind::Paths,
+                context: Some(context),
             });
         });
     }
@@ -620,23 +779,64 @@ impl Tui {
         let Some(line) = self.textarea.lines().get(line_index) else {
             return;
         };
-        let Some(prefix) = attachments::extract_at_prefix(line, cursor_col) else {
-            return;
-        };
-        if prefix.query != result.query {
-            return;
+
+        if result.kind == CompletionKind::Files {
+            let Some(prefix) = attachments::extract_at_prefix(line, cursor_col) else {
+                return;
+            };
+            if prefix.query != result.query {
+                return;
+            }
+        } else {
+            let Some(context) = commands::completion_context(line, cursor_col) else {
+                return;
+            };
+            if result.context.as_ref() != Some(&context) {
+                return;
+            }
         }
 
         self.file_completion_cancel = None;
-        if result.candidates.is_empty() {
+        let old_value = self.completion.as_ref().and_then(|completion| {
+            completion
+                .candidates
+                .get(completion.selected)
+                .map(|candidate| candidate.value.clone())
+        });
+        let candidates = if result.kind == CompletionKind::Paths {
+            let static_candidates = commands::candidates_at_cursor(
+                line,
+                cursor_col,
+                &self.providers,
+                &self.model_lists,
+                &self.provider,
+                &self.session_candidates,
+            )
+            .map(|result| result.candidates)
+            .unwrap_or_default();
+            merge_candidates(static_candidates, result.candidates)
+        } else {
+            result.candidates
+        };
+        if candidates.is_empty() {
             self.completion = None;
             return;
         }
+        let selected = old_value
+            .as_deref()
+            .and_then(|value| {
+                candidates
+                    .iter()
+                    .position(|candidate| candidate.value == value)
+            })
+            .unwrap_or(0)
+            .min(candidates.len().saturating_sub(1));
         self.completion = Some(Completion {
-            candidates: result.candidates,
-            selected: 0,
+            candidates,
+            selected,
             offset: 0,
-            kind: CompletionKind::Files,
+            kind: result.kind,
+            context: result.context,
         });
         self.keep_completion_visible();
     }
@@ -647,11 +847,12 @@ impl Tui {
         }
         self.file_completion_query = None;
         self.file_completion_generation = self.file_completion_generation.wrapping_add(1);
-        if self
-            .completion
-            .as_ref()
-            .is_some_and(|completion| completion.kind == CompletionKind::Files)
-        {
+        if self.completion.as_ref().is_some_and(|completion| {
+            matches!(
+                completion.kind,
+                CompletionKind::Files | CompletionKind::Paths
+            )
+        }) {
             self.completion = None;
         }
     }
@@ -960,6 +1161,7 @@ impl Tui {
                 self.retrying = Some(attempt);
             }
             UiEvent::Error(error) => {
+                self.session_completion_requested = false;
                 self.add_error(error);
                 self.running_tool = None;
                 self.streaming_assistant = None;
@@ -994,6 +1196,8 @@ impl Tui {
                 }
             }
             UiEvent::SessionChanged { id, title, loaded } => {
+                self.session_candidates.clear();
+                self.session_completion_requested = false;
                 self.session_id = Some(id.clone());
                 self.session_title = title;
                 self.transcript.clear();
@@ -1056,6 +1260,8 @@ impl Tui {
                 self.transcript_changed();
             }
             UiEvent::SessionList { sessions } => {
+                self.session_candidates = sessions.clone();
+                self.session_completion_requested = false;
                 let notice = if sessions.is_empty() {
                     "No sessions for this workspace".to_owned()
                 } else {
@@ -1074,6 +1280,9 @@ impl Tui {
                         .join("\n")
                 };
                 self.add_notice(notice);
+                if commands::is_command_input(&self.textarea.lines().join("\n")) {
+                    self.refresh_completion();
+                }
             }
             UiEvent::SessionExported { path } => {
                 self.add_notice(format!("exported session to {path}"));
@@ -1415,19 +1624,13 @@ fn truncate_display(value: &str, width: usize) -> String {
     result
 }
 
-fn replace_current_command_token(input: &str, value: &str) -> String {
-    let Some(command_end) = input.find(char::is_whitespace) else {
-        return value.to_owned();
-    };
-    let token_start = input[command_end..]
-        .find(|character: char| !character.is_whitespace())
-        .map(|offset| command_end + offset)
-        .unwrap_or(input.len());
-    let token_end = input[token_start..]
-        .find(char::is_whitespace)
-        .map(|offset| token_start + offset)
-        .unwrap_or(input.len());
-    format!("{}{}{}", &input[..token_start], value, &input[token_end..])
+fn merge_candidates(primary: Vec<Candidate>, secondary: Vec<Candidate>) -> Vec<Candidate> {
+    let mut seen = HashSet::new();
+    primary
+        .into_iter()
+        .chain(secondary)
+        .filter(|candidate| seen.insert(candidate.value.clone()))
+        .collect()
 }
 
 fn new_textarea() -> TextArea<'static> {

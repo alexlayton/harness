@@ -7,7 +7,8 @@
 
 use crate::commands::{Candidate, CandidateKind};
 use ignore::{DirEntry, WalkBuilder};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
 
 /// Maximum number of file/directory candidates returned by one scan.
@@ -42,15 +43,17 @@ pub struct AtPrefix {
     pub query: String,
 }
 
-/// Find the active `@` token in a line at the supplied byte cursor column.
+/// Find the active `@` token in a line at the supplied character cursor
+/// column. The returned token offsets are byte offsets because they are used
+/// for Rust string slicing.
 ///
 /// A reference begins at the start of the line or after whitespace/punctuation
 /// and may not contain whitespace before the cursor. The whole token is
 /// returned as the replacement range so accepting a result also works when the
 /// cursor is in the middle of an existing reference.
 pub fn extract_at_prefix(line: &str, cursor_col: usize) -> Option<AtPrefix> {
-    let cursor_col = clamp_char_boundary(line, cursor_col);
-    let before_cursor = &line[..cursor_col];
+    let cursor_byte = byte_index_at_char(line, cursor_col);
+    let before_cursor = &line[..cursor_byte];
     let at = before_cursor.rfind('@')?;
 
     if at > 0 {
@@ -60,15 +63,15 @@ pub fn extract_at_prefix(line: &str, cursor_col: usize) -> Option<AtPrefix> {
         }
     }
 
-    let query = &line[at + 1..cursor_col];
+    let query = &line[at + 1..cursor_byte];
     if query.chars().any(char::is_whitespace) {
         return None;
     }
 
-    let token_end = line[cursor_col..]
+    let token_end = line[cursor_byte..]
         .char_indices()
         .find(|(_, character)| character.is_whitespace())
-        .map(|(offset, _)| cursor_col + offset)
+        .map(|(offset, _)| cursor_byte + offset)
         .unwrap_or(line.len());
 
     Some(AtPrefix {
@@ -88,8 +91,8 @@ pub fn replace_at_token(
     is_directory: bool,
 ) -> Option<(String, usize)> {
     let prefix = extract_at_prefix(line, cursor_col)?;
-    let cursor_col = clamp_char_boundary(line, cursor_col);
-    let suffix = if !is_directory && prefix.token_end == cursor_col {
+    let cursor_byte = byte_index_at_char(line, cursor_col);
+    let suffix = if !is_directory && prefix.token_end == cursor_byte {
         " "
     } else {
         ""
@@ -101,7 +104,8 @@ pub fn replace_at_token(
         suffix,
         &line[prefix.token_end..]
     );
-    let new_cursor = prefix.token_start + value.len() + suffix.len();
+    let new_cursor =
+        line[..prefix.token_start].chars().count() + value.chars().count() + suffix.chars().count();
     Some((replacement, new_cursor))
 }
 
@@ -203,6 +207,117 @@ pub fn find_candidates(root: &Path, query: &str, cancel: &CancellationToken) -> 
         .collect()
 }
 
+/// Return filesystem candidates for command arguments such as `/export src/ma`
+/// or `/load ./session`. Unlike `find_candidates`, values do not have an `@`
+/// prefix and preserve the path spelling supplied by the user.
+pub fn find_path_candidates(
+    root: &Path,
+    query: &str,
+    cancel: &CancellationToken,
+) -> Vec<Candidate> {
+    let query = query.replace('\\', "/");
+    let Some((display_dir, directory, partial)) = split_path_query(root, &query) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+
+    let mut matches = Vec::new();
+    for entry in entries {
+        if cancel.is_cancelled() {
+            return Vec::new();
+        }
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if name.chars().any(char::is_whitespace)
+            || BUILT_IN_IGNORED_DIRECTORIES.contains(&name.as_str())
+        {
+            continue;
+        }
+        let is_directory = file_type.is_dir();
+        let Some(score) = score_path(&name, &partial, is_directory) else {
+            continue;
+        };
+        let value = format!(
+            "{}{}{}",
+            display_dir,
+            name,
+            if is_directory { "/" } else { "" }
+        );
+        matches.push((score, is_directory, value));
+    }
+
+    matches.sort_by(
+        |(score_a, directory_a, value_a), (score_b, directory_b, value_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| directory_b.cmp(directory_a))
+                .then_with(|| {
+                    value_a
+                        .to_ascii_lowercase()
+                        .cmp(&value_b.to_ascii_lowercase())
+                })
+                .then_with(|| value_a.cmp(value_b))
+        },
+    );
+    matches
+        .into_iter()
+        .take(MAX_FILE_CANDIDATES)
+        .map(|(_, is_directory, value)| Candidate {
+            value,
+            description: if is_directory {
+                "directory".into()
+            } else {
+                "file".into()
+            },
+            kind: if is_directory {
+                CandidateKind::Directory
+            } else {
+                CandidateKind::File
+            },
+        })
+        .collect()
+}
+
+fn split_path_query(root: &Path, query: &str) -> Option<(String, PathBuf, String)> {
+    if query == "~" {
+        let home = std::env::var_os("HOME")?;
+        return Some(("~/".into(), PathBuf::from(home), String::new()));
+    }
+
+    let (display_dir, partial) = if query.ends_with('/') {
+        (query.to_owned(), String::new())
+    } else if let Some(slash) = query.rfind('/') {
+        (query[..=slash].to_owned(), query[slash + 1..].to_owned())
+    } else {
+        (String::new(), query.to_owned())
+    };
+    let directory = resolve_path(root, &display_dir)?;
+    Some((display_dir, directory, partial))
+}
+
+fn resolve_path(root: &Path, display_path: &str) -> Option<PathBuf> {
+    if display_path.is_empty() {
+        return Some(root.to_path_buf());
+    }
+    if display_path == "~/" || display_path.starts_with("~/") {
+        let home = std::env::var_os("HOME")?;
+        return Some(PathBuf::from(home).join(display_path.trim_start_matches("~/")));
+    }
+    if display_path.starts_with('/') || Path::new(display_path).is_absolute() {
+        return Some(PathBuf::from(display_path));
+    }
+    Some(root.join(display_path))
+}
+
 fn should_prune(entry: &DirEntry) -> bool {
     if is_symlink(entry) {
         return true;
@@ -297,12 +412,12 @@ fn subsequence_score(candidate: &str, query: &str) -> Option<i32> {
     Some(100 - gaps.min(100))
 }
 
-fn clamp_char_boundary(value: &str, index: usize) -> usize {
-    let mut index = index.min(value.len());
-    while index > 0 && !value.is_char_boundary(index) {
-        index -= 1;
-    }
-    index
+fn byte_index_at_char(value: &str, column: usize) -> usize {
+    value
+        .char_indices()
+        .nth(column)
+        .map(|(index, _)| index)
+        .unwrap_or(value.len())
 }
 
 #[cfg(test)]
@@ -341,6 +456,17 @@ mod tests {
 
         let (line, _) = replace_at_token("@src", 4, "@src/", true).unwrap();
         assert_eq!(line, "@src/");
+    }
+
+    #[test]
+    fn unicode_before_an_at_reference_uses_character_cursor_columns() {
+        let line = "é @src";
+        let cursor = line.chars().count();
+        let prefix = extract_at_prefix(line, cursor).unwrap();
+        assert_eq!(prefix.query, "src");
+        let (replacement, new_cursor) = replace_at_token(line, cursor, "@main.rs", false).unwrap();
+        assert_eq!(replacement, "é @main.rs ");
+        assert_eq!(new_cursor, replacement.chars().count());
     }
 
     #[test]
@@ -383,10 +509,15 @@ mod tests {
     }
 
     #[test]
-    fn directories_are_candidates_without_file_space_semantics() {
+    fn command_paths_preserve_the_typed_directory_prefix() {
         let directory = tempdir().unwrap();
         fs::create_dir(directory.path().join("src")).unwrap();
         fs::write(directory.path().join("src/main.rs"), "main\n").unwrap();
+        let candidates =
+            find_path_candidates(directory.path(), "src/ma", &CancellationToken::new());
+        assert_eq!(values(&candidates), vec!["src/main.rs"]);
+        assert_eq!(candidates[0].kind, CandidateKind::File);
+
         let candidates = find_candidates(directory.path(), "src", &CancellationToken::new());
         let directory_candidate = candidates
             .iter()
