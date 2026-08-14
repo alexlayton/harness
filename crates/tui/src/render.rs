@@ -69,8 +69,9 @@ pub const DEFAULT_TAIL_LINES: usize = 4;
 pub const KEYMAP: &[(&str, &str)] = &[
     ("Enter", "Submit prompt"),
     ("Shift+Enter", "Insert newline"),
-    ("↑ / k", "Scroll up"),
-    ("↓ / j", "Scroll down"),
+    ("↑ / ↓", "Move through prompt"),
+    ("k / j", "Scroll transcript"),
+    ("Mouse wheel", "Scroll transcript"),
     ("PageUp / PageDown", "Scroll transcript"),
     ("End / Ctrl+End", "Return to bottom"),
     ("Ctrl+O", "Expand / collapse tool"),

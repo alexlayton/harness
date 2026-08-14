@@ -1,14 +1,16 @@
 use crate::attachments;
 use crate::commands::{self, Candidate, CandidateKind, ParsedCommand};
 use crate::environment::EnvironmentInfo;
-use crate::input::{InputAction, classify, history_next, history_previous, push_history};
+use crate::input::{
+    InputAction, classify, history_next, history_previous, mouse_scroll_delta, push_history,
+};
 use crate::render::{self, Theme};
 use crate::state::{EntryId, Focus, ScrollState, ToolRecord, ToolStatus, TranscriptEntry};
 use crate::{InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, TuiEvent, UiEvent};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEventKind, KeyModifiers,
 };
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute, terminal};
@@ -132,9 +134,11 @@ impl Tui {
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
+            EnableMouseCapture,
             cursor::Hide
         ) {
             let _ = terminal::disable_raw_mode();
+            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
             return Err(error).context("configure terminal input");
         }
 
@@ -143,13 +147,13 @@ impl Tui {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = terminal::disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
                 return Err(error).context("create fullscreen terminal");
             }
         };
         if let Err(error) = terminal.clear() {
             let _ = terminal::disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             return Err(error).context("clear fullscreen terminal");
         }
 
@@ -277,6 +281,11 @@ impl Tui {
             return Ok(false);
         }
 
+        if let Some(delta) = mouse_scroll_delta(&event) {
+            self.scroll_transcript(delta);
+            return Ok(false);
+        }
+
         if self.handle_completion_input(&event, input_tx)? {
             return Ok(false);
         }
@@ -382,7 +391,6 @@ impl Tui {
                 if self.navigate_history_up() {
                     return true;
                 }
-                self.scroll_transcript(-1);
                 true
             }
             KeyCode::Down => {
@@ -396,7 +404,6 @@ impl Tui {
                 if self.navigate_history_down() {
                     return true;
                 }
-                self.scroll_transcript(1);
                 true
             }
             KeyCode::Char('k') if key.modifiers.is_empty() && self.textarea.is_empty() => {
@@ -1583,6 +1590,7 @@ impl Tui {
         execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             cursor::Show,
             LeaveAlternateScreen
         )
@@ -1714,6 +1722,7 @@ fn install_panic_hook() {
         let _ = execute!(
             io::stdout(),
             DisableBracketedPaste,
+            DisableMouseCapture,
             cursor::Show,
             LeaveAlternateScreen
         );

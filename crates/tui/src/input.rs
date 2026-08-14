@@ -1,4 +1,6 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+
+pub const MOUSE_SCROLL_LINES: isize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputAction {
@@ -13,6 +15,17 @@ pub enum InputAction {
     FocusTools,
     Edit,
     Ignore,
+}
+
+pub fn mouse_scroll_delta(event: &Event) -> Option<isize> {
+    match event {
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(-MOUSE_SCROLL_LINES),
+            MouseEventKind::ScrollDown => Some(MOUSE_SCROLL_LINES),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 pub fn classify(event: &Event) -> InputAction {
@@ -127,6 +140,17 @@ mod tests {
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_transcript_by_a_small_fixed_step() {
+        let event = Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(mouse_scroll_delta(&event), Some(-MOUSE_SCROLL_LINES));
     }
 
     #[test]
