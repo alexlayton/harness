@@ -57,6 +57,9 @@ impl Default for Theme {
 }
 
 pub const MAX_COMPLETION_ROWS: usize = 8;
+pub const ACTIVITY_FRAMES: &[&str] = &["·", "∙", "•", "●", "•", "∙"];
+const USER_PREFIX: &str = "› ";
+const ASSISTANT_PREFIX: &str = "‹ ";
 pub const SECTION_GAP: usize = 1;
 pub const BLOCK_GAP: usize = 1;
 pub const DEFAULT_TAIL_LINES: usize = 4;
@@ -199,6 +202,12 @@ fn assistant_style(theme: Theme) -> Style {
     Style::default().fg(theme.assistant_text)
 }
 
+fn message_prefix_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD)
+}
+
 fn error_style(theme: Theme) -> Style {
     Style::default().fg(theme.error)
 }
@@ -297,34 +306,92 @@ fn span_style(base: Style, line_style: Style, span_style: Style) -> Style {
     base.patch(line_style).patch(span_style)
 }
 
-/// Wrap a styled Ratatui text value while preserving span styles. This is the
-/// common measurement/rendering path for Markdown and transcript scrolling.
+/// Wrap a styled Ratatui text value while preserving span styles. Text is
+/// wrapped at whitespace when possible; a single word is split only when it
+/// is wider than the available line. This is the common measurement/rendering
+/// path for Markdown and transcript scrolling.
 pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut result = Vec::new();
 
     for source_line in &text.lines {
         let line_base = base.patch(source_line.style);
-        let mut current = Vec::<Span<'static>>::new();
-        let mut current_width = 0usize;
-
+        let mut source_chars = Vec::<(char, Style, usize)>::new();
         for source_span in &source_line.spans {
             let style = span_style(line_base, Style::default(), source_span.style);
-            for character in source_span.content.chars() {
+            source_chars.extend(source_span.content.chars().map(|character| {
                 let character_width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
-                if current_width > 0 && current_width + character_width > width {
-                    result.push(Line::from(std::mem::take(&mut current)));
+                (character, style, character_width)
+            }));
+        }
+
+        if source_chars.is_empty() {
+            result.push(Line::from("").style(line_base));
+            continue;
+        }
+
+        let mut current = Vec::<(char, Style, usize)>::new();
+        let mut current_width = 0usize;
+        let mut pending_whitespace = Vec::<(char, Style, usize)>::new();
+        let mut pending_width = 0usize;
+        let mut index = 0usize;
+
+        while index < source_chars.len() {
+            let is_whitespace = source_chars[index].0.is_whitespace();
+            let start = index;
+            while index < source_chars.len()
+                && source_chars[index].0.is_whitespace() == is_whitespace
+            {
+                index += 1;
+            }
+            let group = &source_chars[start..index];
+            let group_width = group.iter().map(|(_, _, width)| *width).sum::<usize>();
+
+            if is_whitespace {
+                if current.is_empty() {
+                    current.extend_from_slice(group);
+                    current_width = current_width.saturating_add(group_width);
+                } else {
+                    pending_whitespace.extend_from_slice(group);
+                    pending_width = pending_width.saturating_add(group_width);
+                }
+                continue;
+            }
+
+            if !current.is_empty()
+                && current_width
+                    .saturating_add(pending_width)
+                    .saturating_add(group_width)
+                    > width
+            {
+                result.push(wrapped_line(std::mem::take(&mut current)));
+                current_width = 0;
+                pending_whitespace.clear();
+                pending_width = 0;
+            }
+
+            if !pending_whitespace.is_empty() {
+                current_width = current_width.saturating_add(pending_width);
+                current.append(&mut pending_whitespace);
+                pending_width = 0;
+            }
+
+            for &(character, style, character_width) in group {
+                if current_width > 0 && current_width.saturating_add(character_width) > width {
+                    result.push(wrapped_line(std::mem::take(&mut current)));
                     current_width = 0;
                 }
-                push_span(&mut current, character.to_string(), style);
+                current.push((character, style, character_width));
                 current_width = current_width.saturating_add(character_width);
             }
         }
 
+        // Trailing whitespace is not visible and should not create an extra
+        // whitespace-only row when it happens to land at the wrap boundary.
         if current.is_empty() {
             result.push(Line::from("").style(line_base));
         } else {
-            result.push(Line::from(current));
+            result.push(wrapped_line(current));
         }
     }
 
@@ -332,6 +399,14 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
         result.push(Line::from("").style(base));
     }
     result
+}
+
+fn wrapped_line(chars: Vec<(char, Style, usize)>) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (character, style, _) in chars {
+        push_span(&mut spans, character.to_string(), style);
+    }
+    Line::from(spans)
 }
 
 fn plain_text(value: &str, style: Style) -> Text<'static> {
@@ -363,33 +438,64 @@ fn owned_markdown(markdown: &str, theme: Theme) -> Text<'static> {
     Text::from(lines)
 }
 
-fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
-    let text = plain_text(reasoning, muted_style(theme).add_modifier(Modifier::ITALIC));
-    wrap_text(&text, width, Style::default())
+fn prefix_message_lines(
+    lines: Vec<Line<'static>>,
+    prefix: &str,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let prefix_style = message_prefix_style(theme);
+    let continuation = " ".repeat(UnicodeWidthStr::width(prefix));
+    let mut has_prefix = false;
+    lines
         .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            if index == 0 {
-                line
-            } else {
-                let mut spans = vec![Span::raw("  ")];
-                spans.extend(line.spans);
-                Line::from(spans)
+        .map(|line| {
+            if line_width(&line) == 0 {
+                return line;
             }
+            let prefix = if has_prefix {
+                Span::raw(continuation.clone())
+            } else {
+                has_prefix = true;
+                Span::styled(prefix.to_owned(), prefix_style)
+            };
+            Line::from(
+                std::iter::once(prefix)
+                    .chain(line.spans)
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect()
 }
 
+fn message_content_width(width: usize) -> usize {
+    width
+        .saturating_sub(UnicodeWidthStr::width(USER_PREFIX))
+        .max(1)
+}
+
+fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    let text = plain_text(reasoning, muted_style(theme).add_modifier(Modifier::ITALIC));
+    wrap_text(&text, width, Style::default())
+}
+
 fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let text = owned_markdown(markdown, theme);
-    wrap_text(&text, width, assistant_style(theme))
+    prefix_message_lines(
+        wrap_text(&text, message_content_width(width), assistant_style(theme)),
+        ASSISTANT_PREFIX,
+        theme,
+    )
 }
 
 fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
-    wrap_text(
-        &plain_text(input, primary_style(theme)),
-        width,
-        Style::default(),
+    prefix_message_lines(
+        wrap_text(
+            &plain_text(input, primary_style(theme)),
+            message_content_width(width),
+            Style::default(),
+        ),
+        USER_PREFIX,
+        theme,
     )
 }
 
@@ -801,6 +907,27 @@ pub fn render_new_content_indicator(area: Rect, theme: Theme, frame: &mut Frame<
     );
 }
 
+pub fn render_activity(
+    area: Rect,
+    label: &str,
+    frame_index: usize,
+    theme: Theme,
+    frame: &mut Frame<'_>,
+) {
+    if area.width == 0 || area.height == 0 || ACTIVITY_FRAMES.is_empty() {
+        return;
+    }
+    let marker = ACTIVITY_FRAMES[frame_index % ACTIVITY_FRAMES.len()];
+    let line = Line::from(vec![
+        Span::styled(format!("{marker} "), Style::default().fg(theme.accent)),
+        Span::styled(label, dim_style(theme).add_modifier(Modifier::DIM)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(theme.background)),
+        area,
+    );
+}
+
 pub fn input_block(theme: Theme, focused: bool) -> Block<'static> {
     let border = if focused { theme.focus } else { theme.dim_text };
     Block::default()
@@ -1069,6 +1196,47 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_lines_keep_continuations_aligned_with_the_first_line() {
+        let lines = reasoning_lines("first\nsecond", Theme::default(), 40);
+        let values = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(values, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn message_blocks_use_consistent_prefixes_on_wrapped_lines() {
+        let user = user_lines("I can still", Theme::default(), 8);
+        let assistant = markdown_lines("I can still", Theme::default(), 8);
+        let user_values = user
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let assistant_values = assistant
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_values, vec!["› I can", "  still"]);
+        assert_eq!(assistant_values, vec!["‹ I can", "  still"]);
+    }
+
+    #[test]
     fn collapsed_tools_show_the_tail_and_hint() {
         let lines = tool_box_lines(&record(ToolStatus::Success), false, 50, Theme::default());
         let value = lines
@@ -1114,6 +1282,19 @@ mod tests {
     }
 
     #[test]
+    fn activity_indicator_renders_the_current_frame_and_label() {
+        let backend = TestBackend::new(24, 1);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_activity(frame.area(), "Reasoning...", 3, Theme::default(), frame);
+            })
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "●");
+        assert_eq!(terminal.backend().buffer()[(2, 0)].symbol(), "R");
+    }
+
+    #[test]
     fn transcript_can_render_into_a_test_backend() {
         let entries = vec![TranscriptEntry::User {
             id: 1,
@@ -1126,6 +1307,6 @@ mod tests {
                 render_transcript(frame.area(), &entries, false, 0, Theme::default(), frame);
             })
             .unwrap();
-        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "h");
+        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
     }
 }

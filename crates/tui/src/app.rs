@@ -31,6 +31,27 @@ const MAX_INPUT_FRACTION: usize = 30;
 const MAX_HISTORY: usize = 1_000;
 const PLACEHOLDER: &str = "Type your message...";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Activity {
+    Preparing,
+    Working,
+    Reasoning,
+    Processing,
+    Retrying,
+}
+
+impl Activity {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Preparing => "Preparing...",
+            Self::Working => "Working...",
+            Self::Reasoning => "Reasoning...",
+            Self::Processing => "Processing...",
+            Self::Retrying => "Retrying...",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct Completion {
     candidates: Vec<Candidate>,
@@ -91,6 +112,7 @@ pub struct Tui {
     focus: Focus,
 
     spinner: usize,
+    activity: Activity,
     busy: bool,
     retrying: Option<u32>,
     restored: bool,
@@ -163,6 +185,7 @@ impl Tui {
             transcript_dirty: true,
             focus: Focus::Prompt,
             spinner: 0,
+            activity: Activity::Preparing,
             busy: false,
             retrying: None,
             restored: false,
@@ -196,7 +219,7 @@ impl Tui {
     {
         self.draw()?;
         let mut input_events = EventStream::new();
-        let mut spinner_tick = tokio::time::interval(Duration::from_millis(80));
+        let mut spinner_tick = tokio::time::interval(Duration::from_millis(200));
         spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -230,7 +253,7 @@ impl Tui {
                     }
                 }
                 _ = spinner_tick.tick() => {
-                    if self.running_tool.is_some() {
+                    if self.busy {
                         self.spinner = self.spinner.wrapping_add(1);
                         self.draw()?;
                     }
@@ -1047,6 +1070,8 @@ impl Tui {
             .send(InputMessage::Message(input))
             .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
         self.busy = true;
+        self.activity = Activity::Preparing;
+        self.spinner = 0;
         self.retrying = None;
         Ok(())
     }
@@ -1058,6 +1083,7 @@ impl Tui {
                     return Ok(());
                 }
                 self.busy = true;
+                self.activity = Activity::Working;
                 self.retrying = None;
                 if let TranscriptEntry::Assistant { markdown, .. } = self.ensure_assistant() {
                     markdown.push_str(&delta);
@@ -1069,6 +1095,7 @@ impl Tui {
                     return Ok(());
                 }
                 self.busy = true;
+                self.activity = Activity::Reasoning;
                 self.retrying = None;
                 if let TranscriptEntry::Assistant { reasoning, .. } = self.ensure_assistant() {
                     reasoning.push_str(&delta);
@@ -1081,6 +1108,7 @@ impl Tui {
                 arguments,
             } => {
                 self.busy = true;
+                self.activity = Activity::Processing;
                 self.retrying = None;
                 self.streaming_assistant = None;
                 let id = self.allocate_id();
@@ -1110,6 +1138,7 @@ impl Tui {
                 error,
             } => {
                 self.busy = true;
+                self.activity = Activity::Working;
                 let id = self
                     .running_tool
                     .take()
@@ -1158,6 +1187,7 @@ impl Tui {
             }
             UiEvent::Retrying { attempt, .. } => {
                 self.busy = true;
+                self.activity = Activity::Retrying;
                 self.retrying = Some(attempt);
             }
             UiEvent::Error(error) => {
@@ -1166,6 +1196,7 @@ impl Tui {
                 self.running_tool = None;
                 self.streaming_assistant = None;
                 self.busy = false;
+                self.activity = Activity::Preparing;
                 self.retrying = None;
             }
             UiEvent::TurnFinished => {
@@ -1178,6 +1209,7 @@ impl Tui {
                 self.running_tool = None;
                 self.retrying = None;
                 self.busy = false;
+                self.activity = Activity::Preparing;
                 self.focused_tool = None;
                 self.focus = Focus::Prompt;
             }
@@ -1427,7 +1459,11 @@ impl Tui {
             .map(|completion| render::completion_rows(&completion.candidates))
             .unwrap_or(0);
         let requested_indicator_rows = u16::from(self.scroll.new_content_below);
-        let minimum_layout_rows = 1u16.saturating_add(3).saturating_add(1);
+        let activity_rows = u16::from(self.busy);
+        let minimum_layout_rows = 1u16
+            .saturating_add(3)
+            .saturating_add(1)
+            .saturating_add(activity_rows);
         let indicator_rows = if outer.height >= minimum_layout_rows.saturating_add(1) {
             requested_indicator_rows
         } else {
@@ -1440,7 +1476,8 @@ impl Tui {
         let completion_rows = requested_completion_rows.min(completion_capacity);
         let fixed_rows = indicator_rows
             .saturating_add(completion_rows)
-            .saturating_add(1);
+            .saturating_add(1)
+            .saturating_add(activity_rows);
         let available = outer.height.saturating_sub(fixed_rows);
         let max_prompt = ((outer.height as usize * MAX_INPUT_FRACTION) / 100)
             .max(3)
@@ -1489,6 +1526,8 @@ impl Tui {
         let textarea = &self.textarea;
         let prompt_scroll = self.prompt_scroll;
         let theme = self.theme;
+        let activity = self.activity;
+        let spinner = self.spinner;
         let new_content = self.scroll.new_content_below;
 
         self.terminal.draw(|frame| {
@@ -1496,6 +1535,7 @@ impl Tui {
                 Constraint::Length(transcript_rows),
                 Constraint::Length(indicator_rows),
                 Constraint::Length(completion_rows),
+                Constraint::Length(activity_rows),
                 Constraint::Length(1),
                 Constraint::Length(prompt_rows),
             ];
@@ -1518,8 +1558,9 @@ impl Tui {
                     frame,
                 );
             }
+            render::render_activity(chunks[3], activity.label(), spinner, theme, frame);
             render_metadata(
-                chunks[3],
+                chunks[4],
                 &cwd,
                 branch.as_deref(),
                 &provider,
@@ -1527,7 +1568,7 @@ impl Tui {
                 theme,
                 frame,
             );
-            render::render_prompt(chunks[4], textarea, prompt_scroll, theme, frame);
+            render::render_prompt(chunks[5], textarea, prompt_scroll, theme, frame);
         })?;
         Ok(())
     }
