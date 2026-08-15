@@ -311,6 +311,21 @@ fn span_style(base: Style, line_style: Style, span_style: Style) -> Style {
 /// wrapped at whitespace when possible; a single word is split only when it
 /// is wider than the available line. This is the common measurement/rendering
 /// path for Markdown and transcript scrolling.
+///
+/// The wrapping logic deliberately lives here rather than in ratatui.  ratatui
+/// 0.29 keeps its styled reflow machinery private (`widgets::reflow` is a
+/// private `mod`, exposing `WordWrapper`/`LineComposer` only internally), and
+/// `Paragraph::line_count`/`wrap` are gated behind
+/// `#[instability::unstable(feature = "rendered-line-info")]` with the design
+/// explicitly marked "not stable".  A hand-rolled wrapper is also required
+/// because the transcript renderer needs the wrapped `Line`s up front to
+/// compute scroll heights, not at render time.
+///
+/// The break logic is pinned to `textwrap`'s greedy first-fit algorithm by a
+/// differential test; the intentional differences are whitespace handling:
+/// leading whitespace is preserved (and can occupy its own row), internal
+/// whitespace runs are preserved, and trailing whitespace is dropped at a
+/// wrap boundary or the end of the line.
 pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut result = Vec::new();
@@ -1177,6 +1192,7 @@ pub fn render_completion(
 mod tests {
     use super::*;
     use crate::state::{ToolStatus, TranscriptEntry};
+    use proptest::prelude::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use tui_textarea::TextArea;
@@ -1379,5 +1395,97 @@ mod tests {
             })
             .unwrap();
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
+    }
+
+    fn span_contents(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn wrapped_values(text: &str, width: usize) -> Vec<String> {
+        wrap_text(&Text::from(text), width, Style::default())
+            .iter()
+            .map(span_contents)
+            .collect()
+    }
+
+    #[test]
+    fn wrap_text_preserves_leading_and_internal_whitespace_but_drops_trailing() {
+        // Leading and internal runs survive; the trailing space is dropped.
+        let lines = wrap_text(&Text::from("  a  b "), 40, Style::default());
+        assert_eq!(span_contents(&lines[0]), "  a  b");
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn wrap_text_drops_trailing_whitespace_at_boundaries_and_line_end() {
+        // A pending space before a word that does not fit is dropped at the
+        // wrap boundary, and trailing whitespace never starts a new row.
+        assert_eq!(wrapped_values("hello world", 6), vec!["hello", "world"]);
+        assert_eq!(wrapped_values("hello ", 20), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_text_treats_tabs_as_whitespace() {
+        // A tab is whitespace: it separates words and is dropped at a wrap
+        // boundary like any other pending whitespace.
+        assert_eq!(wrapped_values("a\tb", 2), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn wrap_text_breaks_overwide_words_by_display_width() {
+        assert_eq!(wrapped_values("abcdefgh", 4), vec!["abcd", "efgh"]);
+    }
+
+    #[test]
+    fn wrap_text_uses_display_width_for_cjk_breaks() {
+        // Each CJK char is 2 columns wide, so 3 chars fit in a 6-column line.
+        assert_eq!(wrapped_values("日本語日本語", 6), vec!["日本語", "日本語"]);
+    }
+
+    #[test]
+    fn wrap_text_never_loses_characters_of_unbroken_input() {
+        // ZWJ emoji sequences, combining marks, and CJK are broken at the
+        // character level by this wrapper; the round-trip property holds
+        // regardless of where the breaks land.
+        for input in ["👨‍👩‍👧‍👦", "café\u{301}", "日本語テキスト", "aeiou"] {
+            let lines = wrap_text(&Text::from(input), 3, Style::default());
+            let joined: String = lines.iter().map(span_contents).collect();
+            assert_eq!(joined, input, "round-trip failed for {input:?}");
+        }
+    }
+
+    proptest! {
+        /// Differential test against textwrap's greedy first-fit wrapping.
+        /// ratatui's reflow machinery is private, so this pins the custom
+        /// wrapper's break positions to a battle-tested reference.  The domain
+        /// is restricted to single-space-separated words (no leading or
+        /// trailing whitespace) because whitespace handling is an intentional,
+        /// separately-tested difference.
+        #[test]
+        fn wrap_text_break_positions_match_textwrap(
+            words in proptest::collection::vec("[a-z]{1,6}", 1..10),
+            width in 1usize..24,
+        ) {
+            let input = words.join(" ");
+            let ours = wrapped_values(&input, width);
+
+            let reference = textwrap::wrap(
+                &input,
+                textwrap::Options::new(width)
+                    .break_words(true)
+                    .wrap_algorithm(textwrap::WrapAlgorithm::FirstFit)
+                    .word_separator(textwrap::WordSeparator::AsciiSpace),
+            );
+
+            // textwrap never emits trailing whitespace; ours drops pending
+            // whitespace at boundaries too, so trim defensively on both sides.
+            let ours: Vec<String> = ours.iter().map(|line| line.trim_end().to_owned()).collect();
+            let reference: Vec<String> =
+                reference.iter().map(|line| line.trim_end().to_owned()).collect();
+            prop_assert_eq!(ours, reference, "input {:?} at width {}", input, width);
+        }
     }
 }
