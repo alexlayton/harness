@@ -1,5 +1,6 @@
 use super::{
-    Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
+    Tool, ToolOutput, ToolPrompt, ToolSpec, expand_tilde, normalize_workspace_root,
+    resolve_workspace_path,
 };
 use async_trait::async_trait;
 use llm::ToolDefinition;
@@ -11,6 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 pub struct ReadTool {
     workspace_root: Option<PathBuf>,
+    /// Absolute paths (files AND dirs) `read` may access for agent skills
+    /// (every discovered `SKILL.md` file_path plus skill base_dirs). A path
+    /// is readable when it is under the workspace root or under one of these.
+    /// Populated from `SkillCatalog::read_paths`; `None` means no allowlist
+    /// (arbitrary absolute paths are rejected unless under the workspace).
+    allowed_paths: Option<Vec<PathBuf>>,
 }
 
 impl ReadTool {
@@ -19,13 +26,27 @@ impl ReadTool {
     pub fn new() -> Self {
         Self {
             workspace_root: None,
+            allowed_paths: None,
         }
     }
 
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: Some(normalize_workspace_root(root)),
+            allowed_paths: None,
         }
+    }
+
+    /// Add a set of allowed absolute paths (from the skills catalog). These
+    /// are canonicalized at call time; a path is readable when it is under
+    /// the workspace root or under one of these.
+    pub fn with_allowed_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.allowed_paths = Some(paths.into_iter().collect());
+        self
+    }
+
+    pub fn allowed_paths(&self) -> Option<&[PathBuf]> {
+        self.allowed_paths.as_deref()
     }
 }
 
@@ -38,17 +59,52 @@ impl Default for ReadTool {
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 
+impl ReadTool {
+    async fn resolve_path(&self, path: &str) -> Result<PathBuf, String> {
+        // First try the workspace-rooted resolution (handles containment,
+        // lexical `..`, symlink escapes).
+        if let Ok(resolved) =
+            resolve_workspace_path(path, self.workspace_root.as_deref(), false).await
+        {
+            return Ok(resolved);
+        }
+        // Otherwise, allow an absolute path that is under one of the allowed
+        // skill paths (or a `~`-expanded absolute under one of them). This is
+        // the pi behavior: `read` can load a skill's SKILL.md from anywhere
+        // it was discovered (project or global).
+        let candidate = expand_tilde(&PathBuf::from(path));
+        if !candidate.is_absolute() {
+            return Err(format!("cannot read {path}: outside workspace"));
+        }
+        // Canonicalize both the candidate and each allowed base so symlink
+        // roots (e.g. /tmp -> /private/tmp on macOS) compare equal.
+        let canonical = fs::canonicalize(&candidate)
+            .await
+            .map_err(|e| format!("cannot resolve path {path}: {e}"))?;
+        if let Some(allowed) = self.allowed_paths.as_deref() {
+            for base in allowed {
+                if let Ok(base) = fs::canonicalize(base).await
+                    && canonical.starts_with(&base)
+                {
+                    return Ok(canonical);
+                }
+            }
+        }
+        Err("path is outside workspace root and not an allowed skill path".to_owned())
+    }
+}
+
 #[async_trait]
 impl Tool for ReadTool {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             definition: ToolDefinition {
                 name: "read".into(),
-                description: "Read a text file, optionally selecting a range of lines. Text files are detected by scanning the first 8 KB; files containing NUL bytes are treated as binary and rejected.".into(),
+                description: "Read a text file, optionally selecting a range of lines. Text files are detected by scanning the first 8 KB; files containing NUL bytes are treated as binary and rejected. Paths may be relative to the working directory or absolute; skill paths (SKILL.md and resources) are readable from any location.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Path relative to the working directory" },
+                        "path": { "type": "string", "description": "Path relative to the working directory, or absolute path (including skill paths)" },
                         "offset": { "type": "integer", "minimum": 1, "description": "First 1-indexed line" },
                         "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines" }
                     },
@@ -80,16 +136,15 @@ impl Tool for ReadTool {
             return error(&format!("read {path}"), "cancelled");
         }
 
-        let full_path =
-            match resolve_workspace_path(&path, self.workspace_root.as_deref(), false).await {
-                Ok(path) => path,
-                Err(message) => {
-                    return error(
-                        &format!("read {path}"),
-                        &format!("cannot read {path}: {message}"),
-                    );
-                }
-            };
+        let full_path = match self.resolve_path(&path).await {
+            Ok(path) => path,
+            Err(message) => {
+                return error(
+                    &format!("read {path}"),
+                    &format!("cannot read {path}: {message}"),
+                );
+            }
+        };
         let metadata = match fs::metadata(&full_path).await {
             Ok(metadata) => metadata,
             Err(io_error) => {
@@ -225,5 +280,63 @@ mod tests {
             .await;
         assert!(output.is_error);
         assert!(output.content.contains("binary"));
+    }
+
+    #[tokio::test]
+    async fn skill_paths_in_allowlist_are_readable_outside_workspace() {
+        let skill_dir = tempdir().unwrap();
+        let skill_file = skill_dir.path().join("SKILL.md");
+        std::fs::write(
+            &skill_file,
+            "---\nname: test\ndescription: A test skill\n---\nbody line\n",
+        )
+        .unwrap();
+        let workspace = tempdir().unwrap();
+        let tool = ReadTool::with_workspace_root(workspace.path())
+            .with_allowed_paths(vec![skill_file.clone(), skill_dir.path().to_path_buf()]);
+        // Absolute path to the allowed skill file resolves and reads.
+        let output = tool
+            .execute(
+                json!({"path": skill_file.to_string_lossy()}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("body line"));
+        // A resource under the allowed base dir is readable too.
+        let resource = skill_dir.path().join("references/guide.md");
+        std::fs::create_dir_all(skill_dir.path().join("references")).unwrap();
+        std::fs::write(&resource, "reference content").unwrap();
+        let output = tool
+            .execute(
+                json!({"path": resource.to_string_lossy()}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("reference content"));
+    }
+
+    #[tokio::test]
+    async fn unrelated_absolute_paths_are_rejected_without_workspace() {
+        let outside = tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret").unwrap();
+        let workspace = tempdir().unwrap();
+        let tool = ReadTool::with_workspace_root(workspace.path())
+            .with_allowed_paths(vec![workspace.path().join("skills").to_path_buf()]);
+        let output = tool
+            .execute(
+                json!({"path": secret.to_string_lossy()}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("outside workspace"),
+            "{}",
+            output.content
+        );
+        assert!(!output.content.contains("top secret"));
     }
 }

@@ -25,6 +25,9 @@ pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     active: Vec<String>,
     workspace_root: PathBuf,
+    /// Optional skills catalog discovered at startup; used to render the
+    /// skills section of the system prompt and to hand read-paths to tools.
+    skills: Option<super::skills::SkillCatalog>,
 }
 
 impl ToolRegistry {
@@ -48,6 +51,7 @@ impl ToolRegistry {
             tools: Vec::new(),
             active: Vec::new(),
             workspace_root: workspace_root.into(),
+            skills: None,
         };
         for tool in tools {
             registry.register(tool)?;
@@ -61,6 +65,25 @@ impl ToolRegistry {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Set the discovered skill catalog (called by `default_registry`).
+    pub fn set_skills(&mut self, skills: super::skills::SkillCatalog) {
+        self.skills = Some(skills);
+    }
+
+    /// The discovered skill catalog, if any.
+    pub fn skills(&self) -> Option<&super::skills::SkillCatalog> {
+        self.skills.as_ref()
+    }
+
+    /// Render the skills section of the system prompt (empty when no
+    /// model-invocable skills exist).
+    pub fn skills_prompt(&self) -> String {
+        self.skills
+            .as_ref()
+            .map(super::skills::format_skills_prompt)
+            .unwrap_or_default()
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) -> Result<(), ToolRegistryError> {

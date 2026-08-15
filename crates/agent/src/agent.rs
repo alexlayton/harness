@@ -1,5 +1,5 @@
 use crate::config::{build_provider_with_auth, save_settings};
-use crate::prompt::system_prompt_with_tools;
+use crate::prompt::system_prompt_with_skills;
 use crate::tools::{ToolRegistry, call_recap, call_summary};
 use auth::{AuthEvent, CopilotAuth, sku_from_proxy_token};
 use compact::{
@@ -540,9 +540,10 @@ impl Agent {
         loop {
             let request = CompletionRequest {
                 model: self.model.clone(),
-                system: Some(system_prompt_with_tools(
+                system: Some(system_prompt_with_skills(
                     &self.tools.workspace_root().display().to_string(),
                     &self.tools.prompt_context(),
+                    self.tools.skills(),
                 )),
                 messages: self.history.clone(),
                 tools: self.tools.definitions(),

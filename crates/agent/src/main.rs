@@ -52,7 +52,9 @@ async fn main_inner() -> Result<ExitCode> {
     let provider_name = provider.name().to_owned();
     let workspace_root =
         std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
-    let tools = default_registry(ToolConfig::new(&workspace_root, config.rtk))?;
+    let tools = default_registry(
+        ToolConfig::new(&workspace_root, config.rtk).with_skills(config.skills.clone()),
+    )?;
     let session_store = SessionStore::default_for_workspace(&workspace_root)?;
 
     if cli.print {
