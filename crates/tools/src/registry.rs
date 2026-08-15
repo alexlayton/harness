@@ -1,5 +1,6 @@
 use super::{Tool, ToolOutput};
 use llm::ToolDefinition;
+use llm::util::truncate_utf8;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -145,6 +146,11 @@ impl ToolRegistry {
         }
     }
 
+    #[tracing::instrument(
+        name = "tool",
+        skip_all,
+        fields(name = %name, args = %truncate_utf8(&args.to_string(), 512))
+    )]
     pub async fn execute(&self, name: &str, args: Value, cancel: CancellationToken) -> ToolOutput {
         let Some(tool) = self.tools.iter().find(|tool| tool.name == name) else {
             return ToolOutput {

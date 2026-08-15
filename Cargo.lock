@@ -2644,6 +2644,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "time",
+ "tracing",
  "uuid",
  "windows-sys 0.59.0",
 ]
@@ -3142,6 +3143,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
+ "tracing",
  "unicode-normalization",
 ]
 

@@ -4,6 +4,7 @@ use super::{
 };
 use async_trait::async_trait;
 use llm::ToolDefinition;
+use llm::util::truncate_utf8;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio::fs;
@@ -860,17 +861,6 @@ fn append_diff_text(output: &mut String, value: &str, truncated: &mut bool) {
         return;
     }
     *truncated = true;
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &value[..end])
 }
 
 fn error(summary: &str, content: &str) -> ToolOutput {

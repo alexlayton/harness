@@ -3,6 +3,7 @@ use super::{
 };
 use async_trait::async_trait;
 use llm::ToolDefinition;
+use llm::util::truncate_utf8_prefix;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use tokio::fs;
@@ -131,7 +132,7 @@ impl Tool for ReadTool {
         let mut byte_truncated = false;
 
         if selected.len() > MAX_BYTES {
-            selected = truncate_utf8(&selected, MAX_BYTES).to_owned();
+            selected = truncate_utf8_prefix(&selected, MAX_BYTES).to_owned();
             // The byte limit can cut through a line.  Report the last complete
             // line when possible; the text itself remains useful for a huge line.
             let complete_lines = selected.lines().count();
@@ -176,17 +177,6 @@ fn optional_positive(args: &Value, name: &str) -> Result<Option<usize>, String> 
         return Err(format!("{name} must be a positive integer"));
     }
     Ok(Some(number as usize))
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 fn error(summary: &str, content: &str) -> ToolOutput {

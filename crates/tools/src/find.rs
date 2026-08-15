@@ -5,6 +5,7 @@ use fff_search::{
     MixedSearchConfig, PaginationArgs, QueryParser, SharedFilePicker, SharedFrecency,
 };
 use llm::ToolDefinition;
+use llm::util::truncate_utf8_prefix;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -495,23 +496,12 @@ fn format_results(
         };
         if output.len() + notice.len() >= MAX_OUTPUT_BYTES {
             let max_output = MAX_OUTPUT_BYTES.saturating_sub(notice.len() + 1);
-            output = truncate_utf8_owned(&output, max_output);
+            output = truncate_utf8_prefix(&output, max_output).to_owned();
             output.push('\n');
         }
         output.push_str(&notice);
     }
     output.trim_end_matches('\n').to_owned()
-}
-
-fn truncate_utf8_owned(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
 }
 
 fn error(summary: &str, content: &str) -> ToolOutput {

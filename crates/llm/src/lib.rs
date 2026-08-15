@@ -15,3 +15,4 @@ pub use types::{
     Usage,
 };
 pub use util::as_u64;
+pub use util::{truncate_utf8, truncate_utf8_prefix};

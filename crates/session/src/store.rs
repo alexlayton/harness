@@ -235,6 +235,11 @@ impl SessionStore {
     /// Append one event and make it durable before returning.  A sidecar
     /// create-new lock prevents two Harness processes from interleaving JSON
     /// records.  Every record is followed by a newline and `sync_all`.
+    #[tracing::instrument(
+        name = "session_persist",
+        skip_all,
+        fields(session_id = %session.id())
+    )]
     pub fn append_event(
         &self,
         session: &mut Session,

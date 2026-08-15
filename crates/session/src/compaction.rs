@@ -9,6 +9,7 @@ use crate::error::Result;
 use crate::model::{
     Session, SessionEvent, SessionEventRecord, StoredContent, latest_compaction_boundary,
 };
+use llm::util::truncate_utf8;
 
 /// Policy for the first local compactor.  Counts are deliberately based on
 /// durable events/messages rather than provider-specific tokenizers.
@@ -203,7 +204,7 @@ fn summarize_events(events: &[&SessionEventRecord], max_bytes: usize) -> String 
             | SessionEvent::Unknown { .. } => {}
         }
     }
-    cap_utf8(&lines.join("\n"), max_bytes)
+    truncate_utf8(&lines.join("\n"), max_bytes)
 }
 
 fn message_contents(message: &crate::model::StoredMessage) -> Vec<String> {
@@ -221,21 +222,6 @@ fn message_contents(message: &crate::model::StoredMessage) -> Vec<String> {
 
 fn message_text(parts: Vec<String>) -> String {
     parts.join(" ").replace('\n', " ")
-}
-
-fn cap_utf8(value: &str, max_bytes: usize) -> String {
-    if max_bytes == 0 {
-        return String::new();
-    }
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let suffix = "…";
-    let mut end = max_bytes.saturating_sub(suffix.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &value[..end])
 }
 
 #[cfg(test)]

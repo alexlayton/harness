@@ -4,6 +4,7 @@ use crate::tools::{ToolRegistry, call_summary};
 use futures_util::StreamExt;
 use llm::{
     CompletionRequest, Content, Message, Provider, RetryCallback, Role, StreamEvent, ToolCall,
+    truncate_utf8,
 };
 use session::{
     CompactionPolicy, ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore,
@@ -385,6 +386,11 @@ impl Agent {
     /// execute any tool calls, and persist every durable event.  Returns
     /// [`TurnError::Shutdown`] only when the application cancellation token
     /// fired mid-turn, so `run` can stop immediately.
+    #[tracing::instrument(
+        name = "turn",
+        skip(self, events, input, cancel),
+        fields(user_text = %truncate_utf8(&user_text, 200))
+    )]
     async fn run_turn(
         &mut self,
         user_text: String,
@@ -1079,19 +1085,7 @@ const MAX_TOOL_ARGUMENT_BYTES: usize = 2 * 1024;
 fn format_tool_arguments(arguments: &serde_json::Value) -> String {
     let formatted =
         serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string());
-    cap_utf8(&formatted, MAX_TOOL_ARGUMENT_BYTES)
-}
-
-fn cap_utf8(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let suffix = "…";
-    let mut end = max_bytes.saturating_sub(suffix.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &value[..end])
+    truncate_utf8(&formatted, MAX_TOOL_ARGUMENT_BYTES)
 }
 
 fn usage_event(usage: &session::UsageSummary) -> AgentEvent {
@@ -1127,9 +1121,19 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
+    /// One step of a canned provider script.  Errors are carried as strings
+    /// because `LlmError` embeds a non-cloneable `reqwest::Error`; `stream`
+    /// maps them back into `LlmError::Stream`.
+    type ScriptStep = Result<StreamEvent, String>;
+
+    /// Build a script that emits the given events successfully.
+    fn script(events: Vec<StreamEvent>) -> Vec<ScriptStep> {
+        events.into_iter().map(Ok).collect()
+    }
+
     struct MockProvider {
         calls: AtomicUsize,
-        scripts: Vec<Vec<StreamEvent>>,
+        scripts: Vec<Vec<ScriptStep>>,
     }
 
     #[async_trait]
@@ -1141,7 +1145,9 @@ mod tests {
         async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
             let script = self.scripts.get(index).cloned().unwrap_or_default();
-            Ok(Box::pin(stream::iter(script.into_iter().map(Ok))))
+            Ok(Box::pin(stream::iter(
+                script.into_iter().map(|step| step.map_err(LlmError::Stream)),
+            )))
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -1174,13 +1180,13 @@ mod tests {
     fn simple_text_turn_forwards_deltas() {
         let (events, _) = run_agent(MockProvider {
             calls: AtomicUsize::new(0),
-            scripts: vec![vec![
+            scripts: vec![script(vec![
                 StreamEvent::TextDelta("hello".into()),
                 StreamEvent::Done {
                     stop_reason: Some("stop".into()),
                     usage: Some(Usage::default()),
                 },
-            ]],
+            ])],
         });
         assert!(events.contains(&AgentEvent::TextDelta("hello".into())));
         assert!(events.contains(&AgentEvent::TurnFinished));
@@ -1202,7 +1208,7 @@ mod tests {
                 .unwrap();
             let provider = MockProvider {
                 calls: AtomicUsize::new(0),
-                scripts: vec![vec![
+                scripts: vec![script(vec![
                     StreamEvent::ReasoningDelta("thinking".into()),
                     StreamEvent::TextDelta("answer".into()),
                     StreamEvent::Done {
@@ -1213,7 +1219,7 @@ mod tests {
                             ..Usage::default()
                         }),
                     },
-                ]],
+                ])],
             };
             let cancel = CancellationToken::new();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1245,7 +1251,7 @@ mod tests {
             let provider = MockProvider {
                 calls: AtomicUsize::new(0),
                 scripts: vec![
-                    vec![
+                    script(vec![
                         StreamEvent::ToolCallComplete(ToolCall {
                             id: "c".into(),
                             name: "missing".into(),
@@ -1255,14 +1261,14 @@ mod tests {
                             stop_reason: Some("tool_calls".into()),
                             usage: None,
                         },
-                    ],
-                    vec![
+                    ]),
+                    script(vec![
                         StreamEvent::TextDelta("done".into()),
                         StreamEvent::Done {
                             stop_reason: Some("stop".into()),
                             usage: None,
                         },
-                    ],
+                    ]),
                 ],
             };
             let cancel = CancellationToken::new();
@@ -1292,6 +1298,82 @@ mod tests {
                     ..
                 } if output == "unknown tool: missing" && error == "unknown tool: missing"
             )));
+        });
+    }
+
+    /// Regression test for the cross-cutting review: when the provider emits
+    /// tool calls and then the stream dies before `Done`, the turn must still
+    /// finish (no busy wait) and the pending tool calls must be persisted as
+    /// failed tool results so the next turn sees a consistent history.
+    #[test]
+    fn stream_error_after_tool_call_finishes_turn_and_persists_tool_error() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = store
+                .create(SessionCreateOptions {
+                    provider: Some("mock".into()),
+                    model: Some("demo".into()),
+                    ..SessionCreateOptions::default()
+                })
+                .unwrap();
+            let provider = MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![vec![
+                    Ok(StreamEvent::ToolCallComplete(ToolCall {
+                        id: "c".into(),
+                        name: "missing".into(),
+                        arguments: json!({}),
+                    })),
+                    Err("connection dropped mid-stream".into()),
+                ]],
+            };
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("use tool".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel)
+                .with_session(store.clone(), session.clone())
+                .run(input_rx, event_tx)
+                .await;
+
+            let mut got = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                got.push(event);
+            }
+            assert!(got.contains(&AgentEvent::TurnFinished));
+            assert!(got.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(message) if message.contains("connection dropped mid-stream")
+            )));
+
+            // The interrupted tool call is persisted as a failed ToolResult
+            // instead of being dropped or left dangling.
+            let loaded = store.open(&session.id()).unwrap();
+            let tool_results: Vec<(&bool, &String)> = loaded
+                .events
+                .iter()
+                .filter_map(|record| match &record.event {
+                    SessionEvent::ToolResult {
+                        is_error,
+                        content,
+                        ..
+                    } => Some((is_error, content)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(tool_results.len(), 1, "expected one persisted tool result");
+            let (is_error, content) = tool_results[0];
+            assert!(is_error, "interrupted tool call must be persisted as an error");
+            assert!(
+                content.contains("provider stream interrupted"),
+                "unexpected tool result content: {content}"
+            );
         });
     }
 }
