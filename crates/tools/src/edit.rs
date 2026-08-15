@@ -471,11 +471,13 @@ fn find_best_match(content: &str, old_text: &str) -> Option<FoundMatch> {
     if lenient_old_text.is_empty() {
         return None;
     }
-    lenient_content.find(&lenient_old_text).map(|index| FoundMatch {
-        index,
-        length: lenient_old_text.len(),
-        mode: MatchMode::LenientWhitespace,
-    })
+    lenient_content
+        .find(&lenient_old_text)
+        .map(|index| FoundMatch {
+            index,
+            length: lenient_old_text.len(),
+            mode: MatchMode::LenientWhitespace,
+        })
 }
 
 fn count_occurrences(content: &str, old_text: &str, mode: MatchMode) -> usize {
@@ -1058,8 +1060,8 @@ mod tests {
             old_text: "say 'hello'".into(),
             new_text: "say 'goodbye'".into(),
         }];
-        let result = apply_edits_to_normalized_content("say ‘hello’  \n", &edits, "file.txt")
-            .unwrap();
+        let result =
+            apply_edits_to_normalized_content("say ‘hello’  \n", &edits, "file.txt").unwrap();
         assert_eq!(result.new_content, "say 'goodbye'  \n");
         assert!(result.notice.is_none());
     }
@@ -1070,8 +1072,7 @@ mod tests {
             old_text: "foo\nbar".into(),
             new_text: "one\ntwo".into(),
         }];
-        let result =
-            apply_edits_to_normalized_content("foo  \nbar\n", &edits, "file.txt").unwrap();
+        let result = apply_edits_to_normalized_content("foo  \nbar\n", &edits, "file.txt").unwrap();
         assert_eq!(result.new_content, "one\ntwo\n");
         let notice = result
             .notice

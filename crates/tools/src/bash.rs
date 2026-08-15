@@ -421,7 +421,10 @@ mod tests {
     fn parses_rtk_version_strings() {
         assert_eq!(parse_rtk_version("rtk 0.45.0"), Some((0, 45, 0)));
         assert_eq!(parse_rtk_version("0.46.0"), Some((0, 46, 0)));
-        assert_eq!(parse_rtk_version("rtk 0.45.0 (abcdef1234)"), Some((0, 45, 0)));
+        assert_eq!(
+            parse_rtk_version("rtk 0.45.0 (abcdef1234)"),
+            Some((0, 45, 0))
+        );
         assert_eq!(parse_rtk_version("rtk 0.45.0-beta.1"), Some((0, 45, 0)));
         assert_eq!(parse_rtk_version("1.2"), Some((1, 2, 0)));
         assert_eq!(parse_rtk_version("rtk version unknown"), None);

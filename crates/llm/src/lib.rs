@@ -9,9 +9,9 @@ pub mod types;
 pub mod util;
 
 pub use error::LlmError;
-pub use util::as_u64;
 pub use provider::{EventStream, Provider, RetryCallback};
 pub use types::{
     CompletionRequest, Content, Message, ModelInfo, Role, StreamEvent, ToolCall, ToolDefinition,
     Usage,
 };
+pub use util::as_u64;

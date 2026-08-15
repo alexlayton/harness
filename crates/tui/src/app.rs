@@ -4,10 +4,10 @@
 //! completion state/scanning in `completion`, and layout arithmetic in
 //! `layout`.
 
-use crate::completion::Completion;
 use crate::commands;
+use crate::completion::Completion;
 use crate::environment::EnvironmentInfo;
-use crate::input::{classify, InputAction};
+use crate::input::{InputAction, classify};
 use crate::render::Theme;
 use crate::state::{EntryId, Focus, ScrollState, TranscriptEntry};
 use crate::{InputMessage, ModelEntry, TuiEvent};

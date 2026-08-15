@@ -476,8 +476,11 @@ mod tests {
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
         assert_eq!(headers.get("x-api-key").unwrap(), "secret");
 
-        let bearer_only =
-            AnthropicMessagesClient::with_bearer_only_headers("https://api.githubcopilot.com", "secret", HeaderMap::new());
+        let bearer_only = AnthropicMessagesClient::with_bearer_only_headers(
+            "https://api.githubcopilot.com",
+            "secret",
+            HeaderMap::new(),
+        );
         let headers = bearer_only.headers();
         assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
         assert!(headers.get("x-api-key").is_none());

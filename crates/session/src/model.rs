@@ -1026,6 +1026,152 @@ pub fn usage_summary(usage: &Usage) -> UsageSummary {
     UsageSummary::from_usage(usage)
 }
 
+/// A structural view of a session's conversation, rebuilt from the durable
+/// event log for transcript rendering.  The session crate owns the event
+/// model, so it also owns the tool-result pairing that keeps a snapshot
+/// consistent with [`context_messages`].  Presentation formatting (tool
+/// summaries, bounded argument strings) is layered on top by the agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionSnapshotEntry {
+    User {
+        text: String,
+    },
+    Assistant {
+        markdown: String,
+        reasoning: String,
+    },
+    Tool {
+        name: String,
+        /// Raw structured arguments.  Callers format these for display.
+        arguments: Value,
+        ok: bool,
+        output: String,
+        error: Option<String>,
+    },
+}
+
+/// Rebuild a transcript-style view of the conversation.  A `ToolResult`
+/// event is matched back to the `ToolCall` that produced it (the same
+/// pairing performed by [`context_messages`]), so the snapshot stays in sync
+/// with the provider history as new event kinds are added.  A result
+/// without a preceding call — possible after repair — becomes a standalone
+/// tool entry so nothing is dropped from the view.
+pub fn snapshot_entries(session: &Session) -> Vec<SessionSnapshotEntry> {
+    let mut entries = Vec::new();
+    let mut tool_indices = HashMap::<String, usize>::new();
+
+    for record in &session.events {
+        match &record.event {
+            SessionEvent::UserMessage { message } => {
+                let text = message.content.iter().find_map(|content| match content {
+                    StoredContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                });
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    entries.push(SessionSnapshotEntry::User { text });
+                }
+            }
+            SessionEvent::AssistantMessage { message } => {
+                let mut markdown = String::new();
+                let mut reasoning = String::new();
+                for content in &message.content {
+                    match content {
+                        StoredContent::Text { text } => {
+                            if !markdown.is_empty() {
+                                markdown.push('\n');
+                            }
+                            markdown.push_str(text);
+                        }
+                        StoredContent::Reasoning { text } => {
+                            if !reasoning.is_empty() {
+                                reasoning.push('\n');
+                            }
+                            reasoning.push_str(text);
+                        }
+                        StoredContent::ToolCall { .. } | StoredContent::ToolResult { .. } => {}
+                    }
+                }
+                if !markdown.is_empty() || !reasoning.is_empty() {
+                    entries.push(SessionSnapshotEntry::Assistant {
+                        markdown,
+                        reasoning,
+                    });
+                }
+            }
+            SessionEvent::ToolCall { call } => {
+                let index = entries.len();
+                tool_indices.insert(call.id.clone(), index);
+                entries.push(SessionSnapshotEntry::Tool {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    ok: false,
+                    output: String::new(),
+                    error: None,
+                });
+            }
+            SessionEvent::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                tool_name,
+            } => {
+                if let Some(index) = tool_indices.get(tool_call_id).copied()
+                    && let Some(SessionSnapshotEntry::Tool {
+                        name,
+                        ok,
+                        output,
+                        error,
+                        ..
+                    }) = entries.get_mut(index)
+                {
+                    if let Some(tool_name) = tool_name {
+                        *name = tool_name.clone();
+                    }
+                    *ok = !is_error;
+                    *output = content.clone();
+                    *error = is_error.then(|| content.clone());
+                } else {
+                    entries.push(SessionSnapshotEntry::Tool {
+                        name: tool_name.clone().unwrap_or_else(|| "tool".into()),
+                        arguments: Value::Object(Default::default()),
+                        ok: !is_error,
+                        output: content.clone(),
+                        error: is_error.then(|| content.clone()),
+                    });
+                }
+            }
+            SessionEvent::Reasoning { text } => {
+                if let Some(SessionSnapshotEntry::Assistant { reasoning, .. }) = entries.last_mut()
+                {
+                    if !reasoning.is_empty() {
+                        reasoning.push('\n');
+                    }
+                    reasoning.push_str(text);
+                } else {
+                    entries.push(SessionSnapshotEntry::Assistant {
+                        markdown: String::new(),
+                        reasoning: text.clone(),
+                    });
+                }
+            }
+            SessionEvent::CompactionSummary { summary, .. } => {
+                entries.push(SessionSnapshotEntry::Assistant {
+                    markdown: format!("_Session summary:_\n\n{summary}"),
+                    reasoning: String::new(),
+                });
+            }
+            SessionEvent::ModelChange { .. }
+            | SessionEvent::Usage { .. }
+            | SessionEvent::MetadataChange { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::Error { .. }
+            | SessionEvent::Unknown { .. } => {}
+        }
+    }
+
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1095,5 +1241,79 @@ mod tests {
         });
         assert_eq!(session.metadata.usage.input_tokens, 2);
         assert_eq!(session.metadata.usage.turns, 1);
+    }
+
+    #[test]
+    fn snapshot_entries_matches_tool_results_to_their_calls() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("hi")),
+        });
+        session.append(SessionEvent::AssistantMessage {
+            message: StoredMessage::from_llm(&Message::assistant(vec![Content::Text(
+                "working".into(),
+            )])),
+        });
+        session.append(SessionEvent::ToolCall {
+            call: StoredToolCall {
+                id: "call-1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "Cargo.toml" }),
+            },
+        });
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "file contents".into(),
+            is_error: false,
+            tool_name: Some("read".into()),
+        });
+
+        let snapshot = snapshot_entries(&session);
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(
+            snapshot[0],
+            SessionSnapshotEntry::User { text: "hi".into() }
+        );
+        assert_eq!(
+            snapshot[1],
+            SessionSnapshotEntry::Assistant {
+                markdown: "working".into(),
+                reasoning: String::new(),
+            }
+        );
+        // The result is paired back to the call that produced it, keeping
+        // the arguments from the call while taking the status from the result.
+        assert_eq!(
+            snapshot[2],
+            SessionSnapshotEntry::Tool {
+                name: "read".into(),
+                arguments: json!({ "path": "Cargo.toml" }),
+                ok: true,
+                output: "file contents".into(),
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_entries_keeps_orphan_tool_results() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "call-9".into(),
+            content: "lonely output".into(),
+            is_error: true,
+            tool_name: Some("bash".into()),
+        });
+        let snapshot = snapshot_entries(&session);
+        assert_eq!(
+            snapshot,
+            vec![SessionSnapshotEntry::Tool {
+                name: "bash".into(),
+                arguments: Value::Object(Default::default()),
+                ok: false,
+                output: "lonely output".into(),
+                error: Some("lonely output".into()),
+            }]
+        );
     }
 }

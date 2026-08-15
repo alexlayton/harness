@@ -32,8 +32,9 @@ pub use error::{Result, SessionError};
 pub use export::{ExportOptions, export_jsonl, export_transcript};
 pub use model::{
     EventId, FORMAT_VERSION, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata,
-    SessionUsage, StoredContent, StoredMessage, StoredRole, StoredToolCall, Timestamp,
-    UsageSummary, context_messages, latest_compaction_boundary, usage_summary, validate_events,
+    SessionSnapshotEntry, SessionUsage, StoredContent, StoredMessage, StoredRole, StoredToolCall,
+    Timestamp, UsageSummary, context_messages, latest_compaction_boundary, snapshot_entries,
+    usage_summary, validate_events,
 };
 pub use store::{
     LoadReport, RecoveryReport, RetentionPolicy, SessionCreateOptions, SessionIndexEntry,

@@ -1,5 +1,5 @@
-use crate::error::truncate_body;
 use crate::LlmError;
+use crate::error::truncate_body;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;

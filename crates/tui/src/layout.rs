@@ -29,7 +29,10 @@ impl crate::Tui {
             return Ok(());
         }
 
-        let show_welcome = !self.transcript.iter().any(crate::state::TranscriptEntry::is_meaningful);
+        let show_welcome = !self
+            .transcript
+            .iter()
+            .any(crate::state::TranscriptEntry::is_meaningful);
         let transcript_lines = render::transcript_lines(
             &self.transcript,
             show_welcome,

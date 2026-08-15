@@ -9,6 +9,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -171,6 +172,12 @@ pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// One-time per-process entropy used to make temp-file names unique across
+/// processes.  PIDs recycle quickly on some systems, so a recycled PID alone
+/// could collide with a stale temp file left by an earlier process; the
+/// random component eliminates that risk.
+static TEMP_ENTROPY: OnceLock<u64> = OnceLock::new();
+
 fn temporary_path(path: &Path) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let file_name = path
@@ -178,9 +185,34 @@ fn temporary_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("config.toml");
     path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{sequence}",
-        std::process::id()
+        ".{file_name}.tmp-{}-{sequence}-{:08x}",
+        std::process::id(),
+        temp_random(sequence)
     ))
+}
+
+/// 32 bits of process-lifetime randomness derived from a one-time seed
+/// mixed with the per-call sequence.  Cheap, deterministic, and sufficient
+/// for file-name entropy; not used for security.
+fn temp_random(sequence: u64) -> u32 {
+    let entropy = *TEMP_ENTROPY.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        // ASLR provides cheap per-process address-space entropy.
+        let address = &now as *const u64 as u64;
+        now ^ (std::process::id() as u64).rotate_left(32) ^ address
+    });
+    splitmix64(entropy.wrapping_add(sequence)) as u32
+}
+
+/// A tiny splitmix64 finalizer.
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 /// Update the two currently persisted settings while retaining any unknown
@@ -532,5 +564,21 @@ mod tests {
         // helper's behavior is exercised by config_dir itself in integration
         // tests where the override can be scoped by the harness.
         assert!(path.ends_with("config"));
+    }
+
+    #[test]
+    fn temporary_path_names_are_unique_and_embody_a_random_component() {
+        let path = Path::new("/tmp/harness-config.toml");
+        let first = temporary_path(path);
+        let second = temporary_path(path);
+        let first_name = first.file_name().unwrap().to_string_lossy().into_owned();
+        let second_name = second.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(first_name.starts_with(".harness-config.toml.tmp-"));
+        assert_ne!(first_name, second_name);
+        // The tail is 8 lowercase hex digits.
+        let tail = first_name.rsplit('-').next().unwrap();
+        assert_eq!(tail.len(), 8);
+        assert!(tail.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(first.parent(), second.parent());
     }
 }

@@ -2,11 +2,11 @@
 //! references, and command-argument paths. All completion is debounced and
 //! cancellable so rapid typing cannot queue unbounded blocking scans.
 
+use crate::InputMessage;
 use crate::app::textarea_with_text_at_cursor;
 use crate::attachments;
 use crate::commands::{self, Candidate, CandidateKind, CompletionContext};
 use crate::render;
-use crate::{InputMessage};
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode};
 use std::collections::HashSet;

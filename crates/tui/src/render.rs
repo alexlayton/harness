@@ -1143,7 +1143,11 @@ pub fn render_completion(
     for (index, candidate) in visible {
         let selected = index == selected;
         let value_style = Style::default()
-            .fg(if selected { theme.focus } else { theme.primary_text })
+            .fg(if selected {
+                theme.focus
+            } else {
+                theme.primary_text
+            })
             .add_modifier(if selected {
                 Modifier::BOLD
             } else {
@@ -1338,8 +1342,7 @@ mod tests {
             (0, 10, 3),
         ];
         for (cursor_row, line_count, inner_height) in cases {
-            let scroll =
-                prompt_scroll_for_cursor(cursor_row, line_count, inner_height);
+            let scroll = prompt_scroll_for_cursor(cursor_row, line_count, inner_height);
             assert!(
                 cursor_row >= scroll && cursor_row < scroll + inner_height.max(1),
                 "cursor {cursor_row} outside window [{scroll}, {})",

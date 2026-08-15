@@ -257,9 +257,9 @@ pub(crate) async fn resolve_workspace_path(
     let canonical = loop {
         match fs::metadata(&existing).await {
             Ok(_) => {
-                break fs::canonicalize(&existing).await.map_err(|error| {
-                    format!("cannot resolve path {value}: {error}")
-                })?;
+                break fs::canonicalize(&existing)
+                    .await
+                    .map_err(|error| format!("cannot resolve path {value}: {error}"))?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !existing.pop() {

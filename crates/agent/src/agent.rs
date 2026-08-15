@@ -7,9 +7,9 @@ use llm::{
 };
 use session::{
     CompactionPolicy, ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore,
-    StoredContent, StoredMessage, StoredToolCall, export_jsonl, usage_summary,
+    StoredMessage, StoredToolCall, export_jsonl, snapshot_entries, usage_summary,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -111,6 +111,17 @@ pub struct SessionListItem {
     pub model: Option<String>,
 }
 
+/// Why a single turn did not complete normally.  `run` uses this to decide
+/// whether to keep draining queued input.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TurnError {
+    /// The application cancellation token fired while the turn was in flight;
+    /// the run loop should stop immediately.
+    Shutdown,
+    /// A durable session event could not be persisted; the turn was aborted.
+    Persist(String),
+}
+
 /// Durable session state owned by the agent.  The TUI only receives status
 /// events; it never reads or writes session files directly.
 pub struct AgentSessionState {
@@ -128,6 +139,13 @@ pub struct Agent {
     pub history: Vec<Message>,
     pub cancel: CancellationToken,
     pub session: Option<AgentSessionState>,
+    /// Input messages received while a turn is running.  They are drained by
+    /// `run` before the next turn starts.
+    queued: VecDeque<InputMessage>,
+    /// Whether the input channel has not yet been observed closed.  Once
+    /// closed, the run loop stops selecting on it (a closed `recv` would
+    /// otherwise complete immediately and starve the stream polling).
+    input_open: bool,
 }
 
 impl Agent {
@@ -144,6 +162,8 @@ impl Agent {
             history: Vec::new(),
             cancel,
             session: None,
+            queued: VecDeque::new(),
+            input_open: true,
         }
     }
 
@@ -283,8 +303,6 @@ impl Agent {
         mut input: mpsc::UnboundedReceiver<InputMessage>,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) {
-        let mut queued = VecDeque::new();
-        let mut input_open = true;
         if let Some(session) = self.session.as_ref() {
             send(
                 &events,
@@ -297,22 +315,22 @@ impl Agent {
             send(
                 &events,
                 AgentEvent::SessionSnapshot {
-                    entries: snapshot_entries(&session.session),
+                    entries: ui_snapshot_entries(snapshot_entries(&session.session)),
                 },
             );
             send(&events, usage_event(&session.session.metadata.usage));
         }
 
         loop {
-            let next_message = if let Some(message) = queued.pop_front() {
+            let next_message = if let Some(message) = self.queued.pop_front() {
                 Some(message)
-            } else if !input_open {
+            } else if !self.input_open {
                 None
             } else {
                 tokio::select! {
                     message = input.recv() => {
                         if message.is_none() {
-                            input_open = false;
+                            self.input_open = false;
                         }
                         message
                     }
@@ -322,8 +340,14 @@ impl Agent {
             let Some(message) = next_message else {
                 break;
             };
-            let user_text = match message {
-                InputMessage::Message(text) if !text.trim().is_empty() => text,
+            match message {
+                InputMessage::Message(text) if !text.trim().is_empty() => {
+                    let turn_cancel = CancellationToken::new();
+                    match self.run_turn(text, &events, &mut input, &turn_cancel).await {
+                        Err(TurnError::Shutdown) => break,
+                        Err(TurnError::Persist(_)) | Ok(()) => {}
+                    }
+                }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
                     self.handle_new_session(&events);
@@ -354,307 +378,308 @@ impl Agent {
                     continue;
                 }
             };
+        }
+    }
 
-            let user_message = Message::user(user_text);
-            self.history.push(user_message.clone());
-            if !self.persist_user_message(&user_message, &events) {
-                send(&events, AgentEvent::TurnFinished);
-                continue;
-            }
-            let turn_cancel = CancellationToken::new();
-            let mut iteration = 0u32;
-            let mut end_turn = false;
+    /// Run one user turn: persist the message, stream the provider response,
+    /// execute any tool calls, and persist every durable event.  Returns
+    /// [`TurnError::Shutdown`] only when the application cancellation token
+    /// fired mid-turn, so `run` can stop immediately.
+    async fn run_turn(
+        &mut self,
+        user_text: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+        cancel: &CancellationToken,
+    ) -> Result<(), TurnError> {
+        let user_message = Message::user(user_text);
+        self.history.push(user_message.clone());
+        if !self.persist_user_message(&user_message, events) {
+            send(events, AgentEvent::TurnFinished);
+            return Err(TurnError::Persist("user message".into()));
+        }
+        let mut iteration = 0u32;
 
-            while !end_turn {
-                let request = CompletionRequest {
-                    model: self.model.clone(),
-                    system: Some(system_prompt_with_tools(
-                        &self.tools.workspace_root().display().to_string(),
-                        &self.tools.prompt_context(),
-                    )),
-                    messages: self.history.clone(),
-                    tools: self.tools.definitions(),
-                    max_tokens: None,
-                    temperature: None,
-                    reasoning: true,
-                };
+        loop {
+            let request = CompletionRequest {
+                model: self.model.clone(),
+                system: Some(system_prompt_with_tools(
+                    &self.tools.workspace_root().display().to_string(),
+                    &self.tools.prompt_context(),
+                )),
+                messages: self.history.clone(),
+                tools: self.tools.definitions(),
+                max_tokens: None,
+                temperature: None,
+                reasoning: true,
+            };
 
-                let retry_events = events.clone();
-                let on_retry: RetryCallback = Arc::new(move |attempt, error| {
-                    let _ = retry_events.send(AgentEvent::Retrying {
-                        attempt,
-                        message: error.to_string(),
-                    });
+            let retry_events = events.clone();
+            let on_retry: RetryCallback = Arc::new(move |attempt, error| {
+                let _ = retry_events.send(AgentEvent::Retrying {
+                    attempt,
+                    message: error.to_string(),
                 });
-                // Clone the provider handle before constructing the future so
-                // the future does not hold an immutable borrow of `self`
-                // while durable events are appended below.
-                let provider = self.provider.clone();
-                let provider_future = provider.stream_with_retry(&request, on_retry);
-                tokio::pin!(provider_future);
-                let stream_result = loop {
-                    tokio::select! {
-                        result = &mut provider_future => break Some(result),
-                        message = input.recv(), if input_open => match message {
-                            Some(InputMessage::Interrupt) => {
-                                turn_cancel.cancel();
-                                break None;
-                            }
-                            Some(message) => queued.push_back(message),
-                            None => input_open = false,
-                        },
-                        _ = turn_cancel.cancelled() => break None,
-                        _ = self.cancel.cancelled() => {
-                            self.persist_cancelled("application shutdown", &events);
-                            send(&events, AgentEvent::TurnFinished);
-                            return;
+            });
+            // Clone the provider handle before constructing the future so
+            // the future does not hold an immutable borrow of `self`
+            // while durable events are appended below.
+            let provider = self.provider.clone();
+            let provider_future = provider.stream_with_retry(&request, on_retry);
+            tokio::pin!(provider_future);
+            let stream_result = loop {
+                tokio::select! {
+                    result = &mut provider_future => break Some(result),
+                    message = input.recv(), if self.input_open => match message {
+                        Some(InputMessage::Interrupt) => {
+                            cancel.cancel();
+                            break None;
                         }
-                    }
-                };
-                let Some(stream_result) = stream_result else {
-                    self.persist_cancelled("turn interrupted before response", &events);
-                    send(&events, AgentEvent::TurnFinished);
-                    end_turn = true;
-                    continue;
-                };
-                let mut stream = match stream_result {
-                    Ok(stream) => stream,
-                    Err(error) => {
-                        let message = error.to_string();
-                        let _ = self.persist_event(
-                            SessionEvent::Error {
-                                message: message.clone(),
-                            },
-                            &events,
-                        );
-                        send(&events, AgentEvent::Error(message));
-                        send(&events, AgentEvent::TurnFinished);
-                        end_turn = true;
-                        continue;
-                    }
-                };
-
-                let mut text = String::new();
-                let mut reasoning = String::new();
-                let mut tool_calls = Vec::<ToolCall>::new();
-                let mut cancelled = false;
-                let mut stream_error = None;
-
-                loop {
-                    tokio::select! {
-                        next = stream.next() => {
-                            let Some(next) = next else {
-                                break;
-                            };
-                            match next {
-                                Ok(StreamEvent::TextDelta(delta)) => {
-                                    text.push_str(&delta);
-                                    send(&events, AgentEvent::TextDelta(delta));
-                                }
-                                Ok(StreamEvent::ReasoningDelta(delta)) => {
-                                    reasoning.push_str(&delta);
-                                    send(&events, AgentEvent::ReasoningDelta(delta));
-                                }
-                                Ok(StreamEvent::ToolCallComplete(call)) => tool_calls.push(call),
-                                Ok(StreamEvent::Done { usage: done_usage, .. }) => {
-                                    if let Some(done_usage) = done_usage {
-                                        let summary = usage_summary(&done_usage);
-                                        let _ = self.persist_event(
-                                            SessionEvent::Usage {
-                                                usage: summary.clone(),
-                                            },
-                                            &events,
-                                        );
-                                        if let Some(state) = self.session.as_ref() {
-                                            send(&events, usage_event(&state.session.metadata.usage));
-                                        } else {
-                                            send(&events, usage_event(&summary));
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    stream_error = Some(error.to_string());
-                                    break;
-                                }
-                            }
-                        }
-                        message = input.recv(), if input_open => match message {
-                            Some(InputMessage::Interrupt) => {
-                                turn_cancel.cancel();
-                                cancelled = true;
-                                break;
-                            }
-                            Some(message) => queued.push_back(message),
-                            None => input_open = false,
-                        },
-                        _ = turn_cancel.cancelled() => {
-                            cancelled = true;
-                            break;
-                        }
-                        _ = self.cancel.cancelled() => {
-                            cancelled = true;
-                            break;
-                        }
+                        Some(message) => self.queued.push_back(message),
+                        None => self.input_open = false,
+                    },
+                    _ = cancel.cancelled() => break None,
+                    _ = self.cancel.cancelled() => {
+                        self.persist_cancelled("application shutdown", events);
+                        send(events, AgentEvent::TurnFinished);
+                        return Err(TurnError::Shutdown);
                     }
                 }
-
-                if cancelled {
-                    append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
-                    let _ = self.persist_assistant(&reasoning, &text, &tool_calls, &events);
-                    for call in &tool_calls {
-                        let cancelled_result = "cancelled before tool execution";
-                        self.history.push(Message::tool_result(
-                            call.id.clone(),
-                            cancelled_result,
-                            true,
-                        ));
-                        let _ = self.persist_tool_result(call, cancelled_result, true, &events);
-                    }
-                    self.persist_cancelled("turn interrupted", &events);
-                    send(&events, AgentEvent::TurnFinished);
-                    if self.cancel.is_cancelled() {
-                        return;
-                    }
-                    end_turn = true;
-                    continue;
-                }
-
-                append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
-                let _ = self.persist_assistant(&reasoning, &text, &tool_calls, &events);
-
-                if let Some(error) = stream_error {
-                    for call in &tool_calls {
-                        let error_result = format!("provider stream interrupted: {error}");
-                        self.history.push(Message::tool_result(
-                            call.id.clone(),
-                            error_result.clone(),
-                            true,
-                        ));
-                        let _ = self.persist_tool_result(call, &error_result, true, &events);
-                    }
+            };
+            let Some(stream_result) = stream_result else {
+                self.persist_cancelled("turn interrupted before response", events);
+                send(events, AgentEvent::TurnFinished);
+                return Ok(());
+            };
+            let mut stream = match stream_result {
+                Ok(stream) => stream,
+                Err(error) => {
+                    let message = error.to_string();
                     let _ = self.persist_event(
                         SessionEvent::Error {
-                            message: error.clone(),
+                            message: message.clone(),
                         },
-                        &events,
+                        events,
                     );
-                    send(&events, AgentEvent::Error(error));
-                    send(&events, AgentEvent::TurnFinished);
-                    end_turn = true;
-                    continue;
+                    send(events, AgentEvent::Error(message));
+                    send(events, AgentEvent::TurnFinished);
+                    return Ok(());
                 }
+            };
 
-                if tool_calls.is_empty() {
-                    send(&events, AgentEvent::TurnFinished);
-                    end_turn = true;
-                    continue;
-                }
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let mut tool_calls = Vec::<ToolCall>::new();
+            let mut cancelled = false;
+            let mut stream_error = None;
 
-                iteration += 1;
-                for call in tool_calls {
-                    let summary = call_summary(&call.name, &call.arguments);
-                    send(
-                        &events,
-                        AgentEvent::ToolCallStarted {
-                            name: call.name.clone(),
-                            summary: summary.clone(),
-                            arguments: format_tool_arguments(&call.arguments),
-                        },
-                    );
-                    let started = Instant::now();
-                    let result = {
-                        let tool_future = self.tools.execute(
-                            &call.name,
-                            call.arguments.clone(),
-                            turn_cancel.clone(),
-                        );
-                        tokio::pin!(tool_future);
-                        loop {
-                            tokio::select! {
-                                result = &mut tool_future => break Some(result),
-                                message = input.recv(), if input_open => match message {
-                                    Some(InputMessage::Interrupt) => {
-                                        turn_cancel.cancel();
-                                        break None;
+            loop {
+                tokio::select! {
+                    next = stream.next() => {
+                        let Some(next) = next else {
+                            break;
+                        };
+                        match next {
+                            Ok(StreamEvent::TextDelta(delta)) => {
+                                text.push_str(&delta);
+                                send(events, AgentEvent::TextDelta(delta));
+                            }
+                            Ok(StreamEvent::ReasoningDelta(delta)) => {
+                                reasoning.push_str(&delta);
+                                send(events, AgentEvent::ReasoningDelta(delta));
+                            }
+                            Ok(StreamEvent::ToolCallComplete(call)) => tool_calls.push(call),
+                            Ok(StreamEvent::Done { usage: done_usage, .. }) => {
+                                if let Some(done_usage) = done_usage {
+                                    let summary = usage_summary(&done_usage);
+                                    let _ = self.persist_event(
+                                        SessionEvent::Usage {
+                                            usage: summary.clone(),
+                                        },
+                                        events,
+                                    );
+                                    if let Some(state) = self.session.as_ref() {
+                                        send(events, usage_event(&state.session.metadata.usage));
+                                    } else {
+                                        send(events, usage_event(&summary));
                                     }
-                                    Some(message) => queued.push_back(message),
-                                    None => input_open = false,
-                                },
-                                _ = turn_cancel.cancelled() => break None,
-                                _ = self.cancel.cancelled() => {
-                                    turn_cancel.cancel();
+                                }
+                            }
+                            Err(error) => {
+                                stream_error = Some(error.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    message = input.recv(), if self.input_open => match message {
+                        Some(InputMessage::Interrupt) => {
+                            cancel.cancel();
+                            cancelled = true;
+                            break;
+                        }
+                        Some(message) => self.queued.push_back(message),
+                        None => self.input_open = false,
+                    },
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                    _ = self.cancel.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                }
+            }
+
+            if cancelled {
+                append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
+                let _ = self.persist_assistant(&reasoning, &text, &tool_calls, events);
+                for call in &tool_calls {
+                    let cancelled_result = "cancelled before tool execution";
+                    self.history.push(Message::tool_result(
+                        call.id.clone(),
+                        cancelled_result,
+                        true,
+                    ));
+                    let _ = self.persist_tool_result(call, cancelled_result, true, events);
+                }
+                self.persist_cancelled("turn interrupted", events);
+                send(events, AgentEvent::TurnFinished);
+                if self.cancel.is_cancelled() {
+                    return Err(TurnError::Shutdown);
+                }
+                return Ok(());
+            }
+
+            append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
+            let _ = self.persist_assistant(&reasoning, &text, &tool_calls, events);
+
+            if let Some(error) = stream_error {
+                for call in &tool_calls {
+                    let error_result = format!("provider stream interrupted: {error}");
+                    self.history.push(Message::tool_result(
+                        call.id.clone(),
+                        error_result.clone(),
+                        true,
+                    ));
+                    let _ = self.persist_tool_result(call, &error_result, true, events);
+                }
+                let _ = self.persist_event(
+                    SessionEvent::Error {
+                        message: error.clone(),
+                    },
+                    events,
+                );
+                send(events, AgentEvent::Error(error));
+                send(events, AgentEvent::TurnFinished);
+                return Ok(());
+            }
+
+            if tool_calls.is_empty() {
+                send(events, AgentEvent::TurnFinished);
+                return Ok(());
+            }
+
+            iteration += 1;
+            for call in tool_calls {
+                let summary = call_summary(&call.name, &call.arguments);
+                send(
+                    events,
+                    AgentEvent::ToolCallStarted {
+                        name: call.name.clone(),
+                        summary: summary.clone(),
+                        arguments: format_tool_arguments(&call.arguments),
+                    },
+                );
+                let started = Instant::now();
+                let result = {
+                    let tool_future =
+                        self.tools
+                            .execute(&call.name, call.arguments.clone(), cancel.clone());
+                    tokio::pin!(tool_future);
+                    loop {
+                        tokio::select! {
+                            result = &mut tool_future => break Some(result),
+                            message = input.recv(), if self.input_open => match message {
+                                Some(InputMessage::Interrupt) => {
+                                    cancel.cancel();
                                     break None;
                                 }
+                                Some(message) => self.queued.push_back(message),
+                                None => self.input_open = false,
+                            },
+                            _ = cancel.cancelled() => break None,
+                            _ = self.cancel.cancelled() => {
+                                cancel.cancel();
+                                break None;
                             }
                         }
-                    };
-                    let Some(result) = result else {
-                        let cancelled_output = "cancelled".to_owned();
-                        self.history.push(Message::tool_result(
-                            call.id.clone(),
-                            cancelled_output.clone(),
-                            true,
-                        ));
-                        let _ = self.persist_tool_result(&call, &cancelled_output, true, &events);
-                        send(
-                            &events,
-                            AgentEvent::ToolCallFinished {
-                                name: call.name.clone(),
-                                summary,
-                                ok: false,
-                                duration_ms: started.elapsed().as_millis() as u64,
-                                output: String::new(),
-                                error: Some(cancelled_output),
-                            },
-                        );
-                        self.persist_cancelled("tool execution interrupted", &events);
-                        send(&events, AgentEvent::TurnFinished);
-                        if self.cancel.is_cancelled() {
-                            return;
-                        }
-                        end_turn = true;
-                        break;
-                    };
-                    let output = result.content.clone();
-                    let error = result.is_error.then(|| output.clone());
+                    }
+                };
+                let Some(result) = result else {
+                    let cancelled_output = "cancelled".to_owned();
+                    self.history.push(Message::tool_result(
+                        call.id.clone(),
+                        cancelled_output.clone(),
+                        true,
+                    ));
+                    let _ = self.persist_tool_result(&call, &cancelled_output, true, events);
                     send(
-                        &events,
+                        events,
                         AgentEvent::ToolCallFinished {
                             name: call.name.clone(),
-                            summary: result.summary.clone(),
-                            ok: !result.is_error,
+                            summary,
+                            ok: false,
                             duration_ms: started.elapsed().as_millis() as u64,
-                            output,
-                            error,
+                            output: String::new(),
+                            error: Some(cancelled_output),
                         },
                     );
-                    let result_content = result.content.clone();
-                    let result_is_error = result.is_error;
-                    self.history.push(Message {
-                        role: Role::Tool,
-                        content: vec![Content::ToolResult {
-                            tool_call_id: call.id.clone(),
-                            content: result_content.clone(),
-                            is_error: result_is_error,
-                        }],
-                    });
-                    let _ =
-                        self.persist_tool_result(&call, &result_content, result_is_error, &events);
-                }
+                    self.persist_cancelled("tool execution interrupted", events);
+                    send(events, AgentEvent::TurnFinished);
+                    if self.cancel.is_cancelled() {
+                        return Err(TurnError::Shutdown);
+                    }
+                    return Ok(());
+                };
+                let output = result.content.clone();
+                let error = result.is_error.then(|| output.clone());
+                send(
+                    events,
+                    AgentEvent::ToolCallFinished {
+                        name: call.name.clone(),
+                        summary: result.summary.clone(),
+                        ok: !result.is_error,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        output,
+                        error,
+                    },
+                );
+                let result_content = result.content.clone();
+                let result_is_error = result.is_error;
+                self.history.push(Message {
+                    role: Role::Tool,
+                    content: vec![Content::ToolResult {
+                        tool_call_id: call.id.clone(),
+                        content: result_content.clone(),
+                        is_error: result_is_error,
+                    }],
+                });
+                let _ = self.persist_tool_result(&call, &result_content, result_is_error, events);
+            }
 
-                if !end_turn && iteration >= 100 {
-                    let note = "max tool iterations reached";
-                    self.history.push(Message::user(note));
-                    let _ = self.persist_event(
-                        SessionEvent::Error {
-                            message: note.into(),
-                        },
-                        &events,
-                    );
-                    send(&events, AgentEvent::TextDelta(note.into()));
-                    send(&events, AgentEvent::TurnFinished);
-                    end_turn = true;
-                }
+            if iteration >= 100 {
+                let note = "max tool iterations reached";
+                self.history.push(Message::user(note));
+                let _ = self.persist_event(
+                    SessionEvent::Error {
+                        message: note.into(),
+                    },
+                    events,
+                );
+                send(events, AgentEvent::TextDelta(note.into()));
+                send(events, AgentEvent::TurnFinished);
+                return Ok(());
             }
         }
     }
@@ -757,7 +782,7 @@ impl Agent {
         let id = session.id().to_string();
         let title = session.metadata.title.clone();
         self.history = session.context_messages();
-        let snapshot = snapshot_entries(&session);
+        let snapshot = ui_snapshot_entries(snapshot_entries(&session));
         self.session = Some(crate::agent::AgentSessionState { store, session });
         send(
             events,
@@ -878,18 +903,16 @@ impl Agent {
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        self.handle_set_model_with_factory(provider, model, events, build_provider);
+        self.handle_set_model_with_factory(provider, model, events, Box::new(build_provider));
     }
 
-    fn handle_set_model_with_factory<F>(
+    fn handle_set_model_with_factory(
         &mut self,
         provider: Option<String>,
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
-        factory: F,
-    ) where
-        F: Fn(&str) -> anyhow::Result<Arc<dyn Provider>>,
-    {
+        factory: ProviderFactory,
+    ) {
         let explicit_provider = provider.is_some();
         let requested = provider.unwrap_or_else(|| self.provider.name().to_owned());
         let known_provider = crate::config::ProviderArg::ALL
@@ -961,7 +984,15 @@ impl Agent {
     }
 }
 
-fn spawn_model_list(
+/// Factory used to build providers when the model/provider selection changes.
+/// A `Box<dyn Fn>` (rather than a generic) keeps the call site simple; the
+/// dispatch cost is negligible because it only runs when `/model` is used.
+type ProviderFactory = Box<dyn Fn(&str) -> anyhow::Result<Arc<dyn Provider>>>;
+
+/// Fetch a provider's model list on a background task, reporting
+/// `AgentEvent::ModelList` on success and a notice on failure.  Shared by the
+/// startup fetch in `main` and the `/model` and `/models` handlers.
+pub fn spawn_model_list(
     provider_name: String,
     provider: Arc<dyn Provider>,
     events: mpsc::UnboundedSender<AgentEvent>,
@@ -983,128 +1014,42 @@ fn spawn_model_list(
     });
 }
 
-fn snapshot_entries(session: &Session) -> Vec<SessionSnapshotEntry> {
-    let mut entries = Vec::new();
-    let mut tool_indices = HashMap::<String, usize>::new();
-
-    for record in &session.events {
-        match &record.event {
-            SessionEvent::UserMessage { message } => {
-                let text = message.content.iter().find_map(|content| match content {
-                    StoredContent::Text { text } => Some(text.clone()),
-                    _ => None,
-                });
-                if let Some(text) = text.filter(|text| !text.is_empty()) {
-                    entries.push(SessionSnapshotEntry::User { text });
-                }
-            }
-            SessionEvent::AssistantMessage { message } => {
-                let mut markdown = String::new();
-                let mut reasoning = String::new();
-                for content in &message.content {
-                    match content {
-                        StoredContent::Text { text } => {
-                            if !markdown.is_empty() {
-                                markdown.push('\n');
-                            }
-                            markdown.push_str(text);
-                        }
-                        StoredContent::Reasoning { text } => {
-                            if !reasoning.is_empty() {
-                                reasoning.push('\n');
-                            }
-                            reasoning.push_str(text);
-                        }
-                        StoredContent::ToolCall { .. } | StoredContent::ToolResult { .. } => {}
-                    }
-                }
-                if !markdown.is_empty() || !reasoning.is_empty() {
-                    entries.push(SessionSnapshotEntry::Assistant {
-                        markdown,
-                        reasoning,
-                    });
-                }
-            }
-            SessionEvent::ToolCall { call } => {
-                let index = entries.len();
-                tool_indices.insert(call.id.clone(), index);
-                entries.push(SessionSnapshotEntry::Tool {
-                    name: call.name.clone(),
-                    summary: call_summary(&call.name, &call.arguments),
-                    arguments: format_tool_arguments(&call.arguments),
-                    ok: false,
-                    duration_ms: 0,
-                    output: String::new(),
-                    error: None,
-                });
-            }
-            SessionEvent::ToolResult {
-                tool_call_id,
-                content,
-                is_error,
-                tool_name,
-            } => {
-                if let Some(index) = tool_indices.get(tool_call_id).copied()
-                    && let Some(SessionSnapshotEntry::Tool {
-                        name,
-                        summary,
-                        ok,
-                        output,
-                        error,
-                        ..
-                    }) = entries.get_mut(index)
-                {
-                    if let Some(tool_name) = tool_name {
-                        *name = tool_name.clone();
-                    }
-                    if summary.is_empty() {
-                        *summary = name.clone();
-                    }
-                    *ok = !is_error;
-                    *output = content.clone();
-                    *error = is_error.then(|| content.clone());
-                } else {
-                    entries.push(SessionSnapshotEntry::Tool {
-                        name: tool_name.clone().unwrap_or_else(|| "tool".into()),
-                        summary: tool_name.clone().unwrap_or_else(|| "tool".into()),
-                        arguments: "{}".into(),
-                        ok: !is_error,
-                        duration_ms: 0,
-                        output: content.clone(),
-                        error: is_error.then(|| content.clone()),
-                    });
-                }
-            }
-            SessionEvent::Reasoning { text } => {
-                if let Some(SessionSnapshotEntry::Assistant { reasoning, .. }) = entries.last_mut()
-                {
-                    if !reasoning.is_empty() {
-                        reasoning.push('\n');
-                    }
-                    reasoning.push_str(text);
-                } else {
-                    entries.push(SessionSnapshotEntry::Assistant {
-                        markdown: String::new(),
-                        reasoning: text.clone(),
-                    });
-                }
-            }
-            SessionEvent::CompactionSummary { summary, .. } => {
-                entries.push(SessionSnapshotEntry::Assistant {
-                    markdown: format!("_Session summary:_\n\n{summary}"),
-                    reasoning: String::new(),
-                });
-            }
-            SessionEvent::ModelChange { .. }
-            | SessionEvent::Usage { .. }
-            | SessionEvent::MetadataChange { .. }
-            | SessionEvent::TurnCancelled { .. }
-            | SessionEvent::Error { .. }
-            | SessionEvent::Unknown { .. } => {}
-        }
-    }
-
+/// Adapt the session-owned snapshot into the UI-facing entry type, adding
+/// tool summaries and bounded, pretty-printed argument strings.  The session
+/// crate owns the event walk and tool-result pairing; this conversion is
+/// purely presentational.
+fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<SessionSnapshotEntry> {
     entries
+        .into_iter()
+        .map(|entry| match entry {
+            session::SessionSnapshotEntry::User { text } => SessionSnapshotEntry::User { text },
+            session::SessionSnapshotEntry::Assistant {
+                markdown,
+                reasoning,
+            } => SessionSnapshotEntry::Assistant {
+                markdown,
+                reasoning,
+            },
+            session::SessionSnapshotEntry::Tool {
+                name,
+                arguments,
+                ok,
+                output,
+                error,
+            } => {
+                let summary = call_summary(&name, &arguments);
+                SessionSnapshotEntry::Tool {
+                    name,
+                    summary,
+                    arguments: format_tool_arguments(&arguments),
+                    ok,
+                    duration_ms: 0,
+                    output,
+                    error,
+                }
+            }
+        })
+        .collect()
 }
 
 fn content_is_empty(message: &Message) -> bool {

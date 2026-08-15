@@ -1,4 +1,4 @@
-use agent::agent::{Agent, AgentEvent};
+use agent::agent::{Agent, spawn_model_list};
 use agent::config::{Cli, Config, ProviderArg, build_provider, init_logging};
 use agent::tools::{ToolConfig, default_registry};
 use clap::Parser;
@@ -38,24 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Prime completion as soon as the UI starts.  A failure is informational;
     // ordinary model entry and conversation use do not depend on this fetch.
-    let startup_provider = provider.clone();
-    let startup_events = event_tx.clone();
-    let startup_name = provider_name.clone();
-    tokio::spawn(async move {
-        match startup_provider.list_models().await {
-            Ok(models) => {
-                let _ = startup_events.send(AgentEvent::ModelList {
-                    provider: startup_name,
-                    models,
-                });
-            }
-            Err(error) => {
-                let _ = startup_events.send(AgentEvent::Notice(format!(
-                    "could not fetch model list: {error}"
-                )));
-            }
-        }
-    });
+    spawn_model_list(provider_name.clone(), provider.clone(), event_tx.clone());
 
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
         .with_session(session_store, session);
