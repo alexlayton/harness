@@ -627,17 +627,20 @@ fn tool_top_line(title: &str, width: usize, border: Style, title_style: Style) -
     if width <= 3 {
         return Line::from(Span::styled("─".repeat(width), border));
     }
-    let available = width.saturating_sub(4);
+    // The surrounding decorations are `╭─ ` (3 columns), a separating space,
+    // and `╮` (1 column): 5 columns in total. Reserve them before deciding how
+    // much of the title fits, so the rendered line never exceeds `width`.
+    let available = width.saturating_sub(5);
     let mut title = title.to_owned();
     while UnicodeWidthStr::width(title.as_str()) > available {
         title.pop();
     }
-    let used = 3 + UnicodeWidthStr::width(title.as_str());
-    let fill = width.saturating_sub(used + 1);
+    let title_width = UnicodeWidthStr::width(title.as_str());
+    let fill = width.saturating_sub(title_width + 5);
     Line::from(vec![
         Span::styled("╭─ ", border),
         Span::styled(title, title_style),
-        Span::styled(format!(" {}╮", "─".repeat(fill.saturating_sub(1))), border),
+        Span::styled(format!(" {}╮", "─".repeat(fill)), border),
     ])
 }
 
@@ -1397,6 +1400,58 @@ mod tests {
         assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
     }
 
+    #[test]
+    fn transcript_lines_never_exceed_width() {
+        let long_command = format!("bash: {}", "x".repeat(500));
+        let entries = vec![
+            TranscriptEntry::User {
+                id: 1,
+                text: "a ".repeat(200),
+            },
+            TranscriptEntry::Assistant {
+                id: 2,
+                markdown: "**bold** `code` ".repeat(60),
+                reasoning: "thinking ".repeat(80),
+                streaming: false,
+            },
+            TranscriptEntry::Tool {
+                id: 3,
+                record: record(ToolStatus::Success),
+                expanded: true,
+            },
+            TranscriptEntry::Tool {
+                id: 4,
+                record: ToolRecord {
+                    summary: long_command,
+                    ..record(ToolStatus::Success)
+                },
+                expanded: false,
+            },
+            TranscriptEntry::Notice {
+                id: 5,
+                text: "notice ".repeat(100),
+            },
+            TranscriptEntry::Error {
+                id: 6,
+                text: "error ".repeat(100),
+            },
+        ];
+        for width in 8usize..=140 {
+            let lines = transcript_lines(&entries, false, width, Theme::default());
+            for (index, line) in lines.iter().enumerate() {
+                let w = line_width(line);
+                assert!(
+                    w <= width,
+                    "line {index} is {w} wide but width is {width}: {}",
+                    line.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                );
+            }
+        }
+    }
+
     fn span_contents(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -1450,7 +1505,8 @@ mod tests {
         // ZWJ emoji sequences, combining marks, and CJK are broken at the
         // character level by this wrapper; the round-trip property holds
         // regardless of where the breaks land.
-        for input in ["👨‍👩‍👧‍👦", "café\u{301}", "日本語テキスト", "aeiou"] {
+        for input in ["👨‍👩‍👧‍👦", "café\u{301}", "日本語テキスト", "aeiou"]
+        {
             let lines = wrap_text(&Text::from(input), 3, Style::default());
             let joined: String = lines.iter().map(span_contents).collect();
             assert_eq!(joined, input, "round-trip failed for {input:?}");

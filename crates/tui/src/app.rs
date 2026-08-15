@@ -92,6 +92,11 @@ pub struct Tui {
     pub(crate) focused_tool: Option<usize>,
     pub(crate) scroll: ScrollState,
     pub(crate) transcript_dirty: bool,
+    /// Cache of the wrapped transcript rows so scrolling and spinner redraws do
+    /// not re-parse and re-wrap the whole transcript on every frame. Invalidated
+    /// by `transcript_dirty` or a terminal width change.
+    pub(crate) wrapped_transcript: Vec<ratatui::text::Line<'static>>,
+    pub(crate) wrapped_width: usize,
     pub(crate) focus: Focus,
 
     pub(crate) spinner: usize,
@@ -168,6 +173,8 @@ impl Tui {
             focused_tool: None,
             scroll: ScrollState::default(),
             transcript_dirty: true,
+            wrapped_transcript: Vec::new(),
+            wrapped_width: 0,
             focus: Focus::Prompt,
             spinner: 0,
             activity: Activity::Preparing,
