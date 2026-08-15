@@ -4,6 +4,7 @@ use llm::ToolDefinition;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -56,12 +57,21 @@ const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// rtk documents exit 0 for a successful rewrite (exit 1 for unsupported
+/// commands) but 0.45.0 exited 3 on success.  Only versions at or above this
+/// release are trusted to follow the documented exit-code semantics; older
+/// and unrecognized versions fall back to the non-empty-stdout heuristic.
+const RTK_TRUSTED_EXIT_CODE_VERSION: (u64, u64, u64) = (0, 46, 0);
+
+static RTK_VERSION: OnceLock<Option<(u64, u64, u64)>> = OnceLock::new();
+
 /// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
 /// signals support by printing the rewritten command on stdout; unsupported
 /// commands, a missing rtk binary, and timeouts all degrade to `None`, in
 /// which case the caller runs the original command unchanged.  The exit code
-/// is deliberately ignored: rtk documents 0 for a successful rewrite but
-/// 0.45.0 exits 3, so non-empty stdout is the only reliable signal.
+/// is only authoritative for versions known to implement the documented
+/// semantics: relying on stdout alone would misread a future version that
+/// prints diagnostics but exits non-zero on error.
 async fn rtk_rewrite(command: &str) -> Option<String> {
     let output = tokio::time::timeout(
         RTK_REWRITE_TIMEOUT,
@@ -77,11 +87,88 @@ async fn rtk_rewrite(command: &str) -> Option<String> {
     .ok()?
     .ok()?;
     let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if rtk_exit_codes_trustworthy().await && !output.status.success() {
+        return None;
+    }
     if rewritten.is_empty() {
         None
     } else {
         Some(rewritten)
     }
+}
+
+/// Detect and cache the installed rtk version.  The binary cannot change
+/// during the process lifetime, so a miss is cached too.
+async fn rtk_version() -> Option<(u64, u64, u64)> {
+    if let Some(cached) = RTK_VERSION.get() {
+        return *cached;
+    }
+    let detected = detect_rtk_version().await;
+    let _ = RTK_VERSION.set(detected);
+    detected
+}
+
+async fn detect_rtk_version() -> Option<(u64, u64, u64)> {
+    let output = tokio::time::timeout(
+        RTK_REWRITE_TIMEOUT,
+        Command::new("rtk")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    parse_rtk_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+async fn rtk_exit_codes_trustworthy() -> bool {
+    match rtk_version().await {
+        Some(version) => rtk_exit_codes_trustworthy_for(version),
+        None => false,
+    }
+}
+
+fn rtk_exit_codes_trustworthy_for(version: (u64, u64, u64)) -> bool {
+    version >= RTK_TRUSTED_EXIT_CODE_VERSION
+}
+
+/// Extract the first `major.minor.patch` triplet from `rtk --version` output
+/// (e.g. `rtk 0.45.0` or `0.46.0-beta.1`), tolerating suffixes and arbitrary
+/// surrounding text.
+fn parse_rtk_version(value: &str) -> Option<(u64, u64, u64)> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        while index < bytes.len() && !bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        if start == index {
+            return None;
+        }
+        let mut parts = value[start..].splitn(3, '.');
+        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let (Ok(major), Ok(minor)) = (major.parse::<u64>(), minor.parse::<u64>()) else {
+            continue;
+        };
+        let patch = parts
+            .next()
+            .and_then(|part| {
+                let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+                digits.parse::<u64>().ok()
+            })
+            .unwrap_or(0);
+        return Some((major, minor, patch));
+    }
+    None
 }
 
 #[async_trait]
@@ -328,6 +415,27 @@ mod tests {
         assert!(output.starts_with("[truncated:"));
         assert!(output.contains("2099"));
         assert!(!output.contains("\n0\n"));
+    }
+
+    #[test]
+    fn parses_rtk_version_strings() {
+        assert_eq!(parse_rtk_version("rtk 0.45.0"), Some((0, 45, 0)));
+        assert_eq!(parse_rtk_version("0.46.0"), Some((0, 46, 0)));
+        assert_eq!(parse_rtk_version("rtk 0.45.0 (abcdef1234)"), Some((0, 45, 0)));
+        assert_eq!(parse_rtk_version("rtk 0.45.0-beta.1"), Some((0, 45, 0)));
+        assert_eq!(parse_rtk_version("1.2"), Some((1, 2, 0)));
+        assert_eq!(parse_rtk_version("rtk version unknown"), None);
+        assert_eq!(parse_rtk_version(""), None);
+    }
+
+    #[test]
+    fn rtk_exit_code_trust_threshold_isolates_buggy_releases() {
+        // 0.45.x exits 3 on success despite documenting 0; only 0.46.0+ is
+        // trusted to follow the documented exit-code semantics.
+        assert!(rtk_exit_codes_trustworthy_for((0, 46, 0)));
+        assert!(rtk_exit_codes_trustworthy_for((1, 0, 0)));
+        assert!(!rtk_exit_codes_trustworthy_for((0, 45, 0)));
+        assert!(!rtk_exit_codes_trustworthy_for((0, 45, 9)));
     }
 
     /// rtk is an optional external binary; tests that need it skip silently

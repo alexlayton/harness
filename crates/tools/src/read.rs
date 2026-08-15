@@ -43,7 +43,7 @@ impl Tool for ReadTool {
         ToolSpec {
             definition: ToolDefinition {
                 name: "read".into(),
-                description: "Read a text file, optionally selecting a range of lines.".into(),
+                description: "Read a text file, optionally selecting a range of lines. Text files are detected by scanning the first 8 KB; files containing NUL bytes are treated as binary and rejected.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

@@ -48,12 +48,32 @@ where
             .clone()
     };
 
-    let _guard = tokio::select! {
-        guard = lock.lock() => guard,
+    let result = tokio::select! {
+        guard = lock.lock() => {
+            let result = operation().await;
+            drop(guard);
+            result
+        }
         _ = cancel.cancelled() => return None,
     };
+    drop(lock);
 
-    Some(operation().await)
+    // The map otherwise keeps every path ever locked, growing without bound
+    // over long sessions.  A lock whose strong count is 1 (only the map holds
+    // it) is unreachable: lookups clone under the map mutex, so nobody can be
+    // waiting on it.  Sweeping after each operation bounds the map to paths
+    // with in-flight or queued edits.
+    sweep_unreferenced_file_locks();
+    Some(result)
+}
+
+/// Drop entries from [`FILE_LOCKS`] that no longer have any reference outside
+/// the map itself.  All lookups clone under the map mutex, so a strong count
+/// of 1 while the mutex is held means the entry is genuinely unreachable.
+fn sweep_unreferenced_file_locks() {
+    let locks = FILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().expect("file mutation lock registry poisoned");
+    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
 }
 
 /// Write a file through a same-directory temporary file and atomic rename.

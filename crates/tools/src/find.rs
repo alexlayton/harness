@@ -21,6 +21,13 @@ const MAX_OUTPUT_LINES: usize = 2_000;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 const MAX_TRUNCATION_NOTICE_BYTES: usize = 512;
 
+/// Cadence of the scan-wait loop in [`search_sync`].  fff's `wait_for_scan`
+/// polls internally every 10 ms, so scan-completion latency is unaffected by
+/// this outer interval; it only governs how often the loop can observe
+/// cancellation and enforce the overall timeout.  A 200 ms cadence keeps a
+/// 10 s cancelled scan to ~50 wake-ups instead of ~200 at 50 ms.
+const SCAN_WAIT_POLL: Duration = Duration::from_millis(200);
+
 /// Runtime knobs for the long-lived FFF index and bounded searches.
 #[derive(Clone, Debug)]
 pub struct FindConfig {
@@ -240,7 +247,7 @@ fn search_sync(
             ));
         }
         let remaining = scan_timeout.saturating_sub(elapsed);
-        if shared_picker.wait_for_scan(remaining.min(Duration::from_millis(50))) {
+        if shared_picker.wait_for_scan(remaining.min(SCAN_WAIT_POLL)) {
             break;
         }
     }

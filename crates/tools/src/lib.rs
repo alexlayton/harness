@@ -229,19 +229,37 @@ pub(crate) async fn resolve_workspace_path(
         return Err(format!("path is outside workspace root {}", root.display()));
     }
 
-    // Lexical containment handles `..`; canonicalizing the nearest existing
-    // ancestor also prevents a symlink inside the workspace from escaping it.
+    // Lexical containment handles `..`; canonicalizing also prevents a
+    // symlink inside the workspace from escaping it.  The fast path covers
+    // the common case where the path already exists: one canonicalize, one
+    // containment check.
+    match fs::canonicalize(&candidate).await {
+        Ok(canonical) => {
+            if !canonical.starts_with(&root) {
+                return Err(format!(
+                    "path resolves outside workspace root {}",
+                    root.display()
+                ));
+            }
+            return Ok(candidate);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot resolve path {value}: {error}")),
+    }
+
+    // The candidate does not exist yet (a new file).  Locate the deepest
+    // existing ancestor with cheap metadata probes — one stat per level, no
+    // symlink resolution — then canonicalize only that single ancestor for
+    // the containment check.  The previous loop re-canonicalized every
+    // ancestor, turning a deep missing path into O(depth) expensive realpath
+    // calls.
     let mut existing = candidate.clone();
-    loop {
-        match fs::canonicalize(&existing).await {
-            Ok(canonical) => {
-                if !canonical.starts_with(&root) {
-                    return Err(format!(
-                        "path resolves outside workspace root {}",
-                        root.display()
-                    ));
-                }
-                break;
+    let canonical = loop {
+        match fs::metadata(&existing).await {
+            Ok(_) => {
+                break fs::canonicalize(&existing).await.map_err(|error| {
+                    format!("cannot resolve path {value}: {error}")
+                })?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !existing.pop() {
@@ -250,8 +268,13 @@ pub(crate) async fn resolve_workspace_path(
             }
             Err(error) => return Err(format!("cannot resolve path {value}: {error}")),
         }
+    };
+    if !canonical.starts_with(&root) {
+        return Err(format!(
+            "path resolves outside workspace root {}",
+            root.display()
+        ));
     }
-
     Ok(candidate)
 }
 
@@ -359,5 +382,51 @@ mod tests {
                 .iter()
                 .any(|guideline| guideline.contains("Use find"))
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_path_finds_deepest_existing_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        // Production passes a canonicalized root; mirror that so the
+        // containment check is not confused by platform symlinks (e.g.
+        // /var -> /private/var on macOS).
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+
+        // Only `a/` exists; the deep tail resolves lexically after a single
+        // canonicalize of the existing ancestor.
+        let resolved = resolve_workspace_path("a/b/c/d.txt", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("a/b/c/d.txt"));
+
+        // An existing file resolves through the fast path.
+        std::fs::write(root.join("keep.txt"), "x").unwrap();
+        let resolved = resolve_workspace_path("keep.txt", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("keep.txt"));
+
+        // A path that lexically escapes the root is rejected up front.
+        let error = resolve_workspace_path("../outside/file.txt", Some(&root), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_workspace_path_rejects_symlink_escape_in_deep_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+
+        // The symlink is the deepest existing ancestor; canonicalizing it
+        // once must surface the escape even though the tail does not exist.
+        let error = resolve_workspace_path("link/sub/file.txt", Some(&root), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside"), "{error}");
     }
 }
