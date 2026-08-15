@@ -699,6 +699,86 @@ impl Session {
     pub fn compact(&self, policy: &CompactionPolicy) -> Option<CompactionResult> {
         deterministic_compaction(self, policy)
     }
+
+    /// Sequence boundary of the most recent compaction, if any: the summary's
+    /// own sequence number and the highest sequence it replaces.
+    pub fn latest_compaction_boundary(&self) -> Option<(u64, u64)> {
+        latest_compaction_boundary(&self.events)
+    }
+}
+
+/// Tracks tool-call lifetimes across an event log.  Shared by event
+/// validation and provider-context reconstruction so both functions agree on
+/// which calls are pending, completed, or cancelled — a change to the
+/// bookkeeping no longer needs to be replicated in both places.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolCallTracker {
+    /// Call IDs awaiting a result, in emission order.
+    pending: Vec<String>,
+    /// Call IDs that have received a result.
+    completed: HashSet<String>,
+    /// True when the tail was explicitly cancelled (`TurnCancelled`/`Error`).
+    cancelled: bool,
+}
+
+impl ToolCallTracker {
+    pub(crate) fn pending(&self) -> &[String] {
+        &self.pending
+    }
+
+    pub(crate) fn is_pending(&self, id: &str) -> bool {
+        self.pending.iter().any(|pending| pending == id)
+    }
+
+    pub(crate) fn is_completed(&self, id: &str) -> bool {
+        self.completed.contains(id)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// Apply one event's effect on the tool-call lifecycle.  Events that do
+    /// not carry tool state are no-ops.
+    pub(crate) fn record(&mut self, event: &SessionEvent) {
+        match event {
+            SessionEvent::AssistantMessage { message } => {
+                for content in &message.content {
+                    if let StoredContent::ToolCall { id, .. } = content {
+                        self.push_pending(id);
+                    }
+                }
+                self.cancelled = false;
+            }
+            SessionEvent::ToolCall { call } => {
+                self.push_pending(&call.id);
+                self.cancelled = false;
+            }
+            SessionEvent::ToolResult { tool_call_id, .. } => {
+                self.completed.insert(tool_call_id.clone());
+                if let Some(index) = self.pending.iter().position(|id| id == tool_call_id) {
+                    self.pending.remove(index);
+                }
+            }
+            SessionEvent::TurnCancelled { .. } => {
+                self.pending.clear();
+                self.cancelled = true;
+            }
+            SessionEvent::Error { .. } => {
+                // Errors may follow a stream that ended between a tool call
+                // and its result; they make the tail recoverable without
+                // clearing the pending queue itself.
+                self.cancelled = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn push_pending(&mut self, id: &str) {
+        if !self.is_pending(id) {
+            self.pending.push(id.to_owned());
+        }
+    }
 }
 
 /// Convert the durable event path into valid provider messages.  Compaction
@@ -708,7 +788,7 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     let selected = events_after_latest_compaction(events);
     let mut messages = Vec::<Message>::new();
     let mut call_locations = HashMap::<String, usize>::new();
-    let mut completed_calls = HashSet::<String>::new();
+    let mut tracker = ToolCallTracker::default();
 
     for record in selected {
         match &record.event {
@@ -760,7 +840,6 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                 is_error,
                 ..
             } => {
-                completed_calls.insert(tool_call_id.clone());
                 messages.push(Message::tool_result(
                     tool_call_id.clone(),
                     content.clone(),
@@ -779,13 +858,14 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
             | SessionEvent::TurnCancelled { .. }
             | SessionEvent::Error { .. } => {}
         }
+        tracker.record(&record.event);
     }
 
     // A crash can leave a complete ToolCall line without its result.  Keep the
     // assistant's ordinary text/reasoning, but remove only those calls.  This
     // guarantees the next provider request is structurally valid.
     for (id, index) in call_locations {
-        if completed_calls.contains(&id) {
+        if tracker.is_completed(&id) {
             continue;
         }
         if let Some(Message { content, .. }) = messages.get_mut(index) {
@@ -796,18 +876,24 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     messages
 }
 
-fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&SessionEventRecord> {
-    let latest = events.iter().rev().find_map(|record| {
+/// Find the most recent compaction summary and the sequence boundary it
+/// replaces, if any.  Shared by provider-context reconstruction and the
+/// compactor so a change to the summary format stays in one place.
+pub fn latest_compaction_boundary(events: &[SessionEventRecord]) -> Option<(u64, u64)> {
+    events.iter().rev().find_map(|record| {
         if let SessionEvent::CompactionSummary {
             compacted_through, ..
-        } = record.event
+        } = &record.event
         {
-            Some((record.sequence, compacted_through))
+            Some((record.sequence, *compacted_through))
         } else {
             None
         }
-    });
-    let Some((summary_sequence, compacted_through)) = latest else {
+    })
+}
+
+fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&SessionEventRecord> {
+    let Some((summary_sequence, compacted_through)) = latest_compaction_boundary(events) else {
         return events.iter().collect();
     };
 
@@ -826,8 +912,7 @@ fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&Session
 pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
     let mut expected_sequence = 1u64;
     let mut ids = HashSet::new();
-    let mut pending = Vec::<String>::new();
-    let mut cancelled = false;
+    let mut tracker = ToolCallTracker::default();
 
     for record in events {
         if record.sequence != expected_sequence {
@@ -852,7 +937,7 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
 
         match &record.event {
             SessionEvent::UserMessage { message } => {
-                if !pending.is_empty() && !cancelled {
+                if !tracker.pending().is_empty() && !tracker.is_cancelled() {
                     return Err(SessionError::InvalidEvent(
                         "user message follows an unresolved tool call".into(),
                     ));
@@ -889,16 +974,14 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                     ));
                 }
                 for content in &message.content {
-                    if let StoredContent::ToolCall { id, .. } = content {
-                        if pending.iter().any(|pending_id| pending_id == id) {
-                            return Err(SessionError::InvalidEvent(format!(
-                                "duplicate pending tool call {id}"
-                            )));
-                        }
-                        pending.push(id.clone());
+                    if let StoredContent::ToolCall { id, .. } = content
+                        && tracker.is_pending(id)
+                    {
+                        return Err(SessionError::InvalidEvent(format!(
+                            "duplicate pending tool call {id}"
+                        )));
                     }
                 }
-                cancelled = false;
             }
             SessionEvent::ToolCall { call } => {
                 if call.id.trim().is_empty() || call.name.trim().is_empty() {
@@ -906,14 +989,12 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                         "tool call requires a non-empty ID and name".into(),
                     ));
                 }
-                if pending.iter().any(|pending_id| pending_id == &call.id) {
+                if tracker.is_pending(&call.id) {
                     return Err(SessionError::InvalidEvent(format!(
                         "duplicate pending tool call {}",
                         call.id
                     )));
                 }
-                pending.push(call.id.clone());
-                cancelled = false;
             }
             SessionEvent::ToolResult { tool_call_id, .. } => {
                 if tool_call_id.trim().is_empty() {
@@ -921,7 +1002,7 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                         "tool result requires a non-empty tool_call_id".into(),
                     ));
                 }
-                let Some(first) = pending.first() else {
+                let Some(first) = tracker.pending().first() else {
                     return Err(SessionError::InvalidEvent(format!(
                         "tool result {tool_call_id} has no preceding tool call"
                     )));
@@ -931,19 +1012,11 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                         "tool result {tool_call_id} is out of order; expected {first}"
                     )));
                 }
-                pending.remove(0);
             }
-            SessionEvent::TurnCancelled { .. } => {
-                pending.clear();
-                cancelled = true;
-            }
-            SessionEvent::Error { .. } => {
-                // Errors may follow a provider stream that ended between a
-                // tool call and its result.  They make the tail recoverable.
-                cancelled = true;
-            }
+            SessionEvent::TurnCancelled { .. } | SessionEvent::Error { .. } => {}
             _ => {}
         }
+        tracker.record(&record.event);
     }
     Ok(())
 }

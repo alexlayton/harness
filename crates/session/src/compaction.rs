@@ -6,7 +6,9 @@
 //! be added behind this API later without changing the storage format.
 
 use crate::error::Result;
-use crate::model::{Session, SessionEvent, SessionEventRecord, StoredContent};
+use crate::model::{
+    Session, SessionEvent, SessionEventRecord, StoredContent, latest_compaction_boundary,
+};
 
 /// Policy for the first local compactor.  Counts are deliberately based on
 /// durable events/messages rather than provider-specific tokenizers.
@@ -47,16 +49,7 @@ pub fn deterministic_compaction(
     policy: &CompactionPolicy,
 ) -> Option<CompactionResult> {
     let policy = policy.normalized();
-    let latest_compaction = session.events.iter().rev().find_map(|record| {
-        if let SessionEvent::CompactionSummary {
-            compacted_through, ..
-        } = &record.event
-        {
-            Some((record.sequence, *compacted_through))
-        } else {
-            None
-        }
-    });
+    let latest_compaction = latest_compaction_boundary(&session.events);
 
     let active = if let Some((summary_sequence, boundary)) = latest_compaction {
         session
