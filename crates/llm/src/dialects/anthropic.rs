@@ -1,3 +1,4 @@
+use crate::as_u64;
 use crate::error::truncate_body;
 use crate::sse::{SseEvent, stream_response};
 use crate::{
@@ -16,6 +17,10 @@ pub struct AnthropicMessagesClient {
     pub base_url: String,
     pub api_key: String,
     extra_headers: HeaderMap,
+    /// Copilot's backend expects only `Authorization: Bearer`; when set, the
+    /// `x-api-key` header is omitted.  Defaults to the dual-header behaviour
+    /// used by the Anthropic API and zen-compatible proxies.
+    bearer_only: bool,
 }
 
 impl AnthropicMessagesClient {
@@ -28,11 +33,32 @@ impl AnthropicMessagesClient {
         api_key: impl Into<String>,
         extra_headers: HeaderMap,
     ) -> Self {
+        Self::internal(base_url, api_key, extra_headers, false)
+    }
+
+    /// Construct a client that sends only `Authorization: Bearer <key>` and
+    /// omits `x-api-key`.  Required for the GitHub Copilot backend, which
+    /// rejects requests carrying both headers.
+    pub fn with_bearer_only_headers(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        extra_headers: HeaderMap,
+    ) -> Self {
+        Self::internal(base_url, api_key, extra_headers, true)
+    }
+
+    fn internal(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        extra_headers: HeaderMap,
+        bearer_only: bool,
+    ) -> Self {
         Self {
             http: Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
             extra_headers,
+            bearer_only,
         }
     }
 
@@ -69,7 +95,9 @@ impl AnthropicMessagesClient {
         if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.api_key)) {
             headers.insert(AUTHORIZATION, value);
         }
-        if let Ok(value) = HeaderValue::from_str(&self.api_key) {
+        if !self.bearer_only
+            && let Ok(value) = HeaderValue::from_str(&self.api_key)
+        {
             headers.insert(HeaderName::from_static("x-api-key"), value);
         }
         headers.insert(
@@ -424,13 +452,6 @@ fn value_message(value: &Value) -> Option<&str> {
         .or_else(|| value.get("message").and_then(Value::as_str))
 }
 
-fn as_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
-        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-}
-
 fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
     let stream = async_stream::try_stream! {
         let mut parser = AnthropicParser::new();
@@ -447,6 +468,20 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_only_omits_x_api_key() {
+        let default = AnthropicMessagesClient::new("https://api.anthropic.com", "secret");
+        let headers = default.headers();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        assert_eq!(headers.get("x-api-key").unwrap(), "secret");
+
+        let bearer_only =
+            AnthropicMessagesClient::with_bearer_only_headers("https://api.githubcopilot.com", "secret", HeaderMap::new());
+        let headers = bearer_only.headers();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        assert!(headers.get("x-api-key").is_none());
+    }
 
     #[test]
     fn groups_consecutive_tool_results() {

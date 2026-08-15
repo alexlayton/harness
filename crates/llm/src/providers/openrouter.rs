@@ -47,7 +47,7 @@ impl OpenRouterProvider {
 
 #[async_trait::async_trait]
 impl Provider for OpenRouterProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "openrouter"
     }
 

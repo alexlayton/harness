@@ -1,26 +1,25 @@
-use crate::error::truncate_body;
+use crate::as_u64;
+use crate::http::HttpClient;
 use crate::sse::{SseEvent, stream_response};
 use crate::{
     CompletionRequest, Content, EventStream, LlmError, Message, ModelInfo, Role, StreamEvent,
     ToolCall, ToolDefinition, Usage,
 };
 use futures_util::StreamExt;
-use reqwest::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
 #[derive(Clone)]
 pub struct OpenAiChatClient {
-    http: Client,
-    pub base_url: String,
-    pub api_key: String,
-    extra_headers: HeaderMap,
+    http: HttpClient,
 }
 
 impl OpenAiChatClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
-        Self::with_headers(base_url, api_key, HeaderMap::new())
+        Self {
+            http: HttpClient::new(base_url, api_key),
+        }
     }
 
     pub fn with_headers(
@@ -29,10 +28,7 @@ impl OpenAiChatClient {
         extra_headers: HeaderMap,
     ) -> Self {
         Self {
-            http: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key: api_key.into(),
-            extra_headers,
+            http: HttpClient::with_headers(base_url, api_key, extra_headers),
         }
     }
 
@@ -55,55 +51,15 @@ impl OpenAiChatClient {
         tracing::debug!(provider = "openai-chat", model = %req.model, "starting stream request");
         let response = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .headers(self.headers())
-            .json(&build_request_body(req))
-            .send()
-            .await
-            .map_err(LlmError::Network)?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unable to read response body>".into());
-            return Err(LlmError::Http {
-                status,
-                body: truncate_body(&body, 2048),
-            });
-        }
-
+            .post_json("/chat/completions", &build_request_body(req))
+            .await?;
         Ok(event_stream(stream_response(response)))
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        let response = self
-            .http
-            .get(format!("{}/models", self.base_url))
-            .headers(self.headers())
-            .send()
-            .await
-            .map_err(LlmError::Network)?;
-        let status = response.status();
+        let response = self.http.get("/models").await?;
         let body = response.text().await.map_err(LlmError::Network)?;
-        if !status.is_success() {
-            return Err(LlmError::Http {
-                status: status.as_u16(),
-                body: truncate_body(&body, 2048),
-            });
-        }
         parse_models_body(&body)
-    }
-
-    fn headers(&self) -> HeaderMap {
-        let mut headers = self.extra_headers.clone();
-        let value = format!("Bearer {}", self.api_key);
-        if let Ok(value) = HeaderValue::from_str(&value) {
-            headers.insert(AUTHORIZATION, value);
-        }
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers
     }
 }
 
@@ -392,6 +348,10 @@ impl ChatStreamParser {
             };
             result.push(StreamEvent::ToolCallComplete(ToolCall {
                 id: if call.id.is_empty() {
+                    tracing::warn!(
+                        name = %call.name,
+                        "tool call streamed without an id; generated synthetic id that cannot be matched in later turns"
+                    );
                     format!("call-{}", result.len())
                 } else {
                     call.id
@@ -418,13 +378,6 @@ fn parse_usage(value: &Value) -> Result<Usage, LlmError> {
             .and_then(as_u64),
         cost: value.get("cost").and_then(Value::as_f64),
     })
-}
-
-fn as_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
-        .or_else(|| value.as_str().and_then(|number| number.parse().ok()))
 }
 
 fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {

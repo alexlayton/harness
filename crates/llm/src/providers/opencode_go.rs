@@ -106,7 +106,7 @@ impl OpenCodeGoProvider {
 
 #[async_trait::async_trait]
 impl Provider for OpenCodeGoProvider {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "opencode-go"
     }
 

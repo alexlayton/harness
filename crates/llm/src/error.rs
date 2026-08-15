@@ -10,6 +10,12 @@ pub enum LlmError {
     Stream(String),
     #[error("parse: {0}")]
     Parse(String),
+    /// Missing or expired credentials (e.g. GitHub Copilot).  Callers can use
+    /// this to surface an actionable "run /auth" message instead of a generic
+    /// HTTP or network error.  Never retryable: retrying cannot refresh the
+    /// credential.
+    #[error("auth: {0}")]
+    Auth(String),
 }
 
 impl LlmError {
@@ -20,7 +26,7 @@ impl LlmError {
             // is therefore safe to retry it (and covers connect and timeout errors).
             Self::Network(_) => true,
             Self::Http { status, .. } => *status == 429 || (500..=599).contains(status),
-            Self::Stream(_) | Self::Parse(_) => false,
+            Self::Stream(_) | Self::Parse(_) | Self::Auth(_) => false,
         }
     }
 
@@ -43,4 +49,19 @@ pub fn truncate_body(body: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     format!("{}\n[truncated]", &body[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_errors_are_not_retryable() {
+        assert!(!LlmError::Auth("run /auth".into()).is_retryable());
+        assert!(!LlmError::Parse("bad".into()).is_retryable());
+        assert!(!LlmError::Stream("gone".into()).is_retryable());
+        assert!(LlmError::http(429, "rate limited").is_retryable());
+        assert!(LlmError::http(500, "server error").is_retryable());
+        assert!(!LlmError::http(401, "unauthorized").is_retryable());
+    }
 }

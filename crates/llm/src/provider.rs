@@ -9,7 +9,11 @@ pub type RetryCallback = Arc<dyn for<'a> Fn(u32, &'a LlmError) + Send + Sync>;
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
-    fn name(&self) -> &'static str;
+    /// Provider identifier used in sessions and logs.  Returns `&str` (rather
+    /// than `&'static str`) so dynamically constructed providers (e.g. GitHub
+    /// Copilot with a runtime-derived name) can return a stored `String`
+    /// reference instead of leaking or registering statics.
+    fn name(&self) -> &str;
 
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError>;
 
