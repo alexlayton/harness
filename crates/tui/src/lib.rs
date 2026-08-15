@@ -4,8 +4,11 @@
 mod app;
 pub mod attachments;
 pub mod commands;
+mod completion;
 mod environment;
+mod events;
 mod input;
+mod layout;
 pub mod render;
 mod state;
 

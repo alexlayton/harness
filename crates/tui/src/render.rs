@@ -1047,6 +1047,26 @@ pub fn prompt_layout(textarea: &TextArea<'_>, width: usize, theme: Theme) -> Pro
     }
 }
 
+/// Return the prompt scroll offset that keeps the cursor row visible inside a
+/// prompt body with `inner_height` visible rows.
+///
+/// The cursor can sit on its own fresh visual row when the previous row
+/// filled the width exactly; this helper guarantees that row is painted even
+/// for a one-row prompt area.
+pub fn prompt_scroll_for_cursor(
+    cursor_row: usize,
+    line_count: usize,
+    inner_height: usize,
+) -> usize {
+    let inner_height = inner_height.max(1);
+    let max_scroll = line_count.saturating_sub(inner_height);
+    if cursor_row < inner_height {
+        0
+    } else {
+        (cursor_row + 1 - inner_height).min(max_scroll)
+    }
+}
+
 pub fn render_prompt(
     area: Rect,
     textarea: &TextArea<'_>,
@@ -1280,6 +1300,53 @@ mod tests {
         assert!(layout.lines.len() >= 2);
         assert_eq!(layout.cursor_row, 2);
         assert_eq!(layout.cursor_col, 0);
+    }
+
+    #[test]
+    fn prompt_cursor_stays_visible_in_a_one_row_prompt_when_a_word_wraps() {
+        // A single word that exactly fills each wrapped row places the cursor
+        // on a fresh (initially empty) visual row after the wrap boundary. The
+        // layout must still scroll a 1-row prompt so that row is painted.
+        let mut textarea = TextArea::from(["abcdefgh"]);
+        textarea.move_cursor(tui_textarea::CursorMove::End);
+        let layout = prompt_layout(&textarea, 4, Theme::default());
+        assert_eq!(layout.lines.len(), 3);
+        assert_eq!(layout.cursor_row, 2);
+        assert_eq!(layout.cursor_col, 0);
+
+        let inner_height = 1; // a one-row prompt body
+        let scroll = prompt_scroll_for_cursor(layout.cursor_row, layout.lines.len(), inner_height);
+        assert!(
+            layout.cursor_row >= scroll && layout.cursor_row < scroll + inner_height,
+            "cursor row {} outside visible window [{}, {})",
+            layout.cursor_row,
+            scroll,
+            scroll + inner_height
+        );
+        assert_eq!(scroll, 2);
+    }
+
+    #[test]
+    fn prompt_scroll_helper_keeps_cursor_in_window() {
+        let cases = [
+            // (cursor_row, line_count, inner_height)
+            (0, 1, 1),
+            (1, 2, 1),
+            (2, 3, 1),
+            (5, 20, 4),
+            (19, 20, 4),
+            (0, 10, 3),
+        ];
+        for (cursor_row, line_count, inner_height) in cases {
+            let scroll =
+                prompt_scroll_for_cursor(cursor_row, line_count, inner_height);
+            assert!(
+                cursor_row >= scroll && cursor_row < scroll + inner_height.max(1),
+                "cursor {cursor_row} outside window [{scroll}, {})",
+                scroll + inner_height.max(1)
+            );
+            assert!(scroll <= line_count.saturating_sub(inner_height.max(1)));
+        }
     }
 
     #[test]

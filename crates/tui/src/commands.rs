@@ -115,6 +115,7 @@ pub enum ParsedCommand {
         destination: Option<String>,
     },
     Compact,
+    Auth,
     SetModel {
         provider: Option<String>,
         model: String,
@@ -174,6 +175,13 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /compact".into())
             } else {
                 Ok(ParsedCommand::Compact)
+            }
+        }
+        "/auth" => {
+            if words.next().is_some() {
+                Err("usage: /auth".into())
+            } else {
+                Ok(ParsedCommand::Auth)
             }
         }
         "/model" => {
@@ -846,6 +854,8 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/compact"), Ok(ParsedCommand::Compact));
+        assert_eq!(parse_command("/auth"), Ok(ParsedCommand::Auth));
+        assert_eq!(parse_command("/auth now"), Err("usage: /auth".into()));
         assert_eq!(
             parse_command("/model gpt-5.6-luna"),
             Ok(ParsedCommand::SetModel {
