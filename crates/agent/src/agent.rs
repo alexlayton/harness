@@ -3,8 +3,8 @@ use crate::prompt::system_prompt_with_tools;
 use crate::tools::{ToolRegistry, call_recap, call_summary};
 use futures_util::StreamExt;
 use llm::{
-    CompletionRequest, Content, Message, Provider, RetryCallback, Role, StreamEvent, ToolCall,
-    truncate_utf8,
+    CompletionRequest, Content, LlmError, Message, Provider, RetryCallback, Role, StreamEvent,
+    ToolCall, truncate_utf8,
 };
 use session::{
     CompactionPolicy, ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore,
@@ -17,6 +17,11 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tui::InputMessage;
+
+/// Maximum number of times a turn re-streams after a tool call whose arguments
+/// fail to parse. A model that keeps truncating its output should eventually
+/// give up instead of looping forever.
+const MAX_PARSE_RETRIES: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -404,6 +409,7 @@ impl Agent {
             send(events, AgentEvent::TurnFinished);
             return Err(TurnError::Persist("user message".into()));
         }
+        let mut parse_retries = 0;
         loop {
             let request = CompletionRequest {
                 model: self.model.clone(),
@@ -510,7 +516,7 @@ impl Agent {
                                 }
                             }
                             Err(error) => {
-                                stream_error = Some(error.to_string());
+                                stream_error = Some(error);
                                 break;
                             }
                         }
@@ -559,8 +565,19 @@ impl Agent {
             let _ = self.persist_assistant(&reasoning, &text, &tool_calls, events);
 
             if let Some(error) = stream_error {
+                let message = error.to_string();
+                let _ = self.persist_event(
+                    SessionEvent::Error {
+                        message: message.clone(),
+                    },
+                    events,
+                );
+                send(events, AgentEvent::Error(message.clone()));
+                // Any calls already streamed before the failure must not
+                // dangle; mark them failed so the next request (retry or next
+                // turn) sees a consistent history.
                 for call in &tool_calls {
-                    let error_result = format!("provider stream interrupted: {error}");
+                    let error_result = format!("provider stream interrupted: {message}");
                     self.history.push(Message::tool_result(
                         call.id.clone(),
                         error_result.clone(),
@@ -568,13 +585,46 @@ impl Agent {
                     ));
                     let _ = self.persist_tool_result(call, &error_result, true, events);
                 }
-                let _ = self.persist_event(
-                    SessionEvent::Error {
-                        message: error.clone(),
-                    },
-                    events,
-                );
-                send(events, AgentEvent::Error(error));
+                let mut retried = false;
+                if let LlmError::Parse(parse_message) = error {
+                    // A tool call whose arguments failed to parse (usually
+                    // truncated JSON) never became durable, so the turn can
+                    // retry without leaving dangling state. Nudge the model
+                    // and re-stream instead of dead-ending the turn.
+                    if parse_retries < MAX_PARSE_RETRIES {
+                        parse_retries += 1;
+                        let note = format!(
+                            "[system note: your previous tool call had malformed JSON \
+                             arguments and was not executed: {parse_message}. Re-issue the \
+                             tool call with valid arguments.]"
+                        );
+                        // Appending into a trailing user message (instead of
+                        // always pushing a new one) keeps provider role
+                        // alternation valid across all dialects.
+                        let tail_is_user = matches!(
+                            self.history.last(),
+                            Some(Message {
+                                role: Role::User,
+                                ..
+                            })
+                        );
+                        if tail_is_user {
+                            if let Some(Message {
+                                role: Role::User,
+                                content,
+                            }) = self.history.last_mut()
+                            {
+                                content.push(Content::Text(note));
+                            }
+                        } else {
+                            self.history.push(Message::user(note));
+                        }
+                        retried = true;
+                    }
+                }
+                if retried {
+                    continue;
+                }
                 send(events, AgentEvent::TurnFinished);
                 return Ok(());
             }
@@ -1107,6 +1157,14 @@ mod tests {
     /// maps them back into `LlmError::Stream`.
     type ScriptStep = Result<StreamEvent, String>;
 
+    /// How mock stream errors are wrapped; lets tests exercise the
+    /// parse-error recovery path specifically.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum MockErrorKind {
+        Stream,
+        Parse,
+    }
+
     /// Build a script that emits the given events successfully.
     fn script(events: Vec<StreamEvent>) -> Vec<ScriptStep> {
         events.into_iter().map(Ok).collect()
@@ -1115,6 +1173,7 @@ mod tests {
     struct MockProvider {
         calls: AtomicUsize,
         scripts: Vec<Vec<ScriptStep>>,
+        error_kind: MockErrorKind,
     }
 
     #[async_trait]
@@ -1126,9 +1185,13 @@ mod tests {
         async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
             let script = self.scripts.get(index).cloned().unwrap_or_default();
-            Ok(Box::pin(stream::iter(
-                script.into_iter().map(|step| step.map_err(LlmError::Stream)),
-            )))
+            let error_kind = self.error_kind;
+            Ok(Box::pin(stream::iter(script.into_iter().map(move |step| {
+                step.map_err(|message| match error_kind {
+                    MockErrorKind::Stream => LlmError::Stream(message),
+                    MockErrorKind::Parse => LlmError::Parse(message),
+                })
+            }))))
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -1168,6 +1231,7 @@ mod tests {
                     usage: Some(Usage::default()),
                 },
             ])],
+            error_kind: MockErrorKind::Stream,
         });
         assert!(events.contains(&AgentEvent::TextDelta("hello".into())));
         assert!(events.contains(&AgentEvent::TurnFinished));
@@ -1201,6 +1265,7 @@ mod tests {
                         }),
                     },
                 ])],
+                error_kind: MockErrorKind::Stream,
             };
             let cancel = CancellationToken::new();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1251,6 +1316,7 @@ mod tests {
                         },
                     ]),
                 ],
+                error_kind: MockErrorKind::Stream,
             };
             let cancel = CancellationToken::new();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1313,6 +1379,7 @@ mod tests {
                     })),
                     Err("connection dropped mid-stream".into()),
                 ]],
+                error_kind: MockErrorKind::Stream,
             };
             let cancel = CancellationToken::new();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1357,6 +1424,88 @@ mod tests {
             assert!(
                 content.contains("provider stream interrupted"),
                 "unexpected tool result content: {content}"
+            );
+        });
+    }
+
+    /// A tool call whose arguments fail to parse (the "EOF while parsing a
+    /// list" case from truncated output) must not dead-end the turn: the agent
+    /// re-streams once with an in-memory recovery note, and the retried answer
+    /// is persisted with nothing left dangling.
+    #[test]
+    fn parse_error_retries_turn_instead_of_dead_ending() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = store
+                .create(SessionCreateOptions {
+                    provider: Some("mock".into()),
+                    model: Some("demo".into()),
+                    ..SessionCreateOptions::default()
+                })
+                .unwrap();
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    vec![Err("EOF while parsing a list at line 1 column 253".into())],
+                    script(vec![
+                        StreamEvent::TextDelta("retried".into()),
+                        StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        },
+                    ]),
+                ],
+                error_kind: MockErrorKind::Parse,
+            });
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("use the tool".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .with_session(store.clone(), session.clone())
+                .run(input_rx, event_tx)
+                .await;
+
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                2,
+                "a parse error should re-stream once instead of ending the turn"
+            );
+            let mut got = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                got.push(event);
+            }
+            assert!(got.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(message) if message.contains("EOF while parsing")
+            )));
+            assert!(got.contains(&AgentEvent::TextDelta("retried".into())));
+            assert!(got.contains(&AgentEvent::TurnFinished));
+
+            // The retried answer is durable and no tool call is left dangling.
+            let loaded = store.open(&session.id()).unwrap();
+            let assistant_texts: Vec<&String> = loaded
+                .events
+                .iter()
+                .filter_map(|record| match &record.event {
+                    SessionEvent::AssistantMessage { message } => {
+                        message.content.iter().find_map(|content| match content {
+                            session::StoredContent::Text { text } => Some(text),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                assistant_texts.iter().any(|text| text.contains("retried")),
+                "the retried answer should be persisted"
             );
         });
     }
