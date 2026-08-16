@@ -1,6 +1,6 @@
 use crate::config::{build_provider, save_settings};
 use crate::prompt::system_prompt_with_tools;
-use crate::tools::{ToolRegistry, call_summary};
+use crate::tools::{ToolRegistry, call_recap, call_summary};
 use futures_util::StreamExt;
 use llm::{
     CompletionRequest, Content, Message, Provider, RetryCallback, Role, StreamEvent, ToolCall,
@@ -591,7 +591,7 @@ impl Agent {
                     AgentEvent::ToolCallStarted {
                         name: call.name.clone(),
                         summary: summary.clone(),
-                        arguments: format_tool_arguments(&call.arguments),
+                        arguments: call_recap(&call.name, &call.arguments),
                     },
                 );
                 let started = Instant::now();
@@ -1028,10 +1028,11 @@ fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<Sessi
                 error,
             } => {
                 let summary = call_summary(&name, &arguments);
+                let recap = call_recap(&name, &arguments);
                 SessionSnapshotEntry::Tool {
                     name,
                     summary,
-                    arguments: format_tool_arguments(&arguments),
+                    arguments: recap,
                     ok,
                     duration_ms: 0,
                     output,
@@ -1062,14 +1063,6 @@ fn append_assistant(history: &mut Vec<Message>, reasoning: &str, text: &str, cal
         role: Role::Assistant,
         content,
     });
-}
-
-const MAX_TOOL_ARGUMENT_BYTES: usize = 2 * 1024;
-
-fn format_tool_arguments(arguments: &serde_json::Value) -> String {
-    let formatted =
-        serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string());
-    truncate_utf8(&formatted, MAX_TOOL_ARGUMENT_BYTES)
 }
 
 fn usage_event(usage: &session::UsageSummary) -> AgentEvent {
@@ -1272,7 +1265,10 @@ mod tests {
             assert!(got.contains(&AgentEvent::TextDelta("done".into())));
             assert!(got.iter().any(|event| matches!(
                 event,
-                AgentEvent::ToolCallStarted { arguments, .. } if arguments == "{}"
+                AgentEvent::ToolCallStarted {
+                    arguments,
+                    ..
+                } if arguments == "missing"
             )));
             assert!(got.iter().any(|event| matches!(
                 event,

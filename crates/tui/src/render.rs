@@ -685,7 +685,7 @@ fn tool_box_lines(
     if expanded {
         push_tool_body_line(
             &mut lines,
-            line_with_style("args", tool_header_style(theme)),
+            line_with_style("call", tool_header_style(theme)),
             width,
             border,
             body,
@@ -1203,7 +1203,7 @@ mod tests {
     fn record(status: ToolStatus) -> ToolRecord {
         ToolRecord {
             name: "bash".into(),
-            args: "{\"command\":\"cargo test\"}".into(),
+            args: "bash: cargo test (timeout 30s)".into(),
             summary: "bash: cargo test".into(),
             ok: !matches!(status, ToolStatus::Failure),
             duration_ms: 1_200,
@@ -1296,6 +1296,25 @@ mod tests {
         assert!(value.contains("fifth"));
         assert!(!value.contains("first"));
         assert!(value.contains("ctrl + o to expand all"));
+    }
+
+    #[test]
+    fn expanded_tools_show_the_human_recap_not_raw_json() {
+        let lines = tool_box_lines(&record(ToolStatus::Success), true, 60, Theme::default());
+        let value = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(value.contains("call"));
+        assert!(value.contains("bash: cargo test (timeout 30s)"));
+        assert!(!value.contains("\"command\""));
+        assert!(value.contains("completed in 1.2s"));
     }
 
     #[test]

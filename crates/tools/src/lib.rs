@@ -372,6 +372,58 @@ fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value)
 }
 
+/// Expanded per-tool recap shown in the transcript. Unlike [`call_summary`]
+/// this includes the secondary arguments a user may want to see (line ranges,
+/// limits, timeouts) while still staying readable and free of raw JSON. Falls
+/// back to [`call_summary`] when there are no interesting extras.
+pub fn call_recap(name: &str, args: &Value) -> String {
+    let base = call_summary(name, args);
+    let extras = match name {
+        "read" => {
+            let offset = args.get("offset").and_then(Value::as_u64);
+            let limit = args.get("limit").and_then(Value::as_u64);
+            match (offset, limit) {
+                (Some(offset), Some(limit)) if offset != 1 => {
+                    Some(format!("lines {offset}–{}", offset + limit))
+                }
+                (Some(_), Some(limit)) => Some(format!("lines 1–{}", limit)),
+                _ => None,
+            }
+        }
+        "bash" => {
+            let dir = args.get("dir").and_then(Value::as_str);
+            let timeout = args.get("timeout").and_then(Value::as_u64);
+            match (dir, timeout) {
+                (Some(dir), Some(timeout)) => Some(format!("in {dir} · timeout {timeout}s")),
+                (Some(dir), None) => Some(format!("in {dir}")),
+                (None, Some(timeout)) => Some(format!("timeout {timeout}s")),
+                (None, None) => None,
+            }
+        }
+        "find" => args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|limit| format!("limit {limit}")),
+        "grep" => {
+            let limit = args.get("limit").and_then(Value::as_u64);
+            let context = args.get("context").and_then(Value::as_u64);
+            match (limit, context) {
+                (Some(limit), Some(context)) if context > 0 => {
+                    Some(format!("limit {limit} · context {context}"))
+                }
+                (Some(limit), _) => Some(format!("limit {limit}")),
+                (None, Some(context)) if context > 0 => Some(format!("context {context}")),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    match extras {
+        Some(extras) => format!("{base} ({extras})"),
+        None => base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,6 +450,44 @@ mod tests {
                 &serde_json::json!({"query": "ViewModel", "path": "src"})
             ),
             "find ViewModel in src"
+        );
+    }
+
+    #[test]
+    fn recap_includes_secondary_arguments_human_readably() {
+        assert_eq!(
+            call_recap("read", &serde_json::json!({"path": "a.rs"})),
+            "read a.rs"
+        );
+        assert_eq!(
+            call_recap(
+                "read",
+                &serde_json::json!({"path": "a.rs", "offset": 2, "limit": 30})
+            ),
+            "read a.rs (lines 2–32)"
+        );
+        assert_eq!(
+            call_recap(
+                "bash",
+                &serde_json::json!({"command": "cargo test", "dir": "crates/tui", "timeout": 30})
+            ),
+            "bash: cargo test (in crates/tui · timeout 30s)"
+        );
+        assert_eq!(
+            call_recap("find", &serde_json::json!({"query": "foo", "limit": 25})),
+            "find foo (limit 25)"
+        );
+        assert_eq!(
+            call_recap(
+                "grep",
+                &serde_json::json!({"pattern": "TODO", "context": 2})
+            ),
+            "grep TODO (context 2)"
+        );
+        // Unknown tools have no recap; the summary is returned unchanged.
+        assert_eq!(
+            call_recap("custom", &serde_json::json!({"a": 1})),
+            "custom"
         );
     }
 
