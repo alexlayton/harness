@@ -629,6 +629,19 @@ impl Agent {
             }
 
             if tool_calls.is_empty() {
+                // A turn that produced no text and no tool calls is almost
+                // always a provider stall (reasoning emitted, then nothing).
+                // Nudge once instead of silently ending the turn.
+                if text.trim().is_empty() && recoveries < MAX_TURN_RECOVERIES {
+                    recoveries += 1;
+                    push_recovery_note(
+                        &mut self.history,
+                        "[system note: your previous response produced no output; continue \
+                         and complete the task.]"
+                            .into(),
+                    );
+                    continue;
+                }
                 send(events, AgentEvent::TurnFinished);
                 return Ok(());
             }
@@ -1582,4 +1595,55 @@ mod tests {
         });
     }
 
+    /// A response with no text and no tool calls is a provider stall; the
+    /// agent re-streams once with a nudge instead of ending the turn silently.
+    #[test]
+    fn empty_response_retries_turn_once() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    script(vec![StreamEvent::Done {
+                        stop_reason: None,
+                        usage: None,
+                    }]),
+                    script(vec![
+                        StreamEvent::TextDelta("answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        },
+                    ]),
+                ],
+                error_kind: MockErrorKind::Stream,
+            });
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("do the work".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .run(input_rx, event_tx)
+                .await;
+
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                2,
+                "an empty response should re-stream once"
+            );
+            let mut got = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                got.push(event);
+            }
+            assert!(got.contains(&AgentEvent::TextDelta("answer".into())));
+            assert!(got.contains(&AgentEvent::TurnFinished));
+            assert!(
+                !got.iter().any(|event| matches!(event, AgentEvent::Error(_))),
+                "an empty response is a stall, not an error"
+            );
+        });
+    }
 }
