@@ -52,8 +52,7 @@ impl crate::Tui {
             KeyCode::Char('o')
                 if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.is_empty() =>
             {
-                self.focused_tool = Some(indices[current_position]);
-                self.toggle_tool_at(indices[current_position]);
+                self.toggle_all_tools();
                 Ok(true)
             }
             KeyCode::Tab => {
@@ -567,13 +566,18 @@ impl crate::Tui {
             .collect()
     }
 
-    pub(crate) fn toggle_selected_or_latest_tool(&mut self) {
-        let index = self
-            .focused_tool
-            .or_else(|| self.tool_indices().last().copied());
-        if let Some(index) = index {
-            self.toggle_tool_at(index);
+    pub(crate) fn toggle_all_tools(&mut self) {
+        // Expand every tool when at least one is collapsed, otherwise collapse
+        // them all. This makes Ctrl+O a toggle across the whole transcript
+        // regardless of focus.
+        let expand = crate::state::toggle_all_direction(&self.transcript);
+        for entry in &mut self.transcript {
+            if let TranscriptEntry::Tool { expanded, .. } = entry {
+                *expanded = expand;
+            }
         }
+        self.transcript_changed();
+        self.focused_tool = None;
     }
 
     fn toggle_tool_at(&mut self, index: usize) {

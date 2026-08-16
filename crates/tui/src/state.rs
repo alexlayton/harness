@@ -93,6 +93,15 @@ impl TranscriptEntry {
     }
 }
 
+/// The outcome of a transcript-wide collapse/expand toggle. Collapsed when at
+/// least one tool is collapsed, expanded when every tool is already expanded.
+/// Pure so the toggle logic can be unit-tested without a TTY.
+pub(crate) fn toggle_all_direction(entries: &[TranscriptEntry]) -> bool {
+    entries.iter().any(|entry| {
+        matches!(entry, TranscriptEntry::Tool { expanded: false, .. })
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Focus {
     Prompt,
@@ -210,5 +219,33 @@ mod tests {
         assert_eq!(state.offset, 15);
         assert!(state.follow_latest);
         assert!(!state.new_content_below);
+    }
+
+    #[test]
+    fn toggle_all_direction_expands_when_any_tool_is_collapsed() {
+        let tool = |expanded| TranscriptEntry::Tool {
+            id: 1,
+            record: ToolRecord {
+                name: "bash".into(),
+                args: "{}".into(),
+                summary: "bash: echo hi".into(),
+                ok: true,
+                duration_ms: 1,
+                output: "hi".into(),
+                error: None,
+                status: ToolStatus::Success,
+            },
+            expanded,
+        };
+        // All expanded → the next toggle collapses everything.
+        assert!(!toggle_all_direction(&[tool(true), tool(true)]));
+        // Any collapsed → the next toggle expands everything.
+        assert!(toggle_all_direction(&[tool(true), tool(false)]));
+        assert!(toggle_all_direction(&[tool(false), tool(false)]));
+        // Non-tool entries do not affect the direction.
+        assert!(!toggle_all_direction(&[
+            TranscriptEntry::User { id: 2, text: "hi".into() },
+            tool(true),
+        ]));
     }
 }

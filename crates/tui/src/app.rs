@@ -332,8 +332,8 @@ impl Tui {
                 }
                 self.submit_message(input, input_tx)?;
             }
-            InputAction::ExpandDetails => {
-                self.toggle_selected_or_latest_tool();
+            InputAction::ToggleAllTools => {
+                self.toggle_all_tools();
             }
             InputAction::FocusTools => {
                 if !self.busy && !self.tool_indices().is_empty() {

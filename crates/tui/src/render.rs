@@ -74,7 +74,7 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("Mouse wheel", "Scroll transcript"),
     ("PageUp / PageDown", "Scroll transcript"),
     ("End / Ctrl+End", "Return to bottom"),
-    ("Ctrl+O", "Expand / collapse tool"),
+    ("Ctrl+O", "Expand / collapse all tools"),
     ("Ctrl+C", "Cancel / quit"),
     ("Esc", "Close transient UI"),
     ("/", "Commands"),
@@ -748,7 +748,7 @@ fn tool_box_lines(
         }
         push_tool_body_line(
             &mut lines,
-            line_with_style("ctrl + o to expand", tool_hint_style(theme)),
+            line_with_style("ctrl + o to expand all", tool_hint_style(theme)),
             width,
             border,
             tool_hint_style(theme),
@@ -1295,7 +1295,7 @@ mod tests {
             .join("\n");
         assert!(value.contains("fifth"));
         assert!(!value.contains("first"));
-        assert!(value.contains("ctrl + o to expand"));
+        assert!(value.contains("ctrl + o to expand all"));
     }
 
     #[test]

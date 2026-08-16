@@ -8,7 +8,7 @@ pub enum InputAction {
     Newline,
     Interrupt,
     Quit,
-    ExpandDetails,
+    ToggleAllTools,
     PageUp,
     PageDown,
     Bottom,
@@ -46,7 +46,7 @@ pub fn classify(event: &Event) -> InputAction {
             modifiers,
             ..
         }) if modifiers.contains(KeyModifiers::CONTROL) && value.eq_ignore_ascii_case(&'o') => {
-            InputAction::ExpandDetails
+            InputAction::ToggleAllTools
         }
         Event::Key(KeyEvent {
             code: KeyCode::Tab,
@@ -177,7 +177,7 @@ mod tests {
         );
         assert_eq!(
             classify(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            InputAction::ExpandDetails
+            InputAction::ToggleAllTools
         );
         assert_eq!(
             classify(&key(KeyCode::PageUp, KeyModifiers::NONE)),
