@@ -384,7 +384,9 @@ pub fn call_recap(name: &str, args: &Value) -> String {
             let limit = args.get("limit").and_then(Value::as_u64);
             match (offset, limit) {
                 (Some(offset), Some(limit)) if offset != 1 => {
-                    Some(format!("lines {offset}–{}", offset + limit))
+                    // offset is 1-indexed and limit counts lines, so the last
+                    // line covered is `offset + limit - 1`.
+                    Some(format!("lines {offset}–{}", offset + limit - 1))
                 }
                 (Some(_), Some(limit)) => Some(format!("lines 1–{}", limit)),
                 _ => None,
@@ -464,7 +466,7 @@ mod tests {
                 "read",
                 &serde_json::json!({"path": "a.rs", "offset": 2, "limit": 30})
             ),
-            "read a.rs (lines 2–32)"
+            "read a.rs (lines 2–31)"
         );
         assert_eq!(
             call_recap(
