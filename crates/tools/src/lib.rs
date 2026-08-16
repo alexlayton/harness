@@ -418,7 +418,16 @@ pub fn call_recap(name: &str, args: &Value) -> String {
                 _ => None,
             }
         }
-        _ => None,
+        "write" | "edit" => {
+            // The path in the summary already carries the interesting content.
+            None
+        }
+        _ => {
+            // Custom tools have no curated recap; keep their arguments visible
+            // instead of hiding them behind the bare tool name.
+            let compact = serde_json::to_string(args).unwrap_or_default();
+            (compact != "null" && compact != "{}").then(|| format!("args {compact}"))
+        }
     };
     match extras {
         Some(extras) => format!("{base} ({extras})"),
@@ -486,11 +495,18 @@ mod tests {
             ),
             "grep TODO (context 2)"
         );
-        // Unknown tools have no recap; the summary is returned unchanged.
+        // Unknown tools have no curated recap; the raw args stay visible.
         assert_eq!(
             call_recap("custom", &serde_json::json!({"a": 1})),
-            "custom"
+            "custom (args {\"a\":1})"
         );
+        // edit/write already carry their path in the summary; nothing to add.
+        assert_eq!(
+            call_recap("edit", &serde_json::json!({"path": "a.rs"})),
+            "edit a.rs"
+        );
+        // Empty or absent args add no noise.
+        assert_eq!(call_recap("custom", &serde_json::json!({})), "custom");
     }
 
     #[test]

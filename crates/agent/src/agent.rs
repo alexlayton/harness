@@ -1005,9 +1005,13 @@ pub fn spawn_model_list(
 }
 
 /// Adapt the session-owned snapshot into the UI-facing entry type, adding
-/// tool summaries and bounded, pretty-printed argument strings.  The session
-/// crate owns the event walk and tool-result pairing; this conversion is
-/// purely presentational.
+/// tool summaries and per-tool recap strings.  The session crate owns the
+/// event walk and tool-result pairing; this conversion is purely
+/// presentational.
+///
+/// The recap is display-only: raw JSON arguments stay in the session store and
+/// in `context_messages`, so loaded and continued sessions keep full fidelity.
+/// Do not persist these strings back into session events.
 fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<SessionSnapshotEntry> {
     entries
         .into_iter()
