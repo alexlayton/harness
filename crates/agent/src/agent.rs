@@ -18,10 +18,11 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tui::InputMessage;
 
-/// Maximum number of times a turn re-streams after a tool call whose arguments
-/// fail to parse. A model that keeps truncating its output should eventually
-/// give up instead of looping forever.
-const MAX_PARSE_RETRIES: usize = 2;
+/// Maximum number of times a turn re-streams after a recoverable failure:
+/// malformed tool-call arguments, a retryable mid-stream error, or an empty
+/// response. A model that keeps failing should eventually give up instead of
+/// looping forever.
+const MAX_TURN_RECOVERIES: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -409,7 +410,7 @@ impl Agent {
             send(events, AgentEvent::TurnFinished);
             return Err(TurnError::Persist("user message".into()));
         }
-        let mut parse_retries = 0;
+        let mut recoveries = 0;
         loop {
             let request = CompletionRequest {
                 model: self.model.clone(),
@@ -586,39 +587,37 @@ impl Agent {
                     let _ = self.persist_tool_result(call, &error_result, true, events);
                 }
                 let mut retried = false;
-                if let LlmError::Parse(parse_message) = error {
+                if let LlmError::Parse(parse_message) = &error {
                     // A tool call whose arguments failed to parse (usually
                     // truncated JSON) never became durable, so the turn can
                     // retry without leaving dangling state. Nudge the model
                     // and re-stream instead of dead-ending the turn.
-                    if parse_retries < MAX_PARSE_RETRIES {
-                        parse_retries += 1;
-                        let note = format!(
-                            "[system note: your previous tool call had malformed JSON \
-                             arguments and was not executed: {parse_message}. Re-issue the \
-                             tool call with valid arguments.]"
+                    if recoveries < MAX_TURN_RECOVERIES {
+                        recoveries += 1;
+                        push_recovery_note(
+                            &mut self.history,
+                            format!(
+                                "[system note: your previous tool call had malformed JSON \
+                                 arguments and was not executed: {parse_message}. Re-issue the \
+                                 tool call with valid arguments.]"
+                            ),
                         );
-                        // Appending into a trailing user message (instead of
-                        // always pushing a new one) keeps provider role
-                        // alternation valid across all dialects.
-                        let tail_is_user = matches!(
-                            self.history.last(),
-                            Some(Message {
-                                role: Role::User,
-                                ..
-                            })
+                        retried = true;
+                    }
+                } else if error.is_retryable() {
+                    // Transient mid-stream failures (connection drops, decode
+                    // errors) are worth an automatic re-stream: the partial
+                    // content is already persisted, and the model can continue
+                    // from where it left off.
+                    if recoveries < MAX_TURN_RECOVERIES {
+                        recoveries += 1;
+                        push_recovery_note(
+                            &mut self.history,
+                            format!(
+                                "[system note: your response stream was interrupted \
+                                 ({message}); continue from where you left off.]"
+                            ),
                         );
-                        if tail_is_user {
-                            if let Some(Message {
-                                role: Role::User,
-                                content,
-                            }) = self.history.last_mut()
-                            {
-                                content.push(Content::Text(note));
-                            }
-                        } else {
-                            self.history.push(Message::user(note));
-                        }
                         retried = true;
                     }
                 }
@@ -1101,6 +1100,24 @@ fn content_is_empty(message: &Message) -> bool {
     message.content.is_empty()
 }
 
+/// Push a non-durable recovery note into history, preserving provider role
+/// alternation: append into a trailing user message when present, otherwise
+/// push a new user message. The note lives only in memory; durable events
+/// stay clean.
+fn push_recovery_note(history: &mut Vec<Message>, note: String) {
+    let tail_is_user = matches!(history.last(), Some(Message { role: Role::User, .. }));
+    if tail_is_user
+        && let Some(Message {
+            role: Role::User,
+            content,
+        }) = history.last_mut()
+    {
+        content.push(Content::Text(note));
+        return;
+    }
+    history.push(Message::user(note));
+}
+
 fn append_assistant(history: &mut Vec<Message>, reasoning: &str, text: &str, calls: Vec<ToolCall>) {
     if reasoning.is_empty() && text.is_empty() && calls.is_empty() {
         return;
@@ -1158,11 +1175,12 @@ mod tests {
     type ScriptStep = Result<StreamEvent, String>;
 
     /// How mock stream errors are wrapped; lets tests exercise the
-    /// parse-error recovery path specifically.
+    /// parse-error and transient-error recovery paths specifically.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MockErrorKind {
         Stream,
         Parse,
+        Retryable,
     }
 
     /// Build a script that emits the given events successfully.
@@ -1190,6 +1208,10 @@ mod tests {
                 step.map_err(|message| match error_kind {
                     MockErrorKind::Stream => LlmError::Stream(message),
                     MockErrorKind::Parse => LlmError::Parse(message),
+                    MockErrorKind::Retryable => LlmError::Http {
+                        status: 500,
+                        body: message,
+                    },
                 })
             }))))
         }
@@ -1509,4 +1531,55 @@ mod tests {
             );
         });
     }
+
+    /// A transient mid-stream failure (connection drop / decode error) must
+    /// not dead-end the turn either: the agent re-streams once and the retried
+    /// answer is delivered.
+    #[test]
+    fn retryable_stream_error_retries_turn_instead_of_dead_ending() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    vec![Err("error decoding response body".into())],
+                    script(vec![
+                        StreamEvent::TextDelta("recovered".into()),
+                        StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        },
+                    ]),
+                ],
+                error_kind: MockErrorKind::Retryable,
+            });
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("keep going".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .run(input_rx, event_tx)
+                .await;
+
+            assert_eq!(
+                provider.calls.load(Ordering::SeqCst),
+                2,
+                "a retryable stream error should re-stream once"
+            );
+            let mut got = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                got.push(event);
+            }
+            assert!(got.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(message) if message.contains("http 500")
+            )));
+            assert!(got.contains(&AgentEvent::TextDelta("recovered".into())));
+            assert!(got.contains(&AgentEvent::TurnFinished));
+        });
+    }
+
 }
