@@ -2,7 +2,7 @@ use super::{Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -97,6 +97,142 @@ async fn rtk_rewrite(command: &str) -> Option<String> {
     }
 }
 
+/// rtk's compound-command support is selective: some `cd X && cmd` shapes
+/// pass through untouched even though the trailing command alone has an rtk
+/// equivalent.  When the whole command was not rewritten, split top-level
+/// `&&`/`;` groups and rewrite each operand individually, keeping unchanged
+/// operands verbatim.  Returns `None` when nothing was rewritten or the
+/// command is not safely splittable.
+async fn rtk_rewrite_compound(command: &str) -> Option<String> {
+    let parts = split_compound(command)?;
+    let mut rewritten_any = false;
+    let mut output = String::with_capacity(command.len());
+    for (index, part) in parts.iter().enumerate() {
+        if index % 2 == 0 {
+            match rtk_rewrite(part).await {
+                Some(rewritten) => {
+                    output.push_str(&rewritten);
+                    rewritten_any = true;
+                }
+                None => output.push_str(part),
+            }
+        } else {
+            // Normalize the separator so spacing stays readable after operands
+            // were rewritten to different lengths.
+            output.push_str(match *part {
+                "&&" => " && ",
+                ";" => " ; ",
+                other => other,
+            });
+        }
+    }
+    rewritten_any.then_some(output)
+}
+
+/// Split a shell command on top-level `&&` / `;` separators into alternating
+/// operands and separators.  Splitting respects single/double quotes and
+/// backslash escapes, trims operands, and refuses commands whose structure a
+/// naive split would change: pipes, subshells, heredocs, command substitution,
+/// brace groups, or control-flow keywords.
+fn split_compound(command: &str) -> Option<Vec<&str>> {
+    let bytes = command.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut saw_separator = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                escaped = true;
+                index += 1;
+                continue;
+            }
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'`' => return None,
+            b'$' if bytes.get(index + 1) == Some(&b'(') => return None,
+            b'<' if matches!(bytes.get(index + 1), Some(b'<') | Some(b'(')) => return None,
+            b'|' | b'(' if !in_single && !in_double => return None,
+            b'{' if !in_single
+                && !in_double
+                && bytes.get(index.wrapping_sub(1)) != Some(&b'$') =>
+            {
+                return None;
+            }
+            b'&' | b';' if !in_single && !in_double => {
+                let separator_len = match (byte, bytes.get(index + 1)) {
+                    (b'&', Some(b'&')) => 2,
+                    (b';', _) => 1,
+                    _ => 0,
+                };
+                if separator_len > 0 {
+                    parts.push(command[start..index].trim());
+                    parts.push(&command[index..index + separator_len]);
+                    start = index + separator_len;
+                    saw_separator = true;
+                    index += separator_len;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    if !saw_separator {
+        return None;
+    }
+    let tail = command[start..].trim();
+    if tail.is_empty() {
+        return None;
+    }
+    parts.push(tail);
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    if parts.iter().step_by(2).any(|part| has_control_keyword(part)) {
+        return None;
+    }
+    Some(parts)
+}
+
+/// True when a shell operand contains a control-flow keyword as a word, which
+/// would make per-operand rewriting unsafe.  Conservative: a false positive
+/// only skips the rtk split optimization, never alters execution.
+fn has_control_keyword(operand: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "if ", "then ", "else ", "elif ", "for ", "while ", "until ", "case ",
+        "do ", "done ", "function ", "select ",
+    ];
+    let bytes = operand.as_bytes();
+    KEYWORDS
+        .iter()
+        .any(|keyword| bytes.windows(keyword.len()).any(|window| window == keyword.as_bytes()))
+}
+
+/// Resolve the bash `dir` argument against the workspace root, requiring an
+/// existing directory inside the workspace.  This mirrors the path scoping of
+/// find/grep; `cd` inside the command itself remains the escape hatch for
+/// running anywhere else.
+async fn resolve_workspace_dir(root: &Path, dir: &str) -> Result<PathBuf, String> {
+    let candidate = super::resolve_workspace_path(dir, Some(root), false).await?;
+    let metadata = tokio::fs::metadata(&candidate)
+        .await
+        .map_err(|error| format!("dir {dir}: {error}"))?;
+    if !metadata.is_dir() {
+        return Err(format!("dir {dir} is not a directory"));
+    }
+    Ok(candidate)
+}
+
 /// Detect and cache the installed rtk version.  The binary cannot change
 /// during the process lifetime, so a miss is cached too.
 async fn rtk_version() -> Option<(u64, u64, u64)> {
@@ -177,11 +313,12 @@ impl Tool for BashTool {
         ToolSpec {
             definition: ToolDefinition {
             name: "bash".into(),
-            description: "Run a shell command in the working directory.".into(),
+            description: "Run a shell command in the working directory. Returns stdout and stderr; output keeps the tail. Optionally run in a workspace-relative directory via the dir argument.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Command passed to sh -c" },
+                    "dir": { "type": "string", "description": "Optional working directory for the command, relative to the workspace root (e.g. \"crates/tools\"). Prefer this over prefixing the command with cd <dir> && ..." },
                     "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" }
                 },
                 "required": ["command"],
@@ -190,7 +327,10 @@ impl Tool for BashTool {
             },
             prompt: ToolPrompt::new(
                 "Execute commands and project operations",
-                ["Use bash for tests, builds, git, and operations not covered by a dedicated tool.".to_owned()],
+                [
+                    "Use bash for tests, builds, git, and operations not covered by a dedicated tool.".to_owned(),
+                    "When a command must run in a subdirectory, pass it as the dir argument instead of prefixing the command with cd <dir> && ...".to_owned(),
+                ],
             ),
         }
     }
@@ -207,17 +347,34 @@ impl Tool for BashTool {
                 _ => return error("bash", "timeout must be a positive integer"),
             },
         };
+        let dir = match args.get("dir") {
+            None => None,
+            Some(Value::String(dir)) if !dir.trim().is_empty() => Some(dir.clone()),
+            Some(_) => return error("bash", "dir must be a non-empty string when provided"),
+        };
+        let run_dir = match dir.as_deref() {
+            None => None,
+            Some(dir) => match resolve_workspace_dir(&self.cwd, dir).await {
+                Ok(resolved) => Some(resolved),
+                Err(message) => return error("bash", &message),
+            },
+        };
         if cancel.is_cancelled() {
             return error(&format!("bash: {}", first_line(&command)), "cancelled");
         }
 
         // With rtk enabled, supported commands run through their compact rtk
-        // equivalent; anything else runs verbatim.  The summary keeps naming
-        // the original command the model asked for.
+        // equivalent; anything else runs verbatim.  rtk rewrites most single
+        // commands and many `cd X && cmd` compounds, but its compound support
+        // is selective; when the whole command comes back untouched we split
+        // and rewrite each operand so the real work still gets the rtk form.
         let run_command = if self.rtk {
-            rtk_rewrite(&command)
-                .await
-                .unwrap_or_else(|| command.clone())
+            match rtk_rewrite(&command).await {
+                Some(rewritten) => rewritten,
+                None => rtk_rewrite_compound(&command)
+                    .await
+                    .unwrap_or_else(|| command.clone()),
+            }
         } else {
             command.clone()
         };
@@ -226,7 +383,7 @@ impl Tool for BashTool {
         let mut child = match Command::new("sh")
             .arg("-c")
             .arg(&run_command)
-            .current_dir(cwd)
+            .current_dir(run_dir.as_deref().unwrap_or(&cwd))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -320,7 +477,10 @@ impl Tool for BashTool {
         ToolOutput {
             content: output,
             is_error,
-            summary: format!("bash: {}", first_line(&command)),
+            summary: match dir.as_deref() {
+                Some(dir) => format!("bash: {} (in {dir})", first_line(&run_command)),
+                None => format!("bash: {}", first_line(&run_command)),
+            },
         }
     }
 }
@@ -467,6 +627,83 @@ mod tests {
         assert_eq!(rtk_rewrite("echo hi").await, None);
     }
 
+    #[tokio::test]
+    async fn compound_rewrite_rewrites_each_operand() {
+        if !rtk_available().await {
+            return;
+        }
+        // The trailing `git status` is rewritten even when a whole-command
+        // rewrite would have missed the compound.
+        assert_eq!(
+            rtk_rewrite_compound("cd subdir && git status").await.as_deref(),
+            Some("cd subdir && rtk git status")
+        );
+        // Nothing supported anywhere: pass through unchanged.
+        assert_eq!(rtk_rewrite_compound("cd a/b/c && npm test").await, None);
+    }
+
+    #[test]
+    fn splits_compound_commands_safely() {
+        assert_eq!(
+            split_compound("cd src && cargo build").unwrap(),
+            vec!["cd src", "&&", "cargo build"]
+        );
+        assert_eq!(
+            split_compound("cd src && cargo build && cargo test").unwrap(),
+            vec!["cd src", "&&", "cargo build", "&&", "cargo test"]
+        );
+        assert_eq!(
+            split_compound("cd \"a b\" && echo hi").unwrap(),
+            vec!["cd \"a b\"", "&&", "echo hi"]
+        );
+        assert_eq!(
+            split_compound("cmd1 ; cmd2").unwrap(),
+            vec!["cmd1", ";", "cmd2"]
+        );
+        // Single commands and unsafe constructs are left alone.
+        assert_eq!(split_compound("cargo build"), None);
+        assert_eq!(split_compound("if true; then echo hi; fi"), None);
+        assert_eq!(split_compound("echo $(date) && x"), None);
+        assert_eq!(split_compound("grep foo file | wc -l"), None);
+        assert_eq!(split_compound("cat <<EOF && x\nEOF"), None);
+        assert_eq!(split_compound("{ a && b; }"), None);
+        assert_eq!(split_compound("cmd1 &&"), None);
+    }
+
+    #[tokio::test]
+    async fn dir_argument_runs_command_in_subdirectory() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        let tool = BashTool::with_workspace_root(directory.path());
+        let output = tool
+            .execute(json!({"command": "pwd", "dir": "src"}), CancellationToken::new())
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let expected = std::fs::canonicalize(directory.path().join("src")).unwrap();
+        assert!(output.content.contains(&expected.to_string_lossy().into_owned()));
+        assert!(output.summary.contains("(in src)"));
+    }
+
+    #[tokio::test]
+    async fn dir_argument_rejects_escape_and_missing_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = BashTool::with_workspace_root(directory.path());
+        let outside = tool
+            .execute(
+                json!({"command": "pwd", "dir": "../outside"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(outside.is_error);
+        assert!(outside.content.contains("outside"));
+
+        let missing = tool
+            .execute(json!({"command": "pwd", "dir": "nope"}), CancellationToken::new())
+            .await;
+        assert!(missing.is_error);
+        assert!(missing.content.contains("nope"));
+    }
+
     /// The end-to-end rewrite test runs `git status` in the crate directory,
     /// so it also needs to be inside a git work tree.
     async fn git_work_tree_available() -> bool {
@@ -493,8 +730,8 @@ mod tests {
         // `rtk git status` prints a compact `* <branch>` header instead of
         // git's "On branch", proving the rewrite path ran.
         assert!(output.content.starts_with("* "), "{}", output.content);
-        // The summary still names the command the model asked for.
-        assert_eq!(output.summary, "bash: git status");
+        // The summary names the command that actually ran (like pi).
+        assert_eq!(output.summary, "bash: rtk git status");
     }
 
     #[tokio::test]
