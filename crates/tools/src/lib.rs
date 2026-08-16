@@ -2,6 +2,7 @@ mod bash;
 mod edit;
 pub mod file_mutation;
 mod find;
+mod grep;
 mod read;
 mod registry;
 mod write;
@@ -9,6 +10,7 @@ mod write;
 pub use bash::{BashTool, truncate_command_output};
 pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
+pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use registry::{ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError};
 pub use write::WriteTool;
@@ -169,7 +171,8 @@ pub fn default_registry(config: impl Into<ToolConfig>) -> Result<ToolRegistry, T
                 config.rtk,
                 &workspace_root,
             )),
-            Box::new(FindTool::new(index)),
+            Box::new(FindTool::new(index.clone())),
+            Box::new(GrepTool::new(index.clone())),
         ],
         workspace_root,
     )
@@ -352,6 +355,15 @@ pub fn call_summary(name: &str, args: &Value) -> String {
                 _ => "find".into(),
             }
         }
+        "grep" => {
+            let pattern = args.get("pattern").and_then(Value::as_str);
+            let path = args.get("path").and_then(Value::as_str);
+            match (pattern, path) {
+                (Some(pattern), Some(path)) => format!("grep {pattern} in {path}"),
+                (Some(pattern), None) => format!("grep {pattern}"),
+                _ => "grep".into(),
+            }
+        }
         _ => name.to_owned(),
     }
 }
@@ -390,17 +402,18 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_has_five_active_tools_and_prompt_metadata() {
+    fn default_registry_has_six_active_tools_and_prompt_metadata() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("main.rs"), "fn main() {}\n").unwrap();
         let registry = default_registry(ToolConfig::new(directory.path(), false)).unwrap();
         assert_eq!(
             registry.active_names(),
-            vec!["read", "edit", "write", "bash", "find"]
+            vec!["read", "edit", "write", "bash", "find", "grep"]
         );
         assert_eq!(registry.all_names(), registry.active_names());
         let context = registry.prompt_context();
         assert!(context.snippets.iter().any(|tool| tool.name == "find"));
+        assert!(context.snippets.iter().any(|tool| tool.name == "grep"));
         assert!(
             context
                 .guidelines
