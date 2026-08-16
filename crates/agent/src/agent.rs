@@ -404,8 +404,6 @@ impl Agent {
             send(events, AgentEvent::TurnFinished);
             return Err(TurnError::Persist("user message".into()));
         }
-        let mut iteration = 0u32;
-
         loop {
             let request = CompletionRequest {
                 model: self.model.clone(),
@@ -586,7 +584,6 @@ impl Agent {
                 return Ok(());
             }
 
-            iteration += 1;
             for call in tool_calls {
                 let summary = call_summary(&call.name, &call.arguments);
                 send(
@@ -674,19 +671,6 @@ impl Agent {
                 let _ = self.persist_tool_result(&call, &result_content, result_is_error, events);
             }
 
-            if iteration >= 100 {
-                let note = "max tool iterations reached";
-                self.history.push(Message::user(note));
-                let _ = self.persist_event(
-                    SessionEvent::Error {
-                        message: note.into(),
-                    },
-                    events,
-                );
-                send(events, AgentEvent::TextDelta(note.into()));
-                send(events, AgentEvent::TurnFinished);
-                return Ok(());
-            }
         }
     }
 
