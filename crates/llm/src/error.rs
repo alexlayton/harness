@@ -22,8 +22,12 @@ impl LlmError {
     /// Whether it is safe for the caller to repeat the initial request.
     pub fn is_retryable(&self) -> bool {
         match self {
-            // A Network error is only produced before an HTTP response exists.  It
-            // is therefore safe to retry it (and covers connect and timeout errors).
+            // Network errors cover connect failures, timeouts, and — since
+            // provider clients now set `read_timeout` — a streaming response
+            // body that went silent mid-turn.  Repeating the request is safe
+            // in all of those cases: nothing was charged against a partially
+            // consumed stream, and the agent's mid-stream recovery relies on
+            // this classification to re-stream automatically.
             Self::Network(_) => true,
             Self::Http { status, .. } => *status == 429 || (500..=599).contains(status),
             Self::Stream(_) | Self::Parse(_) | Self::Auth(_) => false,

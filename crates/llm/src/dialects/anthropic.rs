@@ -54,7 +54,7 @@ impl AnthropicMessagesClient {
         bearer_only: bool,
     ) -> Self {
         Self {
-            http: Client::new(),
+            http: crate::http::streaming_client(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
             extra_headers,
