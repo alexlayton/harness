@@ -114,11 +114,9 @@ fn decode_session_lines(
     recover_trailing: bool,
 ) -> Result<(Session, bool)> {
     let mut lines = content.split_inclusive('\n').collect::<Vec<_>>();
+    // The trailing fragment is kept in the normal loop: it is only dropped when
+    // its JSON is actually malformed, while a valid final line is accepted.
     let has_unterminated_tail = lines.last().is_some_and(|line| !line.ends_with('\n'));
-    if has_unterminated_tail {
-        // Keep the tail in the normal loop first.  It is only dropped when its
-        // JSON is actually malformed; a valid final line is accepted too.
-    }
     if content.is_empty() {
         return Err(SessionError::InvalidLine {
             path: source.to_path_buf(),

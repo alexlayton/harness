@@ -435,6 +435,34 @@ impl AnthropicParser {
     pub fn is_done(&self) -> bool {
         self.done
     }
+
+    /// Emit a fallback `Done` when the SSE stream ended without a
+    /// `message_stop` (e.g. a proxy dropped the connection after the last text
+    /// delta). Mirrors `ChatStreamParser::finish` / `ResponsesParser::finish` so
+    /// the agent loop always receives a terminal `Done` and the turn's usage is
+    /// accounted for rather than dropped.
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        let mut output = Vec::new();
+        let indices: Vec<u64> = self.tools.keys().copied().collect();
+        for index in indices {
+            output.extend(self.finish_tool(index)?);
+        }
+        self.done = true;
+        output.push(StreamEvent::Done {
+            stop_reason: self.stop_reason.clone(),
+            usage: Some(Usage {
+                input_tokens: self.input_tokens.unwrap_or(0),
+                output_tokens: self.output_tokens.unwrap_or(0),
+                cached_tokens: None,
+                reasoning_tokens: None,
+                cost: None,
+            }),
+        });
+        Ok(output)
+    }
 }
 
 fn error_message(value: &Value, fallback: &str) -> String {
@@ -458,6 +486,11 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
         while let Some(event) = sse.next().await {
             let event = event?;
             for item in parser.parse_event(&event)? {
+                yield item;
+            }
+        }
+        if !parser.is_done() {
+            for item in parser.finish()? {
                 yield item;
             }
         }
@@ -543,5 +576,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn finish_emits_done_with_usage_when_stream_ends_without_message_stop() {
+        let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#)
+            .unwrap();
+        parser
+            .parse_payload(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            )
+            .unwrap();
+        parser
+            .parse_payload(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+            )
+            .unwrap();
+        parser
+            .parse_payload(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap();
+
+        assert!(!parser.is_done());
+        let done = parser.finish().unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(matches!(
+            &done[0],
+            StreamEvent::Done {
+                usage: Some(Usage {
+                    input_tokens: 5,
+                    output_tokens: 0,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(parser.is_done());
+        assert!(parser.finish().unwrap().is_empty());
     }
 }
