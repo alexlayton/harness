@@ -1,25 +1,54 @@
 use agent::agent::{Agent, spawn_model_list};
 use agent::config::{Cli, Config, ProviderArg, build_provider, init_logging};
+use agent::headless::run_headless;
 use agent::tools::{ToolConfig, default_registry};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
+use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tui::{InputMessage, Tui};
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
+    match main_inner().await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn main_inner() -> Result<ExitCode> {
     let cli = Cli::parse();
+
+    // `--print`-only flags have no meaning in the interactive TUI, which
+    // exposes the same capabilities through its own slash commands.
+    if !cli.print && !cli.prompt.is_empty() {
+        bail!("prompt requires --print");
+    }
+    if !cli.print && cli.resume.is_some() {
+        bail!("--resume requires --print");
+    }
+
     init_logging()?;
-    let config = Config::resolve(&cli)?;
+    let config: Config = Config::resolve(&cli)?;
 
     let provider: Arc<dyn Provider> = build_provider(&config.provider.to_string())?;
     let provider_name = provider.name().to_owned();
-    let workspace_root = std::fs::canonicalize(std::env::current_dir()?)?;
+    let workspace_root = std::fs::canonicalize(std::env::current_dir()
+        .with_context(|| "resolve workspace root")?)?;
     let tools = default_registry(ToolConfig::new(&workspace_root, config.rtk))?;
     let session_store = SessionStore::default_for_workspace(&workspace_root)?;
+
+    if cli.print {
+        return run_headless(&config, &cli, provider, tools, session_store).await;
+    }
+
     let session = session_store.create(SessionCreateOptions {
         provider: Some(provider_name.clone()),
         model: Some(config.model.clone()),
@@ -45,8 +74,8 @@ async fn main() -> anyhow::Result<()> {
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     let tui = Tui::new(&config.model, &provider_name, providers)?;
-    let result = tui.run(event_rx, input_tx, cancel.clone()).await;
+    tui.run(event_rx, input_tx, cancel.clone()).await?;
     cancel.cancel();
     let _ = agent_task.await;
-    result
+    Ok(ExitCode::SUCCESS)
 }

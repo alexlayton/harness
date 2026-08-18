@@ -230,13 +230,35 @@ pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> 
     save_file_config(path, &config)
 }
 
-#[derive(Clone, Debug, Parser)]
+#[derive(Clone, Debug, Default, Parser)]
 #[command(name = "harness", about = "A minimal coding-agent harness")]
 pub struct Cli {
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
+
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Non-interactive mode: run one prompt to completion and print the answer.
+    #[arg(short = 'p', long = "print", default_value_t = false)]
+    pub print: bool,
+
+    /// Verbose: stream reasoning + tool activity + full (bounded) tool output
+    /// to stderr. Default stderr is silent except for hard errors.
+    #[arg(short = 'v', long = "verbose", default_value_t = false)]
+    pub verbose: bool,
+
+    /// Resume an existing session instead of creating a fresh one.
+    /// Accepts a session id, unique prefix, `latest`, or a file path.
+    #[arg(long, value_name = "ID|latest|PATH")]
+    pub resume: Option<String>,
+
+    /// Prompt for non-interactive mode. Joined with spaces. When `--print` is
+    /// set and no positional is given, the prompt is read from stdin.
+    /// Only meaningful with `--print`; passing it without `--print` is an
+    /// error.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -372,10 +394,7 @@ mod tests {
     fn resolves_defaults_and_overrides() {
         // Resolve against an explicit file config so the developer's real
         // ~/.config/harness/config.toml cannot leak into the assertions.
-        let cli = Cli {
-            provider: None,
-            model: None,
-        };
+        let cli = Cli::default();
         let config = Config::resolve_from_file(
             &cli,
             &FileConfig::default(),
@@ -392,6 +411,7 @@ mod tests {
         let cli = Cli {
             provider: Some(ProviderArg::Openrouter),
             model: Some("anthropic/demo".into()),
+            ..Cli::default()
         };
         let config = Config::resolve_from_file(
             &cli,
@@ -411,10 +431,7 @@ mod tests {
             model: Some("file-model".into()),
             ..FileConfig::default()
         };
-        let cli = Cli {
-            provider: None,
-            model: None,
-        };
+        let cli = Cli::default();
         let config = Config::resolve_from_file(
             &cli,
             &file,
@@ -431,6 +448,7 @@ mod tests {
         let cli = Cli {
             provider: Some(ProviderArg::OpencodeGo),
             model: Some("cli-model".into()),
+            ..Cli::default()
         };
         let config = Config::resolve_from_file(
             &cli,
@@ -446,12 +464,7 @@ mod tests {
             provider: Some("typo".into()),
             ..FileConfig::default()
         };
-        let error = Config::resolve_from_file(
-            &Cli {
-                provider: None,
-                model: None,
-            },
-            &invalid,
+        let error = Config::resolve_from_file(&Cli::default(), &invalid,
             PathBuf::from("/tmp/bad-config.toml"),
             |_| Some("secret".into()),
         )
@@ -463,7 +476,7 @@ mod tests {
     fn supports_legacy_opencode_key_name() {
         let cli = Cli {
             provider: Some(ProviderArg::OpencodeGo),
-            model: None,
+            ..Cli::default()
         };
         let config =
             Config::resolve_with_key_values(&cli, None, Some("legacy-secret"), None).unwrap();
@@ -474,14 +487,14 @@ mod tests {
     fn missing_key_names_environment_variables() {
         let cli = Cli {
             provider: Some(ProviderArg::Openrouter),
-            model: None,
+            ..Cli::default()
         };
         let error = Config::resolve_with_keys(&cli, None, None).err().unwrap();
         assert!(error.to_string().contains("OPENROUTER_API_KEY"));
 
         let cli = Cli {
             provider: Some(ProviderArg::OpencodeGo),
-            model: None,
+            ..Cli::default()
         };
         let error = Config::resolve_with_key_values(&cli, None, None, None)
             .err()
@@ -528,10 +541,7 @@ mod tests {
 
     #[test]
     fn rtk_flag_flows_from_file_into_resolved_config() {
-        let cli = Cli {
-            provider: None,
-            model: None,
-        };
+        let cli = Cli::default();
         let file = FileConfig {
             rtk: true,
             ..FileConfig::default()

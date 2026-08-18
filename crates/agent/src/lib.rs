@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+pub mod headless;
 pub mod prompt;
 pub use tools;
 
