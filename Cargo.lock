@@ -15,6 +15,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "compact",
  "dirs 6.0.0",
  "futures-util",
  "llm",
@@ -402,6 +403,21 @@ checksum = "ba5a308b75df32fe02788e748662718f03fde005016435c444eea572398219fd"
 dependencies = [
  "bytes",
  "memchr",
+]
+
+[[package]]
+name = "compact"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "llm",
+ "serde_json",
+ "session",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

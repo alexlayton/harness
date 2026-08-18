@@ -9,6 +9,7 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
+compact.workspace = true
 tui.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

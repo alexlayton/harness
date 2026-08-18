@@ -531,24 +531,6 @@ impl SessionStore {
         crate::export::export_jsonl(session, destination, options)
     }
 
-    pub fn compact(
-        &self,
-        session: &mut Session,
-        policy: &crate::compaction::CompactionPolicy,
-    ) -> Result<Option<crate::compaction::CompactionResult>> {
-        let Some(result) = crate::compaction::deterministic_compaction(session, policy) else {
-            return Ok(None);
-        };
-        self.append_event(
-            session,
-            SessionEvent::CompactionSummary {
-                summary: result.summary.clone(),
-                compacted_through: result.compacted_through,
-            },
-        )?;
-        Ok(Some(result))
-    }
-
     pub fn rename(&self, session: &mut Session, title: Option<String>) -> Result<()> {
         self.append_event(session, SessionEvent::MetadataChange { title })?;
         Ok(())

@@ -1,4 +1,3 @@
-use crate::compaction::{CompactionPolicy, CompactionResult, deterministic_compaction};
 use crate::error::{Result, SessionError};
 use llm::{Content, Message, Role, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
@@ -696,12 +695,6 @@ impl Session {
         validate_events(&self.events)
     }
 
-    pub fn compact(&self, policy: &CompactionPolicy) -> Option<CompactionResult> {
-        deterministic_compaction(self, policy)
-    }
-
-    /// Sequence boundary of the most recent compaction, if any: the summary's
-    /// own sequence number and the highest sequence it replaces.
     pub fn latest_compaction_boundary(&self) -> Option<(u64, u64)> {
         latest_compaction_boundary(&self.events)
     }
@@ -892,7 +885,7 @@ pub fn latest_compaction_boundary(events: &[SessionEventRecord]) -> Option<(u64,
     })
 }
 
-fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&SessionEventRecord> {
+pub fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&SessionEventRecord> {
     let Some((summary_sequence, compacted_through)) = latest_compaction_boundary(events) else {
         return events.iter().collect();
     };

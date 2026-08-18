@@ -497,8 +497,11 @@ impl crate::Tui {
             UiEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
+                auto,
+                reason,
             } => self.add_notice(format!(
-                "compacted through event {compacted_through} ({summary_bytes} bytes)"
+                "{}compacted through event {compacted_through} ({summary_bytes} bytes) [{reason}]",
+                if auto { "auto-" } else { "" }
             )),
         }
         Ok(())

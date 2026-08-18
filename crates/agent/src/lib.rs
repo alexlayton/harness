@@ -123,9 +123,13 @@ impl tui::TuiEvent for AgentEvent {
             AgentEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
+                auto,
+                reason,
             } => tui::UiEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
+                auto,
+                reason: reason.to_string(),
             },
         }
     }

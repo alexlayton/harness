@@ -191,9 +191,15 @@ async fn drive_headless_events_into(
             AgentEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
+                auto,
+                reason,
             } => {
                 if verbose {
-                    let _ = writeln!(stderr, "compacted through {compacted_through} ({summary_bytes}b)");
+                    let _ = writeln!(
+                        stderr,
+                        "{}compacted through {compacted_through} ({summary_bytes}b) [{reason}]",
+                        if *auto { "auto-" } else { "" }
+                    );
                 }
             }
             AgentEvent::SessionSnapshot { .. }
@@ -264,6 +270,7 @@ async fn run_headless_with_cancel(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
+        .with_compaction(config.compaction.clone())
         .with_session(store, session);
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use clap::{Parser, ValueEnum};
+use compact::policy::CompactionPolicy;
 use llm::Provider;
 use llm::providers::{OpenCodeGoProvider, OpenRouterProvider};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,39 @@ impl fmt::Display for ProviderArg {
     }
 }
 
+/// Per-key compaction settings parsed from `[compaction]` in `config.toml`.
+/// Every field is optional so a partial table overrides only what it sets;
+/// the rest fall back to [`CompactionPolicy::default`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CompactConfig {
+    pub auto: Option<bool>,
+    pub threshold: Option<f64>,
+    pub reserve_tokens: Option<u64>,
+    pub keep_recent_turns: Option<usize>,
+    pub keep_recent_tokens: Option<u64>,
+    pub max_summary_input_bytes: Option<usize>,
+    pub max_summary_bytes: Option<usize>,
+    pub context_window: Option<u64>,
+}
+
+impl From<&CompactConfig> for CompactionPolicy {
+    fn from(config: &CompactConfig) -> Self {
+        let defaults = CompactionPolicy::default();
+        Self {
+            auto: config.auto.unwrap_or(defaults.auto),
+            threshold: config.threshold.unwrap_or(defaults.threshold),
+            reserve_tokens: config.reserve_tokens.unwrap_or(defaults.reserve_tokens),
+            keep_recent_turns: config.keep_recent_turns.unwrap_or(defaults.keep_recent_turns),
+            keep_recent_tokens: config.keep_recent_tokens.unwrap_or(defaults.keep_recent_tokens),
+            max_summary_input_bytes: config
+                .max_summary_input_bytes
+                .unwrap_or(defaults.max_summary_input_bytes),
+            max_summary_bytes: config.max_summary_bytes.unwrap_or(defaults.max_summary_bytes),
+            context_window: config.context_window.unwrap_or(defaults.context_window),
+        }
+    }
+}
+
 /// Settings persisted by harness.  API keys deliberately do not belong here;
 /// they remain environment-only secrets.
 ///
@@ -77,6 +111,11 @@ pub struct FileConfig {
     /// user explicitly sets `rtk = true`.
     #[serde(default)]
     pub rtk: bool,
+    /// Compact settings. Anything the compiler cannot answer comes from
+    /// [`CompactionPolicy::default`]. Absent from disk when unset, so older
+    /// harness versions treat the config as unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -89,6 +128,7 @@ impl PartialEq for FileConfig {
         self.provider == other.provider
             && self.model == other.model
             && self.rtk == other.rtk
+            && self.compaction == other.compaction
             && self.extra == other.extra
     }
 }
@@ -268,6 +308,7 @@ pub struct Config {
     pub api_key: String,
     pub config_path: PathBuf,
     pub rtk: bool,
+    pub compaction: CompactionPolicy,
 }
 
 impl Config {
@@ -347,6 +388,11 @@ impl Config {
             api_key,
             config_path: path,
             rtk: file.rtk,
+            compaction: file
+                .compaction
+                .as_ref()
+                .map(CompactionPolicy::from)
+                .unwrap_or_default(),
         })
     }
 }
@@ -511,6 +557,10 @@ mod tests {
             provider: Some("opencode-go".into()),
             model: Some("demo".into()),
             rtk: true,
+            compaction: Some(CompactConfig {
+                keep_recent_turns: Some(5),
+                ..CompactConfig::default()
+            }),
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),
@@ -563,6 +613,36 @@ mod tests {
         )
         .unwrap();
         assert!(!config.rtk);
+    }
+
+    #[test]
+    fn compaction_config_round_trips_and_overrides_defaults() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = FileConfig {
+            compaction: Some(CompactConfig {
+                auto: Some(false),
+                threshold: Some(0.9),
+                reserve_tokens: Some(8_000),
+                context_window: Some(12_000),
+                ..CompactConfig::default()
+            }),
+            ..FileConfig::default()
+        };
+        save_file_config(&path, &original).unwrap();
+        assert_eq!(load_file_config(&path).unwrap(), original);
+
+        let policy = CompactionPolicy::from(original.compaction.as_ref().unwrap());
+        assert!(!policy.auto);
+        assert_eq!(policy.threshold, 0.9);
+        assert_eq!(policy.reserve_tokens, 8_000);
+        assert_eq!(policy.context_window, 12_000);
+        // Unset fields fall back to defaults.
+        assert_eq!(policy.keep_recent_turns, CompactionPolicy::default().keep_recent_turns);
+
+        // The unknown-field survival path must not see the compaction table.
+        let loaded = load_file_config(&path).unwrap();
+        assert!(!loaded.extra.contains_key("compaction"));
     }
 
     #[test]

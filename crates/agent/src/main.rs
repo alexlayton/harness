@@ -70,6 +70,7 @@ async fn main_inner() -> Result<ExitCode> {
     spawn_model_list(provider_name.clone(), provider.clone(), event_tx.clone());
 
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
+        .with_compaction(config.compaction.clone())
         .with_session(session_store, session);
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent", "crates/llm", "crates/session", "crates/tui", "crates/tools"]
+members = ["crates/agent", "crates/compact", "crates/llm", "crates/session", "crates/tui", "crates/tools"]
 default-members = ["crates/agent"]
 
 [workspace.package]
@@ -9,6 +9,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+compact = { path = "crates/compact" }
 llm = { path = "crates/llm" }
 session = { path = "crates/session" }
 tools = { path = "crates/tools" }

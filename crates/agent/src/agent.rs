@@ -1,14 +1,18 @@
 use crate::config::{build_provider, save_settings};
 use crate::prompt::system_prompt_with_tools;
 use crate::tools::{ToolRegistry, call_recap, call_summary};
+use compact::{
+    CompactionPolicy, SummaryOutcome, estimate_live_tokens, plan_compaction,
+    summarize as compact_summarize,
+};
 use futures_util::StreamExt;
 use llm::{
     CompletionRequest, Content, LlmError, Message, Provider, RetryCallback, Role, StreamEvent,
     ToolCall, truncate_utf8,
 };
 use session::{
-    CompactionPolicy, ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore,
-    StoredMessage, StoredToolCall, export_jsonl, snapshot_entries, usage_summary,
+    ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore, StoredMessage,
+    StoredToolCall, export_jsonl, snapshot_entries, usage_summary,
 };
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -23,6 +27,11 @@ use tui::InputMessage;
 /// response. A model that keeps failing should eventually give up instead of
 /// looping forever.
 const MAX_TURN_RECOVERIES: usize = 3;
+
+/// Maximum emergency compactions performed per turn in response to a
+/// context-overflow rejection. Each round is an extra summarizer call plus a
+/// retried request, so it is bounded separately from `MAX_TURN_RECOVERIES`.
+const MAX_OVERFLOW_RECOVERIES: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
@@ -84,7 +93,37 @@ pub enum AgentEvent {
     CompactionFinished {
         compacted_through: u64,
         summary_bytes: usize,
+        auto: bool,
+        reason: CompactionReason,
     },
+}
+
+/// Why a compaction ran. Drives the UI wording (auto vs manual vs overflow)
+/// and is recorded on the `CompactionFinished` event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionReason {
+    /// Pre-turn trigger fired past the threshold.
+    Auto,
+    /// User invoked `/compact`.
+    Manual,
+    /// Provider rejected a request for exceeding the context window.
+    Overflow,
+}
+
+impl CompactionReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+            Self::Overflow => "overflow",
+        }
+    }
+}
+
+impl std::fmt::Display for CompactionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +192,16 @@ pub struct Agent {
     /// closed, the run loop stops selecting on it (a closed `recv` would
     /// otherwise complete immediately and starve the stream polling).
     input_open: bool,
+    /// Exact context occupation from the most recent completed request
+    /// (`input_tokens + output_tokens` of its `Done` usage). Drives the
+    /// pre-turn trigger; `None` before the first request or after a model
+    /// switch, when the estimator takes over.
+    last_context_tokens: Option<u64>,
+    /// Resolved provider context window (config override → model-reported
+    /// `context_length` → conservative default).
+    context_window: u64,
+    /// Token-aware compaction policy.
+    compaction: CompactionPolicy,
 }
 
 impl Agent {
@@ -171,7 +220,16 @@ impl Agent {
             session: None,
             queued: VecDeque::new(),
             input_open: true,
+            last_context_tokens: None,
+            context_window: 0,
+            compaction: CompactionPolicy::default(),
         }
+    }
+
+    /// Attach a compaction policy (resolved from `config.toml`).
+    pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
+        self.compaction = policy;
+        self
     }
 
     pub fn with_history(mut self, history: Vec<Message>) -> Self {
@@ -328,6 +386,12 @@ impl Agent {
             send(&events, usage_event(&session.session.metadata.usage));
         }
 
+        // Resolve the provider context window before the first turn so the
+        // pre-turn trigger has a baseline. Kept after the initial session
+        // events so the UI is not blocked on a model-list fetch; failed
+        // fetches fall back to the config override / conservative default.
+        self.refresh_context_window().await;
+
         loop {
             let next_message = if let Some(message) = self.queued.pop_front() {
                 Some(message)
@@ -373,11 +437,12 @@ impl Agent {
                     continue;
                 }
                 InputMessage::CompactSession => {
-                    self.handle_compact_session(&events);
+                    let cancel = self.cancel.clone();
+                    self.handle_compact_session(&events, &cancel).await;
                     continue;
                 }
                 InputMessage::SetModel { provider, model } => {
-                    self.handle_set_model(provider, model, &events);
+                    self.handle_set_model(provider, model, &events).await;
                     continue;
                 }
                 InputMessage::ListModels { provider } => {
@@ -404,6 +469,27 @@ impl Agent {
         input: &mut mpsc::UnboundedReceiver<InputMessage>,
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
+        // Pre-turn auto-compaction trigger: run *before* the request is built
+        // (never mid-stream), so provider-history validity is trivial. Exact
+        // context from the last request when available, plus the new message
+        // this turn is about to add.
+        if self.should_auto_compact(&user_text) {
+            let context = self.context_tokens_estimate(user_text.len());
+            let percent = if self.context_window > 0 {
+                ((context as f64 / self.context_window as f64) * 100.0) as u32
+            } else {
+                0
+            };
+            if self.compact_and_reload(events, cancel, CompactionReason::Auto).await {
+                send(
+                    events,
+                    AgentEvent::Notice(format!(
+                        "auto-compacted: context at {percent}% of window"
+                    )),
+                );
+            }
+        }
+
         let user_message = Message::user(user_text);
         self.history.push(user_message.clone());
         if !self.persist_user_message(&user_message, events) {
@@ -411,6 +497,7 @@ impl Agent {
             return Err(TurnError::Persist("user message".into()));
         }
         let mut recoveries = 0;
+        let mut overflow_recoveries = 0;
         loop {
             let request = CompletionRequest {
                 model: self.model.clone(),
@@ -465,6 +552,16 @@ impl Agent {
             let mut stream = match stream_result {
                 Ok(stream) => stream,
                 Err(error) => {
+                    // A tool-heavy turn can grow past the window mid-turn: the
+                    // *next* request is rejected with a context-exceeded 400.
+                    // Compact the older material (keeping this turn's tail) and
+                    // retry before surfacing the provider error.
+                    if self
+                        .try_overflow_recovery(&error, events, cancel, &mut overflow_recoveries)
+                        .await
+                    {
+                        continue;
+                    }
                     let message = error.to_string();
                     let _ = self.persist_event(
                         SessionEvent::Error {
@@ -502,6 +599,15 @@ impl Agent {
                             Ok(StreamEvent::ToolCallComplete(call)) => tool_calls.push(call),
                             Ok(StreamEvent::Done { usage: done_usage, .. }) => {
                                 if let Some(done_usage) = done_usage {
+                                    // Exact context occupancy of the request
+                                    // just completed; the next request starts
+                                    // from (approximately) this size, so it
+                                    // drives the pre-turn trigger.
+                                    self.last_context_tokens = Some(
+                                        done_usage
+                                            .input_tokens
+                                            .saturating_add(done_usage.output_tokens),
+                                    );
                                     let summary = usage_summary(&done_usage);
                                     let _ = self.persist_event(
                                         SessionEvent::Usage {
@@ -566,6 +672,27 @@ impl Agent {
             let _ = self.persist_assistant(&reasoning, &text, &tool_calls, events);
 
             if let Some(error) = stream_error {
+                // A mid-stream context overflow (provider tears down an SSE
+                // request that outgrew the window) can also be recovered by
+                // compacting and re-streaming.
+                if self
+                    .try_overflow_recovery(&error, events, cancel, &mut overflow_recoveries)
+                    .await
+                {
+                    // Mark this turn's calls as failed so the retry request
+                    // sees consistent history (mirrors the error path below).
+                    let message = error.to_string();
+                    for call in &tool_calls {
+                        let error_result = format!("provider stream interrupted: {message}");
+                        self.history.push(Message::tool_result(
+                            call.id.clone(),
+                            error_result.clone(),
+                            true,
+                        ));
+                        let _ = self.persist_tool_result(call, &error_result, true, events);
+                    }
+                    continue;
+                }
                 let message = error.to_string();
                 let _ = self.persist_event(
                     SessionEvent::Error {
@@ -762,6 +889,7 @@ impl Agent {
         let id = session.id().to_string();
         let title = session.metadata.title.clone();
         self.history.clear();
+        self.last_context_tokens = None;
         self.session = Some(crate::agent::AgentSessionState { store, session });
         send(
             events,
@@ -834,6 +962,7 @@ impl Agent {
         let id = session.id().to_string();
         let title = session.metadata.title.clone();
         self.history = session.context_messages();
+        self.last_context_tokens = None;
         let snapshot = ui_snapshot_entries(snapshot_entries(&session));
         self.session = Some(crate::agent::AgentSessionState { store, session });
         send(
@@ -914,48 +1043,29 @@ impl Agent {
         }
     }
 
-    fn handle_compact_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
-        let Some(state) = self.session.as_mut() else {
+    async fn handle_compact_session(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) {
+        if self.session.is_none() {
             send(events, AgentEvent::Error("sessions are not enabled".into()));
             return;
-        };
-        let policy = CompactionPolicy::default();
-        let Some(result) = state.session.compact(&policy) else {
-            send(
-                events,
-                AgentEvent::Notice("session does not need compaction yet".into()),
-            );
-            return;
-        };
-        let summary_bytes = result.summary.len();
-        match state.store.append_event(
-            &mut state.session,
-            SessionEvent::CompactionSummary {
-                summary: result.summary,
-                compacted_through: result.compacted_through,
-            },
-        ) {
-            Ok(_) => send(
-                events,
-                AgentEvent::CompactionFinished {
-                    compacted_through: result.compacted_through,
-                    summary_bytes,
-                },
-            ),
-            Err(error) => send(
-                events,
-                AgentEvent::Error(format!("could not compact session: {error}")),
-            ),
         }
+        let _ = self.compact_and_reload(events, cancel, CompactionReason::Manual).await;
     }
 
-    fn handle_set_model(
+    async fn handle_set_model(
         &mut self,
         provider: Option<String>,
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
         self.handle_set_model_with_factory(provider, model, events, Box::new(build_provider));
+        // A different model may have a different context window and stale
+        // token counts; reset both so the next trigger re-baselines.
+        self.last_context_tokens = None;
+        self.refresh_context_window().await;
     }
 
     fn handle_set_model_with_factory(
@@ -1033,6 +1143,182 @@ impl Agent {
             }
         };
         spawn_model_list(provider_name, provider, events.clone());
+    }
+
+    // ------------------------------------------------------------------ compaction
+
+    /// Resolve the provider context window: config override → model-reported
+    /// `context_length` → conservative default. Runs once at startup and again
+    /// after a model switch; a failed fetch keeps the current value.
+    async fn refresh_context_window(&mut self) {
+        let resolved = self.compaction.resolved_window(0);
+        if self.compaction.context_window > 0 {
+            self.context_window = resolved;
+            return;
+        }
+        if let Ok(models) = self.provider.list_models().await
+            && let Some(model) = models.iter().find(|model| {
+                model.id == self.model || model.name.as_deref() == Some(self.model.as_str())
+            })
+        {
+            self.context_window = self.compaction.resolved_window(model.context_length.unwrap_or(0));
+            return;
+        }
+        self.context_window = self.compaction.resolved_window(0);
+    }
+
+    /// Approximate current context occupation: exact from the last request's
+    /// `Done` usage when available, else an estimate over the live session.
+    /// `extra_bytes` covers material added since that request (the new user
+    /// message); it is small relative to the reserved response slack.
+    fn context_tokens_estimate(&self, extra_bytes: usize) -> u64 {
+        let base = match self.last_context_tokens {
+            Some(exact) => exact,
+            None => match self.session.as_ref() {
+                Some(state) => estimate_live_tokens(&state.session),
+                None => self.estimate_history_tokens(),
+            },
+        };
+        base.saturating_add(compact::estimate::estimate_tokens(extra_bytes))
+    }
+
+    /// Estimate context tokens directly from `self.history` (no durable
+    /// session / no provider usage yet).
+    fn estimate_history_tokens(&self) -> u64 {
+        let mut bytes = 0usize;
+        for message in &self.history {
+            for content in &message.content {
+                match content {
+                    Content::Text(text) | Content::Reasoning(text) => bytes = bytes.saturating_add(text.len()),
+                    Content::ToolResult { content, .. } => bytes = bytes.saturating_add(content.len()),
+                    Content::ToolCall(call) => {
+                        bytes = bytes.saturating_add(call.name.len());
+                        bytes = bytes.saturating_add(
+                            serde_json::to_string(&call.arguments)
+                                .map(|rendered| rendered.len())
+                                .unwrap_or(0),
+                        );
+                    }
+                }
+            }
+        }
+        compact::estimate::estimate_tokens(bytes)
+    }
+
+    /// Whether the pre-turn auto-compaction trigger fires for a turn adding
+    /// `user_text`.
+    fn should_auto_compact(&self, user_text: &str) -> bool {
+        if !self.compaction.auto {
+            return false;
+        }
+        let context = self.context_tokens_estimate(user_text.len());
+        self.compaction
+            .should_auto_compact(context, self.context_window)
+    }
+
+    /// Shared compaction routine used by the pre-turn trigger, manual
+    /// `/compact`, and overflow recovery. Plans, summarizes (LLM with a
+    /// deterministic fallback), persists the summary + the summarizer's usage,
+    /// and rebuilds `self.history` from the new boundary. Returns `false`
+    /// (with a `Notice`) when there is nothing to compact or persistence
+    /// failed.
+    async fn compact_and_reload(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+        reason: CompactionReason,
+    ) -> bool {
+        let Some(state) = self.session.as_ref() else {
+            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            return false;
+        };
+        let session = state.session.clone();
+
+        let estimated = self.context_tokens_estimate(0);
+        let Some(plan) = plan_compaction(&session, &self.compaction, estimated) else {
+            send(
+                events,
+                AgentEvent::Notice("nothing to compact yet".into()),
+            );
+            return false;
+        };
+
+        let outcome =
+            compact_summarize(self.provider.as_ref(), &self.model, &plan, &self.compaction, cancel)
+                .await;
+
+        // Persist the summarizer's own usage so session cost totals stay
+        // honest and the UI reflects it.
+        if let SummaryOutcome::Model { usage, .. } = &outcome {
+            let summary = usage_summary(usage);
+            let _ = self.persist_event(SessionEvent::Usage { usage: summary }, events);
+        }
+
+        let compacted_through = plan.boundary;
+        let summary = match &outcome {
+            SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text } => text,
+        };
+        let summary_bytes = summary.len();
+
+        if !self.persist_event(
+            SessionEvent::CompactionSummary {
+                summary: summary.clone(),
+                compacted_through,
+            },
+            events,
+        ) {
+            return false;
+        }
+
+        // This is also the fix for the manual `/compact` no-op: without this
+        // rebuild the live conversation would keep stale (uncompacted) history
+        // until next restart.
+        if let Some(state) = self.session.as_ref() {
+            self.history = state.session.context_messages();
+            send(events, usage_event(&state.session.metadata.usage));
+        }
+
+        send(
+            events,
+            AgentEvent::CompactionFinished {
+                compacted_through,
+                summary_bytes,
+                auto: reason == CompactionReason::Auto,
+                reason,
+            },
+        );
+        true
+    }
+
+    /// Handle a context-overflow provider error (a 400 whose body matches
+    /// context-exceeded patterns) by emergency-compacting and returning
+    /// whether the caller should retry the request. Bounded to
+    /// `MAX_OVERFLOW_RECOVERIES` per turn.
+    async fn try_overflow_recovery(
+        &mut self,
+        error: &LlmError,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+        attempts: &mut usize,
+    ) -> bool {
+        if !is_context_overflow(error) || *attempts >= MAX_OVERFLOW_RECOVERIES {
+            return false;
+        }
+        *attempts += 1;
+        if self
+            .compact_and_reload(events, cancel, CompactionReason::Overflow)
+            .await
+        {
+            send(
+                events,
+                AgentEvent::Notice(format!(
+                    "overflow recovery: compacted ({attempts}/{MAX_OVERFLOW_RECOVERIES}); retrying"
+                )),
+            );
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -1171,6 +1457,27 @@ fn send(events: &mpsc::UnboundedSender<AgentEvent>, event: AgentEvent) {
     let _ = events.send(event);
 }
 
+/// Whether a provider error is a context-window rejection (the request it
+/// describes was too large to admit). Proxies vary in both status and
+/// phrasing, so we match on the rendered error text; a 400 alone is not
+/// enough (it could be a malformed request).
+fn is_context_overflow(error: &LlmError) -> bool {
+    let body = error.to_string().to_ascii_lowercase();
+    const PATTERNS: &[&str] = &[
+        "context length",
+        "context_length",
+        "context window",
+        "too many tokens",
+        "maximum context",
+        "max context",
+        "maximum prompt",
+        "input is too long",
+        "exceeds the maximum",
+        "token limit",
+    ];
+    PATTERNS.iter().any(|pattern| body.contains(pattern))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,6 +1486,7 @@ mod tests {
     use futures_util::stream;
     use llm::{EventStream, LlmError, ModelInfo, Usage};
     use serde_json::json;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
@@ -1644,6 +1952,508 @@ mod tests {
                 !got.iter().any(|event| matches!(event, AgentEvent::Error(_))),
                 "an empty response is a stall, not an error"
             );
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Token-aware auto-compaction tests
+    // ------------------------------------------------------------------
+
+    /// Provider that records every request (system + messages) so tests can
+    /// assert on what was actually sent, and answers from a canned script.
+    /// The summarizer request shares this same provider and is recognizable by
+    /// its system prompt.
+    struct RecordingProvider {
+        calls: AtomicUsize,
+        scripts: Vec<Vec<ScriptStep>>,
+        seen: Mutex<Vec<(Option<String>, Vec<Message>)>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen
+                .lock()
+                .unwrap()
+                .push((request.system.clone(), request.messages.clone()));
+            let script = self.scripts.get(index).cloned().unwrap_or_default();
+            Ok(Box::pin(stream::iter(
+                script.into_iter().map(|step| {
+                    step.map_err(LlmError::Stream)
+                }),
+            )))
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn summarizer_script() -> Vec<ScriptStep> {
+        script(vec![
+            StreamEvent::TextDelta("### Test Summary ###\nAll prior work is captured here.".into()),
+            StreamEvent::Done {
+                stop_reason: Some("stop".into()),
+                usage: Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 5,
+                    ..Usage::default()
+                }),
+            },
+        ])
+    }
+
+    /// Create a durable session pre-populated with `turns` of user+assistant
+    /// messages (assistant ~`assistant_bytes`), giving the planner material to
+    /// summarize without the live estimate itself crossing the trigger.
+    fn populate_session(store: &SessionStore, turns: usize, assistant_bytes: usize) -> Session {
+        let mut session = store
+            .create(SessionCreateOptions {
+                provider: Some("mock".into()),
+                model: Some("demo".into()),
+                ..SessionCreateOptions::default()
+            })
+            .unwrap();
+        for index in 0..turns {
+            store
+                .append_event(
+                    &mut session,
+                    SessionEvent::UserMessage {
+                        message: StoredMessage::from_llm(&Message::user(format!(
+                            "question {index}"
+                        ))),
+                    },
+                )
+                .unwrap();
+            store
+                .append_event(
+                    &mut session,
+                    SessionEvent::AssistantMessage {
+                        message: StoredMessage::from_llm(&Message::assistant(vec![
+                            Content::Text("a".repeat(assistant_bytes)),
+                        ])),
+                    },
+                )
+                .unwrap();
+        }
+        session
+    }
+
+    /// Run an agent with a durable session to completion over `inputs`,
+    /// returning the emitted agent events and the (Arc) provider. Must be
+    /// awaited inside the caller's runtime.
+    async fn run_session_agent(
+        store: &SessionStore,
+        session: Session,
+        provider: Arc<RecordingProvider>,
+        inputs: Vec<InputMessage>,
+    ) -> (Vec<AgentEvent>, Arc<RecordingProvider>) {
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        for input in inputs {
+            input_tx.send(input).unwrap();
+        }
+        drop(input_tx);
+        Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+            .with_session(store.clone(), session)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        (events, provider)
+    }
+
+    fn is_summary_message(message: &Message) -> bool {
+        message.content.iter().any(|content| match content {
+            Content::Text(text) => text.contains("[Generated session summary"),
+            _ => false,
+        })
+    }
+
+    #[test]
+    fn pre_turn_trigger_compacts_and_shrinks_next_request() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = populate_session(&store, 12, 12_000);
+            let populated_session_id = session.id();
+
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    // Turn 1 reports a huge exact context (over the trigger).
+                    script(vec![
+                        StreamEvent::TextDelta("turn 1".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: Some(Usage {
+                                input_tokens: 200_000,
+                                output_tokens: 1_000,
+                                ..Usage::default()
+                            }),
+                        },
+                    ]),
+                    summarizer_script(),
+                    script(vec![
+                        StreamEvent::TextDelta("turn 2".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
+                seen: Mutex::new(Vec::new()),
+            });
+
+            let (events, provider) = run_session_agent(
+                &store,
+                session,
+                provider.clone(),
+                vec![
+                    InputMessage::Message("first".into()),
+                    InputMessage::Message("second".into()),
+                ],
+            ).await;
+
+            // The auto trigger fired between turns.
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CompactionFinished {
+                    auto: true,
+                    reason: CompactionReason::Auto,
+                    ..
+                }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Notice(message) if message.contains("auto-compacted")
+            )));
+
+            // Three requests: turn 1, the summarizer, turn 2.
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 3, "expected turn1 + summarizer + turn2 requests");
+
+            // The summarizer request is distinguishable by its system prompt
+            // and modeled as a standalone summarization, not a conversation.
+            let (system, messages) = &seen[1];
+            assert!(system.as_deref().unwrap_or("").contains("summarization"));
+            assert_eq!(messages.len(), 1, "summarizer gets a single user prompt");
+
+            // The turn-2 conversation request sees the summary and a *smaller*
+            // history than the turn-1 request.
+            let turn2 = &seen[2].1;
+            assert!(
+                turn2.iter().any(is_summary_message),
+                "turn 2 request must include the generated summary"
+            );
+            assert!(turn2.len() < seen[0].1.len(), "history must shrink after compaction");
+
+            // The summarizer's usage was recorded so session cost stays honest.
+            drop(seen);
+            let reloaded = store.open(&populated_session_id).unwrap();
+            assert!(
+                reloaded.metadata.usage.input_tokens >= 200_100,
+                "summarizer usage (input 100) must be folded into session usage"
+            );
+            assert!(reloaded.events.iter().any(|record| matches!(
+                &record.event,
+                SessionEvent::Usage { usage }
+                    if usage.input_tokens == 100
+            )));
+        });
+    }
+
+    #[test]
+    fn summarizer_failure_falls_back_to_deterministic_persisted() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = populate_session(&store, 12, 12_000);
+            let session_id = session.id();
+
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    script(vec![
+                        StreamEvent::TextDelta("turn 1".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: Some(Usage {
+                                input_tokens: 200_000,
+                                output_tokens: 1_000,
+                                ..Usage::default()
+                            }),
+                        },
+                    ]),
+                    vec![Err("summarizer connection dropped".into())],
+                    script(vec![StreamEvent::TextDelta("turn 2".into()), StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    }]),
+                ],
+                seen: Mutex::new(Vec::new()),
+            });
+
+            let (events, _provider) = run_session_agent(
+                &store,
+                session,
+                provider.clone(),
+                vec![
+                    InputMessage::Message("first".into()),
+                    InputMessage::Message("second".into()),
+                ],
+            ).await;
+
+            // Even though the summarizer failed, compaction completed via the
+            // deterministic fallback and the turn went on.
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CompactionFinished {
+                    summary_bytes,
+                    ..
+                } if *summary_bytes > 0
+            )));
+            assert!(events.contains(&AgentEvent::TextDelta("turn 2".into())));
+
+            // The persisted summary is the deterministic transcript.
+            let reloaded = store.open(&session_id).unwrap();
+            let deterministic = reloaded.events.iter().find_map(|record| match &record.event {
+                SessionEvent::CompactionSummary { summary, .. } => Some(summary.clone()),
+                _ => None,
+            });
+            assert!(
+                deterministic.unwrap_or_default().contains("generated context"),
+                "fallback summary must be the deterministic transcript"
+            );
+        });
+    }
+
+    #[test]
+    fn overflow_recovery_compacts_and_retries_successfully() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            // Small enough that the pre-turn estimate does not trigger; the
+            // overflow rejection is the only pressure source.
+            let session = populate_session(&store, 12, 12_000);
+
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    // The first request is rejected for context overflow.
+                    vec![Err("context length exceeded for this request".into())],
+                    summarizer_script(),
+                    script(vec![
+                        StreamEvent::TextDelta("recovered answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
+                seen: Mutex::new(Vec::new()),
+            });
+
+            let (events, provider) = run_session_agent(
+                &store,
+                session,
+                provider.clone(),
+                vec![InputMessage::Message("do the work".into())],
+            ).await;
+
+            // Emergency compaction happened with Overflow reason and the retry
+            // succeeded (turn finished normally).
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CompactionFinished {
+                    reason: CompactionReason::Overflow,
+                    auto: false,
+                    ..
+                }
+            )));
+            assert!(events.contains(&AgentEvent::TextDelta("recovered answer".into())));
+            assert!(events.contains(&AgentEvent::TurnFinished));
+
+            // Requests: overflow-rejected request, summarizer, retried request.
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 3);
+            // The retried request uses the compacted (summary + tail) history.
+            let retried = &seen[2].1;
+            assert!(
+                retried.iter().any(is_summary_message),
+                "retried request must include the generated summary"
+            );
+            assert!(retried.len() < seen[0].1.len(), "history must shrink");
+        });
+    }
+
+    /// Regression: manual `/compact` used to be a no-op on the live
+    /// conversation (the summary event was appended but `history` was never
+    /// rebuilt). It must now rebuild history so the very next request sees the
+    /// summary.
+    #[test]
+    fn manual_compact_rebuilds_history_for_next_request() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = populate_session(&store, 12, 12_000);
+            let session_id = session.id();
+
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![summarizer_script(), script(vec![
+                    StreamEvent::TextDelta("after compact".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ])],
+                seen: Mutex::new(Vec::new()),
+            });
+
+            let (events, provider) = run_session_agent(
+                &store,
+                session,
+                provider.clone(),
+                vec![
+                    InputMessage::CompactSession,
+                    InputMessage::Message("next".into()),
+                ],
+            ).await;
+
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::CompactionFinished {
+                    auto: false,
+                    reason: CompactionReason::Manual,
+                    ..
+                }
+            )));
+
+            // The first request is the summarizer; the second is the turn after
+            // compaction, and it must already carry the rebuilt summary.
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            let turn_after = &seen[1].1;
+            assert!(
+                turn_after.iter().any(is_summary_message),
+                "the request after manual /compact must include the summary"
+            );
+
+            // Reload round-trip: the compacted session loads with summary +
+            // post-boundary events only (no pre-boundary user messages).
+            let reloaded = store.open(&session_id).unwrap();
+            let messages = reloaded.context_messages();
+            assert!(
+                messages.iter().any(is_summary_message),
+                "reloaded session context must start from the summary"
+            );
+            let earliest_user = messages.iter().position(|m| {
+                m.role == Role::User && !is_summary_message(m)
+            });
+            let summary_at = messages.iter().position(is_summary_message).unwrap();
+            match earliest_user {
+                None => {}
+                Some(user_index) => assert!(
+                    user_index > summary_at,
+                    "no user message may precede the generated summary"
+                ),
+            }
+        });
+    }
+
+    /// Sum body: a long session that crosses the threshold compacts exactly
+    /// once per crossing and the conversation remains coherent (the summary
+    /// precedes every subsequent user message).
+    #[test]
+    fn long_session_auto_compaction_stays_coherent() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = populate_session(&store, 12, 12_000);
+            let session_id = session.id();
+
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    script(vec![
+                        StreamEvent::TextDelta("turn 1".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: Some(Usage {
+                                input_tokens: 200_000,
+                                output_tokens: 1_000,
+                                ..Usage::default()
+                            }),
+                        },
+                    ]),
+                    summarizer_script(),
+                    script(vec![
+                        StreamEvent::TextDelta("turn 2".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
+                seen: Mutex::new(Vec::new()),
+            });
+
+            let (events, _provider) = run_session_agent(
+                &store,
+                session,
+                provider.clone(),
+                vec![
+                    InputMessage::Message("first".into()),
+                    InputMessage::Message("second".into()),
+                ],
+            ).await;
+
+            // Exactly one auto-compaction for this crossing.
+            let auto_compactions = events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::CompactionFinished {
+                        auto: true,
+                        reason: CompactionReason::Auto,
+                        ..
+                    }
+                ))
+                .count();
+            assert_eq!(auto_compactions, 1, "expected exactly one auto compaction");
+
+            // Coherence on disk: every real user message follows the summary.
+            let reloaded = store.open(&session_id).unwrap();
+            let messages = reloaded.context_messages();
+            let mut seen_summary = false;
+            for message in &messages {
+                if is_summary_message(message) {
+                    seen_summary = true;
+                    continue;
+                }
+                if message.role == Role::User {
+                    assert!(seen_summary, "user message must follow the summary");
+                }
+            }
         });
     }
 }

@@ -135,6 +135,8 @@ pub enum UiEvent {
     CompactionFinished {
         compacted_through: u64,
         summary_bytes: usize,
+        auto: bool,
+        reason: String,
     },
 }
 
