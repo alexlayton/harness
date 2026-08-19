@@ -40,6 +40,11 @@ clippy defaults (stable, edition 2024).
 - **New tools** implement the `Tool` trait (spec + prompt metadata) in
   `crates/tools` and get registered in `default_registry`. Tools must confine
   paths to the workspace root.
+- **Skills context**: skills autodiscover from `.harness/skills/` and
+  `.agents/skills/` (project walk to the git root) plus the global
+  `~/.harness/skills`. Project instructions are injected from `AGENTS.md` /
+  `CLAUDE.md`, including the global `~/.harness/AGENTS.md` (opt out with
+  `--no-context-files`).
 - **Env overrides for tests**: `HARNESS_CONFIG_DIR`, `HARNESS_SESSION_DIR`,
   `HARNESS_STATE_DIR`, `HARNESS_LOG` (file-only tracing). Use them to avoid
   touching real `~/.config/harness` and `~/.harness/sessions`.

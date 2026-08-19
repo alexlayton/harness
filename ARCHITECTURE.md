@@ -103,6 +103,54 @@ startup; `bash` runs with that root as cwd. `find`/`grep` share one
 `FileSearchIndex` (fff-search) created once per process. `bash` optionally
 rewrites commands through `rtk` for token-lean output.
 
+## Skills and project context
+
+Both **Agent Skills** discovery and **AGENTS.md** project-context injection live
+in `crates/tools` and feed the system prompt:
+
+- `crates/tools/src/skills.rs` — skill discovery, frontmatter parsing, the
+  `SkillCatalog`, and the `<available_skills>` prompt XML.
+- `crates/tools/src/context_files.rs` — loads and renders AGENTS.md/CLAUDE.md
+  as the `<project_context>` block.
+
+Every discovered skill's `SKILL.md` (plus its `scripts/`/`references/`/`assets/`
+dirs) is added to `ReadTool`'s allowlist, and the catalog is stored on the
+registry for the prompt builder.
+
+### Autodiscovery roots (no explicit paths)
+
+Skills autodiscover with **zero flags or config**: the project walk (`cwd` up
+to the git repo root: `.harness/skills` in pi mode and `.agents/skills` in
+agents mode), plus the global roots `~/.harness/skills` (or
+`$HARNESS_SKILLS_DIR`) and `~/.agents/skills`. Project roots beat global roots;
+name collisions keep the earlier (higher-priority) skill. There is deliberately
+no `--skill` flag or config `skills` field — the explicit-path mechanism was
+removed, leaving pure autodiscovery as the only mechanism. pi is inspiration
+for resolving ambiguity, not a contract.
+
+### The two invariants
+
+1. **System-prompt-lives-outside-history (compaction immunity).** The system
+   prompt — including the skills catalog and the `<project_context>` block — is
+   rebuilt from scratch every turn and never touches `self.history`. Compaction
+   only summarizes history, so this content persists across compaction by
+   construction.
+2. **Lazy loading (progressive disclosure).** Only skill *name, description,
+   and location* ever enter the system prompt. The model loads a skill's body
+   by calling `read` on the absolute `<location>` path — the token-efficiency
+   point of skills. Skill bodies, once read into history as tool results, are
+   compacted like any other tool result (truncated to 2000 chars and folded
+   into the summary). That is correct behavior, not something to "fix".
+
+### AGENTS.md context files
+
+`~/.harness/AGENTS.md` (or `$HARNESS_CONFIG_DIR/AGENTS.md`) plus every ancestor
+of `cwd` up to the git repo root, nearest last. Per directory, the first
+existing candidate wins: `AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`,
+`CLAUDE.md`, `CLAUDE.MD`. Files are deduped by canonical path and capped
+(32 KiB total, 16 KiB per file). Opt out with `--no-context-files` or
+`HARNESS_NO_CONTEXT_FILES`.
+
 ## Sessions
 
 Owned by `crates/session`; see `crates/session/README.md` for the full JSONL
