@@ -260,11 +260,13 @@ impl crate::Tui {
     /// The live-tail row budget applied while streaming: the tail region of a
     /// busy fixed-height viewport held at a minimal single-line prompt.
     fn streamed_tail_budget(&self) -> usize {
-        // Mirror `draw`: the live sections live inside `Margin { vertical }`,
-        // which removes one row at the top *and* the bottom of the viewport.
-        let canvas = self
-            .viewport_height
-            .saturating_sub(2 * render::vertical_pad(self.viewport_height));
+        // Mirror `draw`: ratatui clamps the inline viewport to the terminal
+        // rows when the terminal shrinks below the fixed height, and the live
+        // sections live inside `Margin { vertical }`, which removes one row at
+        // the top *and* the bottom of the viewport.
+        let rows = self.terminal.size().map(|s| s.height).unwrap_or(24);
+        let height = self.viewport_height.min(rows);
+        let canvas = height.saturating_sub(2 * render::vertical_pad(height));
         crate::layout::live_layout(canvas, true, 1, 0)
             .tail_rows
             .max(1) as usize

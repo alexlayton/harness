@@ -378,9 +378,13 @@ impl Tui {
     }
 
     fn handle_resize(&mut self) {
-        // Inline viewports are re-anchored and auto-resized inside ratatui's
-        // `draw()`; committed content keeps its original wrap width and the
-        // terminal soft-reflows it. Only the prompt scroll needs resetting.
+        // Resizing needs no extra work beyond drawing: ratatui's `autoresize`
+        // (inside every `draw()`) detects the size change, re-anchors the
+        // inline viewport at the new width, clamps its height to the terminal
+        // rows, and clears the live region — so the next draw is a full
+        // repaint of the live region at the new size. Committed scrollback is
+        // immutable pixels and keeps its original wrap width; the terminal
+        // soft-reflows it itself. Only the prompt scroll needs resetting.
         self.prompt_scroll = 0;
     }
 

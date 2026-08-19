@@ -35,9 +35,11 @@ pub(crate) struct LiveLayout {
 /// Compute the section heights for a `height`-row canvas.
 ///
 /// Budgeting rules:
-/// - The input box keeps a 3-row minimum and caps at `max(3, height - 2)`
-///   (the `−2` reserves the metadata and activity rows); while busy the tail
-///   needs at least one row, so the cap is trimmed to `min(cap, height - 4)`.
+/// - The input box keeps a 3-row minimum (when the canvas allows it) and caps
+///   at `max(3, height - 2)` (the `−2` reserves the metadata and activity
+///   rows); while busy the tail needs at least one row, so the cap is trimmed
+///   to `min(cap, height - 4)`. On a degenerate 1–2 row canvas the input box
+///   degrades to the whole canvas rather than panicking `clamp`.
 /// - Metadata collapses on tiny canvases (<6 rows), activity only renders
 ///   while busy and when the canvas leaves room (<7 rows hides it), so the
 ///   input always keeps its minimum.
@@ -60,7 +62,11 @@ pub(crate) fn live_layout(
         input_cap
     };
     let desired_prompt_rows = desired_prompt_lines.saturating_add(2) as u16;
-    let prompt_rows = desired_prompt_rows.clamp(3, input_cap.min(height));
+    // `clamp` panics when the lower bound exceeds the upper bound, and the
+    // 3-row input minimum can exceed a degenerate canvas after ratatui clamps
+    // the viewport to a 1–2 row terminal. Degrade the minimum instead.
+    let upper = input_cap.min(height);
+    let prompt_rows = desired_prompt_rows.clamp(3.min(upper), upper);
 
     let available = height.saturating_sub(prompt_rows);
     // On tiny canvases the metadata/activity rows collapse entirely so the
@@ -316,6 +322,82 @@ mod tests {
     }
 
     #[test]
+    fn live_layout_survives_degenerate_canvases() {
+        // A 1–2 row canvas (terminal shrunk below the fixed viewport height)
+        // must not panic `clamp` and must still partition the canvas exactly.
+        for height in [1u16, 2, 3, 4] {
+            for busy in [false, true] {
+                let budget = live_layout(height, busy, 1, 0);
+                let total = budget.prompt_rows
+                    + budget.completion_rows
+                    + budget.activity_rows
+                    + budget.metadata_rows
+                    + budget.gap_rows
+                    + budget.tail_rows;
+                assert_eq!(total, height, "height {height} busy {busy}");
+                // Everything except the (border-only) input box collapses.
+                assert_eq!(budget.metadata_rows, 0);
+                assert_eq!(budget.activity_rows, 0);
+                assert_eq!(budget.completion_rows, 0);
+                assert!(budget.prompt_rows >= 3.min(height));
+                assert!(budget.prompt_rows <= height);
+            }
+        }
+    }
+
+    #[test]
+    fn inline_viewport_reflows_the_live_region_after_resize() {
+        // ratatui's `autoresize` runs inside every `draw()`: when the terminal
+        // size changes it re-anchors the inline viewport at the new width and
+        // clamps its height to the terminal. Our layout is computed purely
+        // from `frame.area()`, so the live region reflows with no cached
+        // widths anywhere. This pins that contract.
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: ratatui::Viewport::Inline(7),
+            },
+        )
+        .unwrap();
+        terminal
+            .draw(|frame| {
+                assert_eq!(frame.area().width, 80);
+                assert_eq!(frame.area().height, 7);
+            })
+            .unwrap();
+
+        // Shrinking the terminal re-anchors the viewport at the new width;
+        // the fixed height is untouched while it still fits.
+        terminal.backend_mut().resize(50, 20);
+        terminal
+            .draw(|frame| {
+                assert_eq!(frame.area().width, 50);
+                assert_eq!(frame.area().height, 7);
+            })
+            .unwrap();
+
+        // Growing again is symmetric.
+        terminal.backend_mut().resize(100, 30);
+        terminal
+            .draw(|frame| {
+                assert_eq!(frame.area().width, 100);
+                assert_eq!(frame.area().height, 7);
+            })
+            .unwrap();
+
+        // A terminal shorter than the fixed viewport height clamps the
+        // viewport instead of drawing past the screen edge.
+        terminal.backend_mut().resize(60, 4);
+        terminal
+            .draw(|frame| {
+                assert_eq!(frame.area().width, 60);
+                assert_eq!(frame.area().height, 4);
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn live_layout_puts_one_blank_row_between_tail_and_sections_below() {
         // A busy 14-row canvas with a minimal prompt leaves room for tail,
         // gap, activity, metadata, and the input box.
@@ -344,21 +426,29 @@ mod tests {
     }
 
     /// The fixed-canvas budget yields non-overlapping, in-bounds, contiguous
-    /// rects for every terminal height in the supported band, busy or not,
-    /// with a completion popup open or not, and with a prompt grown past its
-    /// cap. Sections may be zero-height (e.g. tail on a tiny idle canvas) but
-    /// must never overlap or escape the viewport.
+    /// rects for every terminal height in the supported band (including the
+    /// degenerate 1–4 row canvases ratatui clamps to when the terminal shrinks
+    /// below the fixed viewport height), busy or not, with a completion popup
+    /// open or not, and with a prompt grown past its cap. Sections may be
+    /// zero-height (e.g. tail on a tiny idle canvas) but must never overlap or
+    /// escape the viewport.
     #[test]
     fn live_layout_rects_stay_in_bounds_and_do_not_overlap() {
-        for height in [5u16, 8, 12, 16] {
+        for height in 1u16..=16 {
             for busy in [false, true] {
                 for completion in [0u16, 3, 8] {
                     for prompt_lines in [1usize, 3, 20] {
                         let budget = live_layout(height, busy, prompt_lines, completion);
-                        // The input box never drops below its 3-row minimum
-                        // and the budget never exceeds the canvas.
+                        // The input box keeps its 3-row minimum whenever the
+                        // canvas has the rows to spare, and never exceeds the
+                        // canvas; the budget never exceeds the canvas.
                         assert!(
-                            budget.prompt_rows >= 3,
+                            budget.prompt_rows >= 3.min(height),
+                            "height {height} busy {busy} gave prompt {}",
+                            budget.prompt_rows
+                        );
+                        assert!(
+                            budget.prompt_rows <= height,
                             "height {height} busy {busy} gave prompt {}",
                             budget.prompt_rows
                         );
