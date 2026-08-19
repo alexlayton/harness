@@ -1,5 +1,5 @@
 use crate::config::{build_provider_with_auth, save_settings};
-use crate::prompt::system_prompt_with_skills;
+use crate::prompt::system_prompt_with_workspace_context;
 use crate::tools::{ToolRegistry, call_recap, call_summary};
 use auth::{AuthEvent, CopilotAuth, sku_from_proxy_token};
 use compact::{
@@ -224,6 +224,11 @@ pub struct Agent {
     context_window: u64,
     /// Token-aware compaction policy.
     compaction: CompactionPolicy,
+    /// Rendered project-context block (AGENTS.md / CLAUDE.md), loaded once at
+    /// construction and reused every turn via the system prompt. Empty when
+    /// no context files apply or injection is disabled. Lives in the system
+    /// prompt, so it is immune to compaction.
+    project_context: String,
 }
 
 impl Agent {
@@ -246,7 +251,15 @@ impl Agent {
             last_context_tokens: None,
             context_window: 0,
             compaction: CompactionPolicy::default(),
+            project_context: String::new(),
         }
+    }
+
+    /// Attach a pre-rendered project-context block (AGENTS.md / CLAUDE.md).
+    /// Pass an empty string to skip injection.
+    pub fn with_project_context(mut self, project_context: impl Into<String>) -> Self {
+        self.project_context = project_context.into();
+        self
     }
 
     /// Attach a compaction policy (resolved from `config.toml`).
@@ -540,10 +553,11 @@ impl Agent {
         loop {
             let request = CompletionRequest {
                 model: self.model.clone(),
-                system: Some(system_prompt_with_skills(
+                system: Some(system_prompt_with_workspace_context(
                     &self.tools.workspace_root().display().to_string(),
                     &self.tools.prompt_context(),
                     self.tools.skills(),
+                    &self.project_context,
                 )),
                 messages: self.history.clone(),
                 tools: self.tools.definitions(),
@@ -1864,6 +1878,47 @@ mod tests {
                     .iter()
                     .any(|record| matches!(record.event, SessionEvent::AssistantMessage { .. }))
             );
+        });
+    }
+
+    #[test]
+    fn system_prompt_includes_project_context_block() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![script(vec![
+                    StreamEvent::TextDelta("answer".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ])],
+                seen: Mutex::new(Vec::new()),
+            });
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, _event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("hello".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .with_project_context("<project_context>\nrepo rule\n</project_context>")
+                .run(input_rx, event_tx)
+                .await;
+
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            let system = seen[0].0.as_deref().unwrap_or("");
+            assert!(
+                system.contains("<project_context>"),
+                "system prompt must include the project context block"
+            );
+            assert!(system.contains("repo rule"));
+            // The skill catalog is not present (no skills), and the block is
+            // appended after the base prompt.
+            assert!(system.contains("You are harness"));
         });
     }
 

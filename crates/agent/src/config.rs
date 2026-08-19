@@ -311,6 +311,10 @@ pub struct Cli {
     #[arg(long, value_name = "ID|latest|PATH")]
     pub resume: Option<String>,
 
+    /// Disable AGENTS.md / CLAUDE.md project-context injection.
+    #[arg(long = "no-context-files", default_value_t = false)]
+    pub no_context_files: bool,
+
     /// Prompt for non-interactive mode. Joined with spaces. When `--print` is
     /// set and no positional is given, the prompt is read from stdin.
     /// Only meaningful with `--print`; passing it without `--print` is an

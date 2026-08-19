@@ -10,6 +10,7 @@
 use crate::agent::Agent;
 use crate::agent::AgentEvent;
 use crate::config::{Cli, Config};
+use crate::project_context_for;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result, anyhow};
 use llm::Provider;
@@ -297,8 +298,10 @@ async fn run_headless_with_cancel(
     ) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
+    let project_context = project_context_for(tools.workspace_root(), cli.no_context_files);
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
         .with_compaction(config.compaction.clone())
+        .with_project_context(project_context)
         .with_session(store, session);
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 

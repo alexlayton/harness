@@ -1,4 +1,5 @@
 mod bash;
+pub mod context_files;
 mod edit;
 pub mod file_mutation;
 mod find;
@@ -9,6 +10,7 @@ pub mod skills;
 mod write;
 
 pub use bash::{BashTool, truncate_command_output};
+pub use context_files::{format_context_files, load_context_files, load_context_files_with};
 pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;

@@ -1,6 +1,7 @@
 use agent::agent::{Agent, spawn_model_list};
 use agent::config::{Cli, Config, ProviderArg, build_provider_with_auth, init_logging};
 use agent::headless::run_headless;
+use agent::project_context_for;
 use agent::tools::{ToolConfig, default_registry};
 use anyhow::{Context, Result, bail};
 use auth::CopilotAuth;
@@ -79,7 +80,8 @@ async fn main_inner() -> Result<ExitCode> {
     // ordinary model entry and conversation use do not depend on this fetch.
     spawn_model_list(provider_name.clone(), provider.clone(), event_tx.clone());
 
-    let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone());
+    let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
+        .with_project_context(project_context_for(&workspace_root, cli.no_context_files));
     let agent = if let Some(auth) = copilot_auth {
         agent.with_copilot_auth(auth)
     } else {

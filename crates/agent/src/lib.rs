@@ -4,6 +4,19 @@ pub mod headless;
 pub mod prompt;
 pub use tools;
 
+use std::path::Path;
+
+/// Render the project-context block (AGENTS.md / CLAUDE.md) for a workspace,
+/// or an empty string when injection is disabled (`--no-context-files`). Used
+/// by both frontends to attach context to the agent at construction.
+pub fn project_context_for(workspace_root: &Path, disabled: bool) -> String {
+    if disabled {
+        return String::new();
+    }
+    let files = tools::context_files::load_context_files(workspace_root);
+    tools::context_files::format_context_files(&files)
+}
+
 pub use agent::{Agent, AgentEvent};
 
 impl tui::TuiEvent for AgentEvent {

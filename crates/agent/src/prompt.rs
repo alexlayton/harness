@@ -55,10 +55,29 @@ pub fn system_prompt_with_skills(
     }
 }
 
+/// Build a prompt from active tool metadata, a skills catalog, and the
+/// rendered project-context block (AGENTS.md / CLAUDE.md).  The skills and
+/// project-context sections are appended in order; an empty
+/// `project_context` leaves the prompt identical to [`system_prompt_with_skills`].
+pub fn system_prompt_with_workspace_context(
+    cwd: &str,
+    context: &ToolPromptContext,
+    skills: Option<&SkillCatalog>,
+    project_context: &str,
+) -> String {
+    let base = system_prompt_with_skills(cwd, context, skills);
+    if project_context.is_empty() {
+        base
+    } else {
+        format!("{base}\n\n{project_context}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tools::discover;
+    use tools::format_context_files;
 
     #[test]
     fn skills_prompt_is_appended_only_when_invocable_skills_exist() {
@@ -89,5 +108,35 @@ mod tests {
         };
         let prompt = system_prompt_with_skills("/workspace", &context, Some(&empty));
         assert!(!prompt.contains("<available_skills>"));
+    }
+
+    #[test]
+    fn workspace_context_is_appended_only_when_nonempty() {
+        let context = ToolPromptContext::default();
+        let empty = tools::SkillCatalog {
+            skills: vec![],
+            diagnostics: vec![],
+            read_paths: vec![],
+        };
+        // Empty project_context → identical to the skills variant.
+        let with_empty =
+            system_prompt_with_workspace_context("/workspace", &context, Some(&empty), "");
+        let base = system_prompt_with_skills("/workspace", &context, Some(&empty));
+        assert_eq!(with_empty, base);
+
+        // Non-empty → the block appears after the skills section, with the
+        // file content.
+        let rendered = format_context_files(&[tools::context_files::ContextFile {
+            path: std::path::PathBuf::from("/ws/AGENTS.md"),
+            content: "repo rule one\n".into(),
+            truncated: false,
+        }]);
+        let with_context =
+            system_prompt_with_workspace_context("/workspace", &context, Some(&empty), &rendered);
+        assert!(with_context.contains("<project_context>"));
+        assert!(with_context.contains("repo rule one"));
+        assert!(with_context.contains("</project_context>"));
+        // The block is appended after the base prompt.
+        assert!(with_context.starts_with(base.as_str()));
     }
 }
