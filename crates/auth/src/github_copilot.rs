@@ -669,6 +669,19 @@ pub fn get_base_url_from_token(token: &str) -> Option<String> {
     base_url_from_proxy_token(token)
 }
 
+/// The billing SKU from Copilot's semicolon-delimited token metadata (for
+/// example `free_limited_copilot`).  Free plans gate most premium models
+/// behind billing, so callers use this to bias defaults and error hints
+/// toward models such plans can actually serve.
+pub fn sku_from_proxy_token(token: &str) -> Option<&str> {
+    token.split(';').find_map(|part| {
+        let part = part.trim();
+        part.strip_prefix("sku=")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    })
+}
+
 pub fn copilot_base_url(token: &str, enterprise_domain: Option<&str>) -> String {
     if let Some(url) = base_url_from_proxy_token(token) {
         return url;
@@ -1023,6 +1036,16 @@ mod tests {
             copilot_base_url("no-proxy", None),
             "https://api.individual.githubcopilot.com"
         );
+    }
+
+    #[test]
+    fn parses_billing_sku_from_token_metadata() {
+        assert_eq!(
+            sku_from_proxy_token("tid=x;sku=free_limited_copilot;chat=1"),
+            Some("free_limited_copilot")
+        );
+        assert_eq!(sku_from_proxy_token("tid=x;sku="), None);
+        assert_eq!(sku_from_proxy_token("tid=x;chat=1"), None);
     }
 
     #[test]

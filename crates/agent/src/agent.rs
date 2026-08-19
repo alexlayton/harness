@@ -1,7 +1,7 @@
 use crate::config::{build_provider_with_auth, save_settings};
 use crate::prompt::system_prompt_with_tools;
 use crate::tools::{ToolRegistry, call_recap, call_summary};
-use auth::{AuthEvent, CopilotAuth};
+use auth::{AuthEvent, CopilotAuth, sku_from_proxy_token};
 use compact::{
     CompactionPolicy, SummaryOutcome, estimate_live_tokens, plan_compaction,
     summarize as compact_summarize,
@@ -11,6 +11,7 @@ use llm::{
     CompletionRequest, Content, LlmError, Message, Provider, RetryCallback, Role, StreamEvent,
     ToolCall, truncate_utf8,
 };
+use llm::providers::github_copilot::default_model_for;
 use session::{
     ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore, StoredMessage,
     StoredToolCall, export_jsonl, snapshot_entries, usage_summary,
@@ -963,7 +964,7 @@ impl Agent {
         };
 
         match outcome {
-            Some(Ok(Ok(_credential))) => {
+            Some(Ok(Ok(credential))) => {
                 send(events, AgentEvent::AuthFinished);
                 match build_provider_with_auth("github-copilot", Some(auth)) {
                     Ok(provider) => {
@@ -975,6 +976,27 @@ impl Agent {
                             "authenticated, but could not refresh Copilot models: {error}"
                         )),
                     ),
+                }
+                // The model chosen at startup (or any earlier explicit
+                // choice) may not be entitled to the account that just
+                // signed in; every following turn would fail.  Fall back to
+                // the account's preferred default so the next turn works.
+                if self.provider.name() == "github-copilot"
+                    && !credential.available_model_ids.is_empty()
+                    && !credential.available_model_ids.contains(&self.model)
+                    && let Some(default) = default_model_for(
+                        sku_from_proxy_token(&credential.access),
+                        &credential.available_model_ids,
+                    )
+                {
+                    send(
+                        events,
+                        AgentEvent::Notice(format!(
+                            "model `{}` is not available to this account; switching to `{default}`",
+                            self.model
+                        )),
+                    );
+                    self.handle_set_model(None, default, events).await;
                 }
             }
             Some(Ok(Err(error))) => {

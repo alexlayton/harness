@@ -14,7 +14,10 @@ harness --provider github-copilot
 Run `/auth` in the TUI. Harness displays GitHub's device URL and one-time code;
 open the URL in a browser and authorize the device. Press `Ctrl+C` while it is
 waiting to cancel the login without quitting Harness. After login, use `/model`
-to select one of the models available to the account.
+to select one of the models available to the account. When no model is
+configured, Harness defaults to the first model from the account's own
+available list that it knows how to route, and switches automatically after a
+fresh login if the current model is not entitled to the account.
 
 GitHub Copilot credentials are kept separately from normal configuration:
 
@@ -49,4 +52,10 @@ Copilot's device, token, model-policy, and proxy endpoints are client behavior
 used by VS Code/Pi rather than a stable public LLM API. Endpoint paths, headers,
 model-policy filtering, and static dialect metadata are isolated in
 `crates/auth` and `crates/llm/src/providers/github_copilot.rs` so they can be
-updated independently.
+updated independently. Claude models route through the Anthropic-compatible
+`/v1/messages` endpoint, GPT-5-family and MAI models through `/responses`, and
+the rest through `/chat/completions`, matching the per-model
+`supported_endpoints` metadata Copilot publishes. Free plans gate most premium
+models behind billing; when no model is configured, the default prefers one the
+plan can serve, and plan-gated requests surface an actionable error instead of
+a bare 400.

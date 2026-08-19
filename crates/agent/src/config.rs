@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, anyhow};
-use auth::CopilotAuth;
+use auth::{CopilotAuth, sku_from_proxy_token};
 use clap::{Parser, ValueEnum};
 use compact::policy::CompactionPolicy;
 use llm::Provider;
+use llm::providers::github_copilot::default_model_for;
 use llm::providers::{GithubCopilotProvider, OpenCodeGoProvider, OpenRouterProvider};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -330,7 +331,19 @@ impl Config {
     pub fn resolve(cli: &Cli) -> Result<Self> {
         let path = config_path();
         let file = load_file_config(&path)?;
-        Self::resolve_from_file(cli, &file, path, env_api_key)
+        let mut config = Self::resolve_from_file(cli, &file, path, env_api_key)?;
+        // The static Copilot fallback model may not be entitled to this
+        // account.  When no model was chosen explicitly, prefer the first
+        // catalog model the signed-in account can actually use; the choice
+        // is read from the local credential store, so this stays offline.
+        if config.provider == ProviderArg::GithubCopilot
+            && cli.model.is_none()
+            && file.model.is_none()
+            && let Some(model) = entitled_copilot_default()
+        {
+            config.model = model;
+        }
+        Ok(config)
     }
 
     /// Resolve a config with explicitly supplied key values.  This is kept
@@ -424,6 +437,16 @@ fn env_api_key(provider: ProviderArg) -> Option<String> {
             .ok()
             .filter(|value| !value.trim().is_empty())
     })
+}
+
+/// The best default model for a signed-in Copilot account: for free plans,
+/// a model the plan can actually serve; otherwise the first entry of the
+/// account's available list that this build knows how to route.  Reading
+/// the credential is local-only; `None` keeps the static default.
+fn entitled_copilot_default() -> Option<String> {
+    let credential = CopilotAuth::from_default().ok()?.credential().ok()??;
+    let sku = sku_from_proxy_token(&credential.access);
+    default_model_for(sku, &credential.available_model_ids)
 }
 
 /// Construct a provider from its stable configuration/command name.
