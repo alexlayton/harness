@@ -1038,6 +1038,16 @@ pub fn prompt_scroll_for_cursor(
     }
 }
 
+/// Rows hidden *below* the visible window inside a scrollable prompt body
+/// with `inner_height` visible rows at scroll offset `scroll_top`. Shown as
+/// `+N` on the bottom border of the input box. For a scroll within bounds
+/// (`scroll_top <= line_count - inner_height`) this is exactly
+/// `line_count - scroll_top - inner_height`; saturating arithmetic keeps it
+/// defined for any caller-provided offset.
+pub fn prompt_hidden_below(line_count: usize, scroll_top: usize, inner_height: usize) -> usize {
+    line_count.saturating_sub(scroll_top + inner_height)
+}
+
 pub fn render_prompt(
     area: Rect,
     textarea: &TextArea<'_>,
@@ -1403,6 +1413,125 @@ mod tests {
                 scroll + inner_height.max(1)
             );
             assert!(scroll <= line_count.saturating_sub(inner_height.max(1)));
+        }
+    }
+
+    #[test]
+    fn prompt_hidden_below_counts_rows_outside_the_visible_window() {
+        // Everything below the visible window is hidden; nothing above counts.
+        assert_eq!(prompt_hidden_below(10, 0, 4), 6);
+        assert_eq!(prompt_hidden_below(10, 3, 4), 3);
+        assert_eq!(prompt_hidden_below(10, 6, 4), 0);
+        // A scroll offset past the bottom hides nothing below.
+        assert_eq!(prompt_hidden_below(10, 7, 4), 0);
+        assert_eq!(prompt_hidden_below(10, 12, 4), 0);
+        // The window may be taller than the content.
+        assert_eq!(prompt_hidden_below(4, 0, 4), 0);
+        assert_eq!(prompt_hidden_below(4, 1, 6), 0);
+        // Degenerate empty inputs stay defined.
+        assert_eq!(prompt_hidden_below(0, 0, 4), 0);
+        assert_eq!(prompt_hidden_below(0, 0, 0), 0);
+    }
+
+    #[test]
+    fn prompt_window_partitions_the_lines() {
+        // For any in-bounds scroll, hidden-above + visible + hidden-below
+        // partition the prompt lines exactly: no row is lost or shown twice.
+        for line_count in 0..=12usize {
+            for inner_height in 1..=5usize {
+                let max_scroll = line_count.saturating_sub(inner_height);
+                for scroll in 0..=max_scroll {
+                    let hidden_above = scroll;
+                    let hidden_below = prompt_hidden_below(line_count, scroll, inner_height);
+                    let visible = inner_height.min(line_count.saturating_sub(scroll));
+                    assert_eq!(
+                        hidden_above + visible + hidden_below,
+                        line_count,
+                        "lines {line_count} inner {inner_height} scroll {scroll}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_prompt_paints_plus_n_on_both_borders_when_the_input_overflows() {
+        // A 30-line prompt in a 3-row inner box: the cursor forces a scroll
+        // that hides rows above *and* below the visible window.
+        let theme = Theme::default();
+        let mut textarea = TextArea::from((0..30).map(|i| format!("line {i}")).collect::<Vec<_>>());
+        // Park the cursor mid-prompt so rows are hidden above *and* below the
+        // visible window (a cursor at the end hides rows above only).
+        textarea.move_cursor(tui_textarea::CursorMove::Jump(15, 0));
+        let layout = prompt_layout(&textarea, 20, theme);
+        let inner_height = 3usize;
+        let scroll = prompt_scroll_for_cursor(layout.cursor_row, layout.lines.len(), inner_height);
+        let hidden_above = scroll;
+        let hidden_below = prompt_hidden_below(layout.lines.len(), scroll, inner_height);
+        assert!(hidden_above > 0, "expected rows hidden above the window");
+        assert!(hidden_below > 0, "expected rows hidden below the window");
+
+        let backend = TestBackend::new(40, 7);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_prompt(
+                    frame.area(),
+                    &textarea,
+                    scroll,
+                    hidden_above,
+                    hidden_below,
+                    theme,
+                    frame,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let top: String = buffer
+            .content()
+            .iter()
+            .take(40)
+            .map(|c| c.symbol())
+            .collect();
+        let bottom: String = buffer
+            .content()
+            .iter()
+            .skip(40 * 6)
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            top.contains(&format!("+{hidden_above}")),
+            "top border should show +{hidden_above}, got {top:?}"
+        );
+        assert!(
+            bottom.contains(&format!("+{hidden_below}")),
+            "bottom border should show +{hidden_below}, got {bottom:?}"
+        );
+        // The visible window shows exactly the scrolled slice of the prompt:
+        // rows 1..=3 of the buffer are the 3 visible text rows, each starting
+        // at column 2 (border `│`, padding space, then the line).
+        let visible_row_text = |buffer_row: usize| -> String {
+            buffer
+                .content()
+                .iter()
+                .skip(40 * buffer_row + 2)
+                .take(20)
+                .map(|c| c.symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+        for (offset, buffer_row) in (1..=3).enumerate() {
+            let expected: String = layout.lines[scroll + offset]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(
+                visible_row_text(buffer_row),
+                expected,
+                "visible row at buffer row {buffer_row}"
+            );
         }
     }
 

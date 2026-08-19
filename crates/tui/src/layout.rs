@@ -147,10 +147,11 @@ impl crate::Tui {
             let hidden_above = self.prompt_scroll;
             // Rows hidden below the visible window inside the (possibly
             // scrollable) input box; shown as `+N` on the bottom border.
-            let hidden_below = prompt_layout
-                .lines
-                .len()
-                .saturating_sub(self.prompt_scroll + prompt_inner_height);
+            let hidden_below = render::prompt_hidden_below(
+                prompt_layout.lines.len(),
+                self.prompt_scroll,
+                prompt_inner_height,
+            );
 
             let constraints = vec![
                 Constraint::Length(budget.tail_rows),
