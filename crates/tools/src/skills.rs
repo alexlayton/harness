@@ -191,7 +191,6 @@ fn load_skill_from_file(
     file_path: &Path,
     _source: &str,
     diagnostics: &mut Vec<SkillDiagnostic>,
-    read_paths: &mut Vec<PathBuf>,
 ) -> Option<Skill> {
     let raw = match fs::read_to_string(file_path) {
         Ok(raw) => raw,
@@ -251,8 +250,8 @@ fn load_skill_from_file(
         });
     }
     // Reads: the skill file itself, plus its base dir (for resources).
-    read_paths.push(file_path.to_path_buf());
-    read_paths.push(base_dir.clone());
+    // Accumulation happens in `discover`'s post-selection loop so shadowed
+    // skills never contribute paths.
     Some(Skill {
         name,
         description,
@@ -280,7 +279,6 @@ fn discover_dir(
     ig: &ignore::gitignore::Gitignore,
     skills: &mut Vec<Skill>,
     diagnostics: &mut Vec<SkillDiagnostic>,
-    read_paths: &mut Vec<PathBuf>,
 ) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -290,7 +288,7 @@ fn discover_dir(
     if skill_md.is_file() {
         let rel = skill_md.strip_prefix(root).unwrap_or(&skill_md);
         if !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_skill_from_file(&skill_md, source, diagnostics, read_paths)
+            && let Some(skill) = load_skill_from_file(&skill_md, source, diagnostics)
         {
             skills.push(skill);
         }
@@ -313,16 +311,7 @@ fn discover_dir(
             if ig.matched(rel, true).is_ignore() {
                 continue;
             }
-            discover_dir(
-                &path,
-                mode,
-                source,
-                root,
-                ig,
-                skills,
-                diagnostics,
-                read_paths,
-            );
+            discover_dir(&path, mode, source, root, ig, skills, diagnostics);
             continue;
         }
         let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
@@ -336,7 +325,7 @@ fn discover_dir(
             && mode == "pi"
             && path.parent() == Some(root)
             && !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_skill_from_file(&path, source, diagnostics, read_paths)
+            && let Some(skill) = load_skill_from_file(&path, source, diagnostics)
         {
             skills.push(skill);
         }
@@ -374,22 +363,12 @@ fn build_ignore(root: &Path) -> ignore::gitignore::Gitignore {
 pub fn load_skills_from_dir(root: &Path, mode: &str, source: &str) -> SkillCatalog {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
-    let mut read_paths = Vec::new();
     let ig = build_ignore(root);
-    discover_dir(
-        root,
-        mode,
-        source,
-        root,
-        &ig,
-        &mut skills,
-        &mut diagnostics,
-        &mut read_paths,
-    );
+    discover_dir(root, mode, source, root, &ig, &mut skills, &mut diagnostics);
     SkillCatalog {
         skills,
         diagnostics,
-        read_paths,
+        read_paths: Vec::new(),
     }
 }
 
@@ -400,13 +379,11 @@ pub fn load_skills_from_dir(root: &Path, mode: &str, source: &str) -> SkillCatal
 pub fn discover(roots: &[(PathBuf, String)]) -> SkillCatalog {
     let mut all_skills = Vec::new();
     let mut all_diagnostics = Vec::new();
-    let mut read_paths = Vec::new();
     let mut by_name: HashSet<String> = HashSet::new();
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     for (root, mode) in roots {
         let c = load_skills_from_dir(root, mode, "root");
         all_diagnostics.extend(c.diagnostics);
-        read_paths.extend(c.read_paths);
         for skill in c.skills {
             let canonical =
                 fs::canonicalize(&skill.file_path).unwrap_or_else(|_| skill.file_path.clone());
@@ -426,6 +403,18 @@ pub fn discover(roots: &[(PathBuf, String)]) -> SkillCatalog {
             }
             by_name.insert(skill.name.clone());
             all_skills.push(skill);
+        }
+    }
+    // Read-paths for every *kept* skill (its file plus base dir).  Only
+    // skills that won the name collision contribute, and the list is deduped
+    // (root-priority walk can repeat the same path).
+    let mut read_paths = Vec::with_capacity(all_skills.len() * 2);
+    let mut seen_paths: HashSet<PathBuf> = HashSet::new();
+    for skill in &all_skills {
+        for path in [&skill.file_path, &skill.base_dir] {
+            if seen_paths.insert(path.clone()) {
+                read_paths.push(path.clone());
+            }
         }
     }
     SkillCatalog {
@@ -564,8 +553,17 @@ mod tests {
             "---\nname: nodesc\n---\nbody\n",
         )
         .unwrap();
+        // A valid skill alongside it: only *its* paths belong in read_paths.
+        fs::create_dir_all(harness.join("ok")).unwrap();
+        let ok_skill = harness.join("ok/SKILL.md");
+        fs::write(
+            &ok_skill,
+            "---\nname: ok\ndescription: A good skill\n---\nbody\n",
+        )
+        .unwrap();
         let catalog = discover(&[(harness.clone(), "pi".into())]);
-        assert!(catalog.skills.is_empty());
+        assert_eq!(catalog.skills.len(), 1);
+        assert_eq!(catalog.skills[0].name, "ok");
         assert!(
             catalog
                 .diagnostics
@@ -573,6 +571,80 @@ mod tests {
                 .any(|d| d.message.contains("description")),
             "expected a description diagnostic"
         );
+        // The dropped skill's paths must not appear in read_paths.
+        assert!(
+            !catalog
+                .read_paths
+                .contains(&harness.join("nodesc/SKILL.md")),
+            "dropped skill file must not be in read_paths"
+        );
+        assert!(
+            !catalog.read_paths.contains(&harness.join("nodesc")),
+            "dropped skill dir must not be in read_paths"
+        );
+        // The kept skill's file + base dir are present exactly once.
+        let file_count = catalog
+            .read_paths
+            .iter()
+            .filter(|p| *p == &ok_skill)
+            .count();
+        let dir_count = catalog
+            .read_paths
+            .iter()
+            .filter(|p| *p == &harness.join("ok"))
+            .count();
+        assert_eq!(file_count, 1, "kept skill file present once");
+        assert_eq!(dir_count, 1, "kept skill dir present once");
+    }
+
+    #[test]
+    fn shadowed_skill_paths_are_absent_from_read_paths() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("proj/.harness/skills");
+        let global = root.path().join("global/.harness/skills");
+        fs::create_dir_all(project.join("dup")).unwrap();
+        fs::create_dir_all(global.join("dup")).unwrap();
+        let project_md = project.join("dup/SKILL.md");
+        let global_md = global.join("dup/SKILL.md");
+        fs::write(
+            &project_md,
+            "---\nname: dup\ndescription: project\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            &global_md,
+            "---\nname: dup\ndescription: global\n---\nbody\n",
+        )
+        .unwrap();
+        let catalog = discover(&[
+            (project.clone(), "pi".into()),
+            (global.clone(), "pi".into()),
+        ]);
+        // Only the winning (project) skill contributes paths.
+        assert!(catalog.read_paths.contains(&project_md));
+        assert!(catalog.read_paths.contains(&project.join("dup")));
+        assert!(!catalog.read_paths.contains(&global_md));
+        assert!(!catalog.read_paths.contains(&global.join("dup")));
+    }
+
+    #[test]
+    fn read_paths_are_deduped_across_roots() {
+        // The same physical skill reachable via two roots must contribute its
+        // paths exactly once (same PathBuf under different roots).
+        let root = tempdir().unwrap();
+        let a = root.path().join("a/.harness/skills");
+        let b = root.path().join("b/.harness/skills");
+        fs::create_dir_all(a.join("same")).unwrap();
+        fs::create_dir_all(b.join("same")).unwrap();
+        let a_md = a.join("same/SKILL.md");
+        let b_md = b.join("same/SKILL.md");
+        fs::write(&a_md, "---\nname: same\ndescription: A\n---\nbody\n").unwrap();
+        fs::write(&b_md, "---\nname: other\ndescription: B\n---\nbody\n").unwrap();
+        let catalog = discover(&[(a.clone(), "pi".into()), (b.clone(), "pi".into())]);
+        for path in catalog.read_paths.iter() {
+            let count = catalog.read_paths.iter().filter(|p| *p == path).count();
+            assert_eq!(count, 1, "path {path:?} must appear exactly once");
+        }
     }
 
     #[test]

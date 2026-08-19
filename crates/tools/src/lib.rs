@@ -231,7 +231,17 @@ pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog 
     if !agents_global.as_os_str().is_empty() {
         roots.push((agents_global, "agents".into()));
     }
-    discover(&roots)
+    let catalog = discover(&roots);
+    // Surface discovery diagnostics (frontmatter typos, dropped skills,
+    // collisions) so silent drops become visible in the log at startup.
+    for diagnostic in &catalog.diagnostics {
+        tracing::warn!(
+            severity = ?diagnostic.severity,
+            path = ?diagnostic.path,
+            "{}", diagnostic.message
+        );
+    }
+    catalog
 }
 
 impl Default for ToolRegistry {
