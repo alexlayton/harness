@@ -407,7 +407,7 @@ impl GithubCopilotProvider {
         let access = credential.access;
         let result = match model.dialect {
             Dialect::AnthropicMessages => {
-                AnthropicMessagesClient::with_bearer_only(base_url, access.clone(), headers)
+                AnthropicMessagesClient::with_bearer_only_headers(base_url, access.clone(), headers)
                     .stream(&request)
                     .await
             }

@@ -1,4 +1,17 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent", "crates/auth", "crates/llm", "crates/session", "crates/tui", "crates/tools"]
+members = ["crates/agent", "crates/auth", "crates/compact", "crates/llm", "crates/session", "crates/tui", "crates/tools"]
 default-members = ["crates/agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+auth = { path = "crates/auth" }
+compact = { path = "crates/compact" }
+llm = { path = "crates/llm" }
+session = { path = "crates/session" }
+tools = { path = "crates/tools" }
+tui = { path = "crates/tui" }

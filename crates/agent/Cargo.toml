@@ -1,21 +1,23 @@
 [package]
 name = "agent"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
 
 [[bin]]
 name = "harness"
 path = "src/main.rs"
 
 [dependencies]
-auth = { path = "../auth" }
-tui = { path = "../tui" }
+auth.workspace = true
+compact.workspace = true
+tui.workspace = true
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
-llm = { path = "../llm" }
-session = { path = "../session" }
-tools = { path = "../tools" }
+llm.workspace = true
+session.workspace = true
+tools.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

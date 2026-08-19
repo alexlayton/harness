@@ -6,10 +6,7 @@ pub enum InputAction {
     Newline,
     Interrupt,
     Quit,
-    ExpandDetails,
-    PageUp,
-    PageDown,
-    Bottom,
+    ToggleAllTools,
     FocusTools,
     Edit,
     Ignore,
@@ -33,7 +30,7 @@ pub fn classify(event: &Event) -> InputAction {
             modifiers,
             ..
         }) if modifiers.contains(KeyModifiers::CONTROL) && value.eq_ignore_ascii_case(&'o') => {
-            InputAction::ExpandDetails
+            InputAction::ToggleAllTools
         }
         Event::Key(KeyEvent {
             code: KeyCode::Tab,
@@ -52,17 +49,13 @@ pub fn classify(event: &Event) -> InputAction {
             code: KeyCode::Enter,
             ..
         }) => InputAction::Submit,
+        // PageUp / PageDown / End used to scroll the alternate-screen
+        // transcript; with native scrollback they are inert. Map them to
+        // `Ignore` so they never insert control characters into the prompt.
         Event::Key(KeyEvent {
-            code: KeyCode::PageUp,
+            code: KeyCode::PageUp | KeyCode::PageDown | KeyCode::End,
             ..
-        }) => InputAction::PageUp,
-        Event::Key(KeyEvent {
-            code: KeyCode::PageDown,
-            ..
-        }) => InputAction::PageDown,
-        Event::Key(KeyEvent {
-            code: KeyCode::End, ..
-        }) => InputAction::Bottom,
+        }) => InputAction::Ignore,
         Event::Key(_) => InputAction::Edit,
         _ => InputAction::Ignore,
     }
@@ -130,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_submit_newline_interrupt_quit_tools_and_scrolling() {
+    fn classifies_submit_newline_interrupt_quit_and_tools() {
         assert_eq!(
             classify(&key(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::Submit
@@ -153,19 +146,27 @@ mod tests {
         );
         assert_eq!(
             classify(&key(KeyCode::Char('o'), KeyModifiers::CONTROL)),
-            InputAction::ExpandDetails
-        );
-        assert_eq!(
-            classify(&key(KeyCode::PageUp, KeyModifiers::NONE)),
-            InputAction::PageUp
-        );
-        assert_eq!(
-            classify(&key(KeyCode::End, KeyModifiers::CONTROL)),
-            InputAction::Bottom
+            InputAction::ToggleAllTools
         );
         assert_eq!(
             classify(&key(KeyCode::Tab, KeyModifiers::NONE)),
             InputAction::FocusTools
+        );
+        assert_eq!(
+            classify(&key(KeyCode::PageUp, KeyModifiers::NONE)),
+            InputAction::Ignore
+        );
+        assert_eq!(
+            classify(&key(KeyCode::PageDown, KeyModifiers::NONE)),
+            InputAction::Ignore
+        );
+        assert_eq!(
+            classify(&key(KeyCode::End, KeyModifiers::NONE)),
+            InputAction::Ignore
+        );
+        assert_eq!(
+            classify(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            InputAction::Edit
         );
     }
 

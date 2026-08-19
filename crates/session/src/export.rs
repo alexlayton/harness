@@ -3,6 +3,7 @@
 use crate::codec::{encode_header, encode_record};
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{Session, SessionEvent, SessionEventRecord, StoredContent, StoredMessage};
+use llm::util::truncate_utf8;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -253,7 +254,7 @@ fn transform_output(value: &str, options: &ExportOptions) -> String {
         "[tool output omitted from export]".into()
     };
     if let Some(max_bytes) = options.max_tool_output_bytes {
-        output = cap_utf8(&output, max_bytes);
+        output = truncate_utf8(&output, max_bytes);
     }
     if options.redact_secrets {
         output = redact_text(&output);
@@ -261,9 +262,20 @@ fn transform_output(value: &str, options: &ExportOptions) -> String {
     output
 }
 
+/// Best-effort, heuristic secret redaction for free-text tool output.
+///
+/// The string scanner masks values following common secret keys
+/// (`token=…`, `"secret": "…"`) while leaving normal tool output intact.  It
+/// is intentionally dependency-free and conservative, but it is *not* a
+/// parser, so treat it as a guardrail rather than a guarantee:
+/// - nested quotes or escaped characters (`"secret": "a\\\"b"`) can defeat it;
+/// - multi-line values are only masked up to the first line break;
+/// - a value containing a comma, brace, bracket, or quote is truncated there.
+///
+/// Use [`redact_json`] for structured JSON/YAML values.  A future version
+/// could replace this with a Tree-sitter or regex-based redactor for
+/// structured output.
 fn redact_text(value: &str) -> String {
-    // This is intentionally conservative and dependency-free.  It masks
-    // values after common secret keys while leaving normal tool output intact.
     let mut result = value.to_owned();
     for key in [
         "api_key",
@@ -357,21 +369,6 @@ fn message_text(message: &StoredMessage) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-fn cap_utf8(value: &str, max_bytes: usize) -> String {
-    if max_bytes == 0 {
-        return String::new();
-    }
-    if value.len() <= max_bytes {
-        return value.to_owned();
-    }
-    let suffix = "…";
-    let mut end = max_bytes.saturating_sub(suffix.len());
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &value[..end])
 }
 
 fn default_export_path(session: &Session) -> PathBuf {

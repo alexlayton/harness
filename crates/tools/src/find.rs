@@ -1,10 +1,12 @@
 use super::{Tool, ToolOutput, ToolPrompt, ToolSpec, resolve_workspace_path};
 use async_trait::async_trait;
 use fff_search::{
-    Constraint, FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, MixedItemRef,
-    MixedSearchConfig, PaginationArgs, QueryParser, SharedFilePicker, SharedFrecency,
+    Constraint, FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, GrepMode,
+    GrepSearchOptions, MixedItemRef, MixedSearchConfig, PaginationArgs, QueryParser,
+    SharedFilePicker, SharedFrecency, parse_grep_query,
 };
 use llm::ToolDefinition;
+use llm::util::truncate_utf8_prefix;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,10 +18,22 @@ use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_FIND_LIMIT: usize = 100;
 pub const MAX_FIND_LIMIT: usize = 500;
+pub const DEFAULT_GREP_LIMIT: usize = 50;
+pub const MAX_GREP_LIMIT: usize = 500;
+/// A pathological regex can spend minutes scanning a large tree; cap each
+/// grep call at a generous budget and return partial results with a notice.
+const GREP_TIME_BUDGET_MS: u64 = 10_000;
 const MAX_SEARCH_CANDIDATES: usize = 20_000;
 const MAX_OUTPUT_LINES: usize = 2_000;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 const MAX_TRUNCATION_NOTICE_BYTES: usize = 512;
+
+/// Cadence of the scan-wait loop in [`search_sync`].  fff's `wait_for_scan`
+/// polls internally every 10 ms, so scan-completion latency is unaffected by
+/// this outer interval; it only governs how often the loop can observe
+/// cancellation and enforce the overall timeout.  A 200 ms cadence keeps a
+/// 10 s cancelled scan to ~50 wake-ups instead of ~200 at 50 ms.
+const SCAN_WAIT_POLL: Duration = Duration::from_millis(200);
 
 /// Runtime knobs for the long-lived FFF index and bounded searches.
 #[derive(Clone, Debug)]
@@ -179,6 +193,78 @@ impl FileSearchIndex {
         }
     }
 
+    /// Search file contents for a pattern across the same watched index used
+    /// by [`Self::search`].  Shares the concurrency semaphore and scope
+    /// validation so grep and find stay bounded and workspace-rooted.
+    pub(crate) async fn grep(
+        &self,
+        pattern: String,
+        scope: Option<String>,
+        limit: usize,
+        context: usize,
+        mode: GrepMode,
+        cancel: CancellationToken,
+    ) -> Result<GrepRawOutput, String> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err("grep index is shut down".into());
+        }
+        if pattern.trim().is_empty() {
+            return Err("pattern must not be empty".into());
+        }
+
+        let scope = match scope {
+            Some(scope) if !scope.trim().is_empty() && scope != "." => {
+                let scope = self.validate_scope(&scope).await?;
+                (!scope.is_empty()).then_some(scope)
+            }
+            _ => None,
+        };
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        let permit = tokio::select! {
+            permit = Arc::clone(&self.search_slots).acquire_owned() => {
+                permit.map_err(|_| "grep index is shut down".to_owned())?
+            }
+            _ = cancel.cancelled() => return Err("cancelled".into()),
+        };
+
+        let picker = self.picker.clone();
+        let scan_timeout = self.config.scan_timeout;
+        let pattern_for_job = pattern.clone();
+        let scope_for_job = scope.clone();
+        let cancel_for_job = cancel.clone();
+        let options = GrepSearchOptions {
+            page_limit: limit.max(1),
+            // page_limit is a soft cap that always finishes the current file,
+            // so cap per-file matches too to keep one hot file from flooding
+            // the output with near-duplicate lines.
+            max_matches_per_file: limit.max(1),
+            mode,
+            before_context: context,
+            after_context: context,
+            trim_whitespace: true,
+            time_budget_ms: GREP_TIME_BUDGET_MS,
+            ..GrepSearchOptions::default()
+        };
+        let join = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            grep_sync(
+                &picker,
+                &pattern_for_job,
+                scope_for_job.as_deref(),
+                &options,
+                scan_timeout,
+                &cancel_for_job,
+            )
+        });
+
+        tokio::select! {
+            result = join => result.map_err(|error| format!("grep search task failed: {error}"))?,
+            _ = cancel.cancelled() => Err("cancelled".into()),
+        }
+    }
+
     async fn validate_scope(&self, scope: &str) -> Result<String, String> {
         let candidate = resolve_workspace_path(scope, Some(&self.root), false).await?;
         let canonical = fs::canonicalize(&candidate)
@@ -240,7 +326,7 @@ fn search_sync(
             ));
         }
         let remaining = scan_timeout.saturating_sub(elapsed);
-        if shared_picker.wait_for_scan(remaining.min(Duration::from_millis(50))) {
+        if shared_picker.wait_for_scan(remaining.min(SCAN_WAIT_POLL)) {
             break;
         }
     }
@@ -331,6 +417,91 @@ fn escape_glob(value: &str) -> String {
         }
     }
     escaped
+}
+
+/// Fully formatted, owned result of a grep search.  Everything the formatter
+/// needs is copied out while the picker read guard is alive.
+pub(crate) struct GrepRawOutput {
+    lines: Vec<String>,
+    match_count: usize,
+    file_count: usize,
+    has_more: bool,
+    regex_fallback_error: Option<String>,
+    literal_fallback: bool,
+}
+
+fn grep_sync(
+    shared_picker: &SharedFilePicker,
+    pattern: &str,
+    scope: Option<&str>,
+    options: &GrepSearchOptions,
+    scan_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<GrepRawOutput, String> {
+    let scan_start = Instant::now();
+    loop {
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        let elapsed = scan_start.elapsed();
+        if elapsed >= scan_timeout {
+            return Err(format!(
+                "initial file scan did not finish within {} seconds",
+                scan_timeout.as_secs()
+            ));
+        }
+        let remaining = scan_timeout.saturating_sub(elapsed);
+        if shared_picker.wait_for_scan(remaining.min(SCAN_WAIT_POLL)) {
+            break;
+        }
+    }
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+
+    let guard = shared_picker
+        .read()
+        .map_err(|error| format!("cannot access find index: {error}"))?;
+    let picker = guard
+        .as_ref()
+        .ok_or_else(|| "find index is unavailable".to_owned())?;
+
+    let mut parsed = parse_grep_query(pattern);
+    let scoped_glob = scope.map(|scope| format!("{}/**", escape_glob(scope)));
+    if let Some(glob) = scoped_glob.as_deref() {
+        parsed.constraints.push(Constraint::Glob(glob));
+    }
+    if cancel.is_cancelled() {
+        return Err("cancelled".into());
+    }
+    let result = picker.grep(&parsed, options);
+
+    let mut lines = Vec::with_capacity(result.matches.len());
+    for m in &result.matches {
+        if cancel.is_cancelled() {
+            return Err("cancelled".into());
+        }
+        let path = result.files[m.file_index].relative_path(picker);
+        let before_count = m.context_before.len();
+        for (index, line) in m.context_before.iter().enumerate() {
+            let line_number = m.line_number.saturating_sub((before_count - index) as u64);
+            lines.push(format!("{path}-{line_number}-{line}"));
+        }
+        lines.push(format!("{path}:{}:{}", m.line_number, m.line_content));
+        for (index, line) in m.context_after.iter().enumerate() {
+            let line_number = m.line_number + index as u64 + 1;
+            lines.push(format!("{path}-{line_number}-{line}"));
+        }
+    }
+
+    Ok(GrepRawOutput {
+        lines,
+        match_count: result.matches.len(),
+        file_count: result.files_with_matches,
+        has_more: result.next_file_offset > 0,
+        regex_fallback_error: result.regex_fallback_error.clone(),
+        literal_fallback: result.literal_fallback,
+    })
 }
 
 pub struct FindTool {
@@ -488,7 +659,7 @@ fn format_results(
         };
         if output.len() + notice.len() >= MAX_OUTPUT_BYTES {
             let max_output = MAX_OUTPUT_BYTES.saturating_sub(notice.len() + 1);
-            output = truncate_utf8_owned(&output, max_output);
+            output = truncate_utf8_prefix(&output, max_output).to_owned();
             output.push('\n');
         }
         output.push_str(&notice);
@@ -496,15 +667,79 @@ fn format_results(
     output.trim_end_matches('\n').to_owned()
 }
 
-fn truncate_utf8_owned(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_owned();
+/// Render grep matches ripgrep-style: `path:line:content` for matches and
+/// `path-line-content` for context lines, with a trailing notice when results
+/// were truncated or the query silently degraded.
+pub(crate) fn format_grep_output(
+    raw: GrepRawOutput,
+    pattern: &str,
+    requested_limit: usize,
+    max_limit: usize,
+) -> String {
+    if raw.lines.is_empty() {
+        let fallback = if raw.literal_fallback {
+            " (query constraints were ignored; searched the full pattern as literal text)"
+        } else {
+            ""
+        };
+        return format!("No matches for pattern `{pattern}`{fallback}.");
     }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
+
+    let mut output = String::new();
+    let mut byte_truncated = false;
+    let output_budget = MAX_OUTPUT_BYTES.saturating_sub(MAX_TRUNCATION_NOTICE_BYTES);
+    for line in &raw.lines {
+        if output.len() + line.len() + 1 > output_budget {
+            byte_truncated = true;
+            break;
+        }
+        output.push_str(line);
+        output.push('\n');
     }
-    value[..end].to_owned()
+
+    let mut notices: Vec<String> = Vec::new();
+    if let Some(error) = &raw.regex_fallback_error {
+        notices.push(format!(
+            "pattern was not valid regex ({error}); matched as literal text"
+        ));
+    }
+    if raw.literal_fallback {
+        notices.push(
+            "query constraints did not match any files; searched the full pattern as literal text"
+                .to_owned(),
+        );
+    }
+    if raw.has_more {
+        let shown = output.lines().count();
+        notices.push(format!(
+            "showing {shown} match lines from {} file(s) so far; increase limit (maximum {max_limit}) or narrow the pattern",
+            raw.file_count,
+        ));
+    } else if byte_truncated {
+        notices.push(
+            "output size limit reached; narrow the pattern to see fewer results".to_owned(),
+        );
+    }
+    if requested_limit > 1 && raw.match_count > output.lines().count() && !raw.has_more {
+        notices.push(format!(
+            "{} matches in {} file(s)",
+            raw.match_count, raw.file_count
+        ));
+    }
+
+    if !notices.is_empty() {
+        let joined = notices.join("; ");
+        let notice_overhead = joined.len() + 3; // \n [ ]
+        if output.len() + notice_overhead > MAX_OUTPUT_BYTES {
+            let max_output = MAX_OUTPUT_BYTES.saturating_sub(notice_overhead);
+            output = truncate_utf8_prefix(&output, max_output).to_owned();
+        }
+        output.push('\n');
+        output.push('[');
+        output.push_str(&joined);
+        output.push(']');
+    }
+    output.trim_end_matches('\n').to_owned()
 }
 
 fn error(summary: &str, content: &str) -> ToolOutput {
@@ -619,5 +854,51 @@ mod tests {
         assert!(output.contains("truncated"));
         assert!(output.contains("increase limit"));
         assert!(output.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn grep_output_is_bounded_and_actionable() {
+        let raw = GrepRawOutput {
+            lines: (0..600).map(|i| format!("file-{i}.rs:{i}:line {i}")).collect(),
+            match_count: 600,
+            file_count: 600,
+            has_more: true,
+            regex_fallback_error: None,
+            literal_fallback: false,
+        };
+        let output = format_grep_output(raw, "line", 100, 500);
+        assert!(output.contains("increase limit"));
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+
+        let no_matches = format_grep_output(
+            GrepRawOutput {
+                lines: Vec::new(),
+                match_count: 0,
+                file_count: 0,
+                has_more: false,
+                regex_fallback_error: None,
+                literal_fallback: false,
+            },
+            "zzz",
+            50,
+            500,
+        );
+        assert!(no_matches.contains("No matches"));
+
+        let fallback = format_grep_output(
+            GrepRawOutput {
+                lines: vec!["a.rs:1:x".into()],
+                match_count: 1,
+                file_count: 1,
+                has_more: false,
+                regex_fallback_error: Some("bad regex".into()),
+                literal_fallback: false,
+            },
+            "(unclosed",
+            50,
+            500,
+        );
+        assert!(fallback.starts_with("a.rs:1:x"));
+        assert!(fallback.contains("not valid regex"));
     }
 }

@@ -1,3 +1,4 @@
+use crate::as_u64;
 use crate::error::truncate_body;
 use crate::sse::{SseEvent, stream_response};
 use crate::{
@@ -16,7 +17,10 @@ pub struct AnthropicMessagesClient {
     pub base_url: String,
     pub api_key: String,
     extra_headers: HeaderMap,
-    send_api_key_header: bool,
+    /// Copilot's backend expects only `Authorization: Bearer`; when set, the
+    /// `x-api-key` header is omitted.  Defaults to the dual-header behaviour
+    /// used by the Anthropic API and zen-compatible proxies.
+    bearer_only: bool,
 }
 
 impl AnthropicMessagesClient {
@@ -29,28 +33,32 @@ impl AnthropicMessagesClient {
         api_key: impl Into<String>,
         extra_headers: HeaderMap,
     ) -> Self {
+        Self::internal(base_url, api_key, extra_headers, false)
+    }
+
+    /// Construct a client that sends only `Authorization: Bearer <key>` and
+    /// omits `x-api-key`.  Required for the GitHub Copilot backend, which
+    /// rejects requests carrying both headers.
+    pub fn with_bearer_only_headers(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        extra_headers: HeaderMap,
+    ) -> Self {
+        Self::internal(base_url, api_key, extra_headers, true)
+    }
+
+    fn internal(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        extra_headers: HeaderMap,
+        bearer_only: bool,
+    ) -> Self {
         Self {
-            http: Client::new(),
+            http: crate::http::streaming_client(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key: api_key.into(),
             extra_headers,
-            send_api_key_header: true,
-        }
-    }
-
-    /// Construct an Anthropic Messages client for Copilot.  Copilot accepts
-    /// the bearer token but rejects the normal Anthropic `x-api-key` header.
-    pub fn with_bearer_only(
-        base_url: impl Into<String>,
-        bearer_token: impl Into<String>,
-        extra_headers: HeaderMap,
-    ) -> Self {
-        Self {
-            http: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key: bearer_token.into(),
-            extra_headers,
-            send_api_key_header: false,
+            bearer_only,
         }
     }
 
@@ -87,7 +95,7 @@ impl AnthropicMessagesClient {
         if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.api_key)) {
             headers.insert(AUTHORIZATION, value);
         }
-        if self.send_api_key_header
+        if !self.bearer_only
             && let Ok(value) = HeaderValue::from_str(&self.api_key)
         {
             headers.insert(HeaderName::from_static("x-api-key"), value);
@@ -427,6 +435,34 @@ impl AnthropicParser {
     pub fn is_done(&self) -> bool {
         self.done
     }
+
+    /// Emit a fallback `Done` when the SSE stream ended without a
+    /// `message_stop` (e.g. a proxy dropped the connection after the last text
+    /// delta). Mirrors `ChatStreamParser::finish` / `ResponsesParser::finish` so
+    /// the agent loop always receives a terminal `Done` and the turn's usage is
+    /// accounted for rather than dropped.
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        let mut output = Vec::new();
+        let indices: Vec<u64> = self.tools.keys().copied().collect();
+        for index in indices {
+            output.extend(self.finish_tool(index)?);
+        }
+        self.done = true;
+        output.push(StreamEvent::Done {
+            stop_reason: self.stop_reason.clone(),
+            usage: Some(Usage {
+                input_tokens: self.input_tokens.unwrap_or(0),
+                output_tokens: self.output_tokens.unwrap_or(0),
+                cached_tokens: None,
+                reasoning_tokens: None,
+                cost: None,
+            }),
+        });
+        Ok(output)
+    }
 }
 
 fn error_message(value: &Value, fallback: &str) -> String {
@@ -444,19 +480,17 @@ fn value_message(value: &Value) -> Option<&str> {
         .or_else(|| value.get("message").and_then(Value::as_str))
 }
 
-fn as_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
-        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-}
-
 fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
     let stream = async_stream::try_stream! {
         let mut parser = AnthropicParser::new();
         while let Some(event) = sse.next().await {
             let event = event?;
             for item in parser.parse_event(&event)? {
+                yield item;
+            }
+        }
+        if !parser.is_done() {
+            for item in parser.finish()? {
                 yield item;
             }
         }
@@ -469,14 +503,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bearer_only_auth_does_not_send_x_api_key() {
-        let client = AnthropicMessagesClient::with_bearer_only(
-            "https://example.test",
-            "copilot-token",
+    fn bearer_only_omits_x_api_key() {
+        let default = AnthropicMessagesClient::new("https://api.anthropic.com", "secret");
+        let headers = default.headers();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
+        assert_eq!(headers.get("x-api-key").unwrap(), "secret");
+
+        let bearer_only = AnthropicMessagesClient::with_bearer_only_headers(
+            "https://api.githubcopilot.com",
+            "secret",
             HeaderMap::new(),
         );
-        let headers = client.headers();
-        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer copilot-token");
+        let headers = bearer_only.headers();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer secret");
         assert!(headers.get("x-api-key").is_none());
     }
 
@@ -537,5 +576,43 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn finish_emits_done_with_usage_when_stream_ends_without_message_stop() {
+        let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#)
+            .unwrap();
+        parser
+            .parse_payload(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            )
+            .unwrap();
+        parser
+            .parse_payload(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+            )
+            .unwrap();
+        parser
+            .parse_payload(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap();
+
+        assert!(!parser.is_done());
+        let done = parser.finish().unwrap();
+        assert_eq!(done.len(), 1);
+        assert!(matches!(
+            &done[0],
+            StreamEvent::Done {
+                usage: Some(Usage {
+                    input_tokens: 5,
+                    output_tokens: 0,
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(parser.is_done());
+        assert!(parser.finish().unwrap().is_empty());
     }
 }

@@ -1,29 +1,23 @@
-use crate::error::truncate_body;
+use crate::as_u64;
+use crate::http::HttpClient;
 use crate::sse::{SseEvent, stream_response};
 use crate::{
     CompletionRequest, Content, EventStream, LlmError, Message, Role, StreamEvent, ToolCall,
     ToolDefinition, Usage,
 };
 use futures_util::StreamExt;
-use reqwest::Client;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::HeaderMap;
 use serde_json::{Map, Value, json};
 
 #[derive(Clone)]
 pub struct OpenAiResponsesClient {
-    http: Client,
-    pub base_url: String,
-    pub api_key: String,
-    extra_headers: HeaderMap,
+    http: HttpClient,
 }
 
 impl OpenAiResponsesClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
-            http: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key: api_key.into(),
-            extra_headers: HeaderMap::new(),
+            http: HttpClient::new(base_url, api_key),
         }
     }
 
@@ -33,10 +27,7 @@ impl OpenAiResponsesClient {
         extra_headers: HeaderMap,
     ) -> Self {
         Self {
-            http: Client::new(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key: api_key.into(),
-            extra_headers,
+            http: HttpClient::with_headers(base_url, api_key, extra_headers),
         }
     }
 
@@ -45,58 +36,28 @@ impl OpenAiResponsesClient {
     }
 
     pub async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
+        tracing::debug!(provider = "openai-responses", model = %req.model, "starting stream request");
         // Some zen-compatible proxies reject the Responses reasoning field even
         // for models that otherwise speak Responses.  This narrow fallback is
         // intentionally separate from transient retry handling.
-        let response = match self.send(req, req.reasoning).await {
+        let response = match self
+            .http
+            .post_json("/responses", &build_request_body(req, req.reasoning))
+            .await
+        {
             Ok(response) => response,
             Err(error)
                 if req.reasoning
                     && matches!(&error, LlmError::Http { status: 400, body } if body.to_ascii_lowercase().contains("reasoning")) =>
             {
                 tracing::debug!("Responses endpoint rejected reasoning; retrying without it");
-                self.send(req, false).await?
+                self.http
+                    .post_json("/responses", &build_request_body(req, false))
+                    .await?
             }
             Err(error) => return Err(error),
         };
         Ok(event_stream(stream_response(response)))
-    }
-
-    async fn send(
-        &self,
-        req: &CompletionRequest,
-        include_reasoning: bool,
-    ) -> Result<reqwest::Response, LlmError> {
-        tracing::debug!(provider = "openai-responses", model = %req.model, include_reasoning, "starting stream request");
-        let response = self
-            .http
-            .post(format!("{}/responses", self.base_url))
-            .headers(self.headers())
-            .json(&build_request_body(req, include_reasoning))
-            .send()
-            .await
-            .map_err(LlmError::Network)?;
-        if response.status().is_success() {
-            return Ok(response);
-        }
-        let status = response.status().as_u16();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<unable to read response body>".into());
-        Err(LlmError::Http {
-            status,
-            body: truncate_body(&body, 2048),
-        })
-    }
-
-    fn headers(&self) -> HeaderMap {
-        let mut headers = self.extra_headers.clone();
-        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.api_key)) {
-            headers.insert(AUTHORIZATION, value);
-        }
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers
     }
 }
 
@@ -310,6 +271,21 @@ impl ResponsesParser {
     pub fn is_done(&self) -> bool {
         self.done
     }
+
+    /// Emit a fallback `Done` event when the SSE stream ended without a
+    /// `response.completed` (e.g. a proxy dropped the connection after the last
+    /// text delta).  Mirrors `ChatStreamParser::finish` so the agent loop always
+    /// receives `TurnFinished` rather than staying busy forever.
+    pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        self.done = true;
+        Ok(vec![StreamEvent::Done {
+            stop_reason: None,
+            usage: None,
+        }])
+    }
 }
 
 fn error_message(value: &Value, fallback: &str) -> String {
@@ -349,19 +325,17 @@ fn parse_usage(value: &Value) -> Result<Usage, LlmError> {
     })
 }
 
-fn as_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
-        .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
-}
-
 fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
     let stream = async_stream::try_stream! {
         let mut parser = ResponsesParser::new();
         while let Some(event) = sse.next().await {
             let event = event?;
             for item in parser.parse_event(&event)? {
+                yield item;
+            }
+        }
+        if !parser.is_done() {
+            for item in parser.finish()? {
                 yield item;
             }
         }
@@ -394,6 +368,32 @@ mod tests {
         assert_eq!(input[3]["type"], "function_call_output");
     }
 
+    #[test]
+    fn finish_emits_fallback_done_only_once() {
+        let mut parser = ResponsesParser::new();
+        assert!(!parser.is_done());
+        let events = parser.finish().unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StreamEvent::Done {
+                stop_reason: None,
+                usage: None
+            }]
+        ));
+        // A second finish (or a later completed event) is a no-op.
+        assert!(parser.finish().unwrap().is_empty());
+        assert!(parser.is_done());
+    }
+
+    #[test]
+    fn finish_is_noop_after_completed() {
+        let mut parser = ResponsesParser::new();
+        parser
+            .parse_payload(r#"{"type":"response.completed","response":{"status":"completed"}}"#)
+            .unwrap();
+        assert!(parser.is_done());
+        assert!(parser.finish().unwrap().is_empty());
+    }
     #[test]
     fn parses_response_events() {
         let mut parser = ResponsesParser::new();

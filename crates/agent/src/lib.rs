@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod config;
+pub mod headless;
 pub mod prompt;
 pub use tools;
 
@@ -138,9 +139,13 @@ impl tui::TuiEvent for AgentEvent {
             AgentEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
+                auto,
+                reason,
             } => tui::UiEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
+                auto,
+                reason: reason.to_string(),
             },
         }
     }

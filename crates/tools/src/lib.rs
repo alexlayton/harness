@@ -2,6 +2,7 @@ mod bash;
 mod edit;
 pub mod file_mutation;
 mod find;
+mod grep;
 mod read;
 mod registry;
 mod write;
@@ -9,6 +10,7 @@ mod write;
 pub use bash::{BashTool, truncate_command_output};
 pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
+pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use registry::{ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError};
 pub use write::WriteTool;
@@ -169,7 +171,8 @@ pub fn default_registry(config: impl Into<ToolConfig>) -> Result<ToolRegistry, T
                 config.rtk,
                 &workspace_root,
             )),
-            Box::new(FindTool::new(index)),
+            Box::new(FindTool::new(index.clone())),
+            Box::new(GrepTool::new(index.clone())),
         ],
         workspace_root,
     )
@@ -219,6 +222,13 @@ pub(crate) async fn resolve_workspace_path(
     };
 
     let root = lexical_normalize(root);
+    // Canonicalize the workspace root once up front so every containment
+    // check below compares like-for-like.  Production callers pass an already
+    // canonicalized root; doing it here also keeps a symlinked root safe for
+    // embedded and test callers.
+    let canonical_root = fs::canonicalize(&root)
+        .await
+        .map_err(|error| format!("cannot resolve workspace root {}: {error}", root.display()))?;
     let candidate_path = if path.is_absolute() {
         path
     } else {
@@ -229,19 +239,55 @@ pub(crate) async fn resolve_workspace_path(
         return Err(format!("path is outside workspace root {}", root.display()));
     }
 
-    // Lexical containment handles `..`; canonicalizing the nearest existing
-    // ancestor also prevents a symlink inside the workspace from escaping it.
-    let mut existing = candidate.clone();
-    loop {
-        match fs::canonicalize(&existing).await {
-            Ok(canonical) => {
-                if !canonical.starts_with(&root) {
+    // Lexical containment handles `..`; canonicalizing also prevents a
+    // symlink inside the workspace from escaping it.  The fast path covers
+    // the common case where the path already exists: one canonicalize, one
+    // containment check.
+    match fs::canonicalize(&candidate).await {
+        Ok(canonical) => {
+            if !canonical.starts_with(&canonical_root) {
+                return Err(format!(
+                    "path resolves outside workspace root {}",
+                    root.display()
+                ));
+            }
+            return Ok(candidate);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot resolve path {value}: {error}")),
+    }
+
+    // The candidate does not exist yet (a new file).  Its parent directory
+    // almost always exists (writing a new file into an existing tree), so try
+    // canonicalizing just the parent: one canonicalize, no per-level probing.
+    if let Some(parent) = candidate.parent() {
+        match fs::canonicalize(parent).await {
+            Ok(canonical_parent) => {
+                if !canonical_parent.starts_with(&canonical_root) {
                     return Err(format!(
                         "path resolves outside workspace root {}",
                         root.display()
                     ));
                 }
-                break;
+                return Ok(candidate);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("cannot resolve path {value}: {error}")),
+        }
+    }
+
+    // Neither the candidate nor its parent exists (e.g. `write` creating a
+    // deeply nested directory tree).  Locate the deepest existing ancestor
+    // with cheap metadata probes — one stat per level, no symlink resolution
+    // — then canonicalize only that single ancestor for the containment
+    // check.  This path is rare; the cases above are O(1).
+    let mut existing = candidate.clone();
+    let canonical = loop {
+        match fs::metadata(&existing).await {
+            Ok(_) => {
+                break fs::canonicalize(&existing)
+                    .await
+                    .map_err(|error| format!("cannot resolve path {value}: {error}"))?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !existing.pop() {
@@ -250,8 +296,13 @@ pub(crate) async fn resolve_workspace_path(
             }
             Err(error) => return Err(format!("cannot resolve path {value}: {error}")),
         }
+    };
+    if !canonical.starts_with(&canonical_root) {
+        return Err(format!(
+            "path resolves outside workspace root {}",
+            root.display()
+        ));
     }
-
     Ok(candidate)
 }
 
@@ -304,12 +355,84 @@ pub fn call_summary(name: &str, args: &Value) -> String {
                 _ => "find".into(),
             }
         }
+        "grep" => {
+            let pattern = args.get("pattern").and_then(Value::as_str);
+            let path = args.get("path").and_then(Value::as_str);
+            match (pattern, path) {
+                (Some(pattern), Some(path)) => format!("grep {pattern} in {path}"),
+                (Some(pattern), None) => format!("grep {pattern}"),
+                _ => "grep".into(),
+            }
+        }
         _ => name.to_owned(),
     }
 }
 
 fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value)
+}
+
+/// Expanded per-tool recap shown in the transcript. Unlike [`call_summary`]
+/// this includes the secondary arguments a user may want to see (line ranges,
+/// limits, timeouts) while still staying readable and free of raw JSON. Falls
+/// back to [`call_summary`] when there are no interesting extras.
+pub fn call_recap(name: &str, args: &Value) -> String {
+    let base = call_summary(name, args);
+    let extras = match name {
+        "read" => {
+            let offset = args.get("offset").and_then(Value::as_u64);
+            let limit = args.get("limit").and_then(Value::as_u64);
+            match (offset, limit) {
+                (Some(offset), Some(limit)) if offset != 1 => {
+                    // offset is 1-indexed and limit counts lines, so the last
+                    // line covered is `offset + limit - 1`.
+                    Some(format!("lines {offset}–{}", offset + limit - 1))
+                }
+                (Some(_), Some(limit)) => Some(format!("lines 1–{}", limit)),
+                _ => None,
+            }
+        }
+        "bash" => {
+            let dir = args.get("dir").and_then(Value::as_str);
+            let timeout = args.get("timeout").and_then(Value::as_u64);
+            match (dir, timeout) {
+                (Some(dir), Some(timeout)) => Some(format!("in {dir} · timeout {timeout}s")),
+                (Some(dir), None) => Some(format!("in {dir}")),
+                (None, Some(timeout)) => Some(format!("timeout {timeout}s")),
+                (None, None) => None,
+            }
+        }
+        "find" => args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|limit| format!("limit {limit}")),
+        "grep" => {
+            let limit = args.get("limit").and_then(Value::as_u64);
+            let context = args.get("context").and_then(Value::as_u64);
+            match (limit, context) {
+                (Some(limit), Some(context)) if context > 0 => {
+                    Some(format!("limit {limit} · context {context}"))
+                }
+                (Some(limit), _) => Some(format!("limit {limit}")),
+                (None, Some(context)) if context > 0 => Some(format!("context {context}")),
+                _ => None,
+            }
+        }
+        "write" | "edit" => {
+            // The path in the summary already carries the interesting content.
+            None
+        }
+        _ => {
+            // Custom tools have no curated recap; keep their arguments visible
+            // instead of hiding them behind the bare tool name.
+            let compact = serde_json::to_string(args).unwrap_or_default();
+            (compact != "null" && compact != "{}").then(|| format!("args {compact}"))
+        }
+    };
+    match extras {
+        Some(extras) => format!("{base} ({extras})"),
+        None => base,
+    }
 }
 
 #[cfg(test)]
@@ -342,22 +465,160 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_has_five_active_tools_and_prompt_metadata() {
+    fn recap_includes_secondary_arguments_human_readably() {
+        assert_eq!(
+            call_recap("read", &serde_json::json!({"path": "a.rs"})),
+            "read a.rs"
+        );
+        assert_eq!(
+            call_recap(
+                "read",
+                &serde_json::json!({"path": "a.rs", "offset": 2, "limit": 30})
+            ),
+            "read a.rs (lines 2–31)"
+        );
+        assert_eq!(
+            call_recap(
+                "bash",
+                &serde_json::json!({"command": "cargo test", "dir": "crates/tui", "timeout": 30})
+            ),
+            "bash: cargo test (in crates/tui · timeout 30s)"
+        );
+        assert_eq!(
+            call_recap("find", &serde_json::json!({"query": "foo", "limit": 25})),
+            "find foo (limit 25)"
+        );
+        assert_eq!(
+            call_recap(
+                "grep",
+                &serde_json::json!({"pattern": "TODO", "context": 2})
+            ),
+            "grep TODO (context 2)"
+        );
+        // Unknown tools have no curated recap; the raw args stay visible.
+        assert_eq!(
+            call_recap("custom", &serde_json::json!({"a": 1})),
+            "custom (args {\"a\":1})"
+        );
+        // edit/write already carry their path in the summary; nothing to add.
+        assert_eq!(
+            call_recap("edit", &serde_json::json!({"path": "a.rs"})),
+            "edit a.rs"
+        );
+        // Empty or absent args add no noise.
+        assert_eq!(call_recap("custom", &serde_json::json!({})), "custom");
+    }
+
+    #[test]
+    fn default_registry_has_six_active_tools_and_prompt_metadata() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("main.rs"), "fn main() {}\n").unwrap();
         let registry = default_registry(ToolConfig::new(directory.path(), false)).unwrap();
         assert_eq!(
             registry.active_names(),
-            vec!["read", "edit", "write", "bash", "find"]
+            vec!["read", "edit", "write", "bash", "find", "grep"]
         );
         assert_eq!(registry.all_names(), registry.active_names());
         let context = registry.prompt_context();
         assert!(context.snippets.iter().any(|tool| tool.name == "find"));
+        assert!(context.snippets.iter().any(|tool| tool.name == "grep"));
         assert!(
             context
                 .guidelines
                 .iter()
                 .any(|guideline| guideline.contains("Use find"))
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_path_finds_deepest_existing_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        // Production passes a canonicalized root; mirror that so the
+        // containment check is not confused by platform symlinks (e.g.
+        // /var -> /private/var on macOS).
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+
+        // Only `a/` exists; the deep tail resolves lexically after a single
+        // canonicalize of the existing ancestor.
+        let resolved = resolve_workspace_path("a/b/c/d.txt", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("a/b/c/d.txt"));
+
+        // An existing file resolves through the fast path.
+        std::fs::write(root.join("keep.txt"), "x").unwrap();
+        let resolved = resolve_workspace_path("keep.txt", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("keep.txt"));
+
+        // A path that lexically escapes the root is rejected up front.
+        let error = resolve_workspace_path("../outside/file.txt", Some(&root), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_workspace_path_rejects_symlink_escape_in_deep_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+
+        // The symlink is the deepest existing ancestor; canonicalizing it
+        // once must surface the escape even though the tail does not exist.
+        let error = resolve_workspace_path("link/sub/file.txt", Some(&root), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn resolve_workspace_path_new_file_in_existing_dir_uses_parent_fast_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        // Only `src/` exists; the file does not.  The parent fast path
+        // resolves it with a single canonicalize of `src/`.
+        let resolved = resolve_workspace_path("src/main.rs", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("src/main.rs"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_workspace_path_parent_symlink_inside_workspace_resolves() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        // The parent is a symlink inside the workspace; the parent fast path
+        // canonicalizes it and must accept the candidate.
+        let resolved = resolve_workspace_path("link/new.txt", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("link/new.txt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_workspace_path_parent_symlink_escape_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("escape")).unwrap();
+
+        // The parent fast path canonicalizes the symlink and must surface
+        // the escape before the tail is considered.
+        let error = resolve_workspace_path("escape/new.txt", Some(&root), false)
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside"), "{error}");
     }
 }

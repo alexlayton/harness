@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use auth::CopilotAuth;
 use clap::{Parser, ValueEnum};
+use compact::policy::CompactionPolicy;
 use llm::Provider;
 use llm::providers::{GithubCopilotProvider, OpenCodeGoProvider, OpenRouterProvider};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -73,6 +75,39 @@ impl fmt::Display for ProviderArg {
     }
 }
 
+/// Per-key compaction settings parsed from `[compaction]` in `config.toml`.
+/// Every field is optional so a partial table overrides only what it sets;
+/// the rest fall back to [`CompactionPolicy::default`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct CompactConfig {
+    pub auto: Option<bool>,
+    pub threshold: Option<f64>,
+    pub reserve_tokens: Option<u64>,
+    pub keep_recent_turns: Option<usize>,
+    pub keep_recent_tokens: Option<u64>,
+    pub max_summary_input_bytes: Option<usize>,
+    pub max_summary_bytes: Option<usize>,
+    pub context_window: Option<u64>,
+}
+
+impl From<&CompactConfig> for CompactionPolicy {
+    fn from(config: &CompactConfig) -> Self {
+        let defaults = CompactionPolicy::default();
+        Self {
+            auto: config.auto.unwrap_or(defaults.auto),
+            threshold: config.threshold.unwrap_or(defaults.threshold),
+            reserve_tokens: config.reserve_tokens.unwrap_or(defaults.reserve_tokens),
+            keep_recent_turns: config.keep_recent_turns.unwrap_or(defaults.keep_recent_turns),
+            keep_recent_tokens: config.keep_recent_tokens.unwrap_or(defaults.keep_recent_tokens),
+            max_summary_input_bytes: config
+                .max_summary_input_bytes
+                .unwrap_or(defaults.max_summary_input_bytes),
+            max_summary_bytes: config.max_summary_bytes.unwrap_or(defaults.max_summary_bytes),
+            context_window: config.context_window.unwrap_or(defaults.context_window),
+        }
+    }
+}
+
 /// Settings persisted by harness.  API keys deliberately do not belong here;
 /// they remain environment-only secrets.
 ///
@@ -87,6 +122,11 @@ pub struct FileConfig {
     /// user explicitly sets `rtk = true`.
     #[serde(default)]
     pub rtk: bool,
+    /// Compact settings. Anything the compiler cannot answer comes from
+    /// [`CompactionPolicy::default`]. Absent from disk when unset, so older
+    /// harness versions treat the config as unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -99,6 +139,7 @@ impl PartialEq for FileConfig {
         self.provider == other.provider
             && self.model == other.model
             && self.rtk == other.rtk
+            && self.compaction == other.compaction
             && self.extra == other.extra
     }
 }
@@ -182,6 +223,12 @@ pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// One-time per-process entropy used to make temp-file names unique across
+/// processes.  PIDs recycle quickly on some systems, so a recycled PID alone
+/// could collide with a stale temp file left by an earlier process; the
+/// random component eliminates that risk.
+static TEMP_ENTROPY: OnceLock<u64> = OnceLock::new();
+
 fn temporary_path(path: &Path) -> PathBuf {
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let file_name = path
@@ -189,9 +236,34 @@ fn temporary_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("config.toml");
     path.with_file_name(format!(
-        ".{file_name}.tmp-{}-{sequence}",
-        std::process::id()
+        ".{file_name}.tmp-{}-{sequence}-{:08x}",
+        std::process::id(),
+        temp_random(sequence)
     ))
+}
+
+/// 32 bits of process-lifetime randomness derived from a one-time seed
+/// mixed with the per-call sequence.  Cheap, deterministic, and sufficient
+/// for file-name entropy; not used for security.
+fn temp_random(sequence: u64) -> u32 {
+    let entropy = *TEMP_ENTROPY.get_or_init(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        // ASLR provides cheap per-process address-space entropy.
+        let address = &now as *const u64 as u64;
+        now ^ (std::process::id() as u64).rotate_left(32) ^ address
+    });
+    splitmix64(entropy.wrapping_add(sequence)) as u32
+}
+
+/// A tiny splitmix64 finalizer.
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 /// Update the two currently persisted settings while retaining any unknown
@@ -209,13 +281,35 @@ pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> 
     save_file_config(path, &config)
 }
 
-#[derive(Clone, Debug, Parser)]
+#[derive(Clone, Debug, Default, Parser)]
 #[command(name = "harness", about = "A minimal coding-agent harness")]
 pub struct Cli {
     #[arg(long, value_enum)]
     pub provider: Option<ProviderArg>,
+
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Non-interactive mode: run one prompt to completion and print the answer.
+    #[arg(short = 'p', long = "print", default_value_t = false)]
+    pub print: bool,
+
+    /// Verbose: stream reasoning + tool activity + full (bounded) tool output
+    /// to stderr. Default stderr is silent except for hard errors.
+    #[arg(short = 'v', long = "verbose", default_value_t = false)]
+    pub verbose: bool,
+
+    /// Resume an existing session instead of creating a fresh one.
+    /// Accepts a session id, unique prefix, `latest`, or a file path.
+    #[arg(long, value_name = "ID|latest|PATH")]
+    pub resume: Option<String>,
+
+    /// Prompt for non-interactive mode. Joined with spaces. When `--print` is
+    /// set and no positional is given, the prompt is read from stdin.
+    /// Only meaningful with `--print`; passing it without `--print` is an
+    /// error.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +319,7 @@ pub struct Config {
     pub api_key: String,
     pub config_path: PathBuf,
     pub rtk: bool,
+    pub compaction: CompactionPolicy,
 }
 
 impl Config {
@@ -314,6 +409,11 @@ impl Config {
             api_key,
             config_path: path,
             rtk: file.rtk,
+            compaction: file
+                .compaction
+                .as_ref()
+                .map(CompactionPolicy::from)
+                .unwrap_or_default(),
         })
     }
 }
@@ -387,10 +487,7 @@ mod tests {
     fn resolves_defaults_and_overrides() {
         // Resolve against an explicit file config so the developer's real
         // ~/.config/harness/config.toml cannot leak into the assertions.
-        let cli = Cli {
-            provider: None,
-            model: None,
-        };
+        let cli = Cli::default();
         let config = Config::resolve_from_file(
             &cli,
             &FileConfig::default(),
@@ -407,6 +504,7 @@ mod tests {
         let cli = Cli {
             provider: Some(ProviderArg::Openrouter),
             model: Some("anthropic/demo".into()),
+            ..Cli::default()
         };
         let config = Config::resolve_from_file(
             &cli,
@@ -424,6 +522,7 @@ mod tests {
         let cli = Cli {
             provider: Some(ProviderArg::GithubCopilot),
             model: None,
+            ..Cli::default()
         };
         let config = Config::resolve_from_file(
             &cli,
@@ -444,10 +543,7 @@ mod tests {
             model: Some("file-model".into()),
             ..FileConfig::default()
         };
-        let cli = Cli {
-            provider: None,
-            model: None,
-        };
+        let cli = Cli::default();
         let config = Config::resolve_from_file(
             &cli,
             &file,
@@ -464,6 +560,7 @@ mod tests {
         let cli = Cli {
             provider: Some(ProviderArg::OpencodeGo),
             model: Some("cli-model".into()),
+            ..Cli::default()
         };
         let config = Config::resolve_from_file(
             &cli,
@@ -479,12 +576,7 @@ mod tests {
             provider: Some("typo".into()),
             ..FileConfig::default()
         };
-        let error = Config::resolve_from_file(
-            &Cli {
-                provider: None,
-                model: None,
-            },
-            &invalid,
+        let error = Config::resolve_from_file(&Cli::default(), &invalid,
             PathBuf::from("/tmp/bad-config.toml"),
             |_| Some("secret".into()),
         )
@@ -496,7 +588,7 @@ mod tests {
     fn supports_legacy_opencode_key_name() {
         let cli = Cli {
             provider: Some(ProviderArg::OpencodeGo),
-            model: None,
+            ..Cli::default()
         };
         let config =
             Config::resolve_with_key_values(&cli, None, Some("legacy-secret"), None).unwrap();
@@ -507,14 +599,14 @@ mod tests {
     fn missing_key_names_environment_variables() {
         let cli = Cli {
             provider: Some(ProviderArg::Openrouter),
-            model: None,
+            ..Cli::default()
         };
         let error = Config::resolve_with_keys(&cli, None, None).err().unwrap();
         assert!(error.to_string().contains("OPENROUTER_API_KEY"));
 
         let cli = Cli {
             provider: Some(ProviderArg::OpencodeGo),
-            model: None,
+            ..Cli::default()
         };
         let error = Config::resolve_with_key_values(&cli, None, None, None)
             .err()
@@ -531,6 +623,10 @@ mod tests {
             provider: Some("opencode-go".into()),
             model: Some("demo".into()),
             rtk: true,
+            compaction: Some(CompactConfig {
+                keep_recent_turns: Some(5),
+                ..CompactConfig::default()
+            }),
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),
@@ -561,10 +657,7 @@ mod tests {
 
     #[test]
     fn rtk_flag_flows_from_file_into_resolved_config() {
-        let cli = Cli {
-            provider: None,
-            model: None,
-        };
+        let cli = Cli::default();
         let file = FileConfig {
             rtk: true,
             ..FileConfig::default()
@@ -589,6 +682,36 @@ mod tests {
     }
 
     #[test]
+    fn compaction_config_round_trips_and_overrides_defaults() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = FileConfig {
+            compaction: Some(CompactConfig {
+                auto: Some(false),
+                threshold: Some(0.9),
+                reserve_tokens: Some(8_000),
+                context_window: Some(12_000),
+                ..CompactConfig::default()
+            }),
+            ..FileConfig::default()
+        };
+        save_file_config(&path, &original).unwrap();
+        assert_eq!(load_file_config(&path).unwrap(), original);
+
+        let policy = CompactionPolicy::from(original.compaction.as_ref().unwrap());
+        assert!(!policy.auto);
+        assert_eq!(policy.threshold, 0.9);
+        assert_eq!(policy.reserve_tokens, 8_000);
+        assert_eq!(policy.context_window, 12_000);
+        // Unset fields fall back to defaults.
+        assert_eq!(policy.keep_recent_turns, CompactionPolicy::default().keep_recent_turns);
+
+        // The unknown-field survival path must not see the compaction table.
+        let loaded = load_file_config(&path).unwrap();
+        assert!(!loaded.extra.contains_key("compaction"));
+    }
+
+    #[test]
     fn missing_file_is_default_and_config_override_is_used() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("config");
@@ -597,5 +720,21 @@ mod tests {
         // helper's behavior is exercised by config_dir itself in integration
         // tests where the override can be scoped by the harness.
         assert!(path.ends_with("config"));
+    }
+
+    #[test]
+    fn temporary_path_names_are_unique_and_embody_a_random_component() {
+        let path = Path::new("/tmp/harness-config.toml");
+        let first = temporary_path(path);
+        let second = temporary_path(path);
+        let first_name = first.file_name().unwrap().to_string_lossy().into_owned();
+        let second_name = second.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(first_name.starts_with(".harness-config.toml.tmp-"));
+        assert_ne!(first_name, second_name);
+        // The tail is 8 lowercase hex digits.
+        let tail = first_name.rsplit('-').next().unwrap();
+        assert_eq!(tail.len(), 8);
+        assert!(tail.chars().all(|ch| ch.is_ascii_hexdigit()));
+        assert_eq!(first.parent(), second.parent());
     }
 }

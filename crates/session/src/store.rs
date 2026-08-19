@@ -9,9 +9,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime};
+use uuid::Uuid;
 
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
+/// Locks older than this are stolen even when the owning PID cannot be read.
+const LOCK_STALE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Options used when creating a new durable session.
 #[derive(Clone, Debug, Default)]
@@ -70,13 +73,17 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    /// Construct a store with an explicit root.  The root is created lazily on
-    /// the first write; this keeps read-only listing useful for a missing
-    /// state directory.
+    /// Construct a store with an explicit root.  For an existing store the
+    /// root is only read here, keeping read-only listing useful for a missing
+    /// state directory.  A brand-new store performs its first write eagerly:
+    /// it persists a random `.salt` so workspace-key hashes cannot be
+    /// pre-computed, while stores that already contain sessions keep the
+    /// legacy unsalted layout and stay fully backward compatible.
     pub fn new(root: impl Into<PathBuf>, workspace_root: impl Into<PathBuf>) -> Result<Self> {
         let root = absolute_lexical(root.into())?;
         let workspace_root = normalize_workspace(workspace_root.into())?;
-        let workspace_dir = root.join(workspace_key(&workspace_root));
+        let salt = resolve_salt(&root)?;
+        let workspace_dir = root.join(workspace_key(&workspace_root, salt));
         Ok(Self {
             root,
             workspace_root,
@@ -228,6 +235,11 @@ impl SessionStore {
     /// Append one event and make it durable before returning.  A sidecar
     /// create-new lock prevents two Harness processes from interleaving JSON
     /// records.  Every record is followed by a newline and `sync_all`.
+    #[tracing::instrument(
+        name = "session_persist",
+        skip_all,
+        fields(session_id = %session.id())
+    )]
     pub fn append_event(
         &self,
         session: &mut Session,
@@ -517,24 +529,6 @@ impl SessionStore {
         options: &crate::export::ExportOptions,
     ) -> Result<PathBuf> {
         crate::export::export_jsonl(session, destination, options)
-    }
-
-    pub fn compact(
-        &self,
-        session: &mut Session,
-        policy: &crate::compaction::CompactionPolicy,
-    ) -> Result<Option<crate::compaction::CompactionResult>> {
-        let Some(result) = crate::compaction::deterministic_compaction(session, policy) else {
-            return Ok(None);
-        };
-        self.append_event(
-            session,
-            SessionEvent::CompactionSummary {
-                summary: result.summary.clone(),
-                compacted_through: result.compacted_through,
-            },
-        )?;
-        Ok(Some(result))
     }
 
     pub fn rename(&self, session: &mut Session, title: Option<String>) -> Result<()> {
@@ -912,11 +906,92 @@ fn absolute_lexical(path: PathBuf) -> Result<PathBuf> {
     }
 }
 
-fn workspace_key(path: &Path) -> String {
+/// File holding the per-store workspace-key salt.  Its presence distinguishes
+/// a salted store from a legacy (pre-salt) store.
+const SALT_FILE: &str = ".salt";
+
+/// Resolve the store's workspace-key salt: the persisted value when present,
+/// `0` for a legacy store that predates salting, or a freshly generated and
+/// persisted random salt for a brand-new store.  `create_new` makes the first
+/// writer win; a racing process re-reads the winner's value, so every process
+/// resolves the same workspace directory.
+fn resolve_salt(root: &Path) -> Result<u64> {
+    if let Some(salt) = read_salt(root) {
+        return Ok(salt);
+    }
+    if root.join(SALT_FILE).exists() {
+        // The salt file exists but cannot be parsed.  Stay on the stable
+        // legacy layout rather than churning keys on every process start.
+        return Ok(0);
+    }
+    // A store that already contains session directories but no `.salt` was
+    // created before salting.  Keep the unsalted keys so existing sessions
+    // remain discoverable; this store never takes a salt.
+    if root.exists() && store_has_legacy_directories(root) {
+        return Ok(0);
+    }
+    // Brand-new store: create a random salt and persist it.  This is the
+    // store's first write; the root itself is created here if needed.
+    let salt = Uuid::new_v4().as_u128() as u64;
+    fs::create_dir_all(root).map_err(|source| io_error("create session store", root, source))?;
+    persist_salt(root, salt)
+}
+
+fn persist_salt(root: &Path, salt: u64) -> Result<u64> {
+    let salt_path = root.join(SALT_FILE);
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&salt_path)
+    {
+        Ok(mut file) => {
+            writeln!(file, "{salt}")
+                .and_then(|_| file.sync_all())
+                .map_err(|source| io_error("write store salt", &salt_path, source))?;
+            set_private_file(&salt_path);
+            Ok(salt)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another process won the race.  Adopt its salt (retrying briefly
+            // in case it has not finished writing) so both processes resolve
+            // the same workspace directory.
+            for _ in 0..20 {
+                if let Some(winner) = read_salt(root) {
+                    return Ok(winner);
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(0)
+        }
+        Err(source) => Err(io_error("create store salt", &salt_path, source)),
+    }
+}
+
+fn read_salt(root: &Path) -> Option<u64> {
+    fs::read_to_string(root.join(SALT_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// True when `root` already holds session directories from a pre-salt store.
+fn store_has_legacy_directories(root: &Path) -> bool {
+    fs::read_dir(root).ok().is_some_and(|entries| {
+        entries.filter_map(|entry| entry.ok()).any(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && !entry.file_name().to_string_lossy().starts_with('.')
+        })
+    })
+}
+
+fn workspace_key(path: &Path, salt: u64) -> String {
     // FNV-1a is small, deterministic across processes/platforms, and only
     // used as a directory disambiguator (the full workspace path is still
-    // validated from session metadata).
-    let mut hash = 0xcbf29ce484222325u64;
+    // validated from session metadata).  The per-store salt (when present)
+    // prevents an attacker from pre-computing collision keys for a shared
+    // store; salt 0 reproduces the legacy unsalted layout exactly.
+    let mut hash = 0xcbf29ce484222325u64 ^ salt;
     for byte in path.to_string_lossy().as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
@@ -936,6 +1011,12 @@ fn workspace_key(path: &Path) -> String {
     format!("{}-{hash:016x}", readable.trim_matches('_'))
 }
 
+/// Apply private (owner-only) permissions to a store directory.
+///
+/// This is a Unix-only hardening step.  On Windows, session files inherit
+/// the permissions of the parent directory (typically the user's state
+/// directory), which is consistent with the plan; the Windows ACL model
+/// makes a portable equivalent out of scope here.
 fn set_private_directory(path: &Path) {
     #[cfg(unix)]
     {
@@ -946,8 +1027,13 @@ fn set_private_directory(path: &Path) {
             let _ = fs::set_permissions(path, permissions);
         }
     }
+    // #[cfg(not(unix))] — no-op on Windows and other platforms (see above).
 }
 
+/// Apply private (owner-only) permissions to a session or salt file.
+///
+/// Unix-only for the same reason as [`set_private_directory`]; on Windows the
+/// file inherits the parent directory's permissions.
 fn set_private_file(path: &Path) {
     #[cfg(unix)]
     {
@@ -958,6 +1044,7 @@ fn set_private_file(path: &Path) {
             let _ = fs::set_permissions(path, permissions);
         }
     }
+    // #[cfg(not(unix))] — no-op on Windows and other platforms (see above).
 }
 
 struct SessionLock {
@@ -974,12 +1061,8 @@ impl SessionLock {
                     return Ok(Self { path });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&path)
-                        .and_then(|metadata| metadata.modified())
-                        .ok()
-                        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-                        .is_some_and(|age| age > Duration::from_secs(5 * 60));
-                    if stale {
+                    if lock_is_stale(&path) {
+                        // The owner is gone (or the lock is ancient): steal it.
                         let _ = fs::remove_file(&path);
                     } else {
                         thread::sleep(LOCK_WAIT);
@@ -989,6 +1072,66 @@ impl SessionLock {
             }
         }
         Err(SessionError::LockUnavailable(path))
+    }
+}
+
+/// A lock is stale when its recorded owner is no longer alive (checked via
+/// `kill(pid, 0)` on Unix and `OpenProcess` on Windows), or — for lock files
+/// whose PID cannot be read (legacy files, unreadable, malformed) — when it is
+/// older than the conservative timeout.
+fn lock_is_stale(path: &Path) -> bool {
+    // A live owner means the lock is never stale, even past the timeout:
+    // a long append must not be interrupted by another process.
+    if let Some(pid) = lock_owner_pid(path) {
+        return !pid_is_alive(pid);
+    }
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+        .is_some_and(|age| age > LOCK_STALE_TIMEOUT)
+}
+
+fn lock_owner_pid(path: &Path) -> Option<u32> {
+    let value = fs::read_to_string(path).ok()?;
+    value
+        .lines()
+        .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
+}
+
+/// Returns true when the process with `pid` is alive.  On platforms without a
+/// process-existence probe this reports false so the age heuristic applies.
+fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // kill(pid, 0) delivers no signal; it only probes existence.  EPERM
+        // means the process exists but is owned by another user.
+        // SAFETY: the signal number is 0, so no signal is sent; the PID comes
+        // from this store's own lock file.
+        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess only queries; the returned handle is closed
+        // immediately without touching any process state.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        unsafe { CloseHandle(handle) };
+        true
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
     }
 }
 
@@ -1105,5 +1248,100 @@ mod tests {
         let second_store = SessionStore::new(root.path(), second.path()).unwrap();
         let error = second_store.load_path(session.path().unwrap()).unwrap_err();
         assert!(matches!(error, SessionError::WorkspaceMismatch { .. }));
+    }
+
+    #[test]
+    fn lock_file_owned_by_dead_pid_is_stale_immediately() {
+        let directory = tempdir().unwrap();
+        let lock = directory.path().join("session.jsonl.lock");
+        fs::write(&lock, "pid=4000000\n").unwrap();
+        assert!(lock_is_stale(&lock));
+    }
+
+    #[test]
+    fn lock_file_owned_by_live_pid_is_not_stale() {
+        let directory = tempdir().unwrap();
+        let lock = directory.path().join("session.jsonl.lock");
+        fs::write(&lock, format!("pid={}\n", std::process::id())).unwrap();
+        assert!(!lock_is_stale(&lock));
+    }
+
+    #[test]
+    fn lock_file_without_pid_uses_age_heuristic() {
+        let directory = tempdir().unwrap();
+        let lock = directory.path().join("session.jsonl.lock");
+        // A legacy lock (no PID line) is fresh, so it must not be stolen yet.
+        fs::write(&lock, "legacy lock without pid\n").unwrap();
+        assert!(!lock_is_stale(&lock));
+    }
+
+    #[test]
+    fn acquire_steals_lock_left_by_dead_process() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        let lock_path = session.path().unwrap().with_extension("jsonl.lock");
+        // Simulate a harness process killed by SIGKILL mid-append: the lock
+        // file persists with its owner's PID.
+        fs::write(&lock_path, "pid=4000000\n").unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("hello")),
+                },
+            )
+            .unwrap();
+        assert!(
+            !lock_path.exists(),
+            "stale lock must be stolen and released"
+        );
+    }
+
+    #[test]
+    fn legacy_store_without_salt_keeps_unsalted_keys() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        // Simulate a pre-salt store: a workspace directory using the legacy
+        // unsalted key and no `.salt` file.  The key is computed from the
+        // canonical workspace path, matching `SessionStore::new`.
+        let workspace = workspace.path().canonicalize().unwrap();
+        let legacy_dir = root.path().join(workspace_key(&workspace, 0));
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let store = SessionStore::new(root.path(), &workspace).unwrap();
+        assert_eq!(store.workspace_dir(), legacy_dir.as_path());
+        assert!(!root.path().join(SALT_FILE).exists());
+    }
+
+    #[test]
+    fn fresh_store_persists_salt_and_is_stable_across_instances() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let salt_path = root.path().join(SALT_FILE);
+        assert!(salt_path.exists());
+        let salt = fs::read_to_string(&salt_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        assert_ne!(salt, 0);
+        assert_ne!(
+            store.workspace_dir().file_name().unwrap().to_string_lossy(),
+            workspace_key(workspace.path(), 0)
+        );
+        // A second store instance resolves the same salted directory and can
+        // see sessions created through the first.
+        let second = SessionStore::new(root.path(), workspace.path()).unwrap();
+        assert_eq!(second.workspace_dir(), store.workspace_dir());
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        assert!(
+            second
+                .list()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.id == session.id())
+        );
     }
 }

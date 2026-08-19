@@ -1,4 +1,3 @@
-use crate::compaction::{CompactionPolicy, CompactionResult, deterministic_compaction};
 use crate::error::{Result, SessionError};
 use llm::{Content, Message, Role, ToolCall, Usage};
 use serde::{Deserialize, Serialize};
@@ -696,8 +695,82 @@ impl Session {
         validate_events(&self.events)
     }
 
-    pub fn compact(&self, policy: &CompactionPolicy) -> Option<CompactionResult> {
-        deterministic_compaction(self, policy)
+    pub fn latest_compaction_boundary(&self) -> Option<(u64, u64)> {
+        latest_compaction_boundary(&self.events)
+    }
+}
+
+/// Tracks tool-call lifetimes across an event log.  Shared by event
+/// validation and provider-context reconstruction so both functions agree on
+/// which calls are pending, completed, or cancelled — a change to the
+/// bookkeeping no longer needs to be replicated in both places.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolCallTracker {
+    /// Call IDs awaiting a result, in emission order.
+    pending: Vec<String>,
+    /// Call IDs that have received a result.
+    completed: HashSet<String>,
+    /// True when the tail was explicitly cancelled (`TurnCancelled`/`Error`).
+    cancelled: bool,
+}
+
+impl ToolCallTracker {
+    pub(crate) fn pending(&self) -> &[String] {
+        &self.pending
+    }
+
+    pub(crate) fn is_pending(&self, id: &str) -> bool {
+        self.pending.iter().any(|pending| pending == id)
+    }
+
+    pub(crate) fn is_completed(&self, id: &str) -> bool {
+        self.completed.contains(id)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    /// Apply one event's effect on the tool-call lifecycle.  Events that do
+    /// not carry tool state are no-ops.
+    pub(crate) fn record(&mut self, event: &SessionEvent) {
+        match event {
+            SessionEvent::AssistantMessage { message } => {
+                for content in &message.content {
+                    if let StoredContent::ToolCall { id, .. } = content {
+                        self.push_pending(id);
+                    }
+                }
+                self.cancelled = false;
+            }
+            SessionEvent::ToolCall { call } => {
+                self.push_pending(&call.id);
+                self.cancelled = false;
+            }
+            SessionEvent::ToolResult { tool_call_id, .. } => {
+                self.completed.insert(tool_call_id.clone());
+                if let Some(index) = self.pending.iter().position(|id| id == tool_call_id) {
+                    self.pending.remove(index);
+                }
+            }
+            SessionEvent::TurnCancelled { .. } => {
+                self.pending.clear();
+                self.cancelled = true;
+            }
+            SessionEvent::Error { .. } => {
+                // Errors may follow a stream that ended between a tool call
+                // and its result; they make the tail recoverable without
+                // clearing the pending queue itself.
+                self.cancelled = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn push_pending(&mut self, id: &str) {
+        if !self.is_pending(id) {
+            self.pending.push(id.to_owned());
+        }
     }
 }
 
@@ -708,7 +781,7 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     let selected = events_after_latest_compaction(events);
     let mut messages = Vec::<Message>::new();
     let mut call_locations = HashMap::<String, usize>::new();
-    let mut completed_calls = HashSet::<String>::new();
+    let mut tracker = ToolCallTracker::default();
 
     for record in selected {
         match &record.event {
@@ -760,7 +833,6 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                 is_error,
                 ..
             } => {
-                completed_calls.insert(tool_call_id.clone());
                 messages.push(Message::tool_result(
                     tool_call_id.clone(),
                     content.clone(),
@@ -779,13 +851,14 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
             | SessionEvent::TurnCancelled { .. }
             | SessionEvent::Error { .. } => {}
         }
+        tracker.record(&record.event);
     }
 
     // A crash can leave a complete ToolCall line without its result.  Keep the
     // assistant's ordinary text/reasoning, but remove only those calls.  This
     // guarantees the next provider request is structurally valid.
     for (id, index) in call_locations {
-        if completed_calls.contains(&id) {
+        if tracker.is_completed(&id) {
             continue;
         }
         if let Some(Message { content, .. }) = messages.get_mut(index) {
@@ -796,18 +869,24 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     messages
 }
 
-fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&SessionEventRecord> {
-    let latest = events.iter().rev().find_map(|record| {
+/// Find the most recent compaction summary and the sequence boundary it
+/// replaces, if any.  Shared by provider-context reconstruction and the
+/// compactor so a change to the summary format stays in one place.
+pub fn latest_compaction_boundary(events: &[SessionEventRecord]) -> Option<(u64, u64)> {
+    events.iter().rev().find_map(|record| {
         if let SessionEvent::CompactionSummary {
             compacted_through, ..
-        } = record.event
+        } = &record.event
         {
-            Some((record.sequence, compacted_through))
+            Some((record.sequence, *compacted_through))
         } else {
             None
         }
-    });
-    let Some((summary_sequence, compacted_through)) = latest else {
+    })
+}
+
+pub fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&SessionEventRecord> {
+    let Some((summary_sequence, compacted_through)) = latest_compaction_boundary(events) else {
         return events.iter().collect();
     };
 
@@ -826,8 +905,7 @@ fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&Session
 pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
     let mut expected_sequence = 1u64;
     let mut ids = HashSet::new();
-    let mut pending = Vec::<String>::new();
-    let mut cancelled = false;
+    let mut tracker = ToolCallTracker::default();
 
     for record in events {
         if record.sequence != expected_sequence {
@@ -852,7 +930,7 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
 
         match &record.event {
             SessionEvent::UserMessage { message } => {
-                if !pending.is_empty() && !cancelled {
+                if !tracker.pending().is_empty() && !tracker.is_cancelled() {
                     return Err(SessionError::InvalidEvent(
                         "user message follows an unresolved tool call".into(),
                     ));
@@ -889,16 +967,14 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                     ));
                 }
                 for content in &message.content {
-                    if let StoredContent::ToolCall { id, .. } = content {
-                        if pending.iter().any(|pending_id| pending_id == id) {
-                            return Err(SessionError::InvalidEvent(format!(
-                                "duplicate pending tool call {id}"
-                            )));
-                        }
-                        pending.push(id.clone());
+                    if let StoredContent::ToolCall { id, .. } = content
+                        && tracker.is_pending(id)
+                    {
+                        return Err(SessionError::InvalidEvent(format!(
+                            "duplicate pending tool call {id}"
+                        )));
                     }
                 }
-                cancelled = false;
             }
             SessionEvent::ToolCall { call } => {
                 if call.id.trim().is_empty() || call.name.trim().is_empty() {
@@ -906,14 +982,12 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                         "tool call requires a non-empty ID and name".into(),
                     ));
                 }
-                if pending.iter().any(|pending_id| pending_id == &call.id) {
+                if tracker.is_pending(&call.id) {
                     return Err(SessionError::InvalidEvent(format!(
                         "duplicate pending tool call {}",
                         call.id
                     )));
                 }
-                pending.push(call.id.clone());
-                cancelled = false;
             }
             SessionEvent::ToolResult { tool_call_id, .. } => {
                 if tool_call_id.trim().is_empty() {
@@ -921,7 +995,7 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                         "tool result requires a non-empty tool_call_id".into(),
                     ));
                 }
-                let Some(first) = pending.first() else {
+                let Some(first) = tracker.pending().first() else {
                     return Err(SessionError::InvalidEvent(format!(
                         "tool result {tool_call_id} has no preceding tool call"
                     )));
@@ -931,19 +1005,11 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                         "tool result {tool_call_id} is out of order; expected {first}"
                     )));
                 }
-                pending.remove(0);
             }
-            SessionEvent::TurnCancelled { .. } => {
-                pending.clear();
-                cancelled = true;
-            }
-            SessionEvent::Error { .. } => {
-                // Errors may follow a provider stream that ended between a
-                // tool call and its result.  They make the tail recoverable.
-                cancelled = true;
-            }
+            SessionEvent::TurnCancelled { .. } | SessionEvent::Error { .. } => {}
             _ => {}
         }
+        tracker.record(&record.event);
     }
     Ok(())
 }
@@ -951,6 +1017,152 @@ pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
 /// Convert a provider usage value into the storage DTO.
 pub fn usage_summary(usage: &Usage) -> UsageSummary {
     UsageSummary::from_usage(usage)
+}
+
+/// A structural view of a session's conversation, rebuilt from the durable
+/// event log for transcript rendering.  The session crate owns the event
+/// model, so it also owns the tool-result pairing that keeps a snapshot
+/// consistent with [`context_messages`].  Presentation formatting (tool
+/// summaries, bounded argument strings) is layered on top by the agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionSnapshotEntry {
+    User {
+        text: String,
+    },
+    Assistant {
+        markdown: String,
+        reasoning: String,
+    },
+    Tool {
+        name: String,
+        /// Raw structured arguments.  Callers format these for display.
+        arguments: Value,
+        ok: bool,
+        output: String,
+        error: Option<String>,
+    },
+}
+
+/// Rebuild a transcript-style view of the conversation.  A `ToolResult`
+/// event is matched back to the `ToolCall` that produced it (the same
+/// pairing performed by [`context_messages`]), so the snapshot stays in sync
+/// with the provider history as new event kinds are added.  A result
+/// without a preceding call — possible after repair — becomes a standalone
+/// tool entry so nothing is dropped from the view.
+pub fn snapshot_entries(session: &Session) -> Vec<SessionSnapshotEntry> {
+    let mut entries = Vec::new();
+    let mut tool_indices = HashMap::<String, usize>::new();
+
+    for record in &session.events {
+        match &record.event {
+            SessionEvent::UserMessage { message } => {
+                let text = message.content.iter().find_map(|content| match content {
+                    StoredContent::Text { text } => Some(text.clone()),
+                    _ => None,
+                });
+                if let Some(text) = text.filter(|text| !text.is_empty()) {
+                    entries.push(SessionSnapshotEntry::User { text });
+                }
+            }
+            SessionEvent::AssistantMessage { message } => {
+                let mut markdown = String::new();
+                let mut reasoning = String::new();
+                for content in &message.content {
+                    match content {
+                        StoredContent::Text { text } => {
+                            if !markdown.is_empty() {
+                                markdown.push('\n');
+                            }
+                            markdown.push_str(text);
+                        }
+                        StoredContent::Reasoning { text } => {
+                            if !reasoning.is_empty() {
+                                reasoning.push('\n');
+                            }
+                            reasoning.push_str(text);
+                        }
+                        StoredContent::ToolCall { .. } | StoredContent::ToolResult { .. } => {}
+                    }
+                }
+                if !markdown.is_empty() || !reasoning.is_empty() {
+                    entries.push(SessionSnapshotEntry::Assistant {
+                        markdown,
+                        reasoning,
+                    });
+                }
+            }
+            SessionEvent::ToolCall { call } => {
+                let index = entries.len();
+                tool_indices.insert(call.id.clone(), index);
+                entries.push(SessionSnapshotEntry::Tool {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    ok: false,
+                    output: String::new(),
+                    error: None,
+                });
+            }
+            SessionEvent::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                tool_name,
+            } => {
+                if let Some(index) = tool_indices.get(tool_call_id).copied()
+                    && let Some(SessionSnapshotEntry::Tool {
+                        name,
+                        ok,
+                        output,
+                        error,
+                        ..
+                    }) = entries.get_mut(index)
+                {
+                    if let Some(tool_name) = tool_name {
+                        *name = tool_name.clone();
+                    }
+                    *ok = !is_error;
+                    *output = content.clone();
+                    *error = is_error.then(|| content.clone());
+                } else {
+                    entries.push(SessionSnapshotEntry::Tool {
+                        name: tool_name.clone().unwrap_or_else(|| "tool".into()),
+                        arguments: Value::Object(Default::default()),
+                        ok: !is_error,
+                        output: content.clone(),
+                        error: is_error.then(|| content.clone()),
+                    });
+                }
+            }
+            SessionEvent::Reasoning { text } => {
+                if let Some(SessionSnapshotEntry::Assistant { reasoning, .. }) = entries.last_mut()
+                {
+                    if !reasoning.is_empty() {
+                        reasoning.push('\n');
+                    }
+                    reasoning.push_str(text);
+                } else {
+                    entries.push(SessionSnapshotEntry::Assistant {
+                        markdown: String::new(),
+                        reasoning: text.clone(),
+                    });
+                }
+            }
+            SessionEvent::CompactionSummary { summary, .. } => {
+                entries.push(SessionSnapshotEntry::Assistant {
+                    markdown: format!("_Session summary:_\n\n{summary}"),
+                    reasoning: String::new(),
+                });
+            }
+            SessionEvent::ModelChange { .. }
+            | SessionEvent::Usage { .. }
+            | SessionEvent::MetadataChange { .. }
+            | SessionEvent::TurnCancelled { .. }
+            | SessionEvent::Error { .. }
+            | SessionEvent::Unknown { .. } => {}
+        }
+    }
+
+    entries
 }
 
 #[cfg(test)]
@@ -1022,5 +1234,79 @@ mod tests {
         });
         assert_eq!(session.metadata.usage.input_tokens, 2);
         assert_eq!(session.metadata.usage.turns, 1);
+    }
+
+    #[test]
+    fn snapshot_entries_matches_tool_results_to_their_calls() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("hi")),
+        });
+        session.append(SessionEvent::AssistantMessage {
+            message: StoredMessage::from_llm(&Message::assistant(vec![Content::Text(
+                "working".into(),
+            )])),
+        });
+        session.append(SessionEvent::ToolCall {
+            call: StoredToolCall {
+                id: "call-1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "Cargo.toml" }),
+            },
+        });
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "file contents".into(),
+            is_error: false,
+            tool_name: Some("read".into()),
+        });
+
+        let snapshot = snapshot_entries(&session);
+        assert_eq!(snapshot.len(), 3);
+        assert_eq!(
+            snapshot[0],
+            SessionSnapshotEntry::User { text: "hi".into() }
+        );
+        assert_eq!(
+            snapshot[1],
+            SessionSnapshotEntry::Assistant {
+                markdown: "working".into(),
+                reasoning: String::new(),
+            }
+        );
+        // The result is paired back to the call that produced it, keeping
+        // the arguments from the call while taking the status from the result.
+        assert_eq!(
+            snapshot[2],
+            SessionSnapshotEntry::Tool {
+                name: "read".into(),
+                arguments: json!({ "path": "Cargo.toml" }),
+                ok: true,
+                output: "file contents".into(),
+                error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_entries_keeps_orphan_tool_results() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "call-9".into(),
+            content: "lonely output".into(),
+            is_error: true,
+            tool_name: Some("bash".into()),
+        });
+        let snapshot = snapshot_entries(&session);
+        assert_eq!(
+            snapshot,
+            vec![SessionSnapshotEntry::Tool {
+                name: "bash".into(),
+                arguments: Value::Object(Default::default()),
+                ok: false,
+                output: "lonely output".into(),
+                error: Some("lonely output".into()),
+            }]
+        );
     }
 }
