@@ -111,17 +111,11 @@ async fn drive_headless_events_into(
         let is_error = matches!(event, AgentEvent::Error(_));
         let is_turn_finished = matches!(event, AgentEvent::TurnFinished);
         match &event {
-            AgentEvent::AuthStarted
-            | AgentEvent::AuthPrompt { .. }
-            | AgentEvent::AuthProgress { .. } => {
-                if let Some(message) = match &event {
-                    AgentEvent::AuthPrompt { message }
-                    | AgentEvent::AuthProgress { message } => Some(message),
-                    _ => None,
-                } {
-                    if verbose {
-                        let _ = writeln!(stderr, "{message}");
-                    }
+            AgentEvent::AuthStarted => {}
+            AgentEvent::AuthPrompt { message }
+            | AgentEvent::AuthProgress { message } => {
+                if verbose {
+                    let _ = writeln!(stderr, "{message}");
                 }
             }
             AgentEvent::AuthDeviceCode {
