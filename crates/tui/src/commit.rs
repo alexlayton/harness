@@ -10,7 +10,7 @@
 //! - `insert_before` is called only from the commit paths in this module.
 
 use crate::render::{self, Theme};
-use crate::state::TranscriptEntry;
+use crate::state::{EntryId, TranscriptEntry};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget};
@@ -53,6 +53,73 @@ pub(crate) fn collect_ready_lines(
         new_committed = index + 1;
     }
     (lines, new_committed)
+}
+
+/// Byte offset where the stable prefix of streaming `markdown` ends, i.e. the
+/// start of the trailing in-progress block. Splits only at `\n\n` blank-line
+/// boundaries that lie *outside* a code fence (tracking ``` parity while
+/// scanning); an opened-but-unclosed fence makes everything from its opener
+/// onward one block, so nothing after it is ever split. Returns `None` when
+/// the whole text is a single block with no stable prefix yet.
+pub(crate) fn stable_block_split_offset(markdown: &str) -> Option<usize> {
+    let mut in_fence = false;
+    let mut boundary = 0usize;
+    let mut consumed = 0usize;
+    for line in markdown.split('\n') {
+        let trimmed = line.trim_start();
+        if in_fence {
+            if trimmed.starts_with("```") {
+                in_fence = false;
+            }
+        } else if trimmed.starts_with("```") {
+            in_fence = true;
+        } else if trimmed.is_empty() {
+            // A blank line outside a fence closes a paragraph; the byte just
+            // past it (the start of the next line) begins a fresh block.
+            boundary = consumed + line.len() + 1;
+        }
+        consumed += line.len() + 1;
+    }
+    if boundary > 0 && boundary <= markdown.len() {
+        Some(boundary)
+    } else {
+        None
+    }
+}
+
+/// Replace the streaming assistant entry `id` with a finalized prefix entry
+/// (`markdown[..offset]`, whose `streaming` flag is false) followed by a fresh
+/// streaming tail entry (`markdown[offset..]`, new id `tail_id`). Pure
+/// transcript surgery so the commit boundary is unit-testable without a TTY.
+pub(crate) fn split_streaming_assistant(
+    transcript: &mut Vec<TranscriptEntry>,
+    id: EntryId,
+    offset: usize,
+    tail_id: EntryId,
+) -> Option<()> {
+    let index = transcript.iter().position(|entry| entry.id() == id)?;
+    let TranscriptEntry::Assistant {
+        markdown,
+        reasoning,
+        ..
+    } = &transcript[index]
+    else {
+        return None;
+    };
+    let prefix_entry = TranscriptEntry::Assistant {
+        id,
+        markdown: markdown[..offset].to_owned(),
+        reasoning: reasoning.clone(),
+        streaming: false,
+    };
+    let tail_entry = TranscriptEntry::Assistant {
+        id: tail_id,
+        markdown: markdown[offset..].to_owned(),
+        reasoning: String::new(),
+        streaming: true,
+    };
+    transcript.splice(index..=index, [prefix_entry, tail_entry]);
+    Some(())
 }
 
 impl crate::Tui {
@@ -118,6 +185,71 @@ impl crate::Tui {
             self.add_error(format!("failed to write welcome banner: {error:#}"));
         }
         Ok(())
+    }
+
+    /// While an assistant streams, commit the stable prefix of its markdown
+    /// into scrollback once it outgrows the live-tail budget, keeping only the
+    /// trailing in-progress block live. Long responses then flow into
+    /// scrollback incrementally instead of appearing all at once at finalize.
+    ///
+    /// The prefix is finalized as its own committed assistant entry (spliced
+    /// in place of the streaming entry); the end-of-event `commit_ready_entries`
+    /// writes it below the viewport in a single `insert_before`. The in-progress
+    /// block keeps streaming under a fresh entry id until `ToolCallStarted`/
+    /// `TurnFinished` finalizes it.
+    pub(crate) fn commit_streamed_prefix(&mut self) -> anyhow::Result<()> {
+        let Some(id) = self.streaming_assistant else {
+            return Ok(());
+        };
+        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        let index = match self.transcript.iter().position(|entry| entry.id() == id) {
+            Some(index) => index,
+            None => return Ok(()),
+        };
+        let TranscriptEntry::Assistant {
+            markdown,
+            reasoning,
+            ..
+        } = &self.transcript[index]
+        else {
+            return Ok(());
+        };
+        let Some(offset) = stable_block_split_offset(markdown) else {
+            return Ok(()); // single block so far; nothing stable to commit
+        };
+        if offset == 0 {
+            return Ok(());
+        }
+        // Only make room once the completed prefix already overflows the live
+        // tail budget; never call the commit path on every streaming delta.
+        let budget = self.streamed_tail_budget();
+        // Snapshot the prefix (including any completed reasoning) to measure
+        // exactly the rows the eventual commit will render.
+        let prefix_entry = TranscriptEntry::Assistant {
+            id,
+            markdown: markdown[..offset].to_owned(),
+            reasoning: reasoning.clone(),
+            streaming: false,
+        };
+        let prefix_height = render::entry_lines(&prefix_entry, false, width, self.theme).len();
+        if prefix_height <= budget {
+            return Ok(());
+        }
+        let tail_id = self.allocate_id();
+        split_streaming_assistant(&mut self.transcript, id, offset, tail_id);
+        self.streaming_assistant = Some(tail_id);
+        Ok(())
+    }
+
+    /// The live-tail row budget applied while streaming: the tail region of a
+    /// busy fixed-height viewport held at a minimal single-line prompt.
+    fn streamed_tail_budget(&self) -> usize {
+        let canvas = self
+            .viewport_height
+            .saturating_sub(u16::from(self.viewport_height >= 8));
+        crate::layout::live_layout(canvas, true, 1, 0)
+            .tail_rows
+            .max(1) as usize
     }
 
     /// Render `lines` into a temporary buffer and splice it above the inline
@@ -297,5 +429,91 @@ mod tests {
         assert!(text.contains("the answer"));
         assert!(text.contains("a note"));
         assert!(!text.contains("old committed"));
+    }
+
+    #[test]
+    fn stable_split_ends_before_the_last_completed_paragraph() {
+        assert_eq!(stable_block_split_offset("a"), None, "single paragraph");
+        assert_eq!(
+            stable_block_split_offset("a\n\nb"),
+            Some(3),
+            "two paragraphs: prefix is the first"
+        );
+        assert_eq!(
+            stable_block_split_offset("a\n\nb\n\nc"),
+            Some(6),
+            "last boundary wins: prefix is a+b"
+        );
+        assert_eq!(
+            stable_block_split_offset("a\nb"),
+            None,
+            "single newline is not a paragraph boundary"
+        );
+        // A trailing separator would leave an empty in-progress block; defer.
+        assert_eq!(stable_block_split_offset("a\n\n"), None);
+    }
+
+    #[test]
+    fn stable_split_never_splits_inside_code_fences() {
+        // The blank line inside the fence must not split; the one after the
+        // closing fence may.
+        let marked = "a\n\n```\nb\n\nc\n```\n\nd";
+        let offset = stable_block_split_offset(marked).unwrap();
+        assert_eq!(&marked[..offset], "a\n\n```\nb\n\nc\n```\n\n");
+        assert_eq!(&marked[offset..], "d");
+
+        // An unclosed fence makes everything from its opener onward one block:
+        // only the text before the opener is stable.
+        let marked = "a\n\n```\nb\n\nc";
+        let offset = stable_block_split_offset(marked).unwrap();
+        assert_eq!(&marked[..offset], "a\n\n");
+        assert_eq!(&marked[offset..], "```\nb\n\nc");
+    }
+
+    #[test]
+    fn split_streaming_assistant_replaces_one_entry_with_prefix_and_tail() {
+        let mut transcript = vec![TranscriptEntry::Assistant {
+            id: 1,
+            markdown: "first\n\nsecond tail".into(),
+            reasoning: "thinking".into(),
+            streaming: true,
+        }];
+        assert_eq!(
+            split_streaming_assistant(&mut transcript, 1, 7, 2),
+            Some(())
+        );
+        assert_eq!(transcript.len(), 2);
+        match &transcript[0] {
+            TranscriptEntry::Assistant {
+                id,
+                markdown,
+                reasoning,
+                streaming,
+            } => {
+                assert_eq!(*id, 1);
+                assert_eq!(markdown, "first\n\n");
+                assert_eq!(reasoning, "thinking");
+                assert!(!streaming);
+            }
+            _ => panic!("prefix must stay an assistant entry"),
+        }
+        match &transcript[1] {
+            TranscriptEntry::Assistant {
+                id,
+                markdown,
+                reasoning,
+                streaming,
+            } => {
+                assert_eq!(*id, 2);
+                assert_eq!(markdown, "second tail");
+                assert!(reasoning.is_empty(), "tail reasoning starts fresh");
+                assert!(streaming);
+            }
+            _ => panic!("tail must stay an assistant entry"),
+        }
+        // The finalized prefix is now committed by the regular commit pipeline,
+        // leaving only the tail live.
+        let (_, committed) = collect_ready_lines(&transcript, 0, 40, Theme::default());
+        assert_eq!(committed, 1);
     }
 }

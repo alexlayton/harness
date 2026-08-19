@@ -247,6 +247,9 @@ impl crate::Tui {
                 if let TranscriptEntry::Assistant { markdown, .. } = self.ensure_assistant() {
                     markdown.push_str(&delta);
                 }
+                // Long responses flow into scrollback incrementally: finalize
+                // and commit the stable prefix when it outgrows the live tail.
+                self.commit_streamed_prefix()?;
                 self.transcript_changed();
             }
             UiEvent::ReasoningDelta(delta) => {
@@ -269,7 +272,12 @@ impl crate::Tui {
                 self.busy = true;
                 self.activity = crate::app::Activity::Processing;
                 self.retrying = None;
-                self.streaming_assistant = None;
+                // The text streamed before the call is now a complete message:
+                // finalize it so the end-of-event commit writes it into
+                // scrollback (the new tool stays live). Clearing the tracker
+                // alone would leave the entry `streaming` forever, which would
+                // block every later entry from committing.
+                self.finalize_streaming_assistant();
                 let id = self.allocate_id();
                 self.add_entry(TranscriptEntry::Tool {
                     id,
@@ -353,18 +361,13 @@ impl crate::Tui {
                 self.session_completion_requested = false;
                 self.add_error(error);
                 self.running_tool = None;
-                self.streaming_assistant = None;
+                self.finalize_streaming_assistant();
                 self.busy = false;
                 self.activity = crate::app::Activity::Preparing;
                 self.retrying = None;
             }
             UiEvent::TurnFinished => {
-                if let Some(id) = self.streaming_assistant.take()
-                    && let Some(entry) = self.transcript.iter_mut().find(|entry| entry.id() == id)
-                    && let TranscriptEntry::Assistant { streaming, .. } = entry
-                {
-                    *streaming = false;
-                }
+                self.finalize_streaming_assistant();
                 self.running_tool = None;
                 self.retrying = None;
                 self.busy = false;
@@ -546,7 +549,7 @@ impl crate::Tui {
         self.transcript_changed();
     }
 
-    fn allocate_id(&mut self) -> EntryId {
+    pub(crate) fn allocate_id(&mut self) -> EntryId {
         let id = self.next_entry_id;
         self.next_entry_id = self.next_entry_id.wrapping_add(1).max(1);
         id
@@ -561,6 +564,22 @@ impl crate::Tui {
     pub(crate) fn live_tool_index(&self) -> Option<usize> {
         let id = self.running_tool?;
         self.transcript.iter().position(|entry| entry.id() == id)
+    }
+
+    /// Mark the current streaming assistant entry as finalized (its `streaming`
+    /// flag flips to false) and clear the tracker, so the next end-of-event
+    /// commit writes it into scrollback. No-op when nothing is streaming. This
+    /// is the single place an assistant stops being live: nulling only the
+    /// tracker would leave the entry non-final and block every later entry.
+    fn finalize_streaming_assistant(&mut self) {
+        let Some(id) = self.streaming_assistant.take() else {
+            return;
+        };
+        if let Some(entry) = self.transcript.iter_mut().find(|entry| entry.id() == id)
+            && let TranscriptEntry::Assistant { streaming, .. } = entry
+        {
+            *streaming = false;
+        }
     }
 
     pub(crate) fn toggle_live_tool(&mut self) {

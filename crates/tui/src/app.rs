@@ -71,6 +71,10 @@ impl Activity {
 /// consumed externally only through `Tui::new` and `Tui::run`.
 pub struct Tui {
     pub(crate) terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// The fixed inline viewport height H, computed once at startup (immutable
+    /// for the process lifetime). Used by the streaming commit to bound how
+    /// much content stays in the live tail.
+    pub(crate) viewport_height: u16,
     pub(crate) theme: Theme,
     pub(crate) model: String,
     pub(crate) provider: String,
@@ -154,6 +158,7 @@ impl Tui {
         let (file_completion_tx, file_completion_rx) = mpsc::unbounded_channel();
         Ok(Self {
             terminal,
+            viewport_height: height,
             theme: Theme::default(),
             model: model.to_owned(),
             provider: provider.to_owned(),

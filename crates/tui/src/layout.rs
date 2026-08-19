@@ -42,7 +42,7 @@ pub(crate) struct LiveLayout {
 ///   the tail absorbs whatever is left.
 /// - The section heights always sum to exactly `height`, so `Layout::split`
 ///   yields contiguous, in-bounds, non-overlapping rects.
-fn live_layout(
+pub(crate) fn live_layout(
     height: u16,
     busy: bool,
     desired_prompt_lines: usize,
