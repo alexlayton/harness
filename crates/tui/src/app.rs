@@ -291,7 +291,9 @@ impl Tui {
             return Ok(false);
         }
 
-        if !self.busy && self.focused_tool.is_some() && self.handle_tool_focus(&event)? {
+        // Tool focus is reachable while a turn is running: the only focusable
+        // tool is the running one, and it exists only while busy.
+        if self.focused_tool.is_some() && self.handle_tool_focus(&event)? {
             return Ok(false);
         }
 
@@ -346,10 +348,10 @@ impl Tui {
                 self.toggle_live_tool();
             }
             InputAction::FocusTools => {
-                if !self.busy
-                    && let Some(index) = self.live_tool_index()
-                {
-                    // There is at most one live (running) tool; Tab focuses it.
+                // The only focusable tool is the running one, so Tab focuses
+                // mid-turn (see KEYMAP) and falls through to the textarea
+                // whenever nothing is running.
+                if let Some(index) = self.live_tool_index() {
                     self.focused_tool = Some(index);
                     self.focus = Focus::Tool;
                 } else {

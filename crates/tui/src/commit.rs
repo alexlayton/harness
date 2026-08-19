@@ -128,12 +128,20 @@ impl crate::Tui {
     /// delta). `committed` advances only on success so the invariant
     /// `transcript[0..committed] is in scrollback` always holds.
     pub(crate) fn commit_ready_entries(&mut self) -> anyhow::Result<()> {
-        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
-        let (mut lines, new_committed) =
-            collect_ready_lines(&self.transcript, self.committed, width, self.theme);
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+        let (mut lines, new_committed) = collect_ready_lines(
+            &self.transcript,
+            self.committed,
+            render::content_width(width),
+            self.theme,
+        );
         if lines.is_empty() {
             return Ok(());
         }
+        // Committed lines keep the same gutter as the live viewport: wrapped
+        // at `content_width`, then indented so scrollback content never
+        // touches the window edge and does not reflow on commit.
+        render::indent_lines(&mut lines, render::horizontal_pad(width));
         // Theoretically unreachable: a single snapshot bulk commit exceeding
         // 65_535 rows is a bug elsewhere. Keep the newest rows rather than
         // wrapping the u16 height.
@@ -153,17 +161,23 @@ impl crate::Tui {
         Ok(())
     }
 
-    /// One-line separator written into scrollback, e.g. `── new conversation ──`.
+    /// One-line separator written into scrollback, e.g. `── new conversation ──`,
+    /// with one blank line of breathing room above and below.
     pub(crate) fn commit_separator(&mut self, label: &str) -> anyhow::Result<()> {
-        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
         let text = format!("── {label} ──");
-        let pad = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+        let inner = render::content_width(width);
+        let pad = inner.saturating_sub(UnicodeWidthStr::width(text.as_str()));
         let left = pad / 2;
         let right = pad - left;
-        let mut lines = vec![Line::from(Span::styled(
+        let mut lines = Vec::new();
+        render::push_blank(&mut lines, render::SECTION_GAP);
+        lines.push(Line::from(Span::styled(
             format!("{}{}{}", "─".repeat(left), text, "─".repeat(right)),
             Style::default().fg(self.theme.dim_text),
-        ))];
+        )));
+        render::push_blank(&mut lines, render::SECTION_GAP);
+        render::indent_lines(&mut lines, render::horizontal_pad(width));
         self.commit_lines(&mut lines)
     }
 
@@ -179,8 +193,9 @@ impl crate::Tui {
         if !self.transcript.is_empty() {
             return Ok(());
         }
-        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
-        let mut lines = render::welcome_lines(width, self.theme);
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+        let mut lines = render::welcome_lines(render::content_width(width), self.theme);
+        render::indent_lines(&mut lines, render::horizontal_pad(width));
         if let Err(error) = self.commit_lines(&mut lines) {
             self.add_error(format!("failed to write welcome banner: {error:#}"));
         }
@@ -201,7 +216,8 @@ impl crate::Tui {
         let Some(id) = self.streaming_assistant else {
             return Ok(());
         };
-        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        let width = self.terminal.size().map(|s| s.width).unwrap_or(80);
+        let content = render::content_width(width);
         let index = match self.transcript.iter().position(|entry| entry.id() == id) {
             Some(index) => index,
             None => return Ok(()),
@@ -231,7 +247,7 @@ impl crate::Tui {
             reasoning: reasoning.clone(),
             streaming: false,
         };
-        let prefix_height = render::entry_lines(&prefix_entry, false, width, self.theme).len();
+        let prefix_height = render::entry_lines(&prefix_entry, false, content, self.theme).len();
         if prefix_height <= budget {
             return Ok(());
         }
@@ -244,9 +260,11 @@ impl crate::Tui {
     /// The live-tail row budget applied while streaming: the tail region of a
     /// busy fixed-height viewport held at a minimal single-line prompt.
     fn streamed_tail_budget(&self) -> usize {
+        // Mirror `draw`: the live sections live inside `Margin { vertical }`,
+        // which removes one row at the top *and* the bottom of the viewport.
         let canvas = self
             .viewport_height
-            .saturating_sub(u16::from(self.viewport_height >= 8));
+            .saturating_sub(2 * render::vertical_pad(self.viewport_height));
         crate::layout::live_layout(canvas, true, 1, 0)
             .tail_rows
             .max(1) as usize

@@ -60,9 +60,70 @@ pub const MAX_COMPLETION_ROWS: usize = 8;
 pub const ACTIVITY_FRAMES: &[&str] = &["·", "∙", "•", "●", "•", "∙"];
 const USER_PREFIX: &str = "› ";
 const ASSISTANT_PREFIX: &str = "‹ ";
+
+// ---------------------------------------------------------------------------
+// Spacing design system
+//
+// Every blank row and blank column the UI inserts comes from here so that
+// committed scrollback, the live viewport, and separators share one rhythm:
+//
+// - `horizontal_pad`/`vertical_pad` define the gutter around content. The
+//   live viewport applies them as a `Margin`; committed lines are wrapped at
+//   `content_width` and then prefixed with the same gutter by `indent_lines`,
+//   so text keeps its wrap when it moves from the live tail into scrollback.
+// - `SECTION_GAP` is the blank-line count between transcript entries — one
+//   uniform gap between any two entries, tool boxes included.
+// - `BLOCK_GAP` is the blank-line count between blocks *inside* one entry
+//   (reasoning → markdown).
+// ---------------------------------------------------------------------------
+
+/// Blank lines between transcript entries. Tool boxes rely on this same gap
+/// rather than adding their own, so the rhythm between entries is uniform.
 pub const SECTION_GAP: usize = 1;
+/// Blank lines between blocks within a single entry (reasoning → markdown).
 pub const BLOCK_GAP: usize = 1;
+/// Rows of collapsed tool output kept in a tool box.
 pub const DEFAULT_TAIL_LINES: usize = 4;
+
+/// Columns of gutter on each side of content, live and committed alike.
+pub fn horizontal_pad(width: u16) -> u16 {
+    if width >= 80 {
+        2
+    } else if width >= 40 {
+        1
+    } else {
+        0
+    }
+}
+
+/// Blank rows above and below the live viewport's sections.
+pub fn vertical_pad(height: u16) -> u16 {
+    if height >= 8 { 1 } else { 0 }
+}
+
+/// The width content is wrapped at once the gutter is reserved on both sides.
+pub(crate) fn content_width(width: u16) -> usize {
+    width.saturating_sub(2 * horizontal_pad(width)).max(1) as usize
+}
+
+/// Prefix every non-blank line with `pad` spaces so committed scrollback
+/// keeps the same gutter the live viewport draws with `Margin`. Blank
+/// separator lines stay zero-width.
+pub(crate) fn indent_lines(lines: &mut [Line<'static>], pad: u16) {
+    if pad == 0 {
+        return;
+    }
+    let gutter = " ".repeat(pad as usize);
+    for line in lines.iter_mut() {
+        let blank = line
+            .spans
+            .iter()
+            .all(|span| span.content.as_ref().trim().is_empty());
+        if !blank {
+            line.spans.insert(0, Span::raw(gutter.clone()));
+        }
+    }
+}
 
 /// Key descriptions shown to users. Rendered inside a startup welcome banner
 /// committed into scrollback at first draw; kept here so the keymap cannot
@@ -829,9 +890,9 @@ pub fn entry_lines(
             }
         }
         TranscriptEntry::Tool { record, .. } => {
-            push_blank(&mut lines, BLOCK_GAP);
+            // No extra gap here: entries are separated uniformly by
+            // `SECTION_GAP`, so tool boxes do not double the padding.
             lines.extend(tool_box_lines(record, expanded, width, theme));
-            push_blank(&mut lines, BLOCK_GAP);
         }
         TranscriptEntry::Notice { text, .. } => lines.extend(notice_lines(text, theme, width)),
         TranscriptEntry::Error { text, .. } => lines.extend(error_lines(text, theme, width)),
@@ -1592,6 +1653,75 @@ mod tests {
                     assert!(
                         w <= width,
                         "entry {index} line is {w} wide but width is {width}: {}",
+                        span_contents(line)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn content_width_reserves_the_gutter_on_both_sides() {
+        assert_eq!(content_width(80), 76);
+        assert_eq!(content_width(100), 96);
+        assert_eq!(content_width(79), 77);
+        assert_eq!(content_width(40), 38);
+        assert_eq!(content_width(39), 39);
+        assert_eq!(content_width(20), 20);
+        assert_eq!(content_width(2), 2);
+    }
+
+    #[test]
+    fn indent_lines_prefixes_content_but_not_blank_separators() {
+        let mut lines = vec![
+            line_with_style("hello", Style::default()),
+            blank_line(),
+            Line::from(vec![Span::raw("a"), Span::raw("b")]),
+        ];
+        indent_lines(&mut lines, 2);
+        let values: Vec<String> = lines.iter().map(span_contents).collect();
+        assert_eq!(values, vec!["  hello", "", "  ab"]);
+
+        // A zero pad is a no-op.
+        indent_lines(&mut lines, 0);
+        assert_eq!(span_contents(&lines[0]), "  hello");
+    }
+
+    #[test]
+    fn committed_lines_wrapped_at_content_width_stay_within_the_terminal() {
+        // entry_lines wraps at content_width; adding the gutter must never
+        // push a committed line past the real terminal width.
+        let entries = [
+            TranscriptEntry::User {
+                id: 1,
+                text: "a ".repeat(100),
+            },
+            TranscriptEntry::Assistant {
+                id: 2,
+                markdown: "**bold** `code` ".repeat(40),
+                reasoning: "thinking ".repeat(60),
+                streaming: false,
+            },
+            TranscriptEntry::Tool {
+                id: 3,
+                record: record(ToolStatus::Success),
+                expanded: false,
+            },
+            TranscriptEntry::Notice {
+                id: 4,
+                text: "notice ".repeat(60),
+            },
+        ];
+        for width in [20u16, 40, 60, 80, 120] {
+            let pad = horizontal_pad(width);
+            for entry in &entries {
+                let mut lines = entry_lines(entry, false, content_width(width), Theme::default());
+                indent_lines(&mut lines, pad);
+                for line in &lines {
+                    let used = line_width(line);
+                    assert!(
+                        used <= width as usize,
+                        "line is {used} wide but terminal is {width}: {}",
                         span_contents(line)
                     );
                 }

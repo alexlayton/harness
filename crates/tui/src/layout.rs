@@ -26,6 +26,9 @@ pub(crate) struct LiveLayout {
     pub(crate) completion_rows: u16,
     pub(crate) activity_rows: u16,
     pub(crate) metadata_rows: u16,
+    /// Blank row between the live tail and the first section below it, so
+    /// streaming text never touches the activity line or the input box.
+    pub(crate) gap_rows: u16,
     pub(crate) tail_rows: u16,
 }
 
@@ -40,6 +43,8 @@ pub(crate) struct LiveLayout {
 ///   input always keeps its minimum.
 /// - Completion (while typing, i.e. idle) takes rows before the live tail;
 ///   the tail absorbs whatever is left.
+/// - One blank `gap_rows` separates the tail from the sections below it, but
+///   only when it would not eliminate the tail's last visible row.
 /// - The section heights always sum to exactly `height`, so `Layout::split`
 ///   yields contiguous, in-bounds, non-overlapping rects.
 pub(crate) fn live_layout(
@@ -69,13 +74,20 @@ pub(crate) fn live_layout(
     };
     let after_activity = after_metadata - activity;
     let completion_rows = requested_completion_rows.min(after_activity);
-    let tail_rows = after_activity - completion_rows;
+    let mut tail_rows = after_activity - completion_rows;
+    // A blank row between the live tail and whatever sits below it (activity
+    // line, completion popup, metadata, or the input box) — never spent when
+    // it would hide the tail's last visible row.
+    let has_below = activity > 0 || completion_rows > 0 || metadata > 0;
+    let gap_rows = u16::from(tail_rows > 1 && has_below);
+    tail_rows -= gap_rows;
 
     LiveLayout {
         prompt_rows,
         completion_rows,
         activity_rows: activity,
         metadata_rows: metadata,
+        gap_rows,
         tail_rows,
     }
 }
@@ -86,14 +98,8 @@ impl crate::Tui {
             // `frame.area()` is the H-row inline viewport; ratatui already
             // auto-resized it, so layout can only ever address rows within it.
             let area = frame.area();
-            let horizontal = if area.width >= 80 {
-                2
-            } else if area.width >= 40 {
-                1
-            } else {
-                0
-            };
-            let vertical = if area.height >= 8 { 1 } else { 0 };
+            let horizontal = render::horizontal_pad(area.width);
+            let vertical = render::vertical_pad(area.height);
             let outer = area.inner(Margin {
                 horizontal,
                 vertical,
@@ -155,6 +161,7 @@ impl crate::Tui {
 
             let constraints = vec![
                 Constraint::Length(budget.tail_rows),
+                Constraint::Length(budget.gap_rows),
                 Constraint::Length(budget.activity_rows),
                 Constraint::Length(budget.completion_rows),
                 Constraint::Length(budget.metadata_rows),
@@ -166,12 +173,13 @@ impl crate::Tui {
                 .split(outer);
 
             // render_tail always shows the newest rows of the live tail.
+            // chunks[1] is the blank gap row and stays unrendered.
             if budget.tail_rows > 0 {
                 render::render_tail(chunks[0], &tail_lines, self.theme, frame);
             }
             if budget.activity_rows > 0 {
                 render::render_activity(
-                    chunks[1],
+                    chunks[2],
                     self.activity.label(),
                     self.spinner,
                     self.theme,
@@ -182,7 +190,7 @@ impl crate::Tui {
                 && budget.completion_rows > 0
             {
                 render::render_completion(
-                    chunks[2],
+                    chunks[3],
                     &completion.candidates,
                     completion.selected,
                     completion.offset,
@@ -192,7 +200,7 @@ impl crate::Tui {
             }
             if budget.metadata_rows > 0 {
                 render_metadata(
-                    chunks[3],
+                    chunks[4],
                     &self.environment.cwd_display,
                     self.environment.branch.as_deref(),
                     &self.provider,
@@ -202,7 +210,7 @@ impl crate::Tui {
                 );
             }
             render::render_prompt(
-                chunks[4],
+                chunks[5],
                 &self.textarea,
                 self.prompt_scroll,
                 hidden_above,
@@ -299,11 +307,40 @@ mod tests {
     fn split_constraints(budget: LiveLayout) -> Vec<Constraint> {
         vec![
             Constraint::Length(budget.tail_rows),
+            Constraint::Length(budget.gap_rows),
             Constraint::Length(budget.activity_rows),
             Constraint::Length(budget.completion_rows),
             Constraint::Length(budget.metadata_rows),
             Constraint::Length(budget.prompt_rows),
         ]
+    }
+
+    #[test]
+    fn live_layout_puts_one_blank_row_between_tail_and_sections_below() {
+        // A busy 14-row canvas with a minimal prompt leaves room for tail,
+        // gap, activity, metadata, and the input box.
+        let budget = live_layout(14, true, 1, 0);
+        assert_eq!(budget.activity_rows, 1);
+        assert_eq!(budget.metadata_rows, 1);
+        assert_eq!(budget.prompt_rows, 3);
+        assert_eq!(budget.gap_rows, 1, "streaming text needs breathing room");
+        assert!(budget.tail_rows >= 1);
+
+        // Nothing below the tail on a tiny canvas: no gap to spend.
+        let budget = live_layout(5, true, 1, 0);
+        assert_eq!(budget.metadata_rows, 0);
+        assert_eq!(budget.activity_rows, 0);
+        assert_eq!(budget.gap_rows, 0);
+
+        // The gap never eliminates the tail's last visible row.
+        let budget = live_layout(6, true, 1, 0);
+        assert_eq!(budget.metadata_rows, 1);
+        assert_eq!(budget.tail_rows, 1);
+        assert_eq!(budget.gap_rows, 1);
+        let budget = live_layout(7, true, 1, 0);
+        assert_eq!(budget.activity_rows, 1);
+        assert_eq!(budget.tail_rows, 1);
+        assert_eq!(budget.gap_rows, 1);
     }
 
     /// The fixed-canvas budget yields non-overlapping, in-bounds, contiguous
@@ -329,6 +366,7 @@ mod tests {
                             + budget.completion_rows
                             + budget.activity_rows
                             + budget.metadata_rows
+                            + budget.gap_rows
                             + budget.tail_rows;
                         assert_eq!(total, height, "height {height} busy {busy}");
 
