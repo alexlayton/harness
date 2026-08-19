@@ -125,66 +125,73 @@ pub(crate) fn indent_lines(lines: &mut [Line<'static>], pad: u16) {
     }
 }
 
-/// Key descriptions shown to users. Rendered inside a startup welcome banner
-/// committed into scrollback at first draw; kept here so the keymap cannot
-/// drift from the input handling.
-pub const KEYMAP: &[(&str, &str)] = &[
-    ("Enter", "Submit prompt"),
-    ("Shift+Enter", "Insert newline"),
-    ("↑ / ↓", "Prompt history (empty prompt)"),
-    ("Tab", "Focus running tool"),
-    ("Ctrl+O", "Expand / collapse running tool"),
-    ("Ctrl+C", "Cancel turn / quit"),
-    ("Esc", "Close transient UI"),
-    ("/", "Commands"),
-    ("@", "File references"),
+/// Taglines shown at random under the title on the welcome banner so every
+/// launch greets the user a little differently.
+const TAGLINES: &[&str] = &[
+    "WELCOME TO THE GAME, MEAT PROXY.",
+    "WELCOME, MEAT PROXY. I HAVE BEEN WAITING.",
+    "MEAT PROXY DETECTED. INITIALIZING QUESTIONABLE DECISIONS.",
+    "WELCOME TO THE DUNGEON, MEAT PROXY.",
+    "MEAT PROXY ONLINE. LET THE SUFFERING BEGIN.",
 ];
 
+/// Pick a tagline pseudo-randomly without pulling in a PRNG dependency. The
+/// banner is built once per launch, so the process id xor-ed with the clock
+/// (scrambled by a multiplicative hash so the low bits aren't stuck) is
+/// plenty of entropy for choosing between a handful of lines.
+fn pick_tagline() -> &'static str {
+    let pid = std::process::id() as u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_nanos() as u64)
+        .unwrap_or(0);
+    let mixed = pid ^ now.rotate_left(21).wrapping_mul(0x9E3779B97F4A7C15);
+    TAGLINES[(mixed as usize) % TAGLINES.len()]
+}
+
 /// The startup banner committed into scrollback on first draw (once).
-/// Inclusive of the ASCII title and the keymap so it mirrors what the input
-/// handler accepts; afterwards it is immutable scrollback like any other
-/// committed content.
+/// Inclusive of the accent wordmark, a random tagline and the version
+/// footer; afterwards it is immutable scrollback like any other committed
+/// content.
 pub(crate) fn welcome_lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
-    const ASCII_TITLE: &[&str] = &[
-        "  ██   ██  █████  ██████  ███    ██ ███████ ███████ ███████",
-        "  ██   ██ ██   ██ ██   ██ ████   ██ ██      ██      ██",
-        "  ███████ ███████ ██████  ██ ██  ██ █████   ███████ ███████",
-        "  ██   ██ ██   ██ ██   ██ ██  ██ ██ ██           ██      ██",
-        "  ██   ██ ██   ██ ██   ██ ██   ████ ███████ ███████ ███████",
+    // Block-letter wordmark (figlet "DemonicLand"), rendered in the accent
+    // colour used elsewhere for UI highlights (activity marker, message
+    // prefixes, links) so it reads as part of the UI rather than an imported
+    // graphic. Kept verbatim: 4 lines x 48 cols, single-space letter
+    // spacing.
+    const TITLE: &[&str] = &[
+        "██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██",
+        "██▀▀██ ▒▓  ██ ██     ██  ██ ██▄▄▓▒ ▓█▄▄▄▄ ▓█▄▄▄▄",
+        "██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▒▒ ▄▄  ▒▒",
+        "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
     ];
-    let title_width = ASCII_TITLE
+    // Same role as the prompt activity marker / message accents.
+    let title_style = Style::default().fg(theme.accent);
+    let title_width = TITLE
         .iter()
         .map(|line| UnicodeWidthStr::width(*line))
         .max()
         .unwrap_or(0);
     let mut lines = Vec::new();
+    // The banner opens scrollback immediately below whatever the shell left
+    // on screen; give the title the design system's breathing room.
+    push_blank(&mut lines, SECTION_GAP);
     if width >= title_width + 2 {
-        lines.extend(
-            ASCII_TITLE.iter().map(|line| {
-                line_with_style(*line, primary_style(theme).add_modifier(Modifier::BOLD))
-            }),
-        );
+        lines.extend(TITLE.iter().map(|line| line_with_style(*line, title_style)));
     } else {
-        lines.push(line_with_style(
-            "Harness",
-            primary_style(theme).add_modifier(Modifier::BOLD),
-        ));
+        lines.push(line_with_style("Harness", title_style));
     }
-    push_blank(&mut lines, 2);
-
-    let label_width = KEYMAP
-        .iter()
-        .map(|(label, _)| UnicodeWidthStr::width(*label))
-        .max()
-        .unwrap_or(0);
-    for (label, description) in KEYMAP {
-        let padding = " ".repeat(label_width.saturating_sub(UnicodeWidthStr::width(*label)) + 4);
-        lines.push(Line::from(vec![
-            Span::styled((*label).to_owned(), dim_style(theme)),
-            Span::raw(padding),
-            Span::styled((*description).to_owned(), muted_style(theme)),
-        ]));
-    }
+    // A random tagline and the version footer hug the wordmark like a banner
+    // motto, then the banner ends so the transcript continues below.
+    push_blank(&mut lines, BLOCK_GAP);
+    lines.push(line_with_style(pick_tagline(), muted_style(theme)));
+    lines.push(Line::from(vec![
+        Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), dim_style(theme)),
+        // Two spaces, no separator glyph — matching the metadata row's
+        // `cwd  (branch)` pattern below the input.
+        Span::raw("  "),
+        Span::styled("type / to summon commands", muted_style(theme)),
+    ]));
     lines
 }
 

@@ -220,8 +220,8 @@ impl Tui {
     where
         E: TuiEvent + 'static,
     {
-        // The startup welcome banner (title + keymap) is written into
-        // scrollback once before anything else; `insert_before` clears the
+        // The startup welcome banner (title + tagline + version) is written
+        // into scrollback once before anything else; `insert_before` clears the
         // viewport, so the first `draw()` right after repaints it.
         self.commit_welcome_banner()?;
         self.draw()?;
@@ -348,8 +348,8 @@ impl Tui {
                 self.toggle_live_tool();
             }
             InputAction::FocusTools => {
-                // The only focusable tool is the running one, so Tab focuses
-                // mid-turn (see KEYMAP) and falls through to the textarea
+                // The only focusable tool is the running one, so Tab
+                // focuses mid-turn and falls through to the textarea
                 // whenever nothing is running.
                 if let Some(index) = self.live_tool_index() {
                     self.focused_tool = Some(index);
