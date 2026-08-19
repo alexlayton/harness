@@ -58,8 +58,7 @@ pub struct SkillCatalog {
     pub diagnostics: Vec<SkillDiagnostic>,
     /// Absolute paths (files AND dirs) that `read` may access for skills:
     /// every skill's `file_path`, plus its `base_dir` (so `scripts/`
-    /// `references/` `assets/` are reachable), plus any explicit `--skill`
-    /// file/dir paths.
+    /// `references/` `assets/` are reachable).
     pub read_paths: Vec<PathBuf>,
 }
 
@@ -397,7 +396,7 @@ pub fn load_skills_from_dir(root: &Path, mode: &str, source: &str) -> SkillCatal
 /// Discover skills from the given root directories (in order), deduping by
 /// name with **project-beats-global** first-wins (decision 1). `roots` is a
 /// list of `(path, mode)` in priority order: project dirs first (cwd →
-/// ancestors), then global, then explicit `--skill` paths last.
+/// ancestors), then global.
 pub fn discover(roots: &[(PathBuf, String)]) -> SkillCatalog {
     let mut all_skills = Vec::new();
     let mut all_diagnostics = Vec::new();

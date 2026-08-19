@@ -134,10 +134,6 @@ pub struct FileConfig {
     /// harness versions treat the config as unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactConfig>,
-    /// Explicit skill paths (files or directories), additive with the
-    /// default `.harness/skills` + `.agents/skills` discovery.
-    #[serde(default)]
-    pub skills: Vec<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -151,7 +147,6 @@ impl PartialEq for FileConfig {
             && self.model == other.model
             && self.rtk == other.rtk
             && self.compaction == other.compaction
-            && self.skills == other.skills
             && self.extra == other.extra
     }
 }
@@ -316,10 +311,6 @@ pub struct Cli {
     #[arg(long, value_name = "ID|latest|PATH")]
     pub resume: Option<String>,
 
-    /// Add an explicit skill path (file or directory). Repeatable.
-    #[arg(long = "skill", value_name = "PATH")]
-    pub skills: Vec<String>,
-
     /// Prompt for non-interactive mode. Joined with spaces. When `--print` is
     /// set and no positional is given, the prompt is read from stdin.
     /// Only meaningful with `--print`; passing it without `--print` is an
@@ -336,8 +327,6 @@ pub struct Config {
     pub config_path: PathBuf,
     pub rtk: bool,
     pub compaction: CompactionPolicy,
-    /// Explicit skill paths from config `skills` + CLI `--skill`.
-    pub skills: Vec<String>,
 }
 
 impl Config {
@@ -433,8 +422,6 @@ impl Config {
             .clone()
             .or_else(|| file.model.clone())
             .unwrap_or_else(|| provider.default_model().to_owned());
-        let mut skills = file.skills.clone();
-        skills.extend(cli.skills.iter().cloned());
         Ok(Self {
             provider,
             model,
@@ -446,7 +433,6 @@ impl Config {
                 .as_ref()
                 .map(CompactionPolicy::from)
                 .unwrap_or_default(),
-            skills,
         })
     }
 }
@@ -672,7 +658,6 @@ mod tests {
                 keep_recent_turns: Some(5),
                 ..CompactConfig::default()
             }),
-            skills: vec![],
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),

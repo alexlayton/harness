@@ -105,10 +105,6 @@ pub trait Tool: Send + Sync {
 pub struct ToolConfig {
     pub cwd: PathBuf,
     pub rtk: bool,
-    /// Explicit skill roots / single-skill files (config `skills` + CLI
-    /// `--skill`), resolved relative to `cwd`. Scanned last (project beats
-    /// global beats explicit).
-    pub skills_roots: Vec<String>,
 }
 
 impl ToolConfig {
@@ -116,15 +112,7 @@ impl ToolConfig {
         Self {
             cwd: cwd.into(),
             rtk,
-            skills_roots: Vec::new(),
         }
-    }
-
-    /// Add explicit skill paths (files or directories, resolved relative to
-    /// the workspace root at discovery time).
-    pub fn with_skills(mut self, roots: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.skills_roots = roots.into_iter().map(Into::into).collect();
-        self
     }
 
     pub fn from_current_dir(rtk: bool) -> Self {
@@ -160,14 +148,14 @@ pub enum ToolInitError {
     Registry(#[from] ToolRegistryError),
 }
 
-/// Construct the five built-in tools for one workspace.  The index is created
+/// Construct the built-in tools for one workspace.  The index is created
 /// once here and shared by every `find` call; it is never initialized per
 /// request.
 ///
-/// Skills are discovered from the configured roots (and explicit `--skill`
-/// paths); the discovered skill paths are handed to `ReadTool` (pi model: the
-/// model reads a skill's `SKILL.md` via `read` on the absolute `<location>`),
-/// and the catalog is stored on the registry for the prompt builder.
+/// Skills are discovered from the project walk + global roots; the
+/// discovered skill paths are handed to `ReadTool` (pi model: the model
+/// reads a skill's `SKILL.md` via `read` on the absolute `<location>`), and
+/// the catalog is stored on the registry for the prompt builder.
 ///
 /// The generic argument preserves the old `default_registry(false)` spelling
 /// while also accepting the workspace-aware [`ToolConfig`] used by the
@@ -180,7 +168,7 @@ pub fn default_registry(config: impl Into<ToolConfig>) -> Result<ToolRegistry, T
             source,
         })?;
 
-    let skills = discover_skills_for_config(&config.skills_roots, &workspace_root);
+    let skills = discover_skills_for_config(&workspace_root);
     let read_paths = skills.read_paths.clone();
 
     let index = Arc::new(
@@ -209,10 +197,7 @@ pub fn default_registry(config: impl Into<ToolConfig>) -> Result<ToolRegistry, T
     Ok(registry)
 }
 
-pub(crate) fn discover_skills_for_config(
-    skill_roots: &[String],
-    workspace_root: &Path,
-) -> SkillCatalog {
+pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
     // Project roots: cwd up to git repo root (or filesystem root).
     let mut roots: Vec<(PathBuf, String)> = Vec::new();
     let mut dir = workspace_root.to_path_buf();
@@ -245,22 +230,6 @@ pub(crate) fn discover_skills_for_config(
         .unwrap_or_default();
     if !agents_global.as_os_str().is_empty() {
         roots.push((agents_global, "agents".into()));
-    }
-    // Explicit paths (config `skills` + CLI `--skill`) last; treat a dir as
-    // pi-mode and a file as a single skill (a file path is loaded by the
-    // `load_skills_from_dir` root-level .md rule when it sits directly under
-    // the dir; a bare file path is handled below).
-    for p in skill_roots {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            // A single explicit skill file: wrap in a one-entry catalog via
-            // discovery of its parent with an allowlist of just this file.
-            if let Some(parent) = path.parent() {
-                roots.push((parent.to_path_buf(), "pi".into()));
-            }
-        } else {
-            roots.push((path, "pi".into()));
-        }
     }
     discover(&roots)
 }

@@ -77,15 +77,6 @@ impl ToolRegistry {
         self.skills.as_ref()
     }
 
-    /// Render the skills section of the system prompt (empty when no
-    /// model-invocable skills exist).
-    pub fn skills_prompt(&self) -> String {
-        self.skills
-            .as_ref()
-            .map(super::skills::format_skills_prompt)
-            .unwrap_or_default()
-    }
-
     pub fn register(&mut self, tool: Box<dyn Tool>) -> Result<(), ToolRegistryError> {
         let spec = tool.spec();
         let name = spec.definition.name.clone();
