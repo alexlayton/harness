@@ -64,19 +64,68 @@ pub const SECTION_GAP: usize = 1;
 pub const BLOCK_GAP: usize = 1;
 pub const DEFAULT_TAIL_LINES: usize = 4;
 
-/// Key descriptions shown to users. Phase 3 renders these inside a startup
-/// welcome banner committed into scrollback; kept here so the keymap cannot
+/// Key descriptions shown to users. Rendered inside a startup welcome banner
+/// committed into scrollback at first draw; kept here so the keymap cannot
 /// drift from the input handling.
 pub const KEYMAP: &[(&str, &str)] = &[
     ("Enter", "Submit prompt"),
     ("Shift+Enter", "Insert newline"),
-    ("↑ / ↓", "Move through prompt"),
-    ("Ctrl+O", "Expand / collapse all tools"),
-    ("Ctrl+C", "Cancel / quit"),
+    ("↑ / ↓", "Prompt history (empty prompt)"),
+    ("Tab", "Focus running tool"),
+    ("Ctrl+O", "Expand / collapse running tool"),
+    ("Ctrl+C", "Cancel turn / quit"),
     ("Esc", "Close transient UI"),
     ("/", "Commands"),
     ("@", "File references"),
 ];
+
+/// The startup banner committed into scrollback on first draw (once).
+/// Inclusive of the ASCII title and the keymap so it mirrors what the input
+/// handler accepts; afterwards it is immutable scrollback like any other
+/// committed content.
+pub(crate) fn welcome_lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
+    const ASCII_TITLE: &[&str] = &[
+        "  ██   ██  █████  ██████  ███    ██ ███████ ███████ ███████",
+        "  ██   ██ ██   ██ ██   ██ ████   ██ ██      ██      ██",
+        "  ███████ ███████ ██████  ██ ██  ██ █████   ███████ ███████",
+        "  ██   ██ ██   ██ ██   ██ ██  ██ ██ ██           ██      ██",
+        "  ██   ██ ██   ██ ██   ██ ██   ████ ███████ ███████ ███████",
+    ];
+    let title_width = ASCII_TITLE
+        .iter()
+        .map(|line| UnicodeWidthStr::width(*line))
+        .max()
+        .unwrap_or(0);
+    let mut lines = Vec::new();
+    if width >= title_width + 2 {
+        lines.extend(
+            ASCII_TITLE.iter().map(|line| {
+                line_with_style(*line, primary_style(theme).add_modifier(Modifier::BOLD))
+            }),
+        );
+    } else {
+        lines.push(line_with_style(
+            "Harness",
+            primary_style(theme).add_modifier(Modifier::BOLD),
+        ));
+    }
+    push_blank(&mut lines, 2);
+
+    let label_width = KEYMAP
+        .iter()
+        .map(|(label, _)| UnicodeWidthStr::width(*label))
+        .max()
+        .unwrap_or(0);
+    for (label, description) in KEYMAP {
+        let padding = " ".repeat(label_width.saturating_sub(UnicodeWidthStr::width(*label)) + 4);
+        lines.push(Line::from(vec![
+            Span::styled((*label).to_owned(), dim_style(theme)),
+            Span::raw(padding),
+            Span::styled((*description).to_owned(), muted_style(theme)),
+        ]));
+    }
+    lines
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MarkdownTheme {
@@ -737,7 +786,7 @@ fn tool_box_lines(
         }
         push_tool_body_line(
             &mut lines,
-            line_with_style("ctrl + o to expand all", tool_hint_style(theme)),
+            line_with_style("ctrl + o to expand", tool_hint_style(theme)),
             width,
             border,
             tool_hint_style(theme),
@@ -830,13 +879,34 @@ pub fn render_activity(
     );
 }
 
-pub fn input_block(theme: Theme, focused: bool) -> Block<'static> {
+/// The input-box border. `hidden_above`/`hidden_below` are rows scrolled out
+/// of the visible window on each side; when nonzero the adjacent border gains
+/// a dim `+N` title (exactly `+N` — no arrow, no "more").
+pub fn input_block(
+    theme: Theme,
+    focused: bool,
+    hidden_above: usize,
+    hidden_below: usize,
+) -> Block<'static> {
     let border = if focused { theme.focus } else { theme.dim_text };
-    Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border))
-        .padding(Padding::horizontal(1))
+        .padding(Padding::horizontal(1));
+    if hidden_above > 0 {
+        block = block.title_top(Line::from(Span::styled(
+            format!("+{hidden_above}"),
+            dim_style(theme),
+        )));
+    }
+    if hidden_below > 0 {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!("+{hidden_below}"),
+            dim_style(theme),
+        )));
+    }
+    block
 }
 
 #[derive(Clone, Debug)]
@@ -972,10 +1042,12 @@ pub fn render_prompt(
     area: Rect,
     textarea: &TextArea<'_>,
     scroll_top: usize,
+    hidden_above: usize,
+    hidden_below: usize,
     theme: Theme,
     frame: &mut Frame<'_>,
 ) -> PromptLayout {
-    let block = input_block(theme, true);
+    let block = input_block(theme, true, hidden_above, hidden_below);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -1081,6 +1153,7 @@ mod tests {
     use proptest::prelude::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::widgets::Widget;
     use tui_textarea::TextArea;
 
     fn record(status: ToolStatus) -> ToolRecord {
@@ -1178,7 +1251,8 @@ mod tests {
             .join("\n");
         assert!(value.contains("fifth"));
         assert!(!value.contains("first"));
-        assert!(value.contains("ctrl + o to expand all"));
+        assert!(value.contains("ctrl + o to expand"));
+        assert!(!value.contains("all"));
     }
 
     #[test]
@@ -1215,6 +1289,65 @@ mod tests {
             tool_border_style(&record(ToolStatus::Failure), theme).fg,
             Some(theme.tool_failure_border)
         );
+    }
+
+    #[test]
+    fn input_block_shows_plus_n_titles_when_rows_are_hidden() {
+        let theme = Theme::default();
+
+        // No hidden rows: no `+N` on either border.
+        let backend = TestBackend::new(12, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                input_block(theme, true, 0, 0).render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+        let top = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .take(12)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        let bottom = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .skip(24)
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!top.contains('+'));
+        assert!(!bottom.contains('+'));
+    }
+
+    #[test]
+    fn input_block_shows_top_and_bottom_plus_n() {
+        let theme = Theme::default();
+        let backend = TestBackend::new(12, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                input_block(theme, true, 3, 2).render(frame.area(), frame.buffer_mut());
+            })
+            .unwrap();
+        let content = terminal.backend().buffer().content();
+        let top: String = content.iter().take(12).map(|cell| cell.symbol()).collect();
+        let bottom: String = content.iter().skip(24).map(|cell| cell.symbol()).collect();
+        assert!(top.contains("+3"), "top border should show +3, got {top:?}");
+        assert!(
+            bottom.contains("+2"),
+            "bottom border should show +2, got {bottom:?}"
+        );
+
+        // Rendered titles are dim.
+        let dim_on_top = content.iter().take(12).any(|cell| {
+            cell.symbol() == "+" && cell.style().fg == Some(theme.dim_text)
+                || cell.symbol().starts_with('+') && cell.style().fg == Some(theme.dim_text)
+        });
+        assert!(dim_on_top, "+N title should be dimmed");
     }
 
     #[test]
@@ -1289,7 +1422,7 @@ mod tests {
     #[test]
     fn entry_lines_never_exceed_width() {
         let long_command = format!("bash: {}", "x".repeat(500));
-        let entries = vec![
+        let entries = [
             TranscriptEntry::User {
                 id: 1,
                 text: "a ".repeat(200),

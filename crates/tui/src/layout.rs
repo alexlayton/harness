@@ -1,11 +1,13 @@
 //! Layout arithmetic and terminal painting. `draw` sizes the live tail,
-//! completion, activity, metadata, and prompt rows, then delegates painting
-//! to `render`.
+//! activity, completion, metadata, and input rows inside the fixed H-row
+//! inline viewport, then delegates painting to `render`.
 //!
-//! The layout arithmetic is still the temporary pre-migration version (the
-//! Phase 3 rewrite lands later), but the live region now holds only the
-//! uncommitted tail: `transcript[committed..]`, the streaming assistant and/or
-//! running tool that the commit pipeline has not yet written into scrollback.
+//! The canvas is a fixed budget: the input box is anchored at the bottom and
+//! everything above it (metadata, activity, completion, then the live tail)
+//! takes whatever rows are left, degrading gracefully on tiny terminals. The
+//! live tail is always the newest rows of `transcript[committed..]` — it grows
+//! downward while streaming and the bottom stays visible with no user
+//! scrolling; committed history lives in the terminal's native scrollback.
 
 use crate::render::{self, Theme};
 use crate::state::TranscriptEntry;
@@ -14,6 +16,69 @@ use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthStr;
+
+/// The row budget for one live-viewport frame: one rect per section, top to
+/// bottom. Pure and exhaustive so the fixed-canvas arithmetic can be unit
+/// tested without a TTY (see the layout tests below).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveLayout {
+    pub(crate) prompt_rows: u16,
+    pub(crate) completion_rows: u16,
+    pub(crate) activity_rows: u16,
+    pub(crate) metadata_rows: u16,
+    pub(crate) tail_rows: u16,
+}
+
+/// Compute the section heights for a `height`-row canvas.
+///
+/// Budgeting rules:
+/// - The input box keeps a 3-row minimum and caps at `max(3, height - 2)`
+///   (the `−2` reserves the metadata and activity rows); while busy the tail
+///   needs at least one row, so the cap is trimmed to `min(cap, height - 4)`.
+/// - Metadata collapses on tiny canvases (<6 rows), activity only renders
+///   while busy and when the canvas leaves room (<7 rows hides it), so the
+///   input always keeps its minimum.
+/// - Completion (while typing, i.e. idle) takes rows before the live tail;
+///   the tail absorbs whatever is left.
+/// - The section heights always sum to exactly `height`, so `Layout::split`
+///   yields contiguous, in-bounds, non-overlapping rects.
+fn live_layout(
+    height: u16,
+    busy: bool,
+    desired_prompt_lines: usize,
+    requested_completion_rows: u16,
+) -> LiveLayout {
+    let input_cap = 3u16.max(height.saturating_sub(2));
+    let input_cap = if busy {
+        input_cap.min(height.saturating_sub(4)).max(3)
+    } else {
+        input_cap
+    };
+    let desired_prompt_rows = desired_prompt_lines.saturating_add(2) as u16;
+    let prompt_rows = desired_prompt_rows.clamp(3, input_cap.min(height));
+
+    let available = height.saturating_sub(prompt_rows);
+    // On tiny canvases the metadata/activity rows collapse entirely so the
+    // input keeps its 3-row minimum and the slack rows stay blank.
+    let metadata = if height >= 6 && available >= 2 { 1 } else { 0 };
+    let after_metadata = available - metadata;
+    let activity = if busy && height >= 7 && after_metadata >= 2 {
+        1
+    } else {
+        0
+    };
+    let after_activity = after_metadata - activity;
+    let completion_rows = requested_completion_rows.min(after_activity);
+    let tail_rows = after_activity - completion_rows;
+
+    LiveLayout {
+        prompt_rows,
+        completion_rows,
+        activity_rows: activity,
+        metadata_rows: metadata,
+        tail_rows,
+    }
+}
 
 impl crate::Tui {
     pub(crate) fn draw(&mut self) -> Result<()> {
@@ -36,79 +101,87 @@ impl crate::Tui {
             if outer.width == 0 || outer.height == 0 {
                 return;
             }
+            let canvas = outer.height;
 
             // Build the live tail from the uncommitted entries only. Each
             // entry keeps its own expansion state (Ctrl+O expands the running
-            // tool while it streams). The welcome banner is no longer painted
-            // here; Phase 3 commits it into scrollback at startup.
+            // tool while it streams). The welcome banner is committed into
+            // scrollback at startup, never painted here.
             let committed = self.committed.min(self.transcript.len());
             let live = &self.transcript[committed..];
-            let mut lines = Vec::new();
+            let mut tail_lines = Vec::new();
             for entry in live {
-                if !lines.is_empty() {
-                    render::push_blank(&mut lines, render::SECTION_GAP);
+                if !tail_lines.is_empty() {
+                    render::push_blank(&mut tail_lines, render::SECTION_GAP);
                 }
                 let expanded = matches!(entry, TranscriptEntry::Tool { expanded: true, .. });
-                lines.extend(render::entry_lines(
+                tail_lines.extend(render::entry_lines(
                     entry,
                     expanded,
                     outer.width as usize,
                     self.theme,
                 ));
             }
+
             let prompt_content_width = outer.width.saturating_sub(4).max(1) as usize;
             let prompt_layout =
                 render::prompt_layout(&self.textarea, prompt_content_width, self.theme);
-            let desired_prompt_rows = prompt_layout.lines.len().saturating_add(2) as u16;
             let requested_completion_rows = self
                 .completion
                 .as_ref()
                 .map(|completion| render::completion_rows(&completion.candidates))
                 .unwrap_or(0);
-            let activity_rows = u16::from(self.busy);
-            let minimum_layout_rows = 1u16
-                .saturating_add(3)
-                .saturating_add(1)
-                .saturating_add(activity_rows);
-            let completion_capacity = outer.height.saturating_sub(minimum_layout_rows);
-            let completion_rows = requested_completion_rows.min(completion_capacity);
-            let fixed_rows = completion_rows
-                .saturating_add(1)
-                .saturating_add(activity_rows);
-            let available = outer.height.saturating_sub(fixed_rows);
-            let max_prompt = ((outer.height as usize * crate::app::MAX_INPUT_FRACTION) / 100)
-                .max(3)
-                .min(u16::MAX as usize) as u16;
-            let prompt_rows = desired_prompt_rows
-                .max(3)
-                .min(max_prompt)
-                .min(available.saturating_sub(1).max(1));
-            let transcript_rows = available.saturating_sub(prompt_rows).max(1);
+            let budget = live_layout(
+                canvas,
+                self.busy,
+                prompt_layout.lines.len(),
+                requested_completion_rows,
+            );
 
-            let prompt_inner_height = prompt_rows.saturating_sub(2).max(1) as usize;
+            let prompt_inner_height = budget.prompt_rows.saturating_sub(2).max(1) as usize;
             self.prompt_scroll = render::prompt_scroll_for_cursor(
                 prompt_layout.cursor_row,
                 prompt_layout.lines.len(),
                 prompt_inner_height,
             );
+            let hidden_above = self.prompt_scroll;
+            // Rows hidden below the visible window inside the (possibly
+            // scrollable) input box; shown as `+N` on the bottom border.
+            let hidden_below = prompt_layout
+                .lines
+                .len()
+                .saturating_sub(self.prompt_scroll + prompt_inner_height);
 
-            // render_tail always shows the newest rows of the live tail.
             let constraints = vec![
-                Constraint::Length(transcript_rows),
-                Constraint::Length(completion_rows),
-                Constraint::Length(activity_rows),
-                Constraint::Length(1),
-                Constraint::Length(prompt_rows),
+                Constraint::Length(budget.tail_rows),
+                Constraint::Length(budget.activity_rows),
+                Constraint::Length(budget.completion_rows),
+                Constraint::Length(budget.metadata_rows),
+                Constraint::Length(budget.prompt_rows),
             ];
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(constraints)
                 .split(outer);
 
-            render::render_tail(chunks[0], &lines, self.theme, frame);
-            if let Some(completion) = self.completion.as_ref() {
-                render::render_completion(
+            // render_tail always shows the newest rows of the live tail.
+            if budget.tail_rows > 0 {
+                render::render_tail(chunks[0], &tail_lines, self.theme, frame);
+            }
+            if budget.activity_rows > 0 {
+                render::render_activity(
                     chunks[1],
+                    self.activity.label(),
+                    self.spinner,
+                    self.theme,
+                    frame,
+                );
+            }
+            if let Some(completion) = self.completion.as_ref()
+                && budget.completion_rows > 0
+            {
+                render::render_completion(
+                    chunks[2],
                     &completion.candidates,
                     completion.selected,
                     completion.offset,
@@ -116,26 +189,23 @@ impl crate::Tui {
                     frame,
                 );
             }
-            render::render_activity(
-                chunks[2],
-                self.activity.label(),
-                self.spinner,
-                self.theme,
-                frame,
-            );
-            render_metadata(
-                chunks[3],
-                &self.environment.cwd_display,
-                self.environment.branch.as_deref(),
-                &self.provider,
-                &self.model,
-                self.theme,
-                frame,
-            );
+            if budget.metadata_rows > 0 {
+                render_metadata(
+                    chunks[3],
+                    &self.environment.cwd_display,
+                    self.environment.branch.as_deref(),
+                    &self.provider,
+                    &self.model,
+                    self.theme,
+                    frame,
+                );
+            }
             render::render_prompt(
                 chunks[4],
                 &self.textarea,
                 self.prompt_scroll,
+                hidden_above,
+                hidden_below,
                 self.theme,
                 frame,
             );
@@ -216,4 +286,81 @@ fn truncate_display(value: &str, width: usize) -> String {
     }
     result.push('…');
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::TerminalOptions;
+    use ratatui::backend::TestBackend;
+
+    fn split_constraints(budget: LiveLayout) -> Vec<Constraint> {
+        vec![
+            Constraint::Length(budget.tail_rows),
+            Constraint::Length(budget.activity_rows),
+            Constraint::Length(budget.completion_rows),
+            Constraint::Length(budget.metadata_rows),
+            Constraint::Length(budget.prompt_rows),
+        ]
+    }
+
+    /// The fixed-canvas budget yields non-overlapping, in-bounds, contiguous
+    /// rects for every terminal height in the supported band, busy or not,
+    /// with a completion popup open or not, and with a prompt grown past its
+    /// cap. Sections may be zero-height (e.g. tail on a tiny idle canvas) but
+    /// must never overlap or escape the viewport.
+    #[test]
+    fn live_layout_rects_stay_in_bounds_and_do_not_overlap() {
+        for height in [5u16, 8, 12, 16] {
+            for busy in [false, true] {
+                for completion in [0u16, 3, 8] {
+                    for prompt_lines in [1usize, 3, 20] {
+                        let budget = live_layout(height, busy, prompt_lines, completion);
+                        // The input box never drops below its 3-row minimum
+                        // and the budget never exceeds the canvas.
+                        assert!(
+                            budget.prompt_rows >= 3,
+                            "height {height} busy {busy} gave prompt {}",
+                            budget.prompt_rows
+                        );
+                        let total = budget.prompt_rows
+                            + budget.completion_rows
+                            + budget.activity_rows
+                            + budget.metadata_rows
+                            + budget.tail_rows;
+                        assert_eq!(total, height, "height {height} busy {busy}");
+
+                        // Split a real inline viewport and check the geometry.
+                        let backend = TestBackend::new(80, height);
+                        let mut terminal = Terminal::with_options(
+                            backend,
+                            TerminalOptions {
+                                viewport: ratatui::Viewport::Inline(height),
+                            },
+                        )
+                        .unwrap();
+                        terminal
+                            .draw(|frame| {
+                                let chunks = Layout::default()
+                                    .direction(Direction::Vertical)
+                                    .constraints(split_constraints(budget))
+                                    .split(frame.area());
+                                let mut previous_bottom = 0u16;
+                                for chunk in chunks.iter() {
+                                    assert_eq!(chunk.x, 0);
+                                    assert_eq!(chunk.width, 80);
+                                    assert!(chunk.y >= previous_bottom);
+                                    assert!(chunk.y + chunk.height <= height);
+                                    previous_bottom = chunk.y + chunk.height;
+                                }
+                                let last = chunks.last().unwrap();
+                                assert_eq!(last.y + last.height, height);
+                            })
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    }
 }

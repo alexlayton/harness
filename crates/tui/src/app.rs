@@ -98,6 +98,8 @@ pub struct Tui {
     /// Number of entries at the front of `transcript` already committed into
     /// scrollback. Everything after this index is the live (uncommitted) tail.
     pub(crate) committed: usize,
+    /// Whether the startup welcome banner has been committed into scrollback.
+    pub(crate) welcome_shown: bool,
     pub(crate) next_entry_id: EntryId,
     pub(crate) streaming_assistant: Option<EntryId>,
     pub(crate) running_tool: Option<EntryId>,
@@ -174,6 +176,7 @@ impl Tui {
             draft: String::new(),
             transcript: Vec::new(),
             committed: 0,
+            welcome_shown: false,
             next_entry_id: 1,
             streaming_assistant: None,
             running_tool: None,
@@ -212,6 +215,10 @@ impl Tui {
     where
         E: TuiEvent + 'static,
     {
+        // The startup welcome banner (title + keymap) is written into
+        // scrollback once before anything else; `insert_before` clears the
+        // viewport, so the first `draw()` right after repaints it.
+        self.commit_welcome_banner()?;
         self.draw()?;
         let mut input_events = EventStream::new();
         let mut spinner_tick = tokio::time::interval(Duration::from_millis(200));

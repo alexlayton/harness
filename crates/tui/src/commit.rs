@@ -100,6 +100,26 @@ impl crate::Tui {
         self.commit_lines(&mut lines)
     }
 
+    /// Commit the startup welcome banner (title + keymap) into scrollback
+    /// exactly once, before the first `draw()`. The transcript is empty at
+    /// that point; a later `/load` commits its history below the banner,
+    /// which is accepted (pi behaves the same).
+    pub(crate) fn commit_welcome_banner(&mut self) -> anyhow::Result<()> {
+        if self.welcome_shown {
+            return Ok(());
+        }
+        self.welcome_shown = true;
+        if !self.transcript.is_empty() {
+            return Ok(());
+        }
+        let width = self.terminal.size().map(|s| s.width as usize).unwrap_or(80);
+        let mut lines = render::welcome_lines(width, self.theme);
+        if let Err(error) = self.commit_lines(&mut lines) {
+            self.add_error(format!("failed to write welcome banner: {error:#}"));
+        }
+        Ok(())
+    }
+
     /// Render `lines` into a temporary buffer and splice it above the inline
     /// viewport. `insert_before` (default ratatui features) clears the
     /// viewport afterwards, so callers must `draw()` in the same event-loop
