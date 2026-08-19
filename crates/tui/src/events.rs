@@ -98,14 +98,6 @@ impl crate::Tui {
                 }
                 true
             }
-            KeyCode::Char('k') if key.modifiers.is_empty() && self.textarea.is_empty() => {
-                self.scroll_transcript(-1);
-                true
-            }
-            KeyCode::Char('j') if key.modifiers.is_empty() && self.textarea.is_empty() => {
-                self.scroll_transcript(1);
-                true
-            }
             _ => false,
         }
     }
@@ -410,8 +402,6 @@ impl crate::Tui {
                 self.streaming_assistant = None;
                 self.running_tool = None;
                 self.focused_tool = None;
-                self.scroll = crate::state::ScrollState::default();
-                self.transcript_dirty = true;
                 if loaded {
                     self.add_notice(format!("loaded session {}", &id[..id.len().min(8)]));
                 }
@@ -555,10 +545,9 @@ impl crate::Tui {
     }
 
     fn transcript_changed(&mut self) {
-        if !self.scroll.follow_latest && !self.scroll.at_bottom() {
-            self.scroll.new_content_below = true;
-        }
-        self.transcript_dirty = true;
+        // The alternate-screen scroll machinery is gone. With native
+        // scrollback, transcript mutations need no bookkeeping here; the
+        // Phase 2 commit pipeline decides what enters scrollback.
     }
 
     pub(crate) fn tool_indices(&self) -> Vec<usize> {
@@ -588,15 +577,5 @@ impl crate::Tui {
             *expanded = !*expanded;
             self.transcript_changed();
         }
-    }
-
-    pub(crate) fn scroll_transcript(&mut self, delta: isize) {
-        self.scroll.scroll_by(delta);
-        self.focus = Focus::Transcript;
-    }
-
-    pub(crate) fn scroll_to_bottom(&mut self) {
-        self.scroll.go_bottom();
-        self.focus = Focus::Transcript;
     }
 }

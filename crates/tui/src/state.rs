@@ -98,128 +98,25 @@ impl TranscriptEntry {
 /// Pure so the toggle logic can be unit-tested without a TTY.
 pub(crate) fn toggle_all_direction(entries: &[TranscriptEntry]) -> bool {
     entries.iter().any(|entry| {
-        matches!(entry, TranscriptEntry::Tool { expanded: false, .. })
+        matches!(
+            entry,
+            TranscriptEntry::Tool {
+                expanded: false,
+                ..
+            }
+        )
     })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Focus {
     Prompt,
-    Transcript,
     Tool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ScrollState {
-    pub offset: usize,
-    pub content_height: usize,
-    pub viewport_height: usize,
-    pub follow_latest: bool,
-    pub new_content_below: bool,
-}
-
-impl Default for ScrollState {
-    fn default() -> Self {
-        Self {
-            offset: 0,
-            content_height: 0,
-            viewport_height: 1,
-            follow_latest: true,
-            new_content_below: false,
-        }
-    }
-}
-
-impl ScrollState {
-    pub fn max_offset(&self) -> usize {
-        self.content_height.saturating_sub(self.viewport_height)
-    }
-
-    pub fn at_bottom(&self) -> bool {
-        self.offset >= self.max_offset()
-    }
-
-    pub fn clamp(&mut self) {
-        self.offset = self.offset.min(self.max_offset());
-        if self.at_bottom() {
-            self.follow_latest = true;
-            self.new_content_below = false;
-        }
-    }
-
-    pub fn scroll_by(&mut self, delta: isize) {
-        let max = self.max_offset();
-        self.offset = if delta.is_negative() {
-            self.offset.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.offset.saturating_add(delta as usize).min(max)
-        };
-        self.follow_latest = self.at_bottom();
-        if self.follow_latest {
-            self.new_content_below = false;
-        }
-    }
-
-    pub fn page_size(&self) -> usize {
-        self.viewport_height.saturating_sub(2).max(1)
-    }
-
-    pub fn go_bottom(&mut self) {
-        self.offset = self.max_offset();
-        self.follow_latest = true;
-        self.new_content_below = false;
-    }
-
-    pub fn on_content_changed(&mut self, was_at_bottom: bool) {
-        if was_at_bottom || self.follow_latest {
-            self.offset = self.max_offset();
-            self.follow_latest = true;
-            self.new_content_below = false;
-        } else {
-            self.offset = self.offset.min(self.max_offset());
-            self.new_content_below = self.offset < self.max_offset();
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scroll_state_follows_new_content_only_at_bottom() {
-        let mut state = ScrollState {
-            offset: 5,
-            content_height: 10,
-            viewport_height: 5,
-            follow_latest: true,
-            new_content_below: false,
-        };
-        state.on_content_changed(true);
-        assert_eq!(state.offset, 5);
-        assert!(state.follow_latest);
-
-        state.offset = 1;
-        state.follow_latest = false;
-        state.on_content_changed(false);
-        assert_eq!(state.offset, 1);
-        assert!(state.new_content_below);
-    }
-
-    #[test]
-    fn scroll_state_resumes_follow_at_bottom() {
-        let mut state = ScrollState {
-            offset: 0,
-            content_height: 20,
-            viewport_height: 5,
-            follow_latest: false,
-            new_content_below: true,
-        };
-        state.scroll_by(100);
-        assert_eq!(state.offset, 15);
-        assert!(state.follow_latest);
-        assert!(!state.new_content_below);
-    }
 
     #[test]
     fn toggle_all_direction_expands_when_any_tool_is_collapsed() {
@@ -244,7 +141,10 @@ mod tests {
         assert!(toggle_all_direction(&[tool(false), tool(false)]));
         // Non-tool entries do not affect the direction.
         assert!(!toggle_all_direction(&[
-            TranscriptEntry::User { id: 2, text: "hi".into() },
+            TranscriptEntry::User {
+                id: 2,
+                text: "hi".into()
+            },
             tool(true),
         ]));
     }

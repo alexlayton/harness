@@ -1,6 +1,12 @@
-//! Layout arithmetic and terminal painting. `draw` sizes the transcript,
-//! indicator, completion, activity, metadata, and prompt rows, then delegates
+//! Layout arithmetic and terminal painting. `draw` sizes the transcript
+//! tail, completion, activity, metadata, and prompt rows, then delegates
 //! painting to `render`.
+//!
+//! Phase 1 keeps the pre-migration whole-transcript layout arithmetic but
+//! renders only the last (newest) rows on the fixed inline viewport: a
+//! "show tail" paragraph. The wrap cache and scroll machinery are gone; every
+//! frame re-lays the transcript, which is temporary until Phase 2's commit
+//! pipeline shrinks the live region to the uncommitted tail.
 
 use crate::render::{self, Theme};
 use anyhow::Result;
@@ -11,13 +17,9 @@ use unicode_width::UnicodeWidthStr;
 
 impl crate::Tui {
     pub(crate) fn draw(&mut self) -> Result<()> {
-        // Layout is computed inside the render closure from `frame.area()` so
-        // it always matches the buffer `Terminal::draw` autoresized to. Reading
-        // `terminal.size()` beforehand races with that internal autoresize: if
-        // the terminal shrank while the (slow, long-transcript) layout was
-        // computed, a line that exactly fills the stale width overruns the
-        // buffer edge and ratatui panics with "index outside of buffer".
         self.terminal.draw(|frame| {
+            // `frame.area()` is the H-row inline viewport; ratatui already
+            // auto-resized it, so layout can only ever address rows within it.
             let area = frame.area();
             let horizontal = if area.width >= 80 {
                 2
@@ -39,17 +41,13 @@ impl crate::Tui {
                 .transcript
                 .iter()
                 .any(crate::state::TranscriptEntry::is_meaningful);
-            let wrap_width = outer.width as usize;
-            if self.transcript_dirty || self.wrapped_width != wrap_width {
-                self.wrapped_transcript = render::transcript_lines(
-                    &self.transcript,
-                    show_welcome,
-                    wrap_width,
-                    self.theme,
-                );
-                self.wrapped_width = wrap_width;
-            }
-            let content_height = self.wrapped_transcript.len();
+            let lines = render::transcript_lines(
+                &self.transcript,
+                show_welcome,
+                outer.width as usize,
+                self.theme,
+            );
+            let content_height = lines.len();
             let prompt_content_width = outer.width.saturating_sub(4).max(1) as usize;
             let prompt_layout =
                 render::prompt_layout(&self.textarea, prompt_content_width, self.theme);
@@ -59,24 +57,14 @@ impl crate::Tui {
                 .as_ref()
                 .map(|completion| render::completion_rows(&completion.candidates))
                 .unwrap_or(0);
-            let requested_indicator_rows = u16::from(self.scroll.new_content_below);
             let activity_rows = u16::from(self.busy);
             let minimum_layout_rows = 1u16
                 .saturating_add(3)
                 .saturating_add(1)
                 .saturating_add(activity_rows);
-            let indicator_rows = if outer.height >= minimum_layout_rows.saturating_add(1) {
-                requested_indicator_rows
-            } else {
-                0
-            };
-            let completion_capacity = outer
-                .height
-                .saturating_sub(indicator_rows)
-                .saturating_sub(minimum_layout_rows);
+            let completion_capacity = outer.height.saturating_sub(minimum_layout_rows);
             let completion_rows = requested_completion_rows.min(completion_capacity);
-            let fixed_rows = indicator_rows
-                .saturating_add(completion_rows)
+            let fixed_rows = completion_rows
                 .saturating_add(1)
                 .saturating_add(activity_rows);
             let available = outer.height.saturating_sub(fixed_rows);
@@ -89,19 +77,6 @@ impl crate::Tui {
                 .min(available.saturating_sub(1).max(1));
             let transcript_rows = available.saturating_sub(prompt_rows).max(1);
 
-            let was_following = self.scroll.follow_latest || self.scroll.at_bottom();
-            self.scroll.content_height = content_height;
-            self.scroll.viewport_height = transcript_rows as usize;
-            if self.transcript_dirty {
-                self.scroll.on_content_changed(was_following);
-                self.transcript_dirty = false;
-            } else {
-                self.scroll.clamp();
-            }
-            if show_welcome {
-                self.scroll.offset = 0;
-            }
-
             let prompt_inner_height = prompt_rows.saturating_sub(2).max(1) as usize;
             self.prompt_scroll = render::prompt_scroll_for_cursor(
                 prompt_layout.cursor_row,
@@ -109,10 +84,11 @@ impl crate::Tui {
                 prompt_inner_height,
             );
 
-            let offset = self.scroll.offset;
+            // Temporary tail view: scroll the whole-transcript line list so
+            // its last `transcript_rows` rows are the ones painted.
+            let offset = content_height.saturating_sub(transcript_rows as usize);
             let constraints = vec![
                 Constraint::Length(transcript_rows),
-                Constraint::Length(indicator_rows),
                 Constraint::Length(completion_rows),
                 Constraint::Length(activity_rows),
                 Constraint::Length(1),
@@ -123,19 +99,10 @@ impl crate::Tui {
                 .constraints(constraints)
                 .split(outer);
 
-            render::render_transcript_lines(
-                chunks[0],
-                &self.wrapped_transcript,
-                offset,
-                self.theme,
-                frame,
-            );
-            if self.scroll.new_content_below {
-                render::render_new_content_indicator(chunks[1], self.theme, frame);
-            }
+            render::render_transcript_lines(chunks[0], &lines, offset, self.theme, frame);
             if let Some(completion) = self.completion.as_ref() {
                 render::render_completion(
-                    chunks[2],
+                    chunks[1],
                     &completion.candidates,
                     completion.selected,
                     completion.offset,
@@ -144,14 +111,14 @@ impl crate::Tui {
                 );
             }
             render::render_activity(
-                chunks[3],
+                chunks[2],
                 self.activity.label(),
                 self.spinner,
                 self.theme,
                 frame,
             );
             render_metadata(
-                chunks[4],
+                chunks[3],
                 &self.environment.cwd_display,
                 self.environment.branch.as_deref(),
                 &self.provider,
@@ -160,7 +127,7 @@ impl crate::Tui {
                 frame,
             );
             render::render_prompt(
-                chunks[5],
+                chunks[4],
                 &self.textarea,
                 self.prompt_scroll,
                 self.theme,

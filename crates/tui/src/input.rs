@@ -1,6 +1,4 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
-
-pub const MOUSE_SCROLL_LINES: isize = 3;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputAction {
@@ -9,23 +7,9 @@ pub enum InputAction {
     Interrupt,
     Quit,
     ToggleAllTools,
-    PageUp,
-    PageDown,
-    Bottom,
     FocusTools,
     Edit,
     Ignore,
-}
-
-pub fn mouse_scroll_delta(event: &Event) -> Option<isize> {
-    match event {
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => Some(-MOUSE_SCROLL_LINES),
-            MouseEventKind::ScrollDown => Some(MOUSE_SCROLL_LINES),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 pub fn classify(event: &Event) -> InputAction {
@@ -65,17 +49,13 @@ pub fn classify(event: &Event) -> InputAction {
             code: KeyCode::Enter,
             ..
         }) => InputAction::Submit,
+        // PageUp / PageDown / End used to scroll the alternate-screen
+        // transcript; with native scrollback they are inert. Map them to
+        // `Ignore` so they never insert control characters into the prompt.
         Event::Key(KeyEvent {
-            code: KeyCode::PageUp,
+            code: KeyCode::PageUp | KeyCode::PageDown | KeyCode::End,
             ..
-        }) => InputAction::PageUp,
-        Event::Key(KeyEvent {
-            code: KeyCode::PageDown,
-            ..
-        }) => InputAction::PageDown,
-        Event::Key(KeyEvent {
-            code: KeyCode::End, ..
-        }) => InputAction::Bottom,
+        }) => InputAction::Ignore,
         Event::Key(_) => InputAction::Edit,
         _ => InputAction::Ignore,
     }
@@ -143,18 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn mouse_wheel_scrolls_the_transcript_by_a_small_fixed_step() {
-        let event = Event::Mouse(crossterm::event::MouseEvent {
-            kind: MouseEventKind::ScrollUp,
-            column: 0,
-            row: 0,
-            modifiers: KeyModifiers::NONE,
-        });
-        assert_eq!(mouse_scroll_delta(&event), Some(-MOUSE_SCROLL_LINES));
-    }
-
-    #[test]
-    fn classifies_submit_newline_interrupt_quit_tools_and_scrolling() {
+    fn classifies_submit_newline_interrupt_quit_and_tools() {
         assert_eq!(
             classify(&key(KeyCode::Enter, KeyModifiers::NONE)),
             InputAction::Submit
@@ -180,16 +149,24 @@ mod tests {
             InputAction::ToggleAllTools
         );
         assert_eq!(
-            classify(&key(KeyCode::PageUp, KeyModifiers::NONE)),
-            InputAction::PageUp
-        );
-        assert_eq!(
-            classify(&key(KeyCode::End, KeyModifiers::CONTROL)),
-            InputAction::Bottom
-        );
-        assert_eq!(
             classify(&key(KeyCode::Tab, KeyModifiers::NONE)),
             InputAction::FocusTools
+        );
+        assert_eq!(
+            classify(&key(KeyCode::PageUp, KeyModifiers::NONE)),
+            InputAction::Ignore
+        );
+        assert_eq!(
+            classify(&key(KeyCode::PageDown, KeyModifiers::NONE)),
+            InputAction::Ignore
+        );
+        assert_eq!(
+            classify(&key(KeyCode::End, KeyModifiers::NONE)),
+            InputAction::Ignore
+        );
+        assert_eq!(
+            classify(&key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            InputAction::Edit
         );
     }
 

@@ -9,21 +9,20 @@ use crate::completion::Completion;
 use crate::environment::EnvironmentInfo;
 use crate::input::{InputAction, classify};
 use crate::render::Theme;
-use crate::state::{EntryId, Focus, ScrollState, TranscriptEntry};
+use crate::state::{EntryId, Focus, TranscriptEntry};
 use crate::{InputMessage, ModelEntry, TuiEvent};
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
 };
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::{cursor, execute, terminal};
 use futures_util::StreamExt;
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::collections::HashMap;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -32,7 +31,17 @@ use tui_textarea::{CursorMove, TextArea};
 
 pub(crate) const MAX_INPUT_FRACTION: usize = 30;
 pub(crate) const MAX_HISTORY: usize = 1_000;
+/// Bounds for the fixed inline viewport height computed once at startup.
+const MIN_VIEWPORT_ROWS: usize = 5;
+const MAX_VIEWPORT_ROWS: usize = 16;
 const PLACEHOLDER: &str = "Type your message...";
+
+/// The fixed inline viewport height for the process lifetime (ratatui's
+/// inline height is immutable). Mirrors pi's `max(5, floor(rows * 0.3))` via
+/// the existing `MAX_INPUT_FRACTION = 30` constant.
+pub(crate) fn viewport_height(rows: u16) -> u16 {
+    ((rows as usize * MAX_INPUT_FRACTION) / 100).clamp(MIN_VIEWPORT_ROWS, MAX_VIEWPORT_ROWS) as u16
+}
 
 /// Busy-state label used by the activity line. The variant drives both the
 /// label and which transcript updates are expected next.
@@ -90,13 +99,6 @@ pub struct Tui {
     pub(crate) streaming_assistant: Option<EntryId>,
     pub(crate) running_tool: Option<EntryId>,
     pub(crate) focused_tool: Option<usize>,
-    pub(crate) scroll: ScrollState,
-    pub(crate) transcript_dirty: bool,
-    /// Cache of the wrapped transcript rows so scrolling and spinner redraws do
-    /// not re-parse and re-wrap the whole transcript on every frame. Invalidated
-    /// by `transcript_dirty` or a terminal width change.
-    pub(crate) wrapped_transcript: Vec<ratatui::text::Line<'static>>,
-    pub(crate) wrapped_width: usize,
     pub(crate) focus: Focus,
 
     pub(crate) spinner: usize,
@@ -116,32 +118,33 @@ impl Tui {
 
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
         let mut stdout = io::stdout();
-        if let Err(error) = execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture,
-            cursor::Hide
-        ) {
+        if let Err(error) = execute!(stdout, EnableBracketedPaste, cursor::Hide) {
             let _ = terminal::disable_raw_mode();
-            let _ = execute!(stdout, DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(stdout, DisableBracketedPaste);
             return Err(error).context("configure terminal input");
         }
 
+        // The viewport is anchored inline at the current cursor row and stays
+        // a single fixed height H for the whole process. No alternate screen,
+        // no mouse capture: the terminal's own scrollback is the transcript.
+        let rows = terminal::size().map(|(_, rows)| rows).unwrap_or(24);
+        let height = viewport_height(rows);
         let backend = CrosstermBackend::new(stdout);
-        let mut terminal = match Terminal::new(backend) {
+        let terminal = match Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        ) {
             Ok(terminal) => terminal,
             Err(error) => {
                 let _ = terminal::disable_raw_mode();
-                let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-                return Err(error).context("create fullscreen terminal");
+                let _ = execute!(io::stdout(), DisableBracketedPaste);
+                return Err(error).context("create inline terminal");
             }
         };
-        if let Err(error) = terminal.clear() {
-            let _ = terminal::disable_raw_mode();
-            let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
-            return Err(error).context("clear fullscreen terminal");
-        }
+        // No post-construction `clear()`: the first `draw()` paints the whole
+        // viewport, and in inline mode `clear()` would not touch scrollback.
 
         let (file_completion_tx, file_completion_rx) = mpsc::unbounded_channel();
         Ok(Self {
@@ -171,10 +174,6 @@ impl Tui {
             streaming_assistant: None,
             running_tool: None,
             focused_tool: None,
-            scroll: ScrollState::default(),
-            transcript_dirty: true,
-            wrapped_transcript: Vec::new(),
-            wrapped_width: 0,
             focus: Focus::Prompt,
             spinner: 0,
             activity: Activity::Preparing,
@@ -269,10 +268,8 @@ impl Tui {
             return Ok(false);
         }
 
-        if let Some(delta) = crate::input::mouse_scroll_delta(&event) {
-            self.scroll_transcript(delta);
-            return Ok(false);
-        }
+        // Mouse capture is intentionally disabled: the wheel scrolls the
+        // terminal's native scrollback, so there is nothing to handle here.
 
         if self.handle_completion_input(&event, input_tx)? {
             return Ok(false);
@@ -311,9 +308,6 @@ impl Tui {
                     self.focus = Focus::Prompt;
                 }
             }
-            InputAction::PageUp => self.scroll_transcript(-(self.scroll.page_size() as isize)),
-            InputAction::PageDown => self.scroll_transcript(self.scroll.page_size() as isize),
-            InputAction::Bottom => self.scroll_to_bottom(),
             InputAction::Newline => {
                 self.history_pos = None;
                 self.draft.clear();
@@ -364,8 +358,10 @@ impl Tui {
     }
 
     fn handle_resize(&mut self) {
+        // Inline viewports are re-anchored and auto-resized inside ratatui's
+        // `draw()`; committed content keeps its original wrap width and the
+        // terminal soft-reflows it. Only the prompt scroll needs resetting.
         self.prompt_scroll = 0;
-        self.transcript_dirty = true;
     }
 
     pub(crate) fn restore(&mut self) -> Result<()> {
@@ -378,11 +374,12 @@ impl Tui {
         execute!(
             self.terminal.backend_mut(),
             DisableBracketedPaste,
-            DisableMouseCapture,
-            cursor::Show,
-            LeaveAlternateScreen
+            cursor::Show
         )
         .context("restore terminal input")?;
+        // Leave one blank line below the fixed-height viewport so the shell
+        // prompt lands below the UI rather than on its last row.
+        writeln!(self.terminal.backend_mut()).context("leave terminal")?;
         Ok(())
     }
 }
@@ -428,23 +425,35 @@ fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableBracketedPaste,
-            DisableMouseCapture,
-            cursor::Show,
-            LeaveAlternateScreen
-        );
+        let _ = execute!(io::stdout(), DisableBracketedPaste, cursor::Show);
+        let _ = writeln!(io::stdout());
         previous(panic);
     }));
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn fullscreen_ui_keeps_terminal_lifecycle_outside_pure_render_tests() {
         // The real terminal lifecycle is intentionally exercised manually;
         // render.rs, input.rs, state.rs, and environment.rs contain the pure
         // behavior tests that do not require a TTY.
+    }
+
+    #[test]
+    fn viewport_height_is_clamped_to_the_5_16_band() {
+        assert_eq!(viewport_height(5), 5);
+        assert_eq!(viewport_height(16), 5);
+        assert_eq!(viewport_height(17), 5);
+        assert_eq!(viewport_height(20), 6);
+        assert_eq!(viewport_height(24), 7);
+        assert_eq!(viewport_height(50), 15);
+        assert_eq!(viewport_height(53), 15);
+        assert_eq!(viewport_height(54), 16);
+        assert_eq!(viewport_height(200), 16);
+        // Exactly 30% of the terminal rows, floor-divide then clamp.
+        assert_eq!(viewport_height(100), 16);
     }
 }

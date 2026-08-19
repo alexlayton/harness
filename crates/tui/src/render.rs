@@ -70,10 +70,6 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("Enter", "Submit prompt"),
     ("Shift+Enter", "Insert newline"),
     ("↑ / ↓", "Move through prompt"),
-    ("k / j", "Scroll transcript"),
-    ("Mouse wheel", "Scroll transcript"),
-    ("PageUp / PageDown", "Scroll transcript"),
-    ("End / Ctrl+End", "Return to bottom"),
     ("Ctrl+O", "Expand / collapse all tools"),
     ("Ctrl+C", "Cancel / quit"),
     ("Esc", "Close transient UI"),
@@ -900,30 +896,6 @@ pub fn render_transcript(
     let count = lines.len();
     render_transcript_lines(area, &lines, offset, theme, frame);
     count
-}
-
-pub fn render_new_content_indicator(area: Rect, theme: Theme, frame: &mut Frame<'_>) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let text = "↓ new content below · End to follow";
-    let width = UnicodeWidthStr::width(text);
-    let x = area
-        .x
-        .saturating_add(area.width.saturating_sub(width as u16));
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            dim_style(theme).add_modifier(Modifier::DIM),
-        )))
-        .style(Style::default().bg(theme.background)),
-        Rect {
-            x,
-            y: area.y,
-            width: area.width.saturating_sub(x.saturating_sub(area.x)),
-            height: 1,
-        },
-    );
 }
 
 pub fn render_activity(
