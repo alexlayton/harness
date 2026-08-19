@@ -62,10 +62,12 @@ pub fn serialize_one_lite(event: &SessionEvent, max_tool_result_chars: usize) ->
 /// not contribute to the summarizer's view, e.g. usage accounting).
 fn serialize_record(event: &SessionEvent, max_tool_result_chars: usize) -> String {
     match event {
-        SessionEvent::UserMessage { message } => {
-            message_joined_text(message).map(|text| format!("[User]: {text}")).unwrap_or_default()
+        SessionEvent::UserMessage { message } => message_joined_text(message)
+            .map(|text| format!("[User]: {text}"))
+            .unwrap_or_default(),
+        SessionEvent::AssistantMessage { message } => {
+            serialize_assistant_message(message, max_tool_result_chars)
         }
-        SessionEvent::AssistantMessage { message } => serialize_assistant_message(message, max_tool_result_chars),
         SessionEvent::Reasoning { text } => {
             if text.trim().is_empty() {
                 String::new()
@@ -73,8 +75,16 @@ fn serialize_record(event: &SessionEvent, max_tool_result_chars: usize) -> Strin
                 format!("[Assistant reasoning]: {text}")
             }
         }
-        SessionEvent::ToolCall { call } => format!("[Assistant tool calls]: {}", format_tool_call(&call.name, &call.arguments)),
-        SessionEvent::ToolResult { tool_call_id, content, is_error, .. } => {
+        SessionEvent::ToolCall { call } => format!(
+            "[Assistant tool calls]: {}",
+            format_tool_call(&call.name, &call.arguments)
+        ),
+        SessionEvent::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+            ..
+        } => {
             if content.trim().is_empty() {
                 return String::new();
             }
@@ -111,7 +121,9 @@ fn serialize_assistant_message(message: &StoredMessage, max_tool_result_chars: u
         match content {
             StoredContent::Text { text: value } => text.push(value.clone()),
             StoredContent::Reasoning { text: value } => reasoning.push(value.clone()),
-            StoredContent::ToolCall { name, arguments, .. } => {
+            StoredContent::ToolCall {
+                name, arguments, ..
+            } => {
                 calls.push(format_tool_call(name, arguments));
             }
             StoredContent::ToolResult { content, .. } => {
@@ -131,14 +143,23 @@ fn serialize_assistant_message(message: &StoredMessage, max_tool_result_chars: u
     if !calls.is_empty() {
         sections.push(format!("[Assistant tool calls]: {}", calls.join("; ")));
     }
-    sections.iter().filter(|section| !section.is_empty()).cloned().collect::<Vec<_>>().join("\n")
+    sections
+        .iter()
+        .filter(|section| !section.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn serialize_embedded_tool_result(content: &str, max_tool_result_chars: usize) -> String {
     if content.trim().is_empty() {
         return String::new();
     }
-    format!("[Tool result ok]: ({}) {}", content, truncate_for_summary(content, max_tool_result_chars))
+    format!(
+        "[Tool result ok]: ({}) {}",
+        content,
+        truncate_for_summary(content, max_tool_result_chars)
+    )
 }
 
 fn message_joined_text(message: &StoredMessage) -> Option<String> {
@@ -209,7 +230,10 @@ pub fn extract_file_operations(events: &[SessionEventRecord]) -> FileOperations 
         match &record.event {
             SessionEvent::AssistantMessage { message } => {
                 for content in &message.content {
-                    if let StoredContent::ToolCall { name, arguments, .. } = content {
+                    if let StoredContent::ToolCall {
+                        name, arguments, ..
+                    } = content
+                    {
                         record_tool_path(name, arguments, &mut read, &mut modified);
                     }
                 }
@@ -234,7 +258,8 @@ fn record_tool_path(
     arguments: &Value,
     read: &mut BTreeSet<String>,
     modified: &mut BTreeSet<String>,
-) {    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+) {
+    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
         return;
     };
     if path.trim().is_empty() {
@@ -258,7 +283,10 @@ fn record_tool_path(
 pub fn format_file_operations(operations: &FileOperations) -> String {
     let mut sections = Vec::<String>::new();
     if !operations.read.is_empty() {
-        sections.push(format!("<files-read>\n{}\n</files-read>", operations.read.join("\n")));
+        sections.push(format!(
+            "<files-read>\n{}\n</files-read>",
+            operations.read.join("\n")
+        ));
     }
     if !operations.modified.is_empty() {
         sections.push(format!(
@@ -315,7 +343,11 @@ mod tests {
         let transcript = serialize_events(&session.events, 96 * 1024, 2_000);
         assert!(transcript.text.contains("[User]: hello"));
         assert!(transcript.text.contains("[Assistant]: working…"));
-        assert!(transcript.text.contains("[Tool result ok]: (call-1) file contents"));
+        assert!(
+            transcript
+                .text
+                .contains("[Tool result ok]: (call-1) file contents")
+        );
         assert!(!transcript.truncated);
     }
 
@@ -325,7 +357,11 @@ mod tests {
         user(&mut session, "hi");
         tool_result(&mut session, &"x".repeat(5_000), false);
         let transcript = serialize_events(&session.events, 96 * 1024, 100);
-        assert!(transcript.text.contains("[... 4900 more characters truncated]"));
+        assert!(
+            transcript
+                .text
+                .contains("[... 4900 more characters truncated]")
+        );
     }
 
     #[test]
@@ -351,10 +387,7 @@ mod tests {
     #[test]
     fn format_tool_call_renders_arguments_compactly() {
         assert_eq!(
-            format_tool_call(
-                "read",
-                &json!({ "path": "foo.txt", "offset": 5 })
-            ),
+            format_tool_call("read", &json!({ "path": "foo.txt", "offset": 5 })),
             "read(offset=5, path=\"foo.txt\")"
         );
     }

@@ -103,10 +103,16 @@ mod tests {
 
     #[test]
     fn trigger_respects_auto_flag_and_missing_window() {
-        let policy = CompactionPolicy { auto: false, ..CompactionPolicy::default() };
+        let policy = CompactionPolicy {
+            auto: false,
+            ..CompactionPolicy::default()
+        };
         assert!(!policy.should_auto_compact(u64::MAX, 128_000));
 
-        let policy = CompactionPolicy { auto: true, ..CompactionPolicy::default() };
+        let policy = CompactionPolicy {
+            auto: true,
+            ..CompactionPolicy::default()
+        };
         assert!(!policy.should_auto_compact(u64::MAX, 0));
     }
 

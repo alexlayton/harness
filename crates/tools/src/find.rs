@@ -716,9 +716,8 @@ pub(crate) fn format_grep_output(
             raw.file_count,
         ));
     } else if byte_truncated {
-        notices.push(
-            "output size limit reached; narrow the pattern to see fewer results".to_owned(),
-        );
+        notices
+            .push("output size limit reached; narrow the pattern to see fewer results".to_owned());
     }
     if requested_limit > 1 && raw.match_count > output.lines().count() && !raw.has_more {
         notices.push(format!(
@@ -859,7 +858,9 @@ mod tests {
     #[test]
     fn grep_output_is_bounded_and_actionable() {
         let raw = GrepRawOutput {
-            lines: (0..600).map(|i| format!("file-{i}.rs:{i}:line {i}")).collect(),
+            lines: (0..600)
+                .map(|i| format!("file-{i}.rs:{i}:line {i}"))
+                .collect(),
             match_count: 600,
             file_count: 600,
             has_more: true,

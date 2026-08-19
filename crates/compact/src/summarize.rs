@@ -9,9 +9,7 @@
 use crate::plan::CompactionPlan;
 use crate::policy::CompactionPolicy;
 use crate::policy::DEFAULT_TOOL_RESULT_CHARS;
-use crate::serialize::{
-    extract_file_operations, format_file_operations, serialize_events,
-};
+use crate::serialize::{extract_file_operations, format_file_operations, serialize_events};
 use futures_util::StreamExt;
 use llm::{CompletionRequest, Message, Provider, StreamEvent, Usage, truncate_utf8};
 use tokio_util::sync::CancellationToken;
@@ -157,7 +155,9 @@ async fn model_summarize(
         }
     }
     if text.trim().is_empty() {
-        return Err(llm::LlmError::Stream("summarizer produced no output".into()));
+        return Err(llm::LlmError::Stream(
+            "summarizer produced no output".into(),
+        ));
     }
     let text = truncate_utf8(&text, policy.max_summary_bytes);
     Ok((text, usage))
@@ -208,8 +208,8 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::stream;
     use llm::{EventStream, ModelInfo};
-    use session::model::{Session, SessionEvent, SessionMetadata, StoredMessage, StoredToolCall};
     use serde_json::json;
+    use session::model::{Session, SessionEvent, SessionMetadata, StoredMessage, StoredToolCall};
 
     fn push_user(session: &mut Session, text: &str) {
         session.append(SessionEvent::UserMessage {
@@ -264,7 +264,9 @@ mod tests {
         async fn stream(&self, _req: &CompletionRequest) -> Result<EventStream, llm::LlmError> {
             let events = self.events.clone();
             Ok(Box::pin(stream::iter(
-                events.into_iter().map(|event| event.map_err(llm::LlmError::Stream)),
+                events
+                    .into_iter()
+                    .map(|event| event.map_err(llm::LlmError::Stream)),
             )))
         }
         async fn list_models(&self) -> Result<Vec<ModelInfo>, llm::LlmError> {

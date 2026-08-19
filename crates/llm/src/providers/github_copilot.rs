@@ -373,14 +373,9 @@ fn model_gate_error(
     let hint = if suggestions.is_empty() {
         "run /models to list usable models".to_owned()
     } else {
-        format!(
-            "try {} (run /models to list all)",
-            suggestions.join(", ")
-        )
+        format!("try {} (run /models to list all)", suggestions.join(", "))
     };
-    LlmError::Auth(format!(
-        "GitHub Copilot model `{model}` {reason}; {hint}"
-    ))
+    LlmError::Auth(format!("GitHub Copilot model `{model}` {reason}; {hint}"))
 }
 
 /// Pre-flight the requested model against the account's available list.
@@ -388,11 +383,7 @@ fn model_gate_error(
 /// the field existed) defers to the server's own error.  A miss is permanent
 /// for this account, so it surfaces as an actionable error instead of the
 /// raw 404 the API would return.
-fn entitlement_error_for(
-    model: &str,
-    available: &[String],
-    sku: Option<&str>,
-) -> Option<LlmError> {
+fn entitlement_error_for(model: &str, available: &[String], sku: Option<&str>) -> Option<LlmError> {
     if available.is_empty() || available.iter().any(|id| id == model) {
         return None;
     }
@@ -413,15 +404,13 @@ fn plan_gate_error(
     available: &[String],
     sku: Option<&str>,
 ) -> LlmError {
-    if let LlmError::Http { status: 400, ref body } = error
+    if let LlmError::Http {
+        status: 400,
+        ref body,
+    } = error
         && body.contains("model_not_supported")
     {
-        return model_gate_error(
-            model,
-            available,
-            sku,
-            "is not usable on this Copilot plan",
-        );
+        return model_gate_error(model, available, sku, "is not usable on this Copilot plan");
     }
     error
 }
@@ -500,8 +489,7 @@ impl GithubCopilotProvider {
         let credential = self.auth.ensure_valid().await.map_err(auth_error)?;
         let sku = auth::sku_from_proxy_token(&credential.access).map(str::to_owned);
         let sku = sku.as_deref();
-        if let Some(error) =
-            entitlement_error_for(&req.model, &credential.available_model_ids, sku)
+        if let Some(error) = entitlement_error_for(&req.model, &credential.available_model_ids, sku)
         {
             return Err(error);
         }
@@ -707,7 +695,10 @@ mod tests {
             default_model_for(Some("copilot_business"), &available),
             Some("gpt-5.6-luna".into())
         );
-        assert_eq!(default_model_for(None, &available), Some("gpt-5.6-luna".into()));
+        assert_eq!(
+            default_model_for(None, &available),
+            Some("gpt-5.6-luna".into())
+        );
         // Free SKU whose account does not list gpt-4.1 falls through.
         let no_gpt41 = vec!["gpt-5.6-luna".into()];
         assert_eq!(
@@ -745,7 +736,10 @@ mod tests {
             Some("free_limited_copilot"),
         );
         let message = error.to_string();
-        assert!(message.contains("not usable on this Copilot plan"), "{message}");
+        assert!(
+            message.contains("not usable on this Copilot plan"),
+            "{message}"
+        );
         assert!(message.contains("try gpt-4.1"), "{message}");
 
         // Unrelated 400s and other statuses pass through untouched.

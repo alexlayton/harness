@@ -98,12 +98,18 @@ impl From<&CompactConfig> for CompactionPolicy {
             auto: config.auto.unwrap_or(defaults.auto),
             threshold: config.threshold.unwrap_or(defaults.threshold),
             reserve_tokens: config.reserve_tokens.unwrap_or(defaults.reserve_tokens),
-            keep_recent_turns: config.keep_recent_turns.unwrap_or(defaults.keep_recent_turns),
-            keep_recent_tokens: config.keep_recent_tokens.unwrap_or(defaults.keep_recent_tokens),
+            keep_recent_turns: config
+                .keep_recent_turns
+                .unwrap_or(defaults.keep_recent_turns),
+            keep_recent_tokens: config
+                .keep_recent_tokens
+                .unwrap_or(defaults.keep_recent_tokens),
             max_summary_input_bytes: config
                 .max_summary_input_bytes
                 .unwrap_or(defaults.max_summary_input_bytes),
-            max_summary_bytes: config.max_summary_bytes.unwrap_or(defaults.max_summary_bytes),
+            max_summary_bytes: config
+                .max_summary_bytes
+                .unwrap_or(defaults.max_summary_bytes),
             context_window: config.context_window.unwrap_or(defaults.context_window),
         }
     }
@@ -599,7 +605,9 @@ mod tests {
             provider: Some("typo".into()),
             ..FileConfig::default()
         };
-        let error = Config::resolve_from_file(&Cli::default(), &invalid,
+        let error = Config::resolve_from_file(
+            &Cli::default(),
+            &invalid,
             PathBuf::from("/tmp/bad-config.toml"),
             |_| Some("secret".into()),
         )
@@ -727,7 +735,10 @@ mod tests {
         assert_eq!(policy.reserve_tokens, 8_000);
         assert_eq!(policy.context_window, 12_000);
         // Unset fields fall back to defaults.
-        assert_eq!(policy.keep_recent_turns, CompactionPolicy::default().keep_recent_turns);
+        assert_eq!(
+            policy.keep_recent_turns,
+            CompactionPolicy::default().keep_recent_turns
+        );
 
         // The unknown-field survival path must not see the compaction table.
         let loaded = load_file_config(&path).unwrap();

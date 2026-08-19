@@ -162,10 +162,7 @@ fn split_compound(command: &str) -> Option<Vec<&str>> {
             b'$' if bytes.get(index + 1) == Some(&b'(') => return None,
             b'<' if matches!(bytes.get(index + 1), Some(b'<') | Some(b'(')) => return None,
             b'|' | b'(' if !in_single && !in_double => return None,
-            b'{' if !in_single
-                && !in_double
-                && bytes.get(index.wrapping_sub(1)) != Some(&b'$') =>
-            {
+            b'{' if !in_single && !in_double && bytes.get(index.wrapping_sub(1)) != Some(&b'$') => {
                 return None;
             }
             b'&' | b';' if !in_single && !in_double => {
@@ -198,7 +195,11 @@ fn split_compound(command: &str) -> Option<Vec<&str>> {
     if parts.iter().any(|part| part.is_empty()) {
         return None;
     }
-    if parts.iter().step_by(2).any(|part| has_control_keyword(part)) {
+    if parts
+        .iter()
+        .step_by(2)
+        .any(|part| has_control_keyword(part))
+    {
         return None;
     }
     Some(parts)
@@ -209,13 +210,25 @@ fn split_compound(command: &str) -> Option<Vec<&str>> {
 /// only skips the rtk split optimization, never alters execution.
 fn has_control_keyword(operand: &str) -> bool {
     const KEYWORDS: &[&str] = &[
-        "if ", "then ", "else ", "elif ", "for ", "while ", "until ", "case ",
-        "do ", "done ", "function ", "select ",
+        "if ",
+        "then ",
+        "else ",
+        "elif ",
+        "for ",
+        "while ",
+        "until ",
+        "case ",
+        "do ",
+        "done ",
+        "function ",
+        "select ",
     ];
     let bytes = operand.as_bytes();
-    KEYWORDS
-        .iter()
-        .any(|keyword| bytes.windows(keyword.len()).any(|window| window == keyword.as_bytes()))
+    KEYWORDS.iter().any(|keyword| {
+        bytes
+            .windows(keyword.len())
+            .any(|window| window == keyword.as_bytes())
+    })
 }
 
 /// Resolve the bash `dir` argument against the workspace root, requiring an
@@ -635,7 +648,9 @@ mod tests {
         // The trailing `git status` is rewritten even when a whole-command
         // rewrite would have missed the compound.
         assert_eq!(
-            rtk_rewrite_compound("cd subdir && git status").await.as_deref(),
+            rtk_rewrite_compound("cd subdir && git status")
+                .await
+                .as_deref(),
             Some("cd subdir && rtk git status")
         );
         // Nothing supported anywhere: pass through unchanged.
@@ -676,11 +691,18 @@ mod tests {
         std::fs::create_dir_all(directory.path().join("src")).unwrap();
         let tool = BashTool::with_workspace_root(directory.path());
         let output = tool
-            .execute(json!({"command": "pwd", "dir": "src"}), CancellationToken::new())
+            .execute(
+                json!({"command": "pwd", "dir": "src"}),
+                CancellationToken::new(),
+            )
             .await;
         assert!(!output.is_error, "{}", output.content);
         let expected = std::fs::canonicalize(directory.path().join("src")).unwrap();
-        assert!(output.content.contains(&expected.to_string_lossy().into_owned()));
+        assert!(
+            output
+                .content
+                .contains(&expected.to_string_lossy().into_owned())
+        );
         assert!(output.summary.contains("(in src)"));
     }
 
@@ -698,7 +720,10 @@ mod tests {
         assert!(outside.content.contains("outside"));
 
         let missing = tool
-            .execute(json!({"command": "pwd", "dir": "nope"}), CancellationToken::new())
+            .execute(
+                json!({"command": "pwd", "dir": "nope"}),
+                CancellationToken::new(),
+            )
             .await;
         assert!(missing.is_error);
         assert!(missing.content.contains("nope"));

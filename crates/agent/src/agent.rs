@@ -7,11 +7,11 @@ use compact::{
     summarize as compact_summarize,
 };
 use futures_util::StreamExt;
+use llm::providers::github_copilot::default_model_for;
 use llm::{
     CompletionRequest, Content, LlmError, Message, Provider, RetryCallback, Role, StreamEvent,
     ToolCall, truncate_utf8,
 };
-use llm::providers::github_copilot::default_model_for;
 use session::{
     ExportOptions, Session, SessionCreateOptions, SessionEvent, SessionStore, StoredMessage,
     StoredToolCall, export_jsonl, snapshot_entries, usage_summary,
@@ -518,12 +518,13 @@ impl Agent {
             } else {
                 0
             };
-            if self.compact_and_reload(events, cancel, CompactionReason::Auto).await {
+            if self
+                .compact_and_reload(events, cancel, CompactionReason::Auto)
+                .await
+            {
                 send(
                     events,
-                    AgentEvent::Notice(format!(
-                        "auto-compacted: context at {percent}% of window"
-                    )),
+                    AgentEvent::Notice(format!("auto-compacted: context at {percent}% of window")),
                 );
             }
         }
@@ -897,7 +898,6 @@ impl Agent {
                 });
                 let _ = self.persist_tool_result(&call, &result_content, result_is_error, events);
             }
-
         }
     }
 
@@ -1207,7 +1207,9 @@ impl Agent {
             send(events, AgentEvent::Error("sessions are not enabled".into()));
             return;
         }
-        let _ = self.compact_and_reload(events, cancel, CompactionReason::Manual).await;
+        let _ = self
+            .compact_and_reload(events, cancel, CompactionReason::Manual)
+            .await;
     }
 
     async fn handle_set_model(
@@ -1235,16 +1237,21 @@ impl Agent {
                 }
             }
         }
-        self.handle_set_model_with_factory(provider, model, events, Box::new(move |name| {
-            let copilot_auth = if crate::config::ProviderArg::from_name(name)
-                == Some(crate::config::ProviderArg::GithubCopilot)
-            {
-                auth.clone()
-            } else {
-                None
-            };
-            build_provider_with_auth(name, copilot_auth)
-        }));
+        self.handle_set_model_with_factory(
+            provider,
+            model,
+            events,
+            Box::new(move |name| {
+                let copilot_auth = if crate::config::ProviderArg::from_name(name)
+                    == Some(crate::config::ProviderArg::GithubCopilot)
+                {
+                    auth.clone()
+                } else {
+                    None
+                };
+                build_provider_with_auth(name, copilot_auth)
+            }),
+        );
         // A different model may have a different context window and stale
         // token counts; reset both so the next trigger re-baselines.
         self.last_context_tokens = None;
@@ -1349,7 +1356,9 @@ impl Agent {
                 model.id == self.model || model.name.as_deref() == Some(self.model.as_str())
             })
         {
-            self.context_window = self.compaction.resolved_window(model.context_length.unwrap_or(0));
+            self.context_window = self
+                .compaction
+                .resolved_window(model.context_length.unwrap_or(0));
             return;
         }
         self.context_window = self.compaction.resolved_window(0);
@@ -1377,8 +1386,12 @@ impl Agent {
         for message in &self.history {
             for content in &message.content {
                 match content {
-                    Content::Text(text) | Content::Reasoning(text) => bytes = bytes.saturating_add(text.len()),
-                    Content::ToolResult { content, .. } => bytes = bytes.saturating_add(content.len()),
+                    Content::Text(text) | Content::Reasoning(text) => {
+                        bytes = bytes.saturating_add(text.len())
+                    }
+                    Content::ToolResult { content, .. } => {
+                        bytes = bytes.saturating_add(content.len())
+                    }
                     Content::ToolCall(call) => {
                         bytes = bytes.saturating_add(call.name.len());
                         bytes = bytes.saturating_add(
@@ -1424,16 +1437,18 @@ impl Agent {
 
         let estimated = self.context_tokens_estimate(0);
         let Some(plan) = plan_compaction(&session, &self.compaction, estimated) else {
-            send(
-                events,
-                AgentEvent::Notice("nothing to compact yet".into()),
-            );
+            send(events, AgentEvent::Notice("nothing to compact yet".into()));
             return false;
         };
 
-        let outcome =
-            compact_summarize(self.provider.as_ref(), &self.model, &plan, &self.compaction, cancel)
-                .await;
+        let outcome = compact_summarize(
+            self.provider.as_ref(),
+            &self.model,
+            &plan,
+            &self.compaction,
+            cancel,
+        )
+        .await;
 
         // Persist the summarizer's own usage so session cost totals stay
         // honest and the UI reflects it.
@@ -1614,7 +1629,13 @@ fn content_is_empty(message: &Message) -> bool {
 /// push a new user message. The note lives only in memory; durable events
 /// stay clean.
 fn push_recovery_note(history: &mut Vec<Message>, note: String) {
-    let tail_is_user = matches!(history.last(), Some(Message { role: Role::User, .. }));
+    let tail_is_user = matches!(
+        history.last(),
+        Some(Message {
+            role: Role::User,
+            ..
+        })
+    );
     if tail_is_user
         && let Some(Message {
             role: Role::User,
@@ -1735,16 +1756,18 @@ mod tests {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
             let script = self.scripts.get(index).cloned().unwrap_or_default();
             let error_kind = self.error_kind;
-            Ok(Box::pin(stream::iter(script.into_iter().map(move |step| {
-                step.map_err(|message| match error_kind {
-                    MockErrorKind::Stream => LlmError::Stream(message),
-                    MockErrorKind::Parse => LlmError::Parse(message),
-                    MockErrorKind::Retryable => LlmError::Http {
-                        status: 500,
-                        body: message,
-                    },
-                })
-            }))))
+            Ok(Box::pin(stream::iter(script.into_iter().map(
+                move |step| {
+                    step.map_err(|message| match error_kind {
+                        MockErrorKind::Stream => LlmError::Stream(message),
+                        MockErrorKind::Parse => LlmError::Parse(message),
+                        MockErrorKind::Retryable => LlmError::Http {
+                            status: 500,
+                            body: message,
+                        },
+                    })
+                },
+            ))))
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -1964,16 +1987,17 @@ mod tests {
                 .iter()
                 .filter_map(|record| match &record.event {
                     SessionEvent::ToolResult {
-                        is_error,
-                        content,
-                        ..
+                        is_error, content, ..
                     } => Some((is_error, content)),
                     _ => None,
                 })
                 .collect();
             assert_eq!(tool_results.len(), 1, "expected one persisted tool result");
             let (is_error, content) = tool_results[0];
-            assert!(is_error, "interrupted tool call must be persisted as an error");
+            assert!(
+                is_error,
+                "interrupted tool call must be persisted as an error"
+            );
             assert!(
                 content.contains("provider stream interrupted"),
                 "unexpected tool result content: {content}"
@@ -2159,7 +2183,8 @@ mod tests {
             assert!(got.contains(&AgentEvent::TextDelta("answer".into())));
             assert!(got.contains(&AgentEvent::TurnFinished));
             assert!(
-                !got.iter().any(|event| matches!(event, AgentEvent::Error(_))),
+                !got.iter()
+                    .any(|event| matches!(event, AgentEvent::Error(_))),
                 "an empty response is a stall, not an error"
             );
         });
@@ -2193,9 +2218,9 @@ mod tests {
                 .push((request.system.clone(), request.messages.clone()));
             let script = self.scripts.get(index).cloned().unwrap_or_default();
             Ok(Box::pin(stream::iter(
-                script.into_iter().map(|step| {
-                    step.map_err(LlmError::Stream)
-                }),
+                script
+                    .into_iter()
+                    .map(|step| step.map_err(LlmError::Stream)),
             )))
         }
 
@@ -2244,9 +2269,9 @@ mod tests {
                 .append_event(
                     &mut session,
                     SessionEvent::AssistantMessage {
-                        message: StoredMessage::from_llm(&Message::assistant(vec![
-                            Content::Text("a".repeat(assistant_bytes)),
-                        ])),
+                        message: StoredMessage::from_llm(&Message::assistant(vec![Content::Text(
+                            "a".repeat(assistant_bytes),
+                        )])),
                     },
                 )
                 .unwrap();
@@ -2333,7 +2358,8 @@ mod tests {
                     InputMessage::Message("first".into()),
                     InputMessage::Message("second".into()),
                 ],
-            ).await;
+            )
+            .await;
 
             // The auto trigger fired between turns.
             assert!(events.iter().any(|event| matches!(
@@ -2351,7 +2377,11 @@ mod tests {
 
             // Three requests: turn 1, the summarizer, turn 2.
             let seen = provider.seen.lock().unwrap();
-            assert_eq!(seen.len(), 3, "expected turn1 + summarizer + turn2 requests");
+            assert_eq!(
+                seen.len(),
+                3,
+                "expected turn1 + summarizer + turn2 requests"
+            );
 
             // The summarizer request is distinguishable by its system prompt
             // and modeled as a standalone summarization, not a conversation.
@@ -2366,7 +2396,10 @@ mod tests {
                 turn2.iter().any(is_summary_message),
                 "turn 2 request must include the generated summary"
             );
-            assert!(turn2.len() < seen[0].1.len(), "history must shrink after compaction");
+            assert!(
+                turn2.len() < seen[0].1.len(),
+                "history must shrink after compaction"
+            );
 
             // The summarizer's usage was recorded so session cost stays honest.
             drop(seen);
@@ -2408,10 +2441,13 @@ mod tests {
                         },
                     ]),
                     vec![Err("summarizer connection dropped".into())],
-                    script(vec![StreamEvent::TextDelta("turn 2".into()), StreamEvent::Done {
-                        stop_reason: Some("stop".into()),
-                        usage: None,
-                    }]),
+                    script(vec![
+                        StreamEvent::TextDelta("turn 2".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
                 ],
                 seen: Mutex::new(Vec::new()),
             });
@@ -2424,7 +2460,8 @@ mod tests {
                     InputMessage::Message("first".into()),
                     InputMessage::Message("second".into()),
                 ],
-            ).await;
+            )
+            .await;
 
             // Even though the summarizer failed, compaction completed via the
             // deterministic fallback and the turn went on.
@@ -2439,12 +2476,17 @@ mod tests {
 
             // The persisted summary is the deterministic transcript.
             let reloaded = store.open(&session_id).unwrap();
-            let deterministic = reloaded.events.iter().find_map(|record| match &record.event {
-                SessionEvent::CompactionSummary { summary, .. } => Some(summary.clone()),
-                _ => None,
-            });
+            let deterministic = reloaded
+                .events
+                .iter()
+                .find_map(|record| match &record.event {
+                    SessionEvent::CompactionSummary { summary, .. } => Some(summary.clone()),
+                    _ => None,
+                });
             assert!(
-                deterministic.unwrap_or_default().contains("generated context"),
+                deterministic
+                    .unwrap_or_default()
+                    .contains("generated context"),
                 "fallback summary must be the deterministic transcript"
             );
         });
@@ -2483,7 +2525,8 @@ mod tests {
                 session,
                 provider.clone(),
                 vec![InputMessage::Message("do the work".into())],
-            ).await;
+            )
+            .await;
 
             // Emergency compaction happened with Overflow reason and the retry
             // succeeded (turn finished normally).
@@ -2527,13 +2570,16 @@ mod tests {
 
             let provider = Arc::new(RecordingProvider {
                 calls: AtomicUsize::new(0),
-                scripts: vec![summarizer_script(), script(vec![
-                    StreamEvent::TextDelta("after compact".into()),
-                    StreamEvent::Done {
-                        stop_reason: Some("stop".into()),
-                        usage: None,
-                    },
-                ])],
+                scripts: vec![
+                    summarizer_script(),
+                    script(vec![
+                        StreamEvent::TextDelta("after compact".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
                 seen: Mutex::new(Vec::new()),
             });
 
@@ -2545,7 +2591,8 @@ mod tests {
                     InputMessage::CompactSession,
                     InputMessage::Message("next".into()),
                 ],
-            ).await;
+            )
+            .await;
 
             assert!(events.iter().any(|event| matches!(
                 event,
@@ -2574,9 +2621,9 @@ mod tests {
                 messages.iter().any(is_summary_message),
                 "reloaded session context must start from the summary"
             );
-            let earliest_user = messages.iter().position(|m| {
-                m.role == Role::User && !is_summary_message(m)
-            });
+            let earliest_user = messages
+                .iter()
+                .position(|m| m.role == Role::User && !is_summary_message(m));
             let summary_at = messages.iter().position(is_summary_message).unwrap();
             match earliest_user {
                 None => {}
@@ -2635,19 +2682,22 @@ mod tests {
                     InputMessage::Message("first".into()),
                     InputMessage::Message("second".into()),
                 ],
-            ).await;
+            )
+            .await;
 
             // Exactly one auto-compaction for this crossing.
             let auto_compactions = events
                 .iter()
-                .filter(|event| matches!(
-                    event,
-                    AgentEvent::CompactionFinished {
-                        auto: true,
-                        reason: CompactionReason::Auto,
-                        ..
-                    }
-                ))
+                .filter(|event| {
+                    matches!(
+                        event,
+                        AgentEvent::CompactionFinished {
+                            auto: true,
+                            reason: CompactionReason::Auto,
+                            ..
+                        }
+                    )
+                })
                 .count();
             assert_eq!(auto_compactions, 1, "expected exactly one auto compaction");
 

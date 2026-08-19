@@ -7,8 +7,8 @@
 //! exits.  All progress chatter is optional and goes to stderr behind `-v`;
 //! stdout carries only the answer.
 
-use crate::agent::AgentEvent;
 use crate::agent::Agent;
+use crate::agent::AgentEvent;
 use crate::config::{Cli, Config};
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result, anyhow};
@@ -58,7 +58,9 @@ fn resolve_prompt_with(
         return Ok(cli.prompt.join(" ").trim().to_owned());
     }
     if stdin_is_tty() {
-        return Err(anyhow!("no prompt: pass a prompt argument or pipe one on stdin"));
+        return Err(anyhow!(
+            "no prompt: pass a prompt argument or pipe one on stdin"
+        ));
     }
     Ok(read_stdin()?.trim().to_owned())
 }
@@ -112,8 +114,7 @@ async fn drive_headless_events_into(
         let is_turn_finished = matches!(event, AgentEvent::TurnFinished);
         match &event {
             AgentEvent::AuthStarted => {}
-            AgentEvent::AuthPrompt { message }
-            | AgentEvent::AuthProgress { message } => {
+            AgentEvent::AuthPrompt { message } | AgentEvent::AuthProgress { message } => {
                 if verbose {
                     let _ = writeln!(stderr, "{message}");
                 }
@@ -331,8 +332,7 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::stream;
     use llm::{
-        CompletionRequest, Content, EventStream, LlmError, Message, ModelInfo, StreamEvent,
-        Usage,
+        CompletionRequest, Content, EventStream, LlmError, Message, ModelInfo, StreamEvent, Usage,
     };
     use session::SessionEvent;
     use std::path::PathBuf;
@@ -391,7 +391,10 @@ mod tests {
     #[test]
     fn interactive_without_prompt_is_empty() {
         let cli = Cli::default();
-        assert_eq!(resolve_prompt_with(&cli, || true, || unreachable!()).unwrap(), "");
+        assert_eq!(
+            resolve_prompt_with(&cli, || true, || unreachable!()).unwrap(),
+            ""
+        );
     }
 
     // ------------------------------------------------------------- event routing
@@ -459,8 +462,14 @@ mod tests {
         let (stdout, stderr, code) = route(events, true);
         assert_eq!(String::from_utf8(stdout).unwrap(), "done\n");
         let stderr = String::from_utf8(stderr).unwrap();
-        assert!(stderr.contains("▸ echo hi"), "missing started marker: {stderr}");
-        assert!(stderr.contains("✓ echo hi (12ms)"), "missing finished line: {stderr}");
+        assert!(
+            stderr.contains("▸ echo hi"),
+            "missing started marker: {stderr}"
+        );
+        assert!(
+            stderr.contains("✓ echo hi (12ms)"),
+            "missing finished line: {stderr}"
+        );
         assert!(stderr.contains("hi"), "missing tool output: {stderr}");
         assert_eq!(code, ExitCode::SUCCESS);
     }
@@ -468,7 +477,10 @@ mod tests {
     #[test]
     fn output_is_flushed_and_terminated_on_turn_finished() {
         let (stdout, _, _) = route(
-            vec![AgentEvent::TextDelta("partial".into()), AgentEvent::TurnFinished],
+            vec![
+                AgentEvent::TextDelta("partial".into()),
+                AgentEvent::TurnFinished,
+            ],
             false,
         );
         assert_eq!(String::from_utf8(stdout).unwrap(), "partial\n");
@@ -510,7 +522,11 @@ mod tests {
             false,
         );
         assert_eq!(String::from_utf8(stdout).unwrap(), "extra\n");
-        assert!(String::from_utf8(stderr).unwrap().contains("error: provider failed"));
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("error: provider failed")
+        );
         assert_eq!(code, ExitCode::from(1));
     }
 
@@ -530,7 +546,11 @@ mod tests {
             ],
             false,
         );
-        assert!(String::from_utf8(stderr).unwrap().contains("error: http 500"));
+        assert!(
+            String::from_utf8(stderr)
+                .unwrap()
+                .contains("error: http 500")
+        );
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -671,7 +691,9 @@ mod tests {
                 .append_event(
                     &mut session,
                     SessionEvent::UserMessage {
-                        message: session::StoredMessage::from_llm(&Message::user("earlier question")),
+                        message: session::StoredMessage::from_llm(&Message::user(
+                            "earlier question",
+                        )),
                     },
                 )
                 .unwrap();
@@ -694,9 +716,15 @@ mod tests {
                 ..Cli::default()
             };
             let config = headless_config(&cli);
-            let code = run_headless(&config, &cli, provider.clone(), ToolRegistry::empty(), store)
-                .await
-                .unwrap();
+            let code = run_headless(
+                &config,
+                &cli,
+                provider.clone(),
+                ToolRegistry::empty(),
+                store,
+            )
+            .await
+            .unwrap();
             assert_eq!(code, ExitCode::SUCCESS);
 
             let texts = provider.texts();
@@ -725,9 +753,15 @@ mod tests {
                 ..Cli::default()
             };
             let config = headless_config(&cli);
-            let code = run_headless(&config, &cli, provider.clone(), ToolRegistry::empty(), store)
-                .await
-                .unwrap();
+            let code = run_headless(
+                &config,
+                &cli,
+                provider.clone(),
+                ToolRegistry::empty(),
+                store,
+            )
+            .await
+            .unwrap();
             assert_eq!(code, ExitCode::SUCCESS);
             let texts = provider.texts();
             assert_eq!(texts, vec!["hello".to_owned()]);

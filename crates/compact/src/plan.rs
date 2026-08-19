@@ -12,8 +12,8 @@
 use crate::estimate::{estimate_tokens, estimate_transcript_tokens};
 use crate::policy::CompactionPolicy;
 use crate::serialize::{serialize_events, serialize_one_lite};
-use session::model::{events_after_latest_compaction, latest_compaction_boundary};
 use session::model::{Session, SessionEvent, SessionEventRecord};
+use session::model::{events_after_latest_compaction, latest_compaction_boundary};
 
 /// A completed compaction plan: what to summarize, where the new boundary is,
 /// and how much context the summary is expected to free.
@@ -230,8 +230,11 @@ pub fn estimate_live_tokens(session: &Session) -> u64 {
 /// Convenience used by the summarizer to bound its input: serialize the
 /// summarize span under the policy's input cap.
 pub fn summarize_input(plan: &CompactionPlan, max_input_bytes: usize) -> String {
-    let serialized =
-        serialize_events(&plan.to_summarize, max_input_bytes, crate::policy::DEFAULT_TOOL_RESULT_CHARS);
+    let serialized = serialize_events(
+        &plan.to_summarize,
+        max_input_bytes,
+        crate::policy::DEFAULT_TOOL_RESULT_CHARS,
+    );
     serialized.text
 }
 
@@ -245,8 +248,8 @@ pub fn transcript_tokens(text: &str, event_count: usize) -> u64 {
 mod tests {
     use super::*;
     use llm::Message;
-    use session::model::{Session, SessionMetadata, StoredMessage, StoredToolCall};
     use serde_json::json;
+    use session::model::{Session, SessionMetadata, StoredMessage, StoredToolCall};
 
     fn new_session() -> Session {
         Session::new(SessionMetadata::new("/tmp/project", None, None))
@@ -300,7 +303,11 @@ mod tests {
             push_user(&mut session, &format!("question {index}"));
             push_assistant(&mut session, &"a".repeat(bytes_per_turn));
             push_tool_call(&mut session, &format!("call-{index}"), "read");
-            push_tool_result(&mut session, &format!("call-{index}"), &"b".repeat(bytes_per_turn));
+            push_tool_result(
+                &mut session,
+                &format!("call-{index}"),
+                &"b".repeat(bytes_per_turn),
+            );
         }
         session
     }
@@ -373,7 +380,10 @@ mod tests {
         // The kept tail must not start with a ToolResult, and must contain the
         // huge tool result (the current turn's tail) while the older "big turn"
         // user message is summarized (sequence <= boundary).
-        assert!(matches!(first_kept.event, SessionEvent::AssistantMessage { .. }));
+        assert!(matches!(
+            first_kept.event,
+            SessionEvent::AssistantMessage { .. }
+        ));
         let big_user = session
             .events
             .iter()

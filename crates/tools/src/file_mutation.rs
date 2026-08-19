@@ -44,9 +44,7 @@ where
         // Poisoning is recoverable: the map is only ever mutated while the
         // mutex is held, so its contents are always consistent even if a
         // panicking thread was interrupted mid-update.
-        let mut locks = locks
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let mut locks = locks.lock().unwrap_or_else(|poison| poison.into_inner());
         locks
             .entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -77,9 +75,7 @@ where
 /// of 1 while the mutex is held means the entry is genuinely unreachable.
 fn sweep_unreferenced_file_locks() {
     let locks = FILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
+    let mut locks = locks.lock().unwrap_or_else(|poison| poison.into_inner());
     locks.retain(|_, lock| Arc::strong_count(lock) > 1);
 }
 

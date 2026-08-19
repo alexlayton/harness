@@ -50,8 +50,8 @@ async fn main_inner() -> Result<ExitCode> {
     let provider: Arc<dyn Provider> =
         build_provider_with_auth(&config.provider.to_string(), copilot_auth.clone())?;
     let provider_name = provider.name().to_owned();
-    let workspace_root = std::fs::canonicalize(std::env::current_dir()
-        .with_context(|| "resolve workspace root")?)?;
+    let workspace_root =
+        std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
     let tools = default_registry(ToolConfig::new(&workspace_root, config.rtk))?;
     let session_store = SessionStore::default_for_workspace(&workspace_root)?;
 

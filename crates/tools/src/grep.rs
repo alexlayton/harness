@@ -106,7 +106,9 @@ impl Tool for GrepTool {
                 _ => {
                     return error(
                         "grep",
-                        &format!("limit must be a positive integer no greater than {MAX_GREP_LIMIT}"),
+                        &format!(
+                            "limit must be a positive integer no greater than {MAX_GREP_LIMIT}"
+                        ),
                     );
                 }
             },
@@ -177,8 +179,16 @@ mod tests {
             .execute(json!({"pattern": "greeting"}), CancellationToken::new())
             .await;
         assert!(!output.is_error, "{}", output.content);
-        assert!(output.content.contains("src/main.rs:2:let greeting = \"hello\";"));
-        assert!(output.content.contains("src/lib.rs:2:let greeting = \"hi\";"));
+        assert!(
+            output
+                .content
+                .contains("src/main.rs:2:let greeting = \"hello\";")
+        );
+        assert!(
+            output
+                .content
+                .contains("src/lib.rs:2:let greeting = \"hi\";")
+        );
         assert_eq!(output.summary, "grep greeting");
     }
 
@@ -187,8 +197,11 @@ mod tests {
         let directory = tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("src")).unwrap();
         std::fs::create_dir_all(directory.path().join("tests")).unwrap();
-        std::fs::write(directory.path().join("src/main.rs"), "fn main() {\n    let x = 1;\n}\n")
-            .unwrap();
+        std::fs::write(
+            directory.path().join("src/main.rs"),
+            "fn main() {\n    let x = 1;\n}\n",
+        )
+        .unwrap();
         std::fs::write(directory.path().join("tests/test.rs"), "let x = 2;\n").unwrap();
 
         let tool = GrepTool::new(Arc::new(FileSearchIndex::new(directory.path()).unwrap()));
@@ -218,13 +231,19 @@ mod tests {
         std::fs::write(directory.path().join("a.txt"), "hello\n").unwrap();
         let tool = GrepTool::new(Arc::new(FileSearchIndex::new(directory.path()).unwrap()));
         let none = tool
-            .execute(json!({"pattern": "missing-token"}), CancellationToken::new())
+            .execute(
+                json!({"pattern": "missing-token"}),
+                CancellationToken::new(),
+            )
             .await;
         assert!(!none.is_error);
         assert!(none.content.contains("No matches"));
 
         let bad_mode = tool
-            .execute(json!({"pattern": "hello", "mode": "regexx"}), CancellationToken::new())
+            .execute(
+                json!({"pattern": "hello", "mode": "regexx"}),
+                CancellationToken::new(),
+            )
             .await;
         assert!(bad_mode.is_error);
         assert!(bad_mode.content.contains("unknown mode"));
