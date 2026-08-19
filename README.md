@@ -3,6 +3,9 @@
 Harness is a terminal coding-agent harness. It currently supports OpenCode Go,
 OpenRouter, and GitHub Copilot.
 
+Contributing to (or working as an agent in) this repository? Start with
+[AGENTS.md](./AGENTS.md) and [ARCHITECTURE.md](./ARCHITECTURE.md).
+
 ## GitHub Copilot
 
 Start Harness with the Copilot provider when logging in for the first time:
