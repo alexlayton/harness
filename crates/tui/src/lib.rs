@@ -4,6 +4,7 @@
 mod app;
 pub mod attachments;
 pub mod commands;
+mod commit;
 mod completion;
 mod environment;
 mod events;
@@ -13,7 +14,6 @@ pub mod render;
 mod state;
 
 pub use app::Tui;
-pub use render::TailTool;
 pub use state::{ToolRecord, ToolStatus};
 
 /// Messages sent from the terminal UI to the agent. Keeping this protocol in

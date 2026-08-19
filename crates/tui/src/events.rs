@@ -18,45 +18,37 @@ impl crate::Tui {
             self.focus = Focus::Prompt;
             return Ok(false);
         };
-        let indices = self.tool_indices();
-        if indices.is_empty() {
+        // With at most one live (running) tool, focus navigation is trivial:
+        // Tab re-focuses it, Esc returns to the prompt, and Enter/Space/Ctrl+O
+        // toggle its expansion. Multi-tool Up/Down traversal is gone.
+        let Some(index) = self.live_tool_index() else {
             self.focused_tool = None;
             self.focus = Focus::Prompt;
             return Ok(false);
-        }
-        let current_position = self
-            .focused_tool
-            .and_then(|index| indices.iter().position(|candidate| *candidate == index))
-            .unwrap_or(0);
+        };
         match key.code {
             KeyCode::Esc => {
                 self.focused_tool = None;
                 self.focus = Focus::Prompt;
                 Ok(true)
             }
-            KeyCode::Up => {
-                let position = current_position.saturating_sub(1);
-                self.focused_tool = Some(indices[position]);
-                Ok(true)
-            }
-            KeyCode::Down => {
-                let position = (current_position + 1).min(indices.len().saturating_sub(1));
-                self.focused_tool = Some(indices[position]);
-                Ok(true)
-            }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                self.focused_tool = Some(indices[current_position]);
-                self.toggle_tool_at(indices[current_position]);
+                self.focused_tool = Some(index);
+                self.focus = Focus::Tool;
+                self.toggle_live_tool();
                 Ok(true)
             }
             KeyCode::Char('o')
                 if key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.is_empty() =>
             {
-                self.toggle_all_tools();
+                self.focused_tool = Some(index);
+                self.focus = Focus::Tool;
+                self.toggle_live_tool();
                 Ok(true)
             }
             KeyCode::Tab => {
-                self.focused_tool = Some(indices[(current_position + 1) % indices.len()]);
+                self.focused_tool = Some(index);
+                self.focus = Focus::Tool;
                 Ok(true)
             }
             _ => {
@@ -160,7 +152,7 @@ impl crate::Tui {
             Ok(command) => command,
             Err(error) => {
                 self.add_error(error);
-                return Ok(());
+                return self.commit_ready_entries();
             }
         };
         if let ParsedCommand::SetModel {
@@ -173,7 +165,7 @@ impl crate::Tui {
                 "usage: /model [<provider>:]<model> (current: {} · {})",
                 self.provider, self.model
             ));
-            return Ok(());
+            return self.commit_ready_entries();
         }
 
         self.add_notice(format!("⌘ {input}"));
@@ -218,7 +210,7 @@ impl crate::Tui {
                 }
             }
         }
-        Ok(())
+        self.commit_ready_entries()
     }
 
     pub(crate) fn submit_message(
@@ -239,7 +231,8 @@ impl crate::Tui {
         self.activity = crate::app::Activity::Preparing;
         self.spinner = 0;
         self.retrying = None;
-        Ok(())
+        // The user echo is final; commit it before the next draw.
+        self.commit_ready_entries()
     }
 
     pub(crate) fn apply_event(&mut self, event: UiEvent) -> Result<()> {
@@ -398,19 +391,30 @@ impl crate::Tui {
                 self.session_completion_requested = false;
                 self.session_id = Some(id.clone());
                 self.session_title = title;
+                // Flush everything final so far (e.g. the `⌘ /new` echo) into
+                // scrollback, then write a separator, before wiping the
+                // transcript: conversation boundaries must survive in native
+                // scrollback. The old "loaded session X" notice is folded into
+                // the separator so the snapshot that follows cannot wipe it.
+                self.commit_ready_entries()?;
+                let label = if loaded {
+                    format!("loaded session {}", &id[..id.len().min(8)])
+                } else {
+                    "new conversation".to_owned()
+                };
+                self.commit_separator(&label)?;
                 self.transcript.clear();
                 self.streaming_assistant = None;
                 self.running_tool = None;
                 self.focused_tool = None;
-                if loaded {
-                    self.add_notice(format!("loaded session {}", &id[..id.len().min(8)]));
-                }
+                self.committed = 0;
             }
             UiEvent::SessionSnapshot { entries } => {
                 self.transcript.clear();
                 self.streaming_assistant = None;
                 self.running_tool = None;
                 self.focused_tool = None;
+                self.committed = 0;
                 for snapshot in entries {
                     let id = self.allocate_id();
                     let entry = match snapshot {
@@ -453,7 +457,8 @@ impl crate::Tui {
                     };
                     self.transcript.push(entry);
                 }
-                self.transcript_changed();
+                // `committed` is 0, so the end-of-event commit writes the
+                // whole history into scrollback in a single `insert_before`.
             }
             UiEvent::SessionList { sessions } => {
                 self.session_candidates = sessions.clone();
@@ -494,7 +499,10 @@ impl crate::Tui {
                 if auto { "auto-" } else { "" }
             )),
         }
-        Ok(())
+        // After the state mutation, commit any newly-finalized entries so the
+        // live region shrinks to the uncommitted tail before the draw that
+        // follows every event in the loop.
+        self.commit_ready_entries()
     }
 
     fn ensure_assistant(&mut self) -> &mut TranscriptEntry {
@@ -517,7 +525,7 @@ impl crate::Tui {
             .expect("streaming assistant entry exists")
     }
 
-    fn add_notice(&mut self, text: impl Into<String>) {
+    pub(crate) fn add_notice(&mut self, text: impl Into<String>) {
         let id = self.allocate_id();
         self.add_entry(TranscriptEntry::Notice {
             id,
@@ -525,7 +533,7 @@ impl crate::Tui {
         });
     }
 
-    fn add_error(&mut self, text: impl Into<String>) {
+    pub(crate) fn add_error(&mut self, text: impl Into<String>) {
         let id = self.allocate_id();
         self.add_entry(TranscriptEntry::Error {
             id,
@@ -550,30 +558,21 @@ impl crate::Tui {
         // Phase 2 commit pipeline decides what enters scrollback.
     }
 
-    pub(crate) fn tool_indices(&self) -> Vec<usize> {
-        self.transcript
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| entry.tool_record().map(|_| index))
-            .collect()
+    pub(crate) fn live_tool_index(&self) -> Option<usize> {
+        let id = self.running_tool?;
+        self.transcript.iter().position(|entry| entry.id() == id)
     }
 
-    pub(crate) fn toggle_all_tools(&mut self) {
-        // Expand every tool when at least one is collapsed, otherwise collapse
-        // them all. This makes Ctrl+O a toggle across the whole transcript
-        // regardless of focus.
-        let expand = crate::state::toggle_all_direction(&self.transcript);
-        for entry in &mut self.transcript {
-            if let TranscriptEntry::Tool { expanded, .. } = entry {
-                *expanded = expand;
-            }
-        }
-        self.transcript_changed();
-        self.focused_tool = None;
-    }
-
-    fn toggle_tool_at(&mut self, index: usize) {
-        if let Some(TranscriptEntry::Tool { expanded, .. }) = self.transcript.get_mut(index) {
+    pub(crate) fn toggle_live_tool(&mut self) {
+        // With at most one live tool, Ctrl+O toggles just the running one;
+        // committed tool boxes are immutable scrollback and stay collapsed.
+        let Some(id) = self.running_tool else {
+            return;
+        };
+        let Some(entry) = self.transcript.iter_mut().find(|entry| entry.id() == id) else {
+            return;
+        };
+        if let TranscriptEntry::Tool { expanded, .. } = entry {
             *expanded = !*expanded;
             self.transcript_changed();
         }

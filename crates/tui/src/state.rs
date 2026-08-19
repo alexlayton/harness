@@ -93,21 +93,6 @@ impl TranscriptEntry {
     }
 }
 
-/// The outcome of a transcript-wide collapse/expand toggle. Collapsed when at
-/// least one tool is collapsed, expanded when every tool is already expanded.
-/// Pure so the toggle logic can be unit-tested without a TTY.
-pub(crate) fn toggle_all_direction(entries: &[TranscriptEntry]) -> bool {
-    entries.iter().any(|entry| {
-        matches!(
-            entry,
-            TranscriptEntry::Tool {
-                expanded: false,
-                ..
-            }
-        )
-    })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Focus {
     Prompt,
@@ -118,34 +103,48 @@ pub(crate) enum Focus {
 mod tests {
     use super::*;
 
-    #[test]
-    fn toggle_all_direction_expands_when_any_tool_is_collapsed() {
-        let tool = |expanded| TranscriptEntry::Tool {
+    /// Build a ToolRecord so tests can construct transcript fixtures concisely.
+    fn tool(status: ToolStatus) -> TranscriptEntry {
+        TranscriptEntry::Tool {
             id: 1,
             record: ToolRecord {
                 name: "bash".into(),
                 args: "{}".into(),
-                summary: "bash: echo hi".into(),
-                ok: true,
+                summary: "bash".into(),
+                ok: status.is_success(),
                 duration_ms: 1,
-                output: "hi".into(),
+                output: String::new(),
                 error: None,
-                status: ToolStatus::Success,
+                status,
             },
-            expanded,
+            expanded: false,
+        }
+    }
+
+    #[test]
+    fn meaningful_entries_are_user_assistant_and_tool() {
+        let user = TranscriptEntry::User {
+            id: 2,
+            text: "hi".into(),
         };
-        // All expanded → the next toggle collapses everything.
-        assert!(!toggle_all_direction(&[tool(true), tool(true)]));
-        // Any collapsed → the next toggle expands everything.
-        assert!(toggle_all_direction(&[tool(true), tool(false)]));
-        assert!(toggle_all_direction(&[tool(false), tool(false)]));
-        // Non-tool entries do not affect the direction.
-        assert!(!toggle_all_direction(&[
-            TranscriptEntry::User {
-                id: 2,
-                text: "hi".into()
-            },
-            tool(true),
-        ]));
+        let assistant = TranscriptEntry::Assistant {
+            id: 3,
+            markdown: "m".into(),
+            reasoning: String::new(),
+            streaming: false,
+        };
+        let notice = TranscriptEntry::Notice {
+            id: 4,
+            text: "n".into(),
+        };
+        let error = TranscriptEntry::Error {
+            id: 5,
+            text: "e".into(),
+        };
+        assert!(user.is_meaningful());
+        assert!(assistant.is_meaningful());
+        assert!(tool(ToolStatus::Running).is_meaningful());
+        assert!(!notice.is_meaningful());
+        assert!(!error.is_meaningful());
     }
 }

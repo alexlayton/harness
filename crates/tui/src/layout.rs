@@ -1,14 +1,14 @@
-//! Layout arithmetic and terminal painting. `draw` sizes the transcript
-//! tail, completion, activity, metadata, and prompt rows, then delegates
-//! painting to `render`.
+//! Layout arithmetic and terminal painting. `draw` sizes the live tail,
+//! completion, activity, metadata, and prompt rows, then delegates painting
+//! to `render`.
 //!
-//! Phase 1 keeps the pre-migration whole-transcript layout arithmetic but
-//! renders only the last (newest) rows on the fixed inline viewport: a
-//! "show tail" paragraph. The wrap cache and scroll machinery are gone; every
-//! frame re-lays the transcript, which is temporary until Phase 2's commit
-//! pipeline shrinks the live region to the uncommitted tail.
+//! The layout arithmetic is still the temporary pre-migration version (the
+//! Phase 3 rewrite lands later), but the live region now holds only the
+//! uncommitted tail: `transcript[committed..]`, the streaming assistant and/or
+//! running tool that the commit pipeline has not yet written into scrollback.
 
 use crate::render::{self, Theme};
+use crate::state::TranscriptEntry;
 use anyhow::Result;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
@@ -37,17 +37,25 @@ impl crate::Tui {
                 return;
             }
 
-            let show_welcome = !self
-                .transcript
-                .iter()
-                .any(crate::state::TranscriptEntry::is_meaningful);
-            let lines = render::transcript_lines(
-                &self.transcript,
-                show_welcome,
-                outer.width as usize,
-                self.theme,
-            );
-            let content_height = lines.len();
+            // Build the live tail from the uncommitted entries only. Each
+            // entry keeps its own expansion state (Ctrl+O expands the running
+            // tool while it streams). The welcome banner is no longer painted
+            // here; Phase 3 commits it into scrollback at startup.
+            let committed = self.committed.min(self.transcript.len());
+            let live = &self.transcript[committed..];
+            let mut lines = Vec::new();
+            for entry in live {
+                if !lines.is_empty() {
+                    render::push_blank(&mut lines, render::SECTION_GAP);
+                }
+                let expanded = matches!(entry, TranscriptEntry::Tool { expanded: true, .. });
+                lines.extend(render::entry_lines(
+                    entry,
+                    expanded,
+                    outer.width as usize,
+                    self.theme,
+                ));
+            }
             let prompt_content_width = outer.width.saturating_sub(4).max(1) as usize;
             let prompt_layout =
                 render::prompt_layout(&self.textarea, prompt_content_width, self.theme);
@@ -84,9 +92,7 @@ impl crate::Tui {
                 prompt_inner_height,
             );
 
-            // Temporary tail view: scroll the whole-transcript line list so
-            // its last `transcript_rows` rows are the ones painted.
-            let offset = content_height.saturating_sub(transcript_rows as usize);
+            // render_tail always shows the newest rows of the live tail.
             let constraints = vec![
                 Constraint::Length(transcript_rows),
                 Constraint::Length(completion_rows),
@@ -99,7 +105,7 @@ impl crate::Tui {
                 .constraints(constraints)
                 .split(outer);
 
-            render::render_transcript_lines(chunks[0], &lines, offset, self.theme, frame);
+            render::render_tail(chunks[0], &lines, self.theme, frame);
             if let Some(completion) = self.completion.as_ref() {
                 render::render_completion(
                     chunks[1],

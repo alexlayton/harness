@@ -95,6 +95,9 @@ pub struct Tui {
     pub(crate) draft: String,
 
     pub(crate) transcript: Vec<TranscriptEntry>,
+    /// Number of entries at the front of `transcript` already committed into
+    /// scrollback. Everything after this index is the live (uncommitted) tail.
+    pub(crate) committed: usize,
     pub(crate) next_entry_id: EntryId,
     pub(crate) streaming_assistant: Option<EntryId>,
     pub(crate) running_tool: Option<EntryId>,
@@ -170,6 +173,7 @@ impl Tui {
             history_pos: None,
             draft: String::new(),
             transcript: Vec::new(),
+            committed: 0,
             next_entry_id: 1,
             streaming_assistant: None,
             running_tool: None,
@@ -327,12 +331,14 @@ impl Tui {
                 self.submit_message(input, input_tx)?;
             }
             InputAction::ToggleAllTools => {
-                self.toggle_all_tools();
+                self.toggle_live_tool();
             }
             InputAction::FocusTools => {
-                if !self.busy && !self.tool_indices().is_empty() {
-                    let indices = self.tool_indices();
-                    self.focused_tool = Some(indices[0]);
+                if !self.busy
+                    && let Some(index) = self.live_tool_index()
+                {
+                    // There is at most one live (running) tool; Tab focuses it.
+                    self.focused_tool = Some(index);
                     self.focus = Focus::Tool;
                 } else {
                     self.history_pos = None;

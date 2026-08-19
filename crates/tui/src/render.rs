@@ -64,8 +64,9 @@ pub const SECTION_GAP: usize = 1;
 pub const BLOCK_GAP: usize = 1;
 pub const DEFAULT_TAIL_LINES: usize = 4;
 
-/// The key descriptions shown on the empty-session screen. This is kept next
-/// to input rendering so the welcome screen cannot drift from the keymap.
+/// Key descriptions shown to users. Phase 3 renders these inside a startup
+/// welcome banner committed into scrollback; kept here so the keymap cannot
+/// drift from the input handling.
 pub const KEYMAP: &[(&str, &str)] = &[
     ("Enter", "Submit prompt"),
     ("Shift+Enter", "Insert newline"),
@@ -76,14 +77,6 @@ pub const KEYMAP: &[(&str, &str)] = &[
     ("/", "Commands"),
     ("@", "File references"),
 ];
-
-/// Compatibility wrapper retained for embedders that used the old live-tail
-/// type. The retained-mode renderer uses `TranscriptEntry::Tool` directly.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TailTool {
-    pub record: ToolRecord,
-    pub expanded: bool,
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct MarkdownTheme {
@@ -213,7 +206,7 @@ fn blank_line() -> Line<'static> {
     Line::from("")
 }
 
-fn push_blank(lines: &mut Vec<Line<'static>>, count: usize) {
+pub(crate) fn push_blank(lines: &mut Vec<Line<'static>>, count: usize) {
     lines.extend(std::iter::repeat_with(blank_line).take(count));
 }
 
@@ -755,147 +748,65 @@ fn tool_box_lines(
     lines
 }
 
-fn welcome_lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
-    const ASCII_TITLE: &[&str] = &[
-        "  ██   ██  █████  ██████  ███    ██ ███████ ███████ ███████",
-        "  ██   ██ ██   ██ ██   ██ ████   ██ ██      ██      ██",
-        "  ███████ ███████ ██████  ██ ██  ██ █████   ███████ ███████",
-        "  ██   ██ ██   ██ ██   ██ ██  ██ ██ ██           ██      ██",
-        "  ██   ██ ██   ██ ██   ██ ██   ████ ███████ ███████ ███████",
-    ];
-    let title_width = ASCII_TITLE
-        .iter()
-        .map(|line| UnicodeWidthStr::width(*line))
-        .max()
-        .unwrap_or(0);
-    let mut lines = Vec::new();
-    if width >= title_width + 2 {
-        lines.extend(
-            ASCII_TITLE.iter().map(|line| {
-                line_with_style(*line, primary_style(theme).add_modifier(Modifier::BOLD))
-            }),
-        );
-    } else {
-        lines.push(line_with_style(
-            "Harness",
-            primary_style(theme).add_modifier(Modifier::BOLD),
-        ));
-    }
-    push_blank(&mut lines, 2);
-
-    let label_width = KEYMAP
-        .iter()
-        .map(|(label, _)| UnicodeWidthStr::width(*label))
-        .max()
-        .unwrap_or(0);
-    for (label, description) in KEYMAP {
-        let padding = " ".repeat(label_width.saturating_sub(UnicodeWidthStr::width(*label)) + 4);
-        lines.push(Line::from(vec![
-            Span::styled((*label).to_owned(), dim_style(theme)),
-            Span::raw(padding),
-            Span::styled((*description).to_owned(), muted_style(theme)),
-        ]));
-    }
-    lines
-}
-
-/// Build all transcript rows at the current width. Every returned line is
-/// already wrapped, so the scroll offset is measured in the same rows that are
-/// ultimately painted.
-pub fn transcript_lines(
-    entries: &[TranscriptEntry],
-    show_welcome: bool,
+/// Build the wrapped rows for a single transcript entry at the current width.
+/// `expanded` drives tool-box rendering: the commit path always passes
+/// `false`, the live viewport passes the entry's own expansion state. This is
+/// the one builder both the commit pipeline and the live tail share, so a
+/// finalized entry commits into scrollback with the same pixels it rendered
+/// live (committed collapsed, tools included).
+pub fn entry_lines(
+    entry: &TranscriptEntry,
+    expanded: bool,
     width: usize,
     theme: Theme,
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
-    let mut lines = if show_welcome {
-        welcome_lines(width, theme)
-    } else {
-        Vec::new()
-    };
-
-    for entry in entries {
-        if !lines.is_empty() {
-            push_blank(&mut lines, SECTION_GAP);
-        }
-        match entry {
-            TranscriptEntry::User { text, .. } => {
-                lines.extend(user_lines(text, theme, width));
-            }
-            TranscriptEntry::Assistant {
-                markdown,
-                reasoning,
-                ..
-            } => {
-                if !reasoning.is_empty() {
-                    lines.extend(reasoning_lines(reasoning, theme, width));
-                    if !markdown.is_empty() {
-                        push_blank(&mut lines, BLOCK_GAP);
-                    }
-                }
+    let mut lines = Vec::new();
+    match entry {
+        TranscriptEntry::User { text, .. } => lines.extend(user_lines(text, theme, width)),
+        TranscriptEntry::Assistant {
+            markdown,
+            reasoning,
+            ..
+        } => {
+            if !reasoning.is_empty() {
+                lines.extend(reasoning_lines(reasoning, theme, width));
                 if !markdown.is_empty() {
-                    lines.extend(markdown_lines(markdown, theme, width));
+                    push_blank(&mut lines, BLOCK_GAP);
                 }
             }
-            TranscriptEntry::Tool {
-                record, expanded, ..
-            } => {
-                push_blank(&mut lines, BLOCK_GAP);
-                lines.extend(tool_box_lines(record, *expanded, width, theme));
-                push_blank(&mut lines, BLOCK_GAP);
-            }
-            TranscriptEntry::Notice { text, .. } => {
-                lines.extend(notice_lines(text, theme, width));
-            }
-            TranscriptEntry::Error { text, .. } => {
-                lines.extend(error_lines(text, theme, width));
+            if !markdown.is_empty() {
+                lines.extend(markdown_lines(markdown, theme, width));
             }
         }
-    }
-
-    if lines.is_empty() {
-        lines.push(blank_line());
+        TranscriptEntry::Tool { record, .. } => {
+            push_blank(&mut lines, BLOCK_GAP);
+            lines.extend(tool_box_lines(record, expanded, width, theme));
+            push_blank(&mut lines, BLOCK_GAP);
+        }
+        TranscriptEntry::Notice { text, .. } => lines.extend(notice_lines(text, theme, width)),
+        TranscriptEntry::Error { text, .. } => lines.extend(error_lines(text, theme, width)),
     }
     lines
 }
 
-pub fn render_transcript_lines(
-    area: Rect,
-    lines: &[Line<'static>],
-    offset: usize,
-    theme: Theme,
-    frame: &mut Frame<'_>,
-) {
+/// Paint the live tail: the newest rows of `lines`, keeping the bottom of the
+/// content visible while it grows. The terminal's own scrollback holds the
+/// committed history, so there is no user scrolling in the live region.
+pub fn render_tail(area: Rect, lines: &[Line<'static>], theme: Theme, frame: &mut Frame<'_>) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let start = offset.min(lines.len().saturating_sub(area.height as usize));
-    let visible = lines
-        .iter()
-        .skip(start)
-        .take(area.height as usize)
-        .cloned()
-        .collect::<Vec<_>>();
+    let visible_rows = area.height as usize;
+    let offset = lines.len().saturating_sub(visible_rows) as u16;
     frame.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
         area,
     );
-    frame.render_widget(Paragraph::new(Text::from(visible)), area);
-}
-
-pub fn render_transcript(
-    area: Rect,
-    entries: &[TranscriptEntry],
-    show_welcome: bool,
-    offset: usize,
-    theme: Theme,
-    frame: &mut Frame<'_>,
-) -> usize {
-    let lines = transcript_lines(entries, show_welcome, area.width as usize, theme);
-    let count = lines.len();
-    render_transcript_lines(area, &lines, offset, theme, frame);
-    count
+    frame.render_widget(
+        Paragraph::new(Text::from(Vec::from(lines))).scroll((offset, 0)),
+        area,
+    );
 }
 
 pub fn render_activity(
@@ -1376,23 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_can_render_into_a_test_backend() {
-        let entries = vec![TranscriptEntry::User {
-            id: 1,
-            text: "hello".into(),
-        }];
-        let backend = TestBackend::new(40, 8);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render_transcript(frame.area(), &entries, false, 0, Theme::default(), frame);
-            })
-            .unwrap();
-        assert_eq!(terminal.backend().buffer()[(0, 0)].symbol(), "›");
-    }
-
-    #[test]
-    fn transcript_lines_never_exceed_width() {
+    fn entry_lines_never_exceed_width() {
         let long_command = format!("bash: {}", "x".repeat(500));
         let entries = vec![
             TranscriptEntry::User {
@@ -1428,17 +1323,16 @@ mod tests {
             },
         ];
         for width in 8usize..=140 {
-            let lines = transcript_lines(&entries, false, width, Theme::default());
-            for (index, line) in lines.iter().enumerate() {
-                let w = line_width(line);
-                assert!(
-                    w <= width,
-                    "line {index} is {w} wide but width is {width}: {}",
-                    line.spans
-                        .iter()
-                        .map(|s| s.content.as_ref())
-                        .collect::<String>()
-                );
+            for (index, entry) in entries.iter().enumerate() {
+                let lines = entry_lines(entry, false, width, Theme::default());
+                for line in &lines {
+                    let w = line_width(line);
+                    assert!(
+                        w <= width,
+                        "entry {index} line is {w} wide but width is {width}: {}",
+                        span_contents(line)
+                    );
+                }
             }
         }
     }
