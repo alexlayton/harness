@@ -7,11 +7,11 @@
 //! Keep-recent is turn-count primary (last N user turns complete), with the
 //! token cap as a backstop: when the last N turns alone exceed
 //! `keep_recent_tokens`, the cut moves to an assistant message mid-turn — a
-//! "split turn", matching pi.
+//! "split turn".
 
-use crate::estimate::{estimate_tokens, estimate_transcript_tokens};
+use crate::estimate::estimate_tokens;
 use crate::policy::CompactionPolicy;
-use crate::serialize::{serialize_events, serialize_one_lite};
+use crate::serialize::serialize_record;
 use session::model::{Session, SessionEvent, SessionEventRecord};
 use session::model::{events_after_latest_compaction, latest_compaction_boundary};
 
@@ -134,7 +134,7 @@ fn is_cut_point(record: &SessionEventRecord) -> bool {
 
 /// Estimated provider-context tokens represented by a live event.
 fn event_tokens(record: &SessionEventRecord, max_tool_result_chars: usize) -> u64 {
-    let text = serialize_one_lite(&record.event, max_tool_result_chars);
+    let text = serialize_record(&record.event, max_tool_result_chars);
     if text.is_empty() {
         return 0;
     }
@@ -225,23 +225,6 @@ pub fn estimate_live_tokens(session: &Session) -> u64 {
         .filter(|record| !is_compaction(record))
         .collect();
     live_tokens(&live, 0)
-}
-
-/// Convenience used by the summarizer to bound its input: serialize the
-/// summarize span under the policy's input cap.
-pub fn summarize_input(plan: &CompactionPlan, max_input_bytes: usize) -> String {
-    let serialized = serialize_events(
-        &plan.to_summarize,
-        max_input_bytes,
-        crate::policy::DEFAULT_TOOL_RESULT_CHARS,
-    );
-    serialized.text
-}
-
-/// Re-export a small helper so other modules share one token estimator for
-/// transcripts (used by the deterministic fallback).
-pub fn transcript_tokens(text: &str, event_count: usize) -> u64 {
-    estimate_transcript_tokens(text, event_count)
 }
 
 #[cfg(test)]

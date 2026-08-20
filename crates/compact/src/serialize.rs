@@ -52,15 +52,11 @@ pub fn serialize_events(
     }
 }
 
-/// Serialize one event to its transcript line. Used by the planner for
-/// per-event token estimation over the live region.
-pub fn serialize_one_lite(event: &SessionEvent, max_tool_result_chars: usize) -> String {
-    serialize_record(event, max_tool_result_chars)
-}
-
-/// Serialize a single event to its transcript line (empty for events that do
-/// not contribute to the summarizer's view, e.g. usage accounting).
-fn serialize_record(event: &SessionEvent, max_tool_result_chars: usize) -> String {
+/// Serialize one event to its transcript line (empty for events that do not
+/// contribute to the summarizer's view, e.g. usage accounting).  `pub(crate)`
+/// so the planner can reuse it for per-event token estimation over the live
+/// region.
+pub(crate) fn serialize_record(event: &SessionEvent, max_tool_result_chars: usize) -> String {
     match event {
         SessionEvent::UserMessage { message } => message_joined_text(message)
             .map(|text| format!("[User]: {text}"))
@@ -126,9 +122,16 @@ fn serialize_assistant_message(message: &StoredMessage, max_tool_result_chars: u
             } => {
                 calls.push(format_tool_call(name, arguments));
             }
-            StoredContent::ToolResult { content, .. } => {
+            StoredContent::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
                 sections.push(serialize_embedded_tool_result(
+                    tool_call_id,
                     content,
+                    *is_error,
                     max_tool_result_chars,
                 ));
             }
@@ -151,15 +154,18 @@ fn serialize_assistant_message(message: &StoredMessage, max_tool_result_chars: u
         .join("\n")
 }
 
-fn serialize_embedded_tool_result(content: &str, max_tool_result_chars: usize) -> String {
+fn serialize_embedded_tool_result(
+    tool_call_id: &str,
+    content: &str,
+    is_error: bool,
+    max_tool_result_chars: usize,
+) -> String {
     if content.trim().is_empty() {
         return String::new();
     }
-    format!(
-        "[Tool result ok]: ({}) {}",
-        content,
-        truncate_for_summary(content, max_tool_result_chars)
-    )
+    let status = if is_error { "error" } else { "ok" };
+    let body = truncate_for_summary(content, max_tool_result_chars);
+    format!("[Tool result {status}]: ({tool_call_id}) {body}")
 }
 
 fn message_joined_text(message: &StoredMessage) -> Option<String> {
@@ -382,6 +388,39 @@ mod tests {
             "oldest material must be dropped first"
         );
         assert!(transcript.truncated);
+    }
+
+    #[test]
+    fn embedded_tool_result_is_truncated_once_with_its_id() {
+        let content = "y".repeat(5_000);
+        let rendered = serialize_embedded_tool_result("call-9", &content, false, 100);
+        assert_eq!(
+            rendered,
+            format!(
+                "[Tool result ok]: (call-9) {}",
+                truncate_for_summary(&content, 100)
+            ),
+            "body truncated once and rendered with its id"
+        );
+
+        let error = serialize_embedded_tool_result("call-9", &"boom".repeat(5_000), true, 2);
+        assert!(error.starts_with("[Tool result error]:"), "{error}");
+    }
+
+    #[test]
+    fn embedded_tool_result_in_assistant_message_keeps_id_and_truncates() {
+        let message =
+            StoredMessage::from_llm(&Message::assistant(vec![llm::Content::ToolResult {
+                tool_call_id: "call-7".into(),
+                content: "z".repeat(8_000),
+                is_error: false,
+            }]));
+        let rendered = serialize_record(&SessionEvent::AssistantMessage { message }, 50);
+        assert!(rendered.contains("(call-7)"), "{rendered}");
+        assert!(
+            rendered.contains("[... 7950 more characters truncated]"),
+            "{rendered}"
+        );
     }
 
     #[test]
