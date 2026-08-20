@@ -268,18 +268,9 @@ impl Agent {
         self
     }
 
-    pub fn with_history(mut self, history: Vec<Message>) -> Self {
-        self.history = history;
-        self
-    }
-
     pub fn with_copilot_auth(mut self, auth: Arc<CopilotAuth>) -> Self {
         self.copilot_auth = Some(auth);
         self
-    }
-
-    pub fn with_auth(self, auth: Arc<CopilotAuth>) -> Self {
-        self.with_copilot_auth(auth)
     }
 
     /// Attach a loaded/new durable session.  Active provider/model selection
@@ -291,10 +282,6 @@ impl Agent {
         self.history = session.context_messages();
         self.session = Some(AgentSessionState { store, session });
         self
-    }
-
-    pub fn session(&self) -> Option<&Session> {
-        self.session.as_ref().map(|state| &state.session)
     }
 
     fn persist_event(
@@ -351,7 +338,7 @@ impl Agent {
         // message avoids duplicate calls while still making the event stream
         // explicit and easy to inspect/export.
         let message = Message::assistant(content);
-        if !content_is_empty(&message)
+        if !message.content.is_empty()
             && !self.persist_event(
                 SessionEvent::AssistantMessage {
                     message: StoredMessage::from_llm(&message),
@@ -1626,10 +1613,6 @@ fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<Sessi
             }
         })
         .collect()
-}
-
-fn content_is_empty(message: &Message) -> bool {
-    message.content.is_empty()
 }
 
 /// Push a non-durable recovery note into history, preserving provider role

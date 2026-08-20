@@ -41,6 +41,8 @@ impl ProviderArg {
 
     /// The first name is the preferred one. The additional OpenCode name is
     /// supported for compatibility with existing OpenCode installations.
+    /// The first name is the preferred one. The additional OpenCode name is
+    /// supported for compatibility with existing OpenCode installations.
     pub fn env_vars(&self) -> &'static [&'static str] {
         match self {
             Self::OpencodeGo => &["OPENCODE_GO_API_KEY", "OPENCODE_API_KEY"],
@@ -51,10 +53,6 @@ impl ProviderArg {
             // resolution itself does not require it.
             Self::GithubCopilot => &["COPILOT_GITHUB_TOKEN"],
         }
-    }
-
-    pub fn env_var(&self) -> &'static str {
-        self.env_vars()[0]
     }
 
     pub fn default_model(&self) -> &'static str {
@@ -334,10 +332,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_cli(cli: &Cli) -> Result<Self> {
-        Self::resolve(cli)
-    }
-
     pub fn resolve(cli: &Cli) -> Result<Self> {
         let path = config_path();
         let file = load_file_config(&path)?;
@@ -354,16 +348,6 @@ impl Config {
             config.model = model;
         }
         Ok(config)
-    }
-
-    /// Resolve a config with explicitly supplied key values.  This is kept
-    /// independent of the process environment for deterministic unit tests.
-    pub fn resolve_with_keys(
-        cli: &Cli,
-        opencode_key: Option<&str>,
-        openrouter_key: Option<&str>,
-    ) -> Result<Self> {
-        Self::resolve_with_key_values(cli, opencode_key, None, openrouter_key)
     }
 
     /// Testable form that also covers the legacy `OPENCODE_API_KEY` fallback.
@@ -457,11 +441,6 @@ fn entitled_copilot_default() -> Option<String> {
     let credential = CopilotAuth::from_default().ok()?.credential().ok()??;
     let sku = sku_from_proxy_token(&credential.access);
     default_model_for(sku, &credential.available_model_ids)
-}
-
-/// Construct a provider from its stable configuration/command name.
-pub fn build_provider(name: &str) -> Result<Arc<dyn Provider>> {
-    build_provider_with_auth(name, None)
 }
 
 /// Construct a provider while reusing the auth state owned by the agent.  The
@@ -636,7 +615,9 @@ mod tests {
             provider: Some(ProviderArg::Openrouter),
             ..Cli::default()
         };
-        let error = Config::resolve_with_keys(&cli, None, None).err().unwrap();
+        let error = Config::resolve_with_key_values(&cli, None, None, None)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("OPENROUTER_API_KEY"));
 
         let cli = Cli {

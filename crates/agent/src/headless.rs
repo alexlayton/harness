@@ -80,7 +80,7 @@ fn cancel_on_sigint(cancel: CancellationToken) {
 
 /// Drive the headless event stream until the agent task closes the channel.
 /// Writes the answer to real stdout and maps the event stream to stderr per
-/// the routing table in the design.  Returns the process exit code.
+/// the stdout/stderr contract.  Returns the process exit code.
 pub async fn drive_headless_events(
     event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     verbose: bool,
@@ -792,9 +792,8 @@ mod tests {
         }
     }
 
-    /// Mirror of §12's Ctrl-C test without delivering a real signal: external
-    /// cancellation mid-turn must persist `TurnCancelled`, drain the agent
-    /// task, and surface as exit 130.
+    /// External cancellation mid-turn must persist `TurnCancelled`, drain the
+    /// agent task, and surface as exit 130.
     #[test]
     fn cancellation_persists_turn_cancelled_and_exits_130() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
