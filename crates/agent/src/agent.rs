@@ -1122,13 +1122,6 @@ impl Agent {
             );
             return;
         }
-        if let Err(error) = store.set_current(&session) {
-            send(
-                events,
-                AgentEvent::Error(format!("could not update current session: {error}")),
-            );
-            return;
-        }
         let id = session.id().to_string();
         let title = session.metadata.title.clone();
         self.history = session.context_messages();

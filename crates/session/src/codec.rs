@@ -125,6 +125,7 @@ fn decode_session_lines(
         });
     }
 
+    let last_line = content.lines().count();
     let mut session = None::<Session>;
     let mut recovered = false;
     let mut records = Vec::new();
@@ -142,12 +143,7 @@ fn decode_session_lines(
 
         let raw: RawEnvelope = match serde_json::from_str(line) {
             Ok(raw) => raw,
-            Err(source_error)
-                if recover_trailing
-                    && has_unterminated_tail
-                    && line_number == index_of_last(content) =>
-            {
-                let _ = source_error;
+            Err(_) if recover_trailing && has_unterminated_tail && line_number == last_line => {
                 recovered = true;
                 break;
             }
@@ -285,10 +281,6 @@ fn decode_session_lines(
         session.append_record(record);
     }
     Ok((session, recovered))
-}
-
-fn index_of_last(content: &str) -> usize {
-    content.lines().count()
 }
 
 fn parse_session_id(value: Option<&str>, source: &Path, line: usize) -> Result<SessionId> {
@@ -460,6 +452,30 @@ mod tests {
     use super::*;
     use crate::model::{SessionEvent, SessionMetadata, StoredMessage};
     use llm::Message;
+
+    #[test]
+    fn unterminated_trailing_fragment_is_ignored_but_middle_corruption_is_not() {
+        let encoded = encode_session(&Session::new(SessionMetadata::new(
+            "/tmp/project",
+            Some("p".into()),
+            Some("m".into()),
+        )))
+        .unwrap();
+        let corrupted = format!("{encoded}{{");
+        let (session, recovered) = decode_session_file(&corrupted, "<memory>").unwrap();
+        assert!(recovered);
+        assert_eq!(
+            session.events,
+            Session::new(SessionMetadata::new(
+                "/tmp/project",
+                Some("p".into()),
+                Some("m".into()),
+            ))
+            .events
+        );
+        let middle_corruption = encoded.replacen("\n", "\n{\n", 1);
+        assert!(decode_session_file(&middle_corruption, "<memory>").is_err());
+    }
 
     #[test]
     fn canonical_round_trip_keeps_unknown_events() {

@@ -28,11 +28,8 @@ pub use error::{Result, SessionError};
 pub use export::{ExportOptions, export_jsonl, export_transcript};
 pub use model::{
     EventId, FORMAT_VERSION, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata,
-    SessionSnapshotEntry, SessionUsage, StoredContent, StoredMessage, StoredRole, StoredToolCall,
-    Timestamp, UsageSummary, context_messages, events_after_latest_compaction,
-    latest_compaction_boundary, snapshot_entries, usage_summary, validate_events,
+    SessionSnapshotEntry, StoredContent, StoredMessage, StoredRole, StoredToolCall, Timestamp,
+    UsageSummary, context_messages, events_after_latest_compaction, latest_compaction_boundary,
+    snapshot_entries, usage_summary,
 };
-pub use store::{
-    LoadReport, RecoveryReport, RetentionPolicy, SessionCreateOptions, SessionIndexEntry,
-    SessionStore, default_session_dir,
-};
+pub use store::{SessionCreateOptions, SessionIndexEntry, SessionStore, default_session_dir};

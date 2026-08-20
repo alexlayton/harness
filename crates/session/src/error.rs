@@ -57,9 +57,6 @@ pub enum SessionError {
     #[error("invalid session event: {0}")]
     InvalidEvent(String),
 
-    #[error("session has no durable file")]
-    NotPersisted,
-
     #[error("cannot export a session over its source file: {}", .0.display())]
     ExportWouldOverwrite(PathBuf),
 

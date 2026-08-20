@@ -44,10 +44,6 @@ impl SessionId {
     pub fn short(&self) -> String {
         self.to_string().chars().take(8).collect()
     }
-
-    pub fn as_uuid(&self) -> Uuid {
-        self.0
-    }
 }
 
 impl Default for SessionId {
@@ -102,8 +98,6 @@ impl fmt::Display for EventId {
 /// Aggregate usage recorded in session metadata.  Usage is intentionally a
 /// session-owned DTO instead of a provider-owned type so provider changes do
 /// not change the storage schema.
-pub type SessionUsage = UsageSummary;
-
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct UsageSummary {
     #[serde(default)]
@@ -454,37 +448,6 @@ pub enum SessionEvent {
 }
 
 impl SessionEvent {
-    pub fn user_message(message: &Message) -> Self {
-        Self::UserMessage {
-            message: StoredMessage::from_llm(message),
-        }
-    }
-
-    pub fn assistant_message(message: &Message) -> Self {
-        Self::AssistantMessage {
-            message: StoredMessage::from_llm(message),
-        }
-    }
-
-    pub fn tool_call(call: &ToolCall) -> Self {
-        Self::ToolCall {
-            call: StoredToolCall::from(call),
-        }
-    }
-
-    pub fn tool_result(
-        tool_call_id: impl Into<String>,
-        content: impl Into<String>,
-        is_error: bool,
-    ) -> Self {
-        Self::ToolResult {
-            tool_call_id: tool_call_id.into(),
-            content: content.into(),
-            is_error,
-            tool_name: None,
-        }
-    }
-
     /// Convert this event to the provider messages it represents.  Metadata,
     /// usage, diagnostics, and unknown events intentionally produce no
     /// messages; `Session::context_messages` additionally performs grouping
@@ -606,32 +569,6 @@ impl Session {
         self.apply_record(record);
     }
 
-    pub fn append_user(&mut self, message: &Message) -> SessionEventRecord {
-        self.append(SessionEvent::user_message(message))
-    }
-
-    pub fn append_assistant(&mut self, message: &Message) -> SessionEventRecord {
-        self.append(SessionEvent::assistant_message(message))
-    }
-
-    /// Append a user or assistant message using the canonical event kind.
-    pub fn append_message(&mut self, message: &Message) -> Result<SessionEventRecord> {
-        let event = match message.role {
-            Role::User => SessionEvent::UserMessage {
-                message: StoredMessage::from_llm(message),
-            },
-            Role::Assistant => SessionEvent::AssistantMessage {
-                message: StoredMessage::from_llm(message),
-            },
-            Role::System | Role::Tool => {
-                return Err(SessionError::InvalidEvent(
-                    "only user and assistant messages can be appended as messages".into(),
-                ));
-            }
-        };
-        Ok(self.append(event))
-    }
-
     fn apply_record(&mut self, record: SessionEventRecord) {
         self.metadata.updated_at = record.timestamp.clone();
         match &record.event {
@@ -681,22 +618,6 @@ impl Session {
 
     pub fn context_messages(&self) -> Vec<Message> {
         context_messages(&self.events)
-    }
-
-    pub fn messages(&self) -> Vec<Message> {
-        self.context_messages()
-    }
-
-    pub fn to_llm_messages(&self) -> Vec<Message> {
-        self.context_messages()
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        validate_events(&self.events)
-    }
-
-    pub fn latest_compaction_boundary(&self) -> Option<(u64, u64)> {
-        latest_compaction_boundary(&self.events)
     }
 }
 
@@ -902,7 +823,7 @@ pub fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&Ses
 /// Validate envelope-level ordering and tool-result references.  An unmatched
 /// tool call is allowed only at the end of a log: it is the recoverable state
 /// produced by a process crash and is omitted by `context_messages`.
-pub fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
+pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
     let mut expected_sequence = 1u64;
     let mut ids = HashSet::new();
     let mut tracker = ToolCallTracker::default();
@@ -1216,9 +1137,9 @@ mod tests {
     #[test]
     fn first_user_message_provides_a_stable_display_title() {
         let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
-        session.append(SessionEvent::user_message(&Message::user(
-            "Fix the login flow",
-        )));
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("Fix the login flow")),
+        });
         assert_eq!(session.title(), Some("Fix the login flow"));
     }
 

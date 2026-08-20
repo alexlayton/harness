@@ -42,26 +42,6 @@ pub struct SessionIndexEntry {
     pub bytes: u64,
 }
 
-/// Result of loading a session.  A `true` recovery flag means the file ended
-/// with a malformed unterminated JSON fragment, which was ignored safely.
-#[derive(Clone, Debug)]
-pub struct LoadReport {
-    pub session: Session,
-    pub recovered_trailing_line: bool,
-    /// One-based line number when a trailing fragment was ignored.
-    pub recovered_line: Option<usize>,
-}
-
-/// Result of truncating an incomplete trailing record.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoveryReport {
-    pub path: PathBuf,
-    pub truncated: bool,
-    pub removed_bytes: u64,
-    /// One-based line number of the truncated fragment, if any.
-    pub line: Option<usize>,
-}
-
 /// Filesystem-backed session storage.  Sessions are grouped by a stable key
 /// derived from the workspace root, so a project never appears in another
 /// project's normal listing.
@@ -91,21 +71,11 @@ impl SessionStore {
         })
     }
 
-    /// Return the resolved default session directory without creating it.
-    pub fn default_root() -> PathBuf {
-        default_session_dir()
-    }
-
     /// Construct the default Harness store.  `HARNESS_SESSION_DIR` is an
     /// exact directory override; otherwise `HARNESS_STATE_DIR` is treated as
     /// the parent of `sessions`; the default is `~/.harness/sessions`.
     pub fn default_for_workspace(workspace_root: impl Into<PathBuf>) -> Result<Self> {
         Self::new(default_session_dir(), workspace_root)
-    }
-
-    /// Alias useful to embedders that prefer the shorter name.
-    pub fn for_workspace(workspace_root: impl Into<PathBuf>) -> Result<Self> {
-        Self::default_for_workspace(workspace_root)
     }
 
     pub fn root(&self) -> &Path {
@@ -126,60 +96,11 @@ impl SessionStore {
 
     /// Create and immediately persist a new session header.
     pub fn create(&self, options: SessionCreateOptions) -> Result<Session> {
-        fs::create_dir_all(&self.workspace_dir)
-            .map_err(|source| io_error("create session directory", &self.workspace_dir, source))?;
-        self.ensure_path_in_root(&self.workspace_dir)?;
-        set_private_directory(&self.root);
-        set_private_directory(&self.workspace_dir);
-
         let mut metadata =
             SessionMetadata::new(self.workspace_root.clone(), options.provider, options.model);
         metadata.title = options.title;
         metadata.parent_session = options.parent_session;
-        let path = self.workspace_dir.join(format!("{}.jsonl", metadata.id));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|source| {
-                if source.kind() == std::io::ErrorKind::AlreadyExists {
-                    SessionError::AlreadyExists(path.clone())
-                } else {
-                    io_error("create session file", &path, source)
-                }
-            })?;
-        let header = encode_header(&metadata)?;
-        let write_result = file
-            .write_all(header.as_bytes())
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.flush())
-            .and_then(|_| file.sync_all())
-            .map_err(|source| io_error("write session header", &path, source));
-        if let Err(error) = write_result {
-            drop(file);
-            let _ = fs::remove_file(&path);
-            return Err(error);
-        }
-        drop(file);
-        set_private_file(&path);
-        let session = Session {
-            header_metadata: metadata.clone(),
-            metadata,
-            events: Vec::new(),
-            path: Some(path.clone()),
-        };
-        self.write_current(&session.metadata.id)?;
-        Ok(session)
-    }
-
-    /// Alias emphasizing that a new session is persisted before it is handed
-    /// to the agent.
-    pub fn create_session(&self, options: SessionCreateOptions) -> Result<Session> {
-        self.create(options)
-    }
-
-    pub fn new_session(&self, options: SessionCreateOptions) -> Result<Session> {
-        self.create(options)
+        self.create_from_metadata(metadata)
     }
 
     /// Create a session from already prepared metadata.  The metadata ID is
@@ -191,6 +112,11 @@ impl SessionStore {
                 requested: self.workspace_root.clone(),
             });
         }
+        self.create_from_metadata(metadata)
+    }
+
+    /// Persist a new session header on disk and return the in-memory session.
+    fn create_from_metadata(&self, metadata: SessionMetadata) -> Result<Session> {
         fs::create_dir_all(&self.workspace_dir)
             .map_err(|source| io_error("create session directory", &self.workspace_dir, source))?;
         self.ensure_path_in_root(&self.workspace_dir)?;
@@ -222,14 +148,12 @@ impl SessionStore {
         }
         drop(file);
         set_private_file(&path);
-        let session = Session {
+        Ok(Session {
             header_metadata: metadata.clone(),
             metadata,
             events: Vec::new(),
             path: Some(path),
-        };
-        self.write_current(&session.id())?;
-        Ok(session)
+        })
     }
 
     /// Append one event and make it durable before returning.  A sidecar
@@ -286,50 +210,6 @@ impl SessionStore {
         *session = disk_session;
         drop(lock);
         Ok(record)
-    }
-
-    pub fn append(&self, session: &mut Session, event: SessionEvent) -> Result<SessionEventRecord> {
-        self.append_event(session, event)
-    }
-
-    pub fn append_message(
-        &self,
-        session: &mut Session,
-        message: &llm::Message,
-    ) -> Result<SessionEventRecord> {
-        let event = match message.role {
-            llm::Role::User => SessionEvent::UserMessage {
-                message: crate::model::StoredMessage::from_llm(message),
-            },
-            llm::Role::Assistant => SessionEvent::AssistantMessage {
-                message: crate::model::StoredMessage::from_llm(message),
-            },
-            llm::Role::System | llm::Role::Tool => {
-                return Err(SessionError::InvalidEvent(
-                    "only user and assistant messages can be appended as messages".into(),
-                ));
-            }
-        };
-        self.append_event(session, event)
-    }
-
-    /// There is no long-lived buffered writer: append_event acknowledges only
-    /// after flushing and syncing.  This method is provided for shutdown code
-    /// and future buffered implementations.
-    pub fn flush(&self, session: &Session) -> Result<()> {
-        if let Some(path) = session.path() {
-            let file = OpenOptions::new()
-                .read(true)
-                .open(path)
-                .map_err(|source| io_error("open session for flush", path, source))?;
-            file.sync_all()
-                .map_err(|source| io_error("flush session", path, source))?;
-        }
-        Ok(())
-    }
-
-    pub fn open_session(&self, id: &SessionId) -> Result<Session> {
-        self.open(id)
     }
 
     pub fn open(&self, id: &SessionId) -> Result<Session> {
@@ -390,14 +270,6 @@ impl SessionStore {
         }
     }
 
-    pub fn load_by_id(&self, selector: &str) -> Result<Session> {
-        self.load(selector)
-    }
-
-    pub fn open_path(&self, path: &Path) -> Result<Session> {
-        self.load_path(path)
-    }
-
     pub fn load_path(&self, path: &Path) -> Result<Session> {
         let resolved = path
             .canonicalize()
@@ -425,115 +297,8 @@ impl SessionStore {
         Ok(session)
     }
 
-    pub fn load_with_report(&self, path: &Path) -> Result<LoadReport> {
-        let resolved = path
-            .canonicalize()
-            .map_err(|source| io_error("resolve session path", path, source))?;
-        let contents = read_file(&resolved)?;
-        let (mut session, recovered) = decode_session_file(&contents, &resolved)?;
-        let stored_workspace = normalize_workspace(session.metadata.workspace_root.clone())?;
-        if stored_workspace != self.workspace_root {
-            return Err(SessionError::WorkspaceMismatch {
-                stored: session.metadata.workspace_root.clone(),
-                requested: self.workspace_root.clone(),
-            });
-        }
-        session.path = Some(resolved);
-        Ok(LoadReport {
-            session,
-            recovered_trailing_line: recovered,
-            recovered_line: recovered.then(|| contents.lines().count()),
-        })
-    }
-
-    pub fn load_latest(&self) -> Result<Option<Session>> {
-        match self.load("latest") {
-            Ok(session) => Ok(Some(session)),
-            Err(SessionError::NoSession) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub fn latest(&self) -> Result<Option<SessionIndexEntry>> {
-        let mut entries = self.list()?;
-        entries.sort_by(|left, right| {
-            right
-                .updated_at
-                .cmp(&left.updated_at)
-                .then_with(|| right.created_at.cmp(&left.created_at))
-        });
-        Ok(entries.into_iter().next())
-    }
-
-    pub fn set_current(&self, session: &Session) -> Result<()> {
-        if let Some(path) = session.path()
-            && self.ensure_path_in_root(path).is_err()
-        {
-            // Explicitly loaded/exported files may be outside the store.  They
-            // are valid read-only sessions but cannot be represented by the
-            // workspace-local current pointer.
-            return Ok(());
-        }
-        self.write_current(&session.id())
-    }
-
-    pub fn current(&self) -> Result<Option<Session>> {
-        let pointer = self.workspace_dir.join(".current");
-        let id = match fs::read_to_string(&pointer) {
-            Ok(value) => value.trim().to_owned(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => return Err(io_error("read current session", &pointer, source)),
-        };
-        if id.is_empty() {
-            return Ok(None);
-        }
-        self.load(&id).map(Some)
-    }
-
     pub fn list(&self) -> Result<Vec<SessionIndexEntry>> {
         list_directory(&self.workspace_dir, Some(&self.workspace_root))
-    }
-
-    /// List sessions for every workspace below this store root.  Corrupt files
-    /// are skipped by default; callers needing diagnostics can load each path
-    /// directly and receive its first bad line.
-    pub fn list_all(&self) -> Result<Vec<SessionIndexEntry>> {
-        if !self.root.exists() {
-            return Ok(Vec::new());
-        }
-        let mut result = Vec::new();
-        let directories = fs::read_dir(&self.root)
-            .map_err(|source| io_error("list session store", &self.root, source))?;
-        for directory in directories {
-            let directory = directory
-                .map_err(|source| io_error("read session store entry", &self.root, source))?;
-            if !directory
-                .file_type()
-                .map_err(|source| {
-                    io_error("inspect session store entry", directory.path(), source)
-                })?
-                .is_dir()
-            {
-                continue;
-            }
-            result.extend(list_directory(&directory.path(), None)?);
-        }
-        result.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        Ok(result)
-    }
-
-    pub fn export(
-        &self,
-        session: &Session,
-        destination: Option<&Path>,
-        options: &crate::export::ExportOptions,
-    ) -> Result<PathBuf> {
-        crate::export::export_jsonl(session, destination, options)
-    }
-
-    pub fn rename(&self, session: &mut Session, title: Option<String>) -> Result<()> {
-        self.append_event(session, SessionEvent::MetadataChange { title })?;
-        Ok(())
     }
 
     /// Repair tool calls left at the end of a file by a process crash.  The
@@ -594,56 +359,6 @@ impl SessionStore {
         Ok(count)
     }
 
-    pub fn delete(&self, session: &Session) -> Result<()> {
-        let Some(path) = session.path() else {
-            return Err(SessionError::NotPersisted);
-        };
-        self.ensure_path_in_root(path)?;
-        let current_id = fs::read_to_string(self.workspace_dir.join(".current"))
-            .ok()
-            .map(|value| value.trim().to_owned());
-        fs::remove_file(path).map_err(|source| io_error("delete session", path, source))?;
-        let lock = path.with_extension("jsonl.lock");
-        let _ = fs::remove_file(lock);
-        if current_id
-            .as_deref()
-            .is_some_and(|id| id == session.id().to_string())
-        {
-            let _ = fs::remove_file(self.workspace_dir.join(".current"));
-        }
-        Ok(())
-    }
-
-    /// Fork a session into a new append-only file.  Entries are replayed as
-    /// fresh records, while `parent_session` records the origin identity.
-    pub fn fork(&self, source: &Session, title: Option<String>) -> Result<Session> {
-        let mut fork = self.create(SessionCreateOptions {
-            title,
-            provider: source.metadata.provider.clone(),
-            model: source.metadata.model.clone(),
-            parent_session: Some(source.id()),
-        })?;
-        for record in &source.events {
-            self.append_event(&mut fork, record.event.clone())?;
-        }
-        Ok(fork)
-    }
-
-    /// Copy an external/exported session into this workspace with a new ID.
-    pub fn import(&self, path: &Path, title: Option<String>) -> Result<Session> {
-        let source = Self::load_any_path(path)?;
-        let mut imported = self.create(SessionCreateOptions {
-            title,
-            provider: source.metadata.provider.clone(),
-            model: source.metadata.model.clone(),
-            parent_session: Some(source.id()),
-        })?;
-        for record in source.events {
-            self.append_event(&mut imported, record.event)?;
-        }
-        Ok(imported)
-    }
-
     /// Adopt an explicitly loaded external file into this workspace while
     /// retaining its session ID.  This is used when `/load <path>` points at a
     /// JSONL export in the current directory; future appends must remain under
@@ -666,86 +381,6 @@ impl SessionStore {
         Ok(adopted)
     }
 
-    pub fn recover_trailing_line(&self, path: &Path) -> Result<RecoveryReport> {
-        let resolved = path
-            .canonicalize()
-            .map_err(|source| io_error("resolve session path", path, source))?;
-        self.ensure_path_in_root(&resolved)?;
-        let contents = read_file(&resolved)?;
-        let (_, recovered) = decode_session_file(&contents, &resolved)?;
-        if !recovered {
-            return Ok(RecoveryReport {
-                path: resolved,
-                truncated: false,
-                removed_bytes: 0,
-                line: None,
-            });
-        }
-        let last_newline = contents
-            .as_bytes()
-            .iter()
-            .rposition(|byte| *byte == b'\n')
-            .map(|index| index + 1)
-            .unwrap_or(0);
-        let removed_bytes = (contents.len() - last_newline) as u64;
-        let lock = SessionLock::acquire(&resolved)?;
-        let temp = resolved.with_extension("jsonl.recover.tmp");
-        let result = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp)
-                .map_err(|source| io_error("create recovery file", &temp, source))?;
-            file.write_all(&contents.as_bytes()[..last_newline])
-                .and_then(|_| file.flush())
-                .and_then(|_| file.sync_all())
-                .map_err(|source| io_error("write recovery file", &temp, source))?;
-            fs::rename(&temp, &resolved)
-                .map_err(|source| io_error("replace recovered session", &resolved, source))?;
-            set_private_file(&resolved);
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        drop(lock);
-        result?;
-        Ok(RecoveryReport {
-            path: resolved,
-            truncated: true,
-            removed_bytes,
-            line: Some(contents.lines().count()),
-        })
-    }
-
-    pub fn cleanup(&self, policy: &RetentionPolicy) -> Result<usize> {
-        let mut entries = self.list()?;
-        entries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        let now = SystemTime::now();
-        let mut removed = 0;
-        let mut total_bytes = entries.iter().map(|entry| entry.bytes).sum::<u64>();
-        for (index, entry) in entries.into_iter().enumerate() {
-            let over_count = policy.max_sessions.is_some_and(|max| index >= max);
-            let over_bytes = policy.max_bytes.is_some_and(|max| total_bytes > max);
-            let too_old = policy.max_age.is_some_and(|age| {
-                fs::metadata(&entry.path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| now.duration_since(modified).ok())
-                    .is_some_and(|elapsed| elapsed > age)
-            });
-            if !(over_count || over_bytes || too_old) {
-                continue;
-            }
-            fs::remove_file(&entry.path)
-                .map_err(|source| io_error("remove retained session", &entry.path, source))?;
-            total_bytes = total_bytes.saturating_sub(entry.bytes);
-            removed += 1;
-        }
-        Ok(removed)
-    }
-
     fn ensure_path_in_root(&self, path: &Path) -> Result<()> {
         let canonical_root = self
             .root
@@ -760,48 +395,6 @@ impl SessionStore {
         }
         Ok(())
     }
-
-    fn write_current(&self, id: &SessionId) -> Result<()> {
-        fs::create_dir_all(&self.workspace_dir).map_err(|source| {
-            io_error(
-                "create current-session directory",
-                &self.workspace_dir,
-                source,
-            )
-        })?;
-        let pointer = self.workspace_dir.join(".current");
-        let temp = self
-            .workspace_dir
-            .join(format!(".current.tmp-{}", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&temp)
-                .map_err(|source| io_error("create current-session file", &temp, source))?;
-            file.write_all(id.to_string().as_bytes())
-                .and_then(|_| file.write_all(b"\n"))
-                .and_then(|_| file.flush())
-                .and_then(|_| file.sync_all())
-                .map_err(|source| io_error("write current-session file", &temp, source))?;
-            fs::rename(&temp, &pointer)
-                .map_err(|source| io_error("replace current-session file", &pointer, source))?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temp);
-        }
-        result
-    }
-}
-
-/// Age/count/size limits for optional retention cleanup.
-#[derive(Clone, Debug, Default)]
-pub struct RetentionPolicy {
-    pub max_sessions: Option<usize>,
-    pub max_age: Option<Duration>,
-    pub max_bytes: Option<u64>,
 }
 
 fn load_session_file(path: &Path) -> Result<Session> {
@@ -1171,32 +764,6 @@ mod tests {
         let loaded = store.open(&session.id()).unwrap();
         assert_eq!(loaded.context_messages(), session.context_messages());
         assert_eq!(store.list().unwrap().len(), 1);
-        assert_eq!(store.current().unwrap().unwrap().id(), session.id());
-    }
-
-    #[test]
-    fn corrupt_unterminated_tail_is_recoverable_but_middle_corruption_is_not() {
-        let root = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
-        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
-        let mut session = store.create(SessionCreateOptions::default()).unwrap();
-        store
-            .append_event(
-                &mut session,
-                SessionEvent::UserMessage {
-                    message: StoredMessage::from_llm(&Message::user("hello")),
-                },
-            )
-            .unwrap();
-        let path = session.path().unwrap();
-        let mut file = OpenOptions::new().append(true).open(path).unwrap();
-        file.write_all(br#"{"#).unwrap();
-        file.flush().unwrap();
-        let report = store.load_with_report(path).unwrap();
-        assert!(report.recovered_trailing_line);
-        let recovered = store.recover_trailing_line(path).unwrap();
-        assert!(recovered.truncated);
-        assert!(!store.recover_trailing_line(path).unwrap().truncated);
     }
 
     #[test]
@@ -1228,7 +795,12 @@ mod tests {
         let mut loaded = store.open(&session.id()).unwrap();
         assert_eq!(store.repair_incomplete_tool_calls(&mut loaded).unwrap(), 1);
         store
-            .append_message(&mut loaded, &Message::user("continue"))
+            .append_event(
+                &mut loaded,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("continue")),
+                },
+            )
             .unwrap();
         assert!(
             loaded
