@@ -76,6 +76,7 @@ pub fn system_prompt_with_workspace_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tools::SkillMode;
     use tools::discover;
     use tools::format_context_files;
 
@@ -89,7 +90,7 @@ mod tests {
             "---\nname: alpha\ndescription: Alpha skill\n---\nbody\n",
         )
         .unwrap();
-        let catalog = discover(&[(skills_dir, "pi".into())]);
+        let catalog = discover(&[(skills_dir, SkillMode::Harness)]);
         assert!(catalog.has_invocable());
 
         let context = ToolPromptContext::default();

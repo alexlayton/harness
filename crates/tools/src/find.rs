@@ -512,14 +512,6 @@ impl FindTool {
     pub fn new(index: Arc<FileSearchIndex>) -> Self {
         Self { index }
     }
-
-    pub fn from_workspace(root: impl AsRef<Path>) -> Result<Self, String> {
-        Ok(Self::new(Arc::new(FileSearchIndex::new(root)?)))
-    }
-
-    pub fn index(&self) -> &Arc<FileSearchIndex> {
-        &self.index
-    }
 }
 
 #[async_trait]

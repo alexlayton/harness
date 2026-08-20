@@ -16,22 +16,8 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    pub fn new() -> Self {
-        Self {
-            rtk: false,
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        }
-    }
-
     /// A tool that rewrites supported commands to their token-optimized `rtk`
     /// equivalents before execution (see [`rtk_rewrite`]).
-    pub fn with_rtk(rtk: bool) -> Self {
-        Self {
-            rtk,
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        }
-    }
-
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
         Self {
             rtk: false,
@@ -44,12 +30,6 @@ impl BashTool {
             rtk,
             cwd: normalize_workspace_root(root),
         }
-    }
-}
-
-impl Default for BashTool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -557,7 +537,8 @@ mod tests {
 
     #[tokio::test]
     async fn captures_stderr_and_exit_code() {
-        let output = BashTool::new()
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_workspace_root(directory.path())
             .execute(
                 json!({"command":"printf out; printf err >&2; exit 3"}),
                 CancellationToken::new(),
@@ -571,7 +552,8 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_command() {
-        let output = BashTool::new()
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_workspace_root(directory.path())
             .execute(
                 json!({"command":"sleep 2", "timeout": 1}),
                 CancellationToken::new(),
@@ -748,14 +730,15 @@ mod tests {
         if !rtk_available().await || !git_work_tree_available().await {
             return;
         }
-        let output = BashTool::with_rtk(true)
+        let cwd = std::env::current_dir().unwrap();
+        let output = BashTool::with_rtk_and_workspace_root(true, &cwd)
             .execute(json!({"command": "git status"}), CancellationToken::new())
             .await;
         assert!(!output.is_error, "{}", output.content);
         // `rtk git status` prints a compact `* <branch>` header instead of
         // git's "On branch", proving the rewrite path ran.
         assert!(output.content.starts_with("* "), "{}", output.content);
-        // The summary names the command that actually ran (like pi).
+        // The summary names the command that actually ran.
         assert_eq!(output.summary, "bash: rtk git status");
     }
 
@@ -764,7 +747,8 @@ mod tests {
         if !rtk_available().await {
             return;
         }
-        let output = BashTool::with_rtk(true)
+        let cwd = std::env::current_dir().unwrap();
+        let output = BashTool::with_rtk_and_workspace_root(true, &cwd)
             .execute(json!({"command": "echo hi"}), CancellationToken::new())
             .await;
         assert!(!output.is_error);
@@ -773,7 +757,8 @@ mod tests {
 
     #[tokio::test]
     async fn rtk_disabled_tool_runs_command_verbatim() {
-        let output = BashTool::new()
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_workspace_root(directory.path())
             .execute(json!({"command": "echo hi"}), CancellationToken::new())
             .await;
         assert!(!output.is_error);

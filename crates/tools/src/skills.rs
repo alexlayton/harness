@@ -1,14 +1,14 @@
-//! Agent Skills discovery (Agent Skills standard, pi-compatible).
+//! Agent Skills discovery.
 //!
 //! A skill is a directory containing `SKILL.md` (frontmatter + instructions)
 //! plus optional freeform `scripts/`, `references/`, `assets/`.  In a
-//! harness-mode root (`.harness/skills`, `~/.harness/skills`), a root-level
-//! `.md` file is also a skill; in `.agents/skills` roots it is not (spec
-//! compat, matching pi).
+//! [`SkillMode::Harness`] root (`.harness/skills`, `~/.harness/skills`), a
+//! root-level `.md` file is also a skill; in [`SkillMode::Agents`] roots it
+//! is not (spec compat).
 //!
 //! Only skill *descriptions* are ever placed in the model prompt (progressive
 //! disclosure).  The model loads a skill's body by calling `read` on the
-//! absolute `SKILL.md` path in `<location>` — exactly pi's model — so this
+//! absolute `SKILL.md` path in `<location>` — so this
 //! module also produces a **read-path allowlist** (`read_paths`) for
 //! [`ReadTool`], covering every discovered `SKILL.md` plus the skill
 //! directory's `scripts/`, `references/`, `assets/` so helper files are
@@ -24,7 +24,16 @@ pub const MAX_NAME_LENGTH: usize = 64;
 /// Max skill description length per Agent Skills spec.
 pub const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
-/// A discovered skill.  Mirrors pi's `Skill`.
+/// Which skill-discovery convention a root follows.  [`SkillMode::Harness`]
+/// roots (`.harness/skills`) also treat a root-level `.md` file as a skill;
+/// [`SkillMode::Agents`] roots (`.agents/skills`) do not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SkillMode {
+    Harness,
+    Agents,
+}
+
+/// A discovered skill.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skill {
     pub name: String,
@@ -81,7 +90,7 @@ impl SkillCatalog {
     }
 }
 
-/// Frontmatter fields we understand (pi subset).  `description` is required
+/// Frontmatter fields we parse.  `description` is required
 /// for a skill to be loaded.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frontmatter {
@@ -185,13 +194,10 @@ fn validate_name(name: &str, diagnostics: &mut Vec<SkillDiagnostic>, path: &Path
     }
 }
 
-/// Load a single skill file (a `SKILL.md` or a root-level `.md` in a pi-mode
-/// root). Returns `None` when the description is missing (skill is dropped).
-fn load_skill_from_file(
-    file_path: &Path,
-    _source: &str,
-    diagnostics: &mut Vec<SkillDiagnostic>,
-) -> Option<Skill> {
+/// Load a single skill file (a `SKILL.md` or a root-level `.md` in a
+/// harness-mode root).  Returns `None` when the description is missing
+/// (skill is dropped).
+fn load_skill_from_file(file_path: &Path, diagnostics: &mut Vec<SkillDiagnostic>) -> Option<Skill> {
     let raw = match fs::read_to_string(file_path) {
         Ok(raw) => raw,
         Err(error) => {
@@ -261,20 +267,13 @@ fn load_skill_from_file(
     })
 }
 
-/// Recursive skill discovery from a root, mirroring pi's
-/// `loadSkillsFromDirInternal`. `mode` is `"pi"` for `.harness/skills`
-/// (root-level `.md` files are skills) and `"agents"` for `.agents/skills`
-/// (root-level `.md` files are ignored). `root` is the discovery root and
-/// `ig` the shared ignore matcher.
-///
-/// The argument count mirrors pi's `loadSkillsFromDirInternal` threading;
-/// the shared state is accepted as parameters rather than a struct to stay
-/// faithful to the reference implementation.
-#[allow(clippy::too_many_arguments)]
+/// Recursive skill discovery from a root.  `mode` controls whether a
+/// root-level `.md` file is treated as a skill ([`SkillMode::Harness`] does;
+/// [`SkillMode::Agents`] ignores it).  `root` is the discovery root and `ig`
+/// the shared ignore matcher.
 fn discover_dir(
     dir: &Path,
-    mode: &str,
-    source: &str,
+    mode: SkillMode,
     root: &Path,
     ig: &ignore::gitignore::Gitignore,
     skills: &mut Vec<Skill>,
@@ -288,7 +287,7 @@ fn discover_dir(
     if skill_md.is_file() {
         let rel = skill_md.strip_prefix(root).unwrap_or(&skill_md);
         if !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_skill_from_file(&skill_md, source, diagnostics)
+            && let Some(skill) = load_skill_from_file(&skill_md, diagnostics)
         {
             skills.push(skill);
         }
@@ -311,7 +310,7 @@ fn discover_dir(
             if ig.matched(rel, true).is_ignore() {
                 continue;
             }
-            discover_dir(&path, mode, source, root, ig, skills, diagnostics);
+            discover_dir(&path, mode, root, ig, skills, diagnostics);
             continue;
         }
         let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
@@ -319,13 +318,14 @@ fn discover_dir(
             continue;
         }
         let is_md = file_name.to_string_lossy().ends_with(".md");
-        // Root-level .md only in pi mode; subdirectory .md files are not
-        // skills by themselves (only SKILL.md inside a directory is).
+        // Root-level .md files are skills only in harness mode; subdirectory
+        // .md files are not skills by themselves (only SKILL.md inside a
+        // directory is).
         if is_md
-            && mode == "pi"
+            && matches!(mode, SkillMode::Harness)
             && path.parent() == Some(root)
             && !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_skill_from_file(&path, source, diagnostics)
+            && let Some(skill) = load_skill_from_file(&path, diagnostics)
         {
             skills.push(skill);
         }
@@ -334,9 +334,8 @@ fn discover_dir(
 
 /// Build a gitignore-style matcher from `.gitignore` / `.ignore` /
 /// `.fdignore` files rooted at `root`. A single matcher is used for the whole
-/// walk (pi builds one matcher per directory and threads it down; a single
-/// GitignoreBuilder rooted at the top is a close approximation for our
-/// purposes).
+/// walk (per-directory matchers would be more precise; not needed for our
+/// root set).
 fn build_ignore(root: &Path) -> ignore::gitignore::Gitignore {
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     for name in [".gitignore", ".ignore", ".fdignore"] {
@@ -360,11 +359,11 @@ fn build_ignore(root: &Path) -> ignore::gitignore::Gitignore {
 
 /// The chosen discovery entry point: given a root directory and mode, return
 /// all skills (recursively).
-pub fn load_skills_from_dir(root: &Path, mode: &str, source: &str) -> SkillCatalog {
+pub fn load_skills_from_dir(root: &Path, mode: SkillMode) -> SkillCatalog {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
     let ig = build_ignore(root);
-    discover_dir(root, mode, source, root, &ig, &mut skills, &mut diagnostics);
+    discover_dir(root, mode, root, &ig, &mut skills, &mut diagnostics);
     SkillCatalog {
         skills,
         diagnostics,
@@ -376,13 +375,13 @@ pub fn load_skills_from_dir(root: &Path, mode: &str, source: &str) -> SkillCatal
 /// name with **project-beats-global** first-wins (decision 1). `roots` is a
 /// list of `(path, mode)` in priority order: project dirs first (cwd →
 /// ancestors), then global.
-pub fn discover(roots: &[(PathBuf, String)]) -> SkillCatalog {
+pub fn discover(roots: &[(PathBuf, SkillMode)]) -> SkillCatalog {
     let mut all_skills = Vec::new();
     let mut all_diagnostics = Vec::new();
     let mut by_name: HashSet<String> = HashSet::new();
     let mut seen_files: HashSet<PathBuf> = HashSet::new();
     for (root, mode) in roots {
-        let c = load_skills_from_dir(root, mode, "root");
+        let c = load_skills_from_dir(root, *mode);
         all_diagnostics.extend(c.diagnostics);
         for skill in c.skills {
             let canonical =
@@ -424,9 +423,8 @@ pub fn discover(roots: &[(PathBuf, String)]) -> SkillCatalog {
     }
 }
 
-/// Format skills for the system prompt (Agent Skills XML), matching pi's
-/// `formatSkillsForPrompt`: intro uses `read`, per-skill
-/// `<name>/<description>/<location>`, absolute paths. Skills with
+/// Format skills for the system prompt (Agent Skills XML): intro uses `read`,
+/// per-skill `<name>/<description>/<location>`, absolute paths. Skills with
 /// `disable_model_invocation` are excluded.
 pub fn format_skills_prompt(catalog: &SkillCatalog) -> String {
     let visible = catalog.invocable();
@@ -466,7 +464,7 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// Resolve `~` to the user's home directory (pi expands `~` in paths).
+/// Resolve a leading `~` to the user's home directory.
 pub fn expand_tilde(path: &Path) -> PathBuf {
     if let Ok(stripped) = path.strip_prefix("~")
         && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
@@ -501,13 +499,13 @@ mod tests {
     }
 
     #[test]
-    fn discovers_project_and_global_roots_with_pi_and_agents_modes() {
+    fn discovers_project_and_global_roots_with_harness_and_agents_modes() {
         let root = tempdir().unwrap();
         let harness = root.path().join(".harness/skills");
         let agents = root.path().join(".agents/skills");
         fs::create_dir_all(&harness).unwrap();
         fs::create_dir_all(&agents).unwrap();
-        // pi-mode root: dir-with-SKILL.md + root .md file
+        // harness-mode root: dir-with-SKILL.md + root .md file
         fs::create_dir_all(harness.join("alpha")).unwrap();
         fs::write(
             harness.join("alpha/SKILL.md"),
@@ -533,8 +531,8 @@ mod tests {
         .unwrap();
 
         let catalog = discover(&[
-            (harness.clone(), "pi".into()),
-            (agents.clone(), "agents".into()),
+            (harness.clone(), SkillMode::Harness),
+            (agents.clone(), SkillMode::Agents),
         ]);
         let names: Vec<_> = catalog.skills.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"alpha"));
@@ -561,7 +559,7 @@ mod tests {
             "---\nname: ok\ndescription: A good skill\n---\nbody\n",
         )
         .unwrap();
-        let catalog = discover(&[(harness.clone(), "pi".into())]);
+        let catalog = discover(&[(harness.clone(), SkillMode::Harness)]);
         assert_eq!(catalog.skills.len(), 1);
         assert_eq!(catalog.skills[0].name, "ok");
         assert!(
@@ -617,8 +615,8 @@ mod tests {
         )
         .unwrap();
         let catalog = discover(&[
-            (project.clone(), "pi".into()),
-            (global.clone(), "pi".into()),
+            (project.clone(), SkillMode::Harness),
+            (global.clone(), SkillMode::Harness),
         ]);
         // Only the winning (project) skill contributes paths.
         assert!(catalog.read_paths.contains(&project_md));
@@ -640,7 +638,10 @@ mod tests {
         let b_md = b.join("same/SKILL.md");
         fs::write(&a_md, "---\nname: same\ndescription: A\n---\nbody\n").unwrap();
         fs::write(&b_md, "---\nname: other\ndescription: B\n---\nbody\n").unwrap();
-        let catalog = discover(&[(a.clone(), "pi".into()), (b.clone(), "pi".into())]);
+        let catalog = discover(&[
+            (a.clone(), SkillMode::Harness),
+            (b.clone(), SkillMode::Harness),
+        ]);
         for path in catalog.read_paths.iter() {
             let count = catalog.read_paths.iter().filter(|p| *p == path).count();
             assert_eq!(count, 1, "path {path:?} must appear exactly once");
@@ -665,8 +666,8 @@ mod tests {
         )
         .unwrap();
         let catalog = discover(&[
-            (project.clone(), "pi".into()),
-            (global_harness.clone(), "pi".into()),
+            (project.clone(), SkillMode::Harness),
+            (global_harness.clone(), SkillMode::Harness),
         ]);
         assert_eq!(catalog.skills.len(), 1);
         assert_eq!(catalog.skills[0].description, "project dup");
@@ -695,7 +696,7 @@ mod tests {
             "---\nname: secret\ndescription: Manual only\ndisable-model-invocation: true\n---\nbody\n",
         )
         .unwrap();
-        let catalog = discover(&[(harness, "pi".into())]);
+        let catalog = discover(&[(harness, SkillMode::Harness)]);
         let prompt = format_skills_prompt(&catalog);
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>alpha</name>"));

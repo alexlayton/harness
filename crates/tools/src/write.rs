@@ -14,24 +14,10 @@ pub struct WriteTool {
 }
 
 impl WriteTool {
-    /// Compatibility constructor retaining the historical process-cwd and
-    /// absolute-path behavior.
-    pub fn new() -> Self {
-        Self {
-            workspace_root: None,
-        }
-    }
-
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: Some(normalize_workspace_root(root)),
         }
-    }
-}
-
-impl Default for WriteTool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -126,21 +112,26 @@ mod tests {
     #[tokio::test]
     async fn creates_parents_and_overwrites() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("a/b/file.txt");
-        let output = WriteTool::new()
+        let tool = WriteTool::with_workspace_root(dir.path());
+        let output = tool
             .execute(
-                json!({"path": path, "content":"first"}),
+                json!({"path": "a/b/file.txt", "content":"first"}),
                 CancellationToken::new(),
             )
             .await;
         assert!(!output.is_error);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first");
-        WriteTool::new()
-            .execute(
-                json!({"path": path, "content":"second"}),
-                CancellationToken::new(),
-            )
-            .await;
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/file.txt")).unwrap(),
+            "first"
+        );
+        tool.execute(
+            json!({"path": "a/b/file.txt", "content":"second"}),
+            CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/b/file.txt")).unwrap(),
+            "second"
+        );
     }
 }

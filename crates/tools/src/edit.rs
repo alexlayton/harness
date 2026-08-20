@@ -57,24 +57,10 @@ pub struct EditTool {
 }
 
 impl EditTool {
-    /// Compatibility constructor retaining the historical process-cwd and
-    /// absolute-path behavior.
-    pub fn new() -> Self {
-        Self {
-            workspace_root: None,
-        }
-    }
-
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: Some(normalize_workspace_root(root)),
         }
-    }
-}
-
-impl Default for EditTool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -261,7 +247,7 @@ fn parse_args(args: &Value) -> Result<(String, Vec<Edit>), String> {
         _ => return Err("missing required argument: path".into()),
     };
 
-    let mut edits = match args.get("edits") {
+    let edits = match args.get("edits") {
         Some(Value::Array(values)) => parse_edit_array(values)?,
         Some(Value::String(serialized)) => {
             let parsed: Value = serde_json::from_str(serialized)
@@ -274,28 +260,6 @@ fn parse_args(args: &Value) -> Result<(String, Vec<Edit>), String> {
         Some(_) => return Err("edits must be an array of replacement objects".into()),
         None => Vec::new(),
     };
-
-    // Pi accepts the old single-edit shape when replaying older sessions. Keep
-    // the compatibility path here while exposing only the current edits[]
-    // schema to the model.
-    let legacy_old = args
-        .get("oldText")
-        .or_else(|| args.get("old"))
-        .and_then(Value::as_str);
-    let legacy_new = args
-        .get("newText")
-        .or_else(|| args.get("new"))
-        .and_then(Value::as_str);
-    match (legacy_old, legacy_new) {
-        (Some(old_text), Some(new_text)) => edits.push(Edit {
-            old_text: old_text.to_owned(),
-            new_text: new_text.to_owned(),
-        }),
-        (None, None) => {}
-        (Some(_), None) | (None, Some(_)) => {
-            return Err("legacy edit arguments require both oldText and newText".into());
-        }
-    }
 
     if edits.is_empty() {
         return Err("edits must contain at least one replacement".into());
@@ -313,12 +277,10 @@ fn parse_edit_array(values: &[Value]) -> Result<Vec<Edit>, String> {
             };
             let old_text = object
                 .get("oldText")
-                .or_else(|| object.get("old"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("edits[{index}].oldText must be a string"))?;
             let new_text = object
                 .get("newText")
-                .or_else(|| object.get("new"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| format!("edits[{index}].newText must be a string"))?;
             Ok(Edit {
@@ -893,10 +855,10 @@ mod tests {
         let path = directory.path().join("main.rs");
         fs::write(&path, "fn main() {\n    println!(\"old\");\n}\n").unwrap();
 
-        let output = EditTool::new()
+        let output = EditTool::with_workspace_root(directory.path())
             .execute(
                 json!({
-                    "path": path,
+                    "path": "main.rs",
                     "edits": [{
                         "oldText": "println!(\"old\")",
                         "newText": "println!(\"new\")"
@@ -930,10 +892,10 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
 
-        let output = EditTool::new()
+        let output = EditTool::with_workspace_root(directory.path())
             .execute(
                 json!({
-                    "path": path,
+                    "path": "file.txt",
                     "edits": [
                         {"oldText": "alpha", "newText": "one"},
                         {"oldText": "gamma", "newText": "three"}
@@ -973,9 +935,9 @@ mod tests {
         ];
 
         for (edits, expected) in cases {
-            let output = EditTool::new()
+            let output = EditTool::with_workspace_root(directory.path())
                 .execute(
-                    json!({"path": path, "edits": edits}),
+                    json!({"path": "file.txt", "edits": edits}),
                     CancellationToken::new(),
                 )
                 .await;
@@ -991,10 +953,10 @@ mod tests {
         let path = directory.path().join("file.txt");
         fs::write(&path, "\u{feff}first\r\nsecond\r\n").unwrap();
 
-        let output = EditTool::new()
+        let output = EditTool::with_workspace_root(directory.path())
             .execute(
                 json!({
-                    "path": path,
+                    "path": "file.txt",
                     "edits": [{"oldText":"second", "newText":"changed"}]
                 }),
                 CancellationToken::new(),
@@ -1005,22 +967,6 @@ mod tests {
             fs::read(path).unwrap(),
             "\u{feff}first\r\nchanged\r\n".as_bytes()
         );
-    }
-
-    #[tokio::test]
-    async fn supports_pi_legacy_single_edit_arguments() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("file.txt");
-        fs::write(&path, "before").unwrap();
-
-        let output = EditTool::new()
-            .execute(
-                json!({"path": path, "oldText":"before", "newText":"after"}),
-                CancellationToken::new(),
-            )
-            .await;
-        assert!(!output.is_error, "{}", output.content);
-        assert_eq!(fs::read_to_string(path).unwrap(), "after");
     }
 
     #[test]

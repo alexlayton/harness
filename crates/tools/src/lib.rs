@@ -17,7 +17,7 @@ pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use registry::{ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError};
 pub use skills::{
-    Skill, SkillCatalog, SkillDiagnostic, SkillSeverity, discover, expand_tilde,
+    Skill, SkillCatalog, SkillDiagnostic, SkillMode, SkillSeverity, discover, expand_tilde,
     format_skills_prompt, load_skills_from_dir, parse_frontmatter,
 };
 pub use write::WriteTool;
@@ -81,23 +81,8 @@ pub struct ToolOutput {
 
 #[async_trait]
 pub trait Tool: Send + Sync {
-    /// Return the structured definition and optional prompt metadata.  The
-    /// default bridges older integrations that implemented only
-    /// [`Tool::definition`]; new tools should override this method.
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            definition: self.definition(),
-            prompt: ToolPrompt::default(),
-        }
-    }
-
-    /// Compatibility accessor for callers that only need the structured
-    /// definition.  Registry code uses [`Tool::spec`] so it can also build the
-    /// dynamic prompt metadata.  Implementations may override either this
-    /// method or `spec`.
-    fn definition(&self) -> ToolDefinition {
-        self.spec().definition
-    }
+    /// Return the structured definition and prompt metadata for this tool.
+    fn spec(&self) -> ToolSpec;
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput;
 }
@@ -115,25 +100,6 @@ impl ToolConfig {
             cwd: cwd.into(),
             rtk,
         }
-    }
-
-    pub fn from_current_dir(rtk: bool) -> Self {
-        Self::new(
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            rtk,
-        )
-    }
-}
-
-impl From<bool> for ToolConfig {
-    fn from(rtk: bool) -> Self {
-        Self::from_current_dir(rtk)
-    }
-}
-
-impl Default for ToolConfig {
-    fn default() -> Self {
-        Self::from_current_dir(false)
     }
 }
 
@@ -155,18 +121,16 @@ pub enum ToolInitError {
 /// request.
 ///
 /// Skills are discovered from the project walk + global roots; the
-/// discovered skill paths are handed to `ReadTool` (pi model: the model
-/// reads a skill's `SKILL.md` via `read` on the absolute `<location>`), and
-/// the catalog is stored on the registry for the prompt builder.
+/// discovered skill paths are handed to `ReadTool` so the model can load a
+/// skill body via `read` on its absolute `<location>`, and the catalog is
+/// stored on the registry for the prompt builder.
 ///
-/// The generic argument preserves the old `default_registry(false)` spelling
-/// while also accepting the workspace-aware [`ToolConfig`] used by the
-/// application.
-pub fn default_registry(config: impl Into<ToolConfig>) -> Result<ToolRegistry, ToolInitError> {
-    let config = config.into();
+/// The generic argument accepts the workspace-aware [`ToolConfig`].
+pub fn default_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitError> {
+    let ToolConfig { cwd, rtk } = config;
     let workspace_root =
-        std::fs::canonicalize(&config.cwd).map_err(|source| ToolInitError::Workspace {
-            path: config.cwd.clone(),
+        std::fs::canonicalize(&cwd).map_err(|source| ToolInitError::Workspace {
+            path: cwd.clone(),
             source,
         })?;
 
@@ -185,10 +149,7 @@ pub fn default_registry(config: impl Into<ToolConfig>) -> Result<ToolRegistry, T
             ),
             Box::new(EditTool::with_workspace_root(&workspace_root)),
             Box::new(WriteTool::with_workspace_root(&workspace_root)),
-            Box::new(BashTool::with_rtk_and_workspace_root(
-                config.rtk,
-                &workspace_root,
-            )),
+            Box::new(BashTool::with_rtk_and_workspace_root(rtk, &workspace_root)),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
         ],
@@ -201,11 +162,11 @@ pub fn default_registry(config: impl Into<ToolConfig>) -> Result<ToolRegistry, T
 
 pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
     // Project roots: cwd up to git repo root (or filesystem root).
-    let mut roots: Vec<(PathBuf, String)> = Vec::new();
+    let mut roots: Vec<(PathBuf, SkillMode)> = Vec::new();
     let mut dir = workspace_root.to_path_buf();
     loop {
-        roots.push((dir.join(".harness/skills"), "pi".into()));
-        roots.push((dir.join(".agents/skills"), "agents".into()));
+        roots.push((dir.join(".harness/skills"), SkillMode::Harness));
+        roots.push((dir.join(".agents/skills"), SkillMode::Agents));
         // Stop at the git repo root.
         if dir.join(".git").exists() {
             break;
@@ -225,13 +186,13 @@ pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog 
                 .unwrap_or_default()
         });
     if !global.as_os_str().is_empty() {
-        roots.push((global, "pi".into()));
+        roots.push((global, SkillMode::Harness));
     }
     let agents_global = std::env::var_os("HOME")
         .map(|home| PathBuf::from(home).join(".agents/skills"))
         .unwrap_or_default();
     if !agents_global.as_os_str().is_empty() {
-        roots.push((agents_global, "agents".into()));
+        roots.push((agents_global, SkillMode::Agents));
     }
     let catalog = discover(&roots);
     // Surface discovery diagnostics (frontmatter typos, dropped skills,
@@ -244,13 +205,6 @@ pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog 
         );
     }
     catalog
-}
-
-impl Default for ToolRegistry {
-    fn default() -> Self {
-        default_registry(ToolConfig::from_current_dir(false))
-            .expect("the current directory should be a valid tool workspace")
-    }
 }
 
 pub(crate) fn normalize_workspace_root(root: impl Into<PathBuf>) -> PathBuf {
@@ -577,15 +531,16 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_has_six_active_tools_and_prompt_metadata() {
+    fn default_registry_has_all_tools_and_prompt_metadata() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("main.rs"), "fn main() {}\n").unwrap();
         let registry = default_registry(ToolConfig::new(directory.path(), false)).unwrap();
-        assert_eq!(
-            registry.active_names(),
-            vec!["read", "edit", "write", "bash", "find", "grep"]
-        );
-        assert_eq!(registry.all_names(), registry.active_names());
+        let names: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(names, vec!["read", "edit", "write", "bash", "find", "grep"]);
         let context = registry.prompt_context();
         assert!(context.snippets.iter().any(|tool| tool.name == "find"));
         assert!(context.snippets.iter().any(|tool| tool.name == "grep"));

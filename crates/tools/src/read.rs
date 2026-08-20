@@ -21,15 +21,6 @@ pub struct ReadTool {
 }
 
 impl ReadTool {
-    /// Compatibility constructor: relative paths use the process cwd and
-    /// absolute paths retain the historical behavior.
-    pub fn new() -> Self {
-        Self {
-            workspace_root: None,
-            allowed_paths: None,
-        }
-    }
-
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
         Self {
             workspace_root: Some(normalize_workspace_root(root)),
@@ -43,16 +34,6 @@ impl ReadTool {
     pub fn with_allowed_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
         self.allowed_paths = Some(paths.into_iter().collect());
         self
-    }
-
-    pub fn allowed_paths(&self) -> Option<&[PathBuf]> {
-        self.allowed_paths.as_deref()
-    }
-}
-
-impl Default for ReadTool {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -69,9 +50,9 @@ impl ReadTool {
             return Ok(resolved);
         }
         // Otherwise, allow an absolute path that is under one of the allowed
-        // skill paths (or a `~`-expanded absolute under one of them). This is
-        // the pi behavior: `read` can load a skill's SKILL.md from anywhere
-        // it was discovered (project or global).
+        // skill paths (or a `~`-expanded absolute under one of them). `read`
+        // can load a discovered skill's files from any location (project or
+        // global roots).
         let candidate = expand_tilde(&PathBuf::from(path));
         if !candidate.is_absolute() {
             return Err(format!("cannot read {path}: outside workspace"));
@@ -253,15 +234,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("file.txt");
         std::fs::write(&path, "one\ntwo\nthree\nfour\n").unwrap();
-        let old = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let output = ReadTool::new()
+        let output = ReadTool::with_workspace_root(dir.path())
             .execute(
                 json!({"path":"file.txt", "offset":2, "limit":2}),
                 CancellationToken::new(),
             )
             .await;
-        std::env::set_current_dir(old).unwrap();
         assert_eq!(output.content, "two\nthree");
         assert!(!output.is_error);
     }
@@ -272,11 +250,8 @@ mod tests {
         let path = dir.path().join("binary");
         let mut file = std::fs::File::create(path).unwrap();
         file.write_all(b"ok\0no").unwrap();
-        let output = ReadTool::new()
-            .execute(
-                json!({"path": dir.path().join("binary")}),
-                CancellationToken::new(),
-            )
+        let output = ReadTool::with_workspace_root(dir.path())
+            .execute(json!({"path": "binary"}), CancellationToken::new())
             .await;
         assert!(output.is_error);
         assert!(output.content.contains("binary"));

@@ -18,10 +18,6 @@ impl GrepTool {
     pub fn new(index: Arc<FileSearchIndex>) -> Self {
         Self { index }
     }
-
-    pub fn index(&self) -> &Arc<FileSearchIndex> {
-        &self.index
-    }
 }
 
 #[async_trait]

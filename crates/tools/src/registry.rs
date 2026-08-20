@@ -19,11 +19,10 @@ struct RegisteredTool {
     tool: Box<dyn Tool>,
 }
 
-/// Registry of all known tools and the active subset sent to the model.
-/// Registration order is retained for deterministic definitions and prompts.
+/// Registry of all known tools.  Registration order is retained for
+/// deterministic definitions and prompts.
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
-    active: Vec<String>,
     workspace_root: PathBuf,
     /// Optional skills catalog discovered at startup; used to render the
     /// skills section of the system prompt and to hand read-paths to tools.
@@ -49,7 +48,6 @@ impl ToolRegistry {
     ) -> Result<Self, ToolRegistryError> {
         let mut registry = Self {
             tools: Vec::new(),
-            active: Vec::new(),
             workspace_root: workspace_root.into(),
             skills: None,
         };
@@ -86,65 +84,22 @@ impl ToolRegistry {
         if self.tools.iter().any(|registered| registered.name == name) {
             return Err(ToolRegistryError::DuplicateName(name));
         }
-        self.active.push(name.clone());
         self.tools.push(RegisteredTool { name, spec, tool });
         Ok(())
     }
 
-    /// Structured definitions for active tools only.
+    /// Structured definitions for every registered tool.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .filter(|tool| self.active.iter().any(|name| name == &tool.name))
             .map(|tool| tool.spec.definition.clone())
             .collect()
-    }
-
-    pub fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.definitions()
-    }
-
-    /// Names of active tools, in deterministic registration order.
-    pub fn active_names(&self) -> Vec<String> {
-        self.tools
-            .iter()
-            .filter(|tool| self.active.iter().any(|name| name == &tool.name))
-            .map(|tool| tool.name.clone())
-            .collect()
-    }
-
-    /// Names of all registered tools, including inactive tools.
-    pub fn all_names(&self) -> Vec<String> {
-        self.tools.iter().map(|tool| tool.name.clone()).collect()
-    }
-
-    /// Compatibility alias: historically `names()` meant the tools sent to
-    /// the provider, so it continues to report the active subset.
-    pub fn names(&self) -> Vec<String> {
-        self.active_names()
-    }
-
-    /// Activate the requested known tools. Unknown names are ignored, which
-    /// makes configuration allowlists forward-compatible with newer tools.
-    /// The registry's order, rather than the allowlist's order, controls the
-    /// output order.
-    pub fn set_active_tools(&mut self, names: &[String]) {
-        self.active = self
-            .tools
-            .iter()
-            .filter(|tool| names.iter().any(|name| name == &tool.name))
-            .map(|tool| tool.name.clone())
-            .collect();
     }
 
     pub fn prompt_context(&self) -> ToolPromptContext {
         let mut snippets = Vec::new();
         let mut guidelines = Vec::new();
-        for tool in self.tools.iter().filter(|tool| {
-            self.active
-                .iter()
-                .any(|active_name| active_name == &tool.name)
-        }) {
+        for tool in &self.tools {
             let prompt = tool.spec.prompt.clone();
             if let Some(snippet) = prompt.snippet {
                 snippets.push(ToolPromptEntry {
@@ -173,18 +128,7 @@ impl ToolRegistry {
                 summary: name.to_owned(),
             };
         };
-        if !self.active.iter().any(|active_name| active_name == name) {
-            return ToolOutput {
-                content: format!("tool is inactive: {name}"),
-                is_error: true,
-                summary: name.to_owned(),
-            };
-        }
         tool.tool.execute(args, cancel).await
-    }
-
-    pub async fn dispatch(&self, name: &str, args: Value, cancel: CancellationToken) -> ToolOutput {
-        self.execute(name, args, cancel).await
     }
 }
 
@@ -256,19 +200,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inactive_tools_are_not_executable_or_advertised() {
-        let mut registry = ToolRegistry::new(vec![
+    async fn registered_tools_are_executable_and_advertised() {
+        let registry = ToolRegistry::new(vec![
             Box::new(TestTool { name: "one" }),
             Box::new(TestTool { name: "two" }),
         ]);
-        registry.set_active_tools(&["one".into()]);
-        assert_eq!(registry.active_names(), vec!["one"]);
-        assert_eq!(registry.all_names(), vec!["one", "two"]);
-        assert_eq!(registry.definitions().len(), 1);
+        assert_eq!(registry.definitions().len(), 2);
         let output = registry
-            .execute("two", json!({}), CancellationToken::new())
+            .execute("one", json!({}), CancellationToken::new())
             .await;
-        assert!(output.is_error);
-        assert!(output.content.contains("inactive"));
+        assert!(!output.is_error, "{}", output.content);
     }
 }
