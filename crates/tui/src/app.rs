@@ -37,8 +37,8 @@ const MAX_VIEWPORT_ROWS: usize = 16;
 const PLACEHOLDER: &str = "Type your message...";
 
 /// The fixed inline viewport height for the process lifetime (ratatui's
-/// inline height is immutable). Mirrors pi's `max(5, floor(rows * 0.3))` via
-/// the existing `MAX_INPUT_FRACTION = 30` constant.
+/// inline height is immutable): 30% of terminal rows, floored and clamped to
+/// the 5–16 band.
 pub(crate) fn viewport_height(rows: u16) -> u16 {
     ((rows as usize * MAX_INPUT_FRACTION) / 100).clamp(MIN_VIEWPORT_ROWS, MAX_VIEWPORT_ROWS) as u16
 }
@@ -458,13 +458,6 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fullscreen_ui_keeps_terminal_lifecycle_outside_pure_render_tests() {
-        // The real terminal lifecycle is intentionally exercised manually;
-        // render.rs, input.rs, state.rs, and environment.rs contain the pure
-        // behavior tests that do not require a TTY.
-    }
 
     #[test]
     fn viewport_height_is_clamped_to_the_5_16_band() {

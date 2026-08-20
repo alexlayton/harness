@@ -184,7 +184,7 @@ impl crate::Tui {
     /// Commit the startup welcome banner (title + random tagline + version)
     /// into scrollback exactly once, before the first `draw()`. The transcript
     /// is empty at that point; a later `/load` commits its history below the
-    /// banner, which is accepted (pi behaves the same).
+    /// banner, which is accepted.
     pub(crate) fn commit_welcome_banner(&mut self) -> anyhow::Result<()> {
         if self.welcome_shown {
             return Ok(());
