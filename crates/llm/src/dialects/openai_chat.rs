@@ -6,7 +6,7 @@ use crate::{
     ToolCall, ToolDefinition, Usage,
 };
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::HeaderMap;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
@@ -30,21 +30,6 @@ impl OpenAiChatClient {
         Self {
             http: HttpClient::with_headers(base_url, api_key, extra_headers),
         }
-    }
-
-    pub fn with_header(
-        base_url: impl Into<String>,
-        api_key: impl Into<String>,
-        name: HeaderName,
-        value: HeaderValue,
-    ) -> Self {
-        let mut headers = HeaderMap::new();
-        headers.insert(name, value);
-        Self::with_headers(base_url, api_key, headers)
-    }
-
-    pub fn request_body(&self, req: &CompletionRequest) -> Value {
-        build_request_body(req)
     }
 
     pub async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
@@ -226,13 +211,6 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
-}
-
-pub fn parse_payload(
-    payload: &str,
-    parser: &mut ChatStreamParser,
-) -> Result<Vec<StreamEvent>, LlmError> {
-    parser.parse_payload(payload)
 }
 
 impl ChatStreamParser {

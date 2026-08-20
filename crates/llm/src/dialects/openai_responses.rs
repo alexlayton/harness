@@ -31,10 +31,6 @@ impl OpenAiResponsesClient {
         }
     }
 
-    pub fn request_body(&self, req: &CompletionRequest) -> Value {
-        build_request_body(req, req.reasoning)
-    }
-
     pub async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
         tracing::debug!(provider = "openai-responses", model = %req.model, "starting stream request");
         // Some zen-compatible proxies reject the Responses reasoning field even
@@ -181,13 +177,6 @@ fn stringify_arguments(arguments: &Value) -> String {
 #[derive(Debug, Default)]
 pub struct ResponsesParser {
     done: bool,
-}
-
-pub fn parse_payload(
-    payload: &str,
-    parser: &mut ResponsesParser,
-) -> Result<Vec<StreamEvent>, LlmError> {
-    parser.parse_payload(payload)
 }
 
 impl ResponsesParser {

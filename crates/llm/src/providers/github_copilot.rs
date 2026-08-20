@@ -7,10 +7,7 @@
 use crate::dialects::anthropic::AnthropicMessagesClient;
 use crate::dialects::openai_chat::OpenAiChatClient;
 use crate::dialects::openai_responses::OpenAiResponsesClient;
-use crate::retry::with_retry;
-use crate::{
-    CompletionRequest, EventStream, LlmError, Message, ModelInfo, Provider, RetryCallback, Role,
-};
+use crate::{CompletionRequest, EventStream, LlmError, Message, ModelInfo, Provider, Role};
 use auth::{
     COPILOT_EDITOR_PLUGIN_VERSION, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID,
     COPILOT_USER_AGENT, CopilotAuth,
@@ -39,9 +36,8 @@ pub struct CopilotModel {
     pub max_tokens: u32,
 }
 
-/// Static metadata from Pi's Copilot catalog.  The remote policy endpoint
-/// tells us which IDs an account can use, but not reliably which wire dialect
-/// or limits belong to each model.
+/// Static routing metadata; the remote policy endpoint tells us which IDs an
+/// account can use, but not which wire dialect or limits belong to each model.
 pub const COPILOT_MODELS: &[CopilotModel] = &[
     CopilotModel {
         id: "claude-haiku-4.5",
@@ -285,20 +281,12 @@ pub const COPILOT_MODELS: &[CopilotModel] = &[
     },
 ];
 
-/// Compatibility aliases for callers that refer to this as a static catalog.
-pub const STATIC_MODELS: &[CopilotModel] = COPILOT_MODELS;
-pub const MODEL_CATALOG: &[CopilotModel] = COPILOT_MODELS;
-
 pub fn model_metadata(model: &str) -> Option<&'static CopilotModel> {
     COPILOT_MODELS.iter().find(|entry| entry.id == model)
 }
 
 pub fn dialect_for_model(model: &str) -> Option<Dialect> {
     model_metadata(model).map(|entry| entry.dialect)
-}
-
-pub fn known_models() -> Vec<ModelInfo> {
-    models_for_available_ids(COPILOT_MODELS.iter().map(|model| model.id))
 }
 
 /// Merge a dynamic account allow-list with static routing metadata.  This
@@ -326,26 +314,18 @@ where
 /// Pick a sensible default model for a signed-in account: the first entry,
 /// in the account's own ordering, that this build also knows how to route.
 /// Returns `None` when the list is empty or contains nothing from the
-/// catalog, leaving the caller on the static default.
-pub fn default_model_for_available_ids<I, S>(available_ids: I) -> Option<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    available_ids
-        .into_iter()
-        .map(|id| id.as_ref().to_owned())
-        .find(|id| model_metadata(id).is_some())
-}
-
-/// Plan-aware default: free Copilot SKUs gate most premium models behind
-/// billing even when the account's model list advertises them, so prefer a
-/// model every plan can serve.  Other plans keep the account's own order.
+/// catalog, leaving the caller on the static default.  Free Copilot SKUs gate
+/// most premium models behind billing even when the account's model list
+/// advertises them, so prefer a model every plan can serve; other plans keep
+/// the account's own order.
 pub fn default_model_for(sku: Option<&str>, available_ids: &[String]) -> Option<String> {
     if is_free_sku(sku) && available_ids.iter().any(|id| id == "gpt-4.1") {
         return Some("gpt-4.1".to_owned());
     }
-    default_model_for_available_ids(available_ids.iter())
+    available_ids
+        .iter()
+        .find(|&id| model_metadata(id).is_some())
+        .cloned()
 }
 
 fn is_free_sku(sku: Option<&str>) -> bool {
@@ -470,16 +450,15 @@ impl GithubCopilotProvider {
     pub fn from_default() -> Result<Self, auth::AuthError> {
         Ok(Self::new(Arc::new(CopilotAuth::from_default()?)))
     }
+}
 
-    pub fn model_metadata(model: &str) -> Option<&'static CopilotModel> {
-        model_metadata(model)
+#[async_trait::async_trait]
+impl Provider for GithubCopilotProvider {
+    fn name(&self) -> &'static str {
+        PROVIDER_NAME
     }
 
-    pub fn dialect_for_model(model: &str) -> Option<Dialect> {
-        dialect_for_model(model)
-    }
-
-    async fn stream_once(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
+    async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
         let model = model_metadata(&req.model).ok_or_else(|| {
             LlmError::Parse(format!(
                 "GitHub Copilot model `{}` is not in the supported model catalog",
@@ -534,54 +513,13 @@ impl GithubCopilotProvider {
             .map_err(|error| redact_error(error, &access))
     }
 
-    pub async fn stream_with_callback(
-        &self,
-        req: &CompletionRequest,
-        on_retry: RetryCallback,
-    ) -> Result<EventStream, LlmError> {
-        let callback = on_retry.clone();
-        with_retry(
-            || async { self.stream_once(req).await },
-            move |attempt, error| {
-                tracing::warn!(attempt, error = %error, "retrying GitHub Copilot request");
-                callback(attempt, error);
-            },
-        )
-        .await
-    }
-
-    /// Fetch and filter the account's dynamic model policy list, then merge it
-    /// with the static catalog.  No unknown remote model is routed implicitly.
-    pub async fn list_models_direct(&self) -> Result<Vec<ModelInfo>, LlmError> {
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         let available = self
             .auth
             .refresh_available_model_ids()
             .await
             .map_err(auth_error)?;
         Ok(models_for_available_ids(available))
-    }
-}
-
-#[async_trait::async_trait]
-impl Provider for GithubCopilotProvider {
-    fn name(&self) -> &'static str {
-        PROVIDER_NAME
-    }
-
-    async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        self.stream_with_callback(req, Arc::new(|_, _| {})).await
-    }
-
-    async fn stream_with_retry(
-        &self,
-        req: &CompletionRequest,
-        on_retry: RetryCallback,
-    ) -> Result<EventStream, LlmError> {
-        self.stream_with_callback(req, on_retry).await
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        self.list_models_direct().await
     }
 }
 
@@ -668,19 +606,22 @@ mod tests {
     #[test]
     fn default_model_follows_account_order_and_skips_unknown_ids() {
         assert_eq!(
-            default_model_for_available_ids([
-                "gpt-5.4-mini-free-auto",
-                "gpt-5.6-luna",
-                "claude-haiku-4.5",
-            ]),
+            default_model_for(
+                None,
+                &[
+                    "gpt-5.4-mini-free-auto".into(),
+                    "gpt-5.6-luna".into(),
+                    "claude-haiku-4.5".into()
+                ]
+            ),
             Some("gpt-5.6-luna".into())
         );
         // Nothing routable: keep the static default.
         assert_eq!(
-            default_model_for_available_ids(["unknown", "also-unknown"]),
+            default_model_for(None, &["unknown".into(), "also-unknown".into()]),
             None
         );
-        assert_eq!(default_model_for_available_ids(Vec::<String>::new()), None);
+        assert_eq!(default_model_for(None, &[]), None);
     }
 
     #[test]

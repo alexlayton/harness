@@ -1,5 +1,4 @@
 use crate::LlmError;
-use crate::error::truncate_body;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
@@ -116,7 +115,12 @@ impl HttpClient {
 }
 
 /// Map a non-success HTTP status to `LlmError::Http` with a bounded body.
-async fn check_status(response: reqwest::Response) -> Result<reqwest::Response, LlmError> {
+/// `LlmError::http` is the single constructor that enforces the truncation
+/// invariant, so every status-mapped error (OpenAI dialects and Anthropic
+/// alike) is bounded here.
+pub(crate) async fn check_status(
+    response: reqwest::Response,
+) -> Result<reqwest::Response, LlmError> {
     if response.status().is_success() {
         return Ok(response);
     }
@@ -125,10 +129,7 @@ async fn check_status(response: reqwest::Response) -> Result<reqwest::Response, 
         .text()
         .await
         .unwrap_or_else(|_| "<unable to read response body>".into());
-    Err(LlmError::Http {
-        status,
-        body: truncate_body(&body, 2048),
-    })
+    Err(LlmError::http(status, body))
 }
 
 #[cfg(test)]

@@ -1,5 +1,4 @@
 use crate::as_u64;
-use crate::error::truncate_body;
 use crate::sse::{SseEvent, stream_response};
 use crate::{
     CompletionRequest, Content, EventStream, LlmError, Message, Role, StreamEvent, ToolCall,
@@ -72,22 +71,8 @@ impl AnthropicMessagesClient {
             .send()
             .await
             .map_err(LlmError::Network)?;
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "<unable to read response body>".into());
-            return Err(LlmError::Http {
-                status,
-                body: truncate_body(&body, 2048),
-            });
-        }
+        let response = crate::http::check_status(response).await?;
         Ok(event_stream(stream_response(response)))
-    }
-
-    pub fn request_body(&self, req: &CompletionRequest) -> Value {
-        build_request_body(req)
     }
 
     fn headers(&self) -> HeaderMap {
@@ -263,13 +248,6 @@ struct PartialToolUse {
     id: String,
     name: String,
     arguments: String,
-}
-
-pub fn parse_payload(
-    payload: &str,
-    parser: &mut AnthropicParser,
-) -> Result<Vec<StreamEvent>, LlmError> {
-    parser.parse_payload(payload)
 }
 
 impl AnthropicParser {

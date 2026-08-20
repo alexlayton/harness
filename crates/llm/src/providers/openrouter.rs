@@ -1,14 +1,8 @@
 use crate::dialects::openai_chat::OpenAiChatClient;
-use crate::retry::with_retry;
-use crate::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider, RetryCallback};
+use crate::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider};
 use reqwest::header::{HeaderMap, HeaderValue};
-use std::sync::Arc;
 
 pub const BASE_URL: &str = "https://openrouter.ai/api/v1";
-
-pub fn parse_models_response(body: &str) -> Result<Vec<ModelInfo>, LlmError> {
-    crate::dialects::openai_chat::parse_models_body(body)
-}
 
 #[derive(Clone)]
 pub struct OpenRouterProvider {
@@ -23,26 +17,6 @@ impl OpenRouterProvider {
             chat: OpenAiChatClient::with_headers(BASE_URL, api_key, headers),
         }
     }
-
-    async fn stream_once(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        self.chat.stream(req).await
-    }
-
-    pub async fn stream_with_callback(
-        &self,
-        req: &CompletionRequest,
-        on_retry: RetryCallback,
-    ) -> Result<EventStream, LlmError> {
-        let callback = on_retry.clone();
-        with_retry(
-            || async { self.stream_once(req).await },
-            move |attempt, error| {
-                tracing::warn!(attempt, error = %error, "retrying OpenRouter request");
-                callback(attempt, error);
-            },
-        )
-        .await
-    }
 }
 
 #[async_trait::async_trait]
@@ -52,15 +26,7 @@ impl Provider for OpenRouterProvider {
     }
 
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        self.stream_with_callback(req, Arc::new(|_, _| {})).await
-    }
-
-    async fn stream_with_retry(
-        &self,
-        req: &CompletionRequest,
-        on_retry: RetryCallback,
-    ) -> Result<EventStream, LlmError> {
-        self.stream_with_callback(req, on_retry).await
+        self.chat.stream(req).await
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {

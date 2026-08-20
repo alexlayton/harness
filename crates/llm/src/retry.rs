@@ -1,5 +1,4 @@
 use crate::LlmError;
-use crate::error::truncate_body;
 use std::future::Future;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,18 +32,8 @@ where
                 tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter)).await;
                 attempt += 1;
             }
-            Err(error) => return Err(truncate_http_error(error)),
+            Err(error) => return Err(error),
         }
-    }
-}
-
-fn truncate_http_error(error: LlmError) -> LlmError {
-    match error {
-        LlmError::Http { status, body } => LlmError::Http {
-            status,
-            body: truncate_body(&body, 2048),
-        },
-        other => other,
     }
 }
 

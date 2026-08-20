@@ -15,22 +15,29 @@ pub trait Provider: Send + Sync {
     /// reference instead of leaking or registering statics.
     fn name(&self) -> &str;
 
+    /// Perform a single request and return its event stream.  Retrying is the
+    /// caller's concern via [`Provider::stream_with_retry`]; this default
+    /// implementation wraps [`Provider::stream`] with the shared backoff and
+    /// forwards retry notices to the callback.
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError>;
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError>;
 
-    /// Variant used by the agent loop when it wants retry notices in the UI.
-    /// Providers with an HTTP implementation override this; a scripted/mock
-    /// provider only needs to implement the three core methods above.
+    /// Run [`Provider::stream`] with retry, notifying `on_retry` before each
+    /// repeated attempt so the agent loop can surface the failure in the UI.
     async fn stream_with_retry(
         &self,
         req: &CompletionRequest,
         on_retry: RetryCallback,
     ) -> Result<EventStream, LlmError> {
         let callback = on_retry.clone();
+        let provider = self.name().to_owned();
         with_retry(
             || async { self.stream(req).await },
-            move |attempt, error| callback(attempt, error),
+            move |attempt, error| {
+                tracing::warn!(provider = %provider, attempt, error = %error, "retrying provider request");
+                callback(attempt, error);
+            },
         )
         .await
     }

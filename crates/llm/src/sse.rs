@@ -110,11 +110,6 @@ pub fn parse_events(input: &str) -> Vec<SseEvent> {
     result
 }
 
-/// Alias with a descriptive name for callers that have a complete fixture.
-pub fn parse_sse(input: &str) -> Vec<SseEvent> {
-    parse_events(input)
-}
-
 /// A stream adapter over reqwest's response body.  Keeping the decoder here
 /// means dialect parsers can be pure functions over one complete SSE payload.
 pub struct SseStream {

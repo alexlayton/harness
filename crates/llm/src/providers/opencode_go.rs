@@ -1,9 +1,7 @@
 use crate::dialects::anthropic::AnthropicMessagesClient;
 use crate::dialects::openai_chat::OpenAiChatClient;
 use crate::dialects::openai_responses::OpenAiResponsesClient;
-use crate::retry::with_retry;
-use crate::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider, RetryCallback};
-use std::sync::Arc;
+use crate::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider};
 
 pub const BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
@@ -50,10 +48,6 @@ pub fn dialect_for_model(model: &str) -> Dialect {
     }
 }
 
-pub fn parse_models_response(body: &str) -> Result<Vec<ModelInfo>, LlmError> {
-    crate::dialects::openai_chat::parse_models_body(body)
-}
-
 #[derive(Clone)]
 pub struct OpenCodeGoProvider {
     pub chat: OpenAiChatClient,
@@ -62,10 +56,6 @@ pub struct OpenCodeGoProvider {
 }
 
 impl OpenCodeGoProvider {
-    pub fn dialect_for_model(model: &str) -> Dialect {
-        dialect_for_model(model)
-    }
-
     pub fn new(api_key: impl Into<String>) -> Self {
         let api_key = api_key.into();
         Self {
@@ -73,34 +63,6 @@ impl OpenCodeGoProvider {
             responses: OpenAiResponsesClient::new(BASE_URL, api_key.clone()),
             messages: AnthropicMessagesClient::new(BASE_URL, api_key),
         }
-    }
-
-    async fn stream_once(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        match dialect_for_model(&req.model) {
-            Dialect::Responses => self.responses.stream(req).await,
-            Dialect::Messages => self.messages.stream(req).await,
-            Dialect::Chat => self.chat.stream(req).await,
-        }
-    }
-
-    pub async fn stream_with_callback(
-        &self,
-        req: &CompletionRequest,
-        on_retry: RetryCallback,
-    ) -> Result<EventStream, LlmError> {
-        let callback = on_retry.clone();
-        with_retry(
-            || async { self.stream_once(req).await },
-            move |attempt, error| {
-                tracing::warn!(attempt, error = %error, "retrying OpenCode Go request");
-                callback(attempt, error);
-            },
-        )
-        .await
-    }
-
-    pub async fn list_models_direct(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        self.chat.list_models().await
     }
 }
 
@@ -111,19 +73,15 @@ impl Provider for OpenCodeGoProvider {
     }
 
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        self.stream_with_callback(req, Arc::new(|_, _| {})).await
-    }
-
-    async fn stream_with_retry(
-        &self,
-        req: &CompletionRequest,
-        on_retry: RetryCallback,
-    ) -> Result<EventStream, LlmError> {
-        self.stream_with_callback(req, on_retry).await
+        match dialect_for_model(&req.model) {
+            Dialect::Responses => self.responses.stream(req).await,
+            Dialect::Messages => self.messages.stream(req).await,
+            Dialect::Chat => self.chat.stream(req).await,
+        }
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        self.list_models_direct().await
+        self.chat.list_models().await
     }
 }
 
