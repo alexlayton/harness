@@ -28,12 +28,6 @@ impl std::fmt::Debug for DeviceCode {
     }
 }
 
-impl DeviceCode {
-    pub fn expires_in_seconds(&self) -> u64 {
-        self.expires_in
-    }
-}
-
 /// Events emitted while a device flow is running.  The auth crate does not
 /// know anything about a terminal; callers decide how to render these values.
 #[derive(Clone, Debug, PartialEq, Eq)]

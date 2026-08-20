@@ -15,8 +15,7 @@ pub use github_copilot::{
     COPILOT_API_VERSION, COPILOT_EDITOR_PLUGIN_VERSION, COPILOT_EDITOR_VERSION,
     COPILOT_INTEGRATION_ID, COPILOT_USER_AGENT, CopilotAuth, CopilotEndpoints,
     GITHUB_DEVICE_CLIENT_ID, GithubCopilotClient, KNOWN_MODEL_IDS, base_url_from_proxy_token,
-    copilot_base_url, get_base_url_from_token, get_github_copilot_base_url, normalize_domain,
-    parse_available_copilot_model_ids, parse_available_model_ids, parse_available_model_ids_value,
+    copilot_base_url, normalize_domain, parse_available_model_ids, parse_available_model_ids_value,
     parse_copilot_token, sku_from_proxy_token,
 };
 pub use storage::{

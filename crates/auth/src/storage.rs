@@ -182,15 +182,6 @@ impl AuthStore {
         Ok(Some(credential))
     }
 
-    /// Alias with an explicit verb for callers that prefer `load_*` naming.
-    pub fn load_copilot(&self) -> Result<Option<CopilotCredential>> {
-        self.copilot()
-    }
-
-    pub fn get_copilot(&self) -> Result<Option<CopilotCredential>> {
-        self.copilot()
-    }
-
     /// Update one provider while retaining all unrelated entries.  The lock is
     /// held across the read and atomic replacement, which prevents concurrent
     /// login processes from losing one another's credentials.
@@ -221,14 +212,6 @@ impl AuthStore {
             source,
         })?;
         self.save_provider_value(COPILOT_PROVIDER_KEY, value)
-    }
-
-    pub fn write_copilot(&self, credential: &CopilotCredential) -> Result<()> {
-        self.save_copilot(credential)
-    }
-
-    pub fn put_copilot(&self, credential: &CopilotCredential) -> Result<()> {
-        self.save_copilot(credential)
     }
 
     pub fn remove_provider(&self, provider: &str) -> Result<bool> {

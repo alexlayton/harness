@@ -5,7 +5,9 @@
 //! selects the API host.  Keeping those details here makes the rest of Harness
 //! independent from this unstable client protocol.
 
-use crate::device_code::{AuthEvent, DeviceCode, parse_device_code, parse_u64, required_string};
+use crate::device_code::{
+    AuthEvent, DeviceCode, PollResult, parse_device_code, parse_u64, required_string,
+};
 use crate::error::{AuthError, Result};
 use crate::storage::{AuthStore, CopilotCredential};
 use reqwest::header::{
@@ -18,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-/// Public device-flow client ID used by GitHub Copilot's VS Code/Pi clients.
+/// The public device-flow client ID used by GitHub's Copilot editors.
 pub const GITHUB_DEVICE_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 
 pub const COPILOT_USER_AGENT: &str = "GitHubCopilotChat/0.35.0";
@@ -126,18 +128,6 @@ impl CopilotEndpoints {
             copilot_token_url: format!("https://{api_domain}/copilot_internal/v2/token"),
         })
     }
-
-    pub fn with_urls(
-        device_code_url: impl Into<String>,
-        access_token_url: impl Into<String>,
-        copilot_token_url: impl Into<String>,
-    ) -> Self {
-        Self {
-            device_code_url: device_code_url.into(),
-            access_token_url: access_token_url.into(),
-            copilot_token_url: copilot_token_url.into(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -159,20 +149,14 @@ impl fmt::Debug for GithubCopilotClient {
 
 impl GithubCopilotClient {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            http: Client::builder()
-                .user_agent(COPILOT_USER_AGENT)
-                .build()
-                .map_err(|error| AuthError::Network {
-                    endpoint: "GitHub".into(),
-                    message: error.to_string(),
-                })?,
-            endpoints: CopilotEndpoints::for_domain(None)?,
-            api_base_url: None,
-        })
+        Self::from_endpoints(CopilotEndpoints::for_domain(None)?)
     }
 
     pub fn with_endpoints(endpoints: CopilotEndpoints) -> Result<Self> {
+        Self::from_endpoints(endpoints)
+    }
+
+    fn from_endpoints(endpoints: CopilotEndpoints) -> Result<Self> {
         Ok(Self {
             http: Client::builder()
                 .user_agent(COPILOT_USER_AGENT)
@@ -192,14 +176,6 @@ impl GithubCopilotClient {
     pub fn with_api_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.api_base_url = Some(base_url.into().trim_end_matches('/').to_owned());
         self
-    }
-
-    pub fn with_http_client(http: Client, endpoints: CopilotEndpoints) -> Self {
-        Self {
-            http,
-            endpoints,
-            api_base_url: None,
-        }
     }
 
     pub fn for_domain(&self, domain: Option<&str>) -> Result<Self> {
@@ -254,7 +230,7 @@ impl GithubCopilotClient {
     ) -> Result<String> {
         let deadline = Instant::now() + Duration::from_secs(device.expires_in);
         let mut interval = device.interval.max(5);
-        // RFC 8628 and Pi both wait before the first request.
+        // RFC 8628 waits before the first poll.
         loop {
             if Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
@@ -269,11 +245,9 @@ impl GithubCopilotClient {
                 return Err(AuthError::DeviceCodeExpired);
             }
             match self.poll_once(device, cancel).await? {
-                crate::device_code::PollResult::Complete { access_token } => {
-                    return Ok(access_token);
-                }
-                crate::device_code::PollResult::Pending => {}
-                crate::device_code::PollResult::SlowDown {
+                PollResult::Complete { access_token } => return Ok(access_token),
+                PollResult::Pending => {}
+                PollResult::SlowDown {
                     interval: new_interval,
                 } => {
                     interval = new_interval
@@ -288,7 +262,7 @@ impl GithubCopilotClient {
         &self,
         device: &DeviceCode,
         cancel: &CancellationToken,
-    ) -> Result<crate::device_code::PollResult> {
+    ) -> Result<PollResult> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
@@ -324,7 +298,7 @@ impl GithubCopilotClient {
             if access_token.is_empty() {
                 return Err(AuthError::DeviceFlowFailed("empty access token".into()));
             }
-            return Ok(crate::device_code::PollResult::Complete {
+            return Ok(PollResult::Complete {
                 access_token: access_token.to_owned(),
             });
         }
@@ -332,8 +306,8 @@ impl GithubCopilotClient {
             return Err(AuthError::DeviceFlowFailed("invalid token response".into()));
         };
         match error {
-            "authorization_pending" => Ok(crate::device_code::PollResult::Pending),
-            "slow_down" => Ok(crate::device_code::PollResult::SlowDown {
+            "authorization_pending" => Ok(PollResult::Pending),
+            "slow_down" => Ok(PollResult::SlowDown {
                 interval: value
                     .get("interval")
                     .and_then(|value| parse_u64(value, "interval").ok()),
@@ -352,6 +326,34 @@ impl GithubCopilotClient {
         enterprise_domain: Option<&str>,
         cancel: &CancellationToken,
     ) -> Result<CopilotCredential> {
+        self.fetch_copilot_token(github_access_token, enterprise_domain, cancel)
+            .await
+    }
+
+    /// Refresh a Copilot token from a stored GitHub token.
+    pub async fn refresh_copilot_token(
+        &self,
+        credential: &CopilotCredential,
+        cancel: &CancellationToken,
+    ) -> Result<CopilotCredential> {
+        self.fetch_copilot_token(
+            &credential.refresh,
+            credential.enterprise_url.as_deref(),
+            cancel,
+        )
+        .await
+    }
+
+    /// GET `/copilot_internal/v2/token` with a bearer token and parse the
+    /// resulting Copilot credential.  The exchange and refresh flows differ
+    /// only in which token is sent and what is threaded through as the
+    /// re-exchange token.
+    async fn fetch_copilot_token(
+        &self,
+        bearer_token: &str,
+        enterprise_domain: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<CopilotCredential> {
         let domain = normalize_domain(enterprise_domain)?;
         let endpoints = if domain.is_some() {
             self.for_domain(domain.as_deref())?.endpoints
@@ -361,7 +363,7 @@ impl GithubCopilotClient {
         let mut headers = copilot_headers();
         headers.insert(
             AUTHORIZATION,
-            bearer(github_access_token)
+            bearer(bearer_token)
                 .ok_or_else(|| AuthError::InvalidCredential("invalid GitHub token".into()))?,
         );
         let request = self.http.get(&endpoints.copilot_token_url).headers(headers);
@@ -380,44 +382,7 @@ impl GithubCopilotClient {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
             value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot token response".into()))?,
         };
-        parse_copilot_token(&value, github_access_token, domain)
-    }
-
-    /// Refresh a Copilot token from a stored GitHub token.
-    pub async fn refresh_copilot_token(
-        &self,
-        credential: &CopilotCredential,
-        cancel: &CancellationToken,
-    ) -> Result<CopilotCredential> {
-        let domain = normalize_domain(credential.enterprise_url.as_deref())?;
-        let endpoints = if domain.is_some() {
-            self.for_domain(domain.as_deref())?.endpoints
-        } else {
-            self.endpoints.clone()
-        };
-        let mut headers = copilot_headers();
-        headers.insert(
-            AUTHORIZATION,
-            bearer(&credential.refresh)
-                .ok_or_else(|| AuthError::InvalidCredential("invalid GitHub token".into()))?,
-        );
-        let request = self.http.get(&endpoints.copilot_token_url).headers(headers);
-        let response = tokio::select! {
-            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            response = request.send() => response.map_err(|error| network_error(&endpoints.copilot_token_url, error))?,
-        };
-        let status = response.status();
-        if !status.is_success() {
-            return Err(AuthError::Http {
-                status: status.as_u16(),
-                endpoint: endpoint_label(&endpoints.copilot_token_url),
-            });
-        }
-        let value = tokio::select! {
-            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot token response".into()))?,
-        };
-        parse_copilot_token(&value, &credential.refresh, domain)
+        parse_copilot_token(&value, bearer_token, domain)
     }
 
     pub async fn fetch_available_model_ids(
@@ -665,10 +630,6 @@ pub fn base_url_from_proxy_token(token: &str) -> Option<String> {
     Some(format!("{scheme}://{api_host}"))
 }
 
-pub fn get_base_url_from_token(token: &str) -> Option<String> {
-    base_url_from_proxy_token(token)
-}
-
 /// The billing SKU from Copilot's semicolon-delimited token metadata (for
 /// example `free_limited_copilot`).  Free plans gate most premium models
 /// behind billing, so callers use this to bias defaults and error hints
@@ -692,9 +653,10 @@ pub fn copilot_base_url(token: &str, enterprise_domain: Option<&str>) -> String 
     "https://api.individual.githubcopilot.com".into()
 }
 
-/// Filter the dynamic `/models` response using the same policy semantics as
-/// Pi.  Unknown fields are ignored, while unknown model IDs are left for the
-/// provider's static catalog to discard.
+/// Filter the dynamic `/models` response: picker-enabled models unless the
+/// policy state is `disabled`, with policy-enabled models as the fallback on
+/// the individual SKU.  Unknown fields are ignored, while unknown model IDs
+/// are left for the provider's static catalog to discard.
 pub fn parse_available_model_ids_value(
     value: &Value,
     allow_policy_fallback: bool,
@@ -738,17 +700,6 @@ pub fn parse_available_model_ids_value(
     } else {
         Ok(policy)
     }
-}
-
-pub fn get_github_copilot_base_url(token: &str, enterprise_domain: Option<&str>) -> String {
-    copilot_base_url(token, enterprise_domain)
-}
-
-pub fn parse_available_copilot_model_ids(
-    body: &str,
-    allow_policy_fallback: bool,
-) -> Result<Vec<String>> {
-    parse_available_model_ids(body, allow_policy_fallback)
 }
 
 pub fn parse_available_model_ids(body: &str, allow_policy_fallback: bool) -> Result<Vec<String>> {
@@ -797,15 +748,6 @@ impl CopilotAuth {
         })
     }
 
-    pub fn with_client(store: AuthStore, client: GithubCopilotClient) -> Result<Self> {
-        let credential = store.copilot()?;
-        Ok(Self {
-            store,
-            client,
-            credential: Arc::new(Mutex::new(credential)),
-        })
-    }
-
     pub fn from_default() -> Result<Self> {
         Self::new(AuthStore::default())
     }
@@ -849,10 +791,6 @@ impl CopilotAuth {
             return Err(AuthError::NotAuthenticated);
         }
         self.refresh().await
-    }
-
-    pub async fn refresh_if_needed(&self) -> Result<CopilotCredential> {
-        self.ensure_valid().await
     }
 
     pub async fn refresh(&self) -> Result<CopilotCredential> {
