@@ -1,12 +1,12 @@
 # Harness sessions
 
 Harness sessions are durable conversation logs owned by the `session` crate.
-The installed Pi reference was 0.84.1. Harness currently mirrors its
-behavioral ideas (discoverable/resumable JSONL sessions and explicit context
-summaries), not its private on-disk schema; exact Pi import/export compatibility
-is intentionally deferred.
-The agent owns orchestration and the TUI only renders session status; neither
-layer knows the JSONL layout.
+The session format follows the JSONL conventions implemented here and
+documented below: a versioned header, append-only event envelopes, and
+explicit compaction summaries that characterize provider context. It is a
+Harness-owned format (there is no import/export compatibility with other
+tools' private on-disk schemas). The agent owns orchestration and the TUI
+only renders session status; neither layer knows the JSONL layout.
 
 ## Storage and workspace scope
 
@@ -19,10 +19,6 @@ Session directories are private (`0700`) and session files are written with
 private permissions where supported. Session files can contain source code,
 commands, tool output, and reasoning traces; do not share them without
 reviewing their contents.
-
-A `.current` pointer tracks the last session created in a workspace. It is
-metadata only and is not needed to recover a session. Missing or corrupt index
-state can be rebuilt by scanning `*.jsonl` files.
 
 ## JSONL format (version 1)
 
@@ -55,10 +51,8 @@ temporary file and rename.
 
 A malformed unterminated final line is treated as an interrupted write and is
 ignored on load. A malformed middle or newline-terminated line is an error.
-`SessionStore::load_with_report` reports recovery and
-`SessionStore::recover_trailing_line` can truncate only that clearly incomplete
-trailing fragment and reports its line. The recovery API refuses writes outside
-the configured store root. Loading an exported file by path adopts a copy under
+Only that clearly incomplete trailing fragment is ignored; the rest of the
+file stays authoritative. Loading an exported file by path adopts a copy under
 the configured store before the agent appends new events.
 
 ## Lifecycle and commands

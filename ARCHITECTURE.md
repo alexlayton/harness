@@ -120,13 +120,13 @@ registry for the prompt builder.
 ### Autodiscovery roots (no explicit paths)
 
 Skills autodiscover with **zero flags or config**: the project walk (`cwd` up
-to the git repo root: `.harness/skills` in pi mode and `.agents/skills` in
-agents mode), plus the global roots `~/.harness/skills` (or
+to the git repo root: `.harness/skills` in harness mode and `.agents/skills`
+in agents mode), plus the global roots `~/.harness/skills` (or
 `$HARNESS_SKILLS_DIR`) and `~/.agents/skills`. Project roots beat global roots;
 name collisions keep the earlier (higher-priority) skill. There is deliberately
 no `--skill` flag or config `skills` field — the explicit-path mechanism was
-removed, leaving pure autodiscovery as the only mechanism. pi is inspiration
-for resolving ambiguity, not a contract.
+removed, leaving pure autodiscovery as the only mechanism; the Agent Skills
+standard is the contract.
 
 ### The two invariants
 
