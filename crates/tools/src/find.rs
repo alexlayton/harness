@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::fs;
-use tokio::sync::Semaphore;
+use tokio::sync::{OnceCell, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 pub const DEFAULT_FIND_LIMIT: usize = 100;
@@ -55,11 +55,14 @@ impl Default for FindConfig {
     }
 }
 
-/// A per-workspace, watched FFF index.  `FilePicker` is intentionally created
-/// once and shared by all `FindTool` invocations.
+/// A per-workspace, watched FFF index. The [`FilePicker`] is created lazily
+/// on first use — never during tool-registry construction — so process startup
+/// does not pay for a full filesystem scan before the first frame paints. The
+/// scan itself then runs on fff's own background thread while the UI is live;
+/// the first `find`/`grep` call awaits scan completion exactly as before.
 pub struct FileSearchIndex {
     root: PathBuf,
-    picker: SharedFilePicker,
+    picker: OnceCell<SharedFilePicker>,
     // Keeping this handle alive documents that the picker was initialized with
     // a no-op frecency backend and leaves room for a persistent backend later.
     _frecency: SharedFrecency,
@@ -83,31 +86,43 @@ impl FileSearchIndex {
         config.max_limit = config.max_limit.clamp(1, MAX_FIND_LIMIT);
         config.default_limit = config.default_limit.clamp(1, config.max_limit);
 
-        let picker = SharedFilePicker::default();
-        let frecency = SharedFrecency::noop();
-        FilePicker::new_with_shared_state(
-            picker.clone(),
-            frecency.clone(),
-            FilePickerOptions {
-                base_path: root.to_string_lossy().into_owned(),
-                mode: FFFMode::Ai,
-                watch: true,
-                follow_symlinks: false,
-                enable_mmap_cache: false,
-                enable_content_indexing: false,
-                ..FilePickerOptions::default()
-            },
-        )
-        .map_err(|error| error.to_string())?;
-
         Ok(Self {
             root,
-            picker,
-            _frecency: frecency,
+            picker: OnceCell::new(),
+            _frecency: SharedFrecency::noop(),
             search_slots: Arc::new(Semaphore::new(config.max_concurrent_searches.max(1))),
             config,
             shutdown: AtomicBool::new(false),
         })
+    }
+
+    /// Create the underlying picker on first use. Construction itself is
+    /// cheap (thread spawns only); the filesystem walk runs on fff's own
+    /// background thread afterwards, and the first search waits for scan
+    /// completion exactly as it always has. Failures are cached by the
+    /// [`OnceCell`] so every call observes the same error instead of
+    /// re-spawning watchers.
+    async fn ensure_picker(&self) -> Result<&SharedFilePicker, String> {
+        self.picker
+            .get_or_try_init(|| async {
+                let picker = SharedFilePicker::default();
+                FilePicker::new_with_shared_state(
+                    picker.clone(),
+                    SharedFrecency::noop(),
+                    FilePickerOptions {
+                        base_path: self.root.to_string_lossy().into_owned(),
+                        mode: FFFMode::Ai,
+                        watch: true,
+                        follow_symlinks: false,
+                        enable_mmap_cache: false,
+                        enable_content_indexing: false,
+                        ..FilePickerOptions::default()
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(picker)
+            })
+            .await
     }
 
     pub fn root(&self) -> &Path {
@@ -120,14 +135,18 @@ impl FileSearchIndex {
 
     /// Explicitly stop the watcher and release the picker.  `Drop` calls this
     /// as a safety net, while the application can use it at a known lifecycle
-    /// boundary before awaiting its agent task.
+    /// boundary before awaiting its agent task.  A lazily-created index that
+    /// was never used has nothing to shut down.
     pub fn shutdown(&self) {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.picker.cancel();
-        self.picker.shutdown_watches_and_wait();
-        if let Ok(mut guard) = self.picker.write() {
+        let Some(picker) = self.picker.get() else {
+            return;
+        };
+        picker.cancel();
+        picker.shutdown_watches_and_wait();
+        if let Ok(mut guard) = picker.write() {
             if let Some(picker) = guard.as_mut() {
                 picker.cancel();
                 picker.stop_background_monitor();
@@ -149,6 +168,7 @@ impl FileSearchIndex {
         if query.trim().is_empty() {
             return Err("query must not be empty".into());
         }
+        let picker = self.ensure_picker().await?.clone();
 
         let scope = match scope {
             Some(scope) if !scope.trim().is_empty() && scope != "." => {
@@ -167,7 +187,6 @@ impl FileSearchIndex {
             _ = cancel.cancelled() => return Err("cancelled".into()),
         };
 
-        let picker = self.picker.clone();
         let scan_timeout = self.config.scan_timeout;
         let query_for_job = query.clone();
         let scope_for_job = scope.clone();
@@ -211,6 +230,7 @@ impl FileSearchIndex {
         if pattern.trim().is_empty() {
             return Err("pattern must not be empty".into());
         }
+        let picker = self.ensure_picker().await?.clone();
 
         let scope = match scope {
             Some(scope) if !scope.trim().is_empty() && scope != "." => {
@@ -229,7 +249,6 @@ impl FileSearchIndex {
             _ = cancel.cancelled() => return Err("cancelled".into()),
         };
 
-        let picker = self.picker.clone();
         let scan_timeout = self.config.scan_timeout;
         let pattern_for_job = pattern.clone();
         let scope_for_job = scope.clone();
