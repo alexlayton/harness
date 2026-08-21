@@ -49,7 +49,8 @@ use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::style::{
@@ -302,6 +303,15 @@ impl CrossTerm {
             let _ = terminal::disable_raw_mode();
             return Err(error).context("configure terminal input");
         }
+        // The kitty keyboard protocol makes Shift+Enter report as `Enter` with
+        // the SHIFT modifier, which the input handler already maps to a newline
+        // (works on Ghostty; iTerm/Terminal.app do not support it). Only
+        // `DISAMBIGUATE_ESCAPE_CODES` is pushed — `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
+        // would swallow plain characters. Popped in `restore` and the panic hook.
+        let _ = execute!(
+            ui.out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
         // Unlike the inline UI, the cursor stays visible: it *is* the input
         // caret, sitting right after the `› ` prefix. No hide, no fake cell.
         Ok(ui)
@@ -1634,6 +1644,7 @@ impl CrossTerm {
         self.restored = true;
         terminal::disable_raw_mode().context("restore terminal raw mode")?;
         execute!(self.out, DisableBracketedPaste).context("restore terminal input")?;
+        let _ = execute!(self.out, PopKeyboardEnhancementFlags);
         // Leave one blank line so the shell prompt lands below the UI.
         writeln!(self.out).context("leave terminal")?;
         Ok(())
@@ -1683,6 +1694,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |panic| {
         let _ = terminal::disable_raw_mode();
         let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = writeln!(io::stdout());
         previous(panic);
     }));
