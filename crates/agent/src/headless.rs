@@ -87,7 +87,17 @@ pub async fn drive_headless_events(
 ) -> ExitCode {
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
     let mut stderr = std::io::stderr();
-    let code = drive_headless_events_into(event_rx, verbose, &mut stdout, &mut stderr).await;
+    // A terminal wants per-delta flushes so the answer streams visibly; pipes
+    // (CI, scripting) are better served by flushing on line boundaries.
+    let interactive_stdout = std::io::stdout().is_terminal();
+    let code = drive_headless_events_into(
+        event_rx,
+        verbose,
+        &mut stdout,
+        &mut stderr,
+        interactive_stdout,
+    )
+    .await;
     let _ = stdout.flush();
     code
 }
@@ -99,6 +109,7 @@ async fn drive_headless_events_into(
     verbose: bool,
     stdout: &mut (impl Write + Unpin),
     stderr: &mut (impl Write + Unpin),
+    interactive_stdout: bool,
 ) -> ExitCode {
     // An `AgentEvent::Error` marks the turn as failed unless a later event
     // proves the agent recovered (it re-streamed and produced output or more
@@ -143,7 +154,12 @@ async fn drive_headless_events_into(
             AgentEvent::TextDelta(delta) => {
                 wrote_text = true;
                 let _ = write!(stdout, "{delta}");
-                let _ = stdout.flush();
+                // Terminals flush per delta (visible streaming); piped
+                // consumers flush per line — one syscall per token buys
+                // nothing when nobody is watching live.
+                if interactive_stdout || delta.contains('\n') {
+                    let _ = stdout.flush();
+                }
             }
             AgentEvent::ReasoningDelta(delta) => {
                 if verbose {
@@ -255,15 +271,17 @@ async fn drive_headless_events_into(
 /// Run one non-interactive prompt to completion and return the process code.
 ///
 /// Fresh session by default (persisted, resumable later); `--resume <sel>`
-/// loads an existing one through the store's existing selector.  The agent,
-/// its channels, its persistence hooks, and the cancellation token are all the
-/// same objects the interactive path uses.
+/// loads an existing one through the store's existing selector. Passing
+/// `store = None` (the `--no-session` escape hatch) runs the same agent with
+/// no durable state at all — no header, no events, nothing to resume. The
+/// agent, its channels, and the cancellation token are the same objects the
+/// interactive path uses.
 pub async fn run_headless(
     config: &Config,
     cli: &Cli,
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
-    store: SessionStore,
+    store: Option<SessionStore>,
 ) -> Result<ExitCode> {
     run_headless_with_cancel(config, cli, provider, tools, store, None).await
 }
@@ -276,20 +294,29 @@ async fn run_headless_with_cancel(
     cli: &Cli,
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
-    store: SessionStore,
+    store: Option<SessionStore>,
     external_cancel: Option<CancellationToken>,
 ) -> Result<ExitCode> {
     let prompt = resolve_prompt(cli)?;
 
-    let session = match &cli.resume {
-        Some(selector) => store
-            .load(selector)
-            .with_context(|| format!("load session `{selector}`"))?,
-        None => store.create(SessionCreateOptions {
+    let session = match (&cli.resume, &store) {
+        (Some(selector), Some(store)) => Some(
+            store
+                .load(selector)
+                .with_context(|| format!("load session `{selector}`"))?,
+        ),
+        // Resuming without a store cannot work; surface it as a usage error.
+        (Some(_), None) => {
+            return Err(anyhow!(
+                "--resume requires sessions, which --no-session disables"
+            ));
+        }
+        (None, Some(store)) => Some(store.create(SessionCreateOptions {
             provider: Some(provider.name().to_owned()),
             model: Some(config.model.clone()),
             ..SessionCreateOptions::default()
-        })?,
+        })?),
+        (None, None) => None,
     };
 
     let install_sigint = external_cancel.is_none();
@@ -303,8 +330,13 @@ async fn run_headless_with_cancel(
     let project_context = project_context_for(tools.workspace_root(), cli.no_context_files);
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
         .with_compaction(config.compaction.clone())
-        .with_project_context(project_context)
-        .with_session(store, session);
+        .with_project_context(project_context);
+    // Attaching a durable session is the opt-in persistence step: without it
+    // the agent behaves identically but keeps everything in memory only.
+    let agent = match (&store, session) {
+        (Some(store), Some(session)) => agent.with_session(store.clone(), session),
+        _ => agent,
+    };
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     // Send the single user turn, then close the channel so the agent's run
@@ -414,7 +446,9 @@ mod tests {
             drop(tx);
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let code = drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr).await;
+            // Piped mode: flushes only on newlines, like CI consumers see.
+            let code =
+                drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, false).await;
             (stdout, stderr, code)
         })
     }
@@ -723,7 +757,7 @@ mod tests {
                 &cli,
                 provider.clone(),
                 ToolRegistry::empty(),
-                store,
+                Some(store),
             )
             .await
             .unwrap();
@@ -738,6 +772,31 @@ mod tests {
                 texts.iter().any(|text| text.contains("follow up")),
                 "the new prompt must be sent: {texts:?}"
             );
+        });
+    }
+
+    /// `--no-session` (store = None) must run the turn normally but leave no
+    /// trace on disk: no session file, no store directory.
+    #[test]
+    fn no_session_mode_runs_without_persisting_anything() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let provider = Arc::new(RecordingProvider::default());
+            let cli = Cli {
+                print: true,
+                prompt: vec!["ephemeral".into()],
+                ..Cli::default()
+            };
+            let config = headless_config(&cli);
+            let code = run_headless(&config, &cli, provider.clone(), ToolRegistry::empty(), None)
+                .await
+                .unwrap();
+            assert_eq!(code, ExitCode::SUCCESS);
+            assert_eq!(provider.texts(), vec!["ephemeral".to_owned()]);
+            // Nothing was written: the store root never even materialized.
+            assert!(!root.path().exists() || root.path().read_dir().unwrap().next().is_none());
         });
     }
 
@@ -760,7 +819,7 @@ mod tests {
                 &cli,
                 provider.clone(),
                 ToolRegistry::empty(),
-                store,
+                Some(store),
             )
             .await
             .unwrap();
@@ -825,7 +884,7 @@ mod tests {
                     &cli,
                     Arc::new(HangingProvider),
                     ToolRegistry::empty(),
-                    store_for_run,
+                    Some(store_for_run),
                     Some(cancel_for_run),
                 )
                 .await
