@@ -6,6 +6,7 @@ pub mod attachments;
 pub mod commands;
 mod commit;
 mod completion;
+mod cross;
 mod environment;
 mod events;
 mod input;
@@ -14,6 +15,7 @@ pub mod render;
 mod state;
 
 pub use app::Tui;
+pub use cross::CrossTerm;
 pub use state::{ToolRecord, ToolStatus};
 
 /// Messages sent from the terminal UI to the agent. Keeping this protocol in

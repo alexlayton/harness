@@ -34,7 +34,7 @@ pub(crate) const MAX_HISTORY: usize = 1_000;
 /// Bounds for the fixed inline viewport height computed once at startup.
 const MIN_VIEWPORT_ROWS: usize = 5;
 const MAX_VIEWPORT_ROWS: usize = 16;
-const PLACEHOLDER: &str = "Type your message...";
+pub(crate) const PLACEHOLDER: &str = "Type your message...";
 
 /// The fixed inline viewport height for the process lifetime (ratatui's
 /// inline height is immutable): 30% of terminal rows, floored and clamped to

@@ -1,0 +1,1905 @@
+//! An experimental direct-crossterm UI: no ratatui viewport, no retained
+//! buffer, no `insert_before`. Everything final is written once as plain rows
+//! into the terminal's native scrollback; only a small live region at the
+//! bottom (streaming tail, running tool line, activity marker, and the `›`
+//! input line) is rewritten in place with cursor-relative ANSI moves.
+//!
+//! The point of the experiment is a side-by-side comparison with the ratatui
+//! inline UI ([`crate::Tui`]): the same event stream, the same rendering
+//! helpers, radically simpler machinery.
+//!
+//! Screen model and invariants:
+//!
+//! ```text
+//! [ native scrollback: banner, metadata, user echoes, finished messages, ]
+//! [ tool lines, notices — plain rows, never touched again               ]
+//! [ live region: streaming tail · tool line · activity · input          ]
+//!                                       ^ the real terminal cursor here
+//! ```
+//!
+//! - `region` holds the rows we believe are painted and `cursor_row` /
+//!   `cursor_col` locate the terminal cursor inside it. Both are updated only
+//!   by [`CrossTerm::write_frame`], which makes them true by construction.
+//! - The region never exceeds the terminal height: the streaming tail is
+//!   clipped to a budget, the input is clipped around its cursor, and a final
+//!   clamp guards degenerate sizes. This keeps every cursor move on-screen.
+//! - Rows become scrollback by *commitment* rather than by being moved:
+//!   pending entries are printed above the region within the same frame and
+//!   then forgotten — their pixels are already final, so nothing needs to be
+//!   redrawn or scrolled by us. Growth at the bottom scrolls the terminal
+//!   itself, carrying committed rows into scrollback.
+//! - A width change reflows every wrapped row, which invalidates the region
+//!   bookkeeping; the screen is then cleared and repainted from `transcript`,
+//!   which stores source entries (rather than rendered rows) for exactly this
+//!   reason.
+
+use crate::app::{Activity, MAX_HISTORY, PLACEHOLDER};
+use crate::commands::{self, ParsedCommand};
+use crate::commit::stable_block_split_offset;
+use crate::environment::EnvironmentInfo;
+use crate::input::{history_next, history_previous, push_history};
+use crate::render::{self, Theme};
+use crate::state::{ToolRecord, ToolStatus};
+use crate::{InputMessage, SessionSnapshotEntry, TuiEvent, UiEvent};
+use anyhow::{Context, Result};
+use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
+    KeyModifiers,
+};
+use crossterm::execute;
+use crossterm::style::{
+    Attribute, Color as AnsiColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
+};
+use crossterm::terminal::{self, Clear, ClearType};
+use futures_util::StreamExt;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use std::fmt::Write as _;
+use std::io::{self, Stdout, Write};
+use std::path::PathBuf;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// The user-input prefix. Same glyph as the committed user echo so a
+/// submitted message's pixels are exactly the prompt line it was typed on.
+const INPUT_PREFIX: &str = "› ";
+const INPUT_CONTINUATION: &str = "  ";
+const INPUT_PREFIX_WIDTH: usize = 2;
+
+/// One final or in-flight transcript block, stored at the source level so a
+/// resize can re-render it at a new width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Entry {
+    /// The startup wordmark; `tagline` is picked once per launch so
+    /// re-rendering after a resize does not re-roll it.
+    Banner {
+        tagline: String,
+    },
+    /// The header metadata line: `cwd  (branch)` left, `provider · model`
+    /// right — the same information the inline UI keeps above its input box.
+    Metadata {
+        cwd: String,
+        branch: Option<String>,
+        provider: String,
+        model: String,
+    },
+    User {
+        text: String,
+    },
+    Assistant {
+        markdown: String,
+        reasoning: String,
+    },
+    Tool {
+        record: ToolRecord,
+    },
+    Notice {
+        text: String,
+    },
+    Error {
+        text: String,
+    },
+    /// A centered `── label ──` rule marking a conversation boundary.
+    Separator {
+        label: String,
+    },
+}
+
+/// The in-flight assistant message. The stable markdown prefix is drained
+/// into `pending` (as [`Entry::Assistant`]) once it outgrows the live-tail
+/// budget, mirroring the inline UI's incremental scrollback commits.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StreamState {
+    reasoning: String,
+    markdown: String,
+}
+
+/// The visual rows of the input line plus the cursor's position within them.
+struct InputLayout {
+    rows: Vec<Line<'static>>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+/// One frame's live region: the rows to paint and where the terminal cursor
+/// belongs inside them.
+struct RegionBuild {
+    rows: Vec<Line<'static>>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+/// A direct-crossterm alternative to [`crate::Tui`]. See the module docs for
+/// the screen model; the struct is consumed externally only through
+/// `CrossTerm::new` and `CrossTerm::run`.
+pub struct CrossTerm {
+    /// Raw stdout handle; every frame is one formatted ANSI write + flush.
+    out: Stdout,
+    theme: Theme,
+    model: String,
+    provider: String,
+    environment: EnvironmentInfo,
+
+    /// Cached terminal size, refreshed on resize events.
+    width: u16,
+    height: u16,
+
+    /// Final entries of the current conversation, in order. Unlike the inline
+    /// UI (which tracks a commit index into one transcript) these are kept as
+    /// source entries because a width change must re-render the visible
+    /// window of history at the new width.
+    transcript: Vec<Entry>,
+    /// Entries queued to print above the live region at the next paint; they
+    /// become immutable scrollback rows and move into `transcript`.
+    pending: Vec<Entry>,
+
+    stream: Option<StreamState>,
+    running_tool: Option<ToolRecord>,
+
+    input: String,
+    /// Byte offset of the editing cursor (always on a char boundary).
+    cursor: usize,
+    history: Vec<String>,
+    history_pos: Option<usize>,
+    draft: String,
+
+    busy: bool,
+    activity: Activity,
+    spinner: usize,
+
+    /// Rows we believe are painted on screen and may rewrite in place.
+    region: Vec<Line<'static>>,
+    /// Cursor position within `region` (row is 0-based from the region top).
+    cursor_row: usize,
+    cursor_col: usize,
+
+    restored: bool,
+}
+
+impl CrossTerm {
+    /// Assemble the UI state without touching the terminal. `new` layers the
+    /// terminal setup on top, and tests use this directly.
+    fn base(model: &str, provider: &str, width: u16, height: u16) -> Self {
+        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let environment = EnvironmentInfo::discover(workspace_root);
+        Self {
+            out: io::stdout(),
+            theme: Theme::default(),
+            model: model.to_owned(),
+            provider: provider.to_owned(),
+            environment,
+            width,
+            height,
+            transcript: Vec::new(),
+            pending: Vec::new(),
+            stream: None,
+            running_tool: None,
+            input: String::new(),
+            cursor: 0,
+            history: Vec::new(),
+            history_pos: None,
+            draft: String::new(),
+            busy: false,
+            activity: Activity::Preparing,
+            spinner: 0,
+            region: Vec::new(),
+            cursor_row: 0,
+            cursor_col: 0,
+            restored: false,
+        }
+    }
+
+    pub fn new(model: &str, provider: &str) -> Result<Self> {
+        install_panic_hook();
+        let (width, height) = terminal::size().unwrap_or((80, 24));
+        let mut ui = Self::base(model, provider, width, height);
+        terminal::enable_raw_mode().context("enable terminal raw mode")?;
+        if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
+            let _ = terminal::disable_raw_mode();
+            return Err(error).context("configure terminal input");
+        }
+        // Unlike the inline UI, the cursor stays visible: it *is* the input
+        // caret, sitting right after the `› ` prefix. No hide, no fake cell.
+        Ok(ui)
+    }
+
+    pub async fn run<E>(
+        mut self,
+        mut events: mpsc::UnboundedReceiver<E>,
+        input_tx: mpsc::UnboundedSender<InputMessage>,
+        cancel: CancellationToken,
+    ) -> Result<()>
+    where
+        E: TuiEvent + 'static,
+    {
+        let result = self.run_inner(&mut events, input_tx, cancel).await;
+        let restore = self.restore();
+        result.and(restore)
+    }
+
+    async fn run_inner<E>(
+        &mut self,
+        events: &mut mpsc::UnboundedReceiver<E>,
+        input_tx: mpsc::UnboundedSender<InputMessage>,
+        cancel: CancellationToken,
+    ) -> Result<()>
+    where
+        E: TuiEvent + 'static,
+    {
+        // The startup header: the same wordmark banner the inline UI commits,
+        // augmented with the cwd/branch and provider/model metadata line.
+        self.pending.push(Entry::Banner {
+            tagline: render::pick_tagline().to_owned(),
+        });
+        self.pending.push(self.metadata_entry());
+        self.paint()?;
+
+        let mut input_events = EventStream::new();
+        let mut spinner_tick = tokio::time::interval(Duration::from_millis(200));
+        spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                maybe_event = events.recv() => {
+                    let Some(event) = maybe_event else { return Ok(()) };
+                    self.apply_event(event.into_ui_event());
+                    self.paint()?;
+                }
+                maybe_input = input_events.next() => {
+                    let event = match maybe_input {
+                        Some(Ok(event)) => event,
+                        Some(Err(error)) => return Err(error).context("read terminal event"),
+                        None => return Ok(()),
+                    };
+                    if let Event::Resize(width, height) = event {
+                        self.handle_resize(width, height)?;
+                        continue;
+                    }
+                    if self.handle_input(&event, &input_tx, &cancel)? {
+                        return Ok(());
+                    }
+                    self.paint()?;
+                }
+                _ = spinner_tick.tick() => {
+                    if self.busy {
+                        self.spinner = self.spinner.wrapping_add(1);
+                        self.paint()?;
+                    }
+                }
+                _ = cancel.cancelled(), if !self.busy => {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
+        let width_changed = width != self.width;
+        self.width = width;
+        self.height = height;
+        // Rows are pre-wrapped to the terminal width, so a width change
+        // reflows them and invalidates the region bookkeeping — repaint the
+        // whole visible window from the source transcript. A height-only
+        // change reflows nothing; a plain repaint re-clips the budgets. Only
+        // when the height shrank below the painted region is the bookkeeping
+        // stale (the region top may have scrolled off-screen).
+        if width_changed || self.region.len() > height as usize {
+            self.repaint_all()
+        } else {
+            self.paint()
+        }
+    }
+
+    fn handle_input(
+        &mut self,
+        event: &Event,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+        cancel: &CancellationToken,
+    ) -> Result<bool> {
+        let Event::Key(key) = event else {
+            if let Event::Paste(text) = event {
+                insert_text(&mut self.input, &mut self.cursor, text);
+            }
+            return Ok(false);
+        };
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Ok(false);
+        }
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('c') if control => {
+                if self.busy {
+                    let _ = input_tx.send(InputMessage::Interrupt);
+                } else {
+                    cancel.cancel();
+                    return Ok(true);
+                }
+            }
+            KeyCode::Char('d') if control => {
+                cancel.cancel();
+                return Ok(true);
+            }
+            // Esc interrupts a running turn (the same intent as Ctrl+C) and
+            // is a no-op while idle.
+            KeyCode::Esc => {
+                if self.busy {
+                    let _ = input_tx.send(InputMessage::Interrupt);
+                }
+            }
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                insert_text(&mut self.input, &mut self.cursor, "\n");
+            }
+            KeyCode::Enter => self.submit(input_tx)?,
+            KeyCode::Backspace => delete_backward(&mut self.input, &mut self.cursor),
+            KeyCode::Delete => delete_forward(&mut self.input, &mut self.cursor),
+            KeyCode::Left => move_left(&self.input, &mut self.cursor),
+            KeyCode::Right => move_right(&self.input, &mut self.cursor),
+            KeyCode::Home | KeyCode::Char('a') if control => {
+                self.cursor = line_bounds(&self.input, self.cursor).0;
+            }
+            KeyCode::End | KeyCode::Char('e') if control => {
+                self.cursor = line_bounds(&self.input, self.cursor).1;
+            }
+            // Up/Down move within a multi-line draft; at the top/bottom edge
+            // they recall input history (readline-style).
+            KeyCode::Up => {
+                if !self.move_input_line(-1) {
+                    self.history_up();
+                }
+            }
+            KeyCode::Down => {
+                if !self.move_input_line(1) {
+                    self.history_down();
+                }
+            }
+            // PageUp/PageDown scroll the terminal's native scrollback; they
+            // must never insert control characters into the prompt.
+            KeyCode::PageUp | KeyCode::PageDown => {}
+            KeyCode::Char(character)
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
+            {
+                insert_text(&mut self.input, &mut self.cursor, &character.to_string());
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn history_up(&mut self) {
+        let current = self.input.clone();
+        if let Some(value) = history_previous(
+            &self.history,
+            &mut self.history_pos,
+            &mut self.draft,
+            &current,
+        ) {
+            self.input = value;
+            self.cursor = self.input.len();
+        }
+    }
+
+    fn history_down(&mut self) {
+        if let Some(value) = history_next(&self.history, &mut self.history_pos, &self.draft) {
+            self.input = value;
+            self.cursor = self.input.len();
+        }
+    }
+
+    /// Move the editing cursor one logical line up (`delta < 0`) or down.
+    /// Returns `false` at the outer edges, where the caller falls through to
+    /// history recall.
+    fn move_input_line(&mut self, delta: i32) -> bool {
+        match vertical_move(&self.input, self.cursor, delta) {
+            Some(cursor) => {
+                self.cursor = cursor;
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn submit(&mut self, input_tx: &mpsc::UnboundedSender<InputMessage>) -> Result<()> {
+        if self.input.trim().is_empty() {
+            return Ok(());
+        }
+        let text = std::mem::take(&mut self.input);
+        self.cursor = 0;
+        push_history(&mut self.history, &text, MAX_HISTORY);
+        self.history_pos = None;
+        self.draft.clear();
+        if commands::is_command_input(&text) {
+            self.submit_command(&text, input_tx)?;
+        } else {
+            // The typed prompt line is already on screen with the `› ` prefix;
+            // committing it as a user entry below re-prints the same pixels.
+            self.pending.push(Entry::User { text: text.clone() });
+            input_tx
+                .send(InputMessage::Message(text))
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+            self.busy = true;
+            self.activity = Activity::Preparing;
+            self.spinner = 0;
+        }
+        Ok(())
+    }
+
+    fn submit_command(
+        &mut self,
+        input: &str,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<()> {
+        let command = match commands::parse_command(input) {
+            Ok(command) => command,
+            Err(error) => {
+                self.add_error(error);
+                return Ok(());
+            }
+        };
+        if let ParsedCommand::SetModel {
+            provider: None,
+            model,
+        } = &command
+            && model.is_empty()
+        {
+            self.add_notice(format!(
+                "usage: /model [<provider>:]<model> (current: {} · {})",
+                self.provider, self.model
+            ));
+            return Ok(());
+        }
+        self.add_notice(format!("⌘ {input}"));
+        let message = match command {
+            ParsedCommand::New => InputMessage::NewConversation,
+            ParsedCommand::Load { selector } => InputMessage::LoadSession { selector },
+            ParsedCommand::Sessions => InputMessage::ListSessions,
+            ParsedCommand::Export { destination } => InputMessage::ExportSession { destination },
+            ParsedCommand::Compact => InputMessage::CompactSession,
+            ParsedCommand::Auth => {
+                self.busy = true;
+                InputMessage::Authenticate
+            }
+            ParsedCommand::SetModel { provider, model } => {
+                InputMessage::SetModel { provider, model }
+            }
+        };
+        input_tx
+            .send(message)
+            .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Event application
+    // ------------------------------------------------------------------
+
+    fn apply_event(&mut self, event: UiEvent) {
+        match event {
+            UiEvent::AuthStarted => {
+                self.busy = true;
+                self.add_notice(
+                    "GitHub Copilot login\nWaiting for authorization...\nPress Ctrl+C to cancel.",
+                );
+            }
+            UiEvent::AuthPrompt { message } => {
+                self.busy = true;
+                self.add_notice(message);
+            }
+            UiEvent::AuthDeviceCode {
+                verification_url,
+                user_code,
+                expires_in,
+                interval,
+            } => {
+                self.busy = true;
+                self.add_notice(format!(
+                    "GitHub Copilot login\n\nOpen:\n{verification_url}\n\nEnter code:\n{user_code}\n\nWaiting for authorization...\nExpires in {expires_in}s · polling every {interval}s\nPress Ctrl+C to cancel."
+                ));
+            }
+            UiEvent::AuthProgress { message } => {
+                self.busy = true;
+                self.add_notice(message);
+            }
+            UiEvent::AuthFinished => {
+                self.busy = false;
+                self.add_notice(
+                    "GitHub Copilot authentication complete. Use /model to choose a model.",
+                );
+            }
+            UiEvent::AuthFailed { message } => {
+                self.busy = false;
+                self.add_error(message);
+            }
+            UiEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    return;
+                }
+                self.busy = true;
+                self.activity = Activity::Working;
+                self.stream().markdown.push_str(&delta);
+            }
+            UiEvent::ReasoningDelta(delta) => {
+                if delta.is_empty() {
+                    return;
+                }
+                self.busy = true;
+                self.activity = Activity::Reasoning;
+                self.stream().reasoning.push_str(&delta);
+            }
+            UiEvent::ToolCallStarted {
+                name,
+                summary,
+                arguments,
+            } => {
+                self.busy = true;
+                self.activity = Activity::Processing;
+                // Text streamed before the call is a complete message.
+                self.finalize_stream();
+                self.running_tool = Some(ToolRecord {
+                    name,
+                    args: arguments,
+                    summary,
+                    ok: false,
+                    duration_ms: 0,
+                    output: String::new(),
+                    error: None,
+                    status: ToolStatus::Running,
+                });
+            }
+            UiEvent::ToolCallFinished {
+                name,
+                summary,
+                ok,
+                duration_ms,
+                output: _,
+                error,
+            } => {
+                self.busy = true;
+                self.activity = Activity::Working;
+                let mut record = self.running_tool.take().unwrap_or_else(|| ToolRecord {
+                    name: name.clone(),
+                    args: String::new(),
+                    summary: summary.clone(),
+                    ok,
+                    duration_ms,
+                    output: String::new(),
+                    error: error.clone(),
+                    status: if ok {
+                        ToolStatus::Success
+                    } else {
+                        ToolStatus::Failure
+                    },
+                });
+                record.name = name;
+                record.summary = summary;
+                record.ok = ok;
+                record.duration_ms = duration_ms;
+                record.error = error;
+                record.status = if ok {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Failure
+                };
+                self.pending.push(Entry::Tool { record });
+            }
+            UiEvent::Retrying { .. } => {
+                self.busy = true;
+                self.activity = Activity::Retrying;
+            }
+            UiEvent::Error(error) => {
+                self.finalize_stream();
+                // A tool still marked running when the turn aborted finalizes
+                // as failed so its line does not silently vanish.
+                if let Some(mut record) = self.running_tool.take() {
+                    record.status = ToolStatus::Failure;
+                    record.error = Some(error.clone());
+                    self.pending.push(Entry::Tool { record });
+                }
+                self.busy = false;
+                self.activity = Activity::Preparing;
+                self.add_error(error);
+            }
+            UiEvent::TurnFinished => {
+                self.finalize_stream();
+                self.running_tool = None;
+                self.busy = false;
+                self.activity = Activity::Preparing;
+            }
+            UiEvent::Notice(notice) => self.add_notice(notice),
+            UiEvent::ModelChanged { provider, model } => {
+                self.provider = provider;
+                self.model = model;
+                // The startup header is immutable scrollback; surface the new
+                // model as a fresh metadata line instead.
+                self.pending.push(self.metadata_entry());
+            }
+            UiEvent::ModelList { .. } | UiEvent::UsageUpdated { .. } => {}
+            UiEvent::SessionChanged { id, loaded, .. } => {
+                self.finalize_stream();
+                self.running_tool = None;
+                // The terminal keeps everything physically, but the resize
+                // repaint redraws from this store, so the session-global
+                // chrome (banner, metadata, and the boundary separator that
+                // follows) must survive the conversation switch.
+                retain_chrome(&mut self.transcript);
+                let label = if loaded {
+                    format!("loaded session {}", &id[..id.len().min(8)])
+                } else {
+                    "new conversation".to_owned()
+                };
+                self.pending.push(Entry::Separator { label });
+            }
+            UiEvent::SessionSnapshot { entries } => {
+                self.finalize_stream();
+                self.running_tool = None;
+                // Same chrome retention as `SessionChanged`: the snapshot
+                // replaces the conversation, not the header.
+                retain_chrome(&mut self.transcript);
+                for snapshot in entries {
+                    self.pending.push(match snapshot {
+                        SessionSnapshotEntry::User { text } => Entry::User { text },
+                        SessionSnapshotEntry::Assistant {
+                            markdown,
+                            reasoning,
+                        } => Entry::Assistant {
+                            markdown,
+                            reasoning,
+                        },
+                        SessionSnapshotEntry::Tool {
+                            name,
+                            summary,
+                            arguments: _,
+                            ok,
+                            duration_ms,
+                            output: _,
+                            error,
+                        } => Entry::Tool {
+                            record: ToolRecord {
+                                name,
+                                args: String::new(),
+                                summary,
+                                ok,
+                                duration_ms,
+                                output: String::new(),
+                                error,
+                                status: if ok {
+                                    ToolStatus::Success
+                                } else {
+                                    ToolStatus::Failure
+                                },
+                            },
+                        },
+                    });
+                }
+            }
+            UiEvent::SessionList { sessions } => {
+                let notice = if sessions.is_empty() {
+                    "No sessions for this workspace".to_owned()
+                } else {
+                    sessions
+                        .into_iter()
+                        .take(12)
+                        .map(|session| {
+                            let title = session.title.unwrap_or_else(|| "(untitled)".into());
+                            let model = session.model.unwrap_or_else(|| "(model unknown)".into());
+                            format!(
+                                "{} · {} · {} · {}",
+                                session.short_id, title, model, session.updated_at
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                self.add_notice(notice);
+            }
+            UiEvent::SessionExported { path } => {
+                self.add_notice(format!("exported session to {path}"));
+            }
+            UiEvent::CompactionFinished {
+                compacted_through,
+                summary_bytes,
+                auto,
+                reason,
+            } => self.add_notice(format!(
+                "{}compacted through event {compacted_through} ({summary_bytes} bytes) [{reason}]",
+                if auto { "auto-" } else { "" }
+            )),
+        }
+    }
+
+    fn stream(&mut self) -> &mut StreamState {
+        self.stream.get_or_insert_with(StreamState::default)
+    }
+
+    /// Commit the in-flight assistant message as a final entry.
+    fn finalize_stream(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        if stream.reasoning.is_empty() && stream.markdown.is_empty() {
+            return;
+        }
+        self.pending.push(Entry::Assistant {
+            markdown: stream.markdown,
+            reasoning: stream.reasoning,
+        });
+    }
+
+    fn add_notice(&mut self, text: impl Into<String>) {
+        self.pending.push(Entry::Notice { text: text.into() });
+    }
+
+    fn add_error(&mut self, text: impl Into<String>) {
+        self.pending.push(Entry::Error { text: text.into() });
+    }
+
+    fn metadata_entry(&self) -> Entry {
+        Entry::Metadata {
+            cwd: self.environment.cwd_display.clone(),
+            branch: self.environment.branch.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Frame assembly
+    // ------------------------------------------------------------------
+
+    fn input_layout(&self) -> InputLayout {
+        let content = render::content_width(self.width);
+        input_layout(
+            &self.input,
+            self.cursor,
+            content.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
+            self.theme,
+        )
+    }
+
+    /// Rows of the live region: [streaming tail] · [tool line] · [activity] ·
+    /// [input]. Every section except the input is optional; the tail and the
+    /// input are each clipped so the whole region fits the screen.
+    fn build_region(&self, input: &InputLayout) -> RegionBuild {
+        let theme = self.theme;
+        let content = render::content_width(self.width);
+        let (input_rows, input_cursor_row) = clip_input(
+            input,
+            self.height as usize,
+            self.busy,
+            self.running_tool.is_some(),
+        );
+
+        let mut rows: Vec<Line<'static>> = Vec::new();
+
+        // The streaming tail shows only its newest rows; rows that scrolled
+        // out of the budget are printed in full when the message finalizes.
+        let tail = self.stream_tail_lines(content);
+        let budget = self.tail_budget(input_rows.len());
+        let start = tail.len().saturating_sub(budget);
+        rows.extend(tail[start..].iter().cloned());
+
+        if let Some(record) = &self.running_tool {
+            if !rows.is_empty() {
+                render::push_blank(&mut rows, render::SECTION_GAP);
+            }
+            rows.extend(tool_lines(record, content, theme));
+        }
+
+        if self.busy {
+            if !rows.is_empty() {
+                render::push_blank(&mut rows, render::SECTION_GAP);
+            }
+            rows.push(activity_line(self.activity, self.spinner, theme));
+        }
+
+        if !rows.is_empty() {
+            render::push_blank(&mut rows, render::SECTION_GAP);
+        }
+        let mut cursor_row = rows.len() + input_cursor_row;
+        rows.extend(input_rows);
+
+        // Degenerate-terminal guard: the region must never exceed the screen
+        // or cursor-relative moves would clamp at the top and corrupt the
+        // frame. Keep the bottom rows (the input lives there).
+        if self.height > 0 && rows.len() > self.height as usize {
+            let dropped = rows.len() - self.height as usize;
+            rows.drain(..dropped);
+            cursor_row = cursor_row.saturating_sub(dropped).min(rows.len() - 1);
+        }
+
+        let gutter = render::horizontal_pad(self.width) as usize;
+        RegionBuild {
+            rows,
+            cursor_row,
+            cursor_col: gutter + INPUT_PREFIX_WIDTH + input.cursor_col,
+        }
+    }
+
+    /// Rendered rows of the in-flight assistant message (reasoning block,
+    /// then markdown). Re-rendered from source on every frame.
+    fn stream_tail_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let Some(stream) = &self.stream else {
+            return Vec::new();
+        };
+        let mut lines = Vec::new();
+        if !stream.reasoning.is_empty() {
+            lines.extend(render::reasoning_lines(
+                &stream.reasoning,
+                self.theme,
+                width,
+            ));
+        }
+        if !stream.markdown.is_empty() {
+            if !lines.is_empty() {
+                render::push_blank(&mut lines, render::BLOCK_GAP);
+            }
+            lines.extend(render::markdown_lines(&stream.markdown, self.theme, width));
+        }
+        lines
+    }
+
+    /// Row budget for the streaming tail: whatever is left of the screen once
+    /// the input, the tool line, the activity row, separators, and a safety
+    /// row are reserved.
+    fn tail_budget(&self, input_rows: usize) -> usize {
+        (self.height as usize)
+            .saturating_sub(
+                input_rows + usize::from(self.busy) + usize::from(self.running_tool.is_some()) + 3,
+            )
+            .max(1)
+    }
+
+    /// Move the stable prefix of the streaming markdown into `pending` once
+    /// it outgrows the tail budget, so long responses flow into scrollback
+    /// incrementally (the same policy as the inline UI's commit pipeline).
+    /// Reasoning-only streams stay fully live; the display clip handles them.
+    fn commit_stream_prefix(&mut self, input_rows: usize) {
+        // Snapshot the immutable state first so `self.stream` can be borrowed
+        // mutably for the rest of the function.
+        let budget = self.tail_budget(input_rows);
+        let width = render::content_width(self.width);
+        let theme = self.theme;
+        let Some(stream) = self.stream.as_mut() else {
+            return;
+        };
+        if stream.markdown.is_empty() {
+            return;
+        }
+        let Some(offset) = stable_block_split_offset(&stream.markdown) else {
+            return;
+        };
+        if offset == 0 {
+            return;
+        }
+        let prefix = Entry::Assistant {
+            markdown: stream.markdown[..offset].to_owned(),
+            reasoning: stream.reasoning.clone(),
+        };
+        let prefix_height = entry_lines(&prefix, width, theme).len();
+        if prefix_height <= budget {
+            return;
+        }
+        self.pending.push(prefix);
+        stream.reasoning.clear();
+        stream.markdown.drain(..offset);
+    }
+
+    // ------------------------------------------------------------------
+    // Painting
+    // ------------------------------------------------------------------
+
+    /// Repaint the live region in place (plus any pending entries above it).
+    fn paint(&mut self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Ok(());
+        }
+        let input = self.input_layout();
+        self.commit_stream_prefix(input.rows.len());
+        let build = self.build_region(&input);
+        self.write_frame(build, false)
+    }
+
+    /// Clear the screen and repaint the visible window of history plus the
+    /// live region from scratch. Used after a width change (rows reflow) and
+    /// after a height shrink below the painted region. Rows already in
+    /// scrollback keep their old wrap; the on-screen window is re-rendered at
+    /// the new width from source entries.
+    fn repaint_all(&mut self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Ok(());
+        }
+        self.transcript.append(&mut self.pending);
+        let input = self.input_layout();
+        self.commit_stream_prefix(input.rows.len());
+        let build = self.build_region(&input);
+        self.write_frame(build, true)
+    }
+
+    /// Emit one frame. In incremental mode the frame is [pending entries] +
+    /// [region], rewritten in place from the previous region top; pending
+    /// rows are then committed by forgetting them. In `clear_all` mode the
+    /// screen is wiped and the visible window of `transcript` is reprinted
+    /// above the region.
+    fn write_frame(&mut self, build: RegionBuild, clear_all: bool) -> Result<()> {
+        let theme = self.theme;
+        let content = render::content_width(self.width);
+        let gutter = render::horizontal_pad(self.width) as usize;
+
+        let mut above: Vec<Line<'static>> = Vec::new();
+        if clear_all {
+            for (index, entry) in self.transcript.iter().enumerate() {
+                if index > 0 {
+                    render::push_blank(&mut above, render::SECTION_GAP);
+                }
+                above.extend(entry_lines(entry, content, theme));
+            }
+            // Keep as much history as fits above the region, plus one
+            // ellipsis row when older rows fall outside the window.
+            let keep = (self.height as usize).saturating_sub(build.rows.len());
+            if keep == 0 {
+                above.clear();
+            } else if above.len() > keep {
+                let hidden = above.len() - (keep - 1);
+                let mut window = Vec::with_capacity(keep);
+                window.push(Line::from(Span::styled(
+                    format!("… {hidden} rows above"),
+                    Style::default()
+                        .fg(theme.dim_text)
+                        .add_modifier(Modifier::DIM),
+                )));
+                window.extend(above.split_off(hidden));
+                above = window;
+            }
+        } else {
+            for (index, entry) in self.pending.iter().enumerate() {
+                if index > 0 {
+                    render::push_blank(&mut above, render::SECTION_GAP);
+                }
+                above.extend(entry_lines(entry, content, theme));
+            }
+        }
+
+        let mut rows = above;
+        if !rows.is_empty() && !build.rows.is_empty() {
+            render::push_blank(&mut rows, render::SECTION_GAP);
+        }
+        rows.extend(build.rows.iter().cloned());
+        let total = rows.len();
+        // The cursor target, counted from the first printed row.
+        let cursor_abs = total - build.rows.len() + build.cursor_row;
+
+        let mut buffer = String::new();
+        if clear_all {
+            let _ = write!(buffer, "{}{}", Clear(ClearType::All), MoveTo(0, 0));
+        } else if !self.region.is_empty() {
+            // Walk the cursor up to the top of the previously painted region.
+            // The cursor sits at `cursor_row` inside the region, so exactly
+            // that many rows separate it from the top.
+            if self.cursor_row > 0 {
+                let _ = write!(buffer, "{}", MoveUp(self.cursor_row as u16));
+            }
+        }
+
+        for (index, line) in rows.iter().enumerate() {
+            let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
+            write_row(&mut buffer, line, gutter);
+            if index + 1 < total {
+                buffer.push('\n');
+            }
+        }
+
+        // When the frame shrank, erase the leftover rows below it so stale
+        // pixels do not linger. (Pending rows only ever grow the frame, so
+        // this fires when the live region itself got smaller.)
+        if !clear_all && total < self.region.len() {
+            for _ in total..self.region.len() {
+                let _ = write!(buffer, "{}\r{}", MoveDown(1), Clear(ClearType::CurrentLine));
+            }
+            let up = (self.region.len() - 1).saturating_sub(cursor_abs);
+            if up > 0 {
+                let _ = write!(buffer, "{}", MoveUp(up as u16));
+            }
+        } else {
+            let up = (total - 1).saturating_sub(cursor_abs);
+            if up > 0 {
+                let _ = write!(buffer, "{}", MoveUp(up as u16));
+            }
+        }
+
+        // Horizontal placement: column 0 plus the input cursor offset.
+        buffer.push('\r');
+        if build.cursor_col > 0 {
+            let col = build.cursor_col.min(u16::MAX as usize) as u16;
+            let _ = write!(buffer, "{}", MoveRight(col));
+        }
+
+        self.out
+            .write_all(buffer.as_bytes())
+            .context("write frame")?;
+        self.out.flush().context("flush frame")?;
+
+        // Bookkeeping: the printed `above` rows are now immutable scrollback.
+        self.transcript.append(&mut self.pending);
+        self.region = build.rows;
+        self.cursor_row = build.cursor_row;
+        self.cursor_col = build.cursor_col;
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        terminal::disable_raw_mode().context("restore terminal raw mode")?;
+        execute!(self.out, DisableBracketedPaste).context("restore terminal input")?;
+        // Leave one blank line so the shell prompt lands below the UI.
+        writeln!(self.out).context("leave terminal")?;
+        Ok(())
+    }
+}
+
+impl Drop for CrossTerm {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+/// Keep the session-global chrome when a conversation switch replaces the
+/// transcript: the startup banner, metadata lines, and the most recent
+/// boundary separator. Everything else was already printed into scrollback;
+/// it only loses its place in the resize-repaint source, not on screen.
+fn retain_chrome(transcript: &mut Vec<Entry>) {
+    let last_separator = transcript
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::Separator { .. }));
+    let mut index = 0usize;
+    transcript.retain(|entry| {
+        let keep = match entry {
+            Entry::Banner { .. } | Entry::Metadata { .. } => true,
+            Entry::Separator { .. } => Some(index) == last_separator,
+            _ => false,
+        };
+        index += 1;
+        keep
+    });
+}
+
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
+        let _ = writeln!(io::stdout());
+        previous(panic);
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// Entry rendering
+// ---------------------------------------------------------------------------
+
+/// Build the wrapped rows for one final or in-flight entry. Shared by the
+/// pending path (print above the region) and the resize repaint (window of
+/// history), which is why entries are stored at the source level.
+fn entry_lines(entry: &Entry, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    match entry {
+        Entry::Banner { tagline } => render::welcome_lines_with_tagline(width, theme, tagline),
+        Entry::Metadata {
+            cwd,
+            branch,
+            provider,
+            model,
+        } => vec![metadata_line(
+            cwd,
+            branch.as_deref(),
+            provider,
+            model,
+            width,
+            theme,
+        )],
+        Entry::User { text } => render::user_lines(text, theme, width),
+        Entry::Assistant {
+            markdown,
+            reasoning,
+        } => {
+            let mut lines = Vec::new();
+            if !reasoning.is_empty() {
+                lines.extend(render::reasoning_lines(reasoning, theme, width));
+            }
+            if !markdown.is_empty() {
+                if !lines.is_empty() {
+                    render::push_blank(&mut lines, render::BLOCK_GAP);
+                }
+                lines.extend(render::markdown_lines(markdown, theme, width));
+            }
+            lines
+        }
+        Entry::Tool { record } => tool_lines(record, width, theme),
+        Entry::Notice { text } => render::notice_lines(text, theme, width),
+        Entry::Error { text } => render::error_lines(text, theme, width),
+        Entry::Separator { label } => vec![separator_line(label, width, theme)],
+    }
+}
+
+/// The simplified tool call: one line with the tool type and its primary
+/// parameter — `$ git status`, `read file.txt` — plus a duration on success
+/// or a `✗` error preview on failure. No boxes, no expandable output.
+fn tool_lines(record: &ToolRecord, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Agent summaries read `bash: <command>` / `read <path>` / …; bash reads
+    // as a shell line, everything else keeps its `tool param` shape.
+    let command = record
+        .summary
+        .strip_prefix("bash:")
+        .map(|rest| rest.trim_start())
+        .filter(|rest| !rest.is_empty());
+    match command {
+        Some(command) => {
+            spans.push(Span::styled(
+                "$ ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                command.to_owned(),
+                Style::default().fg(theme.primary_text),
+            ));
+        }
+        None => spans.push(Span::styled(
+            record.summary.trim().to_owned(),
+            Style::default().fg(theme.primary_text),
+        )),
+    }
+    match record.status {
+        ToolStatus::Running => {}
+        ToolStatus::Success => spans.push(Span::styled(
+            format!(" · {}", render::duration_text(record.duration_ms)),
+            Style::default().fg(theme.dim_text),
+        )),
+        ToolStatus::Failure => {
+            let preview = record
+                .error
+                .as_deref()
+                .and_then(|error| error.lines().next())
+                .unwrap_or("failed");
+            spans.push(Span::styled("  ✗ ", Style::default().fg(theme.error)));
+            spans.push(Span::styled(
+                preview.to_owned(),
+                Style::default().fg(theme.error),
+            ));
+        }
+    }
+    render::prefix_message_lines(
+        render::wrap_text(
+            &Text::from(Line::from(spans)),
+            width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
+            Style::default(),
+        ),
+        // The bash `$` is part of the spans; other tools keep the plain
+        // summary, so the wrap prefix is empty for them.
+        "",
+        theme,
+    )
+}
+
+/// The header metadata line: `cwd  (branch)` on the left, `provider · model`
+/// on the right, dim — the same pair the inline UI renders above its input
+/// box, promoted here into the startup header.
+fn metadata_line(
+    cwd: &str,
+    branch: Option<&str>,
+    provider: &str,
+    model: &str,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let style = Style::default()
+        .fg(theme.dim_text)
+        .add_modifier(Modifier::DIM);
+    let left = match branch {
+        Some(branch) => format!("{cwd}  ({branch})"),
+        None => cwd.to_owned(),
+    };
+    let right = format!("{provider} · {model}");
+    let left_width = UnicodeWidthStr::width(left.as_str());
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    if left_width + right_width + 2 <= width {
+        let padding = " ".repeat(width - left_width - right_width);
+        Line::from(vec![
+            Span::styled(left, style),
+            Span::raw(padding),
+            Span::styled(right, style),
+        ])
+    } else {
+        // Too narrow to split: keep both, unwrapped; the wrap layer above us
+        // never sees this line (it is one row by construction), so bound it.
+        let joined = format!("{left}  {right}");
+        Line::from(Span::styled(joined, style))
+    }
+}
+
+/// A centered `── label ──` rule marking a conversation boundary.
+fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'static> {
+    let text = format!("── {label} ──");
+    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+    let left = padding / 2;
+    let right = padding - left;
+    Line::from(Span::styled(
+        format!("{}{}{}", "─".repeat(left), text, "─".repeat(right)),
+        Style::default().fg(theme.dim_text),
+    ))
+}
+
+/// The busy indicator row: an animated marker plus the activity label.
+fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'static> {
+    let marker = render::ACTIVITY_FRAMES[spinner % render::ACTIVITY_FRAMES.len()];
+    Line::from(vec![
+        Span::styled(format!("{marker} "), Style::default().fg(theme.accent)),
+        Span::styled(
+            activity.label(),
+            Style::default()
+                .fg(theme.dim_text)
+                .add_modifier(Modifier::DIM),
+        ),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Input line layout
+// ---------------------------------------------------------------------------
+
+/// Wrap the input draft into visual rows (first row prefixed with `› `,
+/// continuations indented to match) and locate the cursor inside them. The
+/// real terminal cursor is placed at `cursor_col` columns into `cursor_row`.
+fn input_layout(input: &str, cursor: usize, width: usize, theme: Theme) -> InputLayout {
+    let width = width.max(1);
+    let cursor = cursor.min(input.len());
+    let prefix_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(theme.primary_text);
+
+    if input.is_empty() {
+        // Placeholder row; the terminal cursor sits right after the prefix.
+        return InputLayout {
+            rows: vec![Line::from(vec![
+                Span::styled(INPUT_PREFIX, prefix_style),
+                Span::styled(
+                    PLACEHOLDER,
+                    Style::default()
+                        .fg(theme.dim_text)
+                        .add_modifier(Modifier::DIM),
+                ),
+            ])],
+            cursor_row: 0,
+            cursor_col: 0,
+        };
+    }
+
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut cursor_row = 0usize;
+    let mut cursor_col = 0usize;
+
+    let mut byte_base = 0usize;
+    for logical in input.split('\n') {
+        let line_end = byte_base + logical.len();
+        let cursor_here = cursor >= byte_base && cursor <= line_end;
+        let chars: Vec<(char, usize)> = logical
+            .chars()
+            .map(|c| (c, UnicodeWidthChar::width(c).unwrap_or(1).max(1)))
+            .collect();
+        let cursor_char = if cursor_here {
+            Some(input[byte_base..cursor].chars().count())
+        } else {
+            None
+        };
+
+        // Greedy wrap; rows are append-stable, so the cursor can be located
+        // afterwards by walking the row boundaries.
+        let mut visual: Vec<Vec<(char, usize)>> = Vec::new();
+        let mut current: Vec<(char, usize)> = Vec::new();
+        let mut current_width = 0usize;
+        for &(character, character_width) in &chars {
+            if current_width > 0 && current_width + character_width > width {
+                visual.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push((character, character_width));
+            current_width += character_width;
+        }
+        visual.push(current);
+
+        if let Some(cursor_char) = cursor_char {
+            if cursor_char >= chars.len() {
+                // End of this logical line. A row filled to exactly the wrap
+                // width gets a fresh row for the cursor, mirroring
+                // `render::prompt_layout`.
+                let last = visual.len() - 1;
+                let last_width: usize = visual[last].iter().map(|(_, w)| *w).sum();
+                if last_width >= width && !visual[last].is_empty() {
+                    cursor_row = rows.len() + visual.len();
+                    cursor_col = 0;
+                    visual.push(Vec::new());
+                } else {
+                    cursor_row = rows.len() + last;
+                    cursor_col = last_width;
+                }
+            } else {
+                let mut index = 0usize;
+                for (row_index, row) in visual.iter().enumerate() {
+                    if index + row.len() > cursor_char {
+                        cursor_row = rows.len() + row_index;
+                        cursor_col = row.iter().take(cursor_char - index).map(|(_, w)| *w).sum();
+                        break;
+                    }
+                    index += row.len();
+                }
+            }
+        }
+
+        for (row_index, row) in visual.iter().enumerate() {
+            let text: String = row.iter().map(|(c, _)| *c).collect();
+            let lead = if rows.is_empty() && row_index == 0 {
+                Span::styled(INPUT_PREFIX, prefix_style)
+            } else {
+                Span::raw(INPUT_CONTINUATION)
+            };
+            rows.push(Line::from(vec![lead, Span::styled(text, text_style)]));
+        }
+
+        byte_base = line_end + 1;
+    }
+
+    if rows.is_empty() {
+        rows.push(Line::from(Span::styled(INPUT_PREFIX, prefix_style)));
+    }
+    InputLayout {
+        rows,
+        cursor_row,
+        cursor_col,
+    }
+}
+
+/// Clip the input rows to a window containing the cursor when the draft is
+/// taller than the screen can show. Returns the visible rows and the cursor
+/// row within them.
+fn clip_input(
+    input: &InputLayout,
+    height: usize,
+    busy: bool,
+    has_tool: bool,
+) -> (Vec<Line<'static>>, usize) {
+    let cap = height
+        .saturating_sub(usize::from(busy) + usize::from(has_tool) + 2)
+        .max(1);
+    if input.rows.len() <= cap {
+        return (input.rows.clone(), input.cursor_row);
+    }
+    // Window pinned so the cursor row stays visible, biased toward showing
+    // as much above it as fits.
+    let start = input
+        .cursor_row
+        .saturating_sub(cap - 1)
+        .min(input.rows.len() - cap);
+    (input.rows[start..].to_vec(), input.cursor_row - start)
+}
+
+// ---------------------------------------------------------------------------
+// Input editing (pure helpers over `String` + byte cursor)
+// ---------------------------------------------------------------------------
+
+/// Insert text at the cursor, normalizing CRLF/CR paste payloads to `\n`.
+fn insert_text(input: &mut String, cursor: &mut usize, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let text = if text.contains('\r') {
+        text.replace("\r\n", "\n").replace('\r', "\n")
+    } else {
+        text.to_owned()
+    };
+    if text.is_empty() {
+        return;
+    }
+    input.insert_str(*cursor, &text);
+    *cursor += text.len();
+}
+
+fn delete_backward(input: &mut String, cursor: &mut usize) {
+    if let Some(len) = input[..*cursor].chars().next_back().map(char::len_utf8) {
+        *cursor -= len;
+        input.drain(*cursor..*cursor + len);
+    }
+}
+
+fn delete_forward(input: &mut String, cursor: &mut usize) {
+    if let Some(len) = input[*cursor..].chars().next().map(char::len_utf8) {
+        input.drain(*cursor..*cursor + len);
+    }
+}
+
+fn move_left(input: &str, cursor: &mut usize) {
+    if let Some(len) = input[..*cursor].chars().next_back().map(char::len_utf8) {
+        *cursor -= len;
+    }
+}
+
+fn move_right(input: &str, cursor: &mut usize) {
+    if let Some(len) = input[*cursor..].chars().next().map(char::len_utf8) {
+        *cursor += len;
+    }
+}
+
+/// Byte offsets of the start and end of the logical line containing `cursor`.
+fn line_bounds(input: &str, cursor: usize) -> (usize, usize) {
+    let start = input[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = input[cursor..]
+        .find('\n')
+        .map(|i| cursor + i)
+        .unwrap_or(input.len());
+    (start, end)
+}
+
+/// Move the cursor one logical line up (`delta < 0`) or down, preserving the
+/// character column. Returns `None` at the outer edges.
+fn vertical_move(input: &str, cursor: usize, delta: i32) -> Option<usize> {
+    let before = &input[..cursor];
+    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let column = before[line_start..].chars().count();
+    let line_index = before.matches('\n').count() as i32;
+    let total_lines = input.matches('\n').count() as i32 + 1;
+    let target = line_index + delta;
+    if target < 0 || target >= total_lines {
+        return None;
+    }
+    let mut position = 0usize;
+    for _ in 0..target {
+        position += input[position..].find('\n').expect("target line exists") + 1;
+    }
+    let line_end = input[position..]
+        .find('\n')
+        .map(|i| position + i)
+        .unwrap_or(input.len());
+    let byte_column: usize = input[position..line_end]
+        .chars()
+        .take(column)
+        .map(char::len_utf8)
+        .sum();
+    Some(position + byte_column)
+}
+
+// ---------------------------------------------------------------------------
+// ANSI output
+// ---------------------------------------------------------------------------
+
+/// Serialize one styled ratatui line to ANSI. Style changes are emitted per
+/// span and reset once per line; empty spans cost nothing.
+fn line_to_ansi(line: &Line<'_>) -> String {
+    let mut out = String::new();
+    let mut styled = false;
+    for span in &line.spans {
+        if span.content.is_empty() {
+            continue;
+        }
+        let style = line.style.patch(span.style);
+        let prefix = style_prefix(&style);
+        if !prefix.is_empty() {
+            styled = true;
+        }
+        out.push_str(&prefix);
+        out.push_str(span.content.as_ref());
+    }
+    if styled {
+        out.push_str("\u{1b}[0m");
+    }
+    out
+}
+
+fn style_prefix(style: &Style) -> String {
+    let mut out = String::new();
+    if let Some(color) = style.fg {
+        let _ = write!(out, "{}", SetForegroundColor(ansi_color(color)));
+    }
+    if let Some(color) = style.bg {
+        let _ = write!(out, "{}", SetBackgroundColor(ansi_color(color)));
+    }
+    for (modifier, attribute) in MODIFIER_ATTRIBUTES {
+        if style.add_modifier.contains(*modifier) {
+            let _ = write!(out, "{}", SetAttribute(*attribute));
+        }
+    }
+    out
+}
+
+/// ratatui → crossterm modifier pairs for [`style_prefix`].
+const MODIFIER_ATTRIBUTES: &[(Modifier, Attribute)] = &[
+    (Modifier::BOLD, Attribute::Bold),
+    (Modifier::DIM, Attribute::Dim),
+    (Modifier::ITALIC, Attribute::Italic),
+    (Modifier::UNDERLINED, Attribute::Underlined),
+    (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+    (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+    (Modifier::REVERSED, Attribute::Reverse),
+    (Modifier::HIDDEN, Attribute::Hidden),
+    (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+];
+
+/// Mirrors ratatui's own crossterm-backend mapping so both UIs render the
+/// same theme colors identically.
+fn ansi_color(color: ratatui::style::Color) -> AnsiColor {
+    use ratatui::style::Color as RatatuiColor;
+    match color {
+        RatatuiColor::Reset => AnsiColor::Reset,
+        RatatuiColor::Black => AnsiColor::Black,
+        RatatuiColor::Red => AnsiColor::DarkRed,
+        RatatuiColor::Green => AnsiColor::DarkGreen,
+        RatatuiColor::Yellow => AnsiColor::DarkYellow,
+        RatatuiColor::Blue => AnsiColor::DarkBlue,
+        RatatuiColor::Magenta => AnsiColor::DarkMagenta,
+        RatatuiColor::Cyan => AnsiColor::DarkCyan,
+        RatatuiColor::Gray => AnsiColor::Grey,
+        RatatuiColor::DarkGray => AnsiColor::DarkGrey,
+        RatatuiColor::LightRed => AnsiColor::Red,
+        RatatuiColor::LightGreen => AnsiColor::Green,
+        RatatuiColor::LightYellow => AnsiColor::Yellow,
+        RatatuiColor::LightBlue => AnsiColor::Blue,
+        RatatuiColor::LightMagenta => AnsiColor::Magenta,
+        RatatuiColor::LightCyan => AnsiColor::Cyan,
+        RatatuiColor::White => AnsiColor::White,
+        RatatuiColor::Rgb(r, g, b) => AnsiColor::Rgb { r, g, b },
+        RatatuiColor::Indexed(value) => AnsiColor::AnsiValue(value),
+    }
+}
+
+/// Write one row: the shared left gutter plus the line's ANSI serialization.
+/// Blank rows become gutter-width space runs, which render identically.
+fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize) {
+    if gutter > 0 {
+        buffer.push_str(&" ".repeat(gutter));
+    }
+    buffer.push_str(&line_to_ansi(line));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ui(width: u16, height: u16) -> CrossTerm {
+        CrossTerm::base("test-model", "test-provider", width, height)
+    }
+
+    fn row_text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    fn record(status: ToolStatus) -> ToolRecord {
+        ToolRecord {
+            name: "bash".into(),
+            args: String::new(),
+            summary: "bash: cargo test".into(),
+            ok: !matches!(status, ToolStatus::Failure),
+            duration_ms: 1_200,
+            output: String::new(),
+            error: matches!(status, ToolStatus::Failure).then(|| "boom\ntrace".into()),
+            status,
+        }
+    }
+
+    #[test]
+    fn input_layout_wraps_and_places_the_cursor() {
+        // "abcdefgh" at width 4 wraps into two full rows; a cursor at the
+        // very end lands on a fresh third row (mirrors prompt_layout).
+        let layout = input_layout("abcdefgh", 8, 4, Theme::default());
+        let values: Vec<String> = layout.rows.iter().map(row_text).collect();
+        assert_eq!(values, vec!["› abcd", "  efgh", "  "]);
+        assert_eq!(layout.cursor_row, 2);
+        assert_eq!(layout.cursor_col, 0);
+
+        // Cursor mid-word stays on the first row at the right column.
+        let layout = input_layout("abcdef", 2, 4, Theme::default());
+        assert_eq!(layout.cursor_row, 0);
+        assert_eq!(layout.cursor_col, 2);
+    }
+
+    #[test]
+    fn input_layout_handles_multiline_drafts() {
+        // Two logical lines, cursor at the end of the second: continuation
+        // rows are indented to line up under the prefix.
+        let layout = input_layout("ab\ncd", 5, 10, Theme::default());
+        let values: Vec<String> = layout.rows.iter().map(row_text).collect();
+        assert_eq!(values, vec!["› ab", "  cd"]);
+        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(layout.cursor_col, 2);
+
+        // Empty input shows the placeholder with the cursor after `› `.
+        let layout = input_layout("", 0, 10, Theme::default());
+        assert_eq!(row_text(&layout.rows[0]), format!("› {PLACEHOLDER}"));
+        assert_eq!(layout.cursor_row, 0);
+        assert_eq!(layout.cursor_col, 0);
+    }
+
+    #[test]
+    fn input_layout_counts_wide_characters_by_display_width() {
+        // Two CJK characters fill a width-4 row; the cursor after the first
+        // sits at display column 2, not byte offset 3.
+        let layout = input_layout("你好", 3, 4, Theme::default());
+        assert_eq!(layout.cursor_row, 0);
+        assert_eq!(layout.cursor_col, 2);
+    }
+
+    #[test]
+    fn tool_lines_are_one_shell_style_line() {
+        // Running: just the command with the `$` marker.
+        let lines = tool_lines(&record(ToolStatus::Running), 60, Theme::default());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(row_text(&lines[0]), "$ cargo test");
+
+        // Success: duration suffix.
+        let lines = tool_lines(&record(ToolStatus::Success), 60, Theme::default());
+        assert_eq!(row_text(&lines[0]), "$ cargo test · 1.2s");
+
+        // Failure: cross and the first error line only.
+        let lines = tool_lines(&record(ToolStatus::Failure), 60, Theme::default());
+        assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
+
+        // Non-bash tools keep their `tool param` summary shape.
+        let mut read = record(ToolStatus::Success);
+        read.summary = "read src/main.rs".into();
+        let lines = tool_lines(&read, 60, Theme::default());
+        assert_eq!(row_text(&lines[0]), "read src/main.rs · 1.2s");
+    }
+
+    #[test]
+    fn metadata_line_splits_cwd_and_model_across_the_width() {
+        let line = metadata_line(
+            "~/proj",
+            Some("main"),
+            "github-copilot",
+            "gpt-5",
+            60,
+            Theme::default(),
+        );
+        let text = row_text(&line);
+        assert!(text.starts_with("~/proj  (main)"));
+        assert!(text.ends_with("github-copilot · gpt-5"));
+
+        // Narrow terminals fall back to the joined form.
+        let line = metadata_line("~/proj", None, "p", "m", 5, Theme::default());
+        assert_eq!(row_text(&line), "~/proj  p · m");
+    }
+
+    #[test]
+    fn separator_line_is_centered() {
+        let line = separator_line("new conversation", 30, Theme::default());
+        let text = row_text(&line);
+        assert_eq!(UnicodeWidthStr::width(text.as_str()), 30);
+        assert!(text.contains("── new conversation ──"));
+    }
+
+    #[test]
+    fn line_to_ansi_emits_style_codes_only_for_styled_spans() {
+        let styled = Line::from(Span::styled(
+            "hi",
+            Style::default()
+                .fg(Theme::default().accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let ansi = line_to_ansi(&styled);
+        assert!(ansi.contains("\u{1b}["));
+        assert!(ansi.ends_with("\u{1b}[0m"));
+
+        let plain = Line::from("plain");
+        assert_eq!(line_to_ansi(&plain), "plain");
+    }
+
+    #[test]
+    fn ansi_color_matches_ratatui_backend_mapping() {
+        assert_eq!(
+            ansi_color(ratatui::style::Color::DarkGray),
+            AnsiColor::DarkGrey
+        );
+        assert_eq!(ansi_color(ratatui::style::Color::Cyan), AnsiColor::DarkCyan);
+        assert_eq!(ansi_color(ratatui::style::Color::LightRed), AnsiColor::Red);
+    }
+
+    #[test]
+    fn editor_helpers_respect_char_boundaries() {
+        let mut input = String::new();
+        let mut cursor = 0usize;
+        insert_text(&mut input, &mut cursor, "aé你");
+        assert_eq!(cursor, 1 + 2 + 3);
+
+        delete_backward(&mut input, &mut cursor);
+        assert_eq!(input, "aé");
+        assert_eq!(cursor, 3);
+
+        move_left(&input, &mut cursor);
+        assert_eq!(cursor, 1);
+        move_right(&input, &mut cursor);
+        assert_eq!(cursor, 3);
+        delete_forward(&mut input, &mut cursor);
+        assert_eq!(input, "aé");
+
+        // CRLF paste payloads normalize to a single newline.
+        let mut input = String::new();
+        let mut cursor = 0usize;
+        insert_text(&mut input, &mut cursor, "a\r\nb");
+        assert_eq!(input, "a\nb");
+    }
+
+    #[test]
+    fn vertical_move_crosses_logical_lines_and_preserves_columns() {
+        let input = "abc\ndefghi\nx";
+        // Cursor 7 sits after "def" (column 3): moving up lands after "abc".
+        assert_eq!(vertical_move(input, 7, -1), Some(3));
+        assert_eq!(vertical_move(input, 1, 1), Some(5)); // after "a" → "d|efghi"
+        assert_eq!(vertical_move(input, 1, -1), None); // already on the first line
+        assert_eq!(vertical_move(input, input.len(), 1), None); // last line
+    }
+
+    #[test]
+    fn build_region_clips_the_streaming_tail_to_the_screen() {
+        let mut ui = ui(80, 10);
+        ui.stream = Some(StreamState {
+            reasoning: String::new(),
+            // One giant single block: no stable split, so the display clip is
+            // the only bound. The full text prints when the message
+            // finalizes.
+            markdown: (0..60).map(|i| format!("line {i}\n")).collect(),
+        });
+        let input = ui.input_layout();
+        let build = ui.build_region(&input);
+        assert!(build.rows.len() <= 10, "region must fit the screen");
+        // The newest rows are visible and the input line is at the bottom.
+        let last = row_text(build.rows.last().expect("input row"));
+        assert_eq!(last, format!("› {PLACEHOLDER}"));
+        let text: String = build
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("line 59"));
+        assert!(!text.contains("line 0"));
+    }
+
+    #[test]
+    fn build_region_clips_huge_input_around_the_cursor() {
+        let mut ui = ui(80, 10);
+        ui.input = (0..50)
+            .map(|i| format!("row{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.cursor = ui.input.len();
+        let input = ui.input_layout();
+        assert!(input.rows.len() > 10);
+        let build = ui.build_region(&input);
+        assert!(build.rows.len() <= 10);
+        // The cursor (at the end of the draft) stays inside the window.
+        assert!(build.cursor_row < build.rows.len());
+        let last = row_text(build.rows.last().expect("clipped input"));
+        assert_eq!(last, "  row49");
+    }
+
+    #[test]
+    fn commit_stream_prefix_moves_stable_blocks_into_pending() {
+        let mut ui = ui(80, 8);
+        // A first paragraph tall enough to outgrow the height-8 tail budget
+        // (~4 rows), followed by an unfinished second paragraph.
+        let tall = format!("{}\n\n", "word ".repeat(100));
+        ui.stream = Some(StreamState {
+            reasoning: String::new(),
+            markdown: tall.clone() + &"second ".repeat(30),
+        });
+        let input = ui.input_layout();
+        ui.commit_stream_prefix(input.rows.len());
+        // The stable first paragraph was committed and drained from the live
+        // stream.
+        assert_eq!(ui.pending.len(), 1);
+        assert_eq!(
+            ui.stream.as_ref().expect("tail remains").markdown,
+            "second ".repeat(30)
+        );
+        match &ui.pending[0] {
+            Entry::Assistant { markdown, .. } => assert_eq!(markdown, &tall),
+            other => panic!("expected assistant prefix entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn commit_stream_prefix_keeps_short_blocks_live() {
+        let mut ui = ui(80, 24);
+        ui.stream = Some(StreamState {
+            reasoning: String::new(),
+            markdown: "short\n\nanswer".into(),
+        });
+        let input = ui.input_layout();
+        ui.commit_stream_prefix(input.rows.len());
+        assert!(ui.pending.is_empty());
+        assert_eq!(
+            ui.stream.as_ref().expect("stream remains").markdown,
+            "short\n\nanswer"
+        );
+    }
+
+    #[test]
+    fn finalize_stream_commits_the_live_message() {
+        let mut live = ui(80, 24);
+        live.stream = Some(StreamState {
+            reasoning: "thinking".into(),
+            markdown: "answer".into(),
+        });
+        live.finalize_stream();
+        assert!(live.stream.is_none());
+        match &live.pending[0] {
+            Entry::Assistant {
+                markdown,
+                reasoning,
+            } => {
+                assert_eq!(markdown, "answer");
+                assert_eq!(reasoning, "thinking");
+            }
+            other => panic!("expected assistant entry, got {other:?}"),
+        }
+
+        // An empty stream finalizes to nothing.
+        let mut empty = ui(80, 24);
+        empty.stream = Some(StreamState::default());
+        empty.finalize_stream();
+        assert!(empty.pending.is_empty());
+    }
+
+    #[test]
+    fn session_events_reset_the_transcript_and_queue_a_separator() {
+        let mut ui = ui(80, 24);
+        ui.transcript.push(Entry::User { text: "old".into() });
+        ui.stream = Some(StreamState {
+            reasoning: String::new(),
+            markdown: "live".into(),
+        });
+        ui.apply_event(UiEvent::SessionChanged {
+            id: "abcd1234efgh".into(),
+            title: None,
+            loaded: true,
+        });
+        assert!(ui.transcript.is_empty());
+        assert!(ui.stream.is_none());
+        // The live message finalizes first, then the separator follows it.
+        assert!(matches!(&ui.pending[0], Entry::Assistant { .. }));
+        assert!(matches!(&ui.pending[1], Entry::Separator { label } if label.contains("abcd1234")));
+    }
+}

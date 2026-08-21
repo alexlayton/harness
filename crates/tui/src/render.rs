@@ -139,7 +139,7 @@ const TAGLINES: &[&str] = &[
 /// banner is built once per launch, so the process id xor-ed with the clock
 /// (scrambled by a multiplicative hash so the low bits aren't stuck) is
 /// plenty of entropy for choosing between a handful of lines.
-fn pick_tagline() -> &'static str {
+pub(crate) fn pick_tagline() -> &'static str {
     let pid = std::process::id() as u64;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -154,6 +154,17 @@ fn pick_tagline() -> &'static str {
 /// footer; afterwards it is immutable scrollback like any other committed
 /// content.
 pub(crate) fn welcome_lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
+    welcome_lines_with_tagline(width, theme, pick_tagline())
+}
+
+/// [`welcome_lines`] with a caller-picked tagline, so a stored banner entry
+/// re-renders identically (e.g. after a resize) instead of re-rolling the
+/// random tagline.
+pub(crate) fn welcome_lines_with_tagline(
+    width: usize,
+    theme: Theme,
+    tagline: &str,
+) -> Vec<Line<'static>> {
     // Block-letter wordmark (figlet "DemonicLand"), rendered in the accent
     // colour used elsewhere for UI highlights (activity marker, message
     // prefixes, links) so it reads as part of the UI rather than an imported
@@ -184,7 +195,7 @@ pub(crate) fn welcome_lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
     // A random tagline and the version footer hug the wordmark like a banner
     // motto, then the banner ends so the transcript continues below.
     push_blank(&mut lines, BLOCK_GAP);
-    lines.push(line_with_style(pick_tagline(), muted_style(theme)));
+    lines.push(line_with_style(tagline, muted_style(theme)));
     lines.push(Line::from(vec![
         Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), dim_style(theme)),
         // Two spaces, no separator glyph — matching the metadata row's
@@ -560,7 +571,7 @@ fn owned_markdown(markdown: &str, theme: Theme) -> Text<'static> {
     Text::from(lines)
 }
 
-fn prefix_message_lines(
+pub(crate) fn prefix_message_lines(
     lines: Vec<Line<'static>>,
     prefix: &str,
     theme: Theme,
@@ -595,12 +606,12 @@ fn message_content_width(width: usize) -> usize {
         .max(1)
 }
 
-fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let text = plain_text(reasoning, muted_style(theme).add_modifier(Modifier::ITALIC));
     wrap_text(&text, width, Style::default())
 }
 
-fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let text = owned_markdown(markdown, theme);
     prefix_message_lines(
         wrap_text(&text, message_content_width(width), assistant_style(theme)),
@@ -609,7 +620,7 @@ fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Line<'stati
     )
 }
 
-fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
     prefix_message_lines(
         wrap_text(
             &plain_text(input, primary_style(theme)),
@@ -621,7 +632,7 @@ fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
     )
 }
 
-fn notice_lines(notice: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn notice_lines(notice: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let text = plain_text(notice, dim_style(theme));
     wrap_text(&text, width.saturating_sub(2).max(1), Style::default())
         .into_iter()
@@ -635,7 +646,7 @@ fn notice_lines(notice: &str, theme: Theme, width: usize) -> Vec<Line<'static>> 
         .collect()
 }
 
-fn error_lines(error: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn error_lines(error: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
     let text = plain_text(error, error_style(theme));
     wrap_text(&text, width.saturating_sub(2).max(1), Style::default())
         .into_iter()
@@ -662,7 +673,7 @@ fn title_tail(name: &str, summary: &str) -> String {
     }
 }
 
-fn duration_text(duration_ms: u64) -> String {
+pub(crate) fn duration_text(duration_ms: u64) -> String {
     if duration_ms >= 1_000 {
         format!("{:.1}s", duration_ms as f64 / 1_000.0)
     } else {
