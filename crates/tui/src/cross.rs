@@ -210,6 +210,14 @@ pub struct CrossTerm {
     /// Most recent turn usage for the placeholder counter trailer.
     usage: Option<Usage>,
 
+    /// Global tool expansion state: Ctrl+O toggles every tool call's output
+    /// expanded or collapsed and repaints the whole visible session. Rows
+    /// already scrolled into the terminal's native scrollback are immutable
+    /// pixels; after the repaint older rows show as the existing
+    /// `… N rows above` ellipsis. Expanded outputs of entries visible in the
+    /// window are correctly re-rendered.
+    tools_expanded: bool,
+
     // Completion (fish-style inline, feature 5).
     providers: Vec<String>,
     model_lists: HashMap<String, Vec<crate::ModelEntry>>,
@@ -263,6 +271,7 @@ impl CrossTerm {
             history_pos: None,
             draft: String::new(),
             usage: None,
+            tools_expanded: false,
             providers,
             model_lists: HashMap::new(),
             session_candidates: Vec::new(),
@@ -420,6 +429,14 @@ impl CrossTerm {
             KeyCode::Char('d') if control => {
                 cancel.cancel();
                 return Ok(true);
+            }
+            // Ctrl+O toggles all tool outputs expanded/collapsed and repaints
+            // the whole visible session from source entries. The Char arm's
+            // CONTROL guard prevents this from falling through to insert.
+            KeyCode::Char('o') if control => {
+                self.tools_expanded = !self.tools_expanded;
+                self.repaint_all()?;
+                return Ok(false);
             }
             // Esc interrupts a running turn (the same intent as Ctrl+C); when
             // a completion list is open, Esc closes the list instead.
@@ -1099,7 +1116,7 @@ impl CrossTerm {
                 summary,
                 ok,
                 duration_ms,
-                output: _,
+                output,
                 error,
             } => {
                 self.busy = true;
@@ -1110,7 +1127,7 @@ impl CrossTerm {
                     summary: summary.clone(),
                     ok,
                     duration_ms,
-                    output: String::new(),
+                    output: output.clone(),
                     error: error.clone(),
                     status: if ok {
                         ToolStatus::Success
@@ -1122,6 +1139,7 @@ impl CrossTerm {
                 record.summary = summary;
                 record.ok = ok;
                 record.duration_ms = duration_ms;
+                record.output = output;
                 record.error = error;
                 record.status = if ok {
                     ToolStatus::Success
@@ -1216,7 +1234,7 @@ impl CrossTerm {
                             arguments: _,
                             ok,
                             duration_ms,
-                            output: _,
+                            output,
                             error,
                         } => Entry::Tool {
                             record: ToolRecord {
@@ -1225,7 +1243,7 @@ impl CrossTerm {
                                 summary,
                                 ok,
                                 duration_ms,
-                                output: String::new(),
+                                output,
                                 error,
                                 status: if ok {
                                     ToolStatus::Success
@@ -1365,7 +1383,7 @@ impl CrossTerm {
             if !rows.is_empty() {
                 render::push_blank(&mut rows, render::SECTION_GAP);
             }
-            rows.extend(tool_lines(record, content, theme));
+            rows.extend(tool_lines(record, self.tools_expanded, content, theme));
         }
 
         if self.busy {
@@ -1458,7 +1476,7 @@ impl CrossTerm {
             markdown: stream.markdown[..offset].to_owned(),
             reasoning: stream.reasoning.clone(),
         };
-        let prefix_height = entry_lines(&prefix, width, theme).len();
+        let prefix_height = entry_lines(&prefix, width, theme, self.tools_expanded).len();
         if prefix_height <= budget {
             return;
         }
@@ -1514,7 +1532,7 @@ impl CrossTerm {
                 if index > 0 {
                     render::push_blank(&mut above, render::SECTION_GAP);
                 }
-                above.extend(entry_lines(entry, content, theme));
+                above.extend(entry_lines(entry, content, theme, self.tools_expanded));
             }
             // Keep as much history as fits above the region, plus one
             // ellipsis row when older rows fall outside the window.
@@ -1538,7 +1556,7 @@ impl CrossTerm {
                 if index > 0 {
                     render::push_blank(&mut above, render::SECTION_GAP);
                 }
-                above.extend(entry_lines(entry, content, theme));
+                above.extend(entry_lines(entry, content, theme, self.tools_expanded));
             }
         }
 
@@ -1677,7 +1695,16 @@ fn install_panic_hook() {
 /// Build the wrapped rows for one final or in-flight entry. Shared by the
 /// pending path (print above the region) and the resize repaint (window of
 /// history), which is why entries are stored at the source level.
-fn entry_lines(entry: &Entry, width: usize, theme: Theme) -> Vec<Line<'static>> {
+/// Build the wrapped rows for one final or in-flight entry. `tools_expanded`
+/// is the global Ctrl+O state; committed entries render collapsed unless the
+/// toggle is on, and the progress snapshot used the same global for its
+/// in-flight tool line so both agree after a repaint.
+fn entry_lines(
+    entry: &Entry,
+    width: usize,
+    theme: Theme,
+    tools_expanded: bool,
+) -> Vec<Line<'static>> {
     let width = width.max(1);
     match entry {
         Entry::Banner { tagline } => render::welcome_lines_with_tagline(width, theme, tagline),
@@ -1704,7 +1731,7 @@ fn entry_lines(entry: &Entry, width: usize, theme: Theme) -> Vec<Line<'static>> 
             }
             lines
         }
-        Entry::Tool { record } => tool_lines(record, width, theme),
+        Entry::Tool { record } => tool_lines(record, tools_expanded, width, theme),
         Entry::Notice { text } => render::notice_lines(text, theme, width),
         Entry::Error { text } => render::error_lines(text, theme, width),
         Entry::Separator { label } => vec![separator_line(label, width, theme)],
@@ -1713,8 +1740,15 @@ fn entry_lines(entry: &Entry, width: usize, theme: Theme) -> Vec<Line<'static>> 
 
 /// The simplified tool call: one line with the tool type and its primary
 /// parameter — `$ git status`, `read file.txt` — plus a duration on success
-/// or a `✗` error preview on failure. No boxes, no expandable output.
-fn tool_lines(record: &ToolRecord, width: usize, theme: Theme) -> Vec<Line<'static>> {
+/// or a `✗` error preview on failure. Collapsed this is the compact line;
+/// expanded it adds the bounded output tail, the first error line, and a
+/// `running…` marker, each indented two spaces.
+fn tool_lines(
+    record: &ToolRecord,
+    expanded: bool,
+    width: usize,
+    theme: Theme,
+) -> Vec<Line<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Agent summaries read `bash: <command>` / `read <path>` / …; bash reads
     // as a shell line, everything else keeps its `tool param` shape.
@@ -1760,7 +1794,7 @@ fn tool_lines(record: &ToolRecord, width: usize, theme: Theme) -> Vec<Line<'stat
             ));
         }
     }
-    render::prefix_message_lines(
+    let summary_lines = render::prefix_message_lines(
         render::wrap_text(
             &Text::from(Line::from(spans)),
             width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
@@ -1770,7 +1804,48 @@ fn tool_lines(record: &ToolRecord, width: usize, theme: Theme) -> Vec<Line<'stat
         // summary, so the wrap prefix is empty for them.
         "",
         theme,
-    )
+    );
+    if !expanded {
+        return summary_lines;
+    }
+
+    // Expanded: the compact line, then the bounded output tail, the first
+    // error line, and a trailing `running…` marker, each indented two spaces
+    // and dimmed so they read as details under the summary.
+    let dim_style = Style::default()
+        .fg(theme.dim_text)
+        .add_modifier(Modifier::DIM);
+    let mut lines = summary_lines;
+    if !record.output.is_empty() {
+        for tail in render::output_tail(&record.output) {
+            push_detail_line(&mut lines, &tail, dim_style, width);
+        }
+    }
+    if let Some(error) = record.error.as_deref()
+        && let Some(first) = error.lines().next()
+    {
+        push_detail_line(&mut lines, first, Style::default().fg(theme.error), width);
+    }
+    if matches!(record.status, ToolStatus::Running) {
+        push_detail_line(&mut lines, "running…", dim_style, width);
+    }
+    lines
+}
+
+/// One indented detail row under an expanded tool line, wrapped to the
+/// content width with the given style applied to every span.
+fn push_detail_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width: usize) {
+    for wrapped in render::wrap_text(
+        &Text::from(Line::from(Span::styled(text.to_owned(), style))),
+        width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
+        Style::default(),
+    ) {
+        lines.push(Line::from(
+            std::iter::once(Span::raw("  "))
+                .chain(wrapped.spans)
+                .collect::<Vec<_>>(),
+        ));
+    }
 }
 
 /// The header metadata: two dim, left-aligned rows — `provider · model` on
@@ -2376,23 +2451,49 @@ mod tests {
     #[test]
     fn tool_lines_are_one_shell_style_line() {
         // Running: just the command with the `$` marker.
-        let lines = tool_lines(&record(ToolStatus::Running), 60, Theme::default());
+        let lines = tool_lines(&record(ToolStatus::Running), false, 60, Theme::default());
         assert_eq!(lines.len(), 1);
         assert_eq!(row_text(&lines[0]), "$ cargo test");
 
         // Success: duration suffix.
-        let lines = tool_lines(&record(ToolStatus::Success), 60, Theme::default());
+        let lines = tool_lines(&record(ToolStatus::Success), false, 60, Theme::default());
         assert_eq!(row_text(&lines[0]), "$ cargo test · 1.2s");
 
         // Failure: cross and the first error line only.
-        let lines = tool_lines(&record(ToolStatus::Failure), 60, Theme::default());
+        let lines = tool_lines(&record(ToolStatus::Failure), false, 60, Theme::default());
         assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
 
         // Non-bash tools keep their `tool param` summary shape.
         let mut read = record(ToolStatus::Success);
         read.summary = "read src/main.rs".into();
-        let lines = tool_lines(&read, 60, Theme::default());
+        let lines = tool_lines(&read, false, 60, Theme::default());
         assert_eq!(row_text(&lines[0]), "read src/main.rs · 1.2s");
+    }
+
+    #[test]
+    fn tool_lines_expanded_show_output_tail_and_error() {
+        // A finished tool with output and an error: expanded shows the
+        // bounded tail plus the first error line, indented.
+        let mut failed = record(ToolStatus::Failure);
+        failed.output = (0..10)
+            .map(|i| format!("out line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = tool_lines(&failed, true, 60, Theme::default());
+        // 1 summary + 4 tail lines (… N above + last 4) + 1 error line.
+        assert_eq!(lines.len(), 1 + 5 + 1);
+        assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
+        assert_eq!(row_text(&lines[1]), "  … 6 lines above");
+        assert_eq!(row_text(&lines[5]), "  out line 9");
+        assert_eq!(row_text(&lines[6]), "  boom");
+
+        // Collapsed stays compact regardless of retained output.
+        let collapsed = tool_lines(&failed, false, 60, Theme::default());
+        assert_eq!(collapsed.len(), 1);
+
+        // A running tool gains a trailing `running…` marker when expanded.
+        let lines = tool_lines(&record(ToolStatus::Running), true, 60, Theme::default());
+        assert_eq!(row_text(lines.last().unwrap()), "  running…");
     }
 
     #[test]

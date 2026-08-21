@@ -771,7 +771,11 @@ fn tool_bottom_line(width: usize, border: Style) -> Line<'static> {
     ))
 }
 
-fn output_tail(output: &str) -> Vec<String> {
+/// Bound a tool's raw output to the collapsed tail rows: the newest
+/// `DEFAULT_TAIL_LINES` lines, preceded by one `… N lines above` row when
+/// more were produced. Shared by the ratatui tool box and the cross-UI
+/// expanded rendering.
+pub(crate) fn output_tail(output: &str) -> Vec<String> {
     let lines = output.lines().map(str::to_owned).collect::<Vec<_>>();
     if lines.len() <= DEFAULT_TAIL_LINES {
         return lines;
