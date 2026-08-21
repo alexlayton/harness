@@ -313,6 +313,18 @@ pub struct Cli {
     #[arg(long = "no-context-files", default_value_t = false)]
     pub no_context_files: bool,
 
+    /// Defer session fsyncs to turn boundaries instead of syncing every
+    /// persisted event. Faster chatty tool loops at the cost of losing the
+    /// current turn's tail (not just the in-flight record) on power loss.
+    #[arg(long = "defer-session-sync", default_value_t = false)]
+    pub defer_session_sync: bool,
+
+    /// Run without persisting a session at all (headless only). For one-shot
+    /// scripting where the transcript has no value; nothing is written to
+    /// `~/.harness/sessions`.
+    #[arg(long = "no-session", default_value_t = false)]
+    pub no_session: bool,
+
     /// Prompt for non-interactive mode. Joined with spaces. When `--print` is
     /// set and no positional is given, the prompt is read from stdin.
     /// Only meaningful with `--print`; passing it without `--print` is an
@@ -329,13 +341,31 @@ pub struct Config {
     pub config_path: PathBuf,
     pub rtk: bool,
     pub compaction: CompactionPolicy,
+    /// The Copilot credential handle loaded once during resolution. Startup
+    /// used to construct `CopilotAuth::from_default()` twice — once for the
+    /// entitled-model default inside `resolve`, again in `main` — reading and
+    /// decrypting auth.json both times. `None` for non-Copilot providers.
+    pub copilot_auth: Option<Arc<CopilotAuth>>,
 }
 
 impl Config {
     pub fn resolve(cli: &Cli) -> Result<Self> {
         let path = config_path();
         let file = load_file_config(&path)?;
+        // One credential read serves both the entitled-model default below
+        // and the provider/agent construction in `main`. Loaded only when the
+        // *effective* provider (CLI override wins) is Copilot, matching the
+        // historical behavior: a broken auth.json must not fail startup for
+        // an unrelated `--provider` override.
+        let effective_provider = cli
+            .provider
+            .or_else(|| file.provider.as_deref().and_then(ProviderArg::from_name))
+            .unwrap_or(ProviderArg::OpencodeGo);
+        let copilot_auth = (effective_provider == ProviderArg::GithubCopilot)
+            .then(|| CopilotAuth::from_default().map(Arc::new))
+            .transpose()?;
         let mut config = Self::resolve_from_file(cli, &file, path, env_api_key)?;
+        config.copilot_auth = copilot_auth;
         // The static Copilot fallback model may not be entitled to this
         // account.  When no model was chosen explicitly, prefer the first
         // catalog model the signed-in account can actually use; the choice
@@ -343,7 +373,7 @@ impl Config {
         if config.provider == ProviderArg::GithubCopilot
             && cli.model.is_none()
             && file.model.is_none()
-            && let Some(model) = entitled_copilot_default()
+            && let Some(model) = entitled_copilot_default(config.copilot_auth.as_ref())
         {
             config.model = model;
         }
@@ -421,6 +451,9 @@ impl Config {
                 .as_ref()
                 .map(CompactionPolicy::from)
                 .unwrap_or_default(),
+            // Only the process-wide [`Config::resolve`] loads credentials;
+            // the testable forms never touch auth.json.
+            copilot_auth: None,
         })
     }
 }
@@ -437,8 +470,8 @@ fn env_api_key(provider: ProviderArg) -> Option<String> {
 /// a model the plan can actually serve; otherwise the first entry of the
 /// account's available list that this build knows how to route.  Reading
 /// the credential is local-only; `None` keeps the static default.
-fn entitled_copilot_default() -> Option<String> {
-    let credential = CopilotAuth::from_default().ok()?.credential().ok()??;
+fn entitled_copilot_default(auth: Option<&Arc<CopilotAuth>>) -> Option<String> {
+    let credential = auth?.credential().ok()??;
     let sku = sku_from_proxy_token(&credential.access);
     default_model_for(sku, &credential.available_model_ids)
 }

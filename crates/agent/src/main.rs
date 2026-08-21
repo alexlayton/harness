@@ -4,7 +4,6 @@ use agent::headless::run_headless;
 use agent::project_context_for;
 use agent::tools::{ToolConfig, default_registry};
 use anyhow::{Context, Result, bail};
-use auth::CopilotAuth;
 use clap::Parser;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
@@ -36,35 +35,73 @@ async fn main_inner() -> Result<ExitCode> {
     if !cli.print && cli.resume.is_some() {
         bail!("--resume requires --print");
     }
+    if !cli.print && cli.no_session {
+        bail!("--no-session requires --print");
+    }
+    if cli.no_session && cli.resume.is_some() {
+        bail!("--resume conflicts with --no-session");
+    }
+    // Whether any part of this run touches the session store: interactive
+    // mode always persists; headless mode skips it under `--no-session`.
+    let needs_session_store = !cli.print || !cli.no_session;
 
     init_logging()?;
+    // Startup tracing: one log line per stage so "fast" stays measurable and
+    // regressions show up in any HARNESS_LOG file. All stages share one
+    // monotonic clock; each line reports time since process start.
+    let started = std::time::Instant::now();
+    let since_start = || started.elapsed().as_millis() as u64;
     let config: Config = Config::resolve(&cli)?;
+    tracing::info!(stage = "config", elapsed_ms = since_start());
 
-    // Keep one auth handle shared by the provider and agent.  Other providers
-    // do not touch auth.json, while Copilot remains constructible without a
-    // credential so the first `/auth` can run.
-    let copilot_auth = if config.provider == ProviderArg::GithubCopilot {
-        Some(Arc::new(CopilotAuth::from_default()?))
-    } else {
-        None
-    };
+    // Reuse the auth handle loaded during config resolution instead of
+    // re-reading auth.json.  Other providers do not touch auth.json, while
+    // Copilot remains constructible without a credential so the first `/auth`
+    // can run.
+    let copilot_auth = config.copilot_auth.clone();
     let provider: Arc<dyn Provider> =
         build_provider_with_auth(&config.provider.to_string(), copilot_auth.clone())?;
     let provider_name = provider.name().to_owned();
     let workspace_root =
         std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
-    let tools = default_registry(ToolConfig::new(&workspace_root, config.rtk))?;
-    // UI-facing views of the auto-loaded context: which AGENTS.md / CLAUDE.md
-    // files were injected and which skills were discovered. Built once here
-    // because the registry owns the catalog; the TUI only renders the names.
-    let context_file_paths = if cli.no_context_files {
-        Vec::new()
-    } else {
-        tools::load_context_files(&workspace_root)
-            .iter()
-            .map(|file| tools::display_path(&file.path))
-            .collect::<Vec<_>>()
-    };
+    tracing::info!(stage = "workspace", elapsed_ms = since_start());
+    // Independent startup work runs concurrently: skills discovery, context
+    // files, and the session store are all filesystem walks/hashing that
+    // don't depend on each other or the tool registry.  On a cold cache these
+    // each cost real I/O, so serializing them delayed the first frame.  The
+    // FFF index is no longer built here at all — it is created lazily on
+    // first `find`/`grep` call.
+    let (tools_result, session_store_result, project_context, context_files) = tokio::join!(
+        async { default_registry(ToolConfig::new(&workspace_root, config.rtk)) },
+        // Under `--no-session` the store is never constructed: even its
+        // first-write salt bootstrap would touch `~/.harness/sessions`.
+        async {
+            match needs_session_store {
+                true => Some(SessionStore::default_for_workspace(&workspace_root)),
+                false => None,
+            }
+        },
+        async {
+            let context = project_context_for(&workspace_root, cli.no_context_files);
+            tracing::debug!(bytes = context.len(), "project context rendered");
+            context
+        },
+        // UI-facing list of which AGENTS.md / CLAUDE.md files were injected;
+        // the TUI only renders the names.
+        async {
+            if cli.no_context_files {
+                Vec::new()
+            } else {
+                tools::load_context_files(&workspace_root)
+                    .iter()
+                    .map(|file| tools::display_path(&file.path))
+                    .collect::<Vec<_>>()
+            }
+        },
+    );
+    let tools = tools_result?;
+    // Which skills were discovered; built from the registry-owned catalog
+    // once, here, so the TUI only renders the names.
     let skill_entries = tools
         .skills()
         .map(|catalog| {
@@ -78,12 +115,18 @@ async fn main_inner() -> Result<ExitCode> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let session_store = SessionStore::default_for_workspace(&workspace_root)?;
+    let session_store = session_store_result
+        .transpose()?
+        .map(|store| store.with_deferred_sync(cli.defer_session_sync));
+    tracing::info!(stage = "registry+store+context", elapsed_ms = since_start());
 
     if cli.print {
         return run_headless(&config, &cli, provider, tools, session_store).await;
     }
 
+    // Interactive mode always has a store (enforced by needs_session_store
+    // being true when !cli.print); headless may run without one.
+    let session_store = session_store.expect("interactive mode always builds the session store");
     let session = session_store.create(SessionCreateOptions {
         provider: Some(provider_name.clone()),
         model: Some(config.model.clone()),
@@ -105,7 +148,7 @@ async fn main_inner() -> Result<ExitCode> {
     spawn_model_list(provider_name.clone(), provider.clone(), event_tx.clone());
 
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
-        .with_project_context(project_context_for(&workspace_root, cli.no_context_files));
+        .with_project_context(project_context);
     let agent = if let Some(auth) = copilot_auth {
         agent.with_copilot_auth(auth)
     } else {
@@ -117,13 +160,15 @@ async fn main_inner() -> Result<ExitCode> {
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     // The crossterm frontend drives the same agent as headless mode and
-    // differs only in rendering and input handling.
+    // differs only in rendering and input handling. The first paint happens
+    // inside `CrossTerm::run`, so this is the end of the startup path.
+    tracing::info!(stage = "pre-first-frame", elapsed_ms = since_start());
     let ui = CrossTerm::new(
         &config.model,
         &provider_name,
         providers,
         skill_entries,
-        context_file_paths
+        context_files
             .into_iter()
             .map(|path| ContextFileEntry { path })
             .collect(),
