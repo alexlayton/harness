@@ -204,6 +204,9 @@ struct RegionBuild {
     rows: Vec<Line<'static>>,
     cursor_row: usize,
     cursor_col: usize,
+    /// Index of the activity row inside `rows` when this frame paints one;
+    /// `None` otherwise. Lets spinner ticks rewrite only that row.
+    activity_row: Option<usize>,
 }
 
 /// The direct-crossterm UI. See the module docs for the screen model; the
@@ -281,6 +284,11 @@ pub struct CrossTerm {
     cursor_row: usize,
     cursor_col: usize,
 
+    /// Index of the activity row inside [`Self::region`] when the current
+    /// frame paints one; `None` otherwise. Lets spinner ticks rewrite only
+    /// that row instead of the whole region.
+    activity_region_row: Option<usize>,
+
     restored: bool,
 }
 
@@ -337,6 +345,7 @@ impl CrossTerm {
             region: Vec::new(),
             cursor_row: 0,
             cursor_col: 0,
+            activity_region_row: None,
             restored: false,
         }
     }
@@ -420,6 +429,16 @@ impl CrossTerm {
                 maybe_event = events.recv() => {
                     let Some(event) = maybe_event else { return Ok(()) };
                     self.apply_event(event.into_ui_event());
+                    // Coalesced painting: an agent burst (streaming deltas,
+                    // tool start/finish pairs, notices) arrives as many
+                    // channel events within a few milliseconds. Drain
+                    // everything already queued and paint once per wake so
+                    // the per-delta repaint tax stays off the streaming
+                    // path. `try_recv` never blocks, so this only ever
+                    // consumes what has already been sent — no added latency.
+                    while let Ok(event) = events.try_recv() {
+                        self.apply_event(event.into_ui_event());
+                    }
                     self.paint()?;
                 }
                 maybe_input = input_events.next() => {
@@ -444,8 +463,16 @@ impl CrossTerm {
                     }
                 }
                 _ = spinner_tick.tick() => {
-                    if self.busy {
-                        self.spinner = self.spinner.wrapping_add(1);
+                    // A busy tick only animates the activity glyph. Rewrite
+                    // just that row in place instead of paying a full
+                    // live-region serialization five times per second; fall
+                    // back to the normal frame when the row cannot be
+                    // located.
+                    if !self.busy {
+                        continue;
+                    }
+                    self.spinner = self.spinner.wrapping_add(1);
+                    if !self.repaint_activity_only()? {
                         self.paint()?;
                     }
                 }
@@ -454,6 +481,40 @@ impl CrossTerm {
                 }
             }
         }
+    }
+
+    /// Rewrite only the activity row in place, leaving the rest of the live
+    /// region untouched. Used by spinner ticks: the glyph animation alone
+    /// must not re-serialize the streaming tail and input rows five times a
+    /// second. Returns `false` when the activity row's position is unknown
+    /// (caller falls back to a full [`Self::paint`]).
+    fn repaint_activity_only(&mut self) -> Result<bool> {
+        let Some(row) = self.activity_region_row else {
+            return Ok(false);
+        };
+        let theme = self.theme;
+        let gutter = render::horizontal_pad(self.width) as usize;
+        let line = activity_line(self.activity, self.spinner, theme);
+        let mut buffer = String::new();
+        let up = self.cursor_row.saturating_sub(row);
+        if up > 0 {
+            let _ = write!(buffer, "{}", MoveUp(up as u16));
+        }
+        let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
+        write_row(&mut buffer, &line, gutter);
+        if up > 0 {
+            let _ = write!(buffer, "\r{}", MoveDown(up as u16));
+        }
+        buffer.push('\r');
+        let col = self.cursor_col.min(u16::MAX as usize) as u16;
+        if col > 0 {
+            let _ = write!(buffer, "{}", MoveRight(col));
+        }
+        self.out
+            .write_all(buffer.as_bytes())
+            .context("write activity")?;
+        self.out.flush().context("flush activity")?;
+        Ok(true)
     }
 
     fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
@@ -1552,6 +1613,7 @@ impl CrossTerm {
         let mut rows: Vec<Line<'static>> = Vec::new();
 
         // The streaming tail shows only its newest rows; rows that scrolled
+        let mut activity_row_index: Option<usize> = None;
         // out of the budget are printed in full when the message finalizes.
         let tail = self.stream_tail_lines(content);
         let budget = self.tail_budget(input_rows.len());
@@ -1569,7 +1631,9 @@ impl CrossTerm {
             if !rows.is_empty() {
                 render::push_blank(&mut rows, render::SECTION_GAP);
             }
+            let activity_row = rows.len();
             rows.push(activity_line(self.activity, self.spinner, theme));
+            activity_row_index = Some(activity_row);
         }
 
         if !rows.is_empty() {
@@ -1592,6 +1656,7 @@ impl CrossTerm {
             rows,
             cursor_row,
             cursor_col: gutter + INPUT_PREFIX_WIDTH + input.cursor_col,
+            activity_row: activity_row_index,
         }
     }
 
@@ -1803,6 +1868,10 @@ impl CrossTerm {
         self.region = build.rows;
         self.cursor_row = build.cursor_row;
         self.cursor_col = build.cursor_col;
+        // The frame just painted decides whether an activity row exists for
+        // spinner ticks to target; a frame without one invalidates the
+        // previous row's position.
+        self.activity_region_row = build.activity_row;
         Ok(())
     }
 
