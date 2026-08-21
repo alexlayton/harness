@@ -100,14 +100,36 @@ pub fn build_request_body(req: &CompletionRequest) -> Value {
     body.insert("max_tokens".into(), json!(req.max_tokens.unwrap_or(32_768)));
     let system = system_text(req);
     if !system.is_empty() {
-        body.insert("system".into(), Value::String(system));
+        // Prompt caching: the system prompt is byte-stable across turns
+        // (rebuilt from the same registry snapshot every time), so an
+        // ephemeral breakpoint here lets the provider reuse tools + system
+        // processing instead of re-reading them per request. This cuts both
+        // time-to-first-token and billed input tokens on long sessions.
+        // Sent as a one-block array because `cache_control` lives on content
+        // blocks, not on the string form.
+        body.insert(
+            "system".into(),
+            json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": {"type": "ephemeral"},
+            }]),
+        );
     }
     body.insert(
         "messages".into(),
         Value::Array(convert_messages(&req.messages)),
     );
     if !req.tools.is_empty() {
-        body.insert("tools".into(), Value::Array(convert_tools(&req.tools)));
+        // Breakpoint on the last tool covers every tool definition (they sit
+        // before the system block in the effective prompt prefix).
+        let mut tools = convert_tools(&req.tools);
+        if let Some(last) = tools.last_mut()
+            && let Some(object) = last.as_object_mut()
+        {
+            object.insert("cache_control".into(), json!({"type": "ephemeral"}));
+        }
+        body.insert("tools".into(), Value::Array(tools));
     }
     if let Some(temperature) = req.temperature {
         body.insert("temperature".into(), json!(temperature));
@@ -230,6 +252,7 @@ pub struct AnthropicParser {
     blocks: BTreeMap<u64, BlockKind>,
     tools: BTreeMap<u64, PartialToolUse>,
     input_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
     output_tokens: Option<u64>,
     stop_reason: Option<String>,
     done: bool,
@@ -341,11 +364,18 @@ impl AnthropicParser {
                 self.finish_tool(index)
             }
             "message_start" => {
-                self.input_tokens = value
+                if let Some(usage) = value
                     .get("message")
                     .and_then(|message| message.get("usage"))
-                    .and_then(|usage| usage.get("input_tokens"))
-                    .and_then(as_u64);
+                {
+                    self.input_tokens = usage.get("input_tokens").and_then(as_u64);
+                    // Cached tokens are reported separately from input;
+                    // surface them so session cost/usage reflects cache hits.
+                    self.cached_tokens = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(as_u64)
+                        .or(self.cached_tokens);
+                }
                 Ok(Vec::new())
             }
             "message_delta" => {
@@ -373,7 +403,7 @@ impl AnthropicParser {
                     usage: Some(Usage {
                         input_tokens: self.input_tokens.unwrap_or(0),
                         output_tokens: self.output_tokens.unwrap_or(0),
-                        cached_tokens: None,
+                        cached_tokens: self.cached_tokens,
                         reasoning_tokens: None,
                         cost: None,
                     }),
@@ -434,7 +464,7 @@ impl AnthropicParser {
             usage: Some(Usage {
                 input_tokens: self.input_tokens.unwrap_or(0),
                 output_tokens: self.output_tokens.unwrap_or(0),
-                cached_tokens: None,
+                cached_tokens: self.cached_tokens,
                 reasoning_tokens: None,
                 cost: None,
             }),
@@ -479,6 +509,64 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_and_last_tool_carry_ephemeral_cache_breakpoints() {
+        let request = CompletionRequest {
+            model: "claude-test".into(),
+            system: Some("stable system prompt".into()),
+            messages: vec![Message::user("hi")],
+            tools: vec![ToolDefinition {
+                name: "read".into(),
+                description: "d".into(),
+                parameters: json!({"type": "object"}),
+            }],
+            max_tokens: None,
+            temperature: None,
+            reasoning: true,
+        };
+        let body = build_request_body(&request);
+        let system = body.get("system").unwrap().as_array().unwrap();
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "stable system prompt");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+
+        let tools = body.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+
+        // No tools: only the system breakpoint exists.
+        let bare = CompletionRequest {
+            tools: Vec::new(),
+            ..request
+        };
+        let body = build_request_body(&bare);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("system").is_some());
+    }
+
+    #[test]
+    fn cached_tokens_are_surfaced_from_message_start() {
+        let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":100,
+                "cache_read_input_tokens":80}}}"#,
+            )
+            .unwrap();
+        let done = parser.parse_payload(r#"{"type":"message_stop"}"#).unwrap();
+        assert!(matches!(
+            &done[0],
+            StreamEvent::Done {
+                usage: Some(Usage {
+                    input_tokens: 100,
+                    cached_tokens: Some(80),
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn bearer_only_omits_x_api_key() {
