@@ -171,6 +171,18 @@ impl crate::Tui {
         self.add_notice(format!("⌘ {input}"));
         self.push_history_and_clear_input(input);
         match command {
+            ParsedCommand::Help => {
+                self.add_notice(
+                    commands::COMMANDS
+                        .iter()
+                        .map(|spec| {
+                            format!("{:<10} {}  ({})", spec.name, spec.description, spec.usage)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                return self.commit_ready_entries();
+            }
             ParsedCommand::New => input_tx
                 .send(InputMessage::NewConversation)
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?,

@@ -31,6 +31,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::None,
     },
     CommandSpec {
+        name: "/help",
+        description: "List available slash commands",
+        usage: "/help",
+        argument_kind: ArgumentKind::None,
+    },
+    CommandSpec {
         name: "/new",
         description: "Start a new persisted conversation",
         usage: "/new",
@@ -107,6 +113,7 @@ pub struct CompletionResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedCommand {
     Auth,
+    Help,
     New,
     Load {
         selector: String,
@@ -141,6 +148,13 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /auth".into())
             } else {
                 Ok(ParsedCommand::Auth)
+            }
+        }
+        "/help" => {
+            if words.next().is_some() {
+                Err("usage: /help".into())
+            } else {
+                Ok(ParsedCommand::Help)
             }
         }
         "/new" => {
@@ -829,6 +843,25 @@ mod tests {
         let values = candidates("/model openrouter:gpt", &providers(), &lists, "opencode-go");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].value, "openrouter:openai/gpt-5.6-luna");
+    }
+
+    #[test]
+    fn help_parses_and_appears_in_command_candidates() {
+        assert_eq!(parse_command("/help"), Ok(ParsedCommand::Help));
+        assert_eq!(parse_command("/help now"), Err("usage: /help".into()));
+        assert_eq!(parse_command("/HELP"), Ok(ParsedCommand::Help));
+
+        let lists = HashMap::new();
+        assert!(
+            candidates("/", &providers(), &lists, "opencode-go")
+                .iter()
+                .any(|candidate| candidate.value == "/help")
+        );
+        assert!(
+            candidates("/he", &providers(), &lists, "opencode-go")
+                .iter()
+                .any(|candidate| candidate.value == "/help")
+        );
     }
 
     #[test]

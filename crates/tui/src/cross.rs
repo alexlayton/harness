@@ -494,6 +494,18 @@ impl CrossTerm {
         // command text.
         self.add_notice(input.to_owned());
         let message = match command {
+            ParsedCommand::Help => {
+                self.add_notice(
+                    commands::COMMANDS
+                        .iter()
+                        .map(|spec| {
+                            format!("{:<10} {}  ({})", spec.name, spec.description, spec.usage)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+                return Ok(());
+            }
             ParsedCommand::New => InputMessage::NewConversation,
             ParsedCommand::Load { selector } => InputMessage::LoadSession { selector },
             ParsedCommand::Sessions => InputMessage::ListSessions,
