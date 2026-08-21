@@ -3,6 +3,25 @@ resolver = "3"
 members = ["crates/agent", "crates/auth", "crates/compact", "crates/llm", "crates/session", "crates/tui", "crates/tools"]
 default-members = ["crates/agent"]
 
+# Release ships lean: symbol tables stripped, cross-crate DCE via fat LTO,
+# one codegen unit for inlining, and abort-on-panic to drop unwind tables.
+# These slow release builds by design — never mirror them in `[profile.dev]`.
+# `panic = "abort"` is the only entry with semantic consequences: Drop
+# handlers no longer run on panic and a panicking tokio worker kills the
+# process instead of just its task. The TUI panic hook still restores the
+# terminal before the abort.
+[profile.release]
+strip = "symbols"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Debug builds keep backtraces usable while shrinking the binary and target/
+# dramatically — full DWARF is most of the ~80 MB dev artifact and dominates
+# link time.
+[profile.dev]
+debug = "line-tables-only"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
@@ -15,3 +34,14 @@ llm = { path = "crates/llm" }
 session = { path = "crates/session" }
 tools = { path = "crates/tools" }
 tui = { path = "crates/tui" }
+# The exact tokio feature set the agent binary needs — `full` used to pull in
+# `net` (unused) and bloated the feature union. Library crates keep their own
+# precise declarations.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+] }
