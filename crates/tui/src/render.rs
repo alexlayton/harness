@@ -7,20 +7,14 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// prevents individual widgets from slowly acquiring unrelated colours.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Theme {
-    pub background: Color,
     pub primary_text: Color,
     pub assistant_text: Color,
-    pub secondary_text: Color,
     pub muted_text: Color,
     pub dim_text: Color,
     pub accent: Color,
     pub code_background: Color,
-    pub tool_background: Color,
-    pub tool_running_border: Color,
-    pub tool_success_border: Color,
-    pub tool_failure_border: Color,
-    pub selection: Color,
-    pub focus: Color,
+    /// Success colour shared by tool durations and markdown `TIP` alerts.
+    pub success: Color,
     pub error: Color,
 }
 
@@ -30,27 +24,20 @@ impl Default for Theme {
             // Use the terminal's default colours for most backgrounds/text so
             // the UI respects the user's terminal theme instead of imposing a
             // dark background everywhere.
-            background: Color::Reset,
             primary_text: Color::Reset,
             assistant_text: Color::Reset,
-            secondary_text: Color::Reset,
             muted_text: Color::DarkGray,
             dim_text: Color::DarkGray,
             accent: Color::Cyan,
             code_background: Color::Reset,
-            tool_background: Color::Reset,
-            tool_running_border: Color::DarkGray,
-            tool_success_border: Color::Green,
-            tool_failure_border: Color::Red,
-            selection: Color::Blue,
-            focus: Color::Blue,
+            success: Color::Green,
             error: Color::Red,
         }
     }
 }
 
-pub const MAX_COMPLETION_ROWS: usize = 8;
-pub const ACTIVITY_FRAMES: &[&str] = &["·", "∙", "•", "●", "•", "∙"];
+pub(crate) const MAX_COMPLETION_ROWS: usize = 8;
+pub(crate) const ACTIVITY_FRAMES: &[&str] = &["·", "∙", "•", "●", "•", "∙"];
 const USER_PREFIX: &str = "› ";
 const ASSISTANT_PREFIX: &str = "‹ ";
 
@@ -60,17 +47,17 @@ const ASSISTANT_PREFIX: &str = "‹ ";
 // Every blank row and blank column the UI inserts comes from here so that
 // committed scrollback, the live viewport, and separators share one rhythm:
 //
-// - `horizontal_pad`/`vertical_pad` define the gutter around content. The
-//   live viewport applies them as a `Margin`; committed lines are wrapped at
-//   `content_width` and then prefixed with the same gutter by `indent_lines`,
-//   so text keeps its wrap when it moves from the live tail into scrollback.
+// - `horizontal_pad` defines the gutter around content. The live region
+//   applies it as a left margin and committed rows are written behind the
+//   same number of spaces, so text keeps its position when it moves from
+//   the live tail into scrollback.
 // - `SECTION_GAP` is the blank-line count between transcript entries — one
-//   uniform gap between any two entries, tool boxes included.
+//   uniform gap between any two entries, tool lines included.
 // - `BLOCK_GAP` is the blank-line count between blocks *inside* one entry
 //   (reasoning → markdown).
 // ---------------------------------------------------------------------------
 
-/// Blank lines between transcript entries. Tool boxes rely on this same gap
+/// Blank lines between transcript entries. Tool lines rely on this same gap
 /// rather than adding their own, so the rhythm between entries is uniform.
 pub const SECTION_GAP: usize = 1;
 /// Blank lines between blocks within a single entry (reasoning → markdown).
@@ -87,11 +74,6 @@ pub fn horizontal_pad(width: u16) -> u16 {
     } else {
         0
     }
-}
-
-/// Blank rows above and below the live viewport's sections.
-pub fn vertical_pad(height: u16) -> u16 {
-    if height >= 8 { 1 } else { 0 }
 }
 
 /// The width content is wrapped at once the gutter is reserved on both sides.
@@ -234,10 +216,10 @@ impl StyleSheet for MarkdownTheme {
     fn alert(&self, kind: AlertKind) -> Style {
         let color = match kind {
             AlertKind::Note => self.theme.accent,
-            AlertKind::Tip => self.theme.tool_success_border,
+            AlertKind::Tip => self.theme.success,
             AlertKind::Important => self.theme.accent,
             AlertKind::Warning => Color::Yellow,
-            AlertKind::Caution => self.theme.tool_failure_border,
+            AlertKind::Caution => self.theme.error,
         };
         fg(color)
     }
@@ -307,10 +289,6 @@ fn line_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
-fn span_style(base: Style, line_style: Style, span_style: Style) -> Style {
-    base.patch(line_style).patch(span_style)
-}
-
 /// Wrap a styled Ratatui text value while preserving span styles. Text is
 /// wrapped at whitespace when possible; a single word is split only when it
 /// is wider than the available line. This is the common measurement/rendering
@@ -338,7 +316,7 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
         let line_base = base.patch(source_line.style);
         let mut source_chars = Vec::<(char, Style, usize)>::new();
         for source_span in &source_line.spans {
-            let style = span_style(line_base, Style::default(), source_span.style);
+            let style = line_base.patch(source_span.style);
             source_chars.extend(source_span.content.chars().map(|character| {
                 let character_width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
                 (character, style, character_width)

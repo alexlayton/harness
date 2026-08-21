@@ -1,8 +1,8 @@
 //! The direct-crossterm UI: no retained buffer, no viewport, no
-//! `insert_before`. Everything final is written once as plain rows
-//! into the terminal's native scrollback; only a small live region at the
-//! bottom (streaming tail, running tool line, activity marker, and the `›`
-//! input line) is rewritten in place with cursor-relative ANSI moves.
+//! `insert_before`. Everything final is written once as plain rows into the
+//! terminal's native scrollback; only a small live region at the bottom
+//! (streaming tail, running tool line, activity marker, and the `›` input
+//! line) is rewritten in place with cursor-relative ANSI moves.
 //!
 //! Screen model and invariants:
 //!
@@ -55,17 +55,17 @@ impl Activity {
 pub(crate) const MAX_HISTORY: usize = 1_000;
 pub(crate) const PLACEHOLDER: &str = "Type your message...";
 
-use crate::attachments;
 use crate::commands::{
-    self, ArgumentKind, Candidate, CandidateKind, CompletionContext, CompletionTarget,
-    ParsedCommand,
+    self, ArgumentKind, Candidate, CandidateKind, CompletionContext, CompletionResult,
+    CompletionTarget, ParsedCommand,
 };
 use crate::commit::stable_block_split_offset;
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
+use crate::paths;
 use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
-use crate::{InputMessage, SessionSnapshotEntry, TuiEvent, UiEvent};
+use crate::{InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, TuiEvent, UiEvent};
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
 use crossterm::event::{
@@ -196,9 +196,9 @@ struct RegionBuild {
     cursor_col: usize,
 }
 
-/// A direct-crossterm alternative to [`crate::Tui`]. See the module docs for
-/// the screen model; the struct is consumed externally only through
-/// `CrossTerm::new` and `CrossTerm::run`.
+/// The direct-crossterm UI. See the module docs for the screen model; the
+/// struct is consumed externally only through `CrossTerm::new` and
+/// `CrossTerm::run`.
 pub struct CrossTerm {
     /// Raw stdout handle; every frame is one formatted ANSI write + flush.
     out: Stdout,
@@ -241,10 +241,10 @@ pub struct CrossTerm {
     /// window are correctly re-rendered.
     tools_expanded: bool,
 
-    // Completion (fish-style inline, feature 5).
+    // Completion (fish-style inline).
     providers: Vec<String>,
-    model_lists: HashMap<String, Vec<crate::ModelEntry>>,
-    session_candidates: Vec<crate::SessionListEntry>,
+    model_lists: HashMap<String, Vec<ModelEntry>>,
+    session_candidates: Vec<SessionListEntry>,
     session_completion_requested: bool,
     /// Providers we have already asked the agent to fetch, to avoid duplicate
     /// `ListModels` requests while typing through a model token.
@@ -564,7 +564,7 @@ impl CrossTerm {
     }
 
     // ------------------------------------------------------------------
-    // Inline completion (feature 5)
+    // Inline completion
     // ------------------------------------------------------------------
 
     /// Rebuild the completion list for the current draft and cursor. Cheap
@@ -616,7 +616,7 @@ impl CrossTerm {
     fn set_completion(
         &mut self,
         kind: CompletionKind,
-        result: crate::commands::CompletionResult,
+        result: CompletionResult,
         old_value: Option<String>,
     ) {
         if result.candidates.is_empty() {
@@ -750,7 +750,7 @@ impl CrossTerm {
             // the backend again.
             self.request_backend(
                 input_tx,
-                &completion.context.clone(),
+                &completion.context,
                 &Candidate {
                     value: String::new(),
                     description: String::new(),
@@ -761,7 +761,7 @@ impl CrossTerm {
         }
         if completion.candidates.len() == 1 {
             let candidate = completion.candidates[0].clone();
-            self.accept_candidate(&candidate, &completion.context.clone(), input_tx)?;
+            self.accept_candidate(&candidate, &completion.context, input_tx)?;
             return Ok(());
         }
         // Multiple candidates: extend the shared prefix, or cycle among them
@@ -775,10 +775,10 @@ impl CrossTerm {
         if token == prefix {
             let selected = (completion.selected + 1) % completion.candidates.len();
             let candidate = completion.candidates[selected].clone();
-            self.accept_candidate(&candidate, &completion.context.clone(), input_tx)?;
+            self.accept_candidate(&candidate, &completion.context, input_tx)?;
         } else {
             let prefix_candidate = Candidate {
-                value: prefix.clone(),
+                value: prefix,
                 description: String::new(),
                 kind: CandidateKind::Slash,
             };
@@ -840,7 +840,6 @@ impl CrossTerm {
             selected,
             kind: CompletionKind::Path,
         });
-        let task_context = context.clone();
         tokio::spawn(async move {
             // Debounce so a burst of typing triggers one scan, not many.
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -848,7 +847,7 @@ impl CrossTerm {
                 return;
             }
             let candidates = tokio::task::spawn_blocking(move || {
-                attachments::find_path_candidates(&root, &scan_query, &scan_cancel)
+                paths::find_path_candidates(&root, &scan_query, &scan_cancel)
             })
             .await
             .unwrap_or_default();
@@ -857,7 +856,7 @@ impl CrossTerm {
             }
             let _ = sender.send(PathCompletionResult {
                 generation,
-                context: task_context,
+                context,
                 candidates,
             });
         });
@@ -875,12 +874,11 @@ impl CrossTerm {
             return;
         }
         self.path_completion_cancel = None;
-        let old_value = self.completion.as_ref().and_then(|completion| {
-            completion
-                .candidates
-                .get(completion.selected)
-                .map(|candidate| candidate.value.clone())
-        });
+        let old_value = self
+            .completion
+            .as_ref()
+            .and_then(|completion| completion.candidates.get(completion.selected))
+            .map(|candidate| candidate.value.as_str());
         // Merge static session candidates (for `/load`) with the scanned links.
         let static_candidates = commands::candidates_at_cursor(
             &self.input,
@@ -898,7 +896,6 @@ impl CrossTerm {
             return;
         }
         let selected = old_value
-            .as_deref()
             .and_then(|value| merged.iter().position(|c| c.value == value))
             .unwrap_or(0)
             .min(merged.len().saturating_sub(1));
@@ -944,7 +941,7 @@ impl CrossTerm {
             return String::new();
         }
         let prefix_candidate = Candidate {
-            value: prefix.clone(),
+            value: prefix,
             description: String::new(),
             kind: CandidateKind::Slash,
         };
@@ -970,7 +967,7 @@ impl CrossTerm {
             .candidates
             .iter()
             .take(cap)
-            .map(|candidate| candidate.value.clone())
+            .map(|candidate| candidate.value.as_str())
             .collect::<Vec<_>>()
             .join(" · ");
         if completion.candidates.len() > cap {
@@ -1122,18 +1119,13 @@ impl CrossTerm {
                 self.activity = Activity::Reasoning;
                 self.stream().reasoning.push_str(&delta);
             }
-            UiEvent::ToolCallStarted {
-                name,
-                summary,
-                arguments,
-            } => {
+            UiEvent::ToolCallStarted { name, summary } => {
                 self.busy = true;
                 self.activity = Activity::Processing;
                 // Text streamed before the call is a complete message.
                 self.finalize_stream();
                 self.running_tool = Some(ToolRecord {
                     name,
-                    args: arguments,
                     summary,
                     ok: false,
                     duration_ms: 0,
@@ -1152,30 +1144,22 @@ impl CrossTerm {
             } => {
                 self.busy = true;
                 self.activity = Activity::Working;
-                let mut record = self.running_tool.take().unwrap_or_else(|| ToolRecord {
-                    name: name.clone(),
-                    args: String::new(),
-                    summary: summary.clone(),
+                // Clear any matching start: its placeholder carries nothing
+                // this line needs, and leaving it set would keep rendering
+                // the tool in the live region after the entry below commits.
+                self.running_tool = None;
+                let record = ToolRecord {
+                    name,
+                    summary,
                     ok,
                     duration_ms,
-                    output: output.clone(),
-                    error: error.clone(),
+                    output,
+                    error,
                     status: if ok {
                         ToolStatus::Success
                     } else {
                         ToolStatus::Failure
                     },
-                });
-                record.name = name;
-                record.summary = summary;
-                record.ok = ok;
-                record.duration_ms = duration_ms;
-                record.output = output;
-                record.error = error;
-                record.status = if ok {
-                    ToolStatus::Success
-                } else {
-                    ToolStatus::Failure
                 };
                 self.pending.push(Entry::Tool { record });
             }
@@ -1262,7 +1246,6 @@ impl CrossTerm {
                         SessionSnapshotEntry::Tool {
                             name,
                             summary,
-                            arguments: _,
                             ok,
                             duration_ms,
                             output,
@@ -1270,7 +1253,6 @@ impl CrossTerm {
                         } => Entry::Tool {
                             record: ToolRecord {
                                 name,
-                                args: String::new(),
                                 summary,
                                 ok,
                                 duration_ms,
@@ -1297,11 +1279,7 @@ impl CrossTerm {
                         .take(12)
                         .map(|session| {
                             let title = session.title.unwrap_or_else(|| "(untitled)".into());
-                            let model = session.model.unwrap_or_else(|| "(model unknown)".into());
-                            format!(
-                                "{} · {} · {} · {}",
-                                session.short_id, title, model, session.updated_at
-                            )
+                            format!("{} · {} · {}", session.short_id, title, session.updated_at)
                         })
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -1728,10 +1706,9 @@ fn install_panic_hook() {
 /// Build the wrapped rows for one final or in-flight entry. Shared by the
 /// pending path (print above the region) and the resize repaint (window of
 /// history), which is why entries are stored at the source level.
-/// Build the wrapped rows for one final or in-flight entry. `tools_expanded`
-/// is the global Ctrl+O state; committed entries render collapsed unless the
-/// toggle is on, and the progress snapshot used the same global for its
-/// in-flight tool line so both agree after a repaint.
+/// `tools_expanded` is the global Ctrl+O state; committed entries render
+/// collapsed unless the toggle is on, and the progress snapshot used the
+/// same global for its in-flight tool line so both agree after a repaint.
 fn entry_lines(
     entry: &Entry,
     width: usize,
@@ -1934,10 +1911,6 @@ fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'stat
 // Input line layout
 // ---------------------------------------------------------------------------
 
-/// Wrap the input draft into visual rows (first row prefixed with `› `,
-/// continuations indented to match) and locate the cursor inside them. The
-/// real terminal cursor is placed at `cursor_col` columns into `cursor_row`.
-///
 /// Wrap the input draft into visual rows (first row prefixed with `› `,
 /// continuations indented to match) and locate the cursor inside them. The
 /// real terminal cursor is placed at `cursor_col` columns into `cursor_row`.
@@ -2168,9 +2141,6 @@ fn insert_text(input: &mut String, cursor: &mut usize, text: &str) {
     } else {
         text.to_owned()
     };
-    if text.is_empty() {
-        return;
-    }
     input.insert_str(*cursor, &text);
     *cursor += text.len();
 }
@@ -2376,7 +2346,6 @@ mod tests {
     fn record(status: ToolStatus) -> ToolRecord {
         ToolRecord {
             name: "bash".into(),
-            args: String::new(),
             summary: "bash: cargo test".into(),
             ok: !matches!(status, ToolStatus::Failure),
             duration_ms: 1_200,

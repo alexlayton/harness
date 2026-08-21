@@ -4,12 +4,12 @@
 //! agent crate, avoiding a library dependency cycle.
 
 mod app;
-pub mod attachments;
-pub mod commands;
+mod commands;
 mod commit;
 mod environment;
 mod input;
-pub mod render;
+mod paths;
+mod render;
 mod state;
 
 pub use app::CrossTerm;
@@ -67,7 +67,6 @@ pub enum SessionSnapshotEntry {
     Tool {
         name: String,
         summary: String,
-        arguments: String,
         ok: bool,
         duration_ms: u64,
         output: String,
@@ -99,9 +98,6 @@ pub enum UiEvent {
     ToolCallStarted {
         name: String,
         summary: String,
-        /// Pretty-printed and bounded by the agent before crossing into the
-        /// serde-free TUI crate.
-        arguments: String,
     },
     ToolCallFinished {
         name: String,
@@ -166,9 +162,6 @@ pub struct SessionListEntry {
     pub short_id: String,
     pub title: Option<String>,
     pub updated_at: String,
-    pub workspace: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
 }
 
 pub trait TuiEvent: Send {

@@ -218,8 +218,6 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                     provider: Some(provider.to_owned()),
                     model: model.to_owned(),
                 })
-            } else if token.is_empty() {
-                Err("usage: /model [<provider>:]<model>".into())
             } else {
                 Ok(ParsedCommand::SetModel {
                     provider: None,
@@ -233,9 +231,8 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
 
 /// Find the command completion context at a character-based cursor column.
 ///
-/// `tui-textarea` reports character columns while Rust string slicing uses
-/// byte offsets, so the context deliberately stores byte offsets and performs
-/// the conversion in one place.
+/// The context deliberately stores byte offsets (used for Rust string
+/// slicing) and performs the char-column conversion in one place.
 pub fn completion_context(input: &str, cursor_col: usize) -> Option<CompletionContext> {
     if !is_command_input(input) {
         return None;
@@ -317,26 +314,6 @@ pub fn candidates_at_cursor(
         context,
         candidates,
     })
-}
-
-/// Compatibility wrapper for callers that only need candidates at the end of
-/// the input and do not have cached session data.
-pub fn candidates(
-    input: &str,
-    providers: &[String],
-    model_lists: &HashMap<String, Vec<ModelEntry>>,
-    current_provider: &str,
-) -> Vec<Candidate> {
-    candidates_at_cursor(
-        input,
-        input.chars().count(),
-        providers,
-        model_lists,
-        current_provider,
-        &[],
-    )
-    .map(|result| result.candidates)
-    .unwrap_or_default()
 }
 
 pub fn command_spec(name: &str) -> Option<&'static CommandSpec> {
@@ -651,10 +628,26 @@ mod tests {
             short_id: short_id.into(),
             title: title.map(str::to_owned),
             updated_at: "2026-08-13 12:00".into(),
-            workspace: "/workspace".into(),
-            provider: Some("openrouter".into()),
-            model: Some("demo".into()),
         }
+    }
+
+    /// Complete at the end of `input` with no cached sessions.
+    fn candidates(
+        input: &str,
+        providers: &[String],
+        model_lists: &HashMap<String, Vec<ModelEntry>>,
+        current_provider: &str,
+    ) -> Vec<Candidate> {
+        candidates_at_cursor(
+            input,
+            input.chars().count(),
+            providers,
+            model_lists,
+            current_provider,
+            &[],
+        )
+        .map(|result| result.candidates)
+        .unwrap_or_default()
     }
 
     #[test]

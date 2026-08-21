@@ -20,7 +20,7 @@ impl EnvironmentInfo {
     }
 }
 
-pub(crate) fn display_path(path: &Path) -> String {
+fn display_path(path: &Path) -> String {
     let Some(home) = dirs_home() else {
         return path.to_string_lossy().replace('\\', "/");
     };

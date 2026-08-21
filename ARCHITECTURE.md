@@ -26,7 +26,7 @@ builds the `harness` binary.
 | Crate | Responsibility | Key public items |
 |---|---|---|
 | [`agent`] | The `harness` binary and the agent orchestration loop: turn state machine, tool dispatch, retry/recovery, compaction triggers, auth UX, plus two frontends (TUI and headless) | `Agent`, `AgentEvent`, `run_headless`, `Cli`, `Config` |
-| [`tui`] | Terminal UI. Renders `UiEvent`s, owns input handling, slash commands, attachments, completion | `CrossTerm`, `InputMessage`, `UiEvent` |
+| [`tui`] | Terminal UI. Renders `UiEvent`s, owns input handling, slash commands, path completion | `CrossTerm`, `InputMessage`, `UiEvent` |
 | [`compact`] | Compaction *policy and planning* (when/what to cut, how to summarize); persistence of summaries stays in `session` | `CompactionPolicy`, `plan_compaction`, `summarize` |
 | [`session`] | Durable append-only JSONL session log: format, codec, store, export, context reconstruction | `Session`, `SessionStore`, `SessionEvent`, `ExportOptions` |
 | [`llm`] | Provider abstraction plus wire-format dialects and provider clients. The only crate that speaks HTTP to model APIs | `Provider`, `CompletionRequest`, `Message`, `StreamEvent` |

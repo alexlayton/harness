@@ -444,7 +444,6 @@ mod tests {
             AgentEvent::ToolCallStarted {
                 name: "bash".into(),
                 summary: "echo hi".into(),
-                arguments: "{}".into(),
             },
             AgentEvent::ToolCallFinished {
                 name: "bash".into(),
@@ -496,7 +495,6 @@ mod tests {
                 AgentEvent::ToolCallStarted {
                     name: "bash".into(),
                     summary: "touch x".into(),
-                    arguments: "{}".into(),
                 },
                 AgentEvent::ToolCallFinished {
                     name: "bash".into(),
@@ -564,7 +562,6 @@ mod tests {
                 AgentEvent::ToolCallStarted {
                     name: "bash".into(),
                     summary: "false".into(),
-                    arguments: "{}".into(),
                 },
                 AgentEvent::ToolCallFinished {
                     name: "bash".into(),

@@ -1,6 +1,6 @@
 use crate::config::{build_provider_with_auth, save_settings};
 use crate::prompt::system_prompt_with_workspace_context;
-use crate::tools::{ToolRegistry, call_recap, call_summary};
+use crate::tools::{ToolRegistry, call_summary};
 use auth::{AuthEvent, CopilotAuth, sku_from_proxy_token};
 use compact::{
     CompactionPolicy, SummaryOutcome, estimate_live_tokens, plan_compaction,
@@ -59,8 +59,6 @@ pub enum AgentEvent {
     ToolCallStarted {
         name: String,
         summary: String,
-        /// Pretty-printed and bounded before it is sent to the serde-free TUI.
-        arguments: String,
     },
     ToolCallFinished {
         name: String,
@@ -157,7 +155,6 @@ pub enum SessionSnapshotEntry {
     Tool {
         name: String,
         summary: String,
-        arguments: String,
         ok: bool,
         duration_ms: u64,
         output: String,
@@ -820,8 +817,9 @@ impl Agent {
                     events,
                     AgentEvent::ToolCallStarted {
                         name: call.name.clone(),
+                        // Cloned: the same label labels the finished/cancelled
+                        // tool event below.
                         summary: summary.clone(),
-                        arguments: call_recap(&call.name, &call.arguments),
                     },
                 );
                 let started = Instant::now();
@@ -1573,13 +1571,12 @@ pub fn spawn_model_list(
 }
 
 /// Adapt the session-owned snapshot into the UI-facing entry type, adding
-/// tool summaries and per-tool recap strings.  The session crate owns the
-/// event walk and tool-result pairing; this conversion is purely
-/// presentational.
+/// tool summaries. The session crate owns the event walk and tool-result
+/// pairing; this conversion is purely presentational.
 ///
-/// The recap is display-only: raw JSON arguments stay in the session store and
-/// in `context_messages`, so loaded and continued sessions keep full fidelity.
-/// Do not persist these strings back into session events.
+/// Summaries are display-only: raw JSON arguments stay in the session store
+/// and in `context_messages`, so loaded and continued sessions keep full
+/// fidelity. Do not persist these strings back into session events.
 fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<SessionSnapshotEntry> {
     entries
         .into_iter()
@@ -1600,11 +1597,9 @@ fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<Sessi
                 error,
             } => {
                 let summary = call_summary(&name, &arguments);
-                let recap = call_recap(&name, &arguments);
                 SessionSnapshotEntry::Tool {
                     name,
                     summary,
-                    arguments: recap,
                     ok,
                     duration_ms: 0,
                     output,
@@ -1943,10 +1938,7 @@ mod tests {
             assert!(got.contains(&AgentEvent::TextDelta("done".into())));
             assert!(got.iter().any(|event| matches!(
                 event,
-                AgentEvent::ToolCallStarted {
-                    arguments,
-                    ..
-                } if arguments == "missing"
+                AgentEvent::ToolCallStarted { summary, .. } if summary == "missing"
             )));
             assert!(got.iter().any(|event| matches!(
                 event,

@@ -40,15 +40,9 @@ impl tui::TuiEvent for AgentEvent {
             AgentEvent::AuthFailed { message } => tui::UiEvent::AuthFailed { message },
             AgentEvent::TextDelta(value) => tui::UiEvent::TextDelta(value),
             AgentEvent::ReasoningDelta(value) => tui::UiEvent::ReasoningDelta(value),
-            AgentEvent::ToolCallStarted {
-                name,
-                summary,
-                arguments,
-            } => tui::UiEvent::ToolCallStarted {
-                name,
-                summary,
-                arguments,
-            },
+            AgentEvent::ToolCallStarted { name, summary } => {
+                tui::UiEvent::ToolCallStarted { name, summary }
+            }
             AgentEvent::ToolCallFinished {
                 name,
                 summary,
@@ -104,7 +98,6 @@ impl tui::TuiEvent for AgentEvent {
                         crate::agent::SessionSnapshotEntry::Tool {
                             name,
                             summary,
-                            arguments,
                             ok,
                             duration_ms,
                             output,
@@ -112,7 +105,6 @@ impl tui::TuiEvent for AgentEvent {
                         } => tui::SessionSnapshotEntry::Tool {
                             name,
                             summary,
-                            arguments,
                             ok,
                             duration_ms,
                             output,
@@ -129,9 +121,6 @@ impl tui::TuiEvent for AgentEvent {
                         short_id: session.short_id,
                         title: session.title,
                         updated_at: session.updated_at,
-                        workspace: session.workspace,
-                        provider: session.provider,
-                        model: session.model,
                     })
                     .collect(),
             },
