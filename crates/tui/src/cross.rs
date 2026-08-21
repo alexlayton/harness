@@ -476,7 +476,10 @@ impl CrossTerm {
             ));
             return Ok(());
         }
-        self.add_notice(format!("⌘ {input}"));
+        // The typed command is echoed without the ⌘ glyph: the input line the
+        // user already sees carries the `› ` prefix, so the notice is the raw
+        // command text.
+        self.add_notice(input.to_owned());
         let message = match command {
             ParsedCommand::New => InputMessage::NewConversation,
             ParsedCommand::Load { selector } => InputMessage::LoadSession { selector },
