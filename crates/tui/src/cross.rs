@@ -124,6 +124,15 @@ struct InputLayout {
     cursor_col: usize,
 }
 
+/// Token usage reported by [`UiEvent::UsageUpdated`], kept for the inline
+/// counter trailer on the input placeholder row (`↑ in ↓ out · cost`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Usage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cost: String,
+}
+
 /// One frame's live region: the rows to paint and where the terminal cursor
 /// belongs inside them.
 struct RegionBuild {
@@ -166,6 +175,9 @@ pub struct CrossTerm {
     history_pos: Option<usize>,
     draft: String,
 
+    /// Most recent turn usage for the placeholder counter trailer.
+    usage: Option<Usage>,
+
     busy: bool,
     activity: Activity,
     spinner: usize,
@@ -202,6 +214,7 @@ impl CrossTerm {
             history: Vec::new(),
             history_pos: None,
             draft: String::new(),
+            usage: None,
             busy: false,
             activity: Activity::Preparing,
             spinner: 0,
@@ -644,7 +657,19 @@ impl CrossTerm {
                 // model as a fresh metadata line instead.
                 self.pending.push(self.metadata_entry());
             }
-            UiEvent::ModelList { .. } | UiEvent::UsageUpdated { .. } => {}
+            UiEvent::ModelList { .. } => {}
+            UiEvent::UsageUpdated {
+                input_tokens,
+                output_tokens,
+                cost,
+                ..
+            } => {
+                self.usage = Some(Usage {
+                    input_tokens,
+                    output_tokens,
+                    cost,
+                });
+            }
             UiEvent::SessionChanged { id, loaded, .. } => {
                 self.finalize_stream();
                 self.running_tool = None;
@@ -779,11 +804,20 @@ impl CrossTerm {
 
     fn input_layout(&self) -> InputLayout {
         let content = render::content_width(self.width);
+        let usage_trailer = self.usage.as_ref().map_or_else(String::new, |usage| {
+            format!(
+                "   ↑ {} ↓ {} · {}",
+                format_tokens(usage.input_tokens),
+                format_tokens(usage.output_tokens),
+                usage.cost
+            )
+        });
         input_layout(
             &self.input,
             self.cursor,
             content.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
             self.theme,
+            &usage_trailer,
         )
     }
 
@@ -1265,26 +1299,39 @@ fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'stat
 /// Wrap the input draft into visual rows (first row prefixed with `› `,
 /// continuations indented to match) and locate the cursor inside them. The
 /// real terminal cursor is placed at `cursor_col` columns into `cursor_row`.
-fn input_layout(input: &str, cursor: usize, width: usize, theme: Theme) -> InputLayout {
+///
+/// `usage_trailer` is appended, dim, to the empty-input placeholder row;
+/// nothing is shown while typing (the counter reappears after a submit
+/// because the input empties again).
+fn input_layout(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    theme: Theme,
+    usage_trailer: &str,
+) -> InputLayout {
     let width = width.max(1);
     let cursor = cursor.min(input.len());
     let prefix_style = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
     let text_style = Style::default().fg(theme.primary_text);
+    let dim_style = Style::default()
+        .fg(theme.dim_text)
+        .add_modifier(Modifier::DIM);
 
     if input.is_empty() {
         // Placeholder row; the terminal cursor sits right after the prefix.
+        // When usage is available the counter trailer trails it, dim.
+        let mut spans = vec![
+            Span::styled(INPUT_PREFIX, prefix_style),
+            Span::styled(PLACEHOLDER, dim_style),
+        ];
+        if !usage_trailer.is_empty() {
+            spans.push(Span::styled(usage_trailer.to_owned(), dim_style));
+        }
         return InputLayout {
-            rows: vec![Line::from(vec![
-                Span::styled(INPUT_PREFIX, prefix_style),
-                Span::styled(
-                    PLACEHOLDER,
-                    Style::default()
-                        .fg(theme.dim_text)
-                        .add_modifier(Modifier::DIM),
-                ),
-            ])],
+            rows: vec![Line::from(spans)],
             cursor_row: 0,
             cursor_col: 0,
         };
@@ -1482,6 +1529,28 @@ fn vertical_move(input: &str, cursor: usize, delta: i32) -> Option<usize> {
     Some(position + byte_column)
 }
 
+/// Compact token counts the way the context-length formatter does: `1_234`
+/// renders as `1.2k`, `1_000_000` as `1M`.
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        let value = n as f64 / 1_000_000.0;
+        if value.fract() == 0.0 {
+            format!("{}M", value as u64)
+        } else {
+            format!("{value:.1}M")
+        }
+    } else if n >= 1_000 {
+        let value = n as f64 / 1_000.0;
+        if value.fract() == 0.0 {
+            format!("{}k", value as u64)
+        } else {
+            format!("{value:.1}k")
+        }
+    } else {
+        n.to_string()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ANSI output
 // ---------------------------------------------------------------------------
@@ -1603,17 +1672,58 @@ mod tests {
     }
 
     #[test]
+    fn format_tokens_uses_k_and_m_units() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1_000), "1k");
+        assert_eq!(format_tokens(1_234), "1.2k");
+        assert_eq!(format_tokens(12_345), "12.3k");
+        assert_eq!(format_tokens(1_000_000), "1M");
+        assert_eq!(format_tokens(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn placeholder_row_shows_the_usage_trailer_only_when_presented() {
+        let layout = input_layout("", 0, 60, Theme::default(), "   ↑ 1.2k ↓ 3.4k · $0.01");
+        assert_eq!(
+            row_text(&layout.rows[0]),
+            "› Type your message...   ↑ 1.2k ↓ 3.4k · $0.01"
+        );
+
+        // Without usage the placeholder stays bare.
+        let layout = input_layout("", 0, 60, Theme::default(), "");
+        assert_eq!(row_text(&layout.rows[0]), "› Type your message...");
+    }
+
+    #[test]
+    fn usage_updated_is_kept_for_the_placeholder_counter() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::UsageUpdated {
+            input_tokens: 1_234,
+            output_tokens: 3_456,
+            cached_tokens: 5,
+            reasoning_tokens: 2,
+            cost: "$0.01".into(),
+        });
+        let layout = ui.input_layout();
+        assert_eq!(
+            row_text(&layout.rows[0]),
+            "› Type your message...   ↑ 1.2k ↓ 3.5k · $0.01"
+        );
+    }
+
+    #[test]
     fn input_layout_wraps_and_places_the_cursor() {
         // "abcdefgh" at width 4 wraps into two full rows; a cursor at the
         // very end lands on a fresh third row (mirrors prompt_layout).
-        let layout = input_layout("abcdefgh", 8, 4, Theme::default());
+        let layout = input_layout("abcdefgh", 8, 4, Theme::default(), "");
         let values: Vec<String> = layout.rows.iter().map(row_text).collect();
         assert_eq!(values, vec!["› abcd", "  efgh", "  "]);
         assert_eq!(layout.cursor_row, 2);
         assert_eq!(layout.cursor_col, 0);
 
         // Cursor mid-word stays on the first row at the right column.
-        let layout = input_layout("abcdef", 2, 4, Theme::default());
+        let layout = input_layout("abcdef", 2, 4, Theme::default(), "");
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 2);
     }
@@ -1622,14 +1732,14 @@ mod tests {
     fn input_layout_handles_multiline_drafts() {
         // Two logical lines, cursor at the end of the second: continuation
         // rows are indented to line up under the prefix.
-        let layout = input_layout("ab\ncd", 5, 10, Theme::default());
+        let layout = input_layout("ab\ncd", 5, 10, Theme::default(), "");
         let values: Vec<String> = layout.rows.iter().map(row_text).collect();
         assert_eq!(values, vec!["› ab", "  cd"]);
         assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_col, 2);
 
         // Empty input shows the placeholder with the cursor after `› `.
-        let layout = input_layout("", 0, 10, Theme::default());
+        let layout = input_layout("", 0, 10, Theme::default(), "");
         assert_eq!(row_text(&layout.rows[0]), format!("› {PLACEHOLDER}"));
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 0);
@@ -1639,7 +1749,7 @@ mod tests {
     fn input_layout_counts_wide_characters_by_display_width() {
         // Two CJK characters fill a width-4 row; the cursor after the first
         // sits at display column 2, not byte offset 3.
-        let layout = input_layout("你好", 3, 4, Theme::default());
+        let layout = input_layout("你好", 3, 4, Theme::default(), "");
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 2);
     }
