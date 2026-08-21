@@ -130,6 +130,16 @@ impl ToolRegistry {
         };
         tool.tool.execute(args, cancel).await
     }
+
+    /// Harness-side concurrency classification for one invocation. Unknown
+    /// tools classify as [`Concurrency::Exclusive`], mirroring the trait
+    /// default, so a name that misses the registry can never join a batch.
+    pub fn concurrency(&self, name: &str, args: &Value) -> super::Concurrency {
+        match self.tools.iter().find(|tool| tool.name == name) {
+            Some(tool) => tool.tool.concurrency(args),
+            None => super::Concurrency::Exclusive,
+        }
+    }
 }
 
 /// Prompt-facing tool entry.  It intentionally contains no JSON schema.

@@ -1,4 +1,4 @@
-use super::{Tool, ToolOutput, ToolPrompt, ToolSpec, resolve_workspace_path};
+use super::{Concurrency, Tool, ToolOutput, ToolPrompt, ToolSpec, resolve_workspace_path};
 use async_trait::async_trait;
 use fff_search::{
     Constraint, FFFMode, FilePicker, FilePickerOptions, FuzzySearchOptions, GrepMode,
@@ -547,9 +547,16 @@ impl Tool for FindTool {
             },
             prompt: ToolPrompt::new(
                 "Find files and directories by fuzzy query",
-                ["Use find for repository path discovery instead of bash find, ls, or shell globbing.".to_owned()],
+                [
+                    "Use find for repository path discovery instead of bash find, ls, or shell globbing.".to_owned(),
+                    "Read-only: independent lookups may be batched in one response and run concurrently.".to_owned(),
+                ],
             ),
         }
+    }
+
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::ReadOnly
     }
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {

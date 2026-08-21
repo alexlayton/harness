@@ -1,5 +1,5 @@
 use super::{
-    Tool, ToolOutput, ToolPrompt, ToolSpec, expand_tilde, normalize_workspace_root,
+    Concurrency, Tool, ToolOutput, ToolPrompt, ToolSpec, expand_tilde, normalize_workspace_root,
     resolve_workspace_path,
 };
 use async_trait::async_trait;
@@ -95,9 +95,16 @@ impl Tool for ReadTool {
             },
             prompt: ToolPrompt::new(
                 "Read file contents, optionally selecting a range of lines",
-                ["Use read to examine file contents instead of cat or sed.".to_owned()],
+                [
+                    "Use read to examine file contents instead of cat or sed.".to_owned(),
+                    "Read-only: independent reads may be batched in one response and run concurrently.".to_owned(),
+                ],
             ),
         }
+    }
+
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::ReadOnly
     }
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {

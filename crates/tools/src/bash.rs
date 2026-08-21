@@ -1,4 +1,4 @@
-use super::{Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root};
+use super::{Concurrency, Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
@@ -211,6 +211,344 @@ fn has_control_keyword(operand: &str) -> bool {
     })
 }
 
+/// Harness-side concurrency classification for one bash invocation.  This is
+/// decided here — never by the model — so scheduling correctness cannot
+/// depend on prompt compliance.  It fails closed: anything not provably
+/// side-effect-light classifies [`Concurrency::Exclusive`], which merely
+/// forfeits latency, while a wrong `ReadOnly` could interleave mutations.
+pub fn command_concurrency(command: &str) -> Concurrency {
+    match split_readonly_segments(command) {
+        Some(segments) if segments.iter().all(|segment| segment_is_read_only(segment)) => {
+            Concurrency::ReadOnly
+        }
+        _ => Concurrency::Exclusive,
+    }
+}
+
+/// Split a command on top-level separators (`&&`, `;`, and newlines, which
+/// are command separators in shell) into operands, refusing any structure a
+/// word-level analysis cannot judge: pipes, subshells, command substitution,
+/// heredocs, brace groups, redirections, or backgrounding.  Quoting and
+/// escapes are respected.  Returns `None` when the command must stay serial;
+/// a plain single command yields one segment.
+fn split_readonly_segments(command: &str) -> Option<Vec<&str>> {
+    let bytes = command.as_bytes();
+    let mut parts: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => escaped = true,
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'`' => return None,
+            b'$' if bytes.get(index + 1) == Some(&b'(') => return None,
+            b'<' if matches!(bytes.get(index + 1), Some(b'<') | Some(b'(')) => return None,
+            b'<' | b'>' if !in_single && !in_double => return None,
+            b'|' | b'(' if !in_single && !in_double => return None,
+            b'{' if !in_single && !in_double && bytes.get(index.wrapping_sub(1)) != Some(&b'$') => {
+                return None;
+            }
+            b'&' if !in_single && !in_double => {
+                // `&&` separates; a lone `&` backgrounds the command, whose
+                // side effects would outlive the tool call — stay serial.
+                if bytes.get(index + 1) != Some(&b'&') {
+                    return None;
+                }
+                parts.push(command[start..index].trim());
+                start = index + 2;
+                index += 2;
+                continue;
+            }
+            b';' | b'\n' | b'\r' if !in_single && !in_double => {
+                parts.push(command[start..index].trim());
+                start = index + 1;
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let tail = command[start..].trim();
+    parts.push(tail);
+    if parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    if parts.iter().any(|part| has_control_keyword(part)) {
+        return None;
+    }
+    Some(parts)
+}
+
+/// Strip one layer of matching quotes so quoted words (`git "status"`)
+/// compare equal to their bare form during table lookup.
+fn strip_quotes(word: &str) -> &str {
+    let mut word = word.trim();
+    for quote in ['\'', '"'] {
+        if word.len() >= 2 && word.starts_with(quote) && word.ends_with(quote) {
+            word = &word[1..word.len() - 1];
+        }
+    }
+    word
+}
+
+/// True for `NAME=value` environment assignments preceding a command.
+fn is_env_assignment(word: &str) -> bool {
+    let Some(equals) = word.find('=') else {
+        return false;
+    };
+    let name = &word[..equals];
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        // A valid identifier starts with a letter or underscore.
+        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {}
+        _ => return false,
+    }
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Git global options that precede the subcommand, mapped to how many
+/// following words they consume as values.  Anything unrecognized fails
+/// closed.
+const GIT_GLOBAL_FLAGS_WITH_VALUES: &[&str] = &["-C", "-c"];
+const GIT_GLOBAL_PREFIX_FLAGS: &[&str] = &["--git-dir=", "--work-tree="];
+const GIT_GLOBAL_BARE_FLAGS: &[&str] = &["--no-pager", "--literal-pathspecs"];
+
+/// Git subcommands that never mutate repository or worktree state, whatever
+/// their arguments (pathspecs and revisions are reads).
+const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "show",
+    "blame",
+    "ls-files",
+    "ls-remote",
+    "cat-file",
+    "rev-parse",
+    "describe",
+    "shortlog",
+    "whatchanged",
+    "merge-base",
+    "reflog",
+    "show-branch",
+    "count-objects",
+    "cherry",
+    "version",
+];
+
+/// Listing-mode flags under which `git branch` / `git tag` are read-only.
+/// With any positional argument they create/delete/rename refs, so those
+/// fail closed.
+const GIT_LIST_MODE_FLAGS: &[&str] = &[
+    "-l",
+    "--list",
+    "-a",
+    "-r",
+    "-v",
+    "-vv",
+    "--show-current",
+    "--show-ref-names",
+    "--merged",
+    "--no-merged",
+    "--contains",
+    "--no-contains",
+    "--points-at",
+    "--sort",
+    "--format",
+    "--color",
+    "--abbrev",
+    "-n",
+];
+
+/// Read-only modes of `git config`; any other form may write configuration.
+const GIT_CONFIG_READ_FLAGS: &[&str] = &["--get", "--get-all", "--get-regexp", "--list"];
+
+/// Shell commands judged side-effect-light with arbitrary arguments.  This
+/// is deliberately an allowlist: unknown commands stay serial.  Deliberately
+/// excluded despite common read-only use: `sed` (`-i`, `w`, `r`), `awk`
+/// (`system()`, redirections), `xargs` (arbitrary execution), `env` (runs a
+/// command), and everything that can spawn processes.
+const READ_ONLY_COMMANDS: &[&str] = &[
+    "ls",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "stat",
+    "pwd",
+    "which",
+    "file",
+    "du",
+    "df",
+    "tree",
+    "uname",
+    "date",
+    "printenv",
+    "id",
+    "whoami",
+    "hostname",
+    "basename",
+    "dirname",
+    "realpath",
+    "readlink",
+    "echo",
+    "printf",
+    "true",
+    "false",
+    "nl",
+    "rev",
+    "tac",
+    "strings",
+    "column",
+    "cksum",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "diff",
+    "cmp",
+    "comm",
+    "sort",
+    "uniq",
+    "cut",
+    "rg",
+    "grep",
+    "fd",
+];
+
+/// Version-print subcommands of build-tool binaries; anything else these
+/// tools do (builds, installs, package management) stays serial.
+const VERSION_ONLY_COMMANDS: &[&str] = &[
+    "cargo", "rustc", "rustup", "node", "npm", "npx", "python", "python3", "go",
+];
+
+/// Arguments that disqualify an otherwise read-only command: flags that
+/// write files (`sort -o`, `git diff --output=`), set state (`date -s`), or
+/// execute other programs (`rg --pre`, `fd -x`).  A flag matches exactly or
+/// as a `--flag=value` prefix.
+const READ_ONLY_COMMAND_EXCLUSIONS: &[(&str, &[&str])] = &[
+    ("rg", &["--pre", "--pre-glob"]),
+    ("fd", &["-x", "-X", "--exec", "--exec-batch"]),
+    ("sort", &["-o", "--output"]),
+    ("date", &["-s", "--set"]),
+    ("hostname", &["-F", "--file"]),
+];
+
+/// Judge one separator-free command operand.  Leading `VAR=value` assignments
+/// and a `cd <dir>` prefix are transparent; the remaining command word is
+/// looked up in the read-only tables.
+fn segment_is_read_only(segment: &str) -> bool {
+    let mut words: Vec<&str> = segment
+        .split_whitespace()
+        .map(strip_quotes)
+        .filter(|word| !word.is_empty())
+        .collect();
+    while words.first().is_some_and(|word| is_env_assignment(word)) {
+        words.remove(0);
+    }
+    let Some(first) = words.first() else {
+        return false;
+    };
+    if *first == "cd" {
+        // `cd <dir>` is transparent; bare `cd`, flags, or extra operands mean
+        // we did not parse what will really run.
+        return words.len() == 2 && !words[1].starts_with('-');
+    }
+    if *first == "git" {
+        return git_invocation_is_read_only(&words[1..]);
+    }
+    if *first == "find" {
+        // find(1) is read-only except for its mutating actions.
+        return !words[1..].iter().any(|word| {
+            *word == "-delete"
+                || *word == "-fls"
+                || word.starts_with("-exec")
+                || word.starts_with("-ok")
+                || word.starts_with("-fprint")
+        });
+    }
+    if READ_ONLY_COMMANDS.contains(first) {
+        // The allowlist entry covers arbitrary arguments except for the
+        // specific flags tabulated as disqualifiers.
+        return !words[1..].iter().any(|word| {
+            READ_ONLY_COMMAND_EXCLUSIONS
+                .iter()
+                .filter(|(command, _)| command == first)
+                .flat_map(|(_, flags)| flags.iter())
+                .any(|flag| *word == *flag || word.starts_with(&format!("{flag}=")))
+        });
+    }
+    if VERSION_ONLY_COMMANDS.contains(first) {
+        return words.len() == 2 && matches!(words[1], "--version" | "-V" | "version");
+    }
+    false
+}
+
+/// Judge a `git` invocation after the leading `git` word: skip known global
+/// options, then require the subcommand to be provably read-only.
+fn git_invocation_is_read_only(rest: &[&str]) -> bool {
+    let mut index = 0;
+    while index < rest.len() {
+        let word = rest[index];
+        if GIT_GLOBAL_FLAGS_WITH_VALUES.contains(&word) {
+            index += 2;
+        } else if GIT_GLOBAL_PREFIX_FLAGS
+            .iter()
+            .any(|flag| word.starts_with(flag))
+            || GIT_GLOBAL_BARE_FLAGS.contains(&word)
+        {
+            index += 1;
+        } else if word.starts_with('-') {
+            return false;
+        } else {
+            break;
+        }
+    }
+    let Some(subcommand) = rest.get(index) else {
+        // Bare `git` prints help: harmless, but pointless to batch.
+        return false;
+    };
+    let args = &rest[index + 1..];
+    // `git diff --output=<file>` (and `--output-indicator-*` are fine, but
+    // plain `--output` writes a file) fails closed.
+    if GIT_READ_ONLY_SUBCOMMANDS.contains(subcommand)
+        && matches!(*subcommand, "diff" | "show" | "whatchanged")
+        && args
+            .iter()
+            .any(|arg| arg.starts_with("--output=") || *arg == "--output")
+    {
+        return false;
+    }
+    match *subcommand {
+        _ if GIT_READ_ONLY_SUBCOMMANDS.contains(subcommand) => true,
+        "branch" | "tag" => {
+            !args.is_empty()
+                && args
+                    .iter()
+                    .all(|arg| arg.starts_with('-') && GIT_LIST_MODE_FLAGS.contains(arg))
+        }
+        "config" => args
+            .first()
+            .is_some_and(|arg| GIT_CONFIG_READ_FLAGS.contains(arg)),
+        "remote" => {
+            args.iter().all(|arg| matches!(*arg, "-v" | "--verbose"))
+                || args.first() == Some(&"get-url") && args.len() == 2
+        }
+        "worktree" | "stash" => args.first() == Some(&"list") || args.first() == Some(&"show"),
+        _ => false,
+    }
+}
+
 /// Resolve the bash `dir` argument against the workspace root, requiring an
 /// existing directory inside the workspace.  This mirrors the path scoping of
 /// find/grep; `cd` inside the command itself remains the escape hatch for
@@ -323,8 +661,16 @@ impl Tool for BashTool {
                 [
                     "Use bash for tests, builds, git, and operations not covered by a dedicated tool.".to_owned(),
                     "When a command must run in a subdirectory, pass it as the dir argument instead of prefixing the command with cd <dir> && ...".to_owned(),
+                    "Clearly read-only commands (git status, ls, cargo --version) may be batched in one response; anything with side effects must stay in its own response.".to_owned(),
                 ],
             ),
+        }
+    }
+
+    fn concurrency(&self, args: &Value) -> Concurrency {
+        match args.get("command").and_then(Value::as_str) {
+            Some(command) => command_concurrency(command),
+            None => Concurrency::Exclusive,
         }
     }
 
@@ -763,5 +1109,134 @@ mod tests {
             .await;
         assert!(!output.is_error);
         assert_eq!(output.content.trim(), "hi");
+    }
+
+    #[test]
+    fn read_only_commands_classify_concurrent() {
+        let concurrent = [
+            "git status",
+            "git log --oneline -5",
+            "git diff HEAD~1",
+            "git -C crates/tools status",
+            "git --no-pager diff",
+            "git branch --list",
+            "git tag -l",
+            "git config --get user.name",
+            "git remote -v",
+            "git stash list",
+            "cd crates/tui && git status",
+            "FOO=bar git status",
+            "ls -la",
+            "cat README.md",
+            "head -20 src/main.rs",
+            "wc -l crates/*/*.rs",
+            "pwd",
+            "which cargo",
+            "rg TODO src/",
+            "grep -rn pattern .",
+            "find . -name '*.rs' -maxdepth 2",
+            "cargo --version",
+            "node --version",
+            "echo hello",
+            "printf '%s\\n' line",
+            "stat Cargo.toml",
+            "du -sh target",
+            "uname -a",
+            "date +%Y",
+            "true",
+        ];
+        for command in concurrent {
+            assert_eq!(
+                command_concurrency(command),
+                Concurrency::ReadOnly,
+                "{command:?} should be read-only"
+            );
+        }
+    }
+
+    #[test]
+    fn mutating_or_unanalyzable_commands_stay_serial() {
+        let exclusive = [
+            "cargo test",
+            "cargo build --release",
+            "rm -rf target",
+            "touch file.txt",
+            "mkdir -p a/b",
+            "git commit -m x",
+            "git checkout main",
+            "git add .",
+            "git push",
+            "git branch new-branch",
+            "git tag v1.0.0",
+            "git config user.email a@b.c",
+            "git worktree add ../wt",
+            "find . -name '*.tmp' -delete",
+            "find . -name '*.log' -exec rm {} \\",
+            "echo hi > out.txt",
+            "cat in.txt | sort",
+            "sort < input.txt",
+            "echo $(date)",
+            "echo `date`",
+            "sleep 5 & wait",
+            "cd .. && rm -rf build",
+            "npm install",
+            "python script.py",
+            "sed -i 's/a/b/' file.txt",
+            "xargs ls < files.txt",
+            "if true; then echo hi; fi",
+            "for f in *; do cat $f; done",
+            "ls; rm file",
+            "git status && cargo test",
+            "", // empty command is rejected at execute time anyway
+        ];
+        for command in exclusive {
+            assert_eq!(
+                command_concurrency(command),
+                Concurrency::Exclusive,
+                "{command:?} must stay serial"
+            );
+        }
+    }
+
+    #[test]
+    fn side_effect_flags_on_read_only_commands_fail_closed() {
+        let exclusive = [
+            "sort -o /etc/passwd input.txt",
+            "sort --output=x.txt input.txt",
+            "date -s 2000-01-01",
+            "date --set=2000-01-01",
+            "rg --pre ./hook.sh pattern",
+            "fd -x chmod 644 \\{",
+            "fd --exec echo",
+            "hostname -F hosts.txt",
+            "git diff --output=patch.txt",
+        ];
+        for command in exclusive {
+            assert_eq!(
+                command_concurrency(command),
+                Concurrency::Exclusive,
+                "{command:?} must stay serial"
+            );
+        }
+        // Unrelated flags on the same commands stay read-only.
+        assert_eq!(
+            command_concurrency("sort -u input.txt"),
+            Concurrency::ReadOnly
+        );
+        assert_eq!(command_concurrency("rg -n TODO"), Concurrency::ReadOnly);
+    }
+
+    #[test]
+    fn quoting_and_escapes_are_respected_by_the_classifier() {
+        // Separators inside quotes do not split.
+        assert_eq!(command_concurrency("echo 'a && b'"), Concurrency::ReadOnly);
+        assert_eq!(command_concurrency("echo \"x; y\""), Concurrency::ReadOnly);
+        // A quoted word still matches the command table.
+        assert_eq!(command_concurrency("git \"status\""), Concurrency::ReadOnly);
+        // An escaped separator does not split either.
+        assert_eq!(
+            command_concurrency("echo a \\&& echo b"),
+            Concurrency::Exclusive
+        );
     }
 }

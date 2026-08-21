@@ -1,4 +1,4 @@
-use super::{Tool, ToolOutput, ToolPrompt, ToolSpec};
+use super::{Concurrency, Tool, ToolOutput, ToolPrompt, ToolSpec};
 use crate::find::{DEFAULT_GREP_LIMIT, FileSearchIndex, MAX_GREP_LIMIT, format_grep_output};
 use async_trait::async_trait;
 use fff_search::GrepMode;
@@ -69,9 +69,14 @@ impl Tool for GrepTool {
                 [
                     "Use grep for content search instead of bash grep, ripgrep, or shell pipelines.".to_owned(),
                     "Match lines are formatted path:line:content; context lines use path-line-content.".to_owned(),
+                    "Read-only: independent searches may be batched in one response and run concurrently.".to_owned(),
                 ],
             ),
         }
+    }
+
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::ReadOnly
     }
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {

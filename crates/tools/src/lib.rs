@@ -9,7 +9,7 @@ mod registry;
 pub mod skills;
 mod write;
 
-pub use bash::{BashTool, truncate_command_output};
+pub use bash::{BashTool, command_concurrency, truncate_command_output};
 pub use context_files::{format_context_files, load_context_files, load_context_files_with};
 pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
@@ -79,10 +79,36 @@ pub struct ToolOutput {
     pub summary: String,
 }
 
+/// Whether one tool invocation may run concurrently with other read-only
+/// calls or must occupy the workspace alone.
+///
+/// Classification is decided by the harness, never the model: the model is
+/// only told that batching read-only calls is encouraged. It fails closed —
+/// anything not provably side-effect-light is [`Concurrency::Exclusive`] —
+/// because a wrong `ReadOnly` corrupts workspace state, while a wrong
+/// `Exclusive` merely forfeits a little latency.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Concurrency {
+    /// Provably read-only for these arguments: safe to run concurrently
+    /// with other `ReadOnly` calls from the same turn.
+    ReadOnly,
+    /// May observe or mutate workspace state: runs alone, in program order.
+    Exclusive,
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Return the structured definition and prompt metadata for this tool.
     fn spec(&self) -> ToolSpec;
+
+    /// Harness-side concurrency classification for one invocation. Consulted
+    /// by the agent before dispatch to plan concurrent batches; the result
+    /// never reaches the model. Defaults to [`Concurrency::Exclusive`] so
+    /// custom and unknown tools always serialize; provably read-only tools
+    /// override, and argument-sensitive tools (bash) inspect `args`.
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        Concurrency::Exclusive
+    }
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput;
 }

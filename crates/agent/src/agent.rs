@@ -1,12 +1,12 @@
 use crate::config::{build_provider_with_auth, save_settings};
 use crate::prompt::system_prompt_with_workspace_context;
-use crate::tools::{ToolRegistry, call_summary};
+use crate::tools::{Concurrency, ToolOutput, ToolRegistry, call_summary};
 use auth::{AuthEvent, CopilotAuth, sku_from_proxy_token};
 use compact::{
     CompactionPolicy, SummaryOutcome, estimate_live_tokens, plan_compaction,
     summarize as compact_summarize,
 };
-use futures_util::StreamExt;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use llm::providers::github_copilot::default_model_for;
 use llm::{
     CompletionRequest, Content, LlmError, Message, Provider, RetryCallback, Role, StreamEvent,
@@ -17,7 +17,9 @@ use session::{
     StoredToolCall, export_jsonl, snapshot_entries, usage_summary,
 };
 use std::collections::VecDeque;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -226,6 +228,233 @@ pub struct Agent {
     /// no context files apply or injection is disabled. Lives in the system
     /// prompt, so it is immune to compaction.
     project_context: String,
+}
+
+/// Upper bound on read-only tool calls running at once.  Read tools are
+/// cheap, but the shared `FileSearchIndex` already gates its own concurrency
+/// and a runaway batch would thrash the disk; 8 keeps latency wins while
+/// staying polite.
+const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 8;
+
+/// One scheduling unit of a turn's tool calls.  Read-only calls group into a
+/// batch that runs concurrently; every exclusive call forms a singleton
+/// batch, preserving program order around it.  A batch of one is executed
+/// exactly like the historical serial path.
+struct ToolBatch {
+    calls: Vec<ToolCall>,
+    concurrent: bool,
+}
+
+/// An in-flight tool execution carrying its slot index so results can be
+/// recorded in original call order rather than completion order.  Borrows
+/// the registry only for the batch's lifetime.
+type ToolRun<'a> = Pin<Box<dyn Future<Output = (usize, ToolOutput, Instant)> + Send + 'a>>;
+
+/// Partition a turn's calls into batches without reordering anything: a
+/// maximal run of read-only calls becomes one batch, and every exclusive
+/// call is a singleton.  A read is never hoisted above a write because the
+/// model may intend the read to observe that write's effect.
+fn plan_tool_batches(calls: Vec<ToolCall>, registry: &ToolRegistry) -> Vec<ToolBatch> {
+    let mut batches: Vec<ToolBatch> = Vec::new();
+    for call in calls {
+        let concurrent = registry.concurrency(&call.name, &call.arguments) == Concurrency::ReadOnly;
+        match batches.last_mut() {
+            Some(batch) if batch.concurrent == concurrent && concurrent => {
+                batch.calls.push(call);
+            }
+            _ => batches.push(ToolBatch {
+                calls: vec![call],
+                concurrent,
+            }),
+        }
+    }
+    batches
+}
+
+impl Agent {
+    /// Dispatch a turn's tool calls in program order, running provably
+    /// read-only batches concurrently (bounded by
+    /// [`MAX_CONCURRENT_READ_ONLY_TOOLS`]) and exclusive calls alone.
+    ///
+    /// Cancellation is uniform: the in-flight batch shares a child token of
+    /// the turn's `cancel`, so an interrupt kills the whole batch while
+    /// leaving the turn token untouched for the next phase.  Results are
+    /// recorded in original call order — completion order inside a batch is
+    /// deliberately not observable in history or the session log.
+    async fn dispatch_tool_batches(
+        &mut self,
+        tool_calls: Vec<ToolCall>,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+        cancel: &CancellationToken,
+    ) -> Result<(), TurnError> {
+        for batch in plan_tool_batches(tool_calls, &self.tools) {
+            if batch.concurrent && batch.calls.len() > 1 {
+                tracing::debug!(count = batch.calls.len(), "running read-only tool batch");
+            }
+            // The batch shares a child token so an interrupt kills exactly
+            // this phase; the turn token stays clean for the next batch.
+            let batch_cancel = cancel.child_token();
+
+            // Announce every call up front, then launch them — all at once
+            // for singletons, bounded by [`MAX_CONCURRENT_READ_ONLY_TOOLS`]
+            // for batches, refilling as each slot completes.  Each future
+            // carries its own slot index; results land in that slot, never
+            // in completion order.
+            for call in &batch.calls {
+                send(
+                    events,
+                    AgentEvent::ToolCallStarted {
+                        name: call.name.clone(),
+                        summary: call_summary(&call.name, &call.arguments),
+                    },
+                );
+            }
+            let mut futures: FuturesUnordered<ToolRun<'_>> = FuturesUnordered::new();
+            let mut next_launch = 0usize;
+            let launch_limit = if batch.concurrent {
+                MAX_CONCURRENT_READ_ONLY_TOOLS
+            } else {
+                1
+            };
+            while next_launch < batch.calls.len().min(launch_limit) {
+                let call = &batch.calls[next_launch];
+                let registry = &self.tools;
+                let name = call.name.clone();
+                let arguments = call.arguments.clone();
+                let call_cancel = batch_cancel.clone();
+                // `next_launch` is `Copy`: each future captures its own
+                // snapshot of the slot index at construction.
+                futures.push(Box::pin(async move {
+                    let started = Instant::now();
+                    let result = registry.execute(&name, arguments, call_cancel).await;
+                    (next_launch, result, started)
+                }));
+                next_launch += 1;
+            }
+
+            let mut slots: Vec<Option<(ToolOutput, Instant)>> =
+                (0..batch.calls.len()).map(|_| None).collect();
+            let mut finished = 0usize;
+            loop {
+                tokio::select! {
+                    item = futures.next() => match item {
+                        Some((index, result, started)) => {
+                            slots[index] = Some((result, started));
+                            finished += 1;
+                            if finished == slots.len() {
+                                break;
+                            }
+                            // Refill the freed slot from the remaining
+                            // calls until the batch is exhausted.
+                            if next_launch < batch.calls.len() {
+                                let call = &batch.calls[next_launch];
+                                let registry = &self.tools;
+                                let name = call.name.clone();
+                                let arguments = call.arguments.clone();
+                                let call_cancel = batch_cancel.clone();
+                                futures.push(Box::pin(async move {
+                                    let started = Instant::now();
+                                    let result =
+                                        registry.execute(&name, arguments, call_cancel).await;
+                                    (next_launch, result, started)
+                                }));
+                                next_launch += 1;
+                            }
+                        }
+                        None => break,
+                    },
+                    message = input.recv(), if self.input_open => match message {
+                        Some(InputMessage::Interrupt) => {
+                            batch_cancel.cancel();
+                            // Drop the in-flight futures (cancelling them)
+                            // and let unfilled slots synthesize "cancelled"
+                            // results below, mirroring the historical
+                            // single-call interrupt behavior.
+                            break;
+                        }
+                        Some(message) => self.queued.push_back(message),
+                        None => self.input_open = false,
+                    },
+                    _ = cancel.cancelled() => {
+                        batch_cancel.cancel();
+                        break;
+                    }
+                }
+            }
+            drop(futures);
+
+            // Drain whatever completed, then synthesize "cancelled" results
+            // for the rest — mirroring the historical single-call behavior —
+            // and end the turn.
+            let mut cancelled = false;
+            for (call, slot) in batch.calls.iter().zip(&mut slots) {
+                let started_at = Instant::now();
+                let mut was_cancelled = false;
+                let (result, started) = match slot.take() {
+                    Some((result, started)) => (result, started),
+                    None => {
+                        was_cancelled = true;
+                        cancelled = true;
+                        // Synthesize the same "cancelled" tool result the
+                        // serial path produced, so provider history stays
+                        // valid across the refactor.
+                        (
+                            ToolOutput {
+                                content: "cancelled".to_owned(),
+                                is_error: true,
+                                summary: call_summary(&call.name, &call.arguments),
+                            },
+                            started_at,
+                        )
+                    }
+                };
+                // Historical interrupt events carried an empty output field
+                // with the error carrying the reason.
+                let output = if was_cancelled {
+                    String::new()
+                } else {
+                    result.content.clone()
+                };
+                let error = result.is_error.then(|| {
+                    if was_cancelled {
+                        "cancelled".to_owned()
+                    } else {
+                        result.content.clone()
+                    }
+                });
+                send(
+                    events,
+                    AgentEvent::ToolCallFinished {
+                        name: call.name.clone(),
+                        summary: result.summary.clone(),
+                        ok: !result.is_error,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        output,
+                        error,
+                    },
+                );
+                self.history.push(Message {
+                    role: Role::Tool,
+                    content: vec![Content::ToolResult {
+                        tool_call_id: call.id.clone(),
+                        content: result.content.clone(),
+                        is_error: result.is_error,
+                    }],
+                });
+                let _ = self.persist_tool_result(call, &result.content, result.is_error, events);
+            }
+            if cancelled {
+                self.persist_cancelled("tool execution interrupted", events);
+                send(events, AgentEvent::TurnFinished);
+                if self.cancel.is_cancelled() {
+                    return Err(TurnError::Shutdown);
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Agent {
@@ -811,93 +1040,8 @@ impl Agent {
                 return Ok(());
             }
 
-            for call in tool_calls {
-                let summary = call_summary(&call.name, &call.arguments);
-                send(
-                    events,
-                    AgentEvent::ToolCallStarted {
-                        name: call.name.clone(),
-                        // Cloned: the same label labels the finished/cancelled
-                        // tool event below.
-                        summary: summary.clone(),
-                    },
-                );
-                let started = Instant::now();
-                let result = {
-                    let tool_future =
-                        self.tools
-                            .execute(&call.name, call.arguments.clone(), cancel.clone());
-                    tokio::pin!(tool_future);
-                    loop {
-                        tokio::select! {
-                            result = &mut tool_future => break Some(result),
-                            message = input.recv(), if self.input_open => match message {
-                                Some(InputMessage::Interrupt) => {
-                                    cancel.cancel();
-                                    break None;
-                                }
-                                Some(message) => self.queued.push_back(message),
-                                None => self.input_open = false,
-                            },
-                            _ = cancel.cancelled() => break None,
-                            _ = self.cancel.cancelled() => {
-                                cancel.cancel();
-                                break None;
-                            }
-                        }
-                    }
-                };
-                let Some(result) = result else {
-                    let cancelled_output = "cancelled".to_owned();
-                    self.history.push(Message::tool_result(
-                        call.id.clone(),
-                        cancelled_output.clone(),
-                        true,
-                    ));
-                    let _ = self.persist_tool_result(&call, &cancelled_output, true, events);
-                    send(
-                        events,
-                        AgentEvent::ToolCallFinished {
-                            name: call.name.clone(),
-                            summary,
-                            ok: false,
-                            duration_ms: started.elapsed().as_millis() as u64,
-                            output: String::new(),
-                            error: Some(cancelled_output),
-                        },
-                    );
-                    self.persist_cancelled("tool execution interrupted", events);
-                    send(events, AgentEvent::TurnFinished);
-                    if self.cancel.is_cancelled() {
-                        return Err(TurnError::Shutdown);
-                    }
-                    return Ok(());
-                };
-                let output = result.content.clone();
-                let error = result.is_error.then(|| output.clone());
-                send(
-                    events,
-                    AgentEvent::ToolCallFinished {
-                        name: call.name.clone(),
-                        summary: result.summary.clone(),
-                        ok: !result.is_error,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        output,
-                        error,
-                    },
-                );
-                let result_content = result.content.clone();
-                let result_is_error = result.is_error;
-                self.history.push(Message {
-                    role: Role::Tool,
-                    content: vec![Content::ToolResult {
-                        tool_call_id: call.id.clone(),
-                        content: result_content.clone(),
-                        is_error: result_is_error,
-                    }],
-                });
-                let _ = self.persist_tool_result(&call, &result_content, result_is_error, events);
-            }
+            self.dispatch_tool_batches(tool_calls, events, input, cancel)
+                .await?;
         }
     }
 
@@ -1702,10 +1846,12 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::stream;
     use llm::{EventStream, LlmError, ModelInfo, Usage};
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use tempfile::tempdir;
+    use tools::Tool;
 
     /// One step of a canned provider script.  Errors are carried as strings
     /// because `LlmError` embeds a non-cloneable `reqwest::Error`; `stream`
@@ -1780,6 +1926,189 @@ mod tests {
             }
             (events, history)
         })
+    }
+
+    /// Execution interval of one probe invocation, for overlap assertions.
+    type ProbeLog = Arc<Mutex<Vec<(&'static str, Instant, Instant)>>>;
+
+    #[test]
+    fn plan_preserves_order_and_groups_read_only_runs() {
+        let log: ProbeLog = Arc::default();
+        let registry = ToolRegistry::try_new(vec![
+            Box::new(ProbeTool::read_only("probe_a", &log)),
+            Box::new(ProbeTool::read_only("probe_b", &log)),
+            Box::new(ProbeTool::exclusive("probe_write", &log)),
+            Box::new(ProbeTool::read_only("probe_c", &log)),
+        ])
+        .unwrap();
+        let calls = vec![
+            call("c1", "probe_a"),
+            call("c2", "probe_b"),
+            call("c3", "probe_write"),
+            call("c4", "probe_c"),
+        ];
+        let batches = plan_tool_batches(calls, &registry);
+        let described: Vec<(usize, bool)> = batches
+            .iter()
+            .map(|batch| (batch.calls.len(), batch.concurrent))
+            .collect();
+        // Maximal read-only runs group; exclusive calls stay singletons; the
+        // trailing read is NOT hoisted above the write.
+        assert_eq!(described, vec![(2, true), (1, false), (1, true)]);
+        let flattened: Vec<&str> = batches
+            .iter()
+            .flat_map(|batch| batch.calls.iter().map(|call| call.id.as_str()))
+            .collect();
+        assert_eq!(flattened, vec!["c1", "c2", "c3", "c4"]);
+    }
+
+    #[test]
+    fn read_only_calls_overlap_and_exclusive_serializes() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let log: ProbeLog = Arc::default();
+            let registry = ToolRegistry::try_new(vec![
+                Box::new(ProbeTool::read_only("probe_a", &log)),
+                Box::new(ProbeTool::read_only("probe_b", &log)),
+                Box::new(ProbeTool::exclusive("probe_write", &log)),
+            ])
+            .unwrap();
+            let provider = MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    script(vec![
+                        StreamEvent::ToolCallComplete(call("c1", "probe_a")),
+                        StreamEvent::ToolCallComplete(call("c2", "probe_b")),
+                        StreamEvent::ToolCallComplete(call("c3", "probe_write")),
+                        StreamEvent::Done {
+                            stop_reason: Some("tool_calls".into()),
+                            usage: None,
+                        },
+                    ]),
+                    script(vec![
+                        StreamEvent::TextDelta("done".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
+                error_kind: MockErrorKind::Stream,
+            };
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx.send(InputMessage::Message("go".into())).unwrap();
+            drop(input_tx);
+            Agent::new(Arc::new(provider), registry, "demo", cancel)
+                .run(input_rx, event_tx)
+                .await;
+            let mut events = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+
+            // Both read-only probes ran concurrently: their execution
+            // intervals overlap.
+            let entries = log.lock().unwrap().clone();
+            let interval = |name: &str| {
+                entries
+                    .iter()
+                    .find(|entry| entry.0 == name)
+                    .copied()
+                    .unwrap_or_else(|| panic!("{name} never executed"))
+            };
+            let (a_name, a_start, a_end) = interval("probe_a");
+            let (b_name, b_start, b_end) = interval("probe_b");
+            assert!(
+                a_start < b_end && b_start < a_end,
+                "{a_name} and {b_name} should have overlapped"
+            );
+            // The write started only after both reads finished.
+            let (_, w_start, _) = interval("probe_write");
+            assert!(w_start >= a_end && w_start >= b_end);
+
+            // Finished events arrive in original call order despite the
+            // concurrent batch.
+            let finished: Vec<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ToolCallFinished { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(finished, vec!["probe_a", "probe_b", "probe_write"]);
+        });
+    }
+
+    /// A tool whose concurrency class and latency are configurable; records
+    /// its execution interval so tests can assert real overlap.
+    struct ProbeTool {
+        name: &'static str,
+        read_only: bool,
+        log: ProbeLog,
+    }
+
+    impl ProbeTool {
+        fn read_only(name: &'static str, log: &ProbeLog) -> Self {
+            Self {
+                name,
+                read_only: true,
+                log: Arc::clone(log),
+            }
+        }
+
+        fn exclusive(name: &'static str, log: &ProbeLog) -> Self {
+            Self {
+                name,
+                read_only: false,
+                log: Arc::clone(log),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ProbeTool {
+        fn spec(&self) -> tools::ToolSpec {
+            tools::ToolSpec {
+                definition: llm::ToolDefinition {
+                    name: self.name.into(),
+                    description: "probe".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                prompt: tools::ToolPrompt::default(),
+            }
+        }
+
+        fn concurrency(&self, _args: &Value) -> Concurrency {
+            if self.read_only {
+                Concurrency::ReadOnly
+            } else {
+                Concurrency::Exclusive
+            }
+        }
+
+        async fn execute(&self, _args: Value, cancel: CancellationToken) -> ToolOutput {
+            let start = Instant::now();
+            // Long enough that two probes reliably overlap on any CI box.
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            let _ = cancel;
+            let end = Instant::now();
+            self.log.lock().unwrap().push((self.name, start, end));
+            ToolOutput {
+                content: format!("{} done", self.name),
+                is_error: false,
+                summary: self.name.into(),
+            }
+        }
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: json!({}),
+        }
     }
 
     #[test]
