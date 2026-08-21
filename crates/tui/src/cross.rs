@@ -1122,14 +1122,7 @@ fn entry_lines(entry: &Entry, width: usize, theme: Theme) -> Vec<Line<'static>> 
             branch,
             provider,
             model,
-        } => vec![metadata_line(
-            cwd,
-            branch.as_deref(),
-            provider,
-            model,
-            width,
-            theme,
-        )],
+        } => metadata_lines(cwd, branch.as_deref(), provider, model, theme),
         Entry::User { text } => render::user_lines(text, theme, width),
         Entry::Assistant {
             markdown,
@@ -1216,17 +1209,16 @@ fn tool_lines(record: &ToolRecord, width: usize, theme: Theme) -> Vec<Line<'stat
     )
 }
 
-/// The header metadata line: `cwd  (branch)` on the left, `provider · model`
-/// on the right, dim — the same pair the inline UI renders above its input
-/// box, promoted here into the startup header.
-fn metadata_line(
+/// The header metadata: two dim, left-aligned rows — `provider · model` on
+/// the first, `cwd  (branch)` on the second — replacing the old right-aligned
+/// split so both lines read as plain left-aligned chrome above the transcript.
+fn metadata_lines(
     cwd: &str,
     branch: Option<&str>,
     provider: &str,
     model: &str,
-    width: usize,
     theme: Theme,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let style = Style::default()
         .fg(theme.dim_text)
         .add_modifier(Modifier::DIM);
@@ -1234,22 +1226,10 @@ fn metadata_line(
         Some(branch) => format!("{cwd}  ({branch})"),
         None => cwd.to_owned(),
     };
-    let right = format!("{provider} · {model}");
-    let left_width = UnicodeWidthStr::width(left.as_str());
-    let right_width = UnicodeWidthStr::width(right.as_str());
-    if left_width + right_width + 2 <= width {
-        let padding = " ".repeat(width - left_width - right_width);
-        Line::from(vec![
-            Span::styled(left, style),
-            Span::raw(padding),
-            Span::styled(right, style),
-        ])
-    } else {
-        // Too narrow to split: keep both, unwrapped; the wrap layer above us
-        // never sees this line (it is one row by construction), so bound it.
-        let joined = format!("{left}  {right}");
-        Line::from(Span::styled(joined, style))
-    }
+    vec![
+        Line::from(Span::styled(format!("{provider} · {model}"), style)),
+        Line::from(Span::styled(left, style)),
+    ]
 }
 
 /// A centered `── label ──` rule marking a conversation boundary.
@@ -1687,22 +1667,31 @@ mod tests {
     }
 
     #[test]
-    fn metadata_line_splits_cwd_and_model_across_the_width() {
-        let line = metadata_line(
+    fn metadata_header_is_two_dim_left_aligned_lines() {
+        let lines = metadata_lines(
             "~/proj",
             Some("main"),
-            "github-copilot",
+            "opencode-go",
             "gpt-5",
-            60,
             Theme::default(),
         );
-        let text = row_text(&line);
-        assert!(text.starts_with("~/proj  (main)"));
-        assert!(text.ends_with("github-copilot · gpt-5"));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(row_text(&lines[0]), "opencode-go · gpt-5");
+        assert_eq!(row_text(&lines[1]), "~/proj  (main)");
+        // Both rows are dimmed.
+        for line in &lines {
+            assert!(
+                line.spans
+                    .iter()
+                    .all(|span| span.style.add_modifier.contains(Modifier::DIM)),
+                "metadata row should be dim: {}",
+                row_text(line)
+            );
+        }
 
-        // Narrow terminals fall back to the joined form.
-        let line = metadata_line("~/proj", None, "p", "m", 5, Theme::default());
-        assert_eq!(row_text(&line), "~/proj  p · m");
+        // No branch: the second row is just the cwd.
+        let lines = metadata_lines("~/proj", None, "p", "m", Theme::default());
+        assert_eq!(row_text(&lines[1]), "~/proj");
     }
 
     #[test]
