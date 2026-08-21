@@ -1761,7 +1761,11 @@ fn tool_lines(
 ) -> Vec<Line<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     // Agent summaries read `bash: <command>` / `read <path>` / …; bash reads
-    // as a shell line, everything else keeps its `tool param` shape.
+    // as a shell line, every other tool as `<verb> <param>` with the verb in
+    // the same accent as the `$` so all tool lines share one signature.
+    let marker_style = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
     let command = record
         .summary
         .strip_prefix("bash:")
@@ -1769,21 +1773,23 @@ fn tool_lines(
         .filter(|rest| !rest.is_empty());
     match command {
         Some(command) => {
-            spans.push(Span::styled(
-                "$ ",
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.push(Span::styled("$ ", marker_style));
             spans.push(Span::styled(
                 command.to_owned(),
                 Style::default().fg(theme.primary_text),
             ));
         }
-        None => spans.push(Span::styled(
-            record.summary.trim().to_owned(),
-            Style::default().fg(theme.primary_text),
-        )),
+        None => {
+            let summary = record.summary.trim();
+            let (verb, rest) = summary.split_once(' ').unwrap_or((summary, ""));
+            spans.push(Span::styled(verb.to_owned(), marker_style));
+            if !rest.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {rest}"),
+                    Style::default().fg(theme.primary_text),
+                ));
+            }
+        }
     }
     match record.status {
         ToolStatus::Running => {}
@@ -1804,16 +1810,12 @@ fn tool_lines(
             ));
         }
     }
-    let summary_lines = render::prefix_message_lines(
-        render::wrap_text(
-            &Text::from(Line::from(spans)),
-            width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
-            Style::default(),
-        ),
-        // The bash `$` is part of the spans; other tools keep the plain
-        // summary, so the wrap prefix is empty for them.
-        "",
-        theme,
+    // The marker/verb is part of the spans, so no extra message prefix is
+    // applied; the wrapper only reflows the line to the available width.
+    let summary_lines = render::wrap_text(
+        &Text::from(Line::from(spans)),
+        width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
+        Style::default(),
     );
     if !expanded {
         return summary_lines;
@@ -2461,11 +2463,26 @@ mod tests {
         let lines = tool_lines(&record(ToolStatus::Failure), false, 60, Theme::default());
         assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
 
-        // Non-bash tools keep their `tool param` summary shape.
+        // Non-bash tools keep their `tool param` summary shape, with the
+        // verb accented like the `$` marker.
         let mut read = record(ToolStatus::Success);
         read.summary = "read src/main.rs".into();
         let lines = tool_lines(&read, false, 60, Theme::default());
         assert_eq!(row_text(&lines[0]), "read src/main.rs · 1.2s");
+        assert!(matches!(
+            lines[0].spans[0],
+            Span { .. }
+            if lines[0].spans[0].style.fg == Some(Theme::default().accent)
+        ));
+        assert_eq!(lines[0].spans[0].content, "read");
+        assert_eq!(lines[0].spans[1].content, " src/main.rs");
+
+        // A single-word summary (no parameter) is all accent, no crash.
+        let mut bare = record(ToolStatus::Running);
+        bare.summary = "compact".into();
+        let lines = tool_lines(&bare, false, 60, Theme::default());
+        assert_eq!(row_text(&lines[0]), "compact");
+        assert_eq!(lines[0].spans.len(), 1);
     }
 
     #[test]
