@@ -12,7 +12,14 @@ bytes = "1"
 eventsource-stream = "0.2"
 futures-core = "0.3"
 futures-util = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream", "json"] }
+# Installs the process-wide rustls crypto provider before any reqwest client
+# is built. reqwest's default `rustls` feature hard-wires aws-lc-rs (C/asm,
+# large); `ring` serves the same TLS stack with a smaller binary. The direct
+# rustls dependency exists to enable its `ring` provider module (the provider
+# lives at `rustls::crypto::ring`, not in the `ring` crate itself).
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

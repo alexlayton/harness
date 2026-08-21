@@ -157,6 +157,11 @@ impl GithubCopilotClient {
     }
 
     fn from_endpoints(endpoints: CopilotEndpoints) -> Result<Self> {
+        // The auth client shares the process-wide rustls crypto provider
+        // installed by `llm`'s HTTP setup; with `rustls-no-provider` a Client
+        // built before that install would panic, so mirror the install here.
+        // Idempotent: rustls rejects double installs and we ignore the error.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         Ok(Self {
             http: Client::builder()
                 .user_agent(COPILOT_USER_AGENT)

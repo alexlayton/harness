@@ -2,6 +2,7 @@ use crate::LlmError;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::Value;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// How long a provider connection may take to establish (DNS + TCP + TLS).
@@ -20,19 +21,35 @@ pub const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The reqwest client shared by every provider dialect.
 ///
+/// One process-wide instance: every dialect client (`OpenAiChatClient`,
+/// `OpenAiResponsesClient`, `AnthropicMessagesClient`) used to build its own
+/// pool per construction, so a Copilot provider alone created three disjoint
+/// connection pools and keep-alive TLS connections died at every dialect or
+/// provider switch. Sharing one pool lets keep-alive connections survive
+/// across turns and endpoints.
+///
 /// A `read_timeout` (not a total `timeout`) is essential here: a total
 /// timeout would abort legitimate multi-minute generations, while the idle
 /// timeout fires only on a stream that has gone completely silent.
+/// `tcp_nodelay` disables Nagle so small SSE chunks are flushed immediately
+/// instead of coalesced into perceptible stutter.
 ///
 /// Panics only if reqwest cannot initialize its TLS backend, which is a
 /// configuration failure worth failing loudly rather than silently
 /// reverting to an unbounded client.
 pub fn streaming_client() -> Client {
-    Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_IDLE_TIMEOUT)
-        .build()
-        .expect("reqwest client with rustls should initialize")
+    static SHARED: OnceLock<Client> = OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            crate::install_ring_crypto_provider();
+            Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_IDLE_TIMEOUT)
+                .tcp_nodelay(true)
+                .build()
+                .expect("reqwest client with rustls should initialize")
+        })
+        .clone()
 }
 
 /// Shared HTTP plumbing for the OpenAI-compatible request clients
