@@ -169,6 +169,14 @@ pub fn find_candidates(root: &Path, query: &str, cancel: &CancellationToken) -> 
         score_b
             .cmp(score_a)
             .then_with(|| dir_b.cmp(dir_a))
+            // Root-level entries first: `README.md` must not lose to
+            // `crates/agent/README.md` merely because it sorts later.
+            .then_with(|| {
+                path_a
+                    .matches('/')
+                    .count()
+                    .cmp(&path_b.matches('/').count())
+            })
             .then_with(|| {
                 path_a
                     .to_ascii_lowercase()
@@ -449,6 +457,23 @@ mod tests {
         assert!(score_path("SomeViewModel.rs", "ViewModel", false).is_some());
         assert!(score_path("some_view_model.rs", "svm", false).is_some());
         assert!(score_path("src/main.rs", "zz", false).is_none());
+    }
+
+    #[test]
+    fn root_files_rank_above_equally_scoring_deep_paths() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("crates/agent")).unwrap();
+        fs::write(directory.path().join("README.md"), "root\n").unwrap();
+        fs::write(directory.path().join("crates/agent/README.md"), "deep\n").unwrap();
+
+        // Both are exact basename matches, so the tie must be broken by
+        // depth: the root `README.md` is the first suggestion (and therefore
+        // what Tab accepts).
+        let candidates = find_candidates(directory.path(), "readme", &CancellationToken::new());
+        assert_eq!(
+            values(&candidates),
+            vec!["@README.md", "@crates/agent/README.md"]
+        );
     }
 
     #[test]

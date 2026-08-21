@@ -585,6 +585,18 @@ impl CrossTerm {
             self.close_completion();
             return;
         };
+        // Seed the request with the open list so the hint never blanks out
+        // while the debounced scan for the refined query is in flight; the
+        // fresh results replace them on arrival.
+        let (initial, preferred) = self
+            .completion
+            .as_ref()
+            .filter(|completion| completion.kind == CompletionKind::Path)
+            .map(|completion| {
+                let preferred = completion.candidates.get(completion.selected).cloned();
+                (completion.candidates.clone(), preferred)
+            })
+            .unwrap_or_default();
         self.request_path_completion(
             CompletionContext {
                 target: CompletionTarget::Argument(ArgumentKind::Path),
@@ -592,8 +604,8 @@ impl CrossTerm {
                 token_end: prefix.token_end,
                 query: prefix.query.clone(),
             },
-            Vec::new(),
-            None,
+            initial,
+            preferred.map(|candidate| candidate.value),
             Some(prefix),
         );
     }
@@ -789,6 +801,22 @@ impl CrossTerm {
             self.accept_candidate(&candidate, &completion.context, input_tx)?;
             return Ok(());
         }
+        // File references rank fuzzily, so a shared prefix is usually
+        // meaningless (`agent.rs` ranks `crates/agent/src/agent.rs` first).
+        // Tab accepts the highlighted candidate — the top-ranked match on the
+        // first press — and a further Tab on an already-inserted token cycles
+        // to the next candidate.
+        if completion.kind == CompletionKind::Path {
+            let mut selected = completion.selected;
+            let token = &self.input[completion.context.token_start
+                ..completion.context.token_end.min(self.input.len())];
+            if completion.candidates[selected].value == token {
+                selected = (selected + 1) % completion.candidates.len();
+            }
+            let candidate = completion.candidates[selected].clone();
+            self.accept_candidate(&candidate, &completion.context, input_tx)?;
+            return Ok(());
+        }
         // Multiple candidates: extend the shared prefix, or cycle among them
         // once the token already matches the common prefix.
         let prefix = commands::common_prefix(&completion.candidates);
@@ -964,6 +992,21 @@ impl CrossTerm {
         let cursor_col = self.cursor_char_col();
         if completion.candidates.is_empty() {
             return String::new();
+        }
+        // Path completions preview the highlighted candidate — exactly what
+        // the next Tab inserts — as the untyped remainder of the token. A
+        // fuzzy match (`agent.rs` → `crates/agent/src/agent.rs`) shares no
+        // literal prefix, so there is nothing honest to dim inline; the hint
+        // row above the input carries those suggestions instead.
+        if completion.kind == CompletionKind::Path {
+            let candidate = &completion.candidates[completion.selected];
+            let token_end = completion.context.token_end.min(self.input.len());
+            let typed = &self.input[completion.context.token_start..token_end];
+            return candidate
+                .value
+                .strip_prefix(typed)
+                .map(str::to_owned)
+                .unwrap_or_default();
         }
         if completion.candidates.len() == 1 {
             return commands::candidate_suffix(
@@ -2371,6 +2414,7 @@ fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
 
     fn ui(width: u16, height: u16) -> CrossTerm {
         CrossTerm::base(
@@ -2888,11 +2932,191 @@ mod tests {
         // A fuzzy match (`Re` → README) shares no literal prefix with the
         // typed token, so there is no ghost to preview.
         assert_eq!(ui.ghost_text(), "");
-
         // Tab accepts the candidate and appends a trailing space.
         let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
         ui.handle_tab(&tx).unwrap();
         assert_eq!(ui.input, "look at @src/README.md ");
+    }
+
+    #[tokio::test]
+    async fn tab_accepts_the_top_ranked_at_candidate_then_cycles() {
+        let mut ui = ui(80, 24);
+        ui.input = "look at @REA".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let generation = ui.path_completion_generation;
+        let context = ui.completion.as_ref().unwrap().context.clone();
+        // Ranking put the root README first (see the paths tests).
+        ui.apply_path_completion(PathCompletionResult {
+            generation,
+            context,
+            candidates: vec![
+                Candidate {
+                    value: "@README.md".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                },
+                Candidate {
+                    value: "@crates/agent/README.md".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                },
+            ],
+            at_prefix: paths::extract_at_prefix("look at @REA", 11),
+        });
+
+        // The ghost previews exactly what Tab will insert.
+        assert_eq!(ui.ghost_text(), "DME.md");
+
+        // First Tab accepts the top-ranked candidate; the trailing space ends
+        // the token so typing continues on a fresh one.
+        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(ui.input, "look at @README.md ");
+    }
+
+    #[tokio::test]
+    async fn fuzzy_at_tab_accepts_the_ranked_match_and_a_repeat_cycles() {
+        let mut ui = ui(80, 24);
+        ui.input = "@agent.rs".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let generation = ui.path_completion_generation;
+        let context = ui.completion.as_ref().unwrap().context.clone();
+        ui.apply_path_completion(PathCompletionResult {
+            generation,
+            context,
+            candidates: vec![
+                Candidate {
+                    value: "@crates/agent/src/agent.rs".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                },
+                Candidate {
+                    value: "@crates/tui/src/app.rs".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                },
+            ],
+            at_prefix: paths::extract_at_prefix("@agent.rs", 9),
+        });
+
+        // No literal extension of `@agent.rs` exists, so nothing is dimmed
+        // inline — but Tab still completes to the ranked match.
+        assert_eq!(ui.ghost_text(), "");
+        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(ui.input, "@crates/agent/src/agent.rs ");
+
+        // The accepted file closes the list; re-opening on the same token and
+        // pressing Tab again cycles to the next candidate.
+        ui.cursor = "@crates/agent/src/agent.rs".len();
+        ui.refresh_completion();
+        let generation = ui.path_completion_generation;
+        let context = ui.completion.as_ref().unwrap().context.clone();
+        ui.apply_path_completion(PathCompletionResult {
+            generation,
+            context,
+            candidates: vec![
+                Candidate {
+                    value: "@crates/agent/src/agent.rs".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                },
+                Candidate {
+                    value: "@crates/tui/src/app.rs".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                },
+            ],
+            at_prefix: paths::extract_at_prefix("@crates/agent/src/agent.rs", 26),
+        });
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(ui.input, "@crates/tui/src/app.rs ");
+    }
+
+    #[tokio::test]
+    async fn enter_still_submits_while_an_at_list_is_open() {
+        let mut ui = ui(80, 24);
+        ui.input = "look at @Re".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let generation = ui.path_completion_generation;
+        let context = ui.completion.as_ref().unwrap().context.clone();
+        ui.apply_path_completion(PathCompletionResult {
+            generation,
+            context,
+            candidates: vec![Candidate {
+                value: "@README.md".into(),
+                description: "file".into(),
+                kind: CandidateKind::File,
+            }],
+            at_prefix: paths::extract_at_prefix("look at @Re", 11),
+        });
+
+        // Enter is submit-only: completion stays a Tab affair.
+        let (tx, mut rx) = mpsc::unbounded_channel::<InputMessage>();
+        let cancel = CancellationToken::new();
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        ui.handle_input(&enter, &tx, &cancel).unwrap();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(InputMessage::Message("look at @Re".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn refining_an_at_query_keeps_the_previous_candidates_visible() {
+        let mut ui = ui(80, 24);
+        ui.input = "look at @Re".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let generation = ui.path_completion_generation;
+        let context = ui.completion.as_ref().unwrap().context.clone();
+        ui.apply_path_completion(PathCompletionResult {
+            generation,
+            context,
+            candidates: vec![Candidate {
+                value: "@README.md".into(),
+                description: "file".into(),
+                kind: CandidateKind::File,
+            }],
+            at_prefix: paths::extract_at_prefix("look at @Re", 11),
+        });
+
+        // Keep typing: the refined scan is still in flight, but the open
+        // list must not blank out while waiting for it.
+        ui.input.push('a');
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let completion = ui.completion.as_ref().expect("list stays open");
+        assert_eq!(completion.candidates.len(), 1);
+        assert_eq!(completion.candidates[0].value, "@README.md");
+        assert_eq!(ui.path_completion_query.as_deref(), Some("Rea"));
+    }
+
+    #[test]
+    fn path_ghost_previews_the_highlighted_remainder() {
+        let mut ui = ui(80, 24);
+        ui.input = "see @REA".to_owned();
+        ui.cursor = ui.input.len();
+        ui.completion = Some(Completion {
+            context: CompletionContext {
+                target: CompletionTarget::Argument(ArgumentKind::Path),
+                token_start: 4,
+                token_end: 8,
+                query: "REA".into(),
+            },
+            candidates: vec![Candidate {
+                value: "@README.md".into(),
+                description: "file".into(),
+                kind: CandidateKind::File,
+            }],
+            selected: 0,
+            kind: CompletionKind::Path,
+        });
+        // The dimmed suffix is exactly what Tab inserts.
+        assert_eq!(ui.ghost_text(), "DME.md");
     }
 
     #[tokio::test]
