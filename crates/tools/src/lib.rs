@@ -10,17 +10,15 @@ pub mod skills;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
-pub use context_files::{
-    display_path, format_context_files, load_context_files, load_context_files_with,
-};
+pub use context_files::{format_context_files, load_context_files, load_context_files_with};
 pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use registry::{ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError};
 pub use skills::{
-    Skill, SkillCatalog, SkillDiagnostic, SkillEntry, SkillMode, SkillSeverity, discover,
-    expand_tilde, format_skills_prompt, load_skills_from_dir, parse_frontmatter,
+    Skill, SkillCatalog, SkillDiagnostic, SkillMode, SkillSeverity, discover, expand_tilde,
+    format_skills_prompt, load_skills_from_dir, parse_frontmatter,
 };
 pub use write::WriteTool;
 
@@ -421,6 +419,69 @@ fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value)
 }
 
+/// Expanded per-tool recap shown in the transcript. Unlike [`call_summary`]
+/// this includes the secondary arguments a user may want to see (line ranges,
+/// limits, timeouts) while still staying readable and free of raw JSON. Falls
+/// back to [`call_summary`] when there are no interesting extras.
+pub fn call_recap(name: &str, args: &Value) -> String {
+    let base = call_summary(name, args);
+    let extras = match name {
+        "read" => {
+            let offset = args.get("offset").and_then(Value::as_u64);
+            let limit = args.get("limit").and_then(Value::as_u64);
+            match (offset, limit) {
+                (Some(offset), Some(limit)) if offset != 1 => {
+                    // offset is 1-indexed and limit counts lines, so the last
+                    // line covered is `offset + limit - 1`.
+                    Some(format!("lines {offset}–{}", offset + limit - 1))
+                }
+                (Some(_), Some(limit)) => Some(format!("lines 1–{}", limit)),
+                _ => None,
+            }
+        }
+        "bash" => {
+            let dir = args.get("dir").and_then(Value::as_str);
+            let timeout = args.get("timeout").and_then(Value::as_u64);
+            match (dir, timeout) {
+                (Some(dir), Some(timeout)) => Some(format!("in {dir} · timeout {timeout}s")),
+                (Some(dir), None) => Some(format!("in {dir}")),
+                (None, Some(timeout)) => Some(format!("timeout {timeout}s")),
+                (None, None) => None,
+            }
+        }
+        "find" => args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|limit| format!("limit {limit}")),
+        "grep" => {
+            let limit = args.get("limit").and_then(Value::as_u64);
+            let context = args.get("context").and_then(Value::as_u64);
+            match (limit, context) {
+                (Some(limit), Some(context)) if context > 0 => {
+                    Some(format!("limit {limit} · context {context}"))
+                }
+                (Some(limit), _) => Some(format!("limit {limit}")),
+                (None, Some(context)) if context > 0 => Some(format!("context {context}")),
+                _ => None,
+            }
+        }
+        "write" | "edit" => {
+            // The path in the summary already carries the interesting content.
+            None
+        }
+        _ => {
+            // Custom tools have no curated recap; keep their arguments visible
+            // instead of hiding them behind the bare tool name.
+            let compact = serde_json::to_string(args).unwrap_or_default();
+            (compact != "null" && compact != "{}").then(|| format!("args {compact}"))
+        }
+    };
+    match extras {
+        Some(extras) => format!("{base} ({extras})"),
+        None => base,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +509,51 @@ mod tests {
             ),
             "find ViewModel in src"
         );
+    }
+
+    #[test]
+    fn recap_includes_secondary_arguments_human_readably() {
+        assert_eq!(
+            call_recap("read", &serde_json::json!({"path": "a.rs"})),
+            "read a.rs"
+        );
+        assert_eq!(
+            call_recap(
+                "read",
+                &serde_json::json!({"path": "a.rs", "offset": 2, "limit": 30})
+            ),
+            "read a.rs (lines 2–31)"
+        );
+        assert_eq!(
+            call_recap(
+                "bash",
+                &serde_json::json!({"command": "cargo test", "dir": "crates/tui", "timeout": 30})
+            ),
+            "bash: cargo test (in crates/tui · timeout 30s)"
+        );
+        assert_eq!(
+            call_recap("find", &serde_json::json!({"query": "foo", "limit": 25})),
+            "find foo (limit 25)"
+        );
+        assert_eq!(
+            call_recap(
+                "grep",
+                &serde_json::json!({"pattern": "TODO", "context": 2})
+            ),
+            "grep TODO (context 2)"
+        );
+        // Unknown tools have no curated recap; the raw args stay visible.
+        assert_eq!(
+            call_recap("custom", &serde_json::json!({"a": 1})),
+            "custom (args {\"a\":1})"
+        );
+        // edit/write already carry their path in the summary; nothing to add.
+        assert_eq!(
+            call_recap("edit", &serde_json::json!({"path": "a.rs"})),
+            "edit a.rs"
+        );
+        // Empty or absent args add no noise.
+        assert_eq!(call_recap("custom", &serde_json::json!({})), "custom");
     }
 
     #[test]
