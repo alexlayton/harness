@@ -65,7 +65,10 @@ use crate::input::{history_next, history_previous, push_history};
 use crate::paths::{self, AtPrefix};
 use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
-use crate::{InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, TuiEvent, UiEvent};
+use crate::{
+    ContextFileEntry, InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, SkillEntry,
+    TuiEvent, UiEvent,
+};
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
 use crossterm::event::{
@@ -113,6 +116,10 @@ enum Entry {
         branch: Option<String>,
         provider: String,
         model: String,
+        /// Auto-loaded AGENTS.md / CLAUDE.md paths (display form).
+        context_files: Vec<String>,
+        /// Discovered skill names.
+        skills: Vec<String>,
     },
     User {
         text: String,
@@ -244,10 +251,15 @@ pub struct CrossTerm {
     /// window are correctly re-rendered.
     tools_expanded: bool,
 
-    // Completion (fish-style inline).
+    /// Cached completion models for a provider.
     providers: Vec<String>,
     model_lists: HashMap<String, Vec<ModelEntry>>,
     session_candidates: Vec<SessionListEntry>,
+    /// Discovered skills, for `/<skill>` completion and `/skill <name>`
+    /// argument completion.
+    skills: Vec<SkillEntry>,
+    /// Auto-loaded AGENTS.md / CLAUDE.md paths for the header context row.
+    context_files: Vec<ContextFileEntry>,
     session_completion_requested: bool,
     /// Providers we have already asked the agent to fetch, to avoid duplicate
     /// `ListModels` requests while typing through a model token.
@@ -275,7 +287,15 @@ pub struct CrossTerm {
 impl CrossTerm {
     /// Assemble the UI state without touching the terminal. `new` layers the
     /// terminal setup on top, and tests use this directly.
-    fn base(model: &str, provider: &str, providers: Vec<String>, width: u16, height: u16) -> Self {
+    fn base(
+        model: &str,
+        provider: &str,
+        providers: Vec<String>,
+        skills: Vec<SkillEntry>,
+        context_files: Vec<ContextFileEntry>,
+        width: u16,
+        height: u16,
+    ) -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let environment = EnvironmentInfo::discover(workspace_root);
         let (path_completion_tx, path_completion_rx) = mpsc::unbounded_channel();
@@ -301,6 +321,8 @@ impl CrossTerm {
             providers,
             model_lists: HashMap::new(),
             session_candidates: Vec::new(),
+            skills,
+            context_files,
             session_completion_requested: false,
             model_list_requested: HashSet::new(),
             completion: None,
@@ -319,10 +341,26 @@ impl CrossTerm {
         }
     }
 
-    pub fn new(model: &str, provider: &str, providers: Vec<String>) -> Result<Self> {
+    /// `skills` and `context_files` come from the startup discovery in main
+    /// (the TUI never touches the filesystem for them).
+    pub fn new(
+        model: &str,
+        provider: &str,
+        providers: Vec<String>,
+        skills: Vec<SkillEntry>,
+        context_files: Vec<ContextFileEntry>,
+    ) -> Result<Self> {
         install_panic_hook();
         let (width, height) = terminal::size().unwrap_or((80, 24));
-        let mut ui = Self::base(model, provider, providers, width, height);
+        let mut ui = Self::base(
+            model,
+            provider,
+            providers,
+            skills,
+            context_files,
+            width,
+            height,
+        );
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
         if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
             let _ = terminal::disable_raw_mode();
@@ -628,6 +666,7 @@ impl CrossTerm {
             &self.model_lists,
             &self.provider,
             &self.session_candidates,
+            &self.skills,
         ) else {
             self.completion = None;
             self.session_completion_requested = false;
@@ -725,7 +764,7 @@ impl CrossTerm {
     fn apply_replacement(&mut self, candidate: &Candidate, context: &CompletionContext) {
         let cursor_col = self.cursor_char_col();
         let Some((replacement, new_cursor_col)) =
-            commands::apply_completion(&self.input, cursor_col, context, candidate)
+            commands::apply_completion(&self.input, cursor_col, context, candidate, &self.skills)
         else {
             return;
         };
@@ -959,6 +998,7 @@ impl CrossTerm {
             &self.model_lists,
             &self.provider,
             &self.session_candidates,
+            &self.skills,
         )
         .map(|result| result.candidates)
         .unwrap_or_default();
@@ -1094,7 +1134,7 @@ impl CrossTerm {
         input: &str,
         input_tx: &mpsc::UnboundedSender<InputMessage>,
     ) -> Result<()> {
-        let command = match commands::parse_command(input) {
+        let command = match commands::parse_command_with_skills(input, &self.skills) {
             Ok(command) => command,
             Err(error) => {
                 self.add_error(error);
@@ -1141,6 +1181,21 @@ impl CrossTerm {
             }
             ParsedCommand::SetModel { provider, model } => {
                 InputMessage::SetModel { provider, model }
+            }
+            ParsedCommand::InvokeSkill { name, alias } => {
+                // The echo already shows what was typed; label the alias form
+                // so it is clear which skill will run.
+                if alias {
+                    self.add_notice(format!("{input} · skill: {name}"));
+                }
+                InputMessage::InvokeSkill { name }
+            }
+            ParsedCommand::Skills => {
+                // Filled asynchronously by the agent's SkillsLoaded event.
+                input_tx
+                    .send(InputMessage::ListSkills)
+                    .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+                return Ok(());
             }
         };
         input_tx
@@ -1379,6 +1434,28 @@ impl CrossTerm {
             UiEvent::SessionExported { path } => {
                 self.add_notice(format!("exported session to {path}"));
             }
+            UiEvent::SkillsLoaded {
+                skills,
+                diagnostics,
+                empty,
+            } => {
+                if empty {
+                    self.add_notice(
+                        "no skills discovered\nlooked in .harness/skills and .agents/skills (project and ~)",
+                    );
+                    return;
+                }
+                let mut text = skills
+                    .iter()
+                    .map(|skill| format!("{:<16} {}", skill.name, skill.description))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !diagnostics.is_empty() {
+                    text.push_str("\n\ndiagnostics:\n");
+                    text.push_str(&diagnostics.join("\n"));
+                }
+                self.add_notice(text);
+            }
             UiEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
@@ -1423,6 +1500,12 @@ impl CrossTerm {
             branch: self.environment.branch.clone(),
             provider: self.provider.clone(),
             model: self.model.clone(),
+            context_files: self
+                .context_files
+                .iter()
+                .map(|file| file.path.clone())
+                .collect(),
+            skills: self.skills.iter().map(|skill| skill.name.clone()).collect(),
         }
     }
 
@@ -1810,7 +1893,17 @@ fn entry_lines(
             branch,
             provider,
             model,
-        } => metadata_lines(cwd, branch.as_deref(), provider, model, theme),
+            context_files,
+            skills,
+        } => metadata_lines(
+            cwd,
+            branch.as_deref(),
+            provider,
+            model,
+            context_files,
+            skills,
+            theme,
+        ),
         Entry::User { text } => render::user_lines(text, theme, width),
         Entry::Assistant {
             markdown,
@@ -1947,14 +2040,36 @@ fn push_detail_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, wi
     }
 }
 
+/// How many context/skill entries each header row shows before folding into
+/// `+N more`. Skills are cheap to accumulate (one per directory), so the cap
+/// keeps a skill-heavy workspace from pushing the transcript out of view.
+const METADATA_MAX_ENTRIES: usize = 4;
+
+fn fold_entries(entries: &[String]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let shown = entries.len().min(METADATA_MAX_ENTRIES);
+    let mut text = entries[..shown].join(", ");
+    let hidden = entries.len() - shown;
+    if hidden > 0 {
+        let _ = write!(text, " · +{hidden} more");
+    }
+    Some(text)
+}
+
 /// The header metadata: two dim, left-aligned rows — `cwd  (branch)` on the
 /// first, `provider · model` on the second — replacing the old right-aligned
 /// split so both lines read as plain left-aligned chrome above the transcript.
+/// Two optional rows follow when project context or skills were auto-loaded:
+/// `context: …` and `skills: …`, capped at [`METADATA_MAX_ENTRIES`] names.
 fn metadata_lines(
     cwd: &str,
     branch: Option<&str>,
     provider: &str,
     model: &str,
+    context_files: &[String],
+    skills: &[String],
     theme: Theme,
 ) -> Vec<Line<'static>> {
     let style = Style::default()
@@ -1964,10 +2079,16 @@ fn metadata_lines(
         Some(branch) => format!("{cwd}  ({branch})"),
         None => cwd.to_owned(),
     };
-    vec![
+    let mut lines = vec![
         Line::from(Span::styled(left, style)),
-        Line::from(Span::styled(format!("{provider} · {model}"), style)),
-    ]
+        Line::from(Span::styled(format!("{provider} \u{b7} {model}"), style)),
+    ];
+    for (label, entries) in [("context", context_files), ("skills", skills)] {
+        if let Some(text) = fold_entries(entries) {
+            lines.push(Line::from(Span::styled(format!("{label}: {text}"), style)));
+        }
+    }
+    lines
 }
 
 /// A centered `── label ──` rule marking a conversation boundary.
@@ -2421,6 +2542,8 @@ mod tests {
             "test-model",
             "test-provider",
             vec!["opencode-go".into(), "openrouter".into()],
+            Vec::new(),
+            Vec::new(),
             width,
             height,
         )
@@ -2606,6 +2729,8 @@ mod tests {
             Some("main"),
             "opencode-go",
             "gpt-5",
+            &[],
+            &[],
             Theme::default(),
         );
         assert_eq!(lines.len(), 2);
@@ -2623,8 +2748,49 @@ mod tests {
         }
 
         // No branch: the first row is just the cwd.
-        let lines = metadata_lines("~/proj", None, "p", "m", Theme::default());
+        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], Theme::default());
         assert_eq!(row_text(&lines[0]), "~/proj");
+    }
+
+    #[test]
+    fn metadata_header_shows_context_and_skill_rows_capped() {
+        let lines = metadata_lines(
+            "~/proj",
+            None,
+            "p",
+            "m",
+            &["AGENTS.md".into(), "~/.harness/AGENTS.md".into()],
+            &["alpha".into(), "beta".into()],
+            Theme::default(),
+        );
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            row_text(&lines[2]),
+            "context: AGENTS.md, ~/.harness/AGENTS.md"
+        );
+        assert_eq!(row_text(&lines[3]), "skills: alpha, beta");
+
+        // More than the cap folds into `+N more`.
+        let many = (0..6).map(|index| format!("s{index}")).collect::<Vec<_>>();
+        let lines = metadata_lines(
+            "~/proj",
+            None,
+            "p",
+            "m",
+            &[],
+            &many
+                .iter()
+                .map(String::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            Theme::default(),
+        );
+        assert_eq!(lines.len(), 3);
+        assert_eq!(row_text(&lines[2]), "skills: s0, s1, s2, s3 · +2 more");
+
+        // Nothing loaded: no extra rows.
+        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], Theme::default());
+        assert_eq!(lines.len(), 2);
     }
 
     #[test]

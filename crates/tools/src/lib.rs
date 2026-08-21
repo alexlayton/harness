@@ -10,15 +10,17 @@ pub mod skills;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
-pub use context_files::{format_context_files, load_context_files, load_context_files_with};
+pub use context_files::{
+    display_path, format_context_files, load_context_files, load_context_files_with,
+};
 pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;
 pub use read::ReadTool;
 pub use registry::{ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError};
 pub use skills::{
-    Skill, SkillCatalog, SkillDiagnostic, SkillMode, SkillSeverity, discover, expand_tilde,
-    format_skills_prompt, load_skills_from_dir, parse_frontmatter,
+    Skill, SkillCatalog, SkillDiagnostic, SkillEntry, SkillMode, SkillSeverity, discover,
+    expand_tilde, format_skills_prompt, load_skills_from_dir, parse_frontmatter,
 };
 pub use write::WriteTool;
 

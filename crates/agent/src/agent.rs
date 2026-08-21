@@ -102,6 +102,13 @@ pub enum AgentEvent {
     SessionExported {
         path: String,
     },
+    /// The discovered-skill view requested by the TUI's `/skills` command.
+    SkillsLoaded {
+        skills: Vec<tools::SkillEntry>,
+        diagnostics: Vec<String>,
+        /// True when no skills were discovered at all.
+        empty: bool,
+    },
     UsageUpdated {
         input_tokens: u64,
         output_tokens: u64,
@@ -713,6 +720,14 @@ impl Agent {
                     self.handle_list_models(provider, &events);
                     continue;
                 }
+                InputMessage::ListSkills => {
+                    self.handle_list_skills(&events);
+                    continue;
+                }
+                InputMessage::InvokeSkill { name } => {
+                    self.handle_invoke_skill(name, &events, &mut input).await;
+                    continue;
+                }
             };
         }
     }
@@ -1208,6 +1223,92 @@ impl Agent {
             events,
             AgentEvent::Notice("Started a new conversation".into()),
         );
+    }
+
+    /// Reply to `/skills` with the discovered-skill view: invocable skills
+    /// first, then discovery diagnostics so broken skills are visible to the
+    /// user (they never reach the model prompt).
+    fn handle_list_skills(&self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let Some(catalog) = self.tools.skills() else {
+            send(
+                events,
+                AgentEvent::SkillsLoaded {
+                    skills: Vec::new(),
+                    diagnostics: Vec::new(),
+                    empty: true,
+                },
+            );
+            return;
+        };
+        let empty = catalog.is_empty();
+        send(
+            events,
+            AgentEvent::SkillsLoaded {
+                skills: catalog
+                    .skills
+                    .iter()
+                    .map(|skill| tools::SkillEntry {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                    })
+                    .collect(),
+                diagnostics: catalog
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| match &diagnostic.path {
+                        Some(path) => format!("{}: {}", path.display(), diagnostic.message),
+                        None => diagnostic.message.clone(),
+                    })
+                    .collect(),
+                empty,
+            },
+        );
+    }
+
+    /// Start a turn from a skill's instructions: the `SKILL.md` body without
+    /// frontmatter, prefixed with a line naming the skill so both the model
+    /// and the session transcript show what was invoked.
+    async fn handle_invoke_skill(
+        &mut self,
+        name: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+    ) {
+        let found = self.tools.skills().and_then(|catalog| {
+            catalog
+                .invocable()
+                .into_iter()
+                .find(|skill| skill.name.eq_ignore_ascii_case(&name))
+                .map(|skill| (skill.file_path.clone(), skill.name.clone()))
+        });
+        let Some((file_path, name)) = found else {
+            send(events, AgentEvent::Error(format!("unknown skill: {name}")));
+            return;
+        };
+        let raw = match std::fs::read_to_string(&file_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(format!("could not read {name}: {error}")),
+                );
+                return;
+            }
+        };
+        let (_, body) = tools::parse_frontmatter(&raw);
+        let body = body.trim();
+        if body.is_empty() {
+            send(events, AgentEvent::Error(format!("skill {name} is empty")));
+            return;
+        }
+        let turn_cancel = CancellationToken::new();
+        let result = self
+            .run_turn(format!("/{name}\n\n{body}"), events, input, &turn_cancel)
+            .await;
+        match result {
+            Err(TurnError::Shutdown) => {}
+            Err(TurnError::Persist(_)) | Ok(()) => {}
+        }
     }
 
     fn handle_load_session(

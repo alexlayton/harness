@@ -188,6 +188,25 @@ fn global_context_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".harness"))
 }
 
+/// Display path with `$HOME` abbreviated to `~` where applicable, so the
+/// header shows `~/.harness/AGENTS.md` rather than an absolute home path.
+pub fn display_path(path: &Path) -> String {
+    let text = path.to_string_lossy().replace('\\', "/");
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(|home| PathBuf::from(home).to_string_lossy().replace('\\', "/"))
+    else {
+        return text;
+    };
+    if text == home {
+        "~".into()
+    } else if let Some(rest) = text.strip_prefix(&(home.clone() + "/")) {
+        format!("~/{rest}")
+    } else {
+        text
+    }
+}
+
 /// First existing candidate file in a directory, per priority order.
 fn first_candidate(dir: &Path) -> Option<PathBuf> {
     CANDIDATES

@@ -80,6 +80,20 @@ impl SkillCatalog {
             .collect()
     }
 
+    /// UI-facing name/description pairs for every discovered skill,
+    /// including ones the model may not invoke. Drives `/skills`, header
+    /// rows, and completion; deliberately decoupled from [`Skill`] so the
+    /// TUI never depends on this crate's filesystem types.
+    pub fn entries(&self) -> Vec<SkillEntry> {
+        self.skills
+            .iter()
+            .map(|skill| SkillEntry {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+            })
+            .collect()
+    }
+
     /// True when the catalog has at least one model-invocable skill.
     pub fn has_invocable(&self) -> bool {
         self.invocable().into_iter().next().is_some()
@@ -88,6 +102,13 @@ impl SkillCatalog {
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
+}
+
+/// A skill as seen by the UI: name plus a short description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
 }
 
 /// Frontmatter fields we parse.  `description` is required

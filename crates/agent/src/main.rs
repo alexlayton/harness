@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::{CrossTerm, InputMessage};
+use tui::{ContextFileEntry, CrossTerm, InputMessage};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -54,6 +54,30 @@ async fn main_inner() -> Result<ExitCode> {
     let workspace_root =
         std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
     let tools = default_registry(ToolConfig::new(&workspace_root, config.rtk))?;
+    // UI-facing views of the auto-loaded context: which AGENTS.md / CLAUDE.md
+    // files were injected and which skills were discovered. Built once here
+    // because the registry owns the catalog; the TUI only renders the names.
+    let context_file_paths = if cli.no_context_files {
+        Vec::new()
+    } else {
+        tools::load_context_files(&workspace_root)
+            .iter()
+            .map(|file| tools::display_path(&file.path))
+            .collect::<Vec<_>>()
+    };
+    let skill_entries = tools
+        .skills()
+        .map(|catalog| {
+            catalog
+                .entries()
+                .into_iter()
+                .map(|skill| tui::SkillEntry {
+                    name: skill.name,
+                    description: skill.description,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let session_store = SessionStore::default_for_workspace(&workspace_root)?;
 
     if cli.print {
@@ -94,7 +118,16 @@ async fn main_inner() -> Result<ExitCode> {
 
     // The crossterm frontend drives the same agent as headless mode and
     // differs only in rendering and input handling.
-    let ui = CrossTerm::new(&config.model, &provider_name, providers)?;
+    let ui = CrossTerm::new(
+        &config.model,
+        &provider_name,
+        providers,
+        skill_entries,
+        context_file_paths
+            .into_iter()
+            .map(|path| ContextFileEntry { path })
+            .collect(),
+    )?;
     ui.run(event_rx, input_tx, cancel.clone()).await?;
     cancel.cancel();
     let _ = agent_task.await;

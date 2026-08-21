@@ -46,6 +46,10 @@ pub enum InputMessage {
     },
     /// Ask the agent to fetch a provider's model list for completion.
     ListModels { provider: String },
+    /// Start a turn from a discovered skill's instructions.
+    InvokeSkill { name: String },
+    /// Ask the agent for the discovered-skill view (see [`UiEvent::SkillsLoaded`]).
+    ListSkills,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +57,24 @@ pub struct ModelEntry {
     pub id: String,
     pub name: Option<String>,
     pub context_length: Option<u64>,
+}
+
+/// A skill as seen by the UI: name plus a short description. The TUI never
+/// touches the filesystem or the frontmatter parser; main passes this list
+/// straight from the discovered [`tools::skills`] catalog at startup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkillEntry {
+    pub name: String,
+    pub description: String,
+}
+
+/// A project-context file (AGENTS.md / CLAUDE.md) injected into the system
+/// prompt. Only the display path is needed; the TUI shows which files are
+/// loaded, not their contents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextFileEntry {
+    /// Display path with `$HOME` abbreviated to `~` where applicable.
+    pub path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,6 +162,15 @@ pub enum UiEvent {
     },
     SessionExported {
         path: String,
+    },
+    /// The full discovered-skill view for `/skills`, delivered once per
+    /// request. Includes diagnostics so broken skills surface to the user;
+    /// they are never placed in the model prompt.
+    SkillsLoaded {
+        skills: Vec<SkillEntry>,
+        diagnostics: Vec<String>,
+        /// True when no skills were discovered at all.
+        empty: bool,
     },
     UsageUpdated {
         input_tokens: u64,

@@ -125,6 +125,21 @@ impl tui::TuiEvent for AgentEvent {
                     .collect(),
             },
             AgentEvent::SessionExported { path } => tui::UiEvent::SessionExported { path },
+            AgentEvent::SkillsLoaded {
+                skills,
+                diagnostics,
+                empty,
+            } => tui::UiEvent::SkillsLoaded {
+                skills: skills
+                    .into_iter()
+                    .map(|skill| tui::SkillEntry {
+                        name: skill.name,
+                        description: skill.description,
+                    })
+                    .collect(),
+                diagnostics,
+                empty,
+            },
             AgentEvent::UsageUpdated {
                 input_tokens,
                 output_tokens,

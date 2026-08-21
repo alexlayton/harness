@@ -4,7 +4,7 @@
 //! owns the editor and cached lists, while the agent remains responsible for
 //! validating providers and executing the resulting semantic messages.
 
-use crate::{ModelEntry, SessionListEntry};
+use crate::{ModelEntry, SessionListEntry, SkillEntry};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -13,6 +13,7 @@ pub enum ArgumentKind {
     Model,
     Session,
     Path,
+    Skill,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +73,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         usage: "/model [<provider>:]<model>",
         argument_kind: ArgumentKind::Model,
     },
+    CommandSpec {
+        name: "/skill",
+        description: "Start a turn from a discovered skill",
+        usage: "/skill <name>",
+        argument_kind: ArgumentKind::Skill,
+    },
+    CommandSpec {
+        name: "/skills",
+        description: "List discovered skills and diagnostics",
+        usage: "/skills",
+        argument_kind: ArgumentKind::None,
+    },
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +139,14 @@ pub enum ParsedCommand {
     SetModel {
         provider: Option<String>,
         model: String,
+    },
+    Skills,
+    /// `/skill <name>` or a bare `/<name>` alias. `name` is the skill's
+    /// catalog name (without the leading slash); `alias` distinguishes the
+    /// two spellings for the echoed notice.
+    InvokeSkill {
+        name: String,
+        alias: bool,
     },
 }
 
@@ -229,6 +250,60 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
     }
 }
 
+/// Parse a slash command against the static command set plus an optional
+/// dynamic skill catalog. Skill aliases (`/<skill-name>`) are only recognized
+/// when the name does not collide with a static command, so `/model` and
+/// `/skill` can never be shadowed by a skill.
+pub fn parse_command_with_skills(
+    text: &str,
+    skills: &[SkillEntry],
+) -> Result<ParsedCommand, String> {
+    let input = text.trim();
+    let mut words = input.split_whitespace();
+    let command = words.next().unwrap_or("");
+    let rest = words.collect::<Vec<_>>();
+    match command.to_ascii_lowercase().as_str() {
+        "/skill" => {
+            let [name] = rest[..] else {
+                return Err("usage: /skill <name>".into());
+            };
+            let Some(entry) = skill_entry(skills, name) else {
+                return Err(format!("unknown skill: {name}"));
+            };
+            Ok(ParsedCommand::InvokeSkill {
+                name: entry.name.clone(),
+                alias: false,
+            })
+        }
+        "/skills" => {
+            if !rest.is_empty() {
+                return Err("usage: /skills".into());
+            }
+            Ok(ParsedCommand::Skills)
+        }
+        other => {
+            if let Some(name) = other.strip_prefix('/')
+                && !name.is_empty()
+                && command_spec(command).is_none()
+                && let Some(entry) = skill_entry(skills, name)
+            {
+                return Ok(ParsedCommand::InvokeSkill {
+                    name: entry.name.clone(),
+                    alias: true,
+                });
+            }
+            parse_command(text)
+        }
+    }
+}
+
+/// The skill entry matching `name` case-insensitively, if any.
+fn skill_entry<'a>(skills: &'a [SkillEntry], name: &str) -> Option<&'a SkillEntry> {
+    skills
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(name))
+}
+
 /// Find the command completion context at a character-based cursor column.
 ///
 /// The context deliberately stores byte offsets (used for Rust string
@@ -296,16 +371,18 @@ pub fn candidates_at_cursor(
     model_lists: &HashMap<String, Vec<ModelEntry>>,
     current_provider: &str,
     sessions: &[SessionListEntry],
+    skills: &[SkillEntry],
 ) -> Option<CompletionResult> {
     let context = completion_context(input, cursor_col)?;
     let cursor_byte = byte_index_at_char(input, cursor_col);
     let query = token_prefix(input, &context, cursor_byte);
     let candidates = match context.target {
-        CompletionTarget::Command => command_candidates(query),
+        CompletionTarget::Command => command_candidates(query, skills),
         CompletionTarget::Argument(ArgumentKind::Model) => {
             model_candidates(query, providers, model_lists, current_provider)
         }
         CompletionTarget::Argument(ArgumentKind::Session) => session_candidates(query, sessions),
+        CompletionTarget::Argument(ArgumentKind::Skill) => skill_candidates(query, skills),
         CompletionTarget::Argument(ArgumentKind::Path)
         | CompletionTarget::Argument(ArgumentKind::None) => Vec::new(),
     };
@@ -331,6 +408,7 @@ pub fn apply_completion(
     cursor_col: usize,
     context: &CompletionContext,
     candidate: &Candidate,
+    skills: &[SkillEntry],
 ) -> Option<(String, usize)> {
     if context.token_start > context.token_end
         || context.token_end > line.len()
@@ -347,11 +425,22 @@ pub fn apply_completion(
     let at_token_end = cursor_byte == context.token_end;
 
     let separator = match context.target {
-        CompletionTarget::Command => command_spec(&candidate.value)
-            .is_some_and(|command| command.argument_kind != ArgumentKind::None)
-            .then_some(" ")
-            .filter(|_| !next_is_whitespace)
-            .unwrap_or(""),
+        CompletionTarget::Command => {
+            let takes_argument = match command_spec(&candidate.value) {
+                Some(command) => command.argument_kind != ArgumentKind::None,
+                // A skill alias keeps the argument phase open so `/skill <name>`
+                // and `/<skill>` behave identically after acceptance.
+                None => candidate
+                    .value
+                    .strip_prefix('/')
+                    .and_then(|name| skill_entry(skills, name))
+                    .is_some(),
+            };
+            takes_argument
+                .then_some(" ")
+                .filter(|_| !next_is_whitespace)
+                .unwrap_or("")
+        }
         // `@` file references and command path arguments end the token with a
         // space once completed, so typing continues on a fresh token.
         // Directories keep the completion context alive instead.
@@ -371,14 +460,47 @@ pub fn apply_completion(
     Some((replacement, new_cursor))
 }
 
-fn command_candidates(query: &str) -> Vec<Candidate> {
+fn command_candidates(query: &str, skills: &[SkillEntry]) -> Vec<Candidate> {
     let query = query.to_ascii_lowercase();
-    COMMANDS
+    let mut candidates: Vec<Candidate> = COMMANDS
         .iter()
         .filter(|command| command.name.to_ascii_lowercase().starts_with(&query))
         .map(|command| Candidate {
             value: command.name.to_owned(),
             description: command.description.to_owned(),
+            kind: CandidateKind::Slash,
+        })
+        .collect();
+    // Skill aliases join the command list only when the name is free —
+    // static commands (including `/skill` itself) always win.
+    for skill in skills {
+        let value = format!("/{}", skill.name);
+        if !value.to_ascii_lowercase().starts_with(&query) {
+            continue;
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.value.eq_ignore_ascii_case(&value))
+        {
+            continue;
+        }
+        candidates.push(Candidate {
+            value,
+            description: skill.description.clone(),
+            kind: CandidateKind::Slash,
+        });
+    }
+    candidates
+}
+
+fn skill_candidates(query: &str, skills: &[SkillEntry]) -> Vec<Candidate> {
+    let query = query.to_ascii_lowercase();
+    skills
+        .iter()
+        .filter(|skill| skill.name.to_ascii_lowercase().starts_with(&query))
+        .map(|skill| Candidate {
+            value: skill.name.clone(),
+            description: skill.description.clone(),
             kind: CandidateKind::Slash,
         })
         .collect()
@@ -648,9 +770,26 @@ mod tests {
             model_lists,
             current_provider,
             &[],
+            &[],
         )
         .map(|result| result.candidates)
         .unwrap_or_default()
+    }
+
+    fn skill(name: &str, description: &str) -> SkillEntry {
+        SkillEntry {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+
+    fn skills() -> Vec<SkillEntry> {
+        vec![
+            skill("greeter", "Says hello"),
+            skill("model", "Collides with /model"),
+            skill("skill", "Collides with /skill"),
+            skill("skills", "Collides with /skills"),
+        ]
     }
 
     #[test]
@@ -694,6 +833,7 @@ mod tests {
             &lists,
             "opencode-go",
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(result.context.target, CompletionTarget::Command);
@@ -702,18 +842,18 @@ mod tests {
             .iter()
             .find(|candidate| candidate.value == "/model")
             .unwrap();
-        let (line, cursor) = apply_completion("/mod", 4, &result.context, candidate).unwrap();
+        let (line, cursor) = apply_completion("/mod", 4, &result.context, candidate, &[]).unwrap();
         assert_eq!(line, "/model ");
         assert_eq!(cursor, 7);
 
         let result =
-            candidates_at_cursor("/au", 3, &providers(), &lists, "opencode-go", &[]).unwrap();
+            candidates_at_cursor("/au", 3, &providers(), &lists, "opencode-go", &[], &[]).unwrap();
         let candidate = result
             .candidates
             .iter()
             .find(|candidate| candidate.value == "/auth")
             .unwrap();
-        let (line, cursor) = apply_completion("/au", 3, &result.context, candidate).unwrap();
+        let (line, cursor) = apply_completion("/au", 3, &result.context, candidate, &[]).unwrap();
         assert_eq!(line, "/auth");
         assert_eq!(cursor, 5);
     }
@@ -727,14 +867,15 @@ mod tests {
         let input = "/model gpt tail";
         let cursor = "/model gpt".chars().count();
         let result =
-            candidates_at_cursor(input, cursor, &providers(), &lists, "opencode-go", &[]).unwrap();
+            candidates_at_cursor(input, cursor, &providers(), &lists, "opencode-go", &[], &[])
+                .unwrap();
         let candidate = result
             .candidates
             .iter()
             .find(|candidate| candidate.value == "gpt-new")
             .unwrap();
         let (line, new_cursor) =
-            apply_completion(input, cursor, &result.context, candidate).unwrap();
+            apply_completion(input, cursor, &result.context, candidate, &[]).unwrap();
         assert_eq!(line, "/model gpt-new tail");
         assert_eq!(new_cursor, "/model gpt-new".chars().count());
     }
@@ -750,6 +891,7 @@ mod tests {
             &lists,
             "opencode-go",
             &[],
+            &[],
         )
         .unwrap();
         let candidate = result
@@ -757,8 +899,14 @@ mod tests {
             .iter()
             .find(|candidate| candidate.value == "openrouter:")
             .unwrap();
-        let (line, cursor) =
-            apply_completion(input, input.chars().count(), &result.context, candidate).unwrap();
+        let (line, cursor) = apply_completion(
+            input,
+            input.chars().count(),
+            &result.context,
+            candidate,
+            &[],
+        )
+        .unwrap();
         assert_eq!(line, "/model openrouter:");
         assert_eq!(cursor, line.chars().count());
     }
@@ -774,6 +922,7 @@ mod tests {
             &lists,
             "opencode-go",
             &[],
+            &[],
         )
         .unwrap();
         let file = Candidate {
@@ -782,7 +931,7 @@ mod tests {
             kind: CandidateKind::File,
         };
         let (line, cursor) =
-            apply_completion(input, input.chars().count(), &result.context, &file).unwrap();
+            apply_completion(input, input.chars().count(), &result.context, &file, &[]).unwrap();
         assert_eq!(line, "/export src/main.rs ");
         assert_eq!(cursor, line.chars().count());
 
@@ -791,8 +940,14 @@ mod tests {
             description: "directory".into(),
             kind: CandidateKind::Directory,
         };
-        let (line, cursor) =
-            apply_completion(input, input.chars().count(), &result.context, &directory).unwrap();
+        let (line, cursor) = apply_completion(
+            input,
+            input.chars().count(),
+            &result.context,
+            &directory,
+            &[],
+        )
+        .unwrap();
         assert_eq!(line, "/export src/");
         assert_eq!(cursor, line.chars().count());
     }
@@ -808,6 +963,7 @@ mod tests {
             &lists,
             "opencode-go",
             &sessions,
+            &[],
         )
         .unwrap();
         let values = result
@@ -836,6 +992,7 @@ mod tests {
             &lists,
             "opencode-go",
             &[],
+            &[],
         )
         .unwrap();
         let candidate = Candidate {
@@ -843,8 +1000,14 @@ mod tests {
             description: String::new(),
             kind: CandidateKind::Slash,
         };
-        let (line, cursor) =
-            apply_completion(input, input.chars().count(), &result.context, &candidate).unwrap();
+        let (line, cursor) = apply_completion(
+            input,
+            input.chars().count(),
+            &result.context,
+            &candidate,
+            &[],
+        )
+        .unwrap();
         assert_eq!(line, "/model replacement");
         assert_eq!(cursor, line.chars().count());
     }
@@ -933,7 +1096,8 @@ mod tests {
         let input = "/model open";
         let cursor = input.chars().count();
         let result =
-            candidates_at_cursor(input, cursor, &providers(), &lists, "opencode-go", &[]).unwrap();
+            candidates_at_cursor(input, cursor, &providers(), &lists, "opencode-go", &[], &[])
+                .unwrap();
         let provider_candidate = result
             .candidates
             .iter()
@@ -1025,5 +1189,160 @@ mod tests {
             Err("usage: /model [<provider>:]<model>".into())
         );
         assert_eq!(parse_command("/foo"), Err("unknown command: /foo".into()));
+    }
+
+    #[test]
+    fn skill_commands_parse_and_shadow_safely() {
+        let skills = skills();
+
+        // `/skill <name>` requires exactly one known skill name.
+        assert_eq!(
+            parse_command_with_skills("/skill greeter", &skills),
+            Ok(ParsedCommand::InvokeSkill {
+                name: "greeter".into(),
+                alias: false
+            })
+        );
+        assert_eq!(
+            parse_command_with_skills("/skill", &skills),
+            Err("usage: /skill <name>".into())
+        );
+        assert_eq!(
+            parse_command_with_skills("/skill greeter now", &skills),
+            Err("usage: /skill <name>".into())
+        );
+        assert_eq!(
+            parse_command_with_skills("/skill nope", &skills),
+            Err("unknown skill: nope".into())
+        );
+        // Case-insensitive lookup returns the catalog name.
+        assert_eq!(
+            parse_command_with_skills("/skill GREETER", &skills),
+            Ok(ParsedCommand::InvokeSkill {
+                name: "greeter".into(),
+                alias: false
+            })
+        );
+
+        // `/skills` takes no arguments.
+        assert_eq!(
+            parse_command_with_skills("/skills", &skills),
+            Ok(ParsedCommand::Skills)
+        );
+        assert_eq!(
+            parse_command_with_skills("/skills now", &skills),
+            Err("usage: /skills".into())
+        );
+
+        // Bare skill aliases parse to invocations…
+        assert_eq!(
+            parse_command_with_skills("/greeter", &skills),
+            Ok(ParsedCommand::InvokeSkill {
+                name: "greeter".into(),
+                alias: true
+            })
+        );
+        // …but never shadow static commands, including the skill commands.
+        assert_eq!(
+            parse_command_with_skills("/model", &skills),
+            Ok(ParsedCommand::SetModel {
+                provider: None,
+                model: String::new()
+            })
+        );
+        assert_eq!(
+            parse_command_with_skills("/skill", &skills),
+            Err("usage: /skill <name>".into())
+        );
+        assert_eq!(
+            parse_command_with_skills("/skills", &skills),
+            Ok(ParsedCommand::Skills)
+        );
+        // Unknown names still fall through to the static error.
+        assert_eq!(
+            parse_command_with_skills("/foo", &skills),
+            Err("unknown command: /foo".into())
+        );
+        // Static commands still parse with an empty catalog.
+        assert_eq!(
+            parse_command_with_skills("/help", &[]),
+            Ok(ParsedCommand::Help)
+        );
+    }
+
+    #[test]
+    fn skill_aliases_and_arguments_complete() {
+        let skills = skills();
+
+        // Command phase: static commands plus non-colliding skill aliases.
+        let result = candidates_at_cursor(
+            "/",
+            1,
+            &providers(),
+            &HashMap::new(),
+            "opencode-go",
+            &[],
+            &skills,
+        )
+        .unwrap();
+        let values = result
+            .candidates
+            .iter()
+            .map(|candidate| candidate.value.as_str())
+            .collect::<Vec<_>>();
+        assert!(values.contains(&"/skill") && values.contains(&"/skills"));
+        assert!(values.contains(&"/greeter"));
+        // Colliding names appear exactly once: the static command, with no
+        // duplicate skill alias.
+        for collided in ["/model", "/skill", "/skills"] {
+            assert_eq!(
+                values.iter().filter(|value| **value == collided).count(),
+                1,
+                "{collided} should appear exactly once"
+            );
+        }
+
+        // `/skill ` completes skill names with descriptions.
+        let result = candidates_at_cursor(
+            "/skill ",
+            "/skill ".chars().count(),
+            &providers(),
+            &HashMap::new(),
+            "opencode-go",
+            &[],
+            &skills,
+        )
+        .unwrap();
+        assert_eq!(
+            result.context.target,
+            CompletionTarget::Argument(ArgumentKind::Skill)
+        );
+        let greeter = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "greeter")
+            .unwrap();
+        assert_eq!(greeter.description, "Says hello");
+
+        // Prefix filtering works for both spellings.
+        let result = candidates_at_cursor(
+            "/gree",
+            5,
+            &providers(),
+            &HashMap::new(),
+            "opencode-go",
+            &[],
+            &skills,
+        )
+        .unwrap();
+        assert_eq!(result.candidates.len(), 1);
+        assert_eq!(result.candidates[0].value, "/greeter");
+
+        // Accepting a skill alias keeps the argument phase open (skill takes
+        // an argument), so the cursor lands after the trailing space.
+        let (line, cursor) =
+            apply_completion("/gree", 5, &result.context, &result.candidates[0], &skills).unwrap();
+        assert_eq!(line, "/greeter ");
+        assert_eq!(cursor, line.chars().count());
     }
 }
