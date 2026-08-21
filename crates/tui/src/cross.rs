@@ -34,7 +34,11 @@
 //!   reason.
 
 use crate::app::{Activity, MAX_HISTORY, PLACEHOLDER};
-use crate::commands::{self, ParsedCommand};
+use crate::attachments;
+use crate::commands::{
+    self, ArgumentKind, Candidate, CandidateKind, CompletionContext, CompletionTarget,
+    ParsedCommand,
+};
 use crate::commit::stable_block_split_offset;
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
@@ -55,6 +59,7 @@ use crossterm::terminal::{self, Clear, ClearType};
 use futures_util::StreamExt;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
@@ -133,6 +138,33 @@ struct Usage {
     cost: String,
 }
 
+/// An open completion list driving the fish-style ghost preview, the Tab
+/// accept, and the one-row hint above the input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Completion {
+    context: CompletionContext,
+    candidates: Vec<Candidate>,
+    selected: usize,
+    kind: CompletionKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionKind {
+    Slash,
+    Session,
+    Model,
+    Path,
+}
+
+/// A debounced path-completion scan result delivered back over the run-loop
+/// channel so a large directory tree never blocks the UI thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PathCompletionResult {
+    generation: u64,
+    context: CompletionContext,
+    candidates: Vec<Candidate>,
+}
+
 /// One frame's live region: the rows to paint and where the terminal cursor
 /// belongs inside them.
 struct RegionBuild {
@@ -178,6 +210,21 @@ pub struct CrossTerm {
     /// Most recent turn usage for the placeholder counter trailer.
     usage: Option<Usage>,
 
+    // Completion (fish-style inline, feature 5).
+    providers: Vec<String>,
+    model_lists: HashMap<String, Vec<crate::ModelEntry>>,
+    session_candidates: Vec<crate::SessionListEntry>,
+    session_completion_requested: bool,
+    /// Providers we have already asked the agent to fetch, to avoid duplicate
+    /// `ListModels` requests while typing through a model token.
+    model_list_requested: HashSet<String>,
+    completion: Option<Completion>,
+    path_completion_tx: mpsc::UnboundedSender<PathCompletionResult>,
+    path_completion_rx: mpsc::UnboundedReceiver<PathCompletionResult>,
+    path_completion_generation: u64,
+    path_completion_query: Option<String>,
+    path_completion_cancel: Option<CancellationToken>,
+
     busy: bool,
     activity: Activity,
     spinner: usize,
@@ -194,9 +241,10 @@ pub struct CrossTerm {
 impl CrossTerm {
     /// Assemble the UI state without touching the terminal. `new` layers the
     /// terminal setup on top, and tests use this directly.
-    fn base(model: &str, provider: &str, width: u16, height: u16) -> Self {
+    fn base(model: &str, provider: &str, providers: Vec<String>, width: u16, height: u16) -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let environment = EnvironmentInfo::discover(workspace_root);
+        let (path_completion_tx, path_completion_rx) = mpsc::unbounded_channel();
         Self {
             out: io::stdout(),
             theme: Theme::default(),
@@ -215,6 +263,17 @@ impl CrossTerm {
             history_pos: None,
             draft: String::new(),
             usage: None,
+            providers,
+            model_lists: HashMap::new(),
+            session_candidates: Vec::new(),
+            session_completion_requested: false,
+            model_list_requested: HashSet::new(),
+            completion: None,
+            path_completion_tx,
+            path_completion_rx,
+            path_completion_generation: 0,
+            path_completion_query: None,
+            path_completion_cancel: None,
             busy: false,
             activity: Activity::Preparing,
             spinner: 0,
@@ -225,10 +284,10 @@ impl CrossTerm {
         }
     }
 
-    pub fn new(model: &str, provider: &str) -> Result<Self> {
+    pub fn new(model: &str, provider: &str, providers: Vec<String>) -> Result<Self> {
         install_panic_hook();
         let (width, height) = terminal::size().unwrap_or((80, 24));
-        let mut ui = Self::base(model, provider, width, height);
+        let mut ui = Self::base(model, provider, providers, width, height);
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
         if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
             let _ = terminal::disable_raw_mode();
@@ -296,6 +355,12 @@ impl CrossTerm {
                     }
                     self.paint()?;
                 }
+                maybe_path = self.path_completion_rx.recv() => {
+                    if let Some(result) = maybe_path {
+                        self.apply_path_completion(result);
+                        self.paint()?;
+                    }
+                }
                 _ = spinner_tick.tick() => {
                     if self.busy {
                         self.spinner = self.spinner.wrapping_add(1);
@@ -335,6 +400,7 @@ impl CrossTerm {
         let Event::Key(key) = event else {
             if let Event::Paste(text) = event {
                 insert_text(&mut self.input, &mut self.cursor, text);
+                self.refresh_completion();
             }
             return Ok(false);
         };
@@ -355,11 +421,15 @@ impl CrossTerm {
                 cancel.cancel();
                 return Ok(true);
             }
-            // Esc interrupts a running turn (the same intent as Ctrl+C) and
-            // is a no-op while idle.
+            // Esc interrupts a running turn (the same intent as Ctrl+C); when
+            // a completion list is open, Esc closes the list instead.
             KeyCode::Esc => {
                 if self.busy {
                     let _ = input_tx.send(InputMessage::Interrupt);
+                } else if self.completion.is_some() {
+                    self.close_completion();
+                    // Skip the tail refresh: it would reopen the same list.
+                    return Ok(false);
                 }
             }
             KeyCode::Enter
@@ -402,8 +472,12 @@ impl CrossTerm {
             {
                 insert_text(&mut self.input, &mut self.cursor, &character.to_string());
             }
+            KeyCode::Tab => self.handle_tab(input_tx)?,
             _ => {}
         }
+        // Recompute completion after any input mutation; refreshing at the
+        // end of every handled key keeps the draft's ghost/hint in sync.
+        self.refresh_completion();
         Ok(false)
     }
 
@@ -437,6 +511,424 @@ impl CrossTerm {
                 true
             }
             None => false,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Inline completion (feature 5)
+    // ------------------------------------------------------------------
+
+    /// Rebuild the completion list for the current draft and cursor. Cheap
+    /// except for path completion, which spawns a debounced blocking scan and
+    /// delivers results over `path_completion_rx`. Pure callers (tests) drive
+    /// this directly; the run loop calls it after every input mutation.
+    fn refresh_completion(&mut self) {
+        if !commands::is_command_input(&self.input) {
+            self.close_completion();
+            return;
+        }
+        let old_value = self.completion.as_ref().and_then(|completion| {
+            completion
+                .candidates
+                .get(completion.selected)
+                .map(|candidate| candidate.value.clone())
+        });
+        self.cancel_path_completion();
+        let cursor_col = self.cursor_char_col();
+        let Some(result) = commands::candidates_at_cursor(
+            &self.input,
+            cursor_col,
+            &self.providers,
+            &self.model_lists,
+            &self.provider,
+            &self.session_candidates,
+        ) else {
+            self.completion = None;
+            self.session_completion_requested = false;
+            return;
+        };
+
+        // Path arguments scan the filesystem on a debounced task.
+        if matches!(
+            result.context.target,
+            CompletionTarget::Argument(ArgumentKind::Path),
+        ) {
+            self.request_path_completion(result.context, result.candidates, old_value);
+            return;
+        }
+        let kind = match result.context.target {
+            CompletionTarget::Argument(ArgumentKind::Session) => CompletionKind::Session,
+            CompletionTarget::Argument(ArgumentKind::Model) => CompletionKind::Model,
+            _ => CompletionKind::Slash,
+        };
+        self.set_completion(kind, result, old_value);
+    }
+
+    fn set_completion(
+        &mut self,
+        kind: CompletionKind,
+        result: crate::commands::CompletionResult,
+        old_value: Option<String>,
+    ) {
+        if result.candidates.is_empty() {
+            // Keep a session list open (empty) so Tab can request it; close
+            // everything else.
+            if kind == CompletionKind::Session {
+                self.completion = Some(Completion {
+                    context: result.context,
+                    candidates: Vec::new(),
+                    selected: 0,
+                    kind,
+                });
+            } else {
+                self.completion = None;
+            }
+            return;
+        }
+        let selected = old_value
+            .as_deref()
+            .and_then(|value| {
+                result
+                    .candidates
+                    .iter()
+                    .position(|candidate| candidate.value == value)
+            })
+            .unwrap_or(0)
+            .min(result.candidates.len().saturating_sub(1));
+        self.completion = Some(Completion {
+            context: result.context,
+            candidates: result.candidates,
+            selected,
+            kind,
+        });
+    }
+
+    fn cursor_char_col(&self) -> usize {
+        self.input[..self.cursor].chars().count()
+    }
+
+    fn close_completion(&mut self) {
+        self.cancel_path_completion();
+        self.completion = None;
+        self.session_completion_requested = false;
+    }
+
+    /// Apply a candidate to the draft, move the cursor, then recompute the
+    /// list and fire any on-demand backend fetch (sessions / model lists).
+    fn accept_candidate(
+        &mut self,
+        candidate: &Candidate,
+        context: &CompletionContext,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<()> {
+        self.apply_replacement(candidate, context);
+        self.completion = None;
+        // A None-argument command (e.g. `/auth`) has no arguments to complete;
+        // the refresh below would otherwise keep its own name listed.
+        let argument_less = matches!(context.target, CompletionTarget::Command,)
+            && commands::command_spec(&candidate.value)
+                .is_some_and(|spec| spec.argument_kind == ArgumentKind::None);
+        if argument_less {
+            return Ok(());
+        }
+        self.request_backend(input_tx, context, candidate)?;
+        self.refresh_completion();
+        Ok(())
+    }
+
+    fn apply_replacement(&mut self, candidate: &Candidate, context: &CompletionContext) {
+        let cursor_col = self.cursor_char_col();
+        let Some((replacement, new_cursor_col)) =
+            commands::apply_completion(&self.input, cursor_col, context, candidate)
+        else {
+            return;
+        };
+        self.input = replacement;
+        self.cursor = byte_index_at_char(&self.input, new_cursor_col);
+    }
+
+    /// Send anything the new draft now needs from the agent: a `ListSessions`
+    /// for `/load` arguments or a `ListModels` when a `provider:` token was
+    /// just completed and its model list is unknown. The dedupe sets keep
+    /// repeated Tab presses from spamming the agent.
+    fn request_backend(
+        &mut self,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+        context: &CompletionContext,
+        candidate: &Candidate,
+    ) -> Result<()> {
+        let is_session = matches!(
+            context.target,
+            CompletionTarget::Argument(ArgumentKind::Session),
+        );
+        if is_session && self.session_candidates.is_empty() && !self.session_completion_requested {
+            self.session_completion_requested = true;
+            input_tx
+                .send(InputMessage::ListSessions)
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+        }
+        let provider = candidate
+            .value
+            .strip_suffix(':')
+            .filter(|name| {
+                self.providers
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(name))
+            })
+            .map(str::to_owned);
+        if let Some(provider) = provider
+            && !self.model_lists.contains_key(&provider)
+            && !self.model_list_requested.contains(provider.as_str())
+        {
+            self.model_list_requested.insert(provider.clone());
+            input_tx
+                .send(InputMessage::ListModels {
+                    provider: provider.clone(),
+                })
+                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
+        }
+        Ok(())
+    }
+
+    /// The Tab handler for completion.
+    fn handle_tab(&mut self, input_tx: &mpsc::UnboundedSender<InputMessage>) -> Result<()> {
+        self.refresh_completion();
+        let Some(completion) = self.completion.as_ref().cloned() else {
+            return Ok(());
+        };
+        if completion.candidates.is_empty() {
+            // Session/model lists often arrive a beat late; repeat Tab asks
+            // the backend again.
+            self.request_backend(
+                input_tx,
+                &completion.context.clone(),
+                &Candidate {
+                    value: String::new(),
+                    description: String::new(),
+                    kind: CandidateKind::Slash,
+                },
+            )?;
+            return Ok(());
+        }
+        if completion.candidates.len() == 1 {
+            let candidate = completion.candidates[0].clone();
+            self.accept_candidate(&candidate, &completion.context.clone(), input_tx)?;
+            return Ok(());
+        }
+        // Multiple candidates: extend the shared prefix, or cycle among them
+        // once the token already matches the common prefix.
+        let prefix = commands::common_prefix(&completion.candidates);
+        if prefix.is_empty() {
+            return Ok(());
+        }
+        let token = &self.input
+            [completion.context.token_start..completion.context.token_end.min(self.input.len())];
+        if token == prefix {
+            let selected = (completion.selected + 1) % completion.candidates.len();
+            let candidate = completion.candidates[selected].clone();
+            self.accept_candidate(&candidate, &completion.context.clone(), input_tx)?;
+        } else {
+            let prefix_candidate = Candidate {
+                value: prefix.clone(),
+                description: String::new(),
+                kind: CandidateKind::Slash,
+            };
+            // Extend to the common prefix and keep the list open.
+            self.apply_replacement(&prefix_candidate, &completion.context);
+            self.refresh_completion();
+        }
+        Ok(())
+    }
+
+    // Path completion helpers -------------------------------------------------
+
+    fn cancel_path_completion(&mut self) {
+        if let Some(cancel) = self.path_completion_cancel.take() {
+            cancel.cancel();
+        }
+        self.path_completion_query = None;
+        self.path_completion_generation = self.path_completion_generation.wrapping_add(1);
+        if self
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.kind == CompletionKind::Path)
+        {
+            self.completion = None;
+        }
+    }
+
+    fn request_path_completion(
+        &mut self,
+        context: CompletionContext,
+        initial: Vec<Candidate>,
+        preferred: Option<String>,
+    ) {
+        let query = context.query.clone();
+        if self.path_completion_query.as_deref() == Some(query.as_str())
+            && self.completion.as_ref().is_some_and(|completion| {
+                completion.kind == CompletionKind::Path && completion.context == context
+            })
+        {
+            return;
+        }
+        self.cancel_path_completion();
+        let generation = self.path_completion_generation;
+        let cancel = CancellationToken::new();
+        let scan_cancel = cancel.clone();
+        let root = self.environment.cwd.clone();
+        let sender = self.path_completion_tx.clone();
+        let scan_query = query.clone();
+        let selected = preferred
+            .as_deref()
+            .and_then(|value| initial.iter().position(|c| c.value == value))
+            .unwrap_or(0)
+            .min(initial.len().saturating_sub(1));
+        self.path_completion_cancel = Some(cancel.clone());
+        self.path_completion_query = Some(query.clone());
+        self.completion = Some(Completion {
+            context: context.clone(),
+            candidates: initial,
+            selected,
+            kind: CompletionKind::Path,
+        });
+        let task_context = context.clone();
+        tokio::spawn(async move {
+            // Debounce so a burst of typing triggers one scan, not many.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if cancel.is_cancelled() {
+                return;
+            }
+            let candidates = tokio::task::spawn_blocking(move || {
+                attachments::find_path_candidates(&root, &scan_query, &scan_cancel)
+            })
+            .await
+            .unwrap_or_default();
+            if cancel.is_cancelled() {
+                return;
+            }
+            let _ = sender.send(PathCompletionResult {
+                generation,
+                context: task_context,
+                candidates,
+            });
+        });
+    }
+
+    fn apply_path_completion(&mut self, result: PathCompletionResult) {
+        if result.generation != self.path_completion_generation {
+            return;
+        }
+        let cursor_col = self.cursor_char_col();
+        let Some(context_now) = commands::completion_context(&self.input, cursor_col) else {
+            return;
+        };
+        if result.context != context_now {
+            return;
+        }
+        self.path_completion_cancel = None;
+        let old_value = self.completion.as_ref().and_then(|completion| {
+            completion
+                .candidates
+                .get(completion.selected)
+                .map(|candidate| candidate.value.clone())
+        });
+        // Merge static session candidates (for `/load`) with the scanned links
+        // like the inline UI does.
+        let static_candidates = commands::candidates_at_cursor(
+            &self.input,
+            cursor_col,
+            &self.providers,
+            &self.model_lists,
+            &self.provider,
+            &self.session_candidates,
+        )
+        .map(|result| result.candidates)
+        .unwrap_or_default();
+        let merged = merge_candidates(static_candidates, result.candidates);
+        if merged.is_empty() {
+            self.completion = None;
+            return;
+        }
+        let selected = old_value
+            .as_deref()
+            .and_then(|value| merged.iter().position(|c| c.value == value))
+            .unwrap_or(0)
+            .min(merged.len().saturating_sub(1));
+        self.completion = Some(Completion {
+            context: result.context,
+            candidates: merged,
+            selected,
+            kind: CompletionKind::Path,
+        });
+    }
+
+    /// The dim ghost suffix drawn after the cursor when the input matches a
+    /// single untyped completion (or the shared prefix of several).
+    fn ghost_text(&self) -> String {
+        let Some(completion) = self.completion.as_ref() else {
+            return String::new();
+        };
+        // Ghost only previews at the very end of the draft.
+        if self.cursor != self.input.len() {
+            return String::new();
+        }
+        let cursor_col = self.cursor_char_col();
+        if completion.candidates.is_empty() {
+            return String::new();
+        }
+        if completion.candidates.len() == 1 {
+            return commands::candidate_suffix(
+                &self.input,
+                cursor_col,
+                &completion.context,
+                &completion.candidates[0],
+            );
+        }
+        let prefix = commands::common_prefix(&completion.candidates);
+        if prefix.is_empty() {
+            return String::new();
+        }
+        // Already at the shared prefix: the list hint stands in for the ghost.
+        if self.input
+            [completion.context.token_start..completion.context.token_end.min(self.input.len())]
+            == prefix
+        {
+            return String::new();
+        }
+        let prefix_candidate = Candidate {
+            value: prefix.clone(),
+            description: String::new(),
+            kind: CandidateKind::Slash,
+        };
+        commands::candidate_suffix(
+            &self.input,
+            cursor_col,
+            &completion.context,
+            &prefix_candidate,
+        )
+    }
+
+    /// One dim hint row above the input listing the visible completion
+    /// candidates, capped and suffixed `… +N` when there are more.
+    fn completion_hint(&self) -> String {
+        let Some(completion) = self.completion.as_ref() else {
+            return String::new();
+        };
+        if completion.candidates.is_empty() {
+            return String::new();
+        }
+        let cap = (render::MAX_COMPLETION_ROWS / 2).max(1);
+        let shown = completion
+            .candidates
+            .iter()
+            .take(cap)
+            .map(|candidate| candidate.value.clone())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        if completion.candidates.len() > cap {
+            format!("{shown} … +{}", completion.candidates.len() - cap)
+        } else {
+            shown
         }
     }
 
@@ -669,7 +1161,12 @@ impl CrossTerm {
                 // model as a fresh metadata line instead.
                 self.pending.push(self.metadata_entry());
             }
-            UiEvent::ModelList { .. } => {}
+            UiEvent::ModelList { provider, models } => {
+                self.model_lists.insert(provider, models);
+                if commands::is_command_input(&self.input) {
+                    self.refresh_completion();
+                }
+            }
             UiEvent::UsageUpdated {
                 input_tokens,
                 output_tokens,
@@ -741,6 +1238,8 @@ impl CrossTerm {
                 }
             }
             UiEvent::SessionList { sessions } => {
+                self.session_candidates = sessions.clone();
+                self.session_completion_requested = false;
                 let notice = if sessions.is_empty() {
                     "No sessions for this workspace".to_owned()
                 } else {
@@ -759,6 +1258,9 @@ impl CrossTerm {
                         .join("\n")
                 };
                 self.add_notice(notice);
+                if commands::is_command_input(&self.input) {
+                    self.refresh_completion();
+                }
             }
             UiEvent::SessionExported { path } => {
                 self.add_notice(format!("exported session to {path}"));
@@ -824,12 +1326,16 @@ impl CrossTerm {
                 usage.cost
             )
         });
+        let ghost = self.ghost_text();
+        let hint = self.completion_hint();
         input_layout(
             &self.input,
             self.cursor,
             content.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
             self.theme,
             &usage_trailer,
+            &ghost,
+            &hint,
         )
     }
 
@@ -1122,6 +1628,18 @@ impl Drop for CrossTerm {
     }
 }
 
+/// Merge two candidate lists, deduplicating by value while preserving the
+/// first list's order. Used to combine static session candidates with the
+/// scanned path results for command arguments.
+fn merge_candidates(primary: Vec<Candidate>, secondary: Vec<Candidate>) -> Vec<Candidate> {
+    let mut seen = HashSet::new();
+    primary
+        .into_iter()
+        .chain(secondary)
+        .filter(|candidate| seen.insert(candidate.value.clone()))
+        .collect()
+}
+
 /// Keep the session-global chrome when a conversation switch replaces the
 /// transcript: the startup banner, metadata lines, and the most recent
 /// boundary separator. Everything else was already printed into scrollback;
@@ -1312,15 +1830,23 @@ fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'stat
 /// continuations indented to match) and locate the cursor inside them. The
 /// real terminal cursor is placed at `cursor_col` columns into `cursor_row`.
 ///
+/// Wrap the input draft into visual rows (first row prefixed with `› `,
+/// continuations indented to match) and locate the cursor inside them. The
+/// real terminal cursor is placed at `cursor_col` columns into `cursor_row`.
+///
 /// `usage_trailer` is appended, dim, to the empty-input placeholder row;
 /// nothing is shown while typing (the counter reappears after a submit
-/// because the input empties again).
+/// because the input empties again). `ghost` is the fish-style dim suffix
+/// preview painted after the cursor (only at end-of-input, clamped to the row
+/// width), and `completion_hint` is one dim candidate row above the input.
 fn input_layout(
     input: &str,
     cursor: usize,
     width: usize,
     theme: Theme,
     usage_trailer: &str,
+    ghost: &str,
+    completion_hint: &str,
 ) -> InputLayout {
     let width = width.max(1);
     let cursor = cursor.min(input.len());
@@ -1342,9 +1868,16 @@ fn input_layout(
         if !usage_trailer.is_empty() {
             spans.push(Span::styled(usage_trailer.to_owned(), dim_style));
         }
+        let mut rows = vec![Line::from(spans)];
+        if !completion_hint.is_empty() {
+            rows.insert(
+                0,
+                Line::from(Span::styled(completion_hint.to_owned(), dim_style)),
+            );
+        }
         return InputLayout {
-            rows: vec![Line::from(spans)],
-            cursor_row: 0,
+            rows,
+            cursor_row: usize::from(!completion_hint.is_empty()),
             cursor_col: 0,
         };
     }
@@ -1426,11 +1959,67 @@ fn input_layout(
     if rows.is_empty() {
         rows.push(Line::from(Span::styled(INPUT_PREFIX, prefix_style)));
     }
+
+    // The list hint is one dim row above the input.
+    if !completion_hint.is_empty() {
+        rows.insert(
+            0,
+            Line::from(Span::styled(completion_hint.to_owned(), dim_style)),
+        );
+        cursor_row += 1;
+    }
+    // Ghost preview: append the dim suffix after the typed text on the
+    // cursor's row. Only at end-of-input, clamped to the remaining width so
+    // the row never overflows; the cursor position is untouched.
+    if !ghost.is_empty()
+        && cursor >= input.len()
+        && let Some(row) = rows.get_mut(cursor_row)
+    {
+        let used = row
+            .spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        let available = width.saturating_sub(used);
+        let fits = ghost_to_width(ghost, available);
+        if !fits.is_empty() {
+            row.spans.push(Span::styled(fits, dim_style));
+        }
+    }
+
     InputLayout {
         rows,
         cursor_row,
         cursor_col,
     }
+}
+
+/// Truncate `text` (in display columns) to fit `width`, only ever cutting at
+/// whole characters. Returns empty when nothing fits.
+fn ghost_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
+        if used + character_width > width {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result
+}
+
+/// The byte offset of the `column`-th character (0-based) into `input`.
+fn byte_index_at_char(input: &str, column: usize) -> usize {
+    input
+        .char_indices()
+        .nth(column)
+        .map(|(index, _)| index)
+        .unwrap_or(input.len())
 }
 
 /// Clip the input rows to a window containing the cursor when the draft is
@@ -1660,7 +2249,17 @@ mod tests {
     use super::*;
 
     fn ui(width: u16, height: u16) -> CrossTerm {
-        CrossTerm::base("test-model", "test-provider", width, height)
+        CrossTerm::base(
+            "test-model",
+            "test-provider",
+            vec!["opencode-go".into(), "openrouter".into()],
+            width,
+            height,
+        )
+    }
+
+    fn ui_with_providers(providers: Vec<String>) -> CrossTerm {
+        CrossTerm::base("test-model", "test-provider", providers, 80, 24)
     }
 
     fn row_text(line: &Line<'_>) -> String {
@@ -1696,14 +2295,22 @@ mod tests {
 
     #[test]
     fn placeholder_row_shows_the_usage_trailer_only_when_presented() {
-        let layout = input_layout("", 0, 60, Theme::default(), "   ↑ 1.2k ↓ 3.4k · $0.01");
+        let layout = input_layout(
+            "",
+            0,
+            60,
+            Theme::default(),
+            "   ↑ 1.2k ↓ 3.4k · $0.01",
+            "",
+            "",
+        );
         assert_eq!(
             row_text(&layout.rows[0]),
             "› Type your message...   ↑ 1.2k ↓ 3.4k · $0.01"
         );
 
         // Without usage the placeholder stays bare.
-        let layout = input_layout("", 0, 60, Theme::default(), "");
+        let layout = input_layout("", 0, 60, Theme::default(), "", "", "");
         assert_eq!(row_text(&layout.rows[0]), "› Type your message...");
     }
 
@@ -1728,14 +2335,14 @@ mod tests {
     fn input_layout_wraps_and_places_the_cursor() {
         // "abcdefgh" at width 4 wraps into two full rows; a cursor at the
         // very end lands on a fresh third row (mirrors prompt_layout).
-        let layout = input_layout("abcdefgh", 8, 4, Theme::default(), "");
+        let layout = input_layout("abcdefgh", 8, 4, Theme::default(), "", "", "");
         let values: Vec<String> = layout.rows.iter().map(row_text).collect();
         assert_eq!(values, vec!["› abcd", "  efgh", "  "]);
         assert_eq!(layout.cursor_row, 2);
         assert_eq!(layout.cursor_col, 0);
 
         // Cursor mid-word stays on the first row at the right column.
-        let layout = input_layout("abcdef", 2, 4, Theme::default(), "");
+        let layout = input_layout("abcdef", 2, 4, Theme::default(), "", "", "");
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 2);
     }
@@ -1744,14 +2351,14 @@ mod tests {
     fn input_layout_handles_multiline_drafts() {
         // Two logical lines, cursor at the end of the second: continuation
         // rows are indented to line up under the prefix.
-        let layout = input_layout("ab\ncd", 5, 10, Theme::default(), "");
+        let layout = input_layout("ab\ncd", 5, 10, Theme::default(), "", "", "");
         let values: Vec<String> = layout.rows.iter().map(row_text).collect();
         assert_eq!(values, vec!["› ab", "  cd"]);
         assert_eq!(layout.cursor_row, 1);
         assert_eq!(layout.cursor_col, 2);
 
         // Empty input shows the placeholder with the cursor after `› `.
-        let layout = input_layout("", 0, 10, Theme::default(), "");
+        let layout = input_layout("", 0, 10, Theme::default(), "", "", "");
         assert_eq!(row_text(&layout.rows[0]), format!("› {PLACEHOLDER}"));
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 0);
@@ -1761,7 +2368,7 @@ mod tests {
     fn input_layout_counts_wide_characters_by_display_width() {
         // Two CJK characters fill a width-4 row; the cursor after the first
         // sits at display column 2, not byte offset 3.
-        let layout = input_layout("你好", 3, 4, Theme::default(), "");
+        let layout = input_layout("你好", 3, 4, Theme::default(), "", "", "");
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 2);
     }
@@ -2015,5 +2622,81 @@ mod tests {
         // The live message finalizes first, then the separator follows it.
         assert!(matches!(&ui.pending[0], Entry::Assistant { .. }));
         assert!(matches!(&ui.pending[1], Entry::Separator { label } if label.contains("abcd1234")));
+    }
+
+    #[test]
+    fn completion_accepts_a_single_command_candidate_on_tab() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model".to_owned();
+        ui.cursor = ui.input.len();
+        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
+        let _ = ui.handle_tab(&tx).unwrap();
+        // `/model` is a command that takes an argument; accepting it appends
+        // the argument space and leaves the caret right after it.
+        assert_eq!(ui.input, "/model ");
+    }
+
+    #[test]
+    fn completion_tab_cycles_providers_after_the_common_prefix() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model open".to_owned();
+        ui.cursor = ui.input.len();
+        let (tx, mut rx) = mpsc::unbounded_channel::<InputMessage>();
+        // First Tab: token "open" equals the common prefix, so it cycles to
+        // the second provider and accepts it.
+        let _ = ui.handle_tab(&tx).unwrap();
+        assert_eq!(ui.input, "/model openrouter:");
+        // Accepting the provider requested its model list on demand.
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(InputMessage::ListModels {
+                provider: "openrouter".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn ghost_previews_a_single_candidate_suffix() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model openc".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        // Only `opencode-go:` matches "openc", so the ghost shows its untyped
+        // remainder.
+        assert_eq!(ui.ghost_text(), "ode-go:");
+    }
+
+    #[test]
+    fn ghost_clears_when_the_cursor_is_mid_token() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model open".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        assert_eq!(ui.ghost_text(), "");
+        // Even with a ghost, a cursor not at the end disables it.
+        ui.cursor = "/model".len();
+        assert_eq!(ui.ghost_text(), "");
+    }
+
+    #[test]
+    fn input_layout_renders_ghost_and_hint_rows() {
+        // Ghost suffix follows the typed text on the input row.
+        let layout = input_layout("/model openc", 12, 60, Theme::default(), "", "ode-go:", "");
+        assert_eq!(row_text(&layout.rows[0]), "› /model opencode-go:");
+        assert_eq!(layout.cursor_row, 0);
+
+        // The completion hint row sits above the input.
+        let layout = input_layout(
+            "/model",
+            6,
+            60,
+            Theme::default(),
+            "",
+            "",
+            "opencode-go: · openrouter:",
+        );
+        assert_eq!(row_text(&layout.rows[0]), "opencode-go: · openrouter:");
+        assert_eq!(row_text(&layout.rows[1]), "› /model");
+        assert_eq!(layout.cursor_row, 1);
     }
 }

@@ -100,7 +100,7 @@ async fn main_inner() -> Result<ExitCode> {
             tui.run(event_rx, input_tx, cancel.clone()).await?;
         }
         UiArg::Crossterm => {
-            let ui = CrossTerm::new(&config.model, &provider_name)?;
+            let ui = CrossTerm::new(&config.model, &provider_name, providers)?;
             ui.run(event_rx, input_tx, cancel.clone()).await?;
         }
     }

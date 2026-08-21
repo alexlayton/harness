@@ -583,6 +583,52 @@ fn format_context_length(context: u64) -> String {
     }
 }
 
+/// The longest common character prefix shared by every candidate value, or
+/// empty when they agree on nothing. Used to extend the typed token to the
+/// common prefix on Tab and to drive the fish-style ghost preview.
+pub fn common_prefix(candidates: &[Candidate]) -> String {
+    let mut iter = candidates.iter().map(|candidate| candidate.value.as_str());
+    let Some(first) = iter.next() else {
+        return String::new();
+    };
+    let mut shared = first.to_owned();
+    for value in iter {
+        while !shared.is_empty() && !value.starts_with(shared.as_str()) {
+            shared.pop();
+        }
+    }
+    shared
+}
+
+/// The untyped remainder of a candidate value relative to the active token at
+/// `cursor_col`. Mirrors `apply_completion`'s token math: the replacement
+/// covers the whole token (`token_start`..`token_end`), so given the token
+/// `open` and the candidate `openrouter:` the suffix is `router:`. Returns
+/// empty when the token is already the candidate or the completion is closed.
+pub fn candidate_suffix(
+    input: &str,
+    cursor_col: usize,
+    context: &CompletionContext,
+    candidate: &Candidate,
+) -> String {
+    if context.token_start > context.token_end
+        || context.token_end > input.len()
+        || !input.is_char_boundary(context.token_start)
+        || !input.is_char_boundary(context.token_end)
+    {
+        return String::new();
+    }
+    let cursor_byte = byte_index_at_char(input, cursor_col);
+    let end = cursor_byte.clamp(context.token_start, context.token_end);
+    if !candidate
+        .value
+        .starts_with(&input[context.token_start..end])
+    {
+        return String::new();
+    }
+    candidate.value[end - context.token_start..].to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,6 +907,71 @@ mod tests {
             candidates("/he", &providers(), &lists, "opencode-go")
                 .iter()
                 .any(|candidate| candidate.value == "/help")
+        );
+    }
+
+    fn candidate(value: &str) -> Candidate {
+        Candidate {
+            value: value.into(),
+            description: String::new(),
+            kind: CandidateKind::Slash,
+        }
+    }
+
+    #[test]
+    fn common_prefix_extends_shared_command_and_model_text() {
+        assert_eq!(common_prefix(&[]), "");
+        let commands = vec![candidate("/model"), candidate("/new")];
+        assert_eq!(common_prefix(&commands), "/");
+        let providers = vec![candidate("opencode-go:"), candidate("openrouter:")];
+        assert_eq!(common_prefix(&providers), "open");
+        // Disjoint values share nothing.
+        assert_eq!(common_prefix(&vec![candidate("abc"), candidate("xyz")]), "");
+    }
+
+    #[test]
+    fn candidate_suffix_returns_the_untyped_token_remainder() {
+        let lists = HashMap::new();
+
+        // Provider: `/model open` completes to `openrouter:` → suffix.
+        let input = "/model open";
+        let cursor = input.chars().count();
+        let result =
+            candidates_at_cursor(input, cursor, &providers(), &lists, "opencode-go", &[]).unwrap();
+        let provider_candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "opencode-go:")
+            .unwrap();
+        assert_eq!(
+            candidate_suffix(input, cursor, &result.context, provider_candidate),
+            "code-go:"
+        );
+
+        // No model typed yet: the full id is the suffix.
+        let suffix_input = "/model ";
+        let suffix_cursor = suffix_input.chars().count();
+        let context = completion_context(suffix_input, suffix_cursor).unwrap();
+        let model = candidate("gpt-5.6-luna");
+        assert_eq!(
+            candidate_suffix(suffix_input, suffix_cursor, &context, &model),
+            "gpt-5.6-luna"
+        );
+
+        // Explicit `provider:` token keeps the prefix; the suffix starts
+        // past the colon.
+        let explicit = "/model openrouter:";
+        let explicit_cursor = explicit.chars().count();
+        let explicit_context = completion_context(explicit, explicit_cursor).unwrap();
+        let explicit_model = candidate("openrouter:openai/gpt-5.6-luna");
+        assert_eq!(
+            candidate_suffix(
+                explicit,
+                explicit_cursor,
+                &explicit_context,
+                &explicit_model
+            ),
+            "openai/gpt-5.6-luna"
         );
     }
 
