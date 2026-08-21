@@ -534,6 +534,21 @@ impl Agent {
         }
     }
 
+    /// Durable flush for deferred-sync stores (no-op otherwise). Called at
+    /// turn boundaries; failures are logged, not surfaced — the data is in
+    /// the OS page cache and the next boundary retries.
+    fn flush_deferred_sync(&self) {
+        let Some(state) = self.session.as_ref() else {
+            return;
+        };
+        if !state.store.deferred_sync() {
+            return;
+        }
+        if let Err(error) = state.store.sync_session(&state.session) {
+            tracing::warn!(error = %error, "deferred session sync failed");
+        }
+    }
+
     fn persist_user_message(
         &mut self,
         message: &Message,
@@ -682,7 +697,13 @@ impl Agent {
                 }
                 InputMessage::Message(text) if !text.trim().is_empty() => {
                     let turn_cancel = CancellationToken::new();
-                    match self.run_turn(text, &events, &mut input, &turn_cancel).await {
+                    let result = self.run_turn(text, &events, &mut input, &turn_cancel).await;
+                    // Turn-boundary durable flush: with deferred sync enabled
+                    // the events of this turn were written+flushed but not
+                    // fsynced; make them all durable once here instead of
+                    // paying an fsync per streamed event.
+                    self.flush_deferred_sync();
+                    match result {
                         Err(TurnError::Shutdown) => break,
                         Err(TurnError::Persist(_)) | Ok(()) => {}
                     }

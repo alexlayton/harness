@@ -7,9 +7,21 @@ use crate::model::{
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
+
+/// Shared deferred-sync flag so the store stays [`Clone`] (session handlers
+/// clone it freely). `true` skips per-record `sync_all`.
+#[derive(Debug, Default)]
+struct DeferredSync(AtomicBool);
+
+impl Clone for DeferredSync {
+    fn clone(&self) -> Self {
+        Self(AtomicBool::new(self.0.load(Ordering::Relaxed)))
+    }
+}
 
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
@@ -50,6 +62,13 @@ pub struct SessionStore {
     root: PathBuf,
     workspace_root: PathBuf,
     workspace_dir: PathBuf,
+    /// When set, [`Self::append_event`] skips the per-record `sync_all`:
+    /// records are still written and flushed to the OS, but the durable
+    /// flush is owed to [`Self::sync_session`], which callers invoke at turn
+    /// boundaries. Chatty tool loops pay several fsyncs per turn otherwise.
+    /// Default is per-event durability: a crash loses at most the in-flight
+    /// record. Deferred mode widens that window to the current turn's tail.
+    deferred_sync: DeferredSync,
 }
 
 impl SessionStore {
@@ -68,7 +87,36 @@ impl SessionStore {
             root,
             workspace_root,
             workspace_dir,
+            deferred_sync: DeferredSync::default(),
         })
+    }
+
+    /// Toggle deferred durability (see the field docs). Returns the store for
+    /// chaining.
+    pub fn with_deferred_sync(self, deferred: bool) -> Self {
+        self.deferred_sync.0.store(deferred, Ordering::Relaxed);
+        self
+    }
+
+    /// Whether deferred durability is enabled.
+    pub fn deferred_sync(&self) -> bool {
+        self.deferred_sync.0.load(Ordering::Relaxed)
+    }
+
+    /// Durable flush for deferred-sync sessions: `fsync`s the session file so
+    /// every record appended so far survives power loss. Cheap to call
+    /// repeatedly; a no-op when the session has no file (memory-only).
+    pub fn sync_session(&self, session: &Session) -> Result<()> {
+        let Some(path) = session.path() else {
+            return Ok(());
+        };
+        self.ensure_path_in_root(path)?;
+        let file = OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(|source| io_error("open session for sync", path, source))?;
+        file.sync_all()
+            .map_err(|source| io_error("sync session", path, source))
     }
 
     /// Construct the default Harness store.  `HARNESS_SESSION_DIR` is an
@@ -156,9 +204,10 @@ impl SessionStore {
         })
     }
 
-    /// Append one event and make it durable before returning.  A sidecar
-    /// create-new lock prevents two Harness processes from interleaving JSON
-    /// records.  Every record is followed by a newline and `sync_all`.
+    /// Append one event and make it durable before returning (or defer the
+    /// `sync_all` when deferred sync is enabled — see the store field docs).
+    /// A sidecar create-new lock prevents two Harness processes from
+    /// interleaving JSON records.  Every record is followed by a newline.
     #[tracing::instrument(
         name = "session_persist",
         skip_all,
@@ -200,11 +249,16 @@ impl SessionStore {
             .append(true)
             .open(&path)
             .map_err(|source| io_error("open session for append", &path, source))?;
-        file.write_all(line.as_bytes())
+        let write_result = file
+            .write_all(line.as_bytes())
             .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.flush())
-            .and_then(|_| file.sync_all())
-            .map_err(|source| io_error("append session event", &path, source))?;
+            .and_then(|_| file.flush());
+        let write_result = if write_result.is_err() || !self.deferred_sync() {
+            write_result.and_then(|_| file.sync_all())
+        } else {
+            write_result
+        };
+        write_result.map_err(|source| io_error("append session event", &path, source))?;
         drop(file);
         disk_session.append_record(record.clone());
         *session = disk_session;
