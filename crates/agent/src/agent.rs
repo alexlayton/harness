@@ -1,6 +1,6 @@
 use crate::config::{build_provider_with_auth, save_settings};
 use crate::prompt::system_prompt_with_workspace_context;
-use crate::tools::{Concurrency, ToolOutput, ToolRegistry, call_recap, call_summary};
+use crate::tools::{Concurrency, SkillEntry, ToolOutput, ToolRegistry, call_summary};
 use auth::{AuthEvent, CopilotAuth, sku_from_proxy_token};
 use compact::{
     CompactionPolicy, SummaryOutcome, estimate_live_tokens, plan_compaction,
@@ -61,8 +61,6 @@ pub enum AgentEvent {
     ToolCallStarted {
         name: String,
         summary: String,
-        /// Pretty-printed and bounded before it is sent to the serde-free TUI.
-        arguments: String,
     },
     ToolCallFinished {
         name: String,
@@ -103,6 +101,13 @@ pub enum AgentEvent {
     },
     SessionExported {
         path: String,
+    },
+    /// The discovered-skill view requested by the TUI's `/skills` command.
+    SkillsLoaded {
+        skills: Vec<SkillEntry>,
+        diagnostics: Vec<String>,
+        /// True when no skills were discovered at all.
+        empty: bool,
     },
     UsageUpdated {
         input_tokens: u64,
@@ -159,7 +164,6 @@ pub enum SessionSnapshotEntry {
     Tool {
         name: String,
         summary: String,
-        arguments: String,
         ok: bool,
         duration_ms: u64,
         output: String,
@@ -310,7 +314,6 @@ impl Agent {
                     AgentEvent::ToolCallStarted {
                         name: call.name.clone(),
                         summary: call_summary(&call.name, &call.arguments),
-                        arguments: call_recap(&call.name, &call.arguments),
                     },
                 );
             }
@@ -736,6 +739,14 @@ impl Agent {
                 }
                 InputMessage::ListModels { provider } => {
                     self.handle_list_models(provider, &events);
+                    continue;
+                }
+                InputMessage::ListSkills => {
+                    self.handle_list_skills(&events);
+                    continue;
+                }
+                InputMessage::InvokeSkill { name } => {
+                    self.handle_invoke_skill(name, &events, &mut input).await;
                     continue;
                 }
             };
@@ -1502,6 +1513,92 @@ impl Agent {
         spawn_model_list(provider_name, provider, events.clone());
     }
 
+    /// Reply to `/skills` with the discovered-skill view: invocable skills
+    /// first, then discovery diagnostics so broken skills are visible to the
+    /// user (they never reach the model prompt).
+    fn handle_list_skills(&self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let Some(catalog) = self.tools.skills() else {
+            send(
+                events,
+                AgentEvent::SkillsLoaded {
+                    skills: Vec::new(),
+                    diagnostics: Vec::new(),
+                    empty: true,
+                },
+            );
+            return;
+        };
+        let empty = catalog.is_empty();
+        send(
+            events,
+            AgentEvent::SkillsLoaded {
+                skills: catalog
+                    .skills
+                    .iter()
+                    .map(|skill| SkillEntry {
+                        name: skill.name.clone(),
+                        description: skill.description.clone(),
+                    })
+                    .collect(),
+                diagnostics: catalog
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| match &diagnostic.path {
+                        Some(path) => format!("{}: {}", path.display(), diagnostic.message),
+                        None => diagnostic.message.clone(),
+                    })
+                    .collect(),
+                empty,
+            },
+        );
+    }
+
+    /// Start a turn from a skill's instructions: the `SKILL.md` body without
+    /// frontmatter, prefixed with a line naming the skill so both the model
+    /// and the session transcript show what was invoked.
+    async fn handle_invoke_skill(
+        &mut self,
+        name: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+    ) {
+        let found = self.tools.skills().and_then(|catalog| {
+            catalog
+                .invocable()
+                .into_iter()
+                .find(|skill| skill.name.eq_ignore_ascii_case(&name))
+                .map(|skill| (skill.file_path.clone(), skill.name.clone()))
+        });
+        let Some((file_path, name)) = found else {
+            send(events, AgentEvent::Error(format!("unknown skill: {name}")));
+            return;
+        };
+        let raw = match std::fs::read_to_string(&file_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(format!("could not read {name}: {error}")),
+                );
+                return;
+            }
+        };
+        let (_, body) = tools::parse_frontmatter(&raw);
+        let body = body.trim();
+        if body.is_empty() {
+            send(events, AgentEvent::Error(format!("skill {name} is empty")));
+            return;
+        }
+        let turn_cancel = CancellationToken::new();
+        let result = self
+            .run_turn(format!("/{name}\n\n{body}"), events, input, &turn_cancel)
+            .await;
+        match result {
+            Err(TurnError::Shutdown) => {}
+            Err(TurnError::Persist(_)) | Ok(()) => {}
+        }
+    }
+
     // ------------------------------------------------------------------ compaction
 
     /// Resolve the provider context window: config override → model-reported
@@ -1740,13 +1837,12 @@ pub fn spawn_model_list(
 }
 
 /// Adapt the session-owned snapshot into the UI-facing entry type, adding
-/// tool summaries and per-tool recap strings.  The session crate owns the
-/// event walk and tool-result pairing; this conversion is purely
-/// presentational.
+/// tool summaries. The session crate owns the event walk and tool-result
+/// pairing; this conversion is purely presentational.
 ///
-/// The recap is display-only: raw JSON arguments stay in the session store and
-/// in `context_messages`, so loaded and continued sessions keep full fidelity.
-/// Do not persist these strings back into session events.
+/// Summaries are display-only: raw JSON arguments stay in the session store
+/// and in `context_messages`, so loaded and continued sessions keep full
+/// fidelity. Do not persist these strings back into session events.
 fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<SessionSnapshotEntry> {
     entries
         .into_iter()
@@ -1767,11 +1863,9 @@ fn ui_snapshot_entries(entries: Vec<session::SessionSnapshotEntry>) -> Vec<Sessi
                 error,
             } => {
                 let summary = call_summary(&name, &arguments);
-                let recap = call_recap(&name, &arguments);
                 SessionSnapshotEntry::Tool {
                     name,
                     summary,
-                    arguments: recap,
                     ok,
                     duration_ms: 0,
                     output,
@@ -2295,10 +2389,7 @@ mod tests {
             assert!(got.contains(&AgentEvent::TextDelta("done".into())));
             assert!(got.iter().any(|event| matches!(
                 event,
-                AgentEvent::ToolCallStarted {
-                    arguments,
-                    ..
-                } if arguments == "missing"
+                AgentEvent::ToolCallStarted { summary, .. } if summary == "missing"
             )));
             assert!(got.iter().any(|event| matches!(
                 event,

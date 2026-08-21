@@ -782,7 +782,6 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let root = tempdir().unwrap();
-            let workspace = tempdir().unwrap();
             let provider = Arc::new(RecordingProvider::default());
             let cli = Cli {
                 print: true,
