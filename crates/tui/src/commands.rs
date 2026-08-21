@@ -352,6 +352,9 @@ pub fn apply_completion(
             .then_some(" ")
             .filter(|_| !next_is_whitespace)
             .unwrap_or(""),
+        // `@` file references and command path arguments end the token with a
+        // space once completed, so typing continues on a fresh token.
+        // Directories keep the completion context alive instead.
         CompletionTarget::Argument(_) if candidate.kind == CandidateKind::File && at_token_end => {
             if next_is_whitespace {
                 ""

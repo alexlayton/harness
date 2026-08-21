@@ -62,7 +62,7 @@ use crate::commands::{
 use crate::commit::stable_block_split_offset;
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
-use crate::paths;
+use crate::paths::{self, AtPrefix};
 use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
 use crate::{InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, TuiEvent, UiEvent};
@@ -84,7 +84,7 @@ use ratatui_core::text::{Line, Span, Text};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -180,12 +180,15 @@ enum CompletionKind {
 }
 
 /// A debounced path-completion scan result delivered back over the run-loop
-/// channel so a large directory tree never blocks the UI thread.
+/// channel so a large directory tree never blocks the UI thread. `at_prefix`
+/// is set when the scan was for an `@` file reference rather than a command
+/// argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PathCompletionResult {
     generation: u64,
     context: CompletionContext,
     candidates: Vec<Candidate>,
+    at_prefix: Option<AtPrefix>,
 }
 
 /// One frame's live region: the rows to paint and where the terminal cursor
@@ -572,10 +575,32 @@ impl CrossTerm {
     /// delivers results over `path_completion_rx`. Pure callers (tests) drive
     /// this directly; the run loop calls it after every input mutation.
     fn refresh_completion(&mut self) {
-        if !commands::is_command_input(&self.input) {
-            self.close_completion();
+        if commands::is_command_input(&self.input) {
+            self.refresh_command_completion();
             return;
         }
+        // Outside slash commands, an active `@` token completes file
+        // references against a debounced workspace scan.
+        let Some(prefix) = paths::extract_at_prefix(&self.input, self.cursor_char_col()) else {
+            self.close_completion();
+            return;
+        };
+        self.request_path_completion(
+            CompletionContext {
+                target: CompletionTarget::Argument(ArgumentKind::Path),
+                token_start: prefix.token_start,
+                token_end: prefix.token_end,
+                query: prefix.query.clone(),
+            },
+            Vec::new(),
+            None,
+            Some(prefix),
+        );
+    }
+
+    /// [`Self::refresh_completion`] half that handles `/command` drafts:
+    /// static candidates plus, for path arguments, a debounced scan.
+    fn refresh_command_completion(&mut self) {
         let old_value = self.completion.as_ref().and_then(|completion| {
             completion
                 .candidates
@@ -602,7 +627,7 @@ impl CrossTerm {
             result.context.target,
             CompletionTarget::Argument(ArgumentKind::Path),
         ) {
-            self.request_path_completion(result.context, result.candidates, old_value);
+            self.request_path_completion(result.context, result.candidates, old_value, None);
             return;
         }
         let kind = match result.context.target {
@@ -811,6 +836,7 @@ impl CrossTerm {
         context: CompletionContext,
         initial: Vec<Candidate>,
         preferred: Option<String>,
+        at_prefix: Option<AtPrefix>,
     ) {
         let query = context.query.clone();
         if self.path_completion_query.as_deref() == Some(query.as_str())
@@ -846,11 +872,20 @@ impl CrossTerm {
             if cancel.is_cancelled() {
                 return;
             }
-            let candidates = tokio::task::spawn_blocking(move || {
-                paths::find_path_candidates(&root, &scan_query, &scan_cancel)
-            })
-            .await
-            .unwrap_or_default();
+            // `@` references walk the whole workspace; command arguments list
+            // one directory.
+            let at = at_prefix.is_some();
+            let scan = move |root: &Path, query: &str, cancel: &CancellationToken| {
+                if at {
+                    paths::find_candidates(root, query, cancel)
+                } else {
+                    paths::find_path_candidates(root, query, cancel)
+                }
+            };
+            let candidates =
+                tokio::task::spawn_blocking(move || scan(&root, &scan_query, &scan_cancel))
+                    .await
+                    .unwrap_or_default();
             if cancel.is_cancelled() {
                 return;
             }
@@ -858,6 +893,7 @@ impl CrossTerm {
                 generation,
                 context,
                 candidates,
+                at_prefix,
             });
         });
     }
@@ -867,7 +903,14 @@ impl CrossTerm {
             return;
         }
         let cursor_col = self.cursor_char_col();
-        let Some(context_now) = commands::completion_context(&self.input, cursor_col) else {
+        // The draft must still be on the same token the scan was started for.
+        let context_now = match &result.at_prefix {
+            Some(prefix) => paths::extract_at_prefix(&self.input, cursor_col)
+                .filter(|now| now.token_start == prefix.token_start)
+                .map(|now| now.into_context()),
+            None => commands::completion_context(&self.input, cursor_col),
+        };
+        let Some(context_now) = context_now else {
             return;
         };
         if result.context != context_now {
@@ -879,7 +922,8 @@ impl CrossTerm {
             .as_ref()
             .and_then(|completion| completion.candidates.get(completion.selected))
             .map(|candidate| candidate.value.as_str());
-        // Merge static session candidates (for `/load`) with the scanned links.
+        // Merge static candidates (sessions for `/load`, providers/models for
+        // `/model`) with the scanned filesystem results.
         let static_candidates = commands::candidates_at_cursor(
             &self.input,
             cursor_col,
@@ -2798,6 +2842,82 @@ mod tests {
         // Even with a ghost, a cursor not at the end disables it.
         ui.cursor = "/model".len();
         assert_eq!(ui.ghost_text(), "");
+    }
+
+    #[tokio::test]
+    async fn at_reference_opens_a_file_completion_context() {
+        let mut ui = ui(80, 24);
+        ui.input = "see @src/ma".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        // The `@` token opens a path completion even though the draft is not
+        // a slash command; the scan starts from the token's query.
+        let completion = ui.completion.as_ref().expect("@ opens completion");
+        assert_eq!(completion.kind, CompletionKind::Path);
+        assert_eq!(completion.context.token_start, 4);
+        assert_eq!(completion.context.query, "src/ma");
+        assert_eq!(ui.path_completion_query.as_deref(), Some("src/ma"));
+
+        // Moving the cursor off the token (e.g. after a space) closes it.
+        ui.input.push(' ');
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        assert!(ui.completion.is_none());
+    }
+
+    #[tokio::test]
+    async fn at_reference_scan_results_replace_the_candidate_list() {
+        let mut ui = ui(80, 24);
+        ui.input = "look at @Re".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let generation = ui.path_completion_generation;
+        let context = ui.completion.as_ref().unwrap().context.clone();
+        ui.apply_path_completion(PathCompletionResult {
+            generation,
+            context,
+            candidates: vec![Candidate {
+                value: "@src/README.md".into(),
+                description: "file".into(),
+                kind: CandidateKind::File,
+            }],
+            at_prefix: paths::extract_at_prefix("look at @Re", 11),
+        });
+        let completion = ui.completion.as_ref().expect("candidates applied");
+        assert_eq!(completion.candidates[0].value, "@src/README.md");
+        // A fuzzy match (`Re` → README) shares no literal prefix with the
+        // typed token, so there is no ghost to preview.
+        assert_eq!(ui.ghost_text(), "");
+
+        // Tab accepts the candidate and appends a trailing space.
+        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(ui.input, "look at @src/README.md ");
+    }
+
+    #[tokio::test]
+    async fn stale_at_scan_results_are_ignored() {
+        let mut ui = ui(80, 24);
+        ui.input = "@a".to_owned();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let generation = ui.path_completion_generation;
+        let context = ui.completion.as_ref().unwrap().context.clone();
+        // The user kept typing before the scan landed: the result is stale.
+        ui.input = "@ab".to_owned();
+        ui.cursor = ui.input.len();
+        ui.apply_path_completion(PathCompletionResult {
+            generation,
+            context,
+            candidates: vec![Candidate {
+                value: "@a.txt".into(),
+                description: "file".into(),
+                kind: CandidateKind::File,
+            }],
+            at_prefix: paths::extract_at_prefix("@a", 2),
+        });
+        let completion = ui.completion.as_ref().expect("still open for @ab");
+        assert!(completion.candidates.is_empty());
     }
 
     #[test]
