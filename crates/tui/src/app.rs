@@ -1881,8 +1881,8 @@ fn push_detail_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, wi
     }
 }
 
-/// The header metadata: two dim, left-aligned rows — `provider · model` on
-/// the first, `cwd  (branch)` on the second — replacing the old right-aligned
+/// The header metadata: two dim, left-aligned rows — `cwd  (branch)` on the
+/// first, `provider · model` on the second — replacing the old right-aligned
 /// split so both lines read as plain left-aligned chrome above the transcript.
 fn metadata_lines(
     cwd: &str,
@@ -1899,8 +1899,8 @@ fn metadata_lines(
         None => cwd.to_owned(),
     };
     vec![
-        Line::from(Span::styled(format!("{provider} · {model}"), style)),
         Line::from(Span::styled(left, style)),
+        Line::from(Span::styled(format!("{provider} · {model}"), style)),
     ]
 }
 
@@ -2535,8 +2535,8 @@ mod tests {
             Theme::default(),
         );
         assert_eq!(lines.len(), 2);
-        assert_eq!(row_text(&lines[0]), "opencode-go · gpt-5");
-        assert_eq!(row_text(&lines[1]), "~/proj  (main)");
+        assert_eq!(row_text(&lines[0]), "~/proj  (main)");
+        assert_eq!(row_text(&lines[1]), "opencode-go · gpt-5");
         // Both rows are dimmed.
         for line in &lines {
             assert!(
@@ -2548,9 +2548,9 @@ mod tests {
             );
         }
 
-        // No branch: the second row is just the cwd.
+        // No branch: the first row is just the cwd.
         let lines = metadata_lines("~/proj", None, "p", "m", Theme::default());
-        assert_eq!(row_text(&lines[1]), "~/proj");
+        assert_eq!(row_text(&lines[0]), "~/proj");
     }
 
     #[test]
