@@ -1,5 +1,5 @@
 use agent::agent::{Agent, spawn_model_list};
-use agent::config::{Cli, Config, ProviderArg, UiArg, build_provider_with_auth, init_logging};
+use agent::config::{Cli, Config, ProviderArg, build_provider_with_auth, init_logging};
 use agent::headless::run_headless;
 use agent::project_context_for;
 use agent::tools::{ToolConfig, default_registry};
@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::{CrossTerm, InputMessage, Tui};
+use tui::{CrossTerm, InputMessage};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -92,18 +92,10 @@ async fn main_inner() -> Result<ExitCode> {
         .with_session(session_store, session);
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
-    // Both frontends drive the same agent and differ only in rendering and
-    // input handling; `--ui` exists so they can be compared side by side.
-    match cli.ui {
-        UiArg::Inline => {
-            let tui = Tui::new(&config.model, &provider_name, providers)?;
-            tui.run(event_rx, input_tx, cancel.clone()).await?;
-        }
-        UiArg::Crossterm => {
-            let ui = CrossTerm::new(&config.model, &provider_name, providers)?;
-            ui.run(event_rx, input_tx, cancel.clone()).await?;
-        }
-    }
+    // The crossterm frontend drives the same agent as headless mode and
+    // differs only in rendering and input handling.
+    let ui = CrossTerm::new(&config.model, &provider_name, providers)?;
+    ui.run(event_rx, input_tx, cancel.clone()).await?;
     cancel.cancel();
     let _ = agent_task.await;
     Ok(ExitCode::SUCCESS)

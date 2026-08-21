@@ -15,17 +15,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Terminal frontend for the interactive binary: the ratatui inline-viewport
-/// UI (default) or the experimental direct-crossterm scrollback UI.
-#[derive(Clone, Copy, Debug, Default, ValueEnum, PartialEq, Eq)]
-pub enum UiArg {
-    /// Ratatui inline viewport with a fixed-height live region.
-    #[default]
-    Inline,
-    /// Direct crossterm: plain rows in native scrollback, `›` prompt line.
-    Crossterm,
-}
-
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ProviderArg {
     #[value(name = "opencode-go")]
@@ -330,10 +319,6 @@ pub struct Cli {
     /// error.
     #[arg(value_name = "PROMPT")]
     pub prompt: Vec<String>,
-
-    /// Interactive terminal UI to run.
-    #[arg(long, value_enum, default_value_t = UiArg::Inline)]
-    pub ui: UiArg,
 }
 
 #[derive(Clone, Debug)]

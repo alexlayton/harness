@@ -2,7 +2,7 @@
 
 Harness is a terminal coding-agent harness: it drives an LLM through a loop of
 streamed completions and workspace-scoped tool calls, renders the result in a
-retained-mode TUI (or headless stdout), and persists every event to a durable,
+terminal UI (or headless stdout), and persists every event to a durable,
 append-only JSONL session log.
 
 The project is a Cargo workspace of 7 crates with a strict dependency
@@ -26,7 +26,7 @@ builds the `harness` binary.
 | Crate | Responsibility | Key public items |
 |---|---|---|
 | [`agent`] | The `harness` binary and the agent orchestration loop: turn state machine, tool dispatch, retry/recovery, compaction triggers, auth UX, plus two frontends (TUI and headless) | `Agent`, `AgentEvent`, `run_headless`, `Cli`, `Config` |
-| [`tui`] | Retained-mode terminal UI. Renders `UiEvent`s, owns input handling, slash commands, attachments, completion | `Tui`, `InputMessage`, `UiEvent` |
+| [`tui`] | Terminal UI. Renders `UiEvent`s, owns input handling, slash commands, attachments, completion | `CrossTerm`, `InputMessage`, `UiEvent` |
 | [`compact`] | Compaction *policy and planning* (when/what to cut, how to summarize); persistence of summaries stays in `session` | `CompactionPolicy`, `plan_compaction`, `summarize` |
 | [`session`] | Durable append-only JSONL session log: format, codec, store, export, context reconstruction | `Session`, `SessionStore`, `SessionEvent`, `ExportOptions` |
 | [`llm`] | Provider abstraction plus wire-format dialects and provider clients. The only crate that speaks HTTP to model APIs | `Provider`, `CompletionRequest`, `Message`, `StreamEvent` |
@@ -61,12 +61,14 @@ and rebuilds provider history from it. Old events are never deleted.
 
 ## Frontends
 
-Both frontends drive the *same* `Agent` and differ only in I/O:
+The interactive UI and the headless runner drive the *same* `Agent` and
+differ only in I/O:
 
-- **TUI** (`crates/tui`): ratatui-based retained-mode UI. The agent's
-  `AgentEvent`s are adapted into `UiEvent`s in `crates/agent/src/lib.rs` —
-  this adapter crate is what breaks the would-be dependency cycle between
-  `agent` and `tui`.
+- **TUI** (`crates/tui`): direct-crossterm terminal UI — plain rows committed
+  into the terminal's native scrollback with a small live region at the bottom.
+  The agent's `AgentEvent`s are adapted into `UiEvent`s in
+  `crates/agent/src/lib.rs` — this adapter crate is what breaks the would-be
+  dependency cycle between `agent` and `tui`.
 - **Headless** (`crates/agent/src/headless.rs`): `harness -p "…"`. One prompt,
   run to completion, final answer to stdout, exit. All progress goes to stderr
   behind `-v`. Stdout purity is a hard requirement (pipes/CI).

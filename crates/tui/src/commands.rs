@@ -926,7 +926,7 @@ mod tests {
         let providers = vec![candidate("opencode-go:"), candidate("openrouter:")];
         assert_eq!(common_prefix(&providers), "open");
         // Disjoint values share nothing.
-        assert_eq!(common_prefix(&vec![candidate("abc"), candidate("xyz")]), "");
+        assert_eq!(common_prefix(&[candidate("abc"), candidate("xyz")]), "");
     }
 
     #[test]

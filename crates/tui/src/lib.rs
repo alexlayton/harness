@@ -1,21 +1,18 @@
-//! A retained-mode terminal UI for Harness. The event adapter keeps this
-//! crate independent from the agent crate, avoiding a library dependency cycle.
+//! A direct-crossterm terminal UI for Harness: plain rows committed into the
+//! terminal's native scrollback, a small live region at the bottom, and a
+//! `›` input line. The event adapter keeps this crate independent from the
+//! agent crate, avoiding a library dependency cycle.
 
 mod app;
 pub mod attachments;
 pub mod commands;
 mod commit;
-mod completion;
-mod cross;
 mod environment;
-mod events;
 mod input;
-mod layout;
 pub mod render;
 mod state;
 
-pub use app::Tui;
-pub use cross::CrossTerm;
+pub use app::CrossTerm;
 pub use state::{ToolRecord, ToolStatus};
 
 /// Messages sent from the terminal UI to the agent. Keeping this protocol in
