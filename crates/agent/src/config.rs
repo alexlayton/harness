@@ -325,6 +325,13 @@ pub struct Cli {
     #[arg(long = "no-session", default_value_t = false)]
     pub no_session: bool,
 
+    /// Serve the agent over stdio using the Agent Client Protocol (ACP), so
+    /// editors (Zed natively; Neovim/JetBrains via plugins) can drive harness.
+    /// Mutually exclusive with `--print`; provider/model/config flags still
+    /// apply. Tools run without an approval step, same as every frontend.
+    #[arg(long = "acp", conflicts_with = "print", default_value_t = false)]
+    pub acp: bool,
+
     /// Prompt for non-interactive mode. Joined with spaces. When `--print` is
     /// set and no positional is given, the prompt is read from stdin.
     /// Only meaningful with `--print`; passing it without `--print` is an

@@ -25,7 +25,7 @@ builds the `harness` binary.
 
 | Crate | Responsibility | Key public items |
 |---|---|---|
-| [`agent`] | The `harness` binary and the agent orchestration loop: turn state machine, tool dispatch, retry/recovery, compaction triggers, auth UX, plus two frontends (TUI and headless) | `Agent`, `AgentEvent`, `run_headless`, `Cli`, `Config` |
+| [`agent`] | The `harness` binary and the agent orchestration loop: turn state machine, tool dispatch, retry/recovery, compaction triggers, auth UX, plus three frontends (TUI, headless, and ACP) | `Agent`, `AgentEvent`, `run_headless`, `acp::run`, `Cli`, `Config` |
 | [`tui`] | Terminal UI. Renders `UiEvent`s, owns input handling, slash commands, path completion | `CrossTerm`, `InputMessage`, `UiEvent` |
 | [`compact`] | Compaction *policy and planning* (when/what to cut, how to summarize); persistence of summaries stays in `session` | `CompactionPolicy`, `plan_compaction`, `summarize` |
 | [`session`] | Durable append-only JSONL session log: format, codec, store, export, context reconstruction | `Session`, `SessionStore`, `SessionEvent`, `ExportOptions` |
@@ -61,8 +61,8 @@ and rebuilds provider history from it. Old events are never deleted.
 
 ## Frontends
 
-The interactive UI and the headless runner drive the *same* `Agent` and
-differ only in I/O:
+The TUI, headless runner, and ACP frontend drive the *same* `Agent` and differ
+only in I/O:
 
 - **TUI** (`crates/tui`): direct-crossterm terminal UI — plain rows committed
   into the terminal's native scrollback with a small live region at the bottom.
@@ -72,6 +72,13 @@ differ only in I/O:
 - **Headless** (`crates/agent/src/headless.rs`): `harness -p "…"`. One prompt,
   run to completion, final answer to stdout, exit. All progress goes to stderr
   behind `-v`. Stdout purity is a hard requirement (pipes/CI).
+- **ACP** (`crates/agent/src/acp.rs`): `harness --acp`. Serves one agent over
+  stdio as an ACP (Agent Client Protocol) connection for editors (Zed, etc.).
+  Each ACP session is one `(ToolRegistry, SessionStore, Agent)` triple rooted at
+  the editor's workspace; `session/prompt` parks its responder until `TurnFinished`,
+  and `session/cancel` resolves a parked prompt as `Cancelled` via
+  `InputMessage::Interrupt`. Stdout carries JSON-RPC only; tracing stays file-only.
+  No approval step, matching the other frontends.
 
 ## Providers and dialects
 

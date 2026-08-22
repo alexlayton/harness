@@ -62,3 +62,24 @@ the rest through `/chat/completions`, matching the per-model
 models behind billing; when no model is configured, the default prefers one the
 plan can serve, and plan-gated requests surface an actionable error instead of
 a bare 400.
+
+## Editor integration (ACP)
+
+Harness ships a third frontend that speaks the [Agent Client Protocol][acp] over
+stdio, so ACP-capable editors (Zed natively; Neovim/JetBrains via plugins) can
+drive it in place of a standalone agent:
+
+```text
+harness --acp
+```
+
+Editors spawn `harness --acp` as a subprocess and send `session/new`,
+`session/prompt`, and `session/cancel` JSON-RPC messages; Harness answers with
+streamed updates and tool-call notifications. Sessions are scoped to the
+workspace the editor opens.
+
+**Tools run without a confirmation step**, exactly like the TUI and headless
+frontends, so an editor that auto-approves prompts is executing your tools as
+soon as the model chooses to. There is no permission gate over ACP.
+
+[acp]: https://agentclientprotocol.com/

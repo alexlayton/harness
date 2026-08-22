@@ -1,3 +1,4 @@
+use agent::acp;
 use agent::agent::{Agent, spawn_model_list};
 use agent::config::{Cli, Config, ProviderArg, build_provider_with_auth, init_logging};
 use agent::headless::run_headless;
@@ -124,9 +125,18 @@ async fn main_inner() -> Result<ExitCode> {
         return run_headless(&config, &cli, provider, tools, session_store).await;
     }
 
+    // ACP is the third frontend: same provider/config setup, but the process
+    // becomes a stdio JSON-RPC server and never touches the terminal. The
+    // workspace root stays the launch directory; per-session roots come from
+    // each `session/new` request.
+    if cli.acp {
+        drop(session_store);
+        drop(tools);
+        return acp::run(provider, config, copilot_auth, cli.no_context_files).await;
+    }
+
     // Interactive mode always has a store (enforced by needs_session_store
     // being true when !cli.print); headless may run without one.
-    let session_store = session_store.expect("interactive mode always builds the session store");
     let session = session_store.create(SessionCreateOptions {
         provider: Some(provider_name.clone()),
         model: Some(config.model.clone()),
