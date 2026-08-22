@@ -320,11 +320,12 @@ where
 // side-effect-free so they unit-test without a connection.
 // ---------------------------------------------------------------------
 
-/// Reply to `initialize`: negotiate down to the highest version both sides
-/// understand (only v1 is implemented), advertise exactly what this frontend
-/// supports, and offer no auth methods (see the `authenticate` handler).
-fn initialize_response(request: &InitializeRequest) -> InitializeResponse {
-    InitializeResponse::new(request.protocol_version.min(ProtocolVersion::V1))
+/// Reply to `initialize`: always answer with v1 (the only version this
+/// adapter implements — echoing an older client version back would claim
+/// support we don't have), advertise exactly what this frontend supports,
+/// and offer no auth methods (see the `authenticate` handler).
+fn initialize_response(_request: &InitializeRequest) -> InitializeResponse {
+    InitializeResponse::new(ProtocolVersion::V1)
         .agent_info(v1::Implementation::new(
             "harness",
             env!("CARGO_PKG_VERSION"),
@@ -719,7 +720,7 @@ fn spawn_agent(
         state.config.model.clone(),
         state.app_cancel.clone(),
     )
-    .with_compaction(state.config.compaction.clone().into())
+    .with_compaction(state.config.compaction.clone())
     .with_project_context(project_context)
     .with_session(store, session);
     if let Some(auth) = &state.copilot_auth {
@@ -732,7 +733,6 @@ fn spawn_agent(
         connection,
         state.prompts.clone(),
         acp_session_id.clone(),
-        input_tx.clone(),
     ));
 
     state
@@ -744,17 +744,15 @@ fn spawn_agent(
 }
 
 /// Consume one session's agent events until the agent task exits: translate
-/// each into a `session/update` notification, resolve the parked prompt on
-/// `TurnFinished`, and keep the input channel registered while the agent is
-/// alive. On exit the session is unregistered so later requests fail cleanly.
+/// each into a `session/update` notification and resolve the parked prompt on
+/// `TurnFinished`. Deliberately holds no input sender: the only live clones
+/// belong to the sessions map, so `session/delete` dropping the handle closes
+/// the channel and lets the agent run loop wind down.
 async fn forward_events(
     mut event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     connection: ConnectionTo<agent_client_protocol::Client>,
     prompts: Arc<PromptTracker>,
     acp_session_id: String,
-    // Held so the registered `SessionHandle` stays sendable for the agent's
-    // whole life; the handle in the sessions map shares this channel.
-    _input_tx: mpsc::UnboundedSender<InputMessage>,
 ) {
     let mut ids = ToolCallIds::default();
     // Context window starts unknown (0); the model catalog refines it.
@@ -1019,7 +1017,8 @@ mod tests {
         );
         assert!(response.auth_methods.is_empty(), "no auth over ACP");
 
-        // A client asking for a newer version gets v1 back.
+        // A client asking for a different version gets v1 back either way:
+        // echoing an older version would claim support we don't have.
         let newer = InitializeRequest::new(ProtocolVersion::from(9u16));
         assert_eq!(
             initialize_response(&newer).protocol_version,
@@ -1352,7 +1351,6 @@ mod tests {
         }
     }
 
-    // Keep unused imports referenced when only unit tests run.
     // Keep unused imports referenced when only unit tests run.
     #[allow(dead_code)]
     fn _assert_traits() {

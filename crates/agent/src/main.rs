@@ -66,6 +66,16 @@ async fn main_inner() -> Result<ExitCode> {
     let workspace_root =
         std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
     tracing::info!(stage = "workspace", elapsed_ms = since_start());
+
+    // ACP is the third frontend: same provider/config setup, but the process
+    // becomes a stdio JSON-RPC server and never touches the terminal. The
+    // workspace root stays the launch directory; per-session roots come from
+    // each `session/new` request, so none of the process-cwd startup work
+    // below (registry, store, context files) is built.
+    if cli.acp {
+        return acp::run(provider, config, copilot_auth, cli.no_context_files).await;
+    }
+
     // Independent startup work runs concurrently: skills discovery, context
     // files, and the session store are all filesystem walks/hashing that
     // don't depend on each other or the tool registry.  On a cold cache these
@@ -125,18 +135,10 @@ async fn main_inner() -> Result<ExitCode> {
         return run_headless(&config, &cli, provider, tools, session_store).await;
     }
 
-    // ACP is the third frontend: same provider/config setup, but the process
-    // becomes a stdio JSON-RPC server and never touches the terminal. The
-    // workspace root stays the launch directory; per-session roots come from
-    // each `session/new` request.
-    if cli.acp {
-        drop(session_store);
-        drop(tools);
-        return acp::run(provider, config, copilot_auth, cli.no_context_files).await;
-    }
-
     // Interactive mode always has a store (enforced by needs_session_store
     // being true when !cli.print); headless may run without one.
+    let session_store = session_store.expect("interactive mode always builds the session store");
+
     let session = session_store.create(SessionCreateOptions {
         provider: Some(provider_name.clone()),
         model: Some(config.model.clone()),
