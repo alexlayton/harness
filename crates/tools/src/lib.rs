@@ -7,6 +7,7 @@ mod grep;
 mod read;
 mod registry;
 pub mod skills;
+mod subagent;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
@@ -22,6 +23,7 @@ pub use skills::{
     Skill, SkillCatalog, SkillDiagnostic, SkillEntry, SkillMode, SkillSeverity, discover,
     expand_tilde, format_skills_prompt, load_skills_from_dir, parse_frontmatter,
 };
+pub use subagent::{SUBAGENT_TOOL_NAME, SubagentRunner, SubagentTool};
 pub use write::WriteTool;
 
 use async_trait::async_trait;
@@ -85,7 +87,7 @@ pub struct ToolOutput {
 /// calls or must occupy the workspace alone.
 ///
 /// Classification is decided by the harness, never the model: the model is
-/// only told that batching read-only calls is encouraged. It fails closed —
+/// only told that batching independent calls is encouraged. It fails closed —
 /// anything not provably side-effect-light is [`Concurrency::Exclusive`] —
 /// because a wrong `ReadOnly` corrupts workspace state, while a wrong
 /// `Exclusive` merely forfeits a little latency.
@@ -94,6 +96,13 @@ pub enum Concurrency {
     /// Provably read-only for these arguments: safe to run concurrently
     /// with other `ReadOnly` calls from the same turn.
     ReadOnly,
+    /// Not side-effect-free, yet designed for fan-out: safe to run
+    /// concurrently with other `Parallel` calls *of the same tool* (each
+    /// invocation is expected to stay within its own scope, e.g. one
+    /// subagent per crate), but never batched together with `ReadOnly`
+    /// calls. Adjacent `Parallel` calls of one tool form their own
+    /// concurrent batch; everything else stays in program order.
+    Parallel,
     /// May observe or mutate workspace state: runs alone, in program order.
     Exclusive,
 }
@@ -412,6 +421,12 @@ pub fn call_summary(name: &str, args: &Value) -> String {
                 (Some(pattern), None) => format!("grep {pattern}"),
                 _ => "grep".into(),
             }
+        }
+        "subagent" => {
+            // Same helper the tool uses for its live summary, so previews
+            // never diverge between dispatch time and snapshot replay.
+            let (description, prompt) = subagent::parse_args(args).unwrap_or((None, None));
+            format!("subagent: {}", subagent::preview(description, prompt))
         }
         _ => name.to_owned(),
     }

@@ -70,6 +70,23 @@ impl ToolRegistry {
         self.skills = Some(skills);
     }
 
+    /// Register the subagent tool with an injected runner.  Kept off
+    /// [`Self::register`] so callers cannot accidentally advertise a
+    /// subagent schema without a working runner behind it.
+    pub fn register_subagent(
+        &mut self,
+        runner: std::sync::Arc<dyn super::subagent::SubagentRunner>,
+    ) -> Result<(), ToolRegistryError> {
+        self.register(Box::new(super::subagent::SubagentTool::new(runner)))
+    }
+
+    /// Whether the subagent tool is available in this registry.
+    pub fn has_subagent(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.name == super::subagent::SUBAGENT_TOOL_NAME)
+    }
+
     /// The discovered skill catalog, if any.
     pub fn skills(&self) -> Option<&super::skills::SkillCatalog> {
         self.skills.as_ref()
@@ -132,8 +149,10 @@ impl ToolRegistry {
     }
 
     /// Harness-side concurrency classification for one invocation. Unknown
-    /// tools classify as [`Concurrency::Exclusive`], mirroring the trait
-    /// default, so a name that misses the registry can never join a batch.
+    /// tools classify as [`super::Concurrency::Exclusive`], mirroring the
+    /// trait default, so a name that misses the registry can never join a
+    /// batch. Read-only calls batch together, `Parallel` calls fan out per
+    /// tool, everything else serializes.
     pub fn concurrency(&self, name: &str, args: &Value) -> super::Concurrency {
         match self.tools.iter().find(|tool| tool.name == name) {
             Some(tool) => tool.tool.concurrency(args),

@@ -235,6 +235,8 @@ pub struct Agent {
     /// no context files apply or injection is disabled. Lives in the system
     /// prompt, so it is immune to compaction.
     project_context: String,
+    /// Fan-out bounds for `Parallel` batches (subagents).
+    subagent_limits: SubagentLimits,
 }
 
 /// Upper bound on read-only tool calls running at once.  Read tools are
@@ -243,13 +245,38 @@ pub struct Agent {
 /// staying polite.
 const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 8;
 
+/// Upper bound on concurrent `Parallel` tool calls (subagents) and the
+/// per-subagent turn budget.  Each parallel slot is an entire nested agent
+/// loop, so this is deliberately separate from (and smaller than) the
+/// read-only cap.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubagentLimits {
+    pub max_concurrent: usize,
+}
+
+impl Default for SubagentLimits {
+    fn default() -> Self {
+        Self { max_concurrent: 4 }
+    }
+}
+
 /// One scheduling unit of a turn's tool calls.  Read-only calls group into a
-/// batch that runs concurrently; every exclusive call forms a singleton
-/// batch, preserving program order around it.  A batch of one is executed
-/// exactly like the historical serial path.
-struct ToolBatch {
-    calls: Vec<ToolCall>,
-    concurrent: bool,
+/// batch that runs concurrently; adjacent `Parallel` calls of the same
+/// fan-out tool form their own concurrent batch; every exclusive call forms
+/// a singleton batch, preserving program order around it.  A batch of one is
+/// executed exactly like the historical serial path.
+pub(crate) struct ToolBatch {
+    pub(crate) calls: Vec<ToolCall>,
+    /// Which concurrency class this batch runs under; only [`Concurrency::ReadOnly`]
+    /// and [`Concurrency::Parallel`] batches ever hold more than one call.
+    pub(crate) class: Concurrency,
+}
+
+impl ToolBatch {
+    /// Whether this batch may launch more than one call at once.
+    fn concurrent(&self) -> bool {
+        matches!(self.class, Concurrency::ReadOnly | Concurrency::Parallel)
+    }
 }
 
 /// An in-flight tool execution carrying its slot index so results can be
@@ -258,20 +285,34 @@ struct ToolBatch {
 type ToolRun<'a> = Pin<Box<dyn Future<Output = (usize, ToolOutput, Instant)> + Send + 'a>>;
 
 /// Partition a turn's calls into batches without reordering anything: a
-/// maximal run of read-only calls becomes one batch, and every exclusive
+/// maximal run of read-only calls becomes one batch, a maximal run of
+/// `Parallel` calls *of one tool* becomes its own batch, and every exclusive
 /// call is a singleton.  A read is never hoisted above a write because the
-/// model may intend the read to observe that write's effect.
-fn plan_tool_batches(calls: Vec<ToolCall>, registry: &ToolRegistry) -> Vec<ToolBatch> {
+/// model may intend the read to observe that write's effect; parallel
+/// fan-out tools are likewise never merged across an intervening call.
+pub(crate) fn plan_tool_batches(calls: Vec<ToolCall>, registry: &ToolRegistry) -> Vec<ToolBatch> {
     let mut batches: Vec<ToolBatch> = Vec::new();
     for call in calls {
-        let concurrent = registry.concurrency(&call.name, &call.arguments) == Concurrency::ReadOnly;
+        let class = registry.concurrency(&call.name, &call.arguments);
         match batches.last_mut() {
-            Some(batch) if batch.concurrent == concurrent && concurrent => {
+            // Read-only calls all share one class, so any maximal run merges.
+            Some(batch)
+                if batch.class == Concurrency::ReadOnly && class == Concurrency::ReadOnly =>
+            {
+                batch.calls.push(call);
+            }
+            // Parallel calls merge only with the same fan-out tool so two
+            // different parallelizable tools cannot interleave their slots.
+            Some(batch)
+                if batch.class == Concurrency::Parallel
+                    && class == Concurrency::Parallel
+                    && batch.calls.iter().all(|prior| prior.name == call.name) =>
+            {
                 batch.calls.push(call);
             }
             _ => batches.push(ToolBatch {
                 calls: vec![call],
-                concurrent,
+                class,
             }),
         }
     }
@@ -296,8 +337,8 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
         for batch in plan_tool_batches(tool_calls, &self.tools) {
-            if batch.concurrent && batch.calls.len() > 1 {
-                tracing::debug!(count = batch.calls.len(), "running read-only tool batch");
+            if batch.calls.len() > 1 {
+                tracing::debug!(count = batch.calls.len(), class = ?batch.class, "running concurrent tool batch");
             }
             // The batch shares a child token so an interrupt kills exactly
             // this phase; the turn token stays clean for the next batch.
@@ -319,8 +360,16 @@ impl Agent {
             }
             let mut futures: FuturesUnordered<ToolRun<'_>> = FuturesUnordered::new();
             let mut next_launch = 0usize;
-            let launch_limit = if batch.concurrent {
-                MAX_CONCURRENT_READ_ONLY_TOOLS
+            // Each concurrency class gets its own in-flight cap: reads are
+            // cheap and share one index, while each `Parallel` slot (e.g. a
+            // subagent) is an entire nested LLM loop and must be bounded
+            // separately so fan-out cannot stampede the provider.
+            let launch_limit = if batch.concurrent() {
+                match batch.class {
+                    Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
+                    Concurrency::Parallel => self.subagent_limits.max_concurrent,
+                    Concurrency::Exclusive => 1,
+                }
             } else {
                 1
             };
@@ -485,7 +534,14 @@ impl Agent {
             context_window: 0,
             compaction: CompactionPolicy::default(),
             project_context: String::new(),
+            subagent_limits: SubagentLimits::default(),
         }
+    }
+
+    /// Configure fan-out bounds for `Parallel` batches (subagents).
+    pub(crate) fn with_subagent_limits(mut self, limits: SubagentLimits) -> Self {
+        self.subagent_limits = limits;
+        self
     }
 
     /// Attach a pre-rendered project-context block (AGENTS.md / CLAUDE.md).
@@ -2072,7 +2128,7 @@ mod tests {
         let batches = plan_tool_batches(calls, &registry);
         let described: Vec<(usize, bool)> = batches
             .iter()
-            .map(|batch| (batch.calls.len(), batch.concurrent))
+            .map(|batch| (batch.calls.len(), batch.concurrent()))
             .collect();
         // Maximal read-only runs group; exclusive calls stay singletons; the
         // trailing read is NOT hoisted above the write.
@@ -2082,6 +2138,97 @@ mod tests {
             .flat_map(|batch| batch.calls.iter().map(|call| call.id.as_str()))
             .collect();
         assert_eq!(flattened, vec!["c1", "c2", "c3", "c4"]);
+    }
+
+    #[test]
+    fn parallel_calls_group_per_tool_without_cross_tool_merging() {
+        let log: ProbeLog = Arc::default();
+        let registry = ToolRegistry::try_new(vec![
+            Box::new(ProbeTool::parallel("fan_a", &log)),
+            Box::new(ProbeTool::parallel("fan_b", &log)),
+            Box::new(ProbeTool::read_only("probe_a", &log)),
+        ])
+        .unwrap();
+        let calls = vec![
+            call("c1", "fan_a"),
+            call("c2", "fan_a"),
+            call("c3", "fan_b"),
+            call("c4", "probe_a"),
+            call("c5", "fan_a"),
+        ];
+        let batches = plan_tool_batches(calls, &registry);
+        // Adjacent same-tool fan-out merges into one concurrent run; a
+        // different fan-out tool or an interleaved read splits the run;
+        // nothing is reordered.
+        let described: Vec<(usize, String)> = batches
+            .iter()
+            .map(|batch| (batch.calls.len(), format!("{:?}", batch.class)))
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                (2, "Parallel".to_owned()),
+                (1, "Parallel".to_owned()),
+                (1, "ReadOnly".to_owned()),
+                (1, "Parallel".to_owned()),
+            ]
+        );
+        let flattened: Vec<&str> = batches
+            .iter()
+            .flat_map(|batch| batch.calls.iter().map(|call| call.id.as_str()))
+            .collect();
+        assert_eq!(flattened, vec!["c1", "c2", "c3", "c4", "c5"]);
+    }
+
+    #[test]
+    fn parallel_calls_overlap_within_their_batch() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let log: ProbeLog = Arc::default();
+            let registry =
+                ToolRegistry::try_new(vec![Box::new(ProbeTool::parallel("fan", &log))]).unwrap();
+            let provider = MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    script(vec![
+                        StreamEvent::ToolCallComplete(call("c1", "fan")),
+                        StreamEvent::ToolCallComplete(call("c2", "fan")),
+                        StreamEvent::Done {
+                            stop_reason: Some("tool_calls".into()),
+                            usage: None,
+                        },
+                    ]),
+                    script(vec![
+                        StreamEvent::TextDelta("done".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
+                error_kind: MockErrorKind::Stream,
+            };
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx.send(InputMessage::Message("go".into())).unwrap();
+            drop(input_tx);
+            Agent::new(Arc::new(provider), registry, "demo", cancel)
+                .run(input_rx, event_tx)
+                .await;
+            while event_rx.try_recv().is_ok() {}
+
+            // Both fan-out probes ran concurrently: their execution intervals
+            // overlap even though neither is read-only.
+            let entries = log.lock().unwrap().clone();
+            assert_eq!(entries.len(), 2, "both probes ran");
+            let (_, first_start, first_end) = entries[0];
+            let (_, second_start, second_end) = entries[1];
+            assert!(
+                first_start < second_end && second_start < first_end,
+                "expected overlapping intervals, got {entries:?}"
+            );
+        });
     }
 
     #[test]
@@ -2167,7 +2314,7 @@ mod tests {
     /// its execution interval so tests can assert real overlap.
     struct ProbeTool {
         name: &'static str,
-        read_only: bool,
+        class: Concurrency,
         log: ProbeLog,
     }
 
@@ -2175,7 +2322,7 @@ mod tests {
         fn read_only(name: &'static str, log: &ProbeLog) -> Self {
             Self {
                 name,
-                read_only: true,
+                class: Concurrency::ReadOnly,
                 log: Arc::clone(log),
             }
         }
@@ -2183,7 +2330,17 @@ mod tests {
         fn exclusive(name: &'static str, log: &ProbeLog) -> Self {
             Self {
                 name,
-                read_only: false,
+                class: Concurrency::Exclusive,
+                log: Arc::clone(log),
+            }
+        }
+
+        /// A fan-out tool (the subagent stand-in): parallelizable with
+        /// itself only.
+        fn parallel(name: &'static str, log: &ProbeLog) -> Self {
+            Self {
+                name,
+                class: Concurrency::Parallel,
                 log: Arc::clone(log),
             }
         }
@@ -2203,11 +2360,7 @@ mod tests {
         }
 
         fn concurrency(&self, _args: &Value) -> Concurrency {
-            if self.read_only {
-                Concurrency::ReadOnly
-            } else {
-                Concurrency::Exclusive
-            }
+            self.class
         }
 
         async fn execute(&self, _args: Value, cancel: CancellationToken) -> ToolOutput {
