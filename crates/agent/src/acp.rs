@@ -714,6 +714,27 @@ fn spawn_agent(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     let project_context = project_context_for(tools.workspace_root(), state.no_context_files);
+
+    // Subagents: same enablement rule as the other frontends. The ACP
+    // frontend builds its registry with `rtk = false`; keep that choice
+    // consistent for child registries.
+    let mut tools = tools;
+    if state.config.subagents.max_turns > 0 {
+        let runner = crate::subagent::SubagentRunnerImpl::new(
+            state.provider.clone(),
+            state.config.model.clone(),
+            tools.workspace_root().to_path_buf(),
+            false,
+            project_context.clone(),
+            state.config.subagents,
+            Some(store.clone()),
+            Some(session.id()),
+        );
+        tools
+            .register_subagent(std::sync::Arc::new(runner))
+            .context("register subagent tool")?;
+    }
+
     let mut agent = Agent::new(
         state.provider.clone(),
         tools,
@@ -721,6 +742,9 @@ fn spawn_agent(
         state.app_cancel.clone(),
     )
     .with_compaction(state.config.compaction.clone())
+    .with_subagent_limits(crate::agent::SubagentLimits {
+        max_concurrent: state.config.subagents.max_concurrent,
+    })
     .with_project_context(project_context)
     .with_session(store, session);
     if let Some(auth) = &state.copilot_auth {

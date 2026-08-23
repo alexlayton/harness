@@ -328,8 +328,32 @@ async fn run_headless_with_cancel(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     let project_context = project_context_for(tools.workspace_root(), cli.no_context_files);
+
+    // Subagents: inject a runner when delegation is enabled (before the
+    // agent consumes `tools`). Runs without a store (`--no-session`) simply
+    // produce ephemeral children.
+    let mut tools = tools;
+    if config.subagents.max_turns > 0 {
+        let runner = crate::subagent::SubagentRunnerImpl::new(
+            provider.clone(),
+            config.model.clone(),
+            tools.workspace_root().to_path_buf(),
+            config.rtk,
+            project_context.clone(),
+            config.subagents,
+            store.clone(),
+            session.as_ref().map(|session| session.id()),
+        );
+        tools
+            .register_subagent(std::sync::Arc::new(runner))
+            .context("register subagent tool")?;
+    }
+
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
         .with_compaction(config.compaction.clone())
+        .with_subagent_limits(crate::agent::SubagentLimits {
+            max_concurrent: config.subagents.max_concurrent,
+        })
         .with_project_context(project_context);
     // Attaching a durable session is the opt-in persistence step: without it
     // the agent behaves identically but keeps everything in memory only.

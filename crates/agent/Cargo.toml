@@ -14,6 +14,7 @@ auth.workspace = true
 compact.workspace = true
 tui.workspace = true
 anyhow = "1"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 llm.workspace = true
@@ -30,5 +31,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
-async-trait = "0.1"
 tempfile = "3"

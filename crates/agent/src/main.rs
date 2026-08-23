@@ -111,6 +111,7 @@ async fn main_inner() -> Result<ExitCode> {
         },
     );
     let tools = tools_result?;
+
     // Which skills were discovered; built from the registry-owned catalog
     // once, here, so the TUI only renders the names.
     let skill_entries = tools
@@ -144,6 +145,28 @@ async fn main_inner() -> Result<ExitCode> {
         model: Some(config.model.clone()),
         ..SessionCreateOptions::default()
     })?;
+
+    // Subagents: inject a runner so the model can delegate self-contained
+    // tasks. Built before the agent consumes `tools` because the tool holds
+    // an Arc back into this shared state. Child sessions land in the same
+    // store linked via `parent_session`; `max_turns = 0` disables delegation.
+    let mut tools = tools;
+    if config.subagents.max_turns > 0 {
+        let runner = agent::subagent::SubagentRunnerImpl::new(
+            provider.clone(),
+            config.model.clone(),
+            tools.workspace_root().to_path_buf(),
+            config.rtk,
+            project_context.clone(),
+            config.subagents,
+            Some(session_store.clone()),
+            Some(session.id()),
+        );
+        tools
+            .register_subagent(std::sync::Arc::new(runner))
+            .context("register subagent tool")?;
+    }
+
     let providers = ProviderArg::ALL
         .iter()
         .map(ToString::to_string)
@@ -168,6 +191,9 @@ async fn main_inner() -> Result<ExitCode> {
     };
     let agent = agent
         .with_compaction(config.compaction.clone())
+        .with_subagent_limits(agent::agent::SubagentLimits {
+            max_concurrent: config.subagents.max_concurrent,
+        })
         .with_session(session_store, session);
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 

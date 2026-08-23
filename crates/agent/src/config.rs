@@ -89,6 +89,50 @@ pub struct CompactConfig {
     pub context_window: Option<u64>,
 }
 
+/// Per-key subagent settings parsed from `[subagents]` in `config.toml`.
+/// Every field is optional so a partial table overrides only what it sets;
+/// the rest fall back to [`SubagentPolicy::default`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SubagentConfig {
+    /// Turn budget for one nested run. `0` disables subagents entirely.
+    pub max_turns: Option<usize>,
+    /// How many subagents may run at once when several are delegated in one
+    /// response.
+    pub max_concurrent: Option<usize>,
+}
+
+/// Resolved subagent bounds. Mirrors how [`CompactionPolicy`] relates to
+/// [`CompactConfig`]: file overrides layer over these defaults.
+#[derive(Clone, Copy, Debug)]
+pub struct SubagentPolicy {
+    /// Maximum nested request/tool rounds for one delegation.
+    pub max_turns: usize,
+    /// Maximum concurrently running delegations per turn.
+    pub max_concurrent: usize,
+}
+
+impl Default for SubagentPolicy {
+    fn default() -> Self {
+        Self {
+            max_turns: 25,
+            max_concurrent: 4,
+        }
+    }
+}
+
+impl From<&SubagentConfig> for SubagentPolicy {
+    fn from(config: &SubagentConfig) -> Self {
+        let defaults = SubagentPolicy::default();
+        Self {
+            max_turns: config.max_turns.unwrap_or(defaults.max_turns),
+            max_concurrent: config
+                .max_concurrent
+                .unwrap_or(defaults.max_concurrent)
+                .max(1),
+        }
+    }
+}
+
 impl From<&CompactConfig> for CompactionPolicy {
     fn from(config: &CompactConfig) -> Self {
         let defaults = CompactionPolicy::default();
@@ -132,6 +176,10 @@ pub struct FileConfig {
     /// harness versions treat the config as unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactConfig>,
+    /// Subagent bounds (`[subagents]`). Same layering contract as
+    /// `compaction`: absent from disk when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagents: Option<SubagentConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -145,6 +193,7 @@ impl PartialEq for FileConfig {
             && self.model == other.model
             && self.rtk == other.rtk
             && self.compaction == other.compaction
+            && self.subagents == other.subagents
             && self.extra == other.extra
     }
 }
@@ -348,6 +397,8 @@ pub struct Config {
     pub config_path: PathBuf,
     pub rtk: bool,
     pub compaction: CompactionPolicy,
+    /// Resolved subagent bounds (file `[subagents]` over defaults).
+    pub subagents: SubagentPolicy,
     /// The Copilot credential handle loaded once during resolution. Startup
     /// used to construct `CopilotAuth::from_default()` twice — once for the
     /// entitled-model default inside `resolve`, again in `main` — reading and
@@ -457,6 +508,11 @@ impl Config {
                 .compaction
                 .as_ref()
                 .map(CompactionPolicy::from)
+                .unwrap_or_default(),
+            subagents: file
+                .subagents
+                .as_ref()
+                .map(SubagentPolicy::from)
                 .unwrap_or_default(),
             // Only the process-wide [`Config::resolve`] loads credentials;
             // the testable forms never touch auth.json.
@@ -683,12 +739,21 @@ mod tests {
                 keep_recent_turns: Some(5),
                 ..CompactConfig::default()
             }),
+            subagents: Some(crate::config::SubagentConfig {
+                max_turns: Some(10),
+                max_concurrent: Some(2),
+            }),
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),
         };
         save_file_config(&path, &original).unwrap();
         assert_eq!(load_file_config(&path).unwrap(), original);
+        let loaded = load_file_config(&path).unwrap();
+        assert_eq!(
+            loaded.subagents.as_ref().and_then(|s| s.max_turns),
+            Some(10)
+        );
 
         save_settings_at(&path, "openrouter", "router/demo").unwrap();
         let saved = load_file_config(&path).unwrap();

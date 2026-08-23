@@ -3,6 +3,7 @@ pub mod agent;
 pub mod config;
 pub mod headless;
 pub mod prompt;
+pub mod subagent;
 pub use tools;
 
 use std::path::Path;

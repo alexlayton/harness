@@ -250,7 +250,7 @@ const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 8;
 /// loop, so this is deliberately separate from (and smaller than) the
 /// read-only cap.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SubagentLimits {
+pub struct SubagentLimits {
     pub max_concurrent: usize,
 }
 
@@ -274,7 +274,7 @@ pub(crate) struct ToolBatch {
 
 impl ToolBatch {
     /// Whether this batch may launch more than one call at once.
-    fn concurrent(&self) -> bool {
+    pub(crate) fn concurrent(&self) -> bool {
         matches!(self.class, Concurrency::ReadOnly | Concurrency::Parallel)
     }
 }
@@ -539,7 +539,7 @@ impl Agent {
     }
 
     /// Configure fan-out bounds for `Parallel` batches (subagents).
-    pub(crate) fn with_subagent_limits(mut self, limits: SubagentLimits) -> Self {
+    pub fn with_subagent_limits(mut self, limits: SubagentLimits) -> Self {
         self.subagent_limits = limits;
         self
     }
