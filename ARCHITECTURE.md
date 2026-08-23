@@ -112,6 +112,38 @@ startup; `bash` runs with that root as cwd. `find`/`grep` share one
 `FileSearchIndex` (fff-search) created once per process. `bash` optionally
 rewrites commands through `rtk` for token-lean output.
 
+### The subagent tool
+
+`crates/tools/src/subagent.rs` defines the `subagent` tool surface: args
+`{description, prompt}`, concurrency class `Parallel`, and an injected
+[`SubagentRunner`] trait object. The runner itself lives in
+`crates/agent/src/subagent.rs` (`SubagentRunnerImpl`) because `tools` must not
+depend on the agent loop. Without a runner nothing registers, so the model
+never sees a schema it cannot call.
+
+The nested loop is a lean copy of the parent turn shape: fresh context (task
+prompt only — parent history never crosses over), stream, dispatch through the
+same `plan_tool_batches`, repeat until a text-only reply, which becomes the
+report handed back as the tool result. Key properties:
+
+- **No recursion by construction**: child registries come from
+  `default_registry`, which contains no subagent tool.
+- **Fan-out**: `Concurrency::Parallel` is a third class beside `ReadOnly` and
+  `Exclusive`. Adjacent calls of the *same* parallel tool form their own
+  concurrent batch (bounded by `[subagents] max_concurrent`, default 4,
+  separate from the read-only cap of 8); program order is preserved around
+  everything else.
+- **Durable children**: with a session store each run creates a child session
+  linked via `parent_session`, titled with the description, persisted through
+  `store.append_event`; usage lands in the child session so parent totals are
+  not double-counted. `--no-session` degrades to ephemeral runs.
+- **Bounds**: `[subagents] max_turns` (default 25; `0` disables the tool)
+  caps one delegation; exhaustion returns partial findings rather than an
+  error. Reports are truncated (~20 KiB) before entering parent history.
+- **Prompts stay generated**: the child's system prompt is the same registry-
+  generated prompt as the parent's plus a worker preamble — never hand-written
+  tool docs.
+
 ## Skills and project context
 
 Both **Agent Skills** discovery and **AGENTS.md** project-context injection live
