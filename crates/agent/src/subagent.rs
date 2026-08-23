@@ -10,9 +10,12 @@
 //! - **No recursion by construction.** The child registry is built by
 //!   `default_registry`, which does not include the subagent tool; there is
 //!   no code path that could register a runner inside a runner.
-//! - **Same provider/model as the parent** (v1 decision, mirroring the
-//!   compaction summarizer). Child usage is persisted to the child session
-//!   only, so parent `/usage` totals are not double-counted.
+//! - **Provider/model snapshot per run.** Each child takes one snapshot of
+//!   the parent's active provider/model and uses it consistently for every
+//!   request, the child-session header, and retry logging; a parent `/model`
+//!   switch retargets only future runs (`update_model`). Child usage is
+//!   persisted to the child session only, so parent `/usage` totals are not
+//!   double-counted.
 //! - **Durable when possible.** With a session store available each run
 //!   creates a child session linked via `parent_session` and titled with the
 //!   task description; without one (`--no-session`) runs stay ephemeral.
@@ -26,16 +29,22 @@
 use crate::agent::plan_tool_batches;
 use crate::config::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
-use crate::tools::{SubagentRunner, ToolConfig, ToolRegistry, call_summary, default_registry};
+use crate::tools::{
+    SubagentMode, SubagentRunner, ToolConfig, ToolRegistry, call_summary, default_registry,
+    read_only_registry,
+};
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use llm::{CompletionRequest, Content, Message, Provider, Role, StreamEvent, truncate_utf8};
-use session::{SessionCreateOptions, SessionStore};
+use llm::{
+    CompletionRequest, Content, Message, Provider, RetryCallback, Role, StreamEvent, truncate_utf8,
+};
+use session::{SessionCreateOptions, SessionStore, usage_summary};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -60,11 +69,18 @@ pub(crate) struct SubagentRun {
     pub prompt: String,
 }
 
-/// Everything a nested loop needs from the host process. One instance is
-/// shared by every subagent invocation of a session.
-pub struct SubagentRunnerImpl {
+/// The active provider/model pair used by future child runs. Held behind a
+/// short-held synchronous lock so a parent `/model` switch can retarget
+/// subagents without rebuilding the runner; never held across `.await`.
+struct SubagentModelState {
     provider: Arc<dyn Provider>,
     model: String,
+}
+
+/// Everything a nested loop needs from the host process. One instance is
+/// shared by every subagent invocation from an agent frontend.
+pub struct SubagentRunnerImpl {
+    model_state: RwLock<SubagentModelState>,
     workspace_root: PathBuf,
     rtk: bool,
     project_context: String,
@@ -73,11 +89,29 @@ pub struct SubagentRunnerImpl {
     /// Store shared with the parent session (same workspace scope); `None`
     /// under `--no-session`, making runs ephemeral.
     store: Option<SessionStore>,
-    /// Parent session id recorded on child sessions for lineage.
-    parent_session_id: Option<session::SessionId>,
-    /// Built lazily on first use: the FFF index walk should not cost anything
-    /// when the model never delegates.
-    child_registry: OnceLock<Arc<ToolRegistry>>,
+    /// Parent session id recorded on future child sessions for lineage. This
+    /// changes when the interactive host starts or loads a conversation, so
+    /// it cannot be a startup-only snapshot like the store itself. Shared
+    /// through an `Arc` so a child run can snapshot it at launch.
+    parent_session_id: Arc<RwLock<Option<session::SessionId>>>,
+    /// Built lazily on first use, one cache per [`SubagentMode`]: the FFF
+    /// index walk should not cost anything when the model never delegates.
+    /// The fallible result is cached too — repeatedly re-building a registry
+    /// that deterministically failed helps no one. `get_or_init` guarantees
+    /// exactly one constructor run even when two first-use delegations race.
+    child_registries: [OnceLock<Result<Arc<ToolRegistry>, String>>; 2],
+    /// Test-only counter of registry constructor runs, for the single-init
+    /// concurrency test.
+    #[cfg(test)]
+    test_registry_builds: std::sync::atomic::AtomicUsize,
+}
+
+/// Cache slot for a mode's child registry.
+fn registry_slot(mode: SubagentMode) -> usize {
+    match mode {
+        SubagentMode::ReadOnly => 0,
+        SubagentMode::Workspace => 1,
+    }
 }
 
 impl SubagentRunnerImpl {
@@ -96,45 +130,89 @@ impl SubagentRunnerImpl {
         parent_session_id: Option<session::SessionId>,
     ) -> Self {
         Self {
-            provider,
-            model: model.into(),
+            model_state: RwLock::new(SubagentModelState {
+                provider,
+                model: model.into(),
+            }),
             workspace_root: workspace_root.into(),
             rtk,
             project_context: project_context.into(),
             config,
             store,
-            parent_session_id,
-            child_registry: OnceLock::new(),
+            parent_session_id: Arc::new(RwLock::new(parent_session_id)),
+            child_registries: [OnceLock::new(), OnceLock::new()],
+            #[cfg(test)]
+            test_registry_builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Build the child tool set once. `default_registry` contains exactly the
-    /// built-in tools — read/edit/write/bash/find/grep — and no subagent
-    /// tool, which is what makes recursion structurally impossible.
-    fn registry(&self) -> Result<&Arc<ToolRegistry>, String> {
-        if let Some(registry) = self.child_registry.get() {
-            return Ok(registry);
+    /// Retarget future child runs after the parent switched provider/model.
+    /// Host-side hook (called by `Agent` after a successful `/model`);
+    /// already-running children keep the snapshot they started with.
+    pub fn update_model(&self, provider: Arc<dyn Provider>, model: impl Into<String>) {
+        let mut state = self
+            .model_state
+            .write()
+            .expect("subagent model state lock poisoned");
+        state.provider = provider;
+        state.model = model.into();
+    }
+
+    /// Retarget child-session lineage after the host starts or loads another
+    /// parent conversation. Already-running children have created their own
+    /// headers before control can return to the host command loop.
+    pub fn update_parent_session(&self, parent_session_id: Option<session::SessionId>) {
+        *self
+            .parent_session_id
+            .write()
+            .expect("subagent parent session lock poisoned") = parent_session_id;
+    }
+
+    /// Build each mode's child tool set exactly once. The read-only registry
+    /// deliberately exposes no mutating tools and no shell (the scheduler
+    /// class is not a sandbox — exclusion is the enforcement); the workspace
+    /// registry is the normal built-in set. Neither contains a subagent tool,
+    /// which is what makes recursion structurally impossible.
+    fn registry(&self, mode: SubagentMode) -> Result<Arc<ToolRegistry>, String> {
+        let cache = &self.child_registries[registry_slot(mode)];
+        let workspace_root = self.workspace_root.clone();
+        let rtk = self.rtk;
+        #[cfg(test)]
+        let builds = &self.test_registry_builds;
+        let built = cache.get_or_init(move || {
+            tracing::debug!(mode = mode.as_str(), "building child tool registry");
+            #[cfg(test)]
+            builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = match mode {
+                SubagentMode::Workspace => default_registry(ToolConfig::new(&workspace_root, rtk)),
+                SubagentMode::ReadOnly => read_only_registry(ToolConfig::new(&workspace_root, rtk)),
+            };
+            result
+                .map(Arc::new)
+                .map_err(|error| format!("could not build subagent tools: {error}"))
+        });
+        match built {
+            Ok(registry) => Ok(registry.clone()),
+            Err(error) => Err(error.clone()),
         }
-        let registry = Arc::new(
-            default_registry(ToolConfig::new(&self.workspace_root, self.rtk))
-                .map_err(|error| format!("could not build subagent tools: {error}"))?,
-        );
-        let _ = self.child_registry.set(registry);
-        Ok(self
-            .child_registry
-            .get()
-            .expect("registry was just inserted"))
     }
 
     /// Persist the child session header up front so even a hard crash leaves
-    /// a resumable trace of the delegation.
-    fn create_child_session(&self, description: &str) -> Option<session::Session> {
-        let store = self.store.as_ref()?;
+    /// a resumable trace of the delegation. The header records the provider
+    /// /model snapshot this run started with, not whatever the parent uses now.
+    fn create_child_session(
+        store: &Option<SessionStore>,
+        provider: &Arc<dyn Provider>,
+        model: &str,
+        description: &str,
+        parent_session: Option<session::SessionId>,
+    ) -> Option<session::Session> {
+        let store = store.as_ref()?;
         match store.create(SessionCreateOptions {
             title: Some(description.to_owned()),
-            provider: Some(self.provider.name().to_owned()),
-            model: Some(self.model.clone()),
-            parent_session: self.parent_session_id,
+            provider: Some(provider.name().to_owned()),
+            model: Some(model.to_owned()),
+            parent_session,
         }) {
             Ok(session) => Some(session),
             Err(error) => {
@@ -152,20 +230,44 @@ impl SubagentRunnerImpl {
     async fn execute(
         &self,
         run: &SubagentRun,
+        mode: SubagentMode,
         cancel: CancellationToken,
     ) -> Result<String, String> {
         if self.config.max_turns == 0 {
             return Err("subagents are disabled".into());
         }
-        let registry = self.registry()?;
+        let started = Instant::now();
+        // One snapshot per child run: every request, the child-session
+        // header/lineage, and retry logging use the selection that existed
+        // when this child was launched, even if the parent changes while
+        // registry initialization or provider work is in flight.
+        let parent_session = *self
+            .parent_session_id
+            .read()
+            .expect("subagent parent session lock poisoned");
+        let (provider, model) = {
+            let state = self
+                .model_state
+                .read()
+                .expect("subagent model state lock poisoned");
+            (state.provider.clone(), state.model.clone())
+        };
+        let registry = self.registry(mode)?;
         let mut history = vec![Message::user(run.prompt.clone())];
         let system = subagent_system_prompt(
             &self.workspace_root.display().to_string(),
             &registry.prompt_context(),
             registry.skills(),
             &self.project_context,
+            mode,
         );
-        let mut session = self.create_child_session(&run.description);
+        let mut session = Self::create_child_session(
+            &self.store,
+            &provider,
+            &model,
+            &run.description,
+            parent_session,
+        );
         Self::persist(
             &self.store,
             &mut session,
@@ -174,8 +276,26 @@ impl SubagentRunnerImpl {
             },
         );
         let outcome = self
-            .loop_turns(registry, &system, &mut history, &mut session, cancel)
+            .loop_turns(
+                &provider,
+                &model,
+                &registry,
+                &system,
+                &mut history,
+                &mut session,
+                cancel,
+            )
             .await;
+        tracing::info!(
+            description = %run.description,
+            mode = mode.as_str(),
+            provider = provider.name(),
+            model = %model,
+            child_session = ?session.as_ref().map(|child| child.id().to_string()),
+            duration_ms = started.elapsed().as_millis() as u64,
+            ok = outcome.is_ok(),
+            "subagent finished"
+        );
         if let Some(child) = session.as_ref()
             && let Some(store) = self.store.as_ref()
             && let Err(error) = store.sync_session(child)
@@ -204,14 +324,19 @@ impl SubagentRunnerImpl {
     }
 
     /// Stream → dispatch → repeat until the model answers with text only.
+    #[allow(clippy::too_many_arguments)]
     async fn loop_turns(
         &self,
+        provider: &Arc<dyn Provider>,
+        model: &str,
         registry: &ToolRegistry,
         system: &str,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
+        let run_description = last_user_line(history);
+        let model_for_log = model.to_owned();
         let mut turns = 0usize;
         loop {
             if turns >= self.config.max_turns {
@@ -227,17 +352,54 @@ impl SubagentRunnerImpl {
             }
             turns += 1;
 
+            // Reserve the final logical turn for synthesis. In real use a
+            // broad audit can otherwise spend every allowed turn issuing
+            // another read and hit the budget with no assistant text at all.
+            // The note is request-local (not durable child history), and an
+            // empty tool list makes the expected terminal action unambiguous.
+            let final_report_turn = turns == self.config.max_turns;
+            let mut request_messages = history.clone();
+            if final_report_turn {
+                push_request_note(
+                    &mut request_messages,
+                    "[system note: this is your final turn. Do not call tools. Return the best \
+                     final report you can from the evidence already gathered.]",
+                );
+            }
             let request = CompletionRequest {
-                model: self.model.clone(),
+                model: model.to_owned(),
                 system: Some(system.to_owned()),
-                messages: history.clone(),
-                tools: registry.definitions(),
+                messages: request_messages,
+                tools: if final_report_turn {
+                    Vec::new()
+                } else {
+                    registry.definitions()
+                },
                 max_tokens: None,
                 temperature: None,
                 reasoning: true,
             };
+            // Standard initial-request retry policy, same as the parent: a
+            // transient 429/5xx while *obtaining* the stream must not
+            // immediately fail an otherwise valid delegation just because
+            // several delegations fan out at once. Retries consume no extra
+            // logical turn. The callback only logs — there is no child UI
+            // event stream to notify.
+            let on_retry: RetryCallback = Arc::new({
+                let run_description = run_description.clone();
+                let model_for_log = model_for_log.clone();
+                move |attempt, error| {
+                    tracing::warn!(
+                        description = %run_description,
+                        model = %model_for_log,
+                        attempt,
+                        error = %error,
+                        "retrying subagent provider request"
+                    );
+                }
+            });
             let mut stream = tokio::select! {
-                stream = self.provider.stream(&request) => stream
+                result = provider.stream_with_retry(&request, on_retry) => result
                     .map_err(|error| format!("provider error: {error}"))?,
                 _ = cancel.cancelled() => return Err("cancelled by user".into()),
             };
@@ -251,6 +413,17 @@ impl SubagentRunnerImpl {
                         Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
                         Some(Ok(StreamEvent::ReasoningDelta(_))) => {}
                         Some(Ok(StreamEvent::ToolCallComplete(call))) => tool_calls.push(call),
+                        // Child usage lands in the child session only, so
+                        // parent totals never double-count delegated work.
+                        Some(Ok(StreamEvent::Done {
+                            usage: Some(usage),..
+                        })) => Self::persist(
+                            &self.store,
+                            session,
+                            session::SessionEvent::Usage {
+                                usage: usage_summary(&usage),
+                            },
+                        ),
                         Some(Ok(StreamEvent::Done { .. })) => {}
                         Some(Err(error)) => {
                             stream_error = Some(error);
@@ -421,24 +594,57 @@ impl SubagentRunner for SubagentRunnerImpl {
         &self,
         description: &str,
         prompt: &str,
+        mode: SubagentMode,
         cancel: CancellationToken,
     ) -> Result<String, String> {
-        let started = Instant::now();
-        let outcome = self
-            .execute(
-                &SubagentRun {
-                    description: description.to_owned(),
-                    prompt: prompt.to_owned(),
-                },
-                cancel,
-            )
-            .await;
-        tracing::info!(
-            duration_ms = started.elapsed().as_millis() as u64,
-            ok = outcome.is_ok(),
-            "subagent finished"
-        );
-        outcome
+        self.execute(
+            &SubagentRun {
+                description: description.to_owned(),
+                prompt: prompt.to_owned(),
+            },
+            mode,
+            cancel,
+        )
+        .await
+    }
+}
+
+/// Last user message line, used as best-effort context in retry logs (never
+/// the full prompt).
+fn last_user_line(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .find_map(|message| {
+            (message.role == Role::User).then(|| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+        })
+        .map(|text| truncate_utf8(&text, 80).to_owned())
+        .unwrap_or_default()
+}
+
+/// Add a request-local instruction while preserving provider role
+/// alternation. In particular, a one-turn child already ends in its initial
+/// user prompt, so the final-report note must fold into that message rather
+/// than create two adjacent user messages.
+fn push_request_note(history: &mut Vec<Message>, note: &str) {
+    if let Some(Message {
+        role: Role::User,
+        content,
+    }) = history.last_mut()
+    {
+        content.push(Content::Text(note.to_owned()));
+    } else {
+        history.push(Message::user(note));
     }
 }
 
@@ -458,18 +664,22 @@ fn append_assistant(history: &mut Vec<Message>, text: &str, calls: Vec<llm::Tool
     });
 }
 
-/// Build the durable events for one assistant exchange: the message event
-/// followed by one event per tool call, mirroring the parent agent's split
-/// so exports stay uniform.
+/// Build the durable events for one assistant exchange, mirroring
+/// `Agent::persist_assistant`: the `AssistantMessage` event carries text (and
+/// reasoning, which children do not produce) ONLY — never tool calls — and
+/// each call is emitted exactly once as a standalone `SessionEvent::ToolCall`.
+/// Putting calls in both places used to make session validation reject the
+/// duplicate, leaving exports with orphaned tool results. A response that
+/// contains only tool calls emits no message event at all.
 fn assistant_events(text: &str, calls: &[llm::ToolCall]) -> Vec<session::SessionEvent> {
-    let mut content = Vec::new();
+    let mut events = Vec::new();
     if !text.is_empty() {
-        content.push(Content::Text(text.to_owned()));
+        events.push(session::SessionEvent::AssistantMessage {
+            message: session::StoredMessage::from_llm(&Message::assistant(vec![Content::Text(
+                text.to_owned(),
+            )])),
+        });
     }
-    content.extend(calls.iter().cloned().map(Content::ToolCall));
-    let mut events = vec![session::SessionEvent::AssistantMessage {
-        message: session::StoredMessage::from_llm(&Message::assistant(content)),
-    }];
     events.extend(calls.iter().map(|call| session::SessionEvent::ToolCall {
         call: session::StoredToolCall::from(call),
     }));
@@ -532,6 +742,7 @@ mod tests {
     use llm::{EventStream, LlmError, ModelInfo};
     use serde_json::json;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
 
     /// Provider that answers each request from a scripted list, recording
     /// every system prompt and tool set it was handed.
@@ -610,14 +821,53 @@ mod tests {
         ]]));
         let runner = runner_with(provider.clone());
         let report = runner
-            .run("audit", "scan the crate", CancellationToken::new())
+            .run(
+                "audit",
+                "scan the crate",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(report, "found 3 issues");
         // The child saw a fresh one-message context with the subagent prompt.
         let (system, tools) = &provider.seen.lock().unwrap()[0];
-        assert!(system.as_deref().unwrap().contains("autonomous subagent"));
+        // The read-only preamble is mode-aware and states the enforced
+        // restriction.
+        assert!(system.as_deref().unwrap().contains("read-only subagent"));
+        assert!(
+            system
+                .as_deref()
+                .unwrap()
+                .contains("intentionally unavailable")
+        );
         assert!(!tools.iter().any(|name| name == "subagent"), "{tools:?}");
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_uses_the_workspace_preamble() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![
+            Ok(StreamEvent::TextDelta("done".into())),
+            ScriptProvider::done("stop"),
+        ]]));
+        let runner = runner_with(provider.clone());
+        runner
+            .run(
+                "fix it",
+                "edit the file",
+                SubagentMode::Workspace,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (system, _) = &provider.seen.lock().unwrap()[0];
+        assert!(system.as_deref().unwrap().contains("autonomous subagent"));
+        assert!(
+            system
+                .as_deref()
+                .unwrap()
+                .contains("may modify the workspace")
+        );
     }
 
     #[tokio::test]
@@ -641,6 +891,7 @@ mod tests {
             .run(
                 "read task",
                 "read lib.rs then report",
+                SubagentMode::Workspace,
                 CancellationToken::new(),
             )
             .await;
@@ -649,31 +900,51 @@ mod tests {
         assert!(report.is_ok());
     }
 
+    #[test]
+    fn request_note_preserves_a_trailing_user_role() {
+        let mut history = vec![Message::user("task")];
+        push_request_note(&mut history, "final report now");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[0].content.len(), 2);
+    }
+
     #[tokio::test]
-    async fn turn_budget_exhaustion_returns_partial_findings() {
-        // Every reply demands another tool call; the budget must end the loop
-        // gracefully instead of spinning forever.
-        let call_script = || {
-            vec![
+    async fn final_budget_turn_disables_tools_and_requests_a_report() {
+        // The model keeps asking for a tool until the final reserved turn,
+        // where the request must expose no tools and explicitly demand the
+        // best report from evidence already gathered.
+        let max_turns = SubagentPolicy::default().max_turns;
+        let mut scripts = Vec::new();
+        for _ in 0..max_turns - 1 {
+            scripts.push(vec![
                 Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
                     id: format!("c{}", rand_suffix()),
-                    name: "bash".into(),
-                    arguments: json!({"command": "true"}),
+                    name: "missing".into(),
+                    arguments: json!({}),
                 })),
                 ScriptProvider::done("tool_calls"),
-            ]
-        };
-        let mut scripts = Vec::new();
-        for _ in 0..SubagentPolicy::default().max_turns + 1 {
-            scripts.push(call_script());
+            ]);
         }
+        scripts.push(vec![
+            Ok(StreamEvent::TextDelta("best available report".into())),
+            ScriptProvider::done("stop"),
+        ]);
         let provider = Arc::new(ScriptProvider::new(scripts));
-        let runner = runner_with(provider);
+        let runner = runner_with(provider.clone());
         let report = runner
-            .run("loop", "never finish", CancellationToken::new())
+            .run(
+                "loop",
+                "keep exploring",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
-        assert!(report.contains("without a final report"), "{report}");
+        assert_eq!(report, "best available report");
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), max_turns);
+        assert!(seen.last().unwrap().1.is_empty(), "final request has tools");
     }
 
     fn rand_suffix() -> usize {
@@ -708,8 +979,24 @@ mod tests {
         let runner: SubagentRunnerImpl = runner_with_hanging();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let outcome = runner.run("x", "y", cancel).await;
+        let outcome = runner.run("x", "y", SubagentMode::ReadOnly, cancel).await;
         assert_eq!(outcome.unwrap_err(), "cancelled by user");
+    }
+
+    /// Like [`runner_with`] but for any provider double.
+    fn runner_with_dyn(provider: Arc<dyn Provider>) -> SubagentRunnerImpl {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = std::mem::ManuallyDrop::new(workspace);
+        SubagentRunnerImpl::new(
+            provider,
+            "demo",
+            root.path().canonicalize().unwrap(),
+            false,
+            "",
+            SubagentPolicy::default(),
+            None,
+            None,
+        )
     }
 
     fn runner_with_hanging() -> SubagentRunnerImpl {
@@ -743,7 +1030,9 @@ mod tests {
             None,
             None,
         );
-        let outcome = runner.run("x", "y", CancellationToken::new()).await;
+        let outcome = runner
+            .run("x", "y", SubagentMode::ReadOnly, CancellationToken::new())
+            .await;
         assert_eq!(outcome.unwrap_err(), "subagents are disabled");
     }
 
@@ -772,10 +1061,15 @@ mod tests {
             "",
             SubagentPolicy::default(),
             Some(store.clone()),
-            Some(parent.id().clone()),
+            Some(parent.id()),
         );
         let report = runner
-            .run("audit tui", "scan it", CancellationToken::new())
+            .run(
+                "audit tui",
+                "scan it",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
             .await
             .unwrap();
         assert_eq!(report, "the audit found nothing");
@@ -809,7 +1103,6 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_parent_agent_delegates_and_receives_report() {
-        use crate::agent::Agent;
         use crate::tools::{ToolConfig, default_registry};
         use tui::InputMessage;
         // Child script: one text-only reply (the report).
@@ -878,5 +1171,483 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             1
         );
+    }
+
+    // -------------------------------------------------------------- retries
+
+    /// Provider double that records whether the child used the retrying
+    /// entry point and serves one scripted result per *attempt*.
+    struct RetryProbeProvider {
+        /// Per-attempt outcomes: an `Err` simulates a transient failure that
+        /// `stream_with_retry` should absorb.
+        attempts: Mutex<Vec<Result<Vec<StreamEvent>, String>>>,
+        attempt_count: std::sync::atomic::AtomicUsize,
+        direct_stream_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for RetryProbeProvider {
+        fn name(&self) -> &str {
+            "retry-probe"
+        }
+
+        async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            self.direct_stream_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(LlmError::Stream("direct stream must not be used".into()))
+        }
+
+        async fn stream_with_retry(
+            &self,
+            _request: &CompletionRequest,
+            _on_retry: RetryCallback,
+        ) -> Result<EventStream, LlmError> {
+            // Deterministic stand-in for the shared backoff: walk the
+            // scripted attempts, absorbing transient failures exactly as the
+            // real helper would, but with no wall-clock wait.
+            loop {
+                let index = self
+                    .attempt_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let outcome = self
+                    .attempts
+                    .lock()
+                    .unwrap()
+                    .get(index)
+                    .cloned()
+                    .unwrap_or_else(|| Err("script exhausted".into()));
+                match outcome {
+                    Ok(events) => return Ok(Box::pin(stream::iter(events.into_iter().map(Ok)))),
+                    Err(message) if index + 1 < self.attempts.lock().unwrap().len() => {
+                        let _ = message;
+                        continue;
+                    }
+                    Err(message) => {
+                        return Err(LlmError::Http {
+                            status: 500,
+                            body: message,
+                        });
+                    }
+                }
+            }
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn report_done() -> StreamEvent {
+        StreamEvent::Done {
+            stop_reason: Some("stop".into()),
+            usage: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn child_uses_stream_with_retry_and_survives_a_transient_failure() {
+        let provider = Arc::new(RetryProbeProvider {
+            attempts: Mutex::new(vec![
+                Err("transient 503".into()),
+                Ok(vec![
+                    StreamEvent::TextDelta("recovered report".into()),
+                    report_done(),
+                ]),
+            ]),
+            attempt_count: std::sync::atomic::AtomicUsize::new(0),
+            direct_stream_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let runner = runner_with_dyn(provider.clone());
+        let report = runner
+            .run("x", "y", SubagentMode::ReadOnly, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(report, "recovered report");
+        assert_eq!(provider.attempt_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider.direct_stream_calls.load(Ordering::SeqCst),
+            0,
+            "the child must go through stream_with_retry, never direct stream"
+        );
+    }
+
+    /// A provider whose first `stream_with_retry` attempt never resolves,
+    /// so cancellation must break the wait while the stream is being
+    /// obtained (e.g. mid-backoff).
+    struct HangOnFirstAttemptProvider {
+        cancel_probe: CancellationToken,
+    }
+
+    #[async_trait]
+    impl Provider for HangOnFirstAttemptProvider {
+        fn name(&self) -> &str {
+            "hang-retry"
+        }
+
+        async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            unreachable!("direct stream must not be used")
+        }
+
+        async fn stream_with_retry(
+            &self,
+            _request: &CompletionRequest,
+            _on_retry: RetryCallback,
+        ) -> Result<EventStream, LlmError> {
+            // Pend forever once cancelled so the *only* way this future can
+            // resolve is the loop's cancel branch — no completion-order race.
+            self.cancel_probe.cancelled().await;
+            let never: std::convert::Infallible = std::future::pending().await;
+            match never {}
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_obtaining_the_stream_returns_promptly() {
+        let cancel = CancellationToken::new();
+        let provider = Arc::new(HangOnFirstAttemptProvider {
+            cancel_probe: cancel.clone(),
+        });
+        let runner = runner_with_dyn(provider);
+        // Cancel shortly after the run starts, while the provider future is
+        // still pending.
+        let cancel_task = tokio::spawn({
+            let cancel = cancel.clone();
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                cancel.cancel();
+            }
+        });
+        let outcome = runner.run("x", "y", SubagentMode::ReadOnly, cancel).await;
+        cancel_task.await.unwrap();
+        assert_eq!(outcome.unwrap_err(), "cancelled by user");
+    }
+
+    // --------------------------------------------- registry single-shot init
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_use_builds_each_registry_exactly_once() {
+        let runner = Arc::new(runner_with(Arc::new(ScriptProvider::new(Vec::new()))));
+        runner.test_registry_builds.store(0, Ordering::SeqCst);
+
+        // Race eight first uses of each mode through get_or_init.
+        let mut handles = Vec::new();
+        for mode in [SubagentMode::ReadOnly, SubagentMode::Workspace] {
+            for _ in 0..8 {
+                let runner = runner.clone();
+                handles.push(tokio::spawn(async move {
+                    runner
+                        .registry(mode)
+                        .map(|registry| Arc::as_ptr(&registry) as usize)
+                }));
+            }
+        }
+        let mut pointers = Vec::new();
+        for handle in handles {
+            pointers.push(handle.await.unwrap().unwrap());
+        }
+
+        // All read-only callers got one Arc, all workspace callers got a
+        // different single Arc, and only two constructions ever ran.
+        let unique: std::collections::HashSet<usize> = pointers.into_iter().collect();
+        assert_eq!(unique.len(), 2, "one distinct registry per mode");
+        assert_eq!(
+            runner.test_registry_builds.load(Ordering::SeqCst),
+            2,
+            "each mode's registry must be constructed exactly once"
+        );
+    }
+
+    // ------------------------------------------------- model snapshot (T8)
+
+    #[tokio::test]
+    async fn update_model_retargests_future_children_without_touching_running_snapshots() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = session::SessionStore::new(
+            root.path(),
+            std::fs::canonicalize(workspace.path()).unwrap(),
+        )
+        .unwrap();
+        let parent = store
+            .create(session::SessionCreateOptions::default())
+            .unwrap();
+
+        let report_a = || {
+            vec![
+                Ok(StreamEvent::TextDelta("report from a".into())),
+                ScriptProvider::done("stop"),
+            ]
+        };
+        let provider_a = Arc::new(ScriptProvider::new(vec![report_a()]));
+        let provider_b = Arc::new(ScriptProvider::new(vec![vec![
+            Ok(StreamEvent::TextDelta("report from b".into())),
+            ScriptProvider::done("stop"),
+        ]]));
+        let runner = Arc::new(SubagentRunnerImpl::new(
+            provider_a.clone(),
+            "model-a",
+            std::fs::canonicalize(workspace.path()).unwrap(),
+            false,
+            "",
+            SubagentPolicy::default(),
+            Some(store.clone()),
+            Some(parent.id()),
+        ));
+
+        // Child one runs on provider/model A.
+        let first = runner
+            .run(
+                "child one",
+                "p",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, "report from a");
+
+        // Parent switches to B; future children must follow.
+        runner.update_model(provider_b.clone() as Arc<dyn Provider>, "model-b");
+        let second = runner
+            .run(
+                "child two",
+                "p",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second, "report from b");
+
+        assert_eq!(provider_a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider_b.calls.load(Ordering::SeqCst), 1);
+
+        // Each child session header recorded the snapshot it ran with.
+        let entries = store.list().unwrap();
+        let header_model = |title: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.title.as_deref() == Some(title))
+                .and_then(|entry| entry.model.clone())
+                .unwrap()
+        };
+        assert_eq!(header_model("child one"), "model-a");
+        assert_eq!(header_model("child two"), "model-b");
+    }
+
+    #[tokio::test]
+    async fn update_parent_session_retargets_future_child_lineage() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let store = session::SessionStore::new(
+            root.path(),
+            std::fs::canonicalize(workspace.path()).unwrap(),
+        )
+        .unwrap();
+        let parent_a = store
+            .create(session::SessionCreateOptions::default())
+            .unwrap();
+        let parent_b = store
+            .create(session::SessionCreateOptions::default())
+            .unwrap();
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                Ok(StreamEvent::TextDelta("first".into())),
+                ScriptProvider::done("stop"),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta("second".into())),
+                ScriptProvider::done("stop"),
+            ],
+        ]));
+        let runner = SubagentRunnerImpl::new(
+            provider,
+            "demo",
+            std::fs::canonicalize(workspace.path()).unwrap(),
+            false,
+            "",
+            SubagentPolicy::default(),
+            Some(store.clone()),
+            Some(parent_a.id()),
+        );
+
+        runner
+            .run(
+                "child a",
+                "p",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        runner.update_parent_session(Some(parent_b.id()));
+        runner
+            .run(
+                "child b",
+                "p",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let entries = store.list().unwrap();
+        let parent_for = |title: &str| {
+            entries
+                .iter()
+                .find(|entry| entry.title.as_deref() == Some(title))
+                .and_then(|entry| entry.parent_session)
+        };
+        assert_eq!(parent_for("child a"), Some(parent_a.id()));
+        assert_eq!(parent_for("child b"), Some(parent_b.id()));
+    }
+
+    // ------------------------------------- durable child transcript + usage
+
+    /// Full durability round trip: real tool call in the child, usage-bearing
+    /// `Done` events on both rounds, then reload/export assertions covering
+    /// exact-once call persistence, call/result pairing, usage totals, and
+    /// structural validity.
+    #[tokio::test]
+    async fn durable_child_persists_one_call_per_id_usage_and_valid_history() {
+        use session::{ExportOptions, StoredContent, export_jsonl, snapshot_entries};
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let ws_root = std::fs::canonicalize(workspace.path()).unwrap();
+        std::fs::write(ws_root.join("lib.rs"), "fn main() {}\n").unwrap();
+        let store = session::SessionStore::new(root.path(), ws_root.clone()).unwrap();
+        let parent = store
+            .create(session::SessionCreateOptions::default())
+            .unwrap();
+
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "lib.rs"}),
+                })),
+                Ok(StreamEvent::Done {
+                    stop_reason: Some("tool_calls".into()),
+                    usage: Some(llm::Usage {
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cached_tokens: None,
+                        reasoning_tokens: None,
+                        cost: Some(0.01),
+                    }),
+                }),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta("final report".into())),
+                Ok(StreamEvent::Done {
+                    stop_reason: Some("stop".into()),
+                    usage: Some(llm::Usage {
+                        input_tokens: 20,
+                        output_tokens: 8,
+                        cached_tokens: None,
+                        reasoning_tokens: None,
+                        cost: Some(0.02),
+                    }),
+                }),
+            ],
+        ]));
+        let runner = SubagentRunnerImpl::new(
+            provider,
+            "demo",
+            ws_root,
+            false,
+            "",
+            SubagentPolicy::default(),
+            Some(store.clone()),
+            Some(parent.id()),
+        );
+        let report = runner
+            .run(
+                "durable task",
+                "read lib.rs and report",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(report, "final report");
+
+        let sessions = store.list().unwrap();
+        let child_entry = sessions
+            .iter()
+            .find(|entry| entry.title.as_deref() == Some("durable task"))
+            .expect("child session listed");
+        // Reload validates the stored history without warnings or errors.
+        let child = store.open(&child_entry.id).unwrap();
+
+        // Exactly one logical ToolCall exists for c1, retaining name/args.
+        let calls: Vec<&session::StoredToolCall> = child
+            .events
+            .iter()
+            .filter_map(|record| match &record.event {
+                session::SessionEvent::ToolCall { call } => Some(call),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "call must be persisted exactly once");
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments, json!({"path": "lib.rs"}));
+
+        // No AssistantMessage carries embedded tool calls anymore.
+        assert!(child.events.iter().all(|record| {
+            match &record.event {
+                session::SessionEvent::AssistantMessage { message } => message
+                    .content
+                    .iter()
+                    .all(|content| !matches!(content, StoredContent::ToolCall { .. })),
+                _ => true,
+            }
+        }));
+
+        // Context reconstruction pairs one call with exactly one result.
+        let messages = child.context_messages();
+        let call_count = messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|content| matches!(content, Content::ToolCall(call) if call.id == "c1"))
+            .count();
+        let result_count = messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter(|content| {
+                matches!(content, Content::ToolResult { tool_call_id, .. } if tool_call_id == "c1")
+            })
+            .count();
+        assert_eq!(call_count, 1);
+        assert_eq!(result_count, 1);
+
+        // Snapshot pairs the same way and names the actual tool.
+        let tools: Vec<String> = snapshot_entries(&child)
+            .into_iter()
+            .filter_map(|entry| match entry {
+                session::SessionSnapshotEntry::Tool { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<String>>();
+        assert_eq!(tools, vec!["read"]);
+
+        // Usage from both rounds aggregates into the child metadata only.
+        assert_eq!(child.metadata.usage.input_tokens, 30);
+        assert_eq!(child.metadata.usage.output_tokens, 13);
+        assert!((child.metadata.usage.cost - 0.03).abs() < 1e-9);
+
+        // Export names the actual tool instead of an orphan generic `tool`.
+        let destination = root.path().join("child-export.jsonl");
+        let exported = export_jsonl(&child, Some(&destination), &ExportOptions::default()).unwrap();
+        let text = std::fs::read_to_string(exported).unwrap();
+        assert!(text.contains("\"read\""), "export lost the tool name");
+        assert!(text.contains("\"c1\""));
     }
 }

@@ -172,12 +172,12 @@ async fn drive_headless_events_into(
                 }
             }
             AgentEvent::ToolCallFinished {
-                name: _,
                 summary,
                 ok,
                 duration_ms,
                 output,
                 error,
+                ..
             } => {
                 if verbose {
                     let mark = if *ok { "✓" } else { "✗" };
@@ -329,12 +329,17 @@ async fn run_headless_with_cancel(
 
     let project_context = project_context_for(tools.workspace_root(), cli.no_context_files);
 
+    // Optional runner attach step applied after the base agent is built.
+    let mut runner_builder: Option<Box<dyn FnOnce(Agent) -> Agent + Send>> = None;
+
     // Subagents: inject a runner when delegation is enabled (before the
     // agent consumes `tools`). Runs without a store (`--no-session`) simply
-    // produce ephemeral children.
+    // produce ephemeral children. The concrete `Arc` is shared between the
+    // registry's trait object and the agent so `/model`-style switches (not
+    // used by this frontend today) would still retarget future children.
     let mut tools = tools;
     if config.subagents.max_turns > 0 {
-        let runner = crate::subagent::SubagentRunnerImpl::new(
+        let runner = std::sync::Arc::new(crate::subagent::SubagentRunnerImpl::new(
             provider.clone(),
             config.model.clone(),
             tools.workspace_root().to_path_buf(),
@@ -343,10 +348,13 @@ async fn run_headless_with_cancel(
             config.subagents,
             store.clone(),
             session.as_ref().map(|session| session.id()),
-        );
+        ));
         tools
-            .register_subagent(std::sync::Arc::new(runner))
+            .register_subagent(runner.clone())
             .context("register subagent tool")?;
+        runner_builder = Some(Box::new(move |agent: Agent| {
+            agent.with_subagent_runner(runner)
+        }));
     }
 
     let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
@@ -355,6 +363,10 @@ async fn run_headless_with_cancel(
             max_concurrent: config.subagents.max_concurrent,
         })
         .with_project_context(project_context);
+    let agent = match runner_builder {
+        Some(apply) => apply(agent),
+        None => agent,
+    };
     // Attaching a durable session is the opt-in persistence step: without it
     // the agent behaves identically but keeps everything in memory only.
     let agent = match (&store, session) {
@@ -502,10 +514,12 @@ mod tests {
     fn verbose_mode_reports_tool_activity_on_stderr() {
         let events = vec![
             AgentEvent::ToolCallStarted {
+                call_id: "c".into(),
                 name: "bash".into(),
                 summary: "echo hi".into(),
             },
             AgentEvent::ToolCallFinished {
+                call_id: "c".into(),
                 name: "bash".into(),
                 summary: "echo hi".into(),
                 ok: true,
@@ -553,10 +567,12 @@ mod tests {
         let (stdout, _, code) = route(
             vec![
                 AgentEvent::ToolCallStarted {
+                    call_id: "c".into(),
                     name: "bash".into(),
                     summary: "touch x".into(),
                 },
                 AgentEvent::ToolCallFinished {
+                    call_id: "c".into(),
                     name: "bash".into(),
                     summary: "touch x".into(),
                     ok: true,
@@ -620,10 +636,12 @@ mod tests {
         let (_, _, code) = route(
             vec![
                 AgentEvent::ToolCallStarted {
+                    call_id: "c".into(),
                     name: "bash".into(),
                     summary: "false".into(),
                 },
                 AgentEvent::ToolCallFinished {
+                    call_id: "c".into(),
                     name: "bash".into(),
                     summary: "false".into(),
                     ok: false,

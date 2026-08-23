@@ -152,6 +152,19 @@ struct StreamState {
     markdown: String,
 }
 
+/// One active tool call in the keyed running-tool state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunningTool {
+    call_id: String,
+    record: ToolRecord,
+}
+
+/// How many active tool rows render before the rest fold into the compact
+/// overflow line. Keeps a large `[subagents] max_concurrent` from pushing
+/// the input line off-screen; the overflow row makes the hidden calls
+/// visible as a count rather than silently clipped.
+const MAX_VISIBLE_RUNNING_TOOLS: usize = 4;
+
 /// The visual rows of the input line plus the cursor's position within them.
 struct InputLayout {
     rows: Vec<Line<'static>>,
@@ -209,6 +222,13 @@ struct RegionBuild {
     activity_row: Option<usize>,
 }
 
+/// The active-tool section of a frame: its rendered lines and total row
+/// count (including any overflow row) for the sizing budgets.
+struct RunningRegion {
+    lines: Vec<Line<'static>>,
+    rows: usize,
+}
+
 /// The direct-crossterm UI. See the module docs for the screen model; the
 /// struct is consumed externally only through `CrossTerm::new` and
 /// `CrossTerm::run`.
@@ -234,7 +254,11 @@ pub struct CrossTerm {
     pending: Vec<Entry>,
 
     stream: Option<StreamState>,
-    running_tool: Option<ToolRecord>,
+    /// Currently running tool calls, keyed by harness call id and kept in
+    /// launch order. Concurrent fan-out (e.g. several `subagent` calls in one
+    /// response) means more than one record can be live at once; a finish
+    /// removes exactly the matching id and never disturbs its neighbors.
+    running_tools: Vec<RunningTool>,
 
     input: String,
     /// Byte offset of the editing cursor (always on a char boundary).
@@ -318,7 +342,7 @@ impl CrossTerm {
             transcript: Vec::new(),
             pending: Vec::new(),
             stream: None,
-            running_tool: None,
+            running_tools: Vec::new(),
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
@@ -1322,12 +1346,19 @@ impl CrossTerm {
                 self.activity = Activity::Reasoning;
                 self.stream().reasoning.push_str(&delta);
             }
-            UiEvent::ToolCallStarted { name, summary } => {
+            UiEvent::ToolCallStarted {
+                call_id,
+                name,
+                summary,
+            } => {
                 self.busy = true;
                 self.activity = Activity::Processing;
                 // Text streamed before the call is a complete message.
                 self.finalize_stream();
-                self.running_tool = Some(ToolRecord {
+                // Insert the new active record without disturbing existing
+                // ones; a duplicate id updates in place (defensive against
+                // a malformed duplicate start).
+                let record = ToolRecord {
                     name,
                     summary,
                     ok: false,
@@ -1335,9 +1366,18 @@ impl CrossTerm {
                     output: String::new(),
                     error: None,
                     status: ToolStatus::Running,
-                });
+                };
+                match self
+                    .running_tools
+                    .iter_mut()
+                    .find(|running| running.call_id == call_id)
+                {
+                    Some(running) => running.record = record,
+                    None => self.running_tools.push(RunningTool { call_id, record }),
+                }
             }
             UiEvent::ToolCallFinished {
+                call_id,
                 name,
                 summary,
                 ok,
@@ -1347,10 +1387,15 @@ impl CrossTerm {
             } => {
                 self.busy = true;
                 self.activity = Activity::Working;
-                // Clear any matching start: its placeholder carries nothing
-                // this line needs, and leaving it set would keep rendering
-                // the tool in the live region after the entry below commits.
-                self.running_tool = None;
+                // Remove exactly the matching start; unrelated running tools
+                // stay live and keep rendering in the region below.
+                if let Some(position) = self
+                    .running_tools
+                    .iter()
+                    .position(|running| running.call_id == call_id)
+                {
+                    self.running_tools.remove(position);
+                }
                 let record = ToolRecord {
                     name,
                     summary,
@@ -1372,12 +1417,14 @@ impl CrossTerm {
             }
             UiEvent::Error(error) => {
                 self.finalize_stream();
-                // A tool still marked running when the turn aborted finalizes
-                // as failed so its line does not silently vanish.
-                if let Some(mut record) = self.running_tool.take() {
-                    record.status = ToolStatus::Failure;
-                    record.error = Some(error.clone());
-                    self.pending.push(Entry::Tool { record });
+                // Tools still marked running when the turn aborted finalize
+                // as failed so their lines do not silently vanish.
+                for mut running in self.running_tools.drain(..) {
+                    running.record.status = ToolStatus::Failure;
+                    running.record.error = Some(error.clone());
+                    self.pending.push(Entry::Tool {
+                        record: running.record,
+                    });
                 }
                 self.busy = false;
                 self.activity = Activity::Preparing;
@@ -1385,7 +1432,7 @@ impl CrossTerm {
             }
             UiEvent::TurnFinished => {
                 self.finalize_stream();
-                self.running_tool = None;
+                self.running_tools.clear();
                 self.busy = false;
                 self.activity = Activity::Preparing;
             }
@@ -1417,7 +1464,7 @@ impl CrossTerm {
             }
             UiEvent::SessionChanged { id, loaded, .. } => {
                 self.finalize_stream();
-                self.running_tool = None;
+                self.running_tools.clear();
                 // The terminal keeps everything physically, but the resize
                 // repaint redraws from this store, so the session-global
                 // chrome (banner, metadata, and the boundary separator that
@@ -1432,7 +1479,7 @@ impl CrossTerm {
             }
             UiEvent::SessionSnapshot { entries } => {
                 self.finalize_stream();
-                self.running_tool = None;
+                self.running_tools.clear();
                 // Same chrome retention as `SessionChanged`: the snapshot
                 // replaces the conversation, not the header.
                 retain_chrome(&mut self.transcript);
@@ -1597,18 +1644,15 @@ impl CrossTerm {
         )
     }
 
-    /// Rows of the live region: [streaming tail] · [tool line] · [activity] ·
-    /// [input]. Every section except the input is optional; the tail and the
-    /// input are each clipped so the whole region fits the screen.
+    /// Rows of the live region: [streaming tail] · [tool lines] · [activity]
+    /// · [input]. Every section except the input is optional; the tail and
+    /// the input are each clipped so the whole region fits the screen.
     fn build_region(&self, input: &InputLayout) -> RegionBuild {
         let theme = self.theme;
         let content = render::content_width(self.width);
-        let (input_rows, input_cursor_row) = clip_input(
-            input,
-            self.height as usize,
-            self.busy,
-            self.running_tool.is_some(),
-        );
+        let running = self.running_region();
+        let (input_rows, input_cursor_row) =
+            clip_input(input, self.height as usize, self.busy, running.rows);
 
         let mut rows: Vec<Line<'static>> = Vec::new();
 
@@ -1620,12 +1664,14 @@ impl CrossTerm {
         let start = tail.len().saturating_sub(budget);
         rows.extend(tail[start..].iter().cloned());
 
-        if let Some(record) = &self.running_tool {
-            if !rows.is_empty() {
-                render::push_blank(&mut rows, render::SECTION_GAP);
-            }
-            rows.extend(tool_lines(record, self.tools_expanded, content, theme));
+        // All active tool records render in deterministic launch order
+        // (collapsed to one line each unless expanded globally); anything
+        // beyond the visible cap folds into one explicit overflow row so a
+        // large fan-out stays discoverable without breaking screen height.
+        if !running.lines.is_empty() && !rows.is_empty() {
+            render::push_blank(&mut rows, render::SECTION_GAP);
         }
+        rows.extend(running.lines);
 
         if self.busy {
             if !rows.is_empty() {
@@ -1660,6 +1706,39 @@ impl CrossTerm {
         }
     }
 
+    /// The active-tool section of the live region: rendered rows for the
+    /// visible subset of running tools in launch order plus an overflow row
+    /// (`… N more running`) when more exist than fit, and the total row count
+    /// for the sizing budgets.
+    fn running_region(&self) -> RunningRegion {
+        let content = render::content_width(self.width);
+        let theme = self.theme;
+        let hidden = self
+            .running_tools
+            .len()
+            .saturating_sub(MAX_VISIBLE_RUNNING_TOOLS);
+        let visible = self.running_tools.len() - hidden;
+        let mut lines = Vec::new();
+        for running in &self.running_tools[..visible] {
+            lines.extend(tool_lines(
+                &running.record,
+                self.tools_expanded,
+                content,
+                theme,
+            ));
+        }
+        if hidden > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("… {hidden} more running"),
+                Style::default()
+                    .fg(theme.dim_text)
+                    .add_modifier(Modifier::DIM),
+            )));
+        }
+        let rows = lines.len();
+        RunningRegion { lines, rows }
+    }
+
     /// Rendered rows of the in-flight assistant message (reasoning block,
     /// then markdown). Re-rendered from source on every frame.
     fn stream_tail_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -1684,13 +1763,11 @@ impl CrossTerm {
     }
 
     /// Row budget for the streaming tail: whatever is left of the screen once
-    /// the input, the tool line, the activity row, separators, and a safety
-    /// row are reserved.
+    /// the input, the active-tool rows, the activity row, separators, and a
+    /// safety row are reserved.
     fn tail_budget(&self, input_rows: usize) -> usize {
         (self.height as usize)
-            .saturating_sub(
-                input_rows + usize::from(self.busy) + usize::from(self.running_tool.is_some()) + 3,
-            )
+            .saturating_sub(input_rows + self.running_region().rows + usize::from(self.busy) + 3)
             .max(1)
     }
 
@@ -2389,10 +2466,10 @@ fn clip_input(
     input: &InputLayout,
     height: usize,
     busy: bool,
-    has_tool: bool,
+    tool_rows: usize,
 ) -> (Vec<Line<'static>>, usize) {
     let cap = height
-        .saturating_sub(usize::from(busy) + usize::from(has_tool) + 2)
+        .saturating_sub(usize::from(busy) + tool_rows + 2)
         .max(1);
     if input.rows.len() <= cap {
         return (input.rows.clone(), input.cursor_row);
@@ -2635,6 +2712,122 @@ mod tests {
             error: matches!(status, ToolStatus::Failure).then(|| "boom\ntrace".into()),
             status,
         }
+    }
+
+    fn start(id: &str, summary: &str) -> UiEvent {
+        UiEvent::ToolCallStarted {
+            call_id: id.into(),
+            name: "subagent".into(),
+            summary: summary.into(),
+        }
+    }
+
+    fn finish(id: &str, summary: &str) -> UiEvent {
+        UiEvent::ToolCallFinished {
+            call_id: id.into(),
+            name: "subagent".into(),
+            summary: summary.into(),
+            ok: true,
+            duration_ms: 10,
+            output: "report".into(),
+            error: None,
+        }
+    }
+
+    fn active_summaries(ui: &CrossTerm) -> Vec<String> {
+        ui.running_tools
+            .iter()
+            .map(|running| running.record.summary.clone())
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_starts_accumulate_and_finishes_remove_by_call_id() {
+        let mut ui = ui(80, 24);
+        // Two same-name subagents with similar summaries — correlation must
+        // be by call id, not by name or FIFO position.
+        ui.apply_event(start("a", "subagent: audit one"));
+        ui.apply_event(start("b", "subagent: audit two"));
+        assert_eq!(
+            active_summaries(&ui),
+            vec!["subagent: audit one", "subagent: audit two"]
+        );
+
+        // Finish out of order: B first, A second.
+        ui.apply_event(finish("b", "subagent: audit two"));
+        assert_eq!(active_summaries(&ui), vec!["subagent: audit one"]);
+        ui.apply_event(finish("a", "subagent: audit one"));
+        assert!(ui.running_tools.is_empty());
+
+        // Both completions were committed as tool entries.
+        let committed = ui
+            .pending
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Tool { .. }))
+            .count();
+        assert_eq!(committed, 2);
+    }
+
+    #[test]
+    fn duplicate_start_updates_in_place_instead_of_duplicating() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(start("a", "first"));
+        ui.apply_event(start("a", "second"));
+        assert_eq!(active_summaries(&ui), vec!["second"]);
+    }
+
+    #[test]
+    fn error_drains_all_active_tools_as_failed_and_turn_finished_clears() {
+        let mut failing = ui(80, 24);
+        failing.apply_event(start("a", "one"));
+        failing.apply_event(start("b", "two"));
+        failing.apply_event(UiEvent::Error("turn blew up".into()));
+        assert!(failing.running_tools.is_empty());
+        let failed = failing
+            .pending
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Tool { record } => Some(record),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failed.len(), 2);
+        assert!(
+            failed
+                .iter()
+                .all(|record| record.status == ToolStatus::Failure)
+        );
+
+        // TurnFinished clears any remaining actives without committing them.
+        let mut fresh = ui(80, 24);
+        fresh.apply_event(start("a", "one"));
+        fresh.apply_event(UiEvent::TurnFinished);
+        assert!(fresh.running_tools.is_empty());
+    }
+
+    #[test]
+    fn region_renders_every_active_tool_plus_overflow_line() {
+        let mut ui = ui(80, 24);
+        for index in 0..6 {
+            ui.apply_event(start(
+                &format!("call-{index}"),
+                &format!("subagent: task {index}"),
+            ));
+        }
+        let input = ui.input_layout();
+        let build = ui.build_region(&input);
+        let text = build
+            .rows
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Four visible in launch order, the rest folded into the overflow.
+        assert!(text.contains("subagent: task 0"));
+        assert!(text.contains("subagent: task 3"));
+        assert!(text.contains("… 2 more running"));
+        // The whole region still fits the terminal height.
+        assert!(build.rows.len() <= 24);
     }
 
     #[test]

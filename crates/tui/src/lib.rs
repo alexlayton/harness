@@ -118,10 +118,14 @@ pub enum UiEvent {
     TextDelta(String),
     ReasoningDelta(String),
     ToolCallStarted {
+        /// Stable harness call id; the key that correlates start/finish of
+        /// concurrent calls in the keyed running-tool state.
+        call_id: String,
         name: String,
         summary: String,
     },
     ToolCallFinished {
+        call_id: String,
         name: String,
         summary: String,
         ok: bool,

@@ -391,25 +391,24 @@ fn tool_kind(name: &str) -> ToolKind {
     }
 }
 
-/// Tool-call id correlation. `AgentEvent` carries no LLM call id, so the
-/// adapter mints a UUID per started call and matches the finished event back
-/// by name in FIFO order — the agent reports starts and finishes in program
-/// order, which holds for both serial and batched dispatch it performs.
+/// Tool-call id correlation. `AgentEvent` carries the harness call id, so
+/// starts and finishes are correlated by exact key — never by tool name or
+/// FIFO position, which would be ambiguous for concurrent `subagent` calls
+/// that all share one name.
 #[derive(Default)]
 struct ToolCallIds {
-    in_flight: Vec<(String, ToolCallId)>,
+    in_flight: HashMap<String, ToolCallId>,
 }
 
 impl ToolCallIds {
-    fn start(&mut self, name: &str, summary: &str) -> AcToolCall {
+    fn start(&mut self, call_id: &str, name: &str, summary: &str) -> AcToolCall {
         let id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
-        self.in_flight.push((name.to_owned(), id.clone()));
+        self.in_flight.insert(call_id.to_owned(), id.clone());
         AcToolCall::new(id, summary).kind(tool_kind(name))
     }
 
-    fn finish(&mut self, name: &str) -> Option<ToolCallId> {
-        let index = self.in_flight.iter().position(|(tool, _)| tool == name)?;
-        Some(self.in_flight.remove(index).1)
+    fn finish(&mut self, call_id: &str) -> Option<ToolCallId> {
+        self.in_flight.remove(call_id)
     }
 }
 
@@ -430,10 +429,13 @@ fn translate_event(
         AgentEvent::ReasoningDelta(delta) => Some(SessionUpdate::AgentThoughtChunk(
             ContentChunk::new(ContentBlock::from(delta.as_str())),
         )),
-        AgentEvent::ToolCallStarted { name, summary } => {
-            Some(SessionUpdate::ToolCall(ids.start(name, summary)))
-        }
+        AgentEvent::ToolCallStarted {
+            call_id,
+            name,
+            summary,
+        } => Some(SessionUpdate::ToolCall(ids.start(call_id, name, summary))),
         AgentEvent::ToolCallFinished {
+            call_id,
             name,
             summary,
             ok,
@@ -441,9 +443,17 @@ fn translate_event(
             output,
             error,
         } => {
-            let tool_call_id = ids
-                .finish(name)
-                .unwrap_or_else(|| ToolCallId::new(uuid::Uuid::new_v4().to_string()));
+            // Correlate by the exact harness call id. A miss is an internal
+            // invariant violation (finish without start); log it loudly but
+            // still mint a fresh id so the editor gets *some* terminal
+            // update instead of a dangling card.
+            let tool_call_id = match ids.finish(call_id) {
+                Some(id) => id,
+                None => {
+                    tracing::warn!(call_id = %call_id, name = %name, "tool finish without matching start (invariant violation)");
+                    ToolCallId::new(uuid::Uuid::new_v4().to_string())
+                }
+            };
             // The error text is the informative payload on failure; otherwise
             // attach the full output so editors can expand it.
             let text = error.clone().unwrap_or_else(|| output.clone());
@@ -715,12 +725,17 @@ fn spawn_agent(
 
     let project_context = project_context_for(tools.workspace_root(), state.no_context_files);
 
+    // Optional runner attach step applied after the base agent is built.
+    let mut runner_builder: Option<Box<dyn FnOnce(Agent) -> Agent + Send>> = None;
+
     // Subagents: same enablement rule as the other frontends. The ACP
     // frontend builds its registry with `rtk = false`; keep that choice
-    // consistent for child registries.
+    // consistent for child registries. The concrete `Arc` is shared between
+    // the registry's trait object and the agent so a future mid-session model
+    // switch retargets children through one setup contract.
     let mut tools = tools;
     if state.config.subagents.max_turns > 0 {
-        let runner = crate::subagent::SubagentRunnerImpl::new(
+        let runner = std::sync::Arc::new(crate::subagent::SubagentRunnerImpl::new(
             state.provider.clone(),
             state.config.model.clone(),
             tools.workspace_root().to_path_buf(),
@@ -729,13 +744,16 @@ fn spawn_agent(
             state.config.subagents,
             Some(store.clone()),
             Some(session.id()),
-        );
+        ));
         tools
-            .register_subagent(std::sync::Arc::new(runner))
+            .register_subagent(runner.clone())
             .context("register subagent tool")?;
+        runner_builder = Some(Box::new(move |agent: Agent| {
+            agent.with_subagent_runner(runner)
+        }));
     }
 
-    let mut agent = Agent::new(
+    let agent = Agent::new(
         state.provider.clone(),
         tools,
         state.config.model.clone(),
@@ -745,11 +763,17 @@ fn spawn_agent(
     .with_subagent_limits(crate::agent::SubagentLimits {
         max_concurrent: state.config.subagents.max_concurrent,
     })
-    .with_project_context(project_context)
-    .with_session(store, session);
-    if let Some(auth) = &state.copilot_auth {
-        agent = agent.with_copilot_auth(auth.clone());
+    .with_project_context(project_context);
+    let agent = match runner_builder {
+        Some(apply) => apply(agent),
+        None => agent,
     }
+    .with_session(store, session);
+    let agent = if let Some(auth) = &state.copilot_auth {
+        agent.with_copilot_auth(auth.clone())
+    } else {
+        agent
+    };
     tokio::spawn(agent.run(input_rx, event_tx));
 
     tokio::spawn(forward_events(
@@ -885,12 +909,16 @@ mod tests {
     }
 
     #[test]
-    fn started_and_finished_tool_calls_correlate_by_name_in_fifo_order() {
+    fn concurrent_same_name_calls_correlate_by_harness_call_id() {
         let mut ids = ToolCallIds::default();
-        let started_a = match translate_event(
+        // Two `subagent` calls: same tool name, similar summaries, distinct
+        // harness call ids — exactly the case FIFO-by-name guessing breaks
+        // on.
+        let started_first = match translate_event(
             &AgentEvent::ToolCallStarted {
-                name: "read".into(),
-                summary: "read a.rs".into(),
+                call_id: "call-1".into(),
+                name: "subagent".into(),
+                summary: "subagent: audit agent".into(),
             },
             &mut ids,
             0,
@@ -898,10 +926,11 @@ mod tests {
             Some(SessionUpdate::ToolCall(call)) => call,
             other => panic!("expected tool call, got {other:?}"),
         };
-        let started_b = match translate_event(
+        let started_second = match translate_event(
             &AgentEvent::ToolCallStarted {
-                name: "grep".into(),
-                summary: "grep foo".into(),
+                call_id: "call-2".into(),
+                name: "subagent".into(),
+                summary: "subagent: audit tools".into(),
             },
             &mut ids,
             0,
@@ -909,18 +938,18 @@ mod tests {
             Some(SessionUpdate::ToolCall(call)) => call,
             other => panic!("expected tool call, got {other:?}"),
         };
-        assert_eq!(started_a.kind, ToolKind::Read);
-        assert_eq!(started_b.kind, ToolKind::Search);
+        assert_ne!(started_first.tool_call_id, started_second.tool_call_id);
 
-        // Finishing `grep` first must return grep's id (FIFO by name), not
-        // read's.
+        // Finishing the second first must target the second ACP card, not
+        // whichever call started earlier.
         let finished = translate_event(
             &AgentEvent::ToolCallFinished {
-                name: "grep".into(),
-                summary: "grep foo".into(),
+                call_id: "call-2".into(),
+                name: "subagent".into(),
+                summary: "subagent: audit tools".into(),
                 ok: true,
                 duration_ms: 3,
-                output: "match".into(),
+                output: "tools report".into(),
                 error: None,
             },
             &mut ids,
@@ -929,14 +958,15 @@ mod tests {
         let Some(SessionUpdate::ToolCallUpdate(update)) = finished else {
             panic!("expected tool call update, got {finished:?}");
         };
-        assert_eq!(update.tool_call_id, started_b.tool_call_id);
+        assert_eq!(update.tool_call_id, started_second.tool_call_id);
         assert_eq!(update.fields.status, Some(ToolCallStatus::Completed));
 
-        // The remaining in-flight call is read's.
+        // The remaining in-flight call is the first one's.
         let finished = translate_event(
             &AgentEvent::ToolCallFinished {
-                name: "read".into(),
-                summary: "read a.rs".into(),
+                call_id: "call-1".into(),
+                name: "subagent".into(),
+                summary: "subagent: audit agent".into(),
                 ok: false,
                 duration_ms: 1,
                 output: String::new(),
@@ -948,7 +978,7 @@ mod tests {
         let Some(SessionUpdate::ToolCallUpdate(update)) = finished else {
             panic!("expected tool call update, got {finished:?}");
         };
-        assert_eq!(update.tool_call_id, started_a.tool_call_id);
+        assert_eq!(update.tool_call_id, started_first.tool_call_id);
         assert_eq!(update.fields.status, Some(ToolCallStatus::Failed));
         let Some(Some(ToolCallContent::Content(content))) =
             update.fields.content.map(|mut c| c.pop())
@@ -959,6 +989,30 @@ mod tests {
             matches!(content.content, ContentBlock::Text(ref t) if t.text == "boom"),
             "error text should be surfaced"
         );
+
+        // Nothing stays in flight after both finishes.
+        assert!(ids.in_flight.is_empty());
+    }
+
+    #[test]
+    fn finish_without_start_is_an_invariant_violation_but_still_updates() {
+        let mut ids = ToolCallIds::default();
+        let finished = translate_event(
+            &AgentEvent::ToolCallFinished {
+                call_id: "ghost".into(),
+                name: "read".into(),
+                summary: "read a.rs".into(),
+                ok: true,
+                duration_ms: 1,
+                output: "x".into(),
+                error: None,
+            },
+            &mut ids,
+            0,
+        );
+        // Defensive fallback: the editor still receives a terminal update;
+        // normal execution never takes this path.
+        assert!(matches!(finished, Some(SessionUpdate::ToolCallUpdate(_))));
     }
 
     #[test]

@@ -115,34 +115,59 @@ rewrites commands through `rtk` for token-lean output.
 ### The subagent tool
 
 `crates/tools/src/subagent.rs` defines the `subagent` tool surface: args
-`{description, prompt}`, concurrency class `Parallel`, and an injected
-[`SubagentRunner`] trait object. The runner itself lives in
-`crates/agent/src/subagent.rs` (`SubagentRunnerImpl`) because `tools` must not
-depend on the agent loop. Without a runner nothing registers, so the model
-never sees a schema it cannot call.
+`{description, prompt, mode?}` and an injected [`SubagentRunner`] trait
+object. The runner itself lives in `crates/agent/src/subagent.rs`
+(`SubagentRunnerImpl`) because `tools` must not depend on the agent loop.
+Without a runner nothing registers, so the model never sees a schema it
+cannot call.
 
 The nested loop is a lean copy of the parent turn shape: fresh context (task
 prompt only — parent history never crosses over), stream, dispatch through the
 same `plan_tool_batches`, repeat until a text-only reply, which becomes the
 report handed back as the tool result. Key properties:
 
-- **No recursion by construction**: child registries come from
-  `default_registry`, which contains no subagent tool.
-- **Fan-out**: `Concurrency::Parallel` is a third class beside `ReadOnly` and
-  `Exclusive`. Adjacent calls of the *same* parallel tool form their own
-  concurrent batch (bounded by `[subagents] max_concurrent`, default 4,
-  separate from the read-only cap of 8); program order is preserved around
-  everything else.
+- **Two modes, two scheduler classes.** `mode` defaults to `read_only`:
+  read-only children get a registry with only `read`/`find`/`grep` (no shell,
+  no mutating tools — exclusion is the enforcement, not prompt wording) and
+  classify `Concurrency::Parallel`, so adjacent read-only delegations fan out
+  concurrently (bounded by `[subagents] max_concurrent`, default 4).
+  `mode: "workspace"` keeps the normal built-in tool set and classifies
+  `Concurrency::Exclusive`: mutating delegations serialize in model call
+  order. Malformed modes fail closed as exclusive and error in `execute`.
+  Process-local file-mutation locks remain defense-in-depth, not the policy.
+- **No recursion by construction**: neither child registry contains a subagent
+  tool; there is no code path that could register a runner inside a runner.
+- **Stable call-ID lifecycle**: every tool call carries its original
+  `llm::ToolCall.id` end-to-end. `ToolCallStarted` fires only when an
+  execution future actually launches (never for queued calls), and
+  `ToolCallFinished` fires exactly once per call at resolution time — live UI
+  events may arrive in completion order, while provider history and durable
+  session results stay in original call order. The TUI tracks running tools
+  keyed by call id (multiple visible at once); ACP correlates updates by call
+  id rather than name/FIFO guessing.
 - **Durable children**: with a session store each run creates a child session
-  linked via `parent_session`, titled with the description, persisted through
-  `store.append_event`; usage lands in the child session so parent totals are
-  not double-counted. `--no-session` degrades to ephemeral runs.
+  linked via `parent_session`, titled with the description. Child assistant
+  messages persist text only; each call is persisted exactly once as a
+  standalone `ToolCall` event (mirroring the parent), so reloads validate and
+  exports name real tools. Each nested request persists its usage to the
+  child session; parent totals never double-count delegated work.
+- **Provider/model snapshot**: one snapshot of the parent's active
+  provider/model is taken per child run (via a short-held lock;
+  never across `.await`). A `/model` switch calls
+  `SubagentRunnerImpl::update_model`, retargeting future children;
+  already-running children finish on their snapshot. Initial child requests
+  use the standard retry policy (`stream_with_retry`).
 - **Bounds**: `[subagents] max_turns` (default 25; `0` disables the tool)
-  caps one delegation; exhaustion returns partial findings rather than an
-  error. Reports are truncated (~20 KiB) before entering parent history.
+  caps one delegation. The final turn exposes no tools and explicitly asks
+  for the best report from evidence already gathered, preventing broad audits
+  from spending the whole budget on reads and returning no report; exhaustion
+  still degrades to partial findings. Reports are truncated (~20 KiB) before
+  entering parent history. Child registries are cached per mode behind
+  `get_or_init`, so concurrent first-use delegations build exactly one registry
+  per mode.
 - **Prompts stay generated**: the child's system prompt is the same registry-
-  generated prompt as the parent's plus a worker preamble — never hand-written
-  tool docs.
+  generated prompt as the parent's plus a mode-appropriate worker preamble —
+  never hand-written tool docs.
 
 ## Skills and project context
 

@@ -150,9 +150,12 @@ async fn main_inner() -> Result<ExitCode> {
     // tasks. Built before the agent consumes `tools` because the tool holds
     // an Arc back into this shared state. Child sessions land in the same
     // store linked via `parent_session`; `max_turns = 0` disables delegation.
+    // The concrete `Arc` is also attached to the agent, so `/model` switches
+    // retarget future children through `SubagentRunnerImpl::update_model`.
     let mut tools = tools;
+    let mut subagent_runner: Option<std::sync::Arc<agent::subagent::SubagentRunnerImpl>> = None;
     if config.subagents.max_turns > 0 {
-        let runner = agent::subagent::SubagentRunnerImpl::new(
+        let runner = std::sync::Arc::new(agent::subagent::SubagentRunnerImpl::new(
             provider.clone(),
             config.model.clone(),
             tools.workspace_root().to_path_buf(),
@@ -161,10 +164,11 @@ async fn main_inner() -> Result<ExitCode> {
             config.subagents,
             Some(session_store.clone()),
             Some(session.id()),
-        );
+        ));
         tools
-            .register_subagent(std::sync::Arc::new(runner))
+            .register_subagent(runner.clone())
             .context("register subagent tool")?;
+        subagent_runner = Some(runner);
     }
 
     let providers = ProviderArg::ALL
@@ -182,13 +186,14 @@ async fn main_inner() -> Result<ExitCode> {
     // ordinary model entry and conversation use do not depend on this fetch.
     spawn_model_list(provider_name.clone(), provider.clone(), event_tx.clone());
 
-    let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
+    let mut agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
         .with_project_context(project_context);
-    let agent = if let Some(auth) = copilot_auth {
-        agent.with_copilot_auth(auth)
-    } else {
-        agent
-    };
+    if let Some(auth) = copilot_auth {
+        agent = agent.with_copilot_auth(auth);
+    }
+    if let Some(runner) = subagent_runner {
+        agent = agent.with_subagent_runner(runner);
+    }
     let agent = agent
         .with_compaction(config.compaction.clone())
         .with_subagent_limits(agent::agent::SubagentLimits {

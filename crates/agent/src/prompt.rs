@@ -1,4 +1,4 @@
-use tools::{SkillCatalog, ToolPromptContext, format_skills_prompt};
+use tools::{SkillCatalog, SubagentMode, ToolPromptContext, format_skills_prompt};
 
 /// The stable prompt header.  Tool snippets and guidelines are generated from
 /// the same registry snapshot that supplies `CompletionRequest.tools`.
@@ -6,10 +6,15 @@ pub const SYSTEM_PROMPT: &str = "You are harness, an expert coding assistant run
 
 Batching: when a response needs several independent read-only calls (read, find, grep, or clearly read-only bash commands such as git status), emit them all in one response — they run concurrently and save wall-clock time. Independent `subagent` delegations also batch in one response and run concurrently. Calls that depend on earlier results, and anything that writes or mutates state (edit, write, builds, package installs), must wait for their inputs and go in their own response; the harness decides what actually runs concurrently.";
 
-/// Appended to the registry-generated prompt for a subagent's own turn. The
-/// child sees only this plus its task; it must behave like a worker, not a
-/// conversation partner.
-pub const SUBAGENT_PREAMBLE: &str = "\n\nYou are operating as an autonomous subagent spawned by another agent to complete one delegated task. Work only from the user message above: you cannot see the parent conversation and it cannot see your intermediate steps. Use your tools to complete the task directly. When finished, reply with ONLY your final report: a concise summary of what you did, what you found or changed (with exact file paths), and anything the parent agent should know next. Do not ask questions; if something is ambiguous, state your assumption and proceed.";
+/// Appended to the registry-generated prompt for a `workspace` subagent's
+/// own turn. The child sees only this plus its task; it must behave like a
+/// worker, not a conversation partner.
+pub const SUBAGENT_WORKSPACE_PREAMBLE: &str = "\n\nYou are operating as an autonomous subagent spawned by another agent to complete one delegated task. Work only from the user message above: you cannot see the parent conversation and it cannot see your intermediate steps. Use your tools to complete the task directly. You have the normal tool set and may modify the workspace. Your tool-call budget is finite: stop exploring once you have enough evidence, reserve a turn for the report, and never use tools merely to make the report more exhaustive. When finished, reply with ONLY your final report: a concise summary of what you did, what you found or changed (with exact file paths), and anything the parent agent should know next. Do not ask questions; if something is ambiguous, state your assumption and proceed.";
+
+/// Appended for a `read_only` subagent: inspect-and-report only. The child's
+/// registry genuinely lacks the mutating tools, so this wording describes an
+/// enforced restriction rather than a request.
+pub const SUBAGENT_READ_ONLY_PREAMBLE: &str = "\n\nYou are operating as an autonomous read-only subagent spawned by another agent to complete one delegated task. Work only from the user message above: you cannot see the parent conversation and it cannot see your intermediate steps. This is an INSPECT AND REPORT task: modification and build tools (edit, write, bash) are intentionally unavailable, so never attempt or suggest changes. Use your read-only tools (read, find, grep) to gather evidence directly. Your tool-call budget is finite: stop exploring once you have enough evidence, reserve a turn for the report, and never use tools merely to make the report more exhaustive. When finished, reply with ONLY your final report: a concise summary of what you found, citing exact file paths and line numbers, and anything the parent agent should know next. Do not ask questions; if something is ambiguous, state your assumption and proceed.";
 
 /// Build a prompt from active tool metadata.  JSON schemas are deliberately
 /// not copied here: structured provider tool definitions remain authoritative.
@@ -81,17 +86,22 @@ pub fn system_prompt_with_workspace_context(
 }
 
 /// System prompt for a nested subagent run: the same registry-generated
-/// prompt (so tool docs and schemas can never drift) plus the subagent
-/// preamble. The preamble is appended last so it reads as the final,
+/// prompt (so tool docs and schemas can never drift) plus the mode-appropriate
+/// subagent preamble. The preamble is appended last so it reads as the final,
 /// controlling instruction.
 pub fn subagent_system_prompt(
     cwd: &str,
     context: &ToolPromptContext,
     skills: Option<&SkillCatalog>,
     project_context: &str,
+    mode: SubagentMode,
 ) -> String {
     let base = system_prompt_with_workspace_context(cwd, context, skills, project_context);
-    format!("{base}{}", crate::prompt::SUBAGENT_PREAMBLE)
+    let preamble = match mode {
+        SubagentMode::ReadOnly => SUBAGENT_READ_ONLY_PREAMBLE,
+        SubagentMode::Workspace => SUBAGENT_WORKSPACE_PREAMBLE,
+    };
+    format!("{base}{preamble}")
 }
 
 #[cfg(test)]

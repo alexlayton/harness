@@ -42,10 +42,17 @@ impl tui::TuiEvent for AgentEvent {
             AgentEvent::AuthFailed { message } => tui::UiEvent::AuthFailed { message },
             AgentEvent::TextDelta(value) => tui::UiEvent::TextDelta(value),
             AgentEvent::ReasoningDelta(value) => tui::UiEvent::ReasoningDelta(value),
-            AgentEvent::ToolCallStarted { name, summary } => {
-                tui::UiEvent::ToolCallStarted { name, summary }
-            }
+            AgentEvent::ToolCallStarted {
+                call_id,
+                name,
+                summary,
+            } => tui::UiEvent::ToolCallStarted {
+                call_id,
+                name,
+                summary,
+            },
             AgentEvent::ToolCallFinished {
+                call_id,
                 name,
                 summary,
                 ok,
@@ -53,6 +60,7 @@ impl tui::TuiEvent for AgentEvent {
                 output,
                 error,
             } => tui::UiEvent::ToolCallFinished {
+                call_id,
                 name,
                 summary,
                 ok,

@@ -23,7 +23,7 @@ pub use skills::{
     Skill, SkillCatalog, SkillDiagnostic, SkillEntry, SkillMode, SkillSeverity, discover,
     expand_tilde, format_skills_prompt, load_skills_from_dir, parse_frontmatter,
 };
-pub use subagent::{SUBAGENT_TOOL_NAME, SubagentRunner, SubagentTool};
+pub use subagent::{SUBAGENT_TOOL_NAME, SubagentMode, SubagentRunner, SubagentTool};
 pub use write::WriteTool;
 
 use async_trait::async_trait;
@@ -164,13 +164,7 @@ pub enum ToolInitError {
 ///
 /// The generic argument accepts the workspace-aware [`ToolConfig`].
 pub fn default_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitError> {
-    let ToolConfig { cwd, rtk } = config;
-    let workspace_root =
-        std::fs::canonicalize(&cwd).map_err(|source| ToolInitError::Workspace {
-            path: cwd.clone(),
-            source,
-        })?;
-
+    let workspace_root = resolve_registry_workspace(&config.cwd)?;
     let skills = discover_skills_for_config(&workspace_root);
     let read_paths = skills.read_paths.clone();
 
@@ -186,15 +180,53 @@ pub fn default_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitErro
             ),
             Box::new(EditTool::with_workspace_root(&workspace_root)),
             Box::new(WriteTool::with_workspace_root(&workspace_root)),
-            Box::new(BashTool::with_rtk_and_workspace_root(rtk, &workspace_root)),
+            Box::new(BashTool::with_rtk_and_workspace_root(
+                config.rtk,
+                &workspace_root,
+            )),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
+        ],
+        workspace_root.clone(),
+    )
+    .map_err(ToolInitError::from)?;
+    registry.set_skills(skills);
+    Ok(registry)
+}
+
+/// Construct the read-only subregistry used by `read_only` subagents:
+/// `read`, `find`, and `grep` plus the same skill discovery/read allowlists
+/// and one shared file index. Deliberately no `edit`/`write`/`bash`: the
+/// scheduler class is not a sandbox, so exclusion of mutating tools is the
+/// actual enforcement, not prompt wording.
+pub fn read_only_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitError> {
+    let workspace_root = resolve_registry_workspace(&config.cwd)?;
+    let skills = discover_skills_for_config(&workspace_root);
+    let read_paths = skills.read_paths.clone();
+
+    let index = Arc::new(
+        FileSearchIndex::new(&workspace_root)
+            .map_err(|error| ToolInitError::Find(error.to_string()))?,
+    );
+    let mut registry = ToolRegistry::try_new_with_workspace(
+        vec![
+            Box::new(ReadTool::with_workspace_root(&workspace_root).with_allowed_paths(read_paths)),
+            Box::new(FindTool::new(index.clone())),
+            Box::new(GrepTool::new(index)),
         ],
         workspace_root,
     )
     .map_err(ToolInitError::from)?;
     registry.set_skills(skills);
     Ok(registry)
+}
+
+/// Canonicalized workspace root shared by both registry constructors.
+fn resolve_registry_workspace(cwd: &Path) -> Result<PathBuf, ToolInitError> {
+    std::fs::canonicalize(cwd).map_err(|source| ToolInitError::Workspace {
+        path: cwd.to_path_buf(),
+        source,
+    })
 }
 
 pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
@@ -425,7 +457,11 @@ pub fn call_summary(name: &str, args: &Value) -> String {
         "subagent" => {
             // Same helper the tool uses for its live summary, so previews
             // never diverge between dispatch time and snapshot replay.
-            let (description, prompt) = subagent::parse_args(args).unwrap_or((None, None));
+            let (description, prompt, _mode) = subagent::parse_args(args).unwrap_or((
+                None,
+                None,
+                Ok(subagent::SubagentMode::ReadOnly),
+            ));
             format!("subagent: {}", subagent::preview(description, prompt))
         }
         _ => name.to_owned(),
@@ -484,6 +520,24 @@ mod tests {
                 .guidelines
                 .iter()
                 .any(|guideline| guideline.contains("Use find"))
+        );
+    }
+
+    #[test]
+    fn read_only_registry_exposes_no_mutating_tools() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let registry = read_only_registry(ToolConfig::new(directory.path(), false)).unwrap();
+        let names: Vec<String> = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(names, vec!["read", "find", "grep"]);
+        // Skill discovery still applies, so skill bodies stay loadable.
+        assert_eq!(
+            registry.workspace_root(),
+            std::fs::canonicalize(directory.path()).unwrap()
         );
     }
 

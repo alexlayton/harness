@@ -59,10 +59,14 @@ pub enum AgentEvent {
     TextDelta(String),
     ReasoningDelta(String),
     ToolCallStarted {
+        /// Provider-neutral tool call id from [`llm::ToolCall::id`]; the key
+        /// frontends use to correlate start/finish of concurrent calls.
+        call_id: String,
         name: String,
         summary: String,
     },
     ToolCallFinished {
+        call_id: String,
         name: String,
         summary: String,
         ok: bool,
@@ -237,6 +241,10 @@ pub struct Agent {
     project_context: String,
     /// Fan-out bounds for `Parallel` batches (subagents).
     subagent_limits: SubagentLimits,
+    /// Shared subagent runner, when the host registered one. Kept so a
+    /// successful `/model` switch can retarget future child runs to the new
+    /// provider/model (`SubagentRunnerImpl::update_model`).
+    subagent_runner: Option<Arc<crate::subagent::SubagentRunnerImpl>>,
 }
 
 /// Upper bound on read-only tool calls running at once.  Read tools are
@@ -324,11 +332,20 @@ impl Agent {
     /// read-only batches concurrently (bounded by
     /// [`MAX_CONCURRENT_READ_ONLY_TOOLS`]) and exclusive calls alone.
     ///
-    /// Cancellation is uniform: the in-flight batch shares a child token of
-    /// the turn's `cancel`, so an interrupt kills the whole batch while
-    /// leaving the turn token untouched for the next phase.  Results are
-    /// recorded in original call order — completion order inside a batch is
-    /// deliberately not observable in history or the session log.
+    /// Event contract: `ToolCallStarted` fires only when an execution future
+    /// actually launches (never for a merely requested or queued call), and
+    /// `ToolCallFinished` fires exactly once per started call as its future
+    /// resolves — so live finish order may be completion order. History and
+    /// the durable session remain in original call order.
+    ///
+    /// Cancellation is uniform and exactly-once: the in-flight batch shares
+    /// a child token of the turn's `cancel`, so an interrupt kills the whole
+    /// batch while leaving the turn token untouched for the next phase.
+    /// Calls that completed keep their real events; launched-but-unfinished
+    /// calls get one synthetic cancelled finish; calls never launched get a
+    /// synthetic start + cancelled finish pair so every frontend sees a
+    /// balanced lifecycle; all of them still receive failed tool results in
+    /// parent history so provider history stays valid.
     async fn dispatch_tool_batches(
         &mut self,
         tool_calls: Vec<ToolCall>,
@@ -337,34 +354,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
         for batch in plan_tool_batches(tool_calls, &self.tools) {
-            if batch.calls.len() > 1 {
-                tracing::debug!(count = batch.calls.len(), class = ?batch.class, "running concurrent tool batch");
-            }
-            // The batch shares a child token so an interrupt kills exactly
-            // this phase; the turn token stays clean for the next batch.
-            let batch_cancel = cancel.child_token();
-
-            // Announce every call up front, then launch them — all at once
-            // for singletons, bounded by [`MAX_CONCURRENT_READ_ONLY_TOOLS`]
-            // for batches, refilling as each slot completes.  Each future
-            // carries its own slot index; results land in that slot, never
-            // in completion order.
-            for call in &batch.calls {
-                send(
-                    events,
-                    AgentEvent::ToolCallStarted {
-                        name: call.name.clone(),
-                        summary: call_summary(&call.name, &call.arguments),
-                    },
-                );
-            }
-            let mut futures: FuturesUnordered<ToolRun<'_>> = FuturesUnordered::new();
-            let mut next_launch = 0usize;
-            // Each concurrency class gets its own in-flight cap: reads are
-            // cheap and share one index, while each `Parallel` slot (e.g. a
-            // subagent) is an entire nested LLM loop and must be bounded
-            // separately so fan-out cannot stampede the provider.
-            let launch_limit = if batch.concurrent() {
+            let limit = if batch.concurrent() {
                 match batch.class {
                     Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
                     Concurrency::Parallel => self.subagent_limits.max_concurrent,
@@ -373,19 +363,32 @@ impl Agent {
             } else {
                 1
             };
-            while next_launch < batch.calls.len().min(launch_limit) {
-                let call = &batch.calls[next_launch];
-                let registry = &self.tools;
-                let name = call.name.clone();
-                let arguments = call.arguments.clone();
-                let call_cancel = batch_cancel.clone();
-                // `next_launch` is `Copy`: each future captures its own
-                // snapshot of the slot index at construction.
-                futures.push(Box::pin(async move {
-                    let started = Instant::now();
-                    let result = registry.execute(&name, arguments, call_cancel).await;
-                    (next_launch, result, started)
-                }));
+            if batch.calls.len() > 1 {
+                tracing::debug!(
+                    count = batch.calls.len(),
+                    class = ?batch.class,
+                    launch_limit = limit,
+                    "running concurrent tool batch"
+                );
+            }
+            // The batch shares a child token so an interrupt kills exactly
+            // this phase; the turn token stays clean for the next batch.
+            let batch_cancel = cancel.child_token();
+
+            let mut futures: FuturesUnordered<ToolRun<'_>> = FuturesUnordered::new();
+            let mut next_launch = 0usize;
+            let mut starts: Vec<Option<Instant>> = (0..batch.calls.len()).map(|_| None).collect();
+            let registry = &self.tools;
+            while next_launch < batch.calls.len().min(limit) {
+                let (future, started) = launch_call(
+                    registry,
+                    &batch.calls[next_launch],
+                    next_launch,
+                    batch_cancel.clone(),
+                    events,
+                );
+                starts[next_launch] = Some(started);
+                futures.push(future);
                 next_launch += 1;
             }
 
@@ -396,6 +399,10 @@ impl Agent {
                 tokio::select! {
                     item = futures.next() => match item {
                         Some((index, result, started)) => {
+                            // Live finish event: emitted in completion order,
+                            // keyed by call id. Durable results below stay in
+                            // original call order regardless.
+                            send_finished(events, &batch.calls[index], &result, started);
                             slots[index] = Some((result, started));
                             finished += 1;
                             if finished == slots.len() {
@@ -404,17 +411,16 @@ impl Agent {
                             // Refill the freed slot from the remaining
                             // calls until the batch is exhausted.
                             if next_launch < batch.calls.len() {
-                                let call = &batch.calls[next_launch];
                                 let registry = &self.tools;
-                                let name = call.name.clone();
-                                let arguments = call.arguments.clone();
-                                let call_cancel = batch_cancel.clone();
-                                futures.push(Box::pin(async move {
-                                    let started = Instant::now();
-                                    let result =
-                                        registry.execute(&name, arguments, call_cancel).await;
-                                    (next_launch, result, started)
-                                }));
+                                let (future, started) = launch_call(
+                                    registry,
+                                    &batch.calls[next_launch],
+                                    next_launch,
+                                    batch_cancel.clone(),
+                                    events,
+                                );
+                                starts[next_launch] = Some(started);
+                                futures.push(future);
                                 next_launch += 1;
                             }
                         }
@@ -442,16 +448,31 @@ impl Agent {
 
             // Drain whatever completed, then synthesize "cancelled" results
             // for the rest — mirroring the historical single-call behavior —
-            // and end the turn.
+            // and end the turn. Finished slots already had their finish event
+            // sent at resolution time, so they must not get a second one;
+            // every call still gets its history entry and durable result.
             let mut cancelled = false;
-            for (call, slot) in batch.calls.iter().zip(&mut slots) {
-                let started_at = Instant::now();
+            for (index, call) in batch.calls.iter().enumerate() {
                 let mut was_cancelled = false;
-                let (result, started) = match slot.take() {
+                let (result, started) = match slots[index].take() {
                     Some((result, started)) => (result, started),
                     None => {
                         was_cancelled = true;
                         cancelled = true;
+                        // A call never launched because the batch was
+                        // interrupted still needs a balanced UI lifecycle:
+                        // synthetic start now, cancelled finish below.
+                        // Launched-but-unfinished calls already had their
+                        // start; all of them get one cancelled finish here
+                        // plus a failed durable result either way, so both
+                        // frontends and provider history stay valid.
+                        let started = match starts[index] {
+                            Some(started) => started,
+                            None => {
+                                send_started(events, call);
+                                Instant::now()
+                            }
+                        };
                         // Synthesize the same "cancelled" tool result the
                         // serial path produced, so provider history stays
                         // valid across the refactor.
@@ -461,35 +482,26 @@ impl Agent {
                                 is_error: true,
                                 summary: call_summary(&call.name, &call.arguments),
                             },
-                            started_at,
+                            started,
                         )
                     }
                 };
-                // Historical interrupt events carried an empty output field
-                // with the error carrying the reason.
-                let output = if was_cancelled {
-                    String::new()
-                } else {
-                    result.content.clone()
-                };
-                let error = result.is_error.then(|| {
-                    if was_cancelled {
-                        "cancelled".to_owned()
-                    } else {
-                        result.content.clone()
-                    }
-                });
-                send(
-                    events,
-                    AgentEvent::ToolCallFinished {
-                        name: call.name.clone(),
-                        summary: result.summary.clone(),
-                        ok: !result.is_error,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        output,
-                        error,
-                    },
-                );
+                if was_cancelled {
+                    // Historical interrupt events carried an empty output
+                    // field with the error carrying the reason.
+                    send(
+                        events,
+                        AgentEvent::ToolCallFinished {
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            summary: result.summary.clone(),
+                            ok: false,
+                            duration_ms: started.elapsed().as_millis() as u64,
+                            output: String::new(),
+                            error: Some("cancelled".to_owned()),
+                        },
+                    );
+                }
                 self.history.push(Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
@@ -511,6 +523,62 @@ impl Agent {
         }
         Ok(())
     }
+}
+
+/// Launch one call's execution future: announce it (`ToolCallStarted` with
+/// its original call id) immediately before pushing, stamping the true start
+/// instant used later for the duration in `ToolCallFinished`. Each future
+/// carries its own slot index; results land in that slot, never in
+/// completion order.
+fn launch_call<'a>(
+    registry: &'a ToolRegistry,
+    call: &'a ToolCall,
+    index: usize,
+    cancel: CancellationToken,
+    events: &mpsc::UnboundedSender<AgentEvent>,
+) -> (ToolRun<'a>, Instant) {
+    send_started(events, call);
+    let started = Instant::now();
+    let name = call.name.clone();
+    let arguments = call.arguments.clone();
+    (
+        Box::pin(async move {
+            let result = registry.execute(&name, arguments, cancel).await;
+            (index, result, started)
+        }),
+        started,
+    )
+}
+
+fn send_started(events: &mpsc::UnboundedSender<AgentEvent>, call: &ToolCall) {
+    send(
+        events,
+        AgentEvent::ToolCallStarted {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            summary: call_summary(&call.name, &call.arguments),
+        },
+    );
+}
+
+fn send_finished(
+    events: &mpsc::UnboundedSender<AgentEvent>,
+    call: &ToolCall,
+    result: &ToolOutput,
+    started: Instant,
+) {
+    send(
+        events,
+        AgentEvent::ToolCallFinished {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            summary: result.summary.clone(),
+            ok: !result.is_error,
+            duration_ms: started.elapsed().as_millis() as u64,
+            output: result.content.clone(),
+            error: result.is_error.then(|| result.content.clone()),
+        },
+    );
 }
 
 impl Agent {
@@ -535,12 +603,30 @@ impl Agent {
             compaction: CompactionPolicy::default(),
             project_context: String::new(),
             subagent_limits: SubagentLimits::default(),
+            subagent_runner: None,
         }
     }
 
     /// Configure fan-out bounds for `Parallel` batches (subagents).
+    /// `max_concurrent` is clamped to at least 1: this type is public and a
+    /// zero limit would otherwise launch no futures and synthesize
+    /// cancellation for the whole batch.
     pub fn with_subagent_limits(mut self, limits: SubagentLimits) -> Self {
-        self.subagent_limits = limits;
+        self.subagent_limits.max_concurrent = limits.max_concurrent.max(1);
+        self
+    }
+
+    /// Attach the shared subagent runner. The agent does not run children
+    /// itself; it only forwards successful provider/model switches so future
+    /// delegations use the active selection.
+    pub fn with_subagent_runner(
+        mut self,
+        runner: Arc<crate::subagent::SubagentRunnerImpl>,
+    ) -> Self {
+        if let Some(state) = self.session.as_ref() {
+            runner.update_parent_session(Some(state.session.id()));
+        }
+        self.subagent_runner = Some(runner);
         self
     }
 
@@ -569,6 +655,9 @@ impl Agent {
             tracing::warn!(error = %error, "could not repair incomplete session tool calls");
         }
         self.history = session.context_messages();
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_parent_session(Some(session.id()));
+        }
         self.session = Some(AgentSessionState { store, session });
         self
     }
@@ -1278,10 +1367,14 @@ impl Agent {
             }
         };
         let id = session.id().to_string();
+        let parent_session_id = session.id();
         let title = session.metadata.title.clone();
         self.history.clear();
         self.last_context_tokens = None;
         self.session = Some(crate::agent::AgentSessionState { store, session });
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_parent_session(Some(parent_session_id));
+        }
         send(
             events,
             AgentEvent::SessionChanged {
@@ -1344,11 +1437,15 @@ impl Agent {
             return;
         }
         let id = session.id().to_string();
+        let parent_session_id = session.id();
         let title = session.metadata.title.clone();
         self.history = session.context_messages();
         self.last_context_tokens = None;
         let snapshot = ui_snapshot_entries(snapshot_entries(&session));
         self.session = Some(crate::agent::AgentSessionState { store, session });
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_parent_session(Some(parent_session_id));
+        }
         send(
             events,
             AgentEvent::SessionChanged {
@@ -1521,6 +1618,12 @@ impl Agent {
             self.provider = provider;
         }
         self.model = model.clone();
+        // Future subagents must follow the parent's active selection; a
+        // failed switch already returned above, so children never see a
+        // half-applied state. Running children keep their own snapshot.
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_model(self.provider.clone(), self.model.clone());
+        }
         let _ = self.persist_event(
             SessionEvent::ModelChange {
                 provider: canonical.clone(),
@@ -2297,8 +2400,9 @@ mod tests {
             let (_, w_start, _) = interval("probe_write");
             assert!(w_start >= a_end && w_start >= b_end);
 
-            // Finished events arrive in original call order despite the
-            // concurrent batch.
+            // Finished events: live finishes may arrive in completion order
+            // within the read-only batch, so compare as a set; the write in
+            // its later singleton batch always finishes last.
             let finished: Vec<&str> = events
                 .iter()
                 .filter_map(|event| match event {
@@ -2306,7 +2410,11 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            assert_eq!(finished, vec!["probe_a", "probe_b", "probe_write"]);
+            assert_eq!(finished.len(), 3);
+            assert_eq!(finished[2], "probe_write");
+            let mut reads = finished[..2].to_vec();
+            reads.sort_unstable();
+            assert_eq!(reads, vec!["probe_a", "probe_b"]);
         });
     }
 
@@ -2384,6 +2492,564 @@ mod tests {
             name: name.into(),
             arguments: json!({}),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Concurrent lifecycle: stable ids, launch-accurate starts, exactly-once
+    // finishes, and bounded fan-out (Task 1 + Task 10 coverage).
+    // ------------------------------------------------------------------
+
+    /// A parallel tool whose calls meet on a shared barrier: every call
+    /// blocks until all parties arrive, so a batch can only complete if the
+    /// calls genuinely overlapped.
+    struct BarrierTool {
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl Tool for BarrierTool {
+        fn spec(&self) -> tools::ToolSpec {
+            tools::ToolSpec {
+                definition: llm::ToolDefinition {
+                    name: "gate".into(),
+                    description: "probe".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                prompt: tools::ToolPrompt::default(),
+            }
+        }
+
+        fn concurrency(&self, _args: &Value) -> Concurrency {
+            Concurrency::Parallel
+        }
+
+        async fn execute(&self, _args: Value, cancel: CancellationToken) -> ToolOutput {
+            let _ = cancel;
+            self.barrier.wait().await;
+            ToolOutput {
+                content: "gated done".into(),
+                is_error: false,
+                summary: "gate".into(),
+            }
+        }
+    }
+
+    /// A tool that never resolves on its own; only being dropped by an
+    /// interrupt ends it.
+    struct HangingTool {
+        name: &'static str,
+        class: Concurrency,
+    }
+
+    #[async_trait]
+    impl Tool for HangingTool {
+        fn spec(&self) -> tools::ToolSpec {
+            tools::ToolSpec {
+                definition: llm::ToolDefinition {
+                    name: self.name.into(),
+                    description: "probe".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                prompt: tools::ToolPrompt::default(),
+            }
+        }
+
+        fn concurrency(&self, _args: &Value) -> Concurrency {
+            self.class
+        }
+
+        async fn execute(&self, _args: Value, cancel: CancellationToken) -> ToolOutput {
+            cancel.cancelled().await;
+            unreachable!("cancelled futures are dropped before returning")
+        }
+    }
+
+    fn parallel_calls_script() -> Vec<Vec<ScriptStep>> {
+        vec![
+            script(vec![
+                StreamEvent::ToolCallComplete(call("t1", "gate")),
+                StreamEvent::ToolCallComplete(call("t2", "gate")),
+                StreamEvent::Done {
+                    stop_reason: Some("tool_calls".into()),
+                    usage: None,
+                },
+            ]),
+            script(vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done {
+                    stop_reason: Some("stop".into()),
+                    usage: None,
+                },
+            ]),
+        ]
+    }
+
+    async fn run_with_registry_and_limits(
+        registry: ToolRegistry,
+        limits: SubagentLimits,
+        scripts: Vec<Vec<ScriptStep>>,
+        interrupt: bool,
+    ) -> Vec<AgentEvent> {
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx.send(InputMessage::Message("go".into())).unwrap();
+        if interrupt {
+            input_tx.send(InputMessage::Interrupt).unwrap();
+        }
+        drop(input_tx);
+        let provider = MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts,
+            error_kind: MockErrorKind::Stream,
+        };
+        Agent::new(Arc::new(provider), registry, "demo", cancel)
+            .with_subagent_limits(limits)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn started_ids(events: &[AgentEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCallStarted { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn finished_ids(events: &[AgentEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCallFinished { call_id, .. } => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fan_out_starts_both_before_either_finishes_with_distinct_ids() {
+        let registry = ToolRegistry::try_new(vec![Box::new(BarrierTool {
+            barrier: Arc::new(tokio::sync::Barrier::new(2)),
+        })])
+        .unwrap();
+        let events = run_with_registry_and_limits(
+            registry,
+            SubagentLimits { max_concurrent: 2 },
+            parallel_calls_script(),
+            false,
+        )
+        .await;
+
+        // Both calls start with their original llm::ToolCall ids, both
+        // starts precede any finish, and each finishes exactly once.
+        assert_eq!(started_ids(&events), vec!["t1", "t2"]);
+        let last_start = events
+            .iter()
+            .rposition(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            .unwrap();
+        let first_finish = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+            .unwrap();
+        assert!(last_start < first_finish, "starts must precede finishes");
+        let mut finishes = finished_ids(&events);
+        finishes.sort_unstable();
+        assert_eq!(finishes, vec!["t1", "t2"]);
+        assert!(events.contains(&AgentEvent::TurnFinished));
+    }
+
+    #[tokio::test]
+    async fn limit_one_delays_the_second_start_until_the_first_finishes() {
+        let log: ProbeLog = Arc::default();
+        // Registered under the same name the scripted calls use.
+        let registry =
+            ToolRegistry::try_new(vec![Box::new(ProbeTool::parallel("gate", &log))]).unwrap();
+        let events = run_with_registry_and_limits(
+            registry,
+            SubagentLimits { max_concurrent: 1 },
+            parallel_calls_script(),
+            false,
+        )
+        .await;
+
+        // With one slot, the second start cannot be announced before the
+        // first call's finish event.
+        let second_start = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            .count();
+        assert_eq!(second_start, 2);
+        let finish_of_first = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+            .unwrap();
+        let start_positions: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(start_positions.len(), 2);
+        assert_eq!(start_positions[0], 0); // relative to first tool event
+        assert!(
+            start_positions[1] > finish_of_first,
+            "second start must wait for a freed slot"
+        );
+
+        // And the two probes really did not overlap.
+        let entries = log.lock().unwrap().clone();
+        assert_eq!(entries.len(), 2);
+        let (_, a_start, a_end) = entries[0];
+        let (_, b_start, b_end) = entries[1];
+        assert!(a_end <= b_start || b_end <= a_start, "serialized");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupt_produces_exactly_one_finish_per_call_and_valid_history() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store
+            .create(SessionCreateOptions {
+                provider: Some("mock".into()),
+                model: Some("demo".into()),
+                ..SessionCreateOptions::default()
+            })
+            .unwrap();
+
+        let session_id = session.id();
+        // Both calls target the same parallel tool so they merge into one
+        // concurrent batch; each hangs until the interrupt drops the batch.
+        let registry = ToolRegistry::try_new(vec![Box::new(HangingTool {
+            name: "hang",
+            class: Concurrency::Parallel,
+        })])
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx.send(InputMessage::Message("go".into())).unwrap();
+        let agent = Agent::new(
+            Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![script(vec![
+                    StreamEvent::ToolCallComplete(call("t1", "hang")),
+                    StreamEvent::ToolCallComplete(call("t2", "hang")),
+                    StreamEvent::Done {
+                        stop_reason: Some("tool_calls".into()),
+                        usage: None,
+                    },
+                ])],
+                error_kind: MockErrorKind::Stream,
+            }),
+            registry,
+            "demo",
+            cancel,
+        )
+        .with_session(store.clone(), session);
+        let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+
+        // Wait until both calls are announced and running, then interrupt:
+        // the dispatcher is provably parked in its select loop at that point,
+        // so the interrupt lands on the tool batch deterministically.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for tool starts"
+            );
+            match event_rx.try_recv() {
+                Ok(event) => {
+                    events.push(event);
+                    let starts = events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+                        .count();
+                    if starts >= 2 {
+                        break;
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    panic!("agent exited before both tools started")
+                }
+            }
+        }
+        input_tx.send(InputMessage::Interrupt).unwrap();
+        drop(input_tx);
+        agent_task.await.unwrap();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+
+        // Balanced lifecycle: one start per call, one cancelled finish per
+        // call, no duplicates.
+        assert_eq!(started_ids(&events), vec!["t1", "t2"]);
+        assert_eq!(finished_ids(&events), vec!["t1", "t2"]);
+        for event in &events {
+            if let AgentEvent::ToolCallFinished { ok, output, .. } = event {
+                assert!(!ok);
+                assert!(output.is_empty());
+            }
+        }
+        assert!(events.contains(&AgentEvent::TurnFinished));
+
+        // Durable history: failed tool results for every model-issued call,
+        // plus the TurnCancelled marker.
+        let loaded = store.open(&session_id).unwrap();
+        let results: Vec<(&String, &bool)> = loaded
+            .events
+            .iter()
+            .filter_map(|record| match &record.event {
+                SessionEvent::ToolResult {
+                    tool_call_id,
+                    is_error,
+                    content,
+                    ..
+                } if content == "cancelled" => Some((tool_call_id, is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(results.iter().all(|(_, is_error)| **is_error));
+        assert!(
+            loaded
+                .events
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::TurnCancelled { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_max_concurrent_is_clamped_instead_of_deadlocking() {
+        let registry = ToolRegistry::try_new(vec![Box::new(BarrierTool {
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+        })])
+        .unwrap();
+        // A public caller constructing a zero limit must not wedge the batch:
+        // the clamp makes it behave like 1 slot at minimum.
+        let events = run_with_registry_and_limits(
+            registry,
+            SubagentLimits { max_concurrent: 0 },
+            vec![script(vec![
+                StreamEvent::ToolCallComplete(call("t1", "gate")),
+                StreamEvent::Done {
+                    stop_reason: Some("tool_calls".into()),
+                    usage: None,
+                },
+            ])],
+            false,
+        )
+        .await;
+        let finished: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCallFinished { call_id, ok, .. } if *ok => Some(call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finished, vec!["t1"], "the single call ran to success");
+    }
+
+    // --------------------------------------------------------------- subagent
+    // end-to-end fan-out through the real `subagent` tool (Task 10).
+
+    /// Fake runner that records peak concurrency and optionally gates all
+    /// in-flight runs behind a barrier.
+    struct CountingRunner {
+        current: AtomicUsize,
+        max: AtomicUsize,
+        gate: Option<Arc<tokio::sync::Barrier>>,
+    }
+
+    struct InFlightGuard<'a>(&'a AtomicUsize);
+
+    impl Drop for InFlightGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl tools::SubagentRunner for CountingRunner {
+        async fn run(
+            &self,
+            description: &str,
+            _prompt: &str,
+            mode: tools::SubagentMode,
+            _cancel: CancellationToken,
+        ) -> Result<String, String> {
+            let previous = self.current.fetch_add(1, Ordering::SeqCst);
+            self.max.fetch_max(previous + 1, Ordering::SeqCst);
+            let _guard = InFlightGuard(&self.current);
+            if let Some(gate) = &self.gate {
+                gate.wait().await;
+            }
+            Ok(format!("{}/{mode:?}", description))
+        }
+    }
+
+    fn parent_script_for(calls: &[(&str, &str)]) -> Vec<Vec<ScriptStep>> {
+        let mut first = Vec::new();
+        for (id, args_mode) in calls {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("description".into(), json!(format!("task {id}")));
+            arguments.insert("prompt".into(), json!("do it"));
+            if !args_mode.is_empty() {
+                arguments.insert("mode".into(), json!(args_mode));
+            }
+            first.push(StreamEvent::ToolCallComplete(ToolCall {
+                id: (*id).into(),
+                name: crate::tools::SUBAGENT_TOOL_NAME.into(),
+                arguments: Value::Object(arguments),
+            }));
+        }
+        first.push(StreamEvent::Done {
+            stop_reason: Some("tool_calls".into()),
+            usage: None,
+        });
+        vec![
+            script(first),
+            script(vec![
+                StreamEvent::TextDelta("parent done".into()),
+                StreamEvent::Done {
+                    stop_reason: Some("stop".into()),
+                    usage: None,
+                },
+            ]),
+        ]
+    }
+
+    async fn run_parent_fan_out(
+        runner: Arc<CountingRunner>,
+        limits: SubagentLimits,
+        calls: &[(&str, &str)],
+    ) -> Vec<AgentEvent> {
+        let mut registry = ToolRegistry::empty();
+        registry.register_subagent(runner).unwrap();
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx.send(InputMessage::Message("go".into())).unwrap();
+        drop(input_tx);
+        let provider = MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: parent_script_for(calls),
+            error_kind: MockErrorKind::Stream,
+        };
+        Agent::new(Arc::new(provider), registry, "demo", cancel)
+            .with_subagent_limits(limits)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_read_only_subagents_overlap_up_to_the_limit() {
+        let runner = Arc::new(CountingRunner {
+            current: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+            gate: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        });
+        let events = run_parent_fan_out(
+            runner.clone(),
+            SubagentLimits { max_concurrent: 2 },
+            &[("t1", ""), ("t2", "")],
+        )
+        .await;
+
+        // The barrier can only be passed by both runners entering together.
+        assert_eq!(runner.max.load(Ordering::SeqCst), 2);
+        assert_eq!(started_ids(&events), vec!["t1", "t2"]);
+        // Results pair with their original call ids regardless of which
+        // finished first.
+        let reports: std::collections::HashMap<&str, &str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolCallFinished {
+                    call_id,
+                    output,
+                    ok: true,
+                    ..
+                } => Some((call_id.as_str(), output.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.get("t1"), Some(&"task t1/ReadOnly"));
+        assert_eq!(reports.get("t2"), Some(&"task t2/ReadOnly"));
+        assert!(events.contains(&AgentEvent::TurnFinished));
+    }
+
+    #[tokio::test]
+    async fn read_only_fan_out_respects_a_limit_of_one() {
+        let runner = Arc::new(CountingRunner {
+            current: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+            gate: None,
+        });
+        let events = run_parent_fan_out(
+            runner.clone(),
+            SubagentLimits { max_concurrent: 1 },
+            &[("t1", ""), ("t2", "")],
+        )
+        .await;
+
+        assert_eq!(runner.max.load(Ordering::SeqCst), 1);
+        let first_finish = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+            .unwrap();
+        let second_start = events
+            .iter()
+            .rposition(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            .unwrap();
+        assert!(
+            second_start > first_finish,
+            "the second delegation must wait for a free slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_delegations_stay_serial_even_when_parallel_is_allowed() {
+        let runner = Arc::new(CountingRunner {
+            current: AtomicUsize::new(0),
+            max: AtomicUsize::new(0),
+            gate: None,
+        });
+        let events = run_parent_fan_out(
+            runner.clone(),
+            SubagentLimits { max_concurrent: 4 },
+            &[("t1", "workspace"), ("t2", "workspace")],
+        )
+        .await;
+
+        // Workspace mode classifies Exclusive: singleton batches, strict
+        // serialization despite a limit of 4.
+        assert_eq!(runner.max.load(Ordering::SeqCst), 1);
+        let first_finish = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ToolCallFinished { .. }))
+            .unwrap();
+        let second_start = events
+            .iter()
+            .rposition(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
+            .unwrap();
+        assert!(second_start > first_finish);
     }
 
     #[test]
