@@ -2582,22 +2582,31 @@ fn format_tokens(n: u64) -> String {
 // ANSI output
 // ---------------------------------------------------------------------------
 
-/// Serialize one styled ratatui line to ANSI. Style changes are emitted per
-/// span and reset once per line; empty spans cost nothing.
+/// Serialize one styled ratatui line to ANSI. Ratatui styles describe each
+/// span independently, while terminal attributes persist until reset, so a
+/// reset is required when adjacent effective styles differ. Without it the
+/// input prefix's bold attribute leaks into the first text row even though
+/// continuation rows correctly use normal weight.
 fn line_to_ansi(line: &Line<'_>) -> String {
     let mut out = String::new();
+    let mut previous = None;
     let mut styled = false;
     for span in &line.spans {
         if span.content.is_empty() {
             continue;
         }
         let style = line.style.patch(span.style);
-        let prefix = style_prefix(&style);
-        if !prefix.is_empty() {
+        if previous.is_some_and(|previous| previous != style) {
+            out.push_str("\u{1b}[0m");
             styled = true;
         }
-        out.push_str(&prefix);
+        if previous != Some(style) {
+            let prefix = style_prefix(&style);
+            styled |= !prefix.is_empty();
+            out.push_str(&prefix);
+        }
         out.push_str(span.content.as_ref());
+        previous = Some(style);
     }
     if styled {
         out.push_str("\u{1b}[0m");
@@ -3069,6 +3078,18 @@ mod tests {
 
         let plain = Line::from("plain");
         assert_eq!(line_to_ansi(&plain), "plain");
+    }
+
+    #[test]
+    fn line_to_ansi_resets_bold_between_the_input_prefix_and_text() {
+        let layout = input_layout("first\nsecond", 12, 40, Theme::default(), "", "", "");
+        let first = line_to_ansi(&layout.rows[0]);
+        let second = line_to_ansi(&layout.rows[1]);
+
+        // The bold prefix is followed by a reset before normal input text;
+        // both logical input rows therefore render at the same weight.
+        assert!(first.contains("› \u{1b}[0m"));
+        assert!(!second.contains(&format!("{}", SetAttribute(Attribute::Bold))));
     }
 
     #[test]
