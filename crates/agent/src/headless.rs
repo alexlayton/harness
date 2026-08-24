@@ -7,8 +7,8 @@
 //! exits.  All progress chatter is optional and goes to stderr behind `-v`;
 //! stdout carries only the answer.
 
-use crate::agent::Agent;
 use crate::agent::AgentEvent;
+use crate::assembly::AgentBuilder;
 use crate::config::{Cli, Config};
 use crate::project_context_for;
 use crate::tools::ToolRegistry;
@@ -303,50 +303,18 @@ async fn run_headless_with_cancel(
 
     let project_context = project_context_for(tools.workspace_root(), cli.no_context_files);
 
-    // Optional runner attach step applied after the base agent is built.
-    let mut runner_builder: Option<Box<dyn FnOnce(Agent) -> Agent + Send>> = None;
-
-    // Subagents: inject a runner when delegation is enabled (before the
-    // agent consumes `tools`). Runs without a store (`--no-session`) simply
-    // produce ephemeral children. The concrete `Arc` is shared between the
-    // registry's trait object and the agent so `/model`-style switches (not
-    // used by this frontend today) would still retarget future children.
-    let mut tools = tools;
-    if config.subagents.max_turns > 0 {
-        let runner = std::sync::Arc::new(crate::subagent::SubagentRunnerImpl::new(
-            provider.clone(),
-            config.model.clone(),
-            tools.workspace_root().to_path_buf(),
-            config.rtk,
-            project_context.clone(),
-            config.subagents,
-            store.clone(),
-            session.as_ref().map(|session| session.id()),
-        ));
-        tools
-            .register_subagent(runner.clone())
-            .context("register subagent tool")?;
-        runner_builder = Some(Box::new(move |agent: Agent| {
-            agent.with_subagent_runner(runner)
-        }));
-    }
-
-    let agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
+    let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_compaction(config.compaction.clone())
-        .with_subagent_limits(crate::agent::SubagentLimits {
-            max_concurrent: config.subagents.max_concurrent,
-        })
+        .with_subagents(config.subagents, config.rtk)
         .with_project_context(project_context);
-    let agent = match runner_builder {
-        Some(apply) => apply(agent),
-        None => agent,
-    };
-    // Attaching a durable session is the opt-in persistence step: without it
-    // the agent behaves identically but keeps everything in memory only.
-    let agent = match (&store, session) {
-        (Some(store), Some(session)) => agent.with_session(store.clone(), session),
-        _ => agent,
-    };
+    if let Some(auth) = config.copilot_auth.clone() {
+        builder = builder.with_copilot_auth(auth);
+    }
+    if let (Some(store), Some(session)) = (&store, session) {
+        builder = builder.with_session(store.clone(), session);
+    }
+    let agent = builder.build()?;
+
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     // Send the single user turn, then close the channel so the agent's run

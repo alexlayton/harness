@@ -1,5 +1,6 @@
 use agent::acp;
-use agent::agent::{Agent, spawn_model_list};
+use agent::agent::spawn_model_list;
+use agent::assembly::AgentBuilder;
 use agent::config::{Cli, Command, Config, ProviderArg, build_provider_with_auths, init_logging};
 use agent::headless::run_headless;
 use agent::project_context_for;
@@ -154,31 +155,6 @@ async fn main_inner() -> Result<ExitCode> {
         ..SessionCreateOptions::default()
     })?;
 
-    // Subagents: inject a runner so the model can delegate self-contained
-    // tasks. Built before the agent consumes `tools` because the tool holds
-    // an Arc back into this shared state. Child sessions land in the same
-    // store linked via `parent_session`; `max_turns = 0` disables delegation.
-    // The concrete `Arc` is also attached to the agent, so `/model` switches
-    // retarget future children through `SubagentRunnerImpl::update_model`.
-    let mut tools = tools;
-    let mut subagent_runner: Option<std::sync::Arc<agent::subagent::SubagentRunnerImpl>> = None;
-    if config.subagents.max_turns > 0 {
-        let runner = std::sync::Arc::new(agent::subagent::SubagentRunnerImpl::new(
-            provider.clone(),
-            config.model.clone(),
-            tools.workspace_root().to_path_buf(),
-            config.rtk,
-            project_context.clone(),
-            config.subagents,
-            Some(session_store.clone()),
-            Some(session.id()),
-        ));
-        tools
-            .register_subagent(runner.clone())
-            .context("register subagent tool")?;
-        subagent_runner = Some(runner);
-    }
-
     let providers = ProviderArg::ALL
         .iter()
         .map(ToString::to_string)
@@ -190,24 +166,20 @@ async fn main_inner() -> Result<ExitCode> {
     ) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-    // Prime completion as soon as the UI starts.  A failure is informational;
-    // ordinary model entry and conversation use do not depend on this fetch.
+    // A model-list failure is informational and must not delay the first UI
+    // frame or agent construction.
     spawn_model_list(provider_name.clone(), provider.clone(), event_tx.clone());
 
-    let mut agent = Agent::new(provider, tools, config.model.clone(), cancel.clone())
-        .with_project_context(project_context);
-    if let Some(auth) = copilot_auth {
-        agent = agent.with_copilot_auth(auth);
-    }
-    if let Some(runner) = subagent_runner {
-        agent = agent.with_subagent_runner(runner);
-    }
-    let agent = agent
+    let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+        .with_project_context(project_context)
         .with_compaction(config.compaction.clone())
-        .with_subagent_limits(agent::agent::SubagentLimits {
-            max_concurrent: config.subagents.max_concurrent,
-        })
+        .with_subagents(config.subagents, config.rtk)
         .with_session(session_store, session);
+    if let Some(auth) = copilot_auth {
+        builder = builder.with_copilot_auth(auth);
+    }
+    let agent = builder.build()?;
+
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     // The crossterm frontend drives the same agent as headless mode and

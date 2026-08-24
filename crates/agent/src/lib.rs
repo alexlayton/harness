@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod agent;
+pub mod assembly;
 pub mod config;
 pub mod headless;
 pub mod login;
@@ -20,7 +21,10 @@ pub fn project_context_for(workspace_root: &Path, disabled: bool) -> String {
     tools::context_files::format_context_files(&files)
 }
 
-pub use agent::{Agent, AgentEvent};
+pub use agent::{
+    Agent, AgentEvent, CompactionReason, SessionListItem, SessionSnapshotEntry, SubagentLimits,
+    TurnError, spawn_model_list,
+};
 
 impl tui::TuiEvent for AgentEvent {
     fn into_ui_event(self) -> tui::UiEvent {

@@ -22,7 +22,8 @@
 //! stays behind `HARNESS_LOG` (file-only), and this module never writes to
 //! stderr either — editors surface child stderr as agent noise.
 
-use crate::agent::{Agent, AgentEvent};
+use crate::agent::AgentEvent;
+use crate::assembly::AgentBuilder;
 use crate::config::{Config, ProviderArg};
 use crate::project_context_for;
 use crate::tools::{ToolConfig, ToolRegistry, default_registry};
@@ -725,55 +726,20 @@ fn spawn_agent(
 
     let project_context = project_context_for(tools.workspace_root(), state.no_context_files);
 
-    // Optional runner attach step applied after the base agent is built.
-    let mut runner_builder: Option<Box<dyn FnOnce(Agent) -> Agent + Send>> = None;
-
-    // Subagents: same enablement rule as the other frontends. The ACP
-    // frontend builds its registry with `rtk = false`; keep that choice
-    // consistent for child registries. The concrete `Arc` is shared between
-    // the registry's trait object and the agent so a future mid-session model
-    // switch retargets children through one setup contract.
-    let mut tools = tools;
-    if state.config.subagents.max_turns > 0 {
-        let runner = std::sync::Arc::new(crate::subagent::SubagentRunnerImpl::new(
-            state.provider.clone(),
-            state.config.model.clone(),
-            tools.workspace_root().to_path_buf(),
-            false,
-            project_context.clone(),
-            state.config.subagents,
-            Some(store.clone()),
-            Some(session.id()),
-        ));
-        tools
-            .register_subagent(runner.clone())
-            .context("register subagent tool")?;
-        runner_builder = Some(Box::new(move |agent: Agent| {
-            agent.with_subagent_runner(runner)
-        }));
-    }
-
-    let agent = Agent::new(
+    let mut builder = AgentBuilder::new(
         state.provider.clone(),
-        tools,
         state.config.model.clone(),
+        tools,
         state.app_cancel.clone(),
     )
     .with_compaction(state.config.compaction.clone())
-    .with_subagent_limits(crate::agent::SubagentLimits {
-        max_concurrent: state.config.subagents.max_concurrent,
-    })
-    .with_project_context(project_context);
-    let agent = match runner_builder {
-        Some(apply) => apply(agent),
-        None => agent,
-    }
+    .with_subagents(state.config.subagents, false)
+    .with_project_context(project_context)
     .with_session(store, session);
-    let agent = if let Some(auth) = &state.copilot_auth {
-        agent.with_copilot_auth(auth.clone())
-    } else {
-        agent
-    };
+    if let Some(auth) = &state.copilot_auth {
+        builder = builder.with_copilot_auth(auth.clone());
+    }
+    let agent = builder.build()?;
     tokio::spawn(agent.run(input_rx, event_tx));
 
     tokio::spawn(forward_events(

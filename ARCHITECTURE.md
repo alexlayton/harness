@@ -39,7 +39,11 @@ not depend on `agent`; `compact` depends on `llm` and `session`; `session` and
 
 ## The main loop
 
-The heart is `Agent::run` in `crates/agent/src/agent.rs`:
+The heart is `Agent::run` in `crates/agent/src/agent/mod.rs`. Its internal
+modules deliberately separate UI events (`events.rs`), durable-session adapter
+(`persistence.rs`), tool scheduling (`tool_dispatch.rs`), turn streaming and
+recovery (`turn.rs`), slash-command handling (`commands.rs`), and compaction
+coordination (`compaction.rs`):
 
 1. User input arrives via an mpsc channel of `InputMessage`s (typed text or a
    slash command from either frontend).
@@ -62,7 +66,9 @@ and rebuilds provider history from it. Old events are never deleted.
 ## Frontends
 
 The TUI, headless runner, and ACP frontend drive the *same* `Agent` and differ
-only in I/O:
+only in I/O. They all construct it through `agent::assembly::AgentBuilder`,
+which owns common provider/tool/session/subagent setup so a subagent schema is
+never registered without its runner:
 
 - **TUI** (`crates/tui`): direct-crossterm terminal UI — plain rows committed
   into the terminal's native scrollback with a small live region at the bottom.
