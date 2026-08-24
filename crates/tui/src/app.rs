@@ -925,12 +925,15 @@ impl CrossTerm {
             self.accept_candidate(&candidate, &completion.context, input_tx)?;
             return Ok(());
         }
-        // File references rank fuzzily, so a shared prefix is usually
-        // meaningless (`agent.rs` ranks `crates/agent/src/agent.rs` first).
-        // Tab accepts the highlighted candidate — the top-ranked match on the
-        // first press — and a further Tab on an already-inserted token cycles
-        // to the next candidate.
-        if completion.kind == CompletionKind::Path {
+        // File and model references rank fuzzily, so a shared prefix is often
+        // meaningless (`luna` may rank `openrouter:openai/gpt-5.6-luna`
+        // first). Tab accepts the highlighted candidate — the top-ranked
+        // match on the first press — rather than becoming a no-op merely
+        // because the typed query is not a literal prefix.
+        if matches!(
+            completion.kind,
+            CompletionKind::Path | CompletionKind::Model
+        ) {
             let mut selected = completion.selected;
             let token = &self.input[completion.context.token_start
                 ..completion.context.token_end.min(self.input.len())];
@@ -1165,28 +1168,14 @@ impl CrossTerm {
         )
     }
 
-    /// One dim hint row above the input listing the visible completion
-    /// candidates, capped and suffixed `… +N` when there are more.
-    fn completion_hint(&self) -> String {
+    /// One dim hint row above the input. It is fitted to the actual content
+    /// width so long provider-qualified model IDs can never soft-wrap behind
+    /// the region bookkeeping and leave apparent duplicate suggestion rows.
+    fn completion_hint(&self, width: usize) -> String {
         let Some(completion) = self.completion.as_ref() else {
             return String::new();
         };
-        if completion.candidates.is_empty() {
-            return String::new();
-        }
-        let cap = (render::MAX_COMPLETION_ROWS / 2).max(1);
-        let shown = completion
-            .candidates
-            .iter()
-            .take(cap)
-            .map(|candidate| candidate.value.as_str())
-            .collect::<Vec<_>>()
-            .join(" · ");
-        if completion.candidates.len() > cap {
-            format!("{shown} … +{}", completion.candidates.len() - cap)
-        } else {
-            shown
-        }
+        fit_completion_hint(&completion.candidates, completion.selected, width)
     }
 
     fn submit(&mut self, input_tx: &mpsc::UnboundedSender<InputMessage>) -> Result<()> {
@@ -1592,12 +1581,13 @@ impl CrossTerm {
                 usage.cost
             )
         });
+        let input_width = content.saturating_sub(INPUT_PREFIX_WIDTH).max(1);
         let ghost = self.ghost_text();
-        let hint = self.completion_hint();
+        let hint = self.completion_hint(input_width);
         input_layout(
             &self.input,
             self.cursor,
-            content.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
+            input_width,
             self.theme,
             &usage_trailer,
             &ghost,
@@ -2390,6 +2380,47 @@ fn input_layout(
         cursor_row,
         cursor_col,
     }
+}
+
+/// Fit completion values onto exactly one visual row. Candidates begin at the
+/// highlighted item and wrap around, so the value Tab will accept is never
+/// hidden behind the `… +N` counter.
+fn fit_completion_hint(candidates: &[Candidate], selected: usize, width: usize) -> String {
+    if candidates.is_empty() || width == 0 {
+        return String::new();
+    }
+    let selected = selected.min(candidates.len() - 1);
+    let values = candidates[selected..]
+        .iter()
+        .chain(&candidates[..selected])
+        .map(|candidate| candidate.value.as_str())
+        .collect::<Vec<_>>();
+
+    let mut best = String::new();
+    for shown in 1..=values.len() {
+        let mut hint = values[..shown].join(" · ");
+        let hidden = values.len() - shown;
+        if hidden > 0 {
+            let _ = write!(hint, " … +{hidden}");
+        }
+        if UnicodeWidthStr::width(hint.as_str()) > width {
+            break;
+        }
+        best = hint;
+    }
+    if !best.is_empty() {
+        return best;
+    }
+
+    // Even one provider-qualified ID can be wider than a small terminal.
+    // Reserve the last cell for an ellipsis rather than letting the terminal
+    // soft-wrap a row the live-region model intentionally counts as one.
+    if width == 1 {
+        return "…".into();
+    }
+    let mut hint = ghost_to_width(values[0], width - 1);
+    hint.push('…');
+    hint
 }
 
 /// Truncate `text` (in display columns) to fit `width`, only ever cutting at
@@ -3236,13 +3267,12 @@ mod tests {
     }
 
     #[test]
-    fn completion_tab_cycles_providers_after_the_common_prefix() {
+    fn completion_tab_accepts_the_best_ranked_provider() {
         let mut ui = ui(80, 24);
         ui.input = "/model open".to_owned();
         ui.cursor = ui.input.len();
         let (tx, mut rx) = mpsc::unbounded_channel::<InputMessage>();
-        // First Tab: token "open" equals the common prefix, so it cycles to
-        // the second provider and accepts it.
+        // Provider completion is fuzzy-ranked; Tab accepts the best match.
         ui.handle_tab(&tx).unwrap();
         assert_eq!(ui.input, "/model openrouter:");
         // Accepting the provider requested its model list on demand.
@@ -3252,6 +3282,24 @@ mod tests {
                 provider: "openrouter".into(),
             })
         );
+    }
+
+    #[test]
+    fn fuzzy_model_tab_accepts_a_provider_qualified_match() {
+        let mut ui = ui(80, 24);
+        ui.model_lists.insert(
+            "openrouter".into(),
+            vec![ModelEntry {
+                id: "anthropic/claude-sonnet-4".into(),
+                name: Some("Claude Sonnet 4".into()),
+                context_length: Some(200_000),
+            }],
+        );
+        ui.input = "/model cs4".to_owned();
+        ui.cursor = ui.input.len();
+        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(ui.input, "/model openrouter:anthropic/claude-sonnet-4");
     }
 
     #[test]
@@ -3531,6 +3579,30 @@ mod tests {
         });
         let completion = ui.completion.as_ref().expect("still open for @ab");
         assert!(completion.candidates.is_empty());
+    }
+
+    #[test]
+    fn completion_hint_is_always_one_bounded_visual_row() {
+        let candidates = vec![
+            Candidate {
+                value: "openrouter:anthropic/claude-sonnet-4-very-long-name".into(),
+                description: String::new(),
+                kind: CandidateKind::Slash,
+            },
+            Candidate {
+                value: "github-copilot:claude-sonnet-4".into(),
+                description: String::new(),
+                kind: CandidateKind::Slash,
+            },
+        ];
+        let hint = fit_completion_hint(&candidates, 0, 24);
+        assert!(UnicodeWidthStr::width(hint.as_str()) <= 24);
+        assert!(hint.ends_with('…'));
+        assert!(!hint.contains(['\n', '\r']));
+
+        // The selected candidate leads even when it is not index zero.
+        let hint = fit_completion_hint(&candidates, 1, 80);
+        assert!(hint.starts_with("github-copilot:"));
     }
 
     #[test]

@@ -36,7 +36,6 @@ impl Default for Theme {
     }
 }
 
-pub(crate) const MAX_COMPLETION_ROWS: usize = 8;
 pub(crate) const ACTIVITY_FRAMES: &[&str] = &["·", "∙", "•", "●", "•", "∙"];
 const USER_PREFIX: &str = "› ";
 const ASSISTANT_PREFIX: &str = "‹ ";

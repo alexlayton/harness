@@ -498,33 +498,42 @@ fn model_candidates(
     model_lists: &HashMap<String, Vec<ModelEntry>>,
     current_provider: &str,
 ) -> Vec<Candidate> {
-    let mut results = Vec::<(bool, Candidate)>::new();
+    // score, provider candidate, current provider, candidate
+    let mut results = Vec::<(i32, bool, bool, Candidate)>::new();
     let mut seen = HashSet::new();
 
-    let (explicit_provider, model_partial) = match token.split_once(':') {
-        Some((prefix, partial)) => {
-            let provider = providers
-                .iter()
-                .find(|provider| provider.eq_ignore_ascii_case(prefix));
-            let Some(provider) = provider else {
-                // A colon commits the token to provider-qualified syntax. Do
-                // not suggest models from the current provider for an unknown
-                // provider prefix.
-                return Vec::new();
-            };
-            (Some(provider.as_str()), partial)
+    if let Some((prefix, query)) = token.split_once(':') {
+        let Some(provider) = providers
+            .iter()
+            .find(|provider| provider.eq_ignore_ascii_case(prefix))
+        else {
+            // A colon commits the token to provider-qualified syntax. Do not
+            // silently fall back to the active provider for a typo.
+            return Vec::new();
+        };
+        if let Some(models) = model_list(model_lists, provider) {
+            push_model_candidates(
+                &mut results,
+                &mut seen,
+                provider,
+                query,
+                models,
+                current_provider,
+            );
         }
-        None => (None, token),
-    };
-
-    if explicit_provider.is_none() {
-        let prefix = token.to_ascii_lowercase();
+    } else {
+        // Provider names and every cached catalog share one search. Model
+        // values are always provider-qualified here: when several catalogs
+        // contain similar IDs, the completion itself makes the destination
+        // unambiguous instead of relying on a dim description.
         for provider in providers {
-            if provider.to_ascii_lowercase().starts_with(&prefix) {
+            if let Some(score) = fuzzy_score(provider, token) {
                 let value = format!("{provider}:");
                 if seen.insert(value.clone()) {
                     results.push((
+                        score,
                         true,
+                        provider.eq_ignore_ascii_case(current_provider),
                         Candidate {
                             value,
                             description: "provider".into(),
@@ -533,53 +542,123 @@ fn model_candidates(
                     ));
                 }
             }
-        }
-    }
-
-    let list_provider = explicit_provider.unwrap_or(current_provider);
-    if let Some(models) = model_lists.get(list_provider) {
-        let partial = model_partial.to_ascii_lowercase();
-        for model in models {
-            let id_matches = model.id.to_ascii_lowercase().contains(&partial);
-            let name_matches = model
-                .name
-                .as_deref()
-                .is_some_and(|name| name.to_ascii_lowercase().contains(&partial));
-            if !id_matches && !name_matches {
-                continue;
-            }
-            let value = match explicit_provider {
-                Some(provider) => format!("{provider}:{}", model.id),
-                None => model.id.clone(),
-            };
-            if seen.insert(value.clone()) {
-                results.push((
-                    false,
-                    Candidate {
-                        value,
-                        description: model_description(model),
-                        kind: CandidateKind::Slash,
-                    },
-                ));
+            if let Some(models) = model_list(model_lists, provider) {
+                push_model_candidates(
+                    &mut results,
+                    &mut seen,
+                    provider,
+                    token,
+                    models,
+                    current_provider,
+                );
             }
         }
     }
 
-    results.sort_by(|(provider_a, candidate_a), (provider_b, candidate_b)| {
-        provider_b
-            .cmp(provider_a)
-            .then_with(|| {
-                candidate_a
-                    .value
-                    .to_ascii_lowercase()
-                    .cmp(&candidate_b.value.to_ascii_lowercase())
-            })
-            .then_with(|| candidate_a.value.cmp(&candidate_b.value))
-    });
+    results.sort_by(
+        |(score_a, provider_a, current_a, candidate_a),
+         (score_b, provider_b, current_b, candidate_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| provider_b.cmp(provider_a))
+                .then_with(|| current_b.cmp(current_a))
+                .then_with(|| {
+                    candidate_a
+                        .value
+                        .to_ascii_lowercase()
+                        .cmp(&candidate_b.value.to_ascii_lowercase())
+                })
+                .then_with(|| candidate_a.value.cmp(&candidate_b.value))
+        },
+    );
     results
         .into_iter()
-        .map(|(_, candidate)| candidate)
+        .map(|(_, _, _, candidate)| candidate)
         .collect()
+}
+
+fn model_list<'a>(
+    model_lists: &'a HashMap<String, Vec<ModelEntry>>,
+    provider: &str,
+) -> Option<&'a [ModelEntry]> {
+    model_lists
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(provider))
+        .map(|(_, models)| models.as_slice())
+}
+
+fn push_model_candidates(
+    results: &mut Vec<(i32, bool, bool, Candidate)>,
+    seen: &mut HashSet<String>,
+    provider: &str,
+    query: &str,
+    models: &[ModelEntry],
+    current_provider: &str,
+) {
+    for model in models {
+        let score = fuzzy_score(&model.id, query)
+            .into_iter()
+            .chain(
+                model
+                    .name
+                    .as_deref()
+                    .and_then(|name| fuzzy_score(name, query)),
+            )
+            .max();
+        let Some(score) = score else {
+            continue;
+        };
+        let value = format!("{provider}:{}", model.id);
+        if seen.insert(value.clone()) {
+            results.push((
+                score,
+                false,
+                provider.eq_ignore_ascii_case(current_provider),
+                Candidate {
+                    value,
+                    description: model_description(model),
+                    kind: CandidateKind::Slash,
+                },
+            ));
+        }
+    }
+}
+
+/// Rank exact, prefix, substring, then ordered-subsequence matches. The final
+/// tier makes compact queries such as `gpt56` useful for IDs containing
+/// punctuation without letting a loose subsequence outrank a literal match.
+fn fuzzy_score(candidate: &str, query: &str) -> Option<i32> {
+    let candidate = candidate.to_ascii_lowercase();
+    let query = query.to_ascii_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+    if candidate == query {
+        return Some(10_000);
+    }
+    if candidate.starts_with(&query) {
+        return Some(8_000 - candidate.len().saturating_sub(query.len()) as i32);
+    }
+    if let Some(index) = candidate.find(&query) {
+        return Some(6_000 - index.min(1_000) as i32);
+    }
+
+    let candidate_chars = candidate.chars().collect::<Vec<_>>();
+    let query_chars = query.chars().collect::<Vec<_>>();
+    let mut positions = Vec::with_capacity(query_chars.len());
+    let mut next = 0usize;
+    for query_char in query_chars.iter().copied() {
+        let offset = candidate_chars[next..]
+            .iter()
+            .position(|candidate_char| *candidate_char == query_char)?;
+        let position = next + offset;
+        positions.push(position);
+        next = position + 1;
+    }
+    let first = positions[0];
+    let span = positions.last().copied().unwrap_or(first) - first + 1;
+    let gaps = span.saturating_sub(query_chars.len());
+    Some(3_000 - first.min(500) as i32 - (gaps.min(200) * 5) as i32)
 }
 
 fn session_candidates(query: &str, sessions: &[SessionListEntry]) -> Vec<Candidate> {
@@ -806,7 +885,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(values.contains(&"opencode-go:".into()));
         assert!(values.contains(&"openrouter:".into()));
-        assert!(values.contains(&"gpt-5.6-luna".into()));
+        assert!(values.contains(&"opencode-go:gpt-5.6-luna".into()));
     }
 
     #[test]
@@ -847,12 +926,12 @@ mod tests {
         let candidate = result
             .candidates
             .iter()
-            .find(|candidate| candidate.value == "gpt-new")
+            .find(|candidate| candidate.value == "opencode-go:gpt-new")
             .unwrap();
         let (line, new_cursor) =
             apply_completion(input, cursor, &result.context, candidate, &[]).unwrap();
-        assert_eq!(line, "/model gpt-new tail");
-        assert_eq!(new_cursor, "/model gpt-new".chars().count());
+        assert_eq!(line, "/model opencode-go:gpt-new tail");
+        assert_eq!(new_cursor, "/model opencode-go:gpt-new".chars().count());
     }
 
     #[test]
@@ -988,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_prefixes_and_substring_model_filtering_work() {
+    fn provider_and_model_fuzzy_matching_is_ranked_and_qualified() {
         let lists = HashMap::from([(
             "opencode-go".into(),
             vec![
@@ -997,17 +1076,44 @@ mod tests {
             ],
         )]);
         let prefix = candidates("/model open", &providers(), &lists, "opencode-go");
-        assert_eq!(prefix[0].value, "opencode-go:");
+        assert_eq!(prefix[0].value, "openrouter:");
         assert!(
             prefix
                 .iter()
-                .any(|candidate| candidate.value == "openrouter:")
+                .any(|candidate| candidate.value == "opencode-go:")
         );
-        let filtered = candidates("/model luna", &providers(), &lists, "opencode-go");
+        // Ordered subsequences ignore punctuation (`g56l` → `gpt-5.6-luna`),
+        // and the inserted value always identifies its provider.
+        let filtered = candidates("/model g56l", &providers(), &lists, "opencode-go");
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].value, "gpt-5.6-luna");
+        assert_eq!(filtered[0].value, "opencode-go:gpt-5.6-luna");
         assert!(filtered[0].description.contains("GPT 5.6 Luna"));
         assert!(filtered[0].description.contains("400k ctx"));
+    }
+
+    #[test]
+    fn unqualified_search_spans_cached_providers_and_keeps_them_distinct() {
+        let lists = HashMap::from([
+            (
+                "opencode-go".into(),
+                vec![model("claude-sonnet", Some("Claude Sonnet"), None)],
+            ),
+            (
+                "openrouter".into(),
+                vec![model(
+                    "anthropic/claude-sonnet",
+                    Some("Claude Sonnet"),
+                    None,
+                )],
+            ),
+        ]);
+        let values = candidates("/model sonnet", &providers(), &lists, "opencode-go")
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .collect::<Vec<_>>();
+        assert_eq!(values.len(), 2);
+        assert!(values.contains(&"opencode-go:claude-sonnet".into()));
+        assert!(values.contains(&"openrouter:anthropic/claude-sonnet".into()));
     }
 
     #[test]
