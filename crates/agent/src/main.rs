@@ -1,6 +1,6 @@
 use agent::acp;
 use agent::agent::{Agent, spawn_model_list};
-use agent::config::{Cli, Config, ProviderArg, build_provider_with_auth, init_logging};
+use agent::config::{Cli, Command, Config, ProviderArg, build_provider_with_auths, init_logging};
 use agent::headless::run_headless;
 use agent::project_context_for;
 use agent::tools::{ToolConfig, default_registry};
@@ -27,6 +27,12 @@ async fn main() -> ExitCode {
 
 async fn main_inner() -> Result<ExitCode> {
     let cli = Cli::parse();
+
+    // Login is credential-only and intentionally precedes config/provider
+    // resolution: a stale configured API key cannot prevent signing in.
+    if let Some(Command::Login(args)) = &cli.command {
+        return agent::login::run(args).await;
+    }
 
     // `--print`-only flags have no meaning in the interactive TUI, which
     // exposes the same capabilities through its own slash commands.
@@ -55,13 +61,15 @@ async fn main_inner() -> Result<ExitCode> {
     let config: Config = Config::resolve(&cli)?;
     tracing::info!(stage = "config", elapsed_ms = since_start());
 
-    // Reuse the auth handle loaded during config resolution instead of
-    // re-reading auth.json.  Other providers do not touch auth.json, while
-    // Copilot remains constructible without a credential so the first `/auth`
-    // can run.
+    // Reuse auth handles loaded during config resolution instead of re-reading
+    // auth.json. OAuth providers remain constructible without credentials so
+    // their local model catalogs work before login.
     let copilot_auth = config.copilot_auth.clone();
-    let provider: Arc<dyn Provider> =
-        build_provider_with_auth(&config.provider.to_string(), copilot_auth.clone())?;
+    let provider: Arc<dyn Provider> = build_provider_with_auths(
+        &config.provider.to_string(),
+        copilot_auth.clone(),
+        config.codex_auth.clone(),
+    )?;
     let provider_name = provider.name().to_owned();
     let workspace_root =
         std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;

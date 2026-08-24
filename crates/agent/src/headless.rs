@@ -125,32 +125,6 @@ async fn drive_headless_events_into(
         let is_error = matches!(event, AgentEvent::Error(_));
         let is_turn_finished = matches!(event, AgentEvent::TurnFinished);
         match &event {
-            AgentEvent::AuthStarted => {}
-            AgentEvent::AuthPrompt { message } | AgentEvent::AuthProgress { message } => {
-                if verbose {
-                    let _ = writeln!(stderr, "{message}");
-                }
-            }
-            AgentEvent::AuthDeviceCode {
-                verification_url,
-                user_code,
-                expires_in,
-                interval,
-            } => {
-                let _ = writeln!(
-                    stderr,
-                    "GitHub Copilot login: open {verification_url} and enter code {user_code} \
-                     (expires in {expires_in}s, polling every {interval}s)"
-                );
-            }
-            AgentEvent::AuthFinished => {
-                if verbose {
-                    let _ = writeln!(stderr, "GitHub Copilot authentication complete");
-                }
-            }
-            AgentEvent::AuthFailed { message } => {
-                let _ = writeln!(stderr, "error: {message}");
-            }
             AgentEvent::TextDelta(delta) => {
                 wrote_text = true;
                 let _ = write!(stdout, "{delta}");

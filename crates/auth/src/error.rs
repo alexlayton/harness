@@ -52,8 +52,19 @@ pub enum AuthError {
     #[error("network while contacting {endpoint}: {message}")]
     Network { endpoint: String, message: String },
 
-    #[error("GitHub Copilot is not authenticated; run /auth")]
+    #[error("GitHub Copilot is not authenticated; run `harness login github-copilot`")]
     NotAuthenticated,
+
+    #[error("OpenAI Codex is not authenticated; run `harness login openai-codex`")]
+    OpenAiCodexNotAuthenticated,
+
+    #[error("OpenAI Codex OAuth failed: {0}")]
+    OpenAiCodex(String),
+
+    #[error(
+        "could not bind the OpenAI Codex login callback; use `harness login openai-codex --device-code`"
+    )]
+    CallbackBind,
 
     #[error("could not acquire auth file lock {}", .0.display())]
     LockUnavailable(PathBuf),

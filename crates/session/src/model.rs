@@ -261,6 +261,10 @@ pub enum StoredContent {
     Text { text: String },
     #[serde(rename = "reasoning")]
     Reasoning { text: String },
+    /// Opaque provider continuation data. It is deliberately data, not prose,
+    /// so exporters and compaction summaries never render it.
+    #[serde(rename = "opaque")]
+    Opaque { provider: String, data: Value },
     #[serde(rename = "tool_call")]
     ToolCall {
         id: String,
@@ -316,6 +320,10 @@ impl From<&Content> for StoredContent {
         match content {
             Content::Text(text) => Self::Text { text: text.clone() },
             Content::Reasoning(text) => Self::Reasoning { text: text.clone() },
+            Content::Opaque { provider, data } => Self::Opaque {
+                provider: provider.clone(),
+                data: data.clone(),
+            },
             Content::ToolCall(call) => Self::ToolCall {
                 id: call.id.clone(),
                 name: call.name.clone(),
@@ -339,6 +347,7 @@ impl From<StoredContent> for Content {
         match content {
             StoredContent::Text { text } => Content::Text(text),
             StoredContent::Reasoning { text } => Content::Reasoning(text),
+            StoredContent::Opaque { provider, data } => Content::Opaque { provider, data },
             StoredContent::ToolCall {
                 id,
                 name,
@@ -1002,7 +1011,9 @@ pub fn snapshot_entries(session: &Session) -> Vec<SessionSnapshotEntry> {
                             }
                             reasoning.push_str(text);
                         }
-                        StoredContent::ToolCall { .. } | StoredContent::ToolResult { .. } => {}
+                        StoredContent::ToolCall { .. }
+                        | StoredContent::ToolResult { .. }
+                        | StoredContent::Opaque { .. } => {}
                     }
                 }
                 if !markdown.is_empty() || !reasoning.is_empty() {

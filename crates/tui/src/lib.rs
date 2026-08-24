@@ -20,10 +20,6 @@ pub use state::{ToolRecord, ToolStatus};
 /// to travel through the same queue as ordinary user input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputMessage {
-    /// Start GitHub Copilot device authentication.  The first version uses
-    /// github.com; the auth crate also exposes enterprise-domain APIs for
-    /// embedders.
-    Authenticate,
     /// Normal user text for the model.
     Message(String),
     /// Turn-local interrupt.
@@ -98,23 +94,6 @@ pub enum SessionSnapshotEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UiEvent {
-    AuthStarted,
-    AuthPrompt {
-        message: String,
-    },
-    AuthDeviceCode {
-        verification_url: String,
-        user_code: String,
-        expires_in: u64,
-        interval: u64,
-    },
-    AuthProgress {
-        message: String,
-    },
-    AuthFinished,
-    AuthFailed {
-        message: String,
-    },
     TextDelta(String),
     ReasoningDelta(String),
     ToolCallStarted {

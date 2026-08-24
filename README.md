@@ -1,26 +1,24 @@
 # Harness
 
-Harness is a terminal coding-agent harness. It currently supports OpenCode Go,
-OpenRouter, and GitHub Copilot.
+Harness is a terminal coding-agent harness. It supports OpenCode Go,
+OpenRouter, GitHub Copilot, and the ChatGPT OpenAI Codex subscription endpoint.
 
 Contributing to (or working as an agent in) this repository? Start with
 [AGENTS.md](./AGENTS.md) and [ARCHITECTURE.md](./ARCHITECTURE.md).
 
 ## GitHub Copilot
 
-Start Harness with the Copilot provider when logging in for the first time:
+Sign in before starting a Copilot session:
 
 ```text
-harness --provider github-copilot
+harness login github-copilot
+# `copilot` is an alias
 ```
 
-Run `/auth` in the TUI. Harness displays GitHub's device URL and one-time code;
-open the URL in a browser and authorize the device. Press `Ctrl+C` while it is
-waiting to cancel the login without quitting Harness. After login, use `/model`
-to select one of the models available to the account. When no model is
-configured, Harness defaults to the first model from the account's own
-available list that it knows how to route, and switches automatically after a
-fresh login if the current model is not entitled to the account.
+The command displays GitHub's device URL and one-time code and attempts to open
+it in a browser. `Ctrl+C` cancels login. Login stores credentials only: it does
+not change the selected provider or model in `config.toml`. Use `/model` after
+login to select an available model.
 
 GitHub Copilot credentials are kept separately from normal configuration:
 
@@ -45,11 +43,8 @@ Conversation history is separate again, under `~/.harness/sessions`. `/new`,
 `/export` writes to the current directory by default.
 
 GitHub Enterprise domains are supported by the auth crate's domain-aware API.
-The first TUI flow defaults to `github.com`. For the TUI, set
-`HARNESS_GITHUB_ENTERPRISE_DOMAIN` to a hostname or URL before running `/auth`;
-blank or unset means `github.com`. Embedding front ends can instead pass the
-optional domain directly without changing credential storage or provider
-routing.
+The standalone command defaults to `github.com`; embedders can pass an optional
+domain without changing credential storage or provider routing.
 
 Copilot's device, token, model-policy, and proxy endpoints are client behavior
 used by VS Code/Pi rather than a stable public LLM API. Endpoint paths, headers,
@@ -62,6 +57,21 @@ the rest through `/chat/completions`, matching the per-model
 models behind billing; when no model is configured, the default prefers one the
 plan can serve, and plan-gated requests surface an actionable error instead of
 a bare 400.
+
+## OpenAI Codex
+
+Sign in to the ChatGPT subscription provider with browser OAuth (the default),
+or use device authorization when a loopback callback is unavailable:
+
+```text
+harness login openai-codex
+harness login codex --device-code
+```
+
+Credentials are stored alongside Copilot in `~/.config/harness/auth.json` with
+private Unix permissions. Select `openai-codex` (or `codex`) and one of its
+static models through `/model`. Codex uses a dedicated SSE-only provider and
+dialect because its subscription protocol differs from the normal OpenAI API.
 
 ## Editor integration (ACP)
 

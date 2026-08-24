@@ -30,7 +30,7 @@ builds the `harness` binary.
 | [`compact`] | Compaction *policy and planning* (when/what to cut, how to summarize); persistence of summaries stays in `session` | `CompactionPolicy`, `plan_compaction`, `summarize` |
 | [`session`] | Durable append-only JSONL session log: format, codec, store, export, context reconstruction | `Session`, `SessionStore`, `SessionEvent`, `ExportOptions` |
 | [`llm`] | Provider abstraction plus wire-format dialects and provider clients. The only crate that speaks HTTP to model APIs | `Provider`, `CompletionRequest`, `Message`, `StreamEvent` |
-| [`auth`] | GitHub Copilot device-flow OAuth, token storage, refresh — independent of `llm`/`agent`/`tui` | `CopilotAuth`, `AuthEvent`, `AuthStore` |
+| [`auth`] | Copilot and OpenAI Codex OAuth, token storage, refresh — independent of `llm`/`agent`/`tui` | `CopilotAuth`, `OpenAiCodexAuth`, `AuthStore` |
 | [`tools`] | The built-in tool set (`read`, `edit`, `write`, `bash`, `find`, `grep`) and the `Tool` trait/registry | `Tool`, `ToolRegistry`, `default_registry` |
 
 Dependency direction is one-way: `agent` may depend on everything; `tui` must
@@ -89,7 +89,8 @@ only in I/O:
 - `dialects/` translates between the neutral message/tool types and each wire
   format: `openai_chat`, `openai_responses`, `anthropic`.
 - `providers/` implements endpoint/auth specifics: `openrouter`,
-  `github_copilot`, `opencode_go`. Copilot routing is model-aware (Claude →
+  `github_copilot`, `openai_codex`, `opencode_go`. Codex is a dedicated,
+  SSE-only subscription endpoint dialect; Copilot routing is model-aware (Claude →
   `/v1/messages`, GPT-5-family/MAI → `/responses`, others →
   `/chat/completions`).
 
@@ -235,9 +236,10 @@ format spec. Key invariants:
 ## Config and secrets
 
 `~/.config/harness/config.toml` holds provider/model selection
-(`HARNESS_CONFIG_DIR` overrides). Copilot credentials live separately in
-`~/.config/harness/auth.json` (0600) and are never written to config or
-session files. `HARNESS_LOG` enables file-only tracing.
+(`HARNESS_CONFIG_DIR` overrides). OAuth credentials for Copilot and OpenAI
+Codex live separately in `~/.config/harness/auth.json` (0600), created by
+`harness login github-copilot` or `harness login openai-codex`; login never
+changes config or session files. `HARNESS_LOG` enables file-only tracing.
 
 ## History and intent
 

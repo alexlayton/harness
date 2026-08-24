@@ -215,7 +215,9 @@ pub fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             "name": call.name,
                             "input": call.arguments,
                         })),
-                        Content::Reasoning(_) | Content::ToolResult { .. } => {}
+                        Content::Reasoning(_)
+                        | Content::Opaque { .. }
+                        | Content::ToolResult { .. } => {}
                     }
                 }
                 result.push(json!({ "role": "assistant", "content": blocks }));

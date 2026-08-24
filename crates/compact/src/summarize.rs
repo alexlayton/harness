@@ -145,6 +145,7 @@ async fn model_summarize(
                     Ok(StreamEvent::Done { usage: Some(found), .. }) => usage = found,
                     Ok(StreamEvent::Done { .. })
                     | Ok(StreamEvent::ReasoningDelta(_))
+                    | Ok(StreamEvent::OpaqueState { .. })
                     | Ok(StreamEvent::ToolCallComplete(_)) => {}
                     Err(error) => return Err(error),
                 }

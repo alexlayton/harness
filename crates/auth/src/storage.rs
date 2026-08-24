@@ -17,6 +17,8 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 pub const COPILOT_PROVIDER_KEY: &str = "github-copilot";
+/// Provider key used by ChatGPT/Codex OAuth credentials.
+pub const OPENAI_CODEX_PROVIDER_KEY: &str = "openai-codex";
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
 
@@ -85,6 +87,59 @@ impl CopilotCredential {
 impl fmt::Debug for CopilotCredential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.redacted().fmt(formatter)
+    }
+}
+
+/// OAuth credentials used by the ChatGPT Codex subscription endpoint.
+/// Expiration is a Unix timestamp in milliseconds.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenAiCodexCredential {
+    #[serde(rename = "type")]
+    pub credential_type: String,
+    pub access: String,
+    pub refresh: String,
+    pub expires: u64,
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+}
+
+impl OpenAiCodexCredential {
+    pub fn new(
+        access: impl Into<String>,
+        refresh: impl Into<String>,
+        expires: u64,
+        account_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            credential_type: "oauth".into(),
+            access: access.into(),
+            refresh: refresh.into(),
+            expires,
+            account_id: account_id.into(),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.credential_type == "oauth"
+            && !self.access.trim().is_empty()
+            && !self.refresh.trim().is_empty()
+            && !self.account_id.trim().is_empty()
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.expires == 0 || self.expires <= unix_millis().saturating_add(60_000)
+    }
+}
+
+impl fmt::Debug for OpenAiCodexCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenAiCodexCredential")
+            .field("credential_type", &self.credential_type)
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires", &self.expires)
+            .field("account_id", &self.account_id)
+            .finish()
     }
 }
 
@@ -160,6 +215,39 @@ impl AuthStore {
     /// Read every provider entry.  A missing auth file is an empty store.
     pub fn load(&self) -> Result<AuthEntries> {
         self.load_unlocked()
+    }
+
+    pub fn openai_codex(&self) -> Result<Option<OpenAiCodexCredential>> {
+        let entries = self.load_unlocked()?;
+        let Some(value) = entries.get(OPENAI_CODEX_PROVIDER_KEY) else {
+            return Ok(None);
+        };
+        let credential =
+            serde_json::from_value::<OpenAiCodexCredential>(value.clone()).map_err(|source| {
+                AuthError::Json {
+                    path: self.path.clone(),
+                    source,
+                }
+            })?;
+        if !credential.is_complete() {
+            return Err(AuthError::InvalidCredential(
+                "OpenAI Codex credential is missing OAuth fields".into(),
+            ));
+        }
+        Ok(Some(credential))
+    }
+
+    pub fn save_openai_codex(&self, credential: &OpenAiCodexCredential) -> Result<()> {
+        if !credential.is_complete() {
+            return Err(AuthError::InvalidCredential(
+                "OpenAI Codex credential is missing OAuth fields".into(),
+            ));
+        }
+        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.save_provider_value(OPENAI_CODEX_PROVIDER_KEY, value)
     }
 
     pub fn copilot(&self) -> Result<Option<CopilotCredential>> {

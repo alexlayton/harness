@@ -169,7 +169,7 @@ pub async fn run(
         && matches!(auth.credential(), Ok(None))
     {
         anyhow::bail!(
-            "Copilot is not authenticated yet: run `harness` interactively once to log in \
+            "Copilot is not authenticated yet: run `harness login github-copilot` \
              (the credential persists in ~/.config/harness/auth.json)"
         );
     }
@@ -236,8 +236,8 @@ where
                    _cx: ConnectionTo<agent_client_protocol::Client>| {
                 let _ = responder.respond_with_error(
                     AcError::auth_required().data(
-                        "harness does not support auth over ACP; run `harness` interactively once \
-                     to log in (Copilot) or export the provider API key environment variable"
+                        "harness does not support auth over ACP; run `harness login github-copilot` \
+                     or `harness login openai-codex`, or export the provider API key"
                             .to_owned(),
                     ),
                 );

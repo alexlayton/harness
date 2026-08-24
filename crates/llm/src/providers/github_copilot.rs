@@ -742,6 +742,8 @@ mod tests {
             Ok(_) => panic!("missing auth unexpectedly produced a stream"),
             Err(error) => error,
         };
-        assert!(matches!(error, LlmError::Auth(message) if message.contains("run /auth")));
+        assert!(
+            matches!(error, LlmError::Auth(message) if message.contains("harness login github-copilot"))
+        );
     }
 }

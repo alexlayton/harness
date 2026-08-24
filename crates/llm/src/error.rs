@@ -11,7 +11,7 @@ pub enum LlmError {
     #[error("parse: {0}")]
     Parse(String),
     /// Missing or expired credentials (e.g. GitHub Copilot).  Callers can use
-    /// this to surface an actionable "run /auth" message instead of a generic
+    /// this to surface an actionable standalone login command instead of a generic
     /// HTTP or network error.  Never retryable: retrying cannot refresh the
     /// credential.
     #[error("auth: {0}")]
@@ -61,7 +61,7 @@ mod tests {
 
     #[test]
     fn auth_errors_are_not_retryable() {
-        assert!(!LlmError::Auth("run /auth".into()).is_retryable());
+        assert!(!LlmError::Auth("harness login github-copilot".into()).is_retryable());
         assert!(!LlmError::Parse("bad".into()).is_retryable());
         assert!(!LlmError::Stream("gone".into()).is_retryable());
         assert!(LlmError::http(429, "rate limited").is_retryable());

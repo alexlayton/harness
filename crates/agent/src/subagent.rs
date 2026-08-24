@@ -411,7 +411,11 @@ impl SubagentRunnerImpl {
                 tokio::select! {
                     next = stream.next() => match next {
                         Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
-                        Some(Ok(StreamEvent::ReasoningDelta(_))) => {}
+                        // Child sessions currently persist displayable output;
+                        // opaque provider state is ignored until the child is
+                        // promoted into parent context.
+                        Some(Ok(StreamEvent::ReasoningDelta(_)))
+                        | Some(Ok(StreamEvent::OpaqueState { .. })) => {}
                         Some(Ok(StreamEvent::ToolCallComplete(call))) => tool_calls.push(call),
                         // Child usage lands in the child session only, so
                         // parent totals never double-count delegated work.

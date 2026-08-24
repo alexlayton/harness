@@ -7,6 +7,7 @@
 pub mod device_code;
 pub mod error;
 pub mod github_copilot;
+pub mod openai_codex;
 pub mod storage;
 
 pub use device_code::{AuthEvent, DeviceCode, PollResult, validate_verification_url};
@@ -18,7 +19,11 @@ pub use github_copilot::{
     copilot_base_url, normalize_domain, parse_available_model_ids, parse_available_model_ids_value,
     parse_copilot_token, sku_from_proxy_token,
 };
+pub use openai_codex::{
+    CALLBACK_PATH, CALLBACK_PORT, OPENAI_CODEX_CLIENT_ID, OpenAiCodexAuth, OpenAiCodexEndpoints,
+    Pkce, account_id_from_jwt, account_id_from_tokens, pkce,
+};
 pub use storage::{
-    AuthEntries, AuthStore, COPILOT_PROVIDER_KEY, CopilotCredential, RedactedCredential, auth_path,
-    config_dir,
+    AuthEntries, AuthStore, COPILOT_PROVIDER_KEY, CopilotCredential, OPENAI_CODEX_PROVIDER_KEY,
+    OpenAiCodexCredential, RedactedCredential, auth_path, config_dir,
 };

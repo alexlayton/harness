@@ -1,5 +1,6 @@
 pub mod anthropic;
 pub mod openai_chat;
+pub mod openai_codex_responses;
 pub mod openai_responses;
 
 pub use anthropic::AnthropicMessagesClient;

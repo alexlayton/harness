@@ -119,7 +119,9 @@ pub fn convert_messages(messages: &[Message]) -> Vec<Value> {
                                 "arguments": stringify_arguments(&call.arguments),
                             }
                         })),
-                        Content::Reasoning(_) | Content::ToolResult { .. } => {}
+                        Content::Reasoning(_)
+                        | Content::Opaque { .. }
+                        | Content::ToolResult { .. } => {}
                     }
                 }
                 let mut value = Map::new();

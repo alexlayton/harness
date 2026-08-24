@@ -833,7 +833,7 @@ impl CrossTerm {
     ) -> Result<()> {
         self.apply_replacement(candidate, context);
         self.completion = None;
-        // A None-argument command (e.g. `/auth`) has no arguments to complete;
+        // A None-argument command (e.g. `/new`) has no arguments to complete;
         // the refresh below would otherwise keep its own name listed.
         let argument_less = matches!(context.target, CompletionTarget::Command,)
             && commands::command_spec(&candidate.value)
@@ -1260,10 +1260,6 @@ impl CrossTerm {
             ParsedCommand::Sessions => InputMessage::ListSessions,
             ParsedCommand::Export { destination } => InputMessage::ExportSession { destination },
             ParsedCommand::Compact => InputMessage::CompactSession,
-            ParsedCommand::Auth => {
-                self.busy = true;
-                InputMessage::Authenticate
-            }
             ParsedCommand::SetModel { provider, model } => {
                 InputMessage::SetModel { provider, model }
             }
@@ -1295,41 +1291,6 @@ impl CrossTerm {
 
     fn apply_event(&mut self, event: UiEvent) {
         match event {
-            UiEvent::AuthStarted => {
-                self.busy = true;
-                self.add_notice(
-                    "GitHub Copilot login\nWaiting for authorization...\nPress Ctrl+C to cancel.",
-                );
-            }
-            UiEvent::AuthPrompt { message } => {
-                self.busy = true;
-                self.add_notice(message);
-            }
-            UiEvent::AuthDeviceCode {
-                verification_url,
-                user_code,
-                expires_in,
-                interval,
-            } => {
-                self.busy = true;
-                self.add_notice(format!(
-                    "GitHub Copilot login\n\nOpen:\n{verification_url}\n\nEnter code:\n{user_code}\n\nWaiting for authorization...\nExpires in {expires_in}s · polling every {interval}s\nPress Ctrl+C to cancel."
-                ));
-            }
-            UiEvent::AuthProgress { message } => {
-                self.busy = true;
-                self.add_notice(message);
-            }
-            UiEvent::AuthFinished => {
-                self.busy = false;
-                self.add_notice(
-                    "GitHub Copilot authentication complete. Use /model to choose a model.",
-                );
-            }
-            UiEvent::AuthFailed { message } => {
-                self.busy = false;
-                self.add_error(message);
-            }
             UiEvent::TextDelta(delta) => {
                 if delta.is_empty() {
                     return;

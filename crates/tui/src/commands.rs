@@ -26,12 +26,6 @@ pub struct CommandSpec {
 
 pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
-        name: "/auth",
-        description: "Authenticate GitHub Copilot",
-        usage: "/auth",
-        argument_kind: ArgumentKind::None,
-    },
-    CommandSpec {
         name: "/help",
         description: "List available slash commands",
         usage: "/help",
@@ -125,7 +119,6 @@ pub struct CompletionResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedCommand {
-    Auth,
     Help,
     New,
     Load {
@@ -164,13 +157,6 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
     let mut words = input.split_whitespace();
     let command = words.next().unwrap_or("");
     match command.to_ascii_lowercase().as_str() {
-        "/auth" => {
-            if words.next().is_some() {
-                Err("usage: /auth".into())
-            } else {
-                Ok(ParsedCommand::Auth)
-            }
-        }
         "/help" => {
             if words.next().is_some() {
                 Err("usage: /help".into())
@@ -845,17 +831,6 @@ mod tests {
         let (line, cursor) = apply_completion("/mod", 4, &result.context, candidate, &[]).unwrap();
         assert_eq!(line, "/model ");
         assert_eq!(cursor, 7);
-
-        let result =
-            candidates_at_cursor("/au", 3, &providers(), &lists, "opencode-go", &[], &[]).unwrap();
-        let candidate = result
-            .candidates
-            .iter()
-            .find(|candidate| candidate.value == "/auth")
-            .unwrap();
-        let (line, cursor) = apply_completion("/au", 3, &result.context, candidate, &[]).unwrap();
-        assert_eq!(line, "/auth");
-        assert_eq!(cursor, 5);
     }
 
     #[test]
@@ -1137,8 +1112,7 @@ mod tests {
 
     #[test]
     fn parses_success_and_usage_errors() {
-        assert_eq!(parse_command("/auth"), Ok(ParsedCommand::Auth));
-        assert_eq!(parse_command("/auth now"), Err("usage: /auth".into()));
+        assert_eq!(parse_command("/auth"), Err("unknown command: /auth".into()));
         assert_eq!(parse_command("/new"), Ok(ParsedCommand::New));
         assert_eq!(
             parse_command("/load"),
@@ -1160,8 +1134,6 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/compact"), Ok(ParsedCommand::Compact));
-        assert_eq!(parse_command("/auth"), Ok(ParsedCommand::Auth));
-        assert_eq!(parse_command("/auth now"), Err("usage: /auth".into()));
         assert_eq!(
             parse_command("/model gpt-5.6-luna"),
             Ok(ParsedCommand::SetModel {

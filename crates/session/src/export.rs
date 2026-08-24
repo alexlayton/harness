@@ -365,7 +365,7 @@ fn message_text(message: &StoredMessage) -> String {
         .filter_map(|content| match content {
             StoredContent::Text { text } | StoredContent::Reasoning { text } => Some(text.as_str()),
             StoredContent::ToolResult { content, .. } => Some(content.as_str()),
-            StoredContent::ToolCall { .. } => None,
+            StoredContent::ToolCall { .. } | StoredContent::Opaque { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")

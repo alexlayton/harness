@@ -15,6 +15,12 @@ pub enum Role {
 pub enum Content {
     Text(String),
     Reasoning(String),
+    /// Provider-owned state required to continue a conversation. It is never
+    /// displayable text and other providers must ignore tags they do not own.
+    Opaque {
+        provider: String,
+        data: Value,
+    },
     ToolCall(ToolCall),
     ToolResult {
         tool_call_id: String,
@@ -67,6 +73,12 @@ pub struct Usage {
 pub enum StreamEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    /// Opaque continuation state returned by a provider (for example Codex
+    /// encrypted reasoning). Frontends deliberately never render this.
+    OpaqueState {
+        provider: String,
+        data: Value,
+    },
     ToolCallComplete(ToolCall),
     Done {
         stop_reason: Option<String>,

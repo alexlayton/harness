@@ -1,13 +1,12 @@
 use crate::config::{build_provider_with_auth, save_settings};
 use crate::prompt::system_prompt_with_workspace_context;
 use crate::tools::{Concurrency, SkillEntry, ToolOutput, ToolRegistry, call_summary};
-use auth::{AuthEvent, CopilotAuth, sku_from_proxy_token};
+use auth::CopilotAuth;
 use compact::{
     CompactionPolicy, SummaryOutcome, estimate_live_tokens, plan_compaction,
     summarize as compact_summarize,
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use llm::providers::github_copilot::default_model_for;
 use llm::{
     CompletionRequest, Content, LlmError, Message, Provider, RetryCallback, Role, StreamEvent,
     ToolCall, truncate_utf8,
@@ -39,23 +38,6 @@ const MAX_OVERFLOW_RECOVERIES: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentEvent {
-    AuthStarted,
-    AuthPrompt {
-        message: String,
-    },
-    AuthDeviceCode {
-        verification_url: String,
-        user_code: String,
-        expires_in: u64,
-        interval: u64,
-    },
-    AuthProgress {
-        message: String,
-    },
-    AuthFinished,
-    AuthFailed {
-        message: String,
-    },
     TextDelta(String),
     ReasoningDelta(String),
     ToolCallStarted {
@@ -214,8 +196,8 @@ pub struct Agent {
     pub history: Vec<Message>,
     pub cancel: CancellationToken,
     pub session: Option<AgentSessionState>,
-    /// Shared with the Copilot provider so `/auth` and automatic refreshes are
-    /// visible without rebuilding the agent.
+    /// Shared with the Copilot provider so automatic refreshes survive model
+    /// switches without rebuilding the agent.
     pub copilot_auth: Option<Arc<CopilotAuth>>,
     /// Input messages received while a turn is running.  They are drained by
     /// `run` before the next turn starts.
@@ -714,10 +696,11 @@ impl Agent {
         &mut self,
         reasoning: &str,
         text: &str,
+        opaque: &[(String, serde_json::Value)],
         calls: &[ToolCall],
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> bool {
-        if reasoning.is_empty() && text.is_empty() && calls.is_empty() {
+        if reasoning.is_empty() && text.is_empty() && opaque.is_empty() && calls.is_empty() {
             return true;
         }
         let mut content = Vec::new();
@@ -727,6 +710,10 @@ impl Agent {
         if !text.is_empty() {
             content.push(Content::Text(text.to_owned()));
         }
+        content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
+            provider: provider.clone(),
+            data: data.clone(),
+        }));
         // Tool calls have their own durable events.  Keeping them out of this
         // message avoids duplicate calls while still making the event stream
         // explicit and easy to inspect/export.
@@ -837,12 +824,6 @@ impl Agent {
                 break;
             };
             match message {
-                InputMessage::Authenticate => {
-                    if self.handle_authentication(&mut input, &events).await {
-                        return;
-                    }
-                    continue;
-                }
                 InputMessage::Message(text) if !text.trim().is_empty() => {
                     let turn_cancel = CancellationToken::new();
                     let result = self.run_turn(text, &events, &mut input, &turn_cancel).await;
@@ -1026,6 +1007,7 @@ impl Agent {
             let mut text = String::new();
             let mut reasoning = String::new();
             let mut tool_calls = Vec::<ToolCall>::new();
+            let mut opaque = Vec::<(String, serde_json::Value)>::new();
             let mut cancelled = false;
             let mut stream_error = None;
 
@@ -1044,6 +1026,7 @@ impl Agent {
                                 reasoning.push_str(&delta);
                                 send(events, AgentEvent::ReasoningDelta(delta));
                             }
+                            Ok(StreamEvent::OpaqueState { provider, data }) => opaque.push((provider, data)),
                             Ok(StreamEvent::ToolCallComplete(call)) => tool_calls.push(call),
                             Ok(StreamEvent::Done { usage: done_usage, .. }) => {
                                 if let Some(done_usage) = done_usage {
@@ -1097,8 +1080,14 @@ impl Agent {
             }
 
             if cancelled {
-                append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
-                let _ = self.persist_assistant(&reasoning, &text, &tool_calls, events);
+                append_assistant(
+                    &mut self.history,
+                    &reasoning,
+                    &text,
+                    &opaque,
+                    tool_calls.clone(),
+                );
+                let _ = self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events);
                 for call in &tool_calls {
                     let cancelled_result = "cancelled before tool execution";
                     self.history.push(Message::tool_result(
@@ -1116,8 +1105,14 @@ impl Agent {
                 return Ok(());
             }
 
-            append_assistant(&mut self.history, &reasoning, &text, tool_calls.clone());
-            let _ = self.persist_assistant(&reasoning, &text, &tool_calls, events);
+            append_assistant(
+                &mut self.history,
+                &reasoning,
+                &text,
+                &opaque,
+                tool_calls.clone(),
+            );
+            let _ = self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events);
 
             if let Some(error) = stream_error {
                 // A mid-stream context overflow (provider tears down an SSE
@@ -1224,123 +1219,6 @@ impl Agent {
             self.dispatch_tool_batches(tool_calls, events, input, cancel)
                 .await?;
         }
-    }
-
-    /// Run device authentication while retaining ordinary input in the
-    /// in-memory queue.  Ctrl+C cancels only the auth token; application
-    /// shutdown remains the separate `self.cancel` path.
-    async fn handle_authentication(
-        &mut self,
-        input: &mut mpsc::UnboundedReceiver<InputMessage>,
-        events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> bool {
-        let auth = if let Some(auth) = self.copilot_auth.clone() {
-            auth
-        } else {
-            match CopilotAuth::from_default() {
-                Ok(auth) => {
-                    let auth = Arc::new(auth);
-                    self.copilot_auth = Some(auth.clone());
-                    auth
-                }
-                Err(error) => {
-                    send(
-                        events,
-                        AgentEvent::AuthFailed {
-                            message: format!("could not open GitHub Copilot auth store: {error}"),
-                        },
-                    );
-                    return false;
-                }
-            }
-        };
-
-        send(events, AgentEvent::AuthStarted);
-        let enterprise_domain = std::env::var("HARNESS_GITHUB_ENTERPRISE_DOMAIN").ok();
-        let auth_cancel = CancellationToken::new();
-        let worker_cancel = auth_cancel.clone();
-        let worker_events = events.clone();
-        let worker_auth = auth.clone();
-        let mut worker = tokio::spawn(async move {
-            worker_auth
-                .login_with_events(enterprise_domain.as_deref(), &worker_cancel, |event| {
-                    if let Some(event) = auth_event_to_agent(event) {
-                        send(&worker_events, event);
-                    }
-                })
-                .await
-        });
-
-        let outcome = loop {
-            tokio::select! {
-                result = &mut worker => break Some(result),
-                message = input.recv(), if self.input_open => match message {
-                    Some(InputMessage::Interrupt) => auth_cancel.cancel(),
-                    Some(message) => self.queued.push_back(message),
-                    None => self.input_open = false,
-                },
-                _ = self.cancel.cancelled() => {
-                    auth_cancel.cancel();
-                    worker.abort();
-                    let _ = worker.await;
-                    return true;
-                }
-            }
-        };
-
-        match outcome {
-            Some(Ok(Ok(credential))) => {
-                send(events, AgentEvent::AuthFinished);
-                match build_provider_with_auth("github-copilot", Some(auth)) {
-                    Ok(provider) => {
-                        spawn_model_list("github-copilot".into(), provider, events.clone())
-                    }
-                    Err(error) => send(
-                        events,
-                        AgentEvent::Notice(format!(
-                            "authenticated, but could not refresh Copilot models: {error}"
-                        )),
-                    ),
-                }
-                // The model chosen at startup (or any earlier explicit
-                // choice) may not be entitled to the account that just
-                // signed in; every following turn would fail.  Fall back to
-                // the account's preferred default so the next turn works.
-                if self.provider.name() == "github-copilot"
-                    && !credential.available_model_ids.is_empty()
-                    && !credential.available_model_ids.contains(&self.model)
-                    && let Some(default) = default_model_for(
-                        sku_from_proxy_token(&credential.access),
-                        &credential.available_model_ids,
-                    )
-                {
-                    send(
-                        events,
-                        AgentEvent::Notice(format!(
-                            "model `{}` is not available to this account; switching to `{default}`",
-                            self.model
-                        )),
-                    );
-                    self.handle_set_model(None, default, events).await;
-                }
-            }
-            Some(Ok(Err(error))) => {
-                send(
-                    events,
-                    AgentEvent::AuthFailed {
-                        message: error.to_string(),
-                    },
-                );
-            }
-            Some(Err(error)) => send(
-                events,
-                AgentEvent::AuthFailed {
-                    message: format!("authentication task failed: {error}"),
-                },
-            ),
-            None => {}
-        }
-        false
     }
 
     fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
@@ -1810,6 +1688,13 @@ impl Agent {
                     Content::ToolResult { content, .. } => {
                         bytes = bytes.saturating_add(content.len())
                     }
+                    Content::Opaque { data, .. } => {
+                        bytes = bytes.saturating_add(
+                            serde_json::to_string(data)
+                                .map(|value| value.len())
+                                .unwrap_or(0),
+                        );
+                    }
                     Content::ToolCall(call) => {
                         bytes = bytes.saturating_add(call.name.len());
                         bytes = bytes.saturating_add(
@@ -1943,28 +1828,6 @@ impl Agent {
     }
 }
 
-fn auth_event_to_agent(event: AuthEvent) -> Option<AgentEvent> {
-    match event {
-        AuthEvent::DeviceCode {
-            verification_url,
-            user_code,
-            expires_in,
-            interval,
-        } => Some(AgentEvent::AuthDeviceCode {
-            verification_url,
-            user_code,
-            expires_in,
-            interval,
-        }),
-        AuthEvent::Prompt { message } => Some(AgentEvent::AuthPrompt { message }),
-        AuthEvent::Progress { message } => Some(AgentEvent::AuthProgress { message }),
-        // The worker result is translated once below, after persistence has
-        // succeeded or failed.  Ignoring this callback event avoids rendering
-        // duplicate failure notices.
-        AuthEvent::Failed { .. } | AuthEvent::Started | AuthEvent::Finished => None,
-    }
-}
-
 /// Factory used to build providers when the model/provider selection changes.
 /// A `Box<dyn Fn>` (rather than a generic) keeps the call site simple; the
 /// dispatch cost is negligible because it only runs when `/model` is used.
@@ -2059,8 +1922,14 @@ fn push_recovery_note(history: &mut Vec<Message>, note: String) {
     history.push(Message::user(note));
 }
 
-fn append_assistant(history: &mut Vec<Message>, reasoning: &str, text: &str, calls: Vec<ToolCall>) {
-    if reasoning.is_empty() && text.is_empty() && calls.is_empty() {
+fn append_assistant(
+    history: &mut Vec<Message>,
+    reasoning: &str,
+    text: &str,
+    opaque: &[(String, serde_json::Value)],
+    calls: Vec<ToolCall>,
+) {
+    if reasoning.is_empty() && text.is_empty() && opaque.is_empty() && calls.is_empty() {
         return;
     }
     let mut content = Vec::new();
@@ -2070,6 +1939,10 @@ fn append_assistant(history: &mut Vec<Message>, reasoning: &str, text: &str, cal
     if !text.is_empty() {
         content.push(Content::Text(text.to_owned()));
     }
+    content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
+        provider: provider.clone(),
+        data: data.clone(),
+    }));
     content.extend(calls.into_iter().map(Content::ToolCall));
     history.push(Message {
         role: Role::Assistant,

@@ -117,6 +117,8 @@ fn serialize_assistant_message(message: &StoredMessage, max_tool_result_chars: u
         match content {
             StoredContent::Text { text: value } => text.push(value.clone()),
             StoredContent::Reasoning { text: value } => reasoning.push(value.clone()),
+            // Opaque continuation state is intentionally excluded from summary prose.
+            StoredContent::Opaque { .. } => {}
             StoredContent::ToolCall {
                 name, arguments, ..
             } => {
