@@ -883,7 +883,7 @@ mod tests {
             system
                 .as_deref()
                 .unwrap()
-                .contains("intentionally unavailable")
+                .contains("mutation and command tools are unavailable")
         );
         assert!(!tools.iter().any(|name| name == "subagent"), "{tools:?}");
     }
@@ -905,12 +905,17 @@ mod tests {
             .await
             .unwrap();
         let (system, _) = &provider.seen.lock().unwrap()[0];
-        assert!(system.as_deref().unwrap().contains("autonomous subagent"));
         assert!(
             system
                 .as_deref()
                 .unwrap()
-                .contains("may modify the workspace")
+                .contains("autonomous workspace subagent")
+        );
+        assert!(
+            system
+                .as_deref()
+                .unwrap()
+                .contains("Complete the task with the available tools")
         );
     }
 
