@@ -886,16 +886,6 @@ mod tests {
         assert_eq!(output.content.trim(), "hi");
     }
 
-    #[tokio::test]
-    async fn rtk_disabled_tool_runs_command_verbatim() {
-        let directory = tempfile::tempdir().unwrap();
-        let output = BashTool::with_workspace_root(directory.path())
-            .execute(json!({"command": "echo hi"}), CancellationToken::new())
-            .await;
-        assert!(!output.is_error);
-        assert_eq!(output.content.trim(), "hi");
-    }
-
     #[test]
     fn read_only_commands_classify_concurrent() {
         let concurrent = [

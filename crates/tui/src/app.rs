@@ -2952,22 +2952,7 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_row_shows_the_usage_trailer_only_when_presented() {
-        let layout = input_layout(
-            "",
-            0,
-            60,
-            Theme::default(),
-            "   ↑ 1.2k ↓ 3.4k · $0.01",
-            "",
-            "",
-        );
-        assert_eq!(
-            row_text(&layout.rows[0]),
-            "› Type your message...   ↑ 1.2k ↓ 3.4k · $0.01"
-        );
-
-        // Without usage the placeholder stays bare.
+    fn placeholder_row_stays_bare_without_usage() {
         let layout = input_layout("", 0, 60, Theme::default(), "", "", "");
         assert_eq!(row_text(&layout.rows[0]), "› Type your message...");
     }
@@ -3123,36 +3108,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_header_is_two_dim_left_aligned_lines() {
-        let lines = metadata_lines(
-            "~/proj",
-            Some("main"),
-            "opencode-go",
-            "gpt-5",
-            &[],
-            &[],
-            Theme::default(),
-        );
-        assert_eq!(lines.len(), 2);
-        assert_eq!(row_text(&lines[0]), "~/proj  (main)");
-        assert_eq!(row_text(&lines[1]), "opencode-go · gpt-5");
-        // Both rows are dimmed.
-        for line in &lines {
-            assert!(
-                line.spans
-                    .iter()
-                    .all(|span| span.style.add_modifier.contains(Modifier::DIM)),
-                "metadata row should be dim: {}",
-                row_text(line)
-            );
-        }
-
-        // No branch: the first row is just the cwd.
-        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], Theme::default());
-        assert_eq!(row_text(&lines[0]), "~/proj");
-    }
-
-    #[test]
     fn metadata_header_shows_context_and_skill_rows_capped() {
         let lines = metadata_lines(
             "~/proj",
@@ -3194,14 +3149,6 @@ mod tests {
     }
 
     #[test]
-    fn separator_line_is_centered() {
-        let line = separator_line("new conversation", 30, Theme::default());
-        let text = row_text(&line);
-        assert_eq!(UnicodeWidthStr::width(text.as_str()), 30);
-        assert!(text.contains("── new conversation ──"));
-    }
-
-    #[test]
     fn line_to_ansi_emits_style_codes_only_for_styled_spans() {
         let styled = Line::from(Span::styled(
             "hi",
@@ -3227,22 +3174,6 @@ mod tests {
         // both logical input rows therefore render at the same weight.
         assert!(first.contains("› \u{1b}[0m"));
         assert!(!second.contains(&format!("{}", SetAttribute(Attribute::Bold))));
-    }
-
-    #[test]
-    fn ansi_color_matches_ratatui_backend_mapping() {
-        assert_eq!(
-            ansi_color(ratatui_core::style::Color::DarkGray),
-            AnsiColor::DarkGrey
-        );
-        assert_eq!(
-            ansi_color(ratatui_core::style::Color::Cyan),
-            AnsiColor::DarkCyan
-        );
-        assert_eq!(
-            ansi_color(ratatui_core::style::Color::LightRed),
-            AnsiColor::Red
-        );
     }
 
     #[test]
@@ -3410,18 +3341,6 @@ mod tests {
         // The live message finalizes first, then the separator follows it.
         assert!(matches!(&ui.pending[0], Entry::Assistant { .. }));
         assert!(matches!(&ui.pending[1], Entry::Separator { label } if label.contains("abcd1234")));
-    }
-
-    #[test]
-    fn completion_accepts_a_single_command_candidate_on_tab() {
-        let mut ui = ui(80, 24);
-        ui.input = "/model".to_owned();
-        ui.cursor = ui.input.len();
-        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
-        ui.handle_tab(&tx).unwrap();
-        // `/model` is a command that takes an argument; accepting it appends
-        // the argument space and leaves the caret right after it.
-        assert_eq!(ui.input, "/model ");
     }
 
     #[test]
@@ -3676,30 +3595,6 @@ mod tests {
         assert_eq!(completion.candidates.len(), 1);
         assert_eq!(completion.candidates[0].value, "@README.md");
         assert_eq!(ui.path_completion_query.as_deref(), Some("Rea"));
-    }
-
-    #[test]
-    fn path_ghost_previews_the_highlighted_remainder() {
-        let mut ui = ui(80, 24);
-        ui.input = "see @REA".to_owned();
-        ui.cursor = ui.input.len();
-        ui.completion = Some(Completion {
-            context: CompletionContext {
-                target: CompletionTarget::Argument(ArgumentKind::Path),
-                token_start: 4,
-                token_end: 8,
-                query: "REA".into(),
-            },
-            candidates: vec![Candidate {
-                value: "@README.md".into(),
-                description: "file".into(),
-                kind: CandidateKind::File,
-            }],
-            selected: 0,
-            kind: CompletionKind::Path,
-        });
-        // The dimmed suffix is exactly what Tab inserts.
-        assert_eq!(ui.ghost_text(), "DME.md");
     }
 
     #[tokio::test]

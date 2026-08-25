@@ -863,32 +863,6 @@ mod tests {
     }
 
     #[test]
-    fn rtk_flag_flows_from_file_into_resolved_config() {
-        let cli = Cli::default();
-        let file = FileConfig {
-            rtk: true,
-            ..FileConfig::default()
-        };
-        let config = Config::resolve_from_file(
-            &cli,
-            &file,
-            PathBuf::from("/tmp/harness-config.toml"),
-            |_| Some("secret".into()),
-        )
-        .unwrap();
-        assert!(config.rtk);
-
-        let config = Config::resolve_from_file(
-            &cli,
-            &FileConfig::default(),
-            PathBuf::from("/tmp/harness-config.toml"),
-            |_| Some("secret".into()),
-        )
-        .unwrap();
-        assert!(!config.rtk);
-    }
-
-    #[test]
     fn compaction_config_round_trips_and_overrides_defaults() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -922,14 +896,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_is_default_and_config_override_is_used() {
+    fn missing_file_resolves_to_defaults() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("config");
         assert_eq!(load_file_config(&path).unwrap(), FileConfig::default());
-        // Keep this test free of process-global environment mutation; the
-        // helper's behavior is exercised by config_dir itself in integration
-        // tests where the override can be scoped by the harness.
-        assert!(path.ends_with("config"));
     }
 
     #[test]

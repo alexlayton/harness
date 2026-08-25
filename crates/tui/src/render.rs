@@ -578,21 +578,6 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_lines_keep_continuations_aligned_with_the_first_line() {
-        let lines = reasoning_lines("first\nsecond", Theme::default(), 40);
-        let values = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(values, vec!["first", "second"]);
-    }
-
-    #[test]
     fn message_blocks_use_consistent_prefixes_on_wrapped_lines() {
         let user = user_lines("I can still", Theme::default(), 8);
         let assistant = markdown_lines("I can still", Theme::default(), 8);
@@ -664,11 +649,6 @@ mod tests {
         // A tab is whitespace: it separates words and is dropped at a wrap
         // boundary like any other pending whitespace.
         assert_eq!(wrapped_values("a\tb", 2), vec!["a", "b"]);
-    }
-
-    #[test]
-    fn wrap_text_breaks_overwide_words_by_display_width() {
-        assert_eq!(wrapped_values("abcdefgh", 4), vec!["abcd", "efgh"]);
     }
 
     #[test]

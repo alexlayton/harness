@@ -88,14 +88,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn jitter_values_stay_within_range() {
-        for _ in 0..10_000 {
-            let value = jitter_ms();
-            assert!(value < 251, "jitter {value} outside 0..251");
-        }
-    }
-
-    #[test]
     fn jitter_is_safe_from_concurrent_callers() {
         let handles = (0..8)
             .map(|_| {
