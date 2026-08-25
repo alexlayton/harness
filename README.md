@@ -1,5 +1,3 @@
-# Harness
-
 ```text
 ██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██
 ██▀▀██ ▒▓  ██ ██     ██  ██ ██▄▄▓▒ ▓█▄▄▄▄ ▓█▄▄▄▄
@@ -66,7 +64,20 @@ advanced options.
 - [Architecture and contributor guide](./ARCHITECTURE.md)
 - [Session format](./crates/session/README.md)
 
-Installation instructions will be added with the first release.
+## Installation
+
+Download the archive for your system from [GitHub Releases][releases]. Each
+archive contains the `harness` binary, this README, and the license. Verify the
+archive with `SHA256SUMS`, then put the binary in a directory on your `PATH`.
+
+Initial releases provide these builds:
+
+- macOS on Apple silicon (`aarch64-apple-darwin`)
+- macOS on Intel (`x86_64-apple-darwin`)
+- Linux x86-64 with glibc (`x86_64-unknown-linux-gnu`)
+- Windows x86-64 (`x86_64-pc-windows-msvc`)
+
+Homebrew installation is planned, but it is not available yet.
 
 ## Usage overview
 
@@ -95,6 +106,9 @@ Contributing to this repository, or running an agent in it? Read
 [AGENTS.md](./AGENTS.md) first. [ARCHITECTURE.md](./ARCHITECTURE.md) explains
 the crate map, data flow, and project invariants.
 
+Development uses the current stable Rust toolchain. The project does not yet
+declare a minimum supported Rust version (MSRV).
+
 The common workspace checks are:
 
 ```text
@@ -104,5 +118,10 @@ cargo test --workspace
 cargo build --workspace
 ```
 
+## License
+
+Harness is available under the [MIT License](./LICENSE).
+
 [fff]: https://crates.io/crates/fff-search
+[releases]: https://github.com/alexlayton/harness/releases
 [rtk]: https://github.com/rtk-ai/rtk
