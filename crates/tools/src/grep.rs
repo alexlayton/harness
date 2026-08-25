@@ -37,7 +37,8 @@ impl Tool for GrepTool {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Optional workspace-relative directory scope"
+                            "minLength": 1,
+                            "description": "Optional workspace-relative directory scope. Omit this field to search the entire workspace; when provided it must not be empty."
                         },
                         "mode": {
                             "type": "string",
@@ -159,6 +160,21 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn scope_schema_requires_a_non_empty_string_when_present() {
+        let directory = tempdir().unwrap();
+        let tool = GrepTool::new(Arc::new(FileSearchIndex::new(directory.path()).unwrap()));
+        let parameters = tool.spec().definition.parameters;
+
+        assert_eq!(parameters["properties"]["path"]["minLength"], 1);
+        assert!(
+            parameters["properties"]["path"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("Omit this field")
+        );
+    }
 
     #[tokio::test]
     async fn greps_without_a_shell() {
