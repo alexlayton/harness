@@ -5,7 +5,7 @@ streamed completions and workspace-scoped tool calls, renders the result in a
 terminal UI (or headless stdout), and persists every event to a durable,
 append-only JSONL session log.
 
-The project is a Cargo workspace of 7 crates with a strict dependency
+The project is a Cargo workspace of 8 crates with a strict dependency
 direction. `agent` is the only binary (`harness`); everything else is a
 library.
 
@@ -15,6 +15,7 @@ agent ──┬── tui      (rendering; no agent dep)
         ├── session  (durable log) ──────── llm
         ├── llm      (providers + dialects)
         ├── auth     (Copilot OAuth; standalone)
+        ├── mcp      (external MCP client) ─ tools, llm
         └── tools    (built-in tools) ───── llm
 ```
 
@@ -32,10 +33,11 @@ builds the `harness` binary.
 | [`llm`] | Provider abstraction plus wire-format dialects and provider clients. The only crate that speaks HTTP to model APIs | `Provider`, `CompletionRequest`, `Message`, `StreamEvent` |
 | [`auth`] | Copilot and OpenAI Codex OAuth, token storage, refresh — independent of `llm`/`agent`/`tui` | `CopilotAuth`, `OpenAiCodexAuth`, `AuthStore` |
 | [`tools`] | The built-in tool set (`read`, `edit`, `write`, `bash`, `find`, `grep`) and the `Tool` trait/registry | `Tool`, `ToolRegistry`, `default_registry` |
+| [`mcp`] | External MCP client lifecycle, stdio transport, discovery, output flattening, and remote-tool adapter | `McpRuntime`, `McpServerConfig` |
 
 Dependency direction is one-way: `agent` may depend on everything; `tui` must
 not depend on `agent`; `compact` depends on `llm` and `session`; `session` and
-`tools` depend on `llm`; `llm` and `auth` depend only on external crates.
+`tools` depend on `llm`; `mcp` depends on `tools` and `llm`; `llm` and `auth` depend only on external crates.
 
 ## The main loop
 
@@ -118,6 +120,18 @@ All path-taking tools confine resolution to the workspace root captured at
 startup; `bash` runs with that root as cwd. `find`/`grep` share one
 `FileSearchIndex` (fff-search) created once per process. `bash` optionally
 rewrites commands through `rtk` for token-lean output.
+
+### External MCP tools
+
+Configured MCP servers are connected while an agent is assembled. The `mcp`
+crate owns each protocol service and stdio child process; it discovers tools
+once, namespaces their provider-facing names, and registers adapters in the
+same immutable `ToolRegistry` snapshot as built-ins. A server's
+`tools/list_changed` notification is deliberately not applied during a turn;
+reconnect in a new session to refresh the catalogue. Remote calls are
+`Exclusive` regardless of server annotations. MCP tools are not included in
+subagent registries. Rich MCP responses are flattened to bounded text; binary
+blocks are represented by omission metadata rather than base64 payloads.
 
 ### The subagent tool
 

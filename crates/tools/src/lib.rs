@@ -18,7 +18,9 @@ pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;
 pub use read::ReadTool;
-pub use registry::{ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError};
+pub use registry::{
+    ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError, ToolRegistrySnapshot,
+};
 pub use skills::{
     Skill, SkillCatalog, SkillDiagnostic, SkillEntry, SkillMode, SkillSeverity, discover,
     expand_tilde, format_skills_prompt, load_skills_from_dir, parse_frontmatter,

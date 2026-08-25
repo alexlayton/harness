@@ -306,6 +306,7 @@ async fn run_headless_with_cancel(
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
+        .with_mcp_servers(config.mcp_servers.clone())
         .with_project_context(project_context);
     if let Some(auth) = config.copilot_auth.clone() {
         builder = builder.with_copilot_auth(auth);
@@ -313,7 +314,7 @@ async fn run_headless_with_cancel(
     if let (Some(store), Some(session)) = (&store, session) {
         builder = builder.with_session(store.clone(), session);
     }
-    let agent = builder.build()?;
+    let agent = builder.build().await?;
 
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 

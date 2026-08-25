@@ -174,11 +174,12 @@ async fn main_inner() -> Result<ExitCode> {
         .with_project_context(project_context)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
+        .with_mcp_servers(config.mcp_servers.clone())
         .with_session(session_store, session);
     if let Some(auth) = copilot_auth {
         builder = builder.with_copilot_auth(auth);
     }
-    let agent = builder.build()?;
+    let agent = builder.build().await?;
 
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 

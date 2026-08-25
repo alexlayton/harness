@@ -57,16 +57,17 @@ impl Agent {
         let mut recoveries = 0;
         let mut overflow_recoveries = 0;
         loop {
+            let tool_snapshot = self.tools.snapshot();
             let request = CompletionRequest {
                 model: self.model.clone(),
                 system: Some(system_prompt_with_workspace_context(
                     &self.tools.workspace_root().display().to_string(),
-                    &self.tools.prompt_context(),
+                    &tool_snapshot.prompt_context,
                     self.tools.skills(),
                     &self.project_context,
                 )),
                 messages: self.history.clone(),
-                tools: self.tools.definitions(),
+                tools: tool_snapshot.definitions,
                 max_tokens: None,
                 temperature: None,
                 reasoning: true,

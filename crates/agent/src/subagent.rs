@@ -253,10 +253,11 @@ impl SubagentRunnerImpl {
             (state.provider.clone(), state.model.clone())
         };
         let registry = self.registry(mode)?;
+        let registry_snapshot = registry.snapshot();
         let mut history = vec![Message::user(run.prompt.clone())];
         let system = subagent_system_prompt(
             &self.workspace_root.display().to_string(),
-            &registry.prompt_context(),
+            &registry_snapshot.prompt_context,
             registry.skills(),
             &self.project_context,
             mode,

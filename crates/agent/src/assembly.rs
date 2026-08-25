@@ -30,6 +30,7 @@ pub struct AgentBuilder {
     rtk: bool,
     session: Option<(SessionStore, Session)>,
     copilot_auth: Option<Arc<CopilotAuth>>,
+    mcp_servers: Vec<mcp::McpServerConfig>,
 }
 
 impl AgentBuilder {
@@ -51,6 +52,7 @@ impl AgentBuilder {
             rtk: false,
             session: None,
             copilot_auth: None,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -85,8 +87,32 @@ impl AgentBuilder {
         self
     }
 
-    /// Register optional subagents and produce a fully configured agent.
-    pub fn build(mut self) -> Result<Agent> {
+    /// Connect external MCP servers before registering subagents. Subagents
+    /// deliberately retain their built-in-only registries.
+    pub fn with_mcp_servers(mut self, servers: Vec<mcp::McpServerConfig>) -> Self {
+        self.mcp_servers = servers;
+        self
+    }
+
+    /// Connect optional MCP servers, register optional subagents, and produce
+    /// a runtime that keeps external server processes alive for the agent.
+    pub async fn build(mut self) -> Result<AssembledAgent> {
+        let mcp = if self.mcp_servers.is_empty() {
+            None
+        } else {
+            let runtime = mcp::McpRuntime::connect(
+                &self.mcp_servers,
+                self.tools.workspace_root(),
+                self.cancel.clone(),
+            )
+            .await
+            .context("connect MCP servers")?;
+            if let Err(error) = runtime.register_into(&mut self.tools) {
+                runtime.shutdown().await;
+                return Err(error).context("register MCP tools");
+            }
+            Some(runtime)
+        };
         let parent_session = self.session.as_ref().map(|(_, session)| session.id());
         let runner = if self.subagents.max_turns > 0 {
             let runner = Arc::new(SubagentRunnerImpl::new(
@@ -122,6 +148,28 @@ impl AgentBuilder {
         if let Some((store, session)) = self.session {
             agent = agent.with_session(store, session);
         }
-        Ok(agent)
+        Ok(AssembledAgent { agent, mcp })
+    }
+}
+
+/// An agent plus the external MCP runtime whose handles its tools use.
+/// Calling [`Self::run`] guarantees an orderly server shutdown after the
+/// frontend closes the agent input channel.
+pub struct AssembledAgent {
+    agent: Agent,
+    mcp: Option<mcp::McpRuntime>,
+}
+
+impl AssembledAgent {
+    /// Run the contained agent, then close every MCP server and reap children.
+    pub async fn run(
+        self,
+        input: tokio::sync::mpsc::UnboundedReceiver<tui::InputMessage>,
+        events: tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
+    ) {
+        self.agent.run(input, events).await;
+        if let Some(mcp) = self.mcp {
+            mcp.shutdown().await;
+        }
     }
 }

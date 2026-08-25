@@ -194,6 +194,9 @@ pub struct FileConfig {
     /// `compaction`: absent from disk when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<SubagentConfig>,
+    /// External MCP servers configured under `[[mcp.servers]]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<mcp::McpConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -208,6 +211,7 @@ impl PartialEq for FileConfig {
             && self.rtk == other.rtk
             && self.compaction == other.compaction
             && self.subagents == other.subagents
+            && self.mcp == other.mcp
             && self.extra == other.extra
     }
 }
@@ -440,6 +444,8 @@ pub struct Config {
     pub compaction: CompactionPolicy,
     /// Resolved subagent bounds (file `[subagents]` over defaults).
     pub subagents: SubagentPolicy,
+    /// MCP servers after deterministic validation and `${ENV_VAR}` expansion.
+    pub mcp_servers: Vec<mcp::McpServerConfig>,
     /// The Copilot credential handle loaded once during resolution. Startup
     /// used to construct `CopilotAuth::from_default()` twice — once for the
     /// entitled-model default inside `resolve`, again in `main` — reading and
@@ -548,6 +554,12 @@ impl Config {
             .clone()
             .or_else(|| file.model.clone())
             .unwrap_or_else(|| provider.default_model().to_owned());
+        let mcp_servers = file
+            .mcp
+            .as_ref()
+            .map(|mcp| mcp.resolve_with(|name| std::env::var(name).ok()))
+            .transpose()
+            .map_err(|error| anyhow!(error))?;
         Ok(Self {
             provider,
             model,
@@ -564,6 +576,7 @@ impl Config {
                 .as_ref()
                 .map(SubagentPolicy::from)
                 .unwrap_or_default(),
+            mcp_servers: mcp_servers.unwrap_or_default(),
             // Only the process-wide [`Config::resolve`] loads credentials;
             // the testable forms never touch auth.json.
             copilot_auth: None,
@@ -815,6 +828,7 @@ mod tests {
                 max_turns: Some(10),
                 max_concurrent: Some(2),
             }),
+            mcp: None,
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),

@@ -73,6 +73,34 @@ private Unix permissions. Select `openai-codex` (or `codex`) and one of its
 static models through `/model`. Codex uses a dedicated SSE-only provider and
 dialect because its subscription protocol differs from the normal OpenAI API.
 
+## MCP tools
+
+Harness can start external stdio MCP servers from `config.toml`:
+
+```toml
+[[mcp.servers]]
+name = "filesystem"
+transport = "stdio"
+command = "/absolute/path/to/mcp-server"
+args = ["--root", "."]
+
+[mcp.servers.env]
+LOG_LEVEL = "warn"
+```
+
+`${ENV_VAR}` placeholders in arguments and environment values are expanded at
+startup; missing variables fail startup and expanded secrets are never saved to
+configuration or session history. Servers run directly (not through a shell)
+with the workspace as their cwd. Their tools run without an approval gate,
+like built-ins, and are serialized as exclusive calls. Stdio server output is
+reserved for MCP framing; server stderr never reaches headless or ACP stdout.
+
+MCP tools are a session-start snapshot: server tool-list changes take effect on
+reconnect. Subagents intentionally do not receive external MCP tools. Rich
+binary MCP content is represented by bounded metadata/omission markers in the
+text-only provider history. Streamable HTTP and legacy SSE transports are not
+yet enabled.
+
 ## Editor integration (ACP)
 
 Harness ships a third frontend that speaks the [Agent Client Protocol][acp] over
@@ -86,7 +114,9 @@ harness --acp
 Editors spawn `harness --acp` as a subprocess and send `session/new`,
 `session/prompt`, and `session/cancel` JSON-RPC messages; Harness answers with
 streamed updates and tool-call notifications. Sessions are scoped to the
-workspace the editor opens.
+workspace the editor opens. ACP `session/new` and `session/load` may supply
+stdio MCP servers for that session; these replace rather than merge local MCP
+configuration. HTTP, SSE, and MCP-over-ACP declarations are rejected clearly.
 
 **Tools run without a confirmation step**, exactly like the TUI and headless
 frontends, so an editor that auto-approves prompts is executing your tools as

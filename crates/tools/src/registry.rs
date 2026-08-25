@@ -105,6 +105,16 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Capture definitions and prompt metadata from one immutable registry
+    /// view. Callers building a completion request must use this instead of
+    /// independently reading the two surfaces.
+    pub fn snapshot(&self) -> ToolRegistrySnapshot {
+        ToolRegistrySnapshot {
+            definitions: self.definitions(),
+            prompt_context: self.prompt_context(),
+        }
+    }
+
     /// Structured definitions for every registered tool.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
@@ -159,6 +169,15 @@ impl ToolRegistry {
             None => super::Concurrency::Exclusive,
         }
     }
+}
+
+/// An immutable provider/prompt view of a registry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolRegistrySnapshot {
+    /// JSON-schema definitions sent to the provider.
+    pub definitions: Vec<ToolDefinition>,
+    /// Concise metadata rendered into the system prompt.
+    pub prompt_context: ToolPromptContext,
 }
 
 /// Prompt-facing tool entry.  It intentionally contains no JSON schema.
@@ -226,6 +245,16 @@ mod tests {
             result,
             Err(ToolRegistryError::DuplicateName(name)) if name == "one"
         ));
+    }
+
+    #[test]
+    fn snapshot_contains_matching_definition_and_prompt_surfaces() {
+        let registry = ToolRegistry::new(vec![Box::new(TestTool { name: "one" })]);
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot.definitions[0].name,
+            snapshot.prompt_context.snippets[0].name
+        );
     }
 
     #[tokio::test]

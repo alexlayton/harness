@@ -15,7 +15,8 @@
 //! (`authenticate` answers with instructions to sign in interactively),
 //! transcript replay on `session/load` (history is intact on disk and in the
 //! agent context; the editor shows an empty transcript until the next turn),
-//! MCP-over-ACP, mid-session model switching. Unhandled requests fall through
+//! HTTP/SSE/MCP-over-ACP transports, mid-session model switching. ACP-provided
+//! stdio MCP servers are supported per session. Unhandled requests fall through
 //! to the SDK default of method-not-found.
 //!
 //! Stdout ownership is inverted here: stdout carries JSON-RPC only. Tracing
@@ -30,7 +31,7 @@ use crate::tools::{ToolConfig, ToolRegistry, default_registry};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, CancelNotification, ContentBlock, ContentChunk,
     DeleteSessionRequest, DeleteSessionResponse, InitializeRequest, InitializeResponse,
-    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse,
+    ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     SessionId, SessionInfo, SessionMode, SessionModeId, SessionModeState, SessionNotification,
     SessionUpdate, StopReason, ToolCall as AcToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
@@ -505,12 +506,26 @@ fn respond_anyhow<T: agent_client_protocol::JsonRpcResponse>(
     Ok(())
 }
 
+/// Reject malformed or unsupported session-provided MCP configuration without
+/// pretending the agent itself failed internally.
+fn respond_invalid_params<T: agent_client_protocol::JsonRpcResponse>(
+    responder: Responder<T>,
+    error: anyhow::Error,
+) -> AcResult<()> {
+    let _ = responder.respond_with_error(AcError::invalid_params().data(error.to_string()));
+    Ok(())
+}
+
 async fn new_session(
     request: NewSessionRequest,
     responder: Responder<NewSessionResponse>,
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
+    let mcp_servers = match acp_mcp_servers(&request.mcp_servers) {
+        Ok(servers) => servers,
+        Err(error) => return respond_invalid_params(responder, error),
+    };
     let (store, tools) = match build_session_stack(&request.cwd, &state.session_root) {
         Ok(stack) => stack,
         Err(error) => return respond_anyhow(responder, error),
@@ -524,7 +539,17 @@ async fn new_session(
         Err(error) => return respond_anyhow(responder, error.into()),
     };
     let id = session.id().to_string();
-    match spawn_agent(&state, store, tools, session, connection, id.clone()) {
+    match spawn_agent(
+        &state,
+        store,
+        tools,
+        session,
+        connection,
+        id.clone(),
+        mcp_servers,
+    )
+    .await
+    {
         Ok(()) => {
             tracing::info!(session = %id, cwd = %request.cwd.display(), "ACP session created");
             let _ = responder
@@ -541,6 +566,10 @@ async fn load_session(
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
+    let mcp_servers = match acp_mcp_servers(&request.mcp_servers) {
+        Ok(servers) => servers,
+        Err(error) => return respond_invalid_params(responder, error),
+    };
     let (store, tools) = match build_session_stack(&request.cwd, &state.session_root) {
         Ok(stack) => stack,
         Err(error) => return respond_anyhow(responder, error),
@@ -555,7 +584,17 @@ async fn load_session(
             );
         }
     };
-    match spawn_agent(&state, store, tools, session, connection, id.clone()) {
+    match spawn_agent(
+        &state,
+        store,
+        tools,
+        session,
+        connection,
+        id.clone(),
+        mcp_servers,
+    )
+    .await
+    {
         Ok(()) => {
             tracing::info!(session = %id, cwd = %request.cwd.display(), "ACP session loaded");
             // Documented limitation: no transcript replay notifications. The
@@ -710,16 +749,54 @@ fn build_session_stack(
     Ok((store, tools))
 }
 
+/// Convert ACP's session-local stdio declarations without retaining ACP wire
+/// types outside this frontend. HTTP, SSE, and MCP-over-ACP are rejected
+/// rather than silently omitted.
+fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
+    let servers = servers
+        .iter()
+        .map(|server| match server {
+            McpServer::Stdio(server) => Ok(mcp::McpServerConfig {
+                name: server.name.clone(),
+                transport: mcp::McpTransportConfig::Stdio {
+                    command: server.command.clone(),
+                    args: server.args.clone(),
+                    env: server
+                        .env
+                        .iter()
+                        .map(|entry| (entry.name.clone(), entry.value.clone()))
+                        .collect(),
+                },
+            }),
+            McpServer::Http(server) => anyhow::bail!(
+                "MCP server `{}` requests HTTP, which this Harness build does not support",
+                server.name
+            ),
+            McpServer::Sse(server) => anyhow::bail!(
+                "MCP server `{}` requests SSE, which this Harness build does not support",
+                server.name
+            ),
+            _ => anyhow::bail!("requested MCP transport is unsupported"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    mcp::McpConfig {
+        servers: servers.clone(),
+    }
+    .validate()?;
+    Ok(servers)
+}
+
 /// Spawn the agent task plus its event forwarder and register the session's
 /// input channel under `acp_session_id`. The forwarder owns everything
 /// event-shaped: notification translation and prompt-turn resolution.
-fn spawn_agent(
+async fn spawn_agent(
     state: &AcpState,
     store: SessionStore,
     tools: ToolRegistry,
     session: session::Session,
     connection: ConnectionTo<agent_client_protocol::Client>,
     acp_session_id: String,
+    mcp_servers: Vec<mcp::McpServerConfig>,
 ) -> Result<()> {
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -734,12 +811,13 @@ fn spawn_agent(
     )
     .with_compaction(state.config.compaction.clone())
     .with_subagents(state.config.subagents, false)
+    .with_mcp_servers(mcp_servers)
     .with_project_context(project_context)
     .with_session(store, session);
     if let Some(auth) = &state.copilot_auth {
         builder = builder.with_copilot_auth(auth.clone());
     }
-    let agent = builder.build()?;
+    let agent = builder.build().await?;
     tokio::spawn(agent.run(input_rx, event_tx));
 
     tokio::spawn(forward_events(
