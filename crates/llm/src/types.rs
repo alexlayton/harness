@@ -69,6 +69,33 @@ pub struct Usage {
     pub cost: Option<f64>,
 }
 
+/// Current subscription allowance reported by a provider. This is distinct
+/// from [`Usage`], which describes tokens consumed by one model request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionUsage {
+    /// Provider plan name when the endpoint exposes one (for example `plus`).
+    pub plan: Option<String>,
+    /// Independently resetting allowance windows, in provider display order.
+    pub windows: Vec<SubscriptionUsageWindow>,
+}
+
+/// One rolling subscription allowance window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionUsageWindow {
+    /// Human-readable window name, such as `rolling`, `weekly`, or `5 hours`.
+    pub label: String,
+    /// Percentage of the allowance consumed. Providers currently report whole
+    /// percentages; `u16` avoids silently wrapping unexpected values over 255.
+    pub used_percent: u16,
+    /// Provider status when available (OpenCode Go reports `ok`).
+    pub status: Option<String>,
+    /// Absolute reset time. Kept as provider text because OpenCode returns
+    /// RFC 3339 while Codex returns Unix seconds.
+    pub resets_at: Option<String>,
+    /// Relative reset duration when the provider reports it.
+    pub resets_after_seconds: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     TextDelta(String),

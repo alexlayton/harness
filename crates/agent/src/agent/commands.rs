@@ -324,6 +324,38 @@ impl Agent {
         spawn_model_list(canonical, self.provider.clone(), events.clone());
     }
 
+    /// Fetch subscription allowance usage from the provider active when the
+    /// command was submitted. The request runs in the background so a slow
+    /// account endpoint cannot block subsequent input processing.
+    pub(crate) fn handle_subscription_usage(&self, events: &mpsc::UnboundedSender<AgentEvent>) {
+        let provider = self.provider.clone();
+        let provider_name = provider.name().to_owned();
+        let events = events.clone();
+        tokio::spawn(async move {
+            match provider.subscription_usage().await {
+                Ok(Some(usage)) => send(
+                    &events,
+                    AgentEvent::SubscriptionUsageLoaded {
+                        provider: provider_name,
+                        usage,
+                    },
+                ),
+                Ok(None) => send(
+                    &events,
+                    AgentEvent::Notice(format!(
+                        "subscription usage is not available for {provider_name}"
+                    )),
+                ),
+                Err(error) => send(
+                    &events,
+                    AgentEvent::Error(format!(
+                        "could not fetch {provider_name} subscription usage: {error}"
+                    )),
+                ),
+            }
+        });
+    }
+
     pub(crate) fn handle_list_models(
         &self,
         provider: String,

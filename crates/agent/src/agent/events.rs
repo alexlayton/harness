@@ -67,6 +67,11 @@ pub enum AgentEvent {
         reasoning_tokens: u64,
         cost: String,
     },
+    /// Current allowance returned by the active subscription provider.
+    SubscriptionUsageLoaded {
+        provider: String,
+        usage: llm::SubscriptionUsage,
+    },
     CompactionFinished {
         compacted_through: u64,
         summary_bytes: usize,

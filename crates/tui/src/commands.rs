@@ -68,6 +68,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::Model,
     },
     CommandSpec {
+        name: "/usage",
+        description: "Show active subscription allowance usage",
+        usage: "/usage",
+        argument_kind: ArgumentKind::None,
+    },
+    CommandSpec {
         name: "/skill",
         description: "Start a turn from a discovered skill",
         usage: "/skill <name>",
@@ -133,6 +139,7 @@ pub enum ParsedCommand {
         provider: Option<String>,
         model: String,
     },
+    Usage,
     Skills,
     /// `/skill <name>` or a bare `/<name>` alias. `name` is the skill's
     /// catalog name (without the leading slash); `alias` distinguishes the
@@ -203,6 +210,13 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /compact".into())
             } else {
                 Ok(ParsedCommand::Compact)
+            }
+        }
+        "/usage" => {
+            if words.next().is_some() {
+                Err("usage: /usage".into())
+            } else {
+                Ok(ParsedCommand::Usage)
             }
         }
         "/model" => {
@@ -1240,6 +1254,9 @@ mod tests {
             })
         );
         assert_eq!(parse_command("/compact"), Ok(ParsedCommand::Compact));
+        assert_eq!(parse_command("/usage"), Ok(ParsedCommand::Usage));
+        assert_eq!(parse_command("/USAGE"), Ok(ParsedCommand::Usage));
+        assert_eq!(parse_command("/usage now"), Err("usage: /usage".into()));
         assert_eq!(
             parse_command("/model gpt-5.6-luna"),
             Ok(ParsedCommand::SetModel {

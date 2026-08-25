@@ -279,6 +279,10 @@ impl Agent {
                     self.handle_list_models(provider, &events);
                     continue;
                 }
+                InputMessage::SubscriptionUsage => {
+                    self.handle_subscription_usage(&events);
+                    continue;
+                }
                 InputMessage::ListSkills => {
                     self.handle_list_skills(&events);
                     continue;

@@ -31,8 +31,8 @@ fn install_ring_crypto_provider() {
 pub use error::LlmError;
 pub use provider::{EventStream, Provider, RetryCallback};
 pub use types::{
-    CompletionRequest, Content, Message, ModelInfo, Role, StreamEvent, ToolCall, ToolDefinition,
-    Usage,
+    CompletionRequest, Content, Message, ModelInfo, Role, StreamEvent, SubscriptionUsage,
+    SubscriptionUsageWindow, ToolCall, ToolDefinition, Usage,
 };
 pub use util::as_u64;
 pub use util::{truncate_utf8, truncate_utf8_prefix};

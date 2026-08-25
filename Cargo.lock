@@ -3778,6 +3778,7 @@ dependencies = [
  "ratatui-core",
  "tempfile",
  "textwrap",
+ "time",
  "tokio",
  "tokio-util",
  "tracing",

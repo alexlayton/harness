@@ -152,6 +152,25 @@ impl tui::TuiEvent for AgentEvent {
                 reasoning_tokens,
                 cost,
             },
+            AgentEvent::SubscriptionUsageLoaded { provider, usage } => {
+                tui::UiEvent::SubscriptionUsageLoaded {
+                    provider,
+                    usage: tui::SubscriptionUsage {
+                        plan: usage.plan,
+                        windows: usage
+                            .windows
+                            .into_iter()
+                            .map(|window| tui::SubscriptionUsageWindow {
+                                label: window.label,
+                                used_percent: window.used_percent,
+                                status: window.status,
+                                resets_at: window.resets_at,
+                                resets_after_seconds: window.resets_after_seconds,
+                            })
+                            .collect(),
+                    },
+                }
+            }
             AgentEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,

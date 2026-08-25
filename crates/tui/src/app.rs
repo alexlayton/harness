@@ -67,7 +67,7 @@ use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
 use crate::{
     ContextFileEntry, InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, SkillEntry,
-    TuiEvent, UiEvent,
+    SubscriptionUsage, SubscriptionUsageWindow, TuiEvent, UiEvent,
 };
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
@@ -89,6 +89,8 @@ use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -1252,6 +1254,7 @@ impl CrossTerm {
             ParsedCommand::SetModel { provider, model } => {
                 InputMessage::SetModel { provider, model }
             }
+            ParsedCommand::Usage => InputMessage::SubscriptionUsage,
             ParsedCommand::InvokeSkill { name, alias } => {
                 // The echo already shows what was typed; label the alias form
                 // so it is clear which skill will run.
@@ -1411,6 +1414,9 @@ impl CrossTerm {
                     output_tokens,
                     cost,
                 });
+            }
+            UiEvent::SubscriptionUsageLoaded { provider, usage } => {
+                self.add_notice(format_subscription_usage(&provider, &usage));
             }
             UiEvent::SessionChanged { id, loaded, .. } => {
                 self.finalize_stream();
@@ -2578,6 +2584,109 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
+fn format_subscription_usage(provider: &str, usage: &SubscriptionUsage) -> String {
+    format_subscription_usage_at(provider, usage, OffsetDateTime::now_utc().unix_timestamp())
+}
+
+fn format_subscription_usage_at(
+    provider: &str,
+    usage: &SubscriptionUsage,
+    now_timestamp: i64,
+) -> String {
+    let mut output = format!("{provider} subscription usage");
+    if let Some(plan) = usage.plan.as_deref().filter(|plan| !plan.is_empty()) {
+        let _ = write!(output, " · {plan}");
+    }
+    let label_width = usage
+        .windows
+        .iter()
+        .map(|window| window.label.chars().count())
+        .max()
+        .unwrap_or_default();
+    for window in &usage.windows {
+        let _ = write!(
+            output,
+            "\n{:<label_width$}  {:>3}% used",
+            window.label, window.used_percent
+        );
+        if let Some(status) = window
+            .status
+            .as_deref()
+            .filter(|status| !status.eq_ignore_ascii_case("ok"))
+        {
+            let _ = write!(output, " · {status}");
+        }
+        if let Some(reset) = format_subscription_reset(window, now_timestamp) {
+            let _ = write!(output, " · {reset}");
+        }
+    }
+    output
+}
+
+fn format_subscription_reset(
+    window: &SubscriptionUsageWindow,
+    now_timestamp: i64,
+) -> Option<String> {
+    if let Some(seconds) = window.resets_after_seconds {
+        return Some(format!("resets in {}", format_duration(seconds)));
+    }
+    let value = window.resets_at.as_deref()?;
+    if let Some(reset_timestamp) = parse_reset_timestamp(value) {
+        let remaining = reset_timestamp.saturating_sub(now_timestamp);
+        return Some(if remaining <= 0 {
+            "reset due".into()
+        } else {
+            format!("resets in {}", format_duration(remaining as u64))
+        });
+    }
+    Some(format!("resets at {}", friendly_reset_time(value)))
+}
+
+fn parse_reset_timestamp(value: &str) -> Option<i64> {
+    value.parse::<i64>().ok().or_else(|| {
+        OffsetDateTime::parse(value, &Rfc3339)
+            .ok()
+            .map(|timestamp| timestamp.unix_timestamp())
+    })
+}
+
+fn format_duration(seconds: u64) -> String {
+    let units = [
+        (7 * 86_400, "w"),
+        (86_400, "d"),
+        (3_600, "h"),
+        (60, "m"),
+        (1, "s"),
+    ];
+    let mut remaining = seconds;
+    let mut parts = Vec::new();
+    for (size, suffix) in units {
+        let count = remaining / size;
+        if count > 0 || (size == 1 && parts.is_empty()) {
+            parts.push(format!("{count}{suffix}"));
+            remaining %= size;
+            if parts.len() == 2 {
+                break;
+            }
+        }
+    }
+    parts.join(" ")
+}
+
+/// Make an unparseable RFC 3339-shaped timestamp compact as a fallback.
+fn friendly_reset_time(value: &str) -> String {
+    let Some((date, time)) = value.split_once('T') else {
+        return value.to_owned();
+    };
+    let time = time
+        .strip_suffix('Z')
+        .unwrap_or(time)
+        .split('.')
+        .next()
+        .unwrap_or(time);
+    format!("{date} {time}Z")
+}
+
 // ---------------------------------------------------------------------------
 // ANSI output
 // ---------------------------------------------------------------------------
@@ -2877,6 +2986,34 @@ mod tests {
         assert_eq!(
             row_text(&layout.rows[0]),
             "› Type your message...   ↑ 1.2k ↓ 3.5k · $0.01"
+        );
+    }
+
+    #[test]
+    fn formats_subscription_usage_windows_and_resets() {
+        let usage = SubscriptionUsage {
+            plan: Some("Go".into()),
+            windows: vec![
+                SubscriptionUsageWindow {
+                    label: "rolling".into(),
+                    used_percent: 0,
+                    status: Some("ok".into()),
+                    resets_at: Some("2026-08-25T14:48:50.201Z".into()),
+                    resets_after_seconds: None,
+                },
+                SubscriptionUsageWindow {
+                    label: "monthly".into(),
+                    used_percent: 54,
+                    status: Some("limited".into()),
+                    resets_at: None,
+                    resets_after_seconds: Some(553_554),
+                },
+            ],
+        };
+        let now = parse_reset_timestamp("2026-08-25T10:00:00Z").unwrap();
+        assert_eq!(
+            format_subscription_usage_at("opencode-go", &usage, now),
+            "opencode-go subscription usage · Go\nrolling    0% used · resets in 4h 48m\nmonthly   54% used · limited · resets in 6d 9h"
         );
     }
 

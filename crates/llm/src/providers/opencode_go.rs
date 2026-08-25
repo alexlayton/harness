@@ -1,7 +1,12 @@
 use crate::dialects::anthropic::AnthropicMessagesClient;
 use crate::dialects::openai_chat::OpenAiChatClient;
 use crate::dialects::openai_responses::OpenAiResponsesClient;
-use crate::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider};
+use crate::http::HttpClient;
+use crate::{
+    CompletionRequest, EventStream, LlmError, ModelInfo, Provider, SubscriptionUsage,
+    SubscriptionUsageWindow,
+};
+use serde::Deserialize;
 
 pub const BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
@@ -53,6 +58,7 @@ pub struct OpenCodeGoProvider {
     pub chat: OpenAiChatClient,
     pub responses: OpenAiResponsesClient,
     pub messages: AnthropicMessagesClient,
+    usage: HttpClient,
 }
 
 impl OpenCodeGoProvider {
@@ -61,7 +67,8 @@ impl OpenCodeGoProvider {
         Self {
             chat: OpenAiChatClient::new(BASE_URL, api_key.clone()),
             responses: OpenAiResponsesClient::new(BASE_URL, api_key.clone()),
-            messages: AnthropicMessagesClient::new(BASE_URL, api_key),
+            messages: AnthropicMessagesClient::new(BASE_URL, api_key.clone()),
+            usage: HttpClient::new(BASE_URL, api_key),
         }
     }
 }
@@ -83,6 +90,59 @@ impl Provider for OpenCodeGoProvider {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         self.chat.list_models().await
     }
+
+    async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {
+        let response = self.usage.get("/usage").await?;
+        let body = response.text().await.map_err(LlmError::Network)?;
+        parse_usage_body(&body).map(Some)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageResponse {
+    usage: UsageWindows,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageWindows {
+    rolling: UsageWindow,
+    weekly: UsageWindow,
+    monthly: UsageWindow,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UsageWindow {
+    status: String,
+    percent: u16,
+    resets_at: Option<String>,
+}
+
+fn parse_usage_body(body: &str) -> Result<SubscriptionUsage, LlmError> {
+    let response: UsageResponse = serde_json::from_str(body)
+        .map_err(|error| LlmError::Parse(format!("invalid OpenCode Go usage response: {error}")))?;
+    let UsageWindows {
+        rolling,
+        weekly,
+        monthly,
+    } = response.usage;
+    Ok(SubscriptionUsage {
+        plan: Some("Go".into()),
+        windows: [
+            ("rolling", rolling),
+            ("weekly", weekly),
+            ("monthly", monthly),
+        ]
+        .into_iter()
+        .map(|(label, window)| SubscriptionUsageWindow {
+            label: label.into(),
+            used_percent: window.percent,
+            status: Some(window.status),
+            resets_at: window.resets_at,
+            resets_after_seconds: None,
+        })
+        .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -101,5 +161,35 @@ mod tests {
             assert_eq!(dialect_for_model(model), Dialect::Chat);
         }
         assert_eq!(dialect_for_model("new-model"), Dialect::Chat);
+    }
+
+    #[test]
+    fn parses_all_subscription_windows() {
+        let usage = parse_usage_body(
+            r#"{
+                "usage": {
+                    "rolling": {"status":"ok","percent":0,"resetsAt":"2026-08-25T14:48:50.201Z"},
+                    "weekly": {"status":"ok","percent":12,"resetsAt":"2026-08-31T00:00:00.201Z"},
+                    "monthly": {"status":"limited","percent":54,"resetsAt":"2026-09-14T10:36:14.201Z"}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(usage.plan.as_deref(), Some("Go"));
+        assert_eq!(usage.windows.len(), 3);
+        assert_eq!(usage.windows[0].label, "rolling");
+        assert_eq!(usage.windows[1].used_percent, 12);
+        assert_eq!(usage.windows[2].status.as_deref(), Some("limited"));
+        assert_eq!(
+            usage.windows[2].resets_at.as_deref(),
+            Some("2026-09-14T10:36:14.201Z")
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_subscription_usage() {
+        let error = parse_usage_body(r#"{"usage":{"rolling":{}}}"#).unwrap_err();
+        assert!(error.to_string().contains("OpenCode Go usage response"));
     }
 }

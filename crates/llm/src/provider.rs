@@ -1,5 +1,5 @@
 use crate::retry::with_retry;
-use crate::{CompletionRequest, LlmError, ModelInfo, StreamEvent};
+use crate::{CompletionRequest, LlmError, ModelInfo, StreamEvent, SubscriptionUsage};
 use futures_core::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -22,6 +22,12 @@ pub trait Provider: Send + Sync {
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError>;
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError>;
+
+    /// Fetch the current subscription allowance, when this provider has a
+    /// usage endpoint. Providers without subscription allowances return `None`.
+    async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {
+        Ok(None)
+    }
 
     /// Run [`Provider::stream`] with retry, notifying `on_retry` before each
     /// repeated attempt so the agent loop can surface the failure in the UI.

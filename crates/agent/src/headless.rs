@@ -191,6 +191,23 @@ async fn drive_headless_events_into(
                     );
                 }
             }
+            AgentEvent::SubscriptionUsageLoaded { provider, usage } => {
+                if verbose {
+                    let plan = usage
+                        .plan
+                        .as_deref()
+                        .map(|plan| format!(" · {plan}"))
+                        .unwrap_or_default();
+                    let _ = writeln!(stderr, "{provider} subscription usage{plan}");
+                    for window in &usage.windows {
+                        let _ = writeln!(
+                            stderr,
+                            "{}: {}% used",
+                            window.label, window.used_percent
+                        );
+                    }
+                }
+            }
             AgentEvent::TurnFinished => {
                 if wrote_text {
                     let _ = writeln!(stdout);

@@ -44,6 +44,8 @@ pub enum InputMessage {
     ListModels { provider: String },
     /// Start a turn from a discovered skill's instructions.
     InvokeSkill { name: String },
+    /// Ask the active provider for current subscription allowance usage.
+    SubscriptionUsage,
     /// Ask the agent for the discovered-skill view (see [`UiEvent::SkillsLoaded`]).
     ListSkills,
 }
@@ -90,6 +92,30 @@ pub enum SessionSnapshotEntry {
         output: String,
         error: Option<String>,
     },
+}
+
+/// Provider-neutral subscription usage rendered by `/usage`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionUsage {
+    /// Provider plan name, when available.
+    pub plan: Option<String>,
+    /// Independently resetting allowance windows.
+    pub windows: Vec<SubscriptionUsageWindow>,
+}
+
+/// One display-ready subscription allowance window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubscriptionUsageWindow {
+    /// Human-readable window name.
+    pub label: String,
+    /// Percentage of the allowance consumed.
+    pub used_percent: u16,
+    /// Provider status, when available.
+    pub status: Option<String>,
+    /// Provider-formatted absolute reset time.
+    pub resets_at: Option<String>,
+    /// Seconds until reset, when available.
+    pub resets_after_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +187,11 @@ pub enum UiEvent {
         cached_tokens: u64,
         reasoning_tokens: u64,
         cost: String,
+    },
+    /// Current allowance returned by the active subscription provider.
+    SubscriptionUsageLoaded {
+        provider: String,
+        usage: SubscriptionUsage,
     },
     CompactionFinished {
         compacted_through: u64,

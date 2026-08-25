@@ -93,7 +93,9 @@ never registered without its runner:
 `llm` separates *what* from *how*:
 
 - `provider.rs` defines the `Provider` trait (`stream`, `list_models`,
-  `stream_with_retry`) — the provider-neutral contract the agent sees.
+  `subscription_usage`, `stream_with_retry`) — the provider-neutral contract
+  the agent sees. Subscription usage is optional and currently implemented by
+  OpenCode Go and OpenAI Codex.
 - `dialects/` translates between the neutral message/tool types and each wire
   format: `openai_chat`, `openai_responses`, `anthropic`.
 - `providers/` implements endpoint/auth specifics: `openrouter`,
