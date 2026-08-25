@@ -6,7 +6,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1"
-crossterm = { version = "0.28", features = ["event-stream"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = "0.3"
 ignore = "0.4"
 ratatui-core = "0.1"
