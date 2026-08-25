@@ -562,8 +562,23 @@ mod tests {
             vec!["read", "edit", "write", "bash", "find", "grep", "multigrep"]
         );
         let context = registry.prompt_context();
-        assert!(context.snippets.iter().any(|tool| tool.name == "find"));
-        assert!(context.snippets.iter().any(|tool| tool.name == "grep"));
+        let snippets: Vec<(&str, &str)> = context
+            .snippets
+            .iter()
+            .map(|tool| (tool.name.as_str(), tool.snippet.as_str()))
+            .collect();
+        assert_eq!(
+            snippets,
+            vec![
+                ("read", "Read files"),
+                ("edit", "Apply exact replacements"),
+                ("write", "Create or replace files"),
+                ("bash", "Run commands"),
+                ("find", "Find files and directories"),
+                ("grep", "Search file contents"),
+                ("multigrep", "Search multiple literal patterns"),
+            ]
+        );
         assert!(
             context
                 .guidelines

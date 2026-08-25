@@ -64,8 +64,8 @@ impl Tool for MultiGrepTool {
                 }),
             },
             prompt: ToolPrompt::new(
-                "Search once for several literal aliases or symbol variants",
-                ["Use multigrep instead of several plain greps when looking for aliases, renamed symbols, or literal variants.".to_owned()],
+                "Search multiple literal patterns",
+                ["Use multigrep for aliases, renamed symbols, or literal variants.".to_owned()],
             ),
         }
     }

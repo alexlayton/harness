@@ -39,8 +39,8 @@ impl Tool for WriteTool {
                 }),
             },
             prompt: ToolPrompt::new(
-                "Create or overwrite files with complete contents",
-                ["Use write only for new files or complete rewrites.".to_owned()],
+                "Create or replace files",
+                ["Use write only for new files or full rewrites.".to_owned()],
             ),
         }
     }

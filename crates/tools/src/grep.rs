@@ -66,10 +66,10 @@ impl Tool for GrepTool {
                 }),
             },
             prompt: ToolPrompt::new(
-                "Search file contents for a pattern",
+                "Search file contents",
                 [
-                    "Use grep for content search instead of bash grep, ripgrep, or shell pipelines.".to_owned(),
-                    "Match lines are formatted path:line:content; context lines use path-line-content.".to_owned(),
+                    "Use grep for content search instead of shell searches.".to_owned(),
+                    "Matches use path:line:content; context lines use path-line-content.".to_owned(),
                 ],
             ),
         }

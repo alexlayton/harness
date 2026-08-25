@@ -181,19 +181,10 @@ impl Tool for SubagentTool {
                 }),
             },
             prompt: ToolPrompt::new(
-                "delegate a self-contained task to a fresh subagent (own context window); returns its final report",
+                "Delegate a self-contained task",
                 vec![
-                    "The subagent cannot see this conversation: write `prompt` fully \
-                     self-contained, with explicit file paths, constraints, and the exact \
-                     deliverable you expect back.",
-                    "Batch multiple `read_only` `subagent` calls in one response when their tasks \
-                     are independent (e.g. one per crate/module) — they run concurrently. \
-                     Sequence calls when one depends on another's result.",
-                    "Use `mode: \"workspace\"` only when a delegation genuinely needs to modify \
-                     files or execute commands. Workspace delegations serialize with other \
-                     mutating work, so keep their scopes explicit and non-overlapping.",
-                    "Prefer subagents for breadth (surveys, audits, per-target repetition) \
-                     over depth; do the focused edit yourself so you keep full context.",
+                    "Delegated prompts must include all relevant context, paths, constraints, and the expected result.",
+                    "Prefer read_only subagents for independent breadth; use workspace only for delegated commands or mutations.",
                 ],
             ),
         }

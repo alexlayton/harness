@@ -104,8 +104,8 @@ impl Tool for EditTool {
             }),
             },
             prompt: ToolPrompt::new(
-                "Make precise file edits with exact text replacement",
-                ["Use edit for targeted changes; match oldText against the original file.".to_owned()],
+                "Apply exact replacements",
+                ["Use edit for targeted changes; oldText matches the original file.".to_owned()],
             ),
         }
     }

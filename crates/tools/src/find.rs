@@ -733,8 +733,8 @@ impl Tool for FindTool {
                 }),
             },
             prompt: ToolPrompt::new(
-                "Find files and directories by fuzzy query",
-                ["Use find for repository path discovery instead of bash find, ls, or shell globbing.".to_owned()],
+                "Find files and directories",
+                ["Use find for path discovery instead of shell searches.".to_owned()],
             ),
         }
     }

@@ -467,10 +467,10 @@ impl Tool for BashTool {
             }),
             },
             prompt: ToolPrompt::new(
-                "Execute commands and project operations",
+                "Run commands",
                 [
-                    "Use bash for tests, builds, git, and operations not covered by a dedicated tool.".to_owned(),
-                    "When a command must run in a subdirectory, pass it as the dir argument instead of prefixing the command with cd <dir> && ...".to_owned(),
+                    "Use bash for tests, builds, git, or when no dedicated tool applies.".to_owned(),
+                    "Use dir for commands in subdirectories instead of cd.".to_owned(),
                 ],
             ),
         }

@@ -94,8 +94,8 @@ impl Tool for ReadTool {
                 }),
             },
             prompt: ToolPrompt::new(
-                "Read file contents, optionally selecting a range of lines",
-                ["Use read to examine file contents instead of cat or sed.".to_owned()],
+                "Read files",
+                ["Prefer read to cat or sed.".to_owned()],
             ),
         }
     }
