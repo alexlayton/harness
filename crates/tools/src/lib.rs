@@ -286,15 +286,15 @@ pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog 
     let global = std::env::var_os("HARNESS_SKILLS_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".harness/skills"))
+            skills::home_dir()
+                .map(|home| home.join(".harness/skills"))
                 .unwrap_or_default()
         });
     if !global.as_os_str().is_empty() {
         roots.push((global, SkillMode::Harness));
     }
-    let agents_global = std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".agents/skills"))
+    let agents_global = skills::home_dir()
+        .map(|home| home.join(".agents/skills"))
         .unwrap_or_default();
     if !agents_global.as_os_str().is_empty() {
         roots.push((agents_global, SkillMode::Agents));

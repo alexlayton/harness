@@ -182,16 +182,16 @@ fn global_context_dir() -> Option<PathBuf> {
     {
         return Some(path);
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".harness"))
+    crate::skills::home_dir().map(|home| home.join(".harness"))
 }
 
-/// Display path with `$HOME` abbreviated to `~` where applicable, so the
-/// header shows `~/.harness/AGENTS.md` rather than an absolute home path.
+/// Display a path with the home directory abbreviated to `~` where
+/// applicable, so the header shows `~/.harness/AGENTS.md` rather than an
+/// absolute path.
 pub fn display_path(path: &Path) -> String {
     let text = path.to_string_lossy().replace('\\', "/");
-    let Some(home) = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(|home| PathBuf::from(home).to_string_lossy().replace('\\', "/"))
+    let Some(home) =
+        crate::skills::home_dir().map(|home| home.to_string_lossy().replace('\\', "/"))
     else {
         return text;
     };

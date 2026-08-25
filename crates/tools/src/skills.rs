@@ -485,10 +485,18 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Return the user's home directory on Unix and Windows.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
+
 /// Resolve a leading `~` to the user's home directory.
 pub fn expand_tilde(path: &Path) -> PathBuf {
     if let Ok(stripped) = path.strip_prefix("~")
-        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && let Some(home) = home_dir()
     {
         if stripped.as_os_str().is_empty() {
             return home;
@@ -708,7 +716,7 @@ mod tests {
 
     #[test]
     fn expand_tilde_resolves_home() {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
+        let home = home_dir().expect("test requires HOME or USERPROFILE");
         assert_eq!(
             expand_tilde(Path::new("~/.harness/skills")),
             home.join(".harness/skills")

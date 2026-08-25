@@ -801,21 +801,21 @@ mod tests {
     #[tokio::test]
     async fn dir_argument_runs_command_in_subdirectory() {
         let directory = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        let subdirectory = directory.path().join("src");
+        std::fs::create_dir_all(&subdirectory).unwrap();
         let tool = BashTool::with_workspace_root(directory.path());
         let output = tool
             .execute(
-                json!({"command": "pwd", "dir": "src"}),
+                json!({"command": "printf ran > cwd-marker", "dir": "src"}),
                 CancellationToken::new(),
             )
             .await;
         assert!(!output.is_error, "{}", output.content);
-        let expected = std::fs::canonicalize(directory.path().join("src")).unwrap();
-        assert!(
-            output
-                .content
-                .contains(&expected.to_string_lossy().into_owned())
+        assert_eq!(
+            std::fs::read_to_string(subdirectory.join("cwd-marker")).unwrap(),
+            "ran"
         );
+        assert!(!directory.path().join("cwd-marker").exists());
         assert!(output.summary.contains("(in src)"));
     }
 
