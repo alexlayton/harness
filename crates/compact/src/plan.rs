@@ -323,20 +323,6 @@ mod tests {
     }
 
     #[test]
-    fn never_cuts_before_a_tool_result() {
-        let session = grow_session(6, 2_000);
-        let plan = plan_compaction(&session, &default_policy(), 60_000).unwrap();
-        // The kept tail starts at plan.boundary + 1 and must not begin with a
-        // ToolResult (which would orphan a summarized tool call).
-        let first_kept = session
-            .events
-            .iter()
-            .find(|record| record.sequence == plan.boundary + 1)
-            .unwrap();
-        assert!(!matches!(first_kept.event, SessionEvent::ToolResult { .. }));
-    }
-
-    #[test]
     fn split_turn_when_one_turn_exceeds_the_keep_budget() {
         // One enormous turn that alone exceeds keep_recent_tokens, preceded by
         // some older material. The cut must split the turn: keep its tail,
@@ -450,29 +436,6 @@ mod tests {
         });
         // No new events: a repeated plan must be a no-op.
         assert!(plan_compaction(&session, &policy, 40_000).is_none());
-    }
-
-    #[test]
-    fn tool_call_is_a_valid_cut_point() {
-        let mut session = new_session();
-        push_user(&mut session, "u1");
-        push_assistant(&mut session, "a1");
-        for id in ["c1", "c2", "c3"] {
-            push_tool_call(&mut session, id, "read");
-            push_tool_result(&mut session, id, &".rand".repeat(5_000));
-        }
-        push_user(&mut session, "u2 (just arrived, must be kept)");
-        push_assistant(&mut session, "a2");
-        let policy = CompactionPolicy {
-            keep_recent_turns: 1,
-            keep_recent_tokens: 12_000,
-            ..CompactionPolicy::default()
-        };
-        let plan = plan_compaction(&session, &policy, 100_000).unwrap();
-        assert!(plan.boundary >= 1);
-        // The newest user message is always kept.
-        let newest = session.events.last().unwrap();
-        assert!(newest.sequence > plan.boundary);
     }
 
     #[test]

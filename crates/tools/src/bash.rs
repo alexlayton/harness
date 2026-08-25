@@ -36,13 +36,6 @@ const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// rtk documents exit 0 for a successful rewrite (exit 1 for unsupported
-/// commands) but 0.45.0 exited 3 on success.  Only versions at or above this
-/// release are trusted to follow the documented exit-code semantics; older
-/// and unrecognized versions fall back to the non-empty-stdout heuristic.
-#[cfg(test)]
-const RTK_TRUSTED_EXIT_CODE_VERSION: (u64, u64, u64) = (0, 46, 0);
-
 /// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
 /// signals support by printing the rewritten command on stdout; unsupported
 /// commands, a missing rtk binary, and timeouts all degrade to `None`, in
@@ -76,126 +69,6 @@ async fn rtk_rewrite_cancellable(
     let accepted = matches!(output.status.code(), Some(0 | 3));
     let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     (accepted && !rewritten.is_empty()).then_some(rewritten)
-}
-
-#[cfg(test)]
-async fn rtk_rewrite(command: &str) -> Option<String> {
-    rtk_rewrite_cancellable(
-        command,
-        &CancellationToken::new(),
-        tokio::time::Instant::now() + RTK_REWRITE_TIMEOUT,
-    )
-    .await
-}
-
-/// rtk's compound-command support is selective: some `cd X && cmd` shapes
-/// pass through untouched even though the trailing command alone has an rtk
-/// equivalent.  When the whole command was not rewritten, split top-level
-/// `&&`/`;` groups and rewrite each operand individually, keeping unchanged
-/// operands verbatim.  Returns `None` when nothing was rewritten or the
-/// command is not safely splittable.
-#[cfg(test)]
-async fn rtk_rewrite_compound(command: &str) -> Option<String> {
-    let parts = split_compound(command)?;
-    let mut rewritten_any = false;
-    let mut output = String::with_capacity(command.len());
-    for (index, part) in parts.iter().enumerate() {
-        if index % 2 == 0 {
-            match rtk_rewrite(part).await {
-                Some(rewritten) => {
-                    output.push_str(&rewritten);
-                    rewritten_any = true;
-                }
-                None => output.push_str(part),
-            }
-        } else {
-            // Normalize the separator so spacing stays readable after operands
-            // were rewritten to different lengths.
-            output.push_str(match *part {
-                "&&" => " && ",
-                ";" => " ; ",
-                other => other,
-            });
-        }
-    }
-    rewritten_any.then_some(output)
-}
-
-/// Split a shell command on top-level `&&` / `;` separators into alternating
-/// operands and separators.  Splitting respects single/double quotes and
-/// backslash escapes, trims operands, and refuses commands whose structure a
-/// naive split would change: pipes, subshells, heredocs, command substitution,
-/// brace groups, or control-flow keywords.
-#[cfg(test)]
-fn split_compound(command: &str) -> Option<Vec<&str>> {
-    let bytes = command.as_bytes();
-    let mut parts: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut saw_separator = false;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'\\' => {
-                escaped = true;
-                index += 1;
-                continue;
-            }
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'`' => return None,
-            b'$' if bytes.get(index + 1) == Some(&b'(') => return None,
-            b'<' if matches!(bytes.get(index + 1), Some(b'<') | Some(b'(')) => return None,
-            b'|' | b'(' if !in_single && !in_double => return None,
-            b'{' if !in_single && !in_double && bytes.get(index.wrapping_sub(1)) != Some(&b'$') => {
-                return None;
-            }
-            b'&' | b';' if !in_single && !in_double => {
-                let separator_len = match (byte, bytes.get(index + 1)) {
-                    (b'&', Some(b'&')) => 2,
-                    (b';', _) => 1,
-                    _ => 0,
-                };
-                if separator_len > 0 {
-                    parts.push(command[start..index].trim());
-                    parts.push(&command[index..index + separator_len]);
-                    start = index + separator_len;
-                    saw_separator = true;
-                    index += separator_len;
-                    continue;
-                }
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if !saw_separator {
-        return None;
-    }
-    let tail = command[start..].trim();
-    if tail.is_empty() {
-        return None;
-    }
-    parts.push(tail);
-    if parts.iter().any(|part| part.is_empty()) {
-        return None;
-    }
-    if parts
-        .iter()
-        .step_by(2)
-        .any(|part| has_control_keyword(part))
-    {
-        return None;
-    }
-    Some(parts)
 }
 
 /// True when a shell operand contains a control-flow keyword as a word, which
@@ -575,48 +448,6 @@ async fn resolve_workspace_dir(root: &Path, dir: &str) -> Result<PathBuf, String
     Ok(candidate)
 }
 
-#[cfg(test)]
-fn rtk_exit_codes_trustworthy_for(version: (u64, u64, u64)) -> bool {
-    version >= RTK_TRUSTED_EXIT_CODE_VERSION
-}
-
-/// Extract the first `major.minor.patch` triplet from `rtk --version` output
-/// (e.g. `rtk 0.45.0` or `0.46.0-beta.1`), tolerating suffixes and arbitrary
-/// surrounding text.
-#[cfg(test)]
-fn parse_rtk_version(value: &str) -> Option<(u64, u64, u64)> {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        while index < bytes.len() && !bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if start == index {
-            return None;
-        }
-        let mut parts = value[start..].splitn(3, '.');
-        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let (Ok(major), Ok(minor)) = (major.parse::<u64>(), minor.parse::<u64>()) else {
-            continue;
-        };
-        let patch = parts
-            .next()
-            .and_then(|part| {
-                let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-                digits.parse::<u64>().ok()
-            })
-            .unwrap_or(0);
-        return Some((major, minor, patch));
-    }
-    None
-}
-
 #[async_trait]
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
@@ -953,30 +784,6 @@ mod tests {
         assert!(!output.contains("\n0\n"));
     }
 
-    #[test]
-    fn parses_rtk_version_strings() {
-        assert_eq!(parse_rtk_version("rtk 0.45.0"), Some((0, 45, 0)));
-        assert_eq!(parse_rtk_version("0.46.0"), Some((0, 46, 0)));
-        assert_eq!(
-            parse_rtk_version("rtk 0.45.0 (abcdef1234)"),
-            Some((0, 45, 0))
-        );
-        assert_eq!(parse_rtk_version("rtk 0.45.0-beta.1"), Some((0, 45, 0)));
-        assert_eq!(parse_rtk_version("1.2"), Some((1, 2, 0)));
-        assert_eq!(parse_rtk_version("rtk version unknown"), None);
-        assert_eq!(parse_rtk_version(""), None);
-    }
-
-    #[test]
-    fn rtk_exit_code_trust_threshold_isolates_buggy_releases() {
-        // 0.45.x exits 3 on success despite documenting 0; only 0.46.0+ is
-        // trusted to follow the documented exit-code semantics.
-        assert!(rtk_exit_codes_trustworthy_for((0, 46, 0)));
-        assert!(rtk_exit_codes_trustworthy_for((1, 0, 0)));
-        assert!(!rtk_exit_codes_trustworthy_for((0, 45, 0)));
-        assert!(!rtk_exit_codes_trustworthy_for((0, 45, 9)));
-    }
-
     /// rtk is an optional external binary; tests that need it skip silently
     /// when it is not installed.
     async fn rtk_available() -> bool {
@@ -989,63 +796,6 @@ mod tests {
             .await
             .map(|status| status.success())
             .unwrap_or(false)
-    }
-
-    #[tokio::test]
-    async fn rtk_rewrite_rewrites_supported_commands_only() {
-        if !rtk_available().await {
-            return;
-        }
-        assert_eq!(
-            rtk_rewrite("git status").await.as_deref(),
-            Some("rtk git status")
-        );
-        assert_eq!(rtk_rewrite("echo hi").await, None);
-    }
-
-    #[tokio::test]
-    async fn compound_rewrite_rewrites_each_operand() {
-        if !rtk_available().await {
-            return;
-        }
-        // The trailing `git status` is rewritten even when a whole-command
-        // rewrite would have missed the compound.
-        assert_eq!(
-            rtk_rewrite_compound("cd subdir && git status")
-                .await
-                .as_deref(),
-            Some("cd subdir && rtk git status")
-        );
-        // Nothing supported anywhere: pass through unchanged.
-        assert_eq!(rtk_rewrite_compound("cd a/b/c && npm test").await, None);
-    }
-
-    #[test]
-    fn splits_compound_commands_safely() {
-        assert_eq!(
-            split_compound("cd src && cargo build").unwrap(),
-            vec!["cd src", "&&", "cargo build"]
-        );
-        assert_eq!(
-            split_compound("cd src && cargo build && cargo test").unwrap(),
-            vec!["cd src", "&&", "cargo build", "&&", "cargo test"]
-        );
-        assert_eq!(
-            split_compound("cd \"a b\" && echo hi").unwrap(),
-            vec!["cd \"a b\"", "&&", "echo hi"]
-        );
-        assert_eq!(
-            split_compound("cmd1 ; cmd2").unwrap(),
-            vec!["cmd1", ";", "cmd2"]
-        );
-        // Single commands and unsafe constructs are left alone.
-        assert_eq!(split_compound("cargo build"), None);
-        assert_eq!(split_compound("if true; then echo hi; fi"), None);
-        assert_eq!(split_compound("echo $(date) && x"), None);
-        assert_eq!(split_compound("grep foo file | wc -l"), None);
-        assert_eq!(split_compound("cat <<EOF && x\nEOF"), None);
-        assert_eq!(split_compound("{ a && b; }"), None);
-        assert_eq!(split_compound("cmd1 &&"), None);
     }
 
     #[tokio::test]

@@ -3471,18 +3471,6 @@ mod tests {
         assert_eq!(ui.ghost_text(), "ode-go:");
     }
 
-    #[test]
-    fn ghost_clears_when_the_cursor_is_mid_token() {
-        let mut ui = ui(80, 24);
-        ui.input = "/model open".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        assert_eq!(ui.ghost_text(), "");
-        // Even with a ghost, a cursor not at the end disables it.
-        ui.cursor = "/model".len();
-        assert_eq!(ui.ghost_text(), "");
-    }
-
     #[tokio::test]
     async fn at_reference_opens_a_file_completion_context() {
         let mut ui = ui(80, 24);

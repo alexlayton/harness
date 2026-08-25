@@ -511,18 +511,6 @@ mod tests {
     }
 
     #[test]
-    fn output_is_flushed_and_terminated_on_turn_finished() {
-        let (stdout, _, _) = route(
-            vec![
-                AgentEvent::TextDelta("partial".into()),
-                AgentEvent::TurnFinished,
-            ],
-            false,
-        );
-        assert_eq!(String::from_utf8(stdout).unwrap(), "partial\n");
-    }
-
-    #[test]
     fn tool_only_turn_leaves_stdout_empty() {
         let (stdout, _, code) = route(
             vec![

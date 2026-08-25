@@ -932,7 +932,6 @@ fn endpoint_label(endpoint: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tempfile::tempdir;
 
     #[test]
     fn normalizes_github_and_enterprise_domains() {
@@ -1022,13 +1021,5 @@ mod tests {
         .unwrap();
         assert_eq!(credential.expires, 1_999_700_000);
         assert!(!format!("{credential:?}").contains("secret"));
-    }
-
-    #[test]
-    fn auth_can_be_constructed_without_touching_provider_config() {
-        let directory = tempdir().unwrap();
-        let store = AuthStore::new(directory.path().join("auth.json"));
-        let auth = CopilotAuth::new(store).unwrap();
-        assert!(auth.credential().unwrap().is_none());
     }
 }

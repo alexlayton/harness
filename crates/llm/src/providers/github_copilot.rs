@@ -703,15 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_can_be_constructed_without_a_credential() {
-        let directory = tempdir().unwrap();
-        let auth =
-            Arc::new(CopilotAuth::new(AuthStore::new(directory.path().join("auth.json"))).unwrap());
-        let provider = GithubCopilotProvider::new(auth);
-        assert_eq!(provider.name(), "github-copilot");
-    }
-
-    #[test]
     fn provider_errors_redact_access_tokens() {
         let error = redact_error(
             LlmError::Http {

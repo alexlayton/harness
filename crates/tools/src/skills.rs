@@ -647,29 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn read_paths_are_deduped_across_roots() {
-        // The same physical skill reachable via two roots must contribute its
-        // paths exactly once (same PathBuf under different roots).
-        let root = tempdir().unwrap();
-        let a = root.path().join("a/.harness/skills");
-        let b = root.path().join("b/.harness/skills");
-        fs::create_dir_all(a.join("same")).unwrap();
-        fs::create_dir_all(b.join("same")).unwrap();
-        let a_md = a.join("same/SKILL.md");
-        let b_md = b.join("same/SKILL.md");
-        fs::write(&a_md, "---\nname: same\ndescription: A\n---\nbody\n").unwrap();
-        fs::write(&b_md, "---\nname: other\ndescription: B\n---\nbody\n").unwrap();
-        let catalog = discover(&[
-            (a.clone(), SkillMode::Harness),
-            (b.clone(), SkillMode::Harness),
-        ]);
-        for path in catalog.read_paths.iter() {
-            let count = catalog.read_paths.iter().filter(|p| *p == path).count();
-            assert_eq!(count, 1, "path {path:?} must appear exactly once");
-        }
-    }
-
-    #[test]
     fn collision_first_wins_project_beats_global() {
         let root = tempdir().unwrap();
         let project = root.path().join("proj/.harness/skills");

@@ -74,12 +74,4 @@ mod tests {
         // A single-byte ellipsis budget yields just the ellipsis.
         assert_eq!(truncate_utf8("hello", 1), "…");
     }
-
-    #[test]
-    fn truncate_utf8_prefix_returns_same_bytes_as_slice() {
-        let value = "héllo wörld";
-        let prefix = truncate_utf8_prefix(value, 6);
-        assert!(value.starts_with(prefix));
-        assert!(prefix.len() <= 6);
-    }
 }

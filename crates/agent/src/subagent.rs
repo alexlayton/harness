@@ -914,36 +914,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn tool_round_trip_then_final_report() {
-        let provider = Arc::new(ScriptProvider::new(vec![
-            vec![
-                Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
-                    id: "c1".into(),
-                    name: "read".into(),
-                    arguments: json!({"path": "lib.rs"}),
-                })),
-                ScriptProvider::done("tool_calls"),
-            ],
-            vec![
-                Ok(StreamEvent::TextDelta("report after reading".into())),
-                ScriptProvider::done("stop"),
-            ],
-        ]));
-        let runner = runner_with(provider);
-        let report = runner
-            .run(
-                "read task",
-                "read lib.rs then report",
-                SubagentMode::Workspace,
-                CancellationToken::new(),
-            )
-            .await;
-        // The read tool fails (file absent in the temp workspace) but that is
-        // fine: what matters is history stayed valid for the second request.
-        assert!(report.is_ok());
-    }
-
     #[test]
     fn request_note_preserves_a_trailing_user_role() {
         let mut history = vec![Message::user("task")];

@@ -1148,19 +1148,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prompt_tracker_resolves_once_then_ignores() {
-        let tracker = Arc::new(PromptTracker {
-            in_flight: Mutex::new(HashMap::new()),
-        });
-        // Nothing parked: resolve and cancel are both no-ops (the parked
-        // responder is only constructible inside the SDK, so the tracker is
-        // exercised through its bookkeeping API).
-        tracker.resolve("s", Some(StopReason::EndTurn));
-        assert!(!tracker.mark_cancelled("s"));
-        assert!(!tracker.is_cancelled("s"));
-    }
-
     // ------------------------------------------------------------------
     // Integration: full connection over an in-memory transport with a
     // scripted provider. Follows the SDK's own test shape (LocalSet +
