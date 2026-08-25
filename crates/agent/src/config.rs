@@ -354,7 +354,7 @@ pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> 
 }
 
 #[derive(Clone, Debug, Default, Parser)]
-#[command(name = "harness", about = "A minimal coding-agent harness")]
+#[command(name = "harness", version, about = "A minimal coding-agent harness")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,

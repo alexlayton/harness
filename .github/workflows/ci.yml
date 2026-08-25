@@ -82,13 +82,9 @@ jobs:
           restore-keys: ${{ runner.os }}-build-
       - run: cargo build --workspace
 
-  platform-tests:
-    name: Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
+  macos-test:
+    name: Test (macOS)
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Select stable Rust

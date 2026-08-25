@@ -16,6 +16,12 @@ The editor sends `session/new`, `session/load`, `session/prompt`, and
 usage, and tool-call updates. Sessions are scoped to the workspace that the
 editor opens.
 
+> [!NOTE]
+> `session/load` restores the saved history for the agent, but Harness does not
+> replay the old transcript into the editor. The editor shows an empty
+> transcript until the next turn. The restored history still supplies context
+> to the model.
+
 ACP `session/new` and `session/load` can supply stdio MCP servers for that
 session. Session declarations replace the MCP servers in local configuration;
 they do not merge with them. Harness rejects HTTP, SSE, and MCP-over-ACP
