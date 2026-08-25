@@ -30,8 +30,8 @@ use crate::agent::plan_tool_batches;
 use crate::config::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
 use crate::tools::{
-    SubagentMode, SubagentRunner, ToolConfig, ToolRegistry, call_summary, default_registry,
-    read_only_registry,
+    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry, call_summary,
+    default_registry_with_index, read_only_registry_with_index,
 };
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -82,6 +82,7 @@ struct SubagentModelState {
 pub struct SubagentRunnerImpl {
     model_state: RwLock<SubagentModelState>,
     workspace_root: PathBuf,
+    search_index: Arc<FileSearchIndex>,
     rtk: bool,
     project_context: String,
     /// Resolved delegation bounds (`max_turns`; `0` disables subagents).
@@ -129,12 +130,18 @@ impl SubagentRunnerImpl {
         store: Option<SessionStore>,
         parent_session_id: Option<session::SessionId>,
     ) -> Self {
+        let workspace_root = workspace_root.into();
+        let search_index = Arc::new(
+            FileSearchIndex::new(&workspace_root)
+                .expect("subagent workspace was already validated by assembly"),
+        );
         Self {
             model_state: RwLock::new(SubagentModelState {
                 provider,
                 model: model.into(),
             }),
-            workspace_root: workspace_root.into(),
+            workspace_root,
+            search_index,
             rtk,
             project_context: project_context.into(),
             config,
@@ -144,6 +151,13 @@ impl SubagentRunnerImpl {
             #[cfg(test)]
             test_registry_builds: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Replace the compatibility constructor's index with the assembly-owned
+    /// parent index before the runner can be shared or used.
+    pub fn with_file_search_index(mut self, index: Arc<FileSearchIndex>) -> Self {
+        self.search_index = index;
+        self
     }
 
     /// Retarget future child runs after the parent switched provider/model.
@@ -177,6 +191,7 @@ impl SubagentRunnerImpl {
         let cache = &self.child_registries[registry_slot(mode)];
         let workspace_root = self.workspace_root.clone();
         let rtk = self.rtk;
+        let search_index = self.search_index.clone();
         #[cfg(test)]
         let builds = &self.test_registry_builds;
         let built = cache.get_or_init(move || {
@@ -184,8 +199,13 @@ impl SubagentRunnerImpl {
             #[cfg(test)]
             builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let result = match mode {
-                SubagentMode::Workspace => default_registry(ToolConfig::new(&workspace_root, rtk)),
-                SubagentMode::ReadOnly => read_only_registry(ToolConfig::new(&workspace_root, rtk)),
+                SubagentMode::Workspace => {
+                    default_registry_with_index(ToolConfig::new(&workspace_root, rtk), search_index)
+                }
+                SubagentMode::ReadOnly => read_only_registry_with_index(
+                    ToolConfig::new(&workspace_root, rtk),
+                    search_index,
+                ),
             };
             result
                 .map(Arc::new)
@@ -406,17 +426,17 @@ impl SubagentRunnerImpl {
             };
 
             let mut text = String::new();
+            let mut opaque = Vec::<(String, serde_json::Value)>::new();
             let mut tool_calls = Vec::<llm::ToolCall>::new();
             let mut stream_error = None;
             loop {
                 tokio::select! {
                     next = stream.next() => match next {
                         Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
-                        // Child sessions currently persist displayable output;
-                        // opaque provider state is ignored until the child is
-                        // promoted into parent context.
-                        Some(Ok(StreamEvent::ReasoningDelta(_)))
-                        | Some(Ok(StreamEvent::OpaqueState { .. })) => {}
+                        Some(Ok(StreamEvent::ReasoningDelta(_))) => {}
+                        Some(Ok(StreamEvent::OpaqueState { provider, data })) => {
+                            opaque.push((provider, data));
+                        }
                         Some(Ok(StreamEvent::ToolCallComplete(call))) => tool_calls.push(call),
                         // Child usage lands in the child session only, so
                         // parent totals never double-count delegated work.
@@ -440,8 +460,8 @@ impl SubagentRunnerImpl {
                 }
             }
 
-            append_assistant(history, &text, tool_calls.clone());
-            for event in assistant_events(&text, &tool_calls) {
+            append_assistant(history, &text, &opaque, tool_calls.clone());
+            for event in assistant_events(&text, &opaque, &tool_calls) {
                 Self::persist(&self.store, session, event);
             }
 
@@ -653,15 +673,24 @@ fn push_request_note(history: &mut Vec<Message>, note: &str) {
     }
 }
 
-/// Append an assistant message (text plus any tool calls) to history.
-fn append_assistant(history: &mut Vec<Message>, text: &str, calls: Vec<llm::ToolCall>) {
-    if text.is_empty() && calls.is_empty() {
+/// Append an assistant message and provider continuation state to history.
+fn append_assistant(
+    history: &mut Vec<Message>,
+    text: &str,
+    opaque: &[(String, serde_json::Value)],
+    calls: Vec<llm::ToolCall>,
+) {
+    if text.is_empty() && opaque.is_empty() && calls.is_empty() {
         return;
     }
     let mut content = Vec::new();
     if !text.is_empty() {
         content.push(Content::Text(text.to_owned()));
     }
+    content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
+        provider: provider.clone(),
+        data: data.clone(),
+    }));
     content.extend(calls.into_iter().map(Content::ToolCall));
     history.push(Message {
         role: Role::Assistant,
@@ -676,13 +705,23 @@ fn append_assistant(history: &mut Vec<Message>, text: &str, calls: Vec<llm::Tool
 /// Putting calls in both places used to make session validation reject the
 /// duplicate, leaving exports with orphaned tool results. A response that
 /// contains only tool calls emits no message event at all.
-fn assistant_events(text: &str, calls: &[llm::ToolCall]) -> Vec<session::SessionEvent> {
+fn assistant_events(
+    text: &str,
+    opaque: &[(String, serde_json::Value)],
+    calls: &[llm::ToolCall],
+) -> Vec<session::SessionEvent> {
     let mut events = Vec::new();
-    if !text.is_empty() {
+    if !text.is_empty() || !opaque.is_empty() {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(Content::Text(text.to_owned()));
+        }
+        content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
+            provider: provider.clone(),
+            data: data.clone(),
+        }));
         events.push(session::SessionEvent::AssistantMessage {
-            message: session::StoredMessage::from_llm(&Message::assistant(vec![Content::Text(
-                text.to_owned(),
-            )])),
+            message: session::StoredMessage::from_llm(&Message::assistant(content)),
         });
     }
     events.extend(calls.iter().map(|call| session::SessionEvent::ToolCall {

@@ -1,4 +1,4 @@
-use super::file_mutation::with_file_mutation_lock;
+use super::file_mutation::{atomic_write, with_file_mutation_lock};
 use super::{
     Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
 };
@@ -72,12 +72,18 @@ impl Tool for WriteTool {
             };
         let summary = format!("write {path}");
         let Some(result) = with_file_mutation_lock(&full_path, &cancel, || async {
+            if cancel.is_cancelled() {
+                return Err("cancelled".to_owned());
+            }
             if let Some(parent) = full_path.parent()
                 && let Err(io_error) = fs::create_dir_all(parent).await
             {
                 return Err(format!("cannot create parent directory: {io_error}"));
             }
-            fs::write(&full_path, content.as_bytes())
+            if cancel.is_cancelled() {
+                return Err("cancelled".to_owned());
+            }
+            atomic_write(&full_path, content.as_bytes(), &cancel)
                 .await
                 .map_err(|io_error| format!("cannot write {path}: {io_error}"))
         })

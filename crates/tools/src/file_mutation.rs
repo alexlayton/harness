@@ -98,7 +98,10 @@ pub async fn atomic_write(
     let (temporary_path, mut temporary_file) = create_temporary_file(parent).await?;
 
     let result = async {
-        temporary_file.write_all(contents).await?;
+        for chunk in contents.chunks(64 * 1024) {
+            check_cancelled(cancel)?;
+            temporary_file.write_all(chunk).await?;
+        }
         temporary_file.sync_all().await?;
         drop(temporary_file);
 
@@ -107,7 +110,12 @@ pub async fn atomic_write(
             fs::set_permissions(&temporary_path, permissions).await?;
         }
         check_cancelled(cancel)?;
-        fs::rename(&temporary_path, path).await
+        fs::rename(&temporary_path, path).await?;
+        // Persist the directory entry as well as the file contents so a
+        // successful atomic write survives a crash after rename.
+        #[cfg(unix)]
+        fs::File::open(parent).await?.sync_all().await?;
+        Ok(())
     }
     .await;
 

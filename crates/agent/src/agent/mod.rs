@@ -151,6 +151,7 @@ impl Agent {
 
     /// Attach a compaction policy (resolved from `config.toml`).
     pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
+        self.context_window = policy.resolved_window(0);
         self.compaction = policy;
         self
     }
@@ -203,11 +204,37 @@ impl Agent {
             send(&events, usage_event(&session.session.metadata.usage));
         }
 
-        // Resolve the provider context window before the first turn so the
-        // pre-turn trigger has a baseline. Kept after the initial session
-        // events so the UI is not blocked on a model-list fetch; failed
-        // fetches fall back to the config override / conservative default.
-        self.refresh_context_window().await;
+        // Tests and embedded callers may update the policy directly instead
+        // of using the builder; establish the conservative/configured value
+        // synchronously, without provider I/O.
+        if self.context_window == 0 {
+            self.context_window = self.compaction.resolved_window(0);
+        }
+        // Begin model discovery without placing it on the first-turn critical
+        // path. The conservative/configured window is already installed; a
+        // bounded late result only affects future turns.
+        let (context_tx, mut context_rx) = mpsc::channel(1);
+        let mut metadata_pending = self.compaction.context_window == 0;
+        if metadata_pending {
+            let provider = self.provider.clone();
+            let model = self.model.clone();
+            let shutdown = self.cancel.clone();
+            tokio::spawn(async move {
+                let discovered = tokio::select! {
+                    result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        provider.list_models(),
+                    ) => result.ok().and_then(Result::ok).and_then(|models| {
+                        models.into_iter().find(|candidate| {
+                            candidate.id == model
+                                || candidate.name.as_deref() == Some(model.as_str())
+                        }).and_then(|candidate| candidate.context_length)
+                    }),
+                    _ = shutdown.cancelled() => None,
+                };
+                let _ = context_tx.send(discovered).await;
+            });
+        }
 
         loop {
             let next_message = if let Some(message) = self.queued.pop_front() {
@@ -222,6 +249,13 @@ impl Agent {
                         }
                         message
                     }
+                    reported = context_rx.recv(), if metadata_pending => {
+                        metadata_pending = false;
+                        if let Some(Some(window)) = reported {
+                            self.context_window = self.compaction.resolved_window(window);
+                        }
+                        continue;
+                    }
                     _ = self.cancel.cancelled() => None,
                 }
             };
@@ -230,7 +264,9 @@ impl Agent {
             };
             match message {
                 InputMessage::Message(text) if !text.trim().is_empty() => {
-                    let turn_cancel = CancellationToken::new();
+                    // A turn is independently interruptible, but application shutdown must
+                    // propagate through the same token to tools and compaction work.
+                    let turn_cancel = self.cancel.child_token();
                     let result = self.run_turn(text, &events, &mut input, &turn_cancel).await;
                     // Turn-boundary durable flush: with deferred sync enabled
                     // the events of this turn were written+flushed but not
@@ -241,7 +277,14 @@ impl Agent {
                         Err(TurnError::Shutdown) => break,
                         // Persistence errors are emitted at their source; the
                         // outer boundary owns the single terminal event.
-                        Err(TurnError::Persist(_)) => send(&events, AgentEvent::TurnFinished),
+                        Err(TurnError::Persist(_)) => {
+                            send(&events, AgentEvent::TurnFinished);
+                            // Live state may include an executed side effect whose
+                            // durable result could not be appended. Quarantine this
+                            // agent instance rather than sending divergent history
+                            // on a later queued turn.
+                            break;
+                        }
                         Ok(()) => {}
                     }
                 }
@@ -997,7 +1040,9 @@ mod tests {
                     is_error,
                     content,
                     ..
-                } if content == "cancelled" => Some((tool_call_id, is_error)),
+                } if content == "cancelled; execution status unknown" => {
+                    Some((tool_call_id, is_error))
+                }
                 _ => None,
             })
             .collect();

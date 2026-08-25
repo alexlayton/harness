@@ -51,13 +51,30 @@ impl Agent {
     /// Estimate context tokens directly from `self.history` (no durable
     /// session / no provider usage yet).
     pub(crate) fn estimate_history_tokens(&self) -> u64 {
-        let mut bytes = 0usize;
+        let snapshot = self.tools.snapshot();
+        let system = crate::prompt::system_prompt_with_workspace_context(
+            &self.tools.workspace_root().display().to_string(),
+            &snapshot.prompt_context,
+            self.tools.skills(),
+            &self.project_context,
+        );
+        let definition_bytes = snapshot
+            .definitions
+            .iter()
+            .fold(0usize, |total, definition| {
+                total
+                    .saturating_add(definition.name.len())
+                    .saturating_add(definition.description.len())
+                    .saturating_add(definition.parameters.to_string().len())
+            });
+        let mut bytes = system.len().saturating_add(definition_bytes);
         for message in &self.history {
             for content in &message.content {
                 match content {
-                    Content::Text(text) | Content::Reasoning(text) => {
-                        bytes = bytes.saturating_add(text.len())
-                    }
+                    Content::Text(text) => bytes = bytes.saturating_add(text.len()),
+                    // Neutral reasoning deltas are display-only and provider
+                    // dialects do not resend them as conversation context.
+                    Content::Reasoning(_) => {}
                     Content::ToolResult { content, .. } => {
                         bytes = bytes.saturating_add(content.len())
                     }

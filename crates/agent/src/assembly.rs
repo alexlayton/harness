@@ -114,8 +114,9 @@ impl AgentBuilder {
             Some(runtime)
         };
         let parent_session = self.session.as_ref().map(|(_, session)| session.id());
+        let search_index = self.tools.file_search_index().cloned();
         let runner = if self.subagents.max_turns > 0 {
-            let runner = Arc::new(SubagentRunnerImpl::new(
+            let mut runner = SubagentRunnerImpl::new(
                 self.provider.clone(),
                 self.model.clone(),
                 self.tools.workspace_root().to_path_buf(),
@@ -124,7 +125,11 @@ impl AgentBuilder {
                 self.subagents,
                 self.session.as_ref().map(|(store, _)| store.clone()),
                 parent_session,
-            ));
+            );
+            if let Some(index) = search_index {
+                runner = runner.with_file_search_index(index);
+            }
+            let runner = Arc::new(runner);
             self.tools
                 .register_subagent(runner.clone())
                 .context("register subagent tool")?;

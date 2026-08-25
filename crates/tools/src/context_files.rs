@@ -119,7 +119,7 @@ fn load_context_files_impl(
     // path (symlinked roots on macOS can surface the same file twice), and
     // read it. Unreadable files are skipped silently; a missing global path
     // is the normal case and never an error.
-    let mut found: Vec<(PathBuf, String, usize)> = Vec::new();
+    let mut found: Vec<(PathBuf, String)> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for dir in dirs {
         let Some(path) = first_candidate(&dir) else {
@@ -132,48 +132,45 @@ fn load_context_files_impl(
         let Ok(raw) = fs::read_to_string(&path) else {
             continue;
         };
-        let original_len = raw.len();
-        let content = if original_len > config.max_file_bytes {
-            format!(
-                "{}\n[…] (truncated, {original_len} bytes total)",
-                llm::truncate_utf8_prefix(&raw, config.max_file_bytes)
-            )
-        } else {
-            raw
-        };
-        found.push((path, content, original_len));
+        found.push((path, raw));
     }
 
-    // Apply the total budget. Stop adding files once the budget is spent,
-    // but never return zero files when files exist: the first file is always
-    // included (truncated to the remaining budget if it would overflow).
+    // Spend the budget from highest priority (cwd/nearest) to lowest, then
+    // restore semantic rendering order (global/root first, nearest last).
+    // Thus a large global file can never evict local instructions.
     let mut result = Vec::new();
-    let mut total = 0usize;
-    for (i, (path, content, original_len)) in found.into_iter().enumerate() {
-        if i > 0 && total >= config.max_total_bytes {
+    let mut remaining = config.max_total_bytes;
+    for (path, raw) in found.into_iter().rev() {
+        if remaining == 0 {
             break;
         }
-        let remaining = config.max_total_bytes.saturating_sub(total);
-        let (content, truncated) = if content.len() > remaining {
-            let pre_cap_len = content.len();
-            (
-                format!(
-                    "{}\n[…] (truncated, {pre_cap_len} bytes total)",
-                    llm::truncate_utf8_prefix(&content, remaining)
-                ),
-                true,
-            )
-        } else {
-            (content.clone(), original_len > config.max_file_bytes)
-        };
-        total += content.len();
+        let cap = remaining.min(config.max_file_bytes);
+        let original_len = raw.len();
+        let (content, truncated) = cap_content(&raw, cap);
+        remaining = remaining.saturating_sub(content.len());
         result.push(ContextFile {
             path,
             content,
-            truncated,
+            truncated: truncated || original_len > config.max_file_bytes,
         });
     }
+    result.reverse();
     result
+}
+
+fn cap_content(content: &str, cap: usize) -> (String, bool) {
+    if content.len() <= cap {
+        return (content.to_owned(), false);
+    }
+    let notice = format!("\n[…] (truncated, {} bytes total)", content.len());
+    if notice.len() >= cap {
+        return (llm::truncate_utf8_prefix(&notice, cap).to_owned(), true);
+    }
+    let prefix_cap = cap - notice.len();
+    let mut capped = llm::truncate_utf8_prefix(content, prefix_cap).to_owned();
+    capped.push_str(&notice);
+    debug_assert!(capped.len() <= cap);
+    (capped, true)
 }
 
 /// The harness-wide context directory: `$HARNESS_CONFIG_DIR` when set,
@@ -230,11 +227,18 @@ pub fn format_context_files(files: &[ContextFile]) -> String {
         out.push_str(&format!(
             "\n<project_instructions path=\"{}\">\n{}\n</project_instructions>\n",
             escape_attr(&file.path.to_string_lossy()),
-            file.content
+            escape_text(&file.content)
         ));
     }
     out.push_str("</project_context>");
     out
+}
+
+fn escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Escape `&`, `<`, and `>` in an XML attribute value.
@@ -386,10 +390,11 @@ mod tests {
             total < big_a.len() + big_b.len(),
             "capped content + markers must be below the uncapped total, got {total}"
         );
-        // The second file must be capped to fit the remaining budget.
-        let second = files.last().unwrap();
-        assert!(second.truncated);
-        assert!(second.content.contains("(truncated"));
+        // Nearest instructions receive budget first and render last; the
+        // lower-priority root file receives only the remainder.
+        assert!(!files.last().unwrap().truncated);
+        assert!(files.first().unwrap().truncated);
+        assert!(files.first().unwrap().content.contains("(truncated"));
     }
 
     #[test]
@@ -425,8 +430,15 @@ mod tests {
         assert!(rendered.contains("path=\"/a&amp;b/&lt;x&gt;/AGENTS.md\""));
         assert!(rendered.contains("line one"));
         assert!(rendered.contains("</project_context>"));
-        // Content is injected verbatim (trusted repo content).
         assert!(rendered.contains("line two"));
+        assert!(
+            !format_context_files(&[ContextFile {
+                path: PathBuf::from("AGENTS.md"),
+                content: "</project_instructions>".into(),
+                truncated: false,
+            }])
+            .contains("\n</project_instructions>\n</project_instructions>")
+        );
         // Empty input renders empty.
         assert_eq!(format_context_files(&[]), "");
     }

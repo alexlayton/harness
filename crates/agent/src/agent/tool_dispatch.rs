@@ -1,5 +1,6 @@
 use super::{Agent, AgentEvent, TurnError, send};
 use crate::tools::{Concurrency, ToolOutput, ToolRegistry, call_summary};
+use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use llm::{Content, Message, Role, ToolCall};
 use std::future::Future;
@@ -157,6 +158,7 @@ impl Agent {
             let mut slots: Vec<Option<(ToolOutput, Instant)>> =
                 (0..batch.calls.len()).map(|_| None).collect();
             let mut finished = 0usize;
+            let mut drain_before_cancel = false;
             loop {
                 tokio::select! {
                     item = futures.next() => match item {
@@ -190,11 +192,9 @@ impl Agent {
                     },
                     message = input.recv(), if self.input_open => match message {
                         Some(InputMessage::Interrupt) => {
-                            batch_cancel.cancel();
-                            // Drop the in-flight futures (cancelling them)
-                            // and let unfilled slots synthesize "cancelled"
-                            // results below, mirroring the historical
-                            // single-call interrupt behavior.
+                            // First harvest completions that won the race; only
+                            // then signal cancellation to unresolved calls.
+                            drain_before_cancel = true;
                             break;
                         }
                         Some(message) => self.queued.push_back(message),
@@ -205,6 +205,18 @@ impl Agent {
                         break;
                     }
                 }
+            }
+            // An explicit interrupt can race a mutating call's final ready
+            // result. Drain only completions available before broadcasting
+            // cancellation; application shutdown has already cancelled the
+            // parent token, so polling cancellation-aware tools there would
+            // run their cancelled branch rather than harvest prior work.
+            if drain_before_cancel {
+                while let Some(Some((index, result, started))) = futures.next().now_or_never() {
+                    send_finished(events, &batch.calls[index], &result, started);
+                    slots[index] = Some((result, started));
+                }
+                batch_cancel.cancel();
             }
             drop(futures);
 
@@ -235,12 +247,15 @@ impl Agent {
                                 Instant::now()
                             }
                         };
-                        // Synthesize the same "cancelled" tool result the
-                        // serial path produced, so provider history stays
-                        // valid across the refactor.
+                        let cancellation =
+                            if starts[index].is_some() && batch.class != Concurrency::ReadOnly {
+                                "cancelled; execution status unknown"
+                            } else {
+                                "cancelled"
+                            };
                         (
                             ToolOutput {
-                                content: "cancelled".to_owned(),
+                                content: cancellation.to_owned(),
                                 is_error: true,
                                 summary: call_summary(&call.name, &call.arguments),
                             },
@@ -260,10 +275,11 @@ impl Agent {
                             ok: false,
                             duration_ms: started.elapsed().as_millis() as u64,
                             output: String::new(),
-                            error: Some("cancelled".to_owned()),
+                            error: Some(result.content.clone()),
                         },
                     );
                 }
+                self.persist_tool_result(call, &result.content, result.is_error, events)?;
                 self.history.push(Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
@@ -272,7 +288,6 @@ impl Agent {
                         is_error: result.is_error,
                     }],
                 });
-                self.persist_tool_result(call, &result.content, result.is_error, events)?;
             }
             if cancelled {
                 self.persist_cancelled("tool execution interrupted", events);

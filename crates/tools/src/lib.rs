@@ -4,6 +4,7 @@ mod edit;
 pub mod file_mutation;
 mod find;
 mod grep;
+mod multigrep;
 mod read;
 mod registry;
 pub mod skills;
@@ -17,6 +18,7 @@ pub use context_files::{
 pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;
+pub use multigrep::MultiGrepTool;
 pub use read::ReadTool;
 pub use registry::{
     ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError, ToolRegistrySnapshot,
@@ -167,13 +169,28 @@ pub enum ToolInitError {
 /// The generic argument accepts the workspace-aware [`ToolConfig`].
 pub fn default_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitError> {
     let workspace_root = resolve_registry_workspace(&config.cwd)?;
-    let skills = discover_skills_for_config(&workspace_root);
-    let read_paths = skills.read_paths.clone();
-
     let index = Arc::new(
         FileSearchIndex::new(&workspace_root)
             .map_err(|error| ToolInitError::Find(error.to_string()))?,
     );
+    default_registry_with_index(config, index)
+}
+
+/// Construct the full built-in registry around an assembly-owned search
+/// index. Parent and child registries for one workspace should use this path
+/// so FFF performs one scan and owns one watcher.
+pub fn default_registry_with_index(
+    config: ToolConfig,
+    index: Arc<FileSearchIndex>,
+) -> Result<ToolRegistry, ToolInitError> {
+    let workspace_root = resolve_registry_workspace(&config.cwd)?;
+    if index.root() != workspace_root {
+        return Err(ToolInitError::Find(
+            "search index workspace does not match registry".into(),
+        ));
+    }
+    let skills = discover_skills_for_config(&workspace_root);
+    let read_paths = skills.read_paths.clone();
     let mut registry = ToolRegistry::try_new_with_workspace(
         vec![
             Box::new(
@@ -188,11 +205,13 @@ pub fn default_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitErro
             )),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
+            Box::new(MultiGrepTool::new(index.clone())),
         ],
         workspace_root.clone(),
     )
     .map_err(ToolInitError::from)?;
     registry.set_skills(skills);
+    registry.set_file_search_index(index);
     Ok(registry)
 }
 
@@ -203,23 +222,38 @@ pub fn default_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitErro
 /// actual enforcement, not prompt wording.
 pub fn read_only_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitError> {
     let workspace_root = resolve_registry_workspace(&config.cwd)?;
-    let skills = discover_skills_for_config(&workspace_root);
-    let read_paths = skills.read_paths.clone();
-
     let index = Arc::new(
         FileSearchIndex::new(&workspace_root)
             .map_err(|error| ToolInitError::Find(error.to_string()))?,
     );
+    read_only_registry_with_index(config, index)
+}
+
+/// Construct the read-only registry with an assembly-owned search index.
+pub fn read_only_registry_with_index(
+    config: ToolConfig,
+    index: Arc<FileSearchIndex>,
+) -> Result<ToolRegistry, ToolInitError> {
+    let workspace_root = resolve_registry_workspace(&config.cwd)?;
+    if index.root() != workspace_root {
+        return Err(ToolInitError::Find(
+            "search index workspace does not match registry".into(),
+        ));
+    }
+    let skills = discover_skills_for_config(&workspace_root);
+    let read_paths = skills.read_paths.clone();
     let mut registry = ToolRegistry::try_new_with_workspace(
         vec![
             Box::new(ReadTool::with_workspace_root(&workspace_root).with_allowed_paths(read_paths)),
             Box::new(FindTool::new(index.clone())),
-            Box::new(GrepTool::new(index)),
+            Box::new(GrepTool::new(index.clone())),
+            Box::new(MultiGrepTool::new(index.clone())),
         ],
         workspace_root,
     )
     .map_err(ToolInitError::from)?;
     registry.set_skills(skills);
+    registry.set_file_search_index(index);
     Ok(registry)
 }
 
@@ -456,6 +490,16 @@ pub fn call_summary(name: &str, args: &Value) -> String {
                 _ => "grep".into(),
             }
         }
+        "multigrep" => {
+            let count = args
+                .get("patterns")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            match args.get("path").and_then(Value::as_str) {
+                Some(path) => format!("multigrep {count} patterns in {path}"),
+                None => format!("multigrep {count} patterns"),
+            }
+        }
         "subagent" => {
             // Same helper the tool uses for its live summary, so previews
             // never diverge between dispatch time and snapshot replay.
@@ -513,7 +557,10 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect();
-        assert_eq!(names, vec!["read", "edit", "write", "bash", "find", "grep"]);
+        assert_eq!(
+            names,
+            vec!["read", "edit", "write", "bash", "find", "grep", "multigrep"]
+        );
         let context = registry.prompt_context();
         assert!(context.snippets.iter().any(|tool| tool.name == "find"));
         assert!(context.snippets.iter().any(|tool| tool.name == "grep"));
@@ -535,7 +582,7 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect();
-        assert_eq!(names, vec!["read", "find", "grep"]);
+        assert_eq!(names, vec!["read", "find", "grep", "multigrep"]);
         // Skill discovery still applies, so skill bodies stay loadable.
         assert_eq!(
             registry.workspace_root(),

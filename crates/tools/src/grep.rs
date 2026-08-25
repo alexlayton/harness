@@ -70,7 +70,6 @@ impl Tool for GrepTool {
                 [
                     "Use grep for content search instead of bash grep, ripgrep, or shell pipelines.".to_owned(),
                     "Match lines are formatted path:line:content; context lines use path-line-content.".to_owned(),
-                    "Read-only: independent searches may be batched in one response and run concurrently.".to_owned(),
                 ],
             ),
         }
@@ -82,7 +81,7 @@ impl Tool for GrepTool {
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(Value::as_str) {
-            Some(pattern) if !pattern.trim().is_empty() => pattern.trim().to_owned(),
+            Some(pattern) if !pattern.trim().is_empty() => pattern.to_owned(),
             _ => return error("grep", "pattern must be a non-empty string"),
         };
         let path = match args.get("path") {
@@ -135,6 +134,9 @@ impl Tool for GrepTool {
             .await;
         match result {
             Ok(raw) => {
+                if let Some(message) = raw.regex_fallback_error.as_deref() {
+                    return error(&summary, &format!("invalid regex: {message}"));
+                }
                 let content = format_grep_output(raw, &pattern, limit, MAX_GREP_LIMIT);
                 ToolOutput {
                     content,

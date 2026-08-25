@@ -96,6 +96,12 @@ pub(crate) type SubagentArgs<'a> = (
 
 pub(crate) fn parse_args(args: &Value) -> Result<SubagentArgs<'_>, String> {
     let object = args.as_object().ok_or("arguments must be an object")?;
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !matches!(key.as_str(), "description" | "prompt" | "mode"))
+    {
+        return Err(format!("unknown subagent argument `{unknown}`"));
+    }
     let description = object.get("description").and_then(Value::as_str);
     let prompt = object.get("prompt").and_then(Value::as_str);
     // A present-but-non-string mode is malformed (not merely absent): it
@@ -170,7 +176,8 @@ impl Tool for SubagentTool {
                             "description": "Capability set for this delegation; defaults to read_only. read_only subagents can inspect the repo and report but cannot modify files or run arbitrary commands — they run CONCURRENTLY, so batch independent ones in one response. workspace subagents have the normal tool set including edit/write/bash but run ONE AT A TIME (serialized), so reserve them for delegations that genuinely need to modify or execute."
                         }
                     },
-                    "required": ["description", "prompt"]
+                    "required": ["description", "prompt"],
+                    "additionalProperties": false
                 }),
             },
             prompt: ToolPrompt::new(

@@ -1,6 +1,5 @@
 use super::{Tool, ToolOutput};
 use llm::ToolDefinition;
-use llm::util::truncate_utf8;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use tokio_util::sync::CancellationToken;
@@ -27,6 +26,7 @@ pub struct ToolRegistry {
     /// Optional skills catalog discovered at startup; used to render the
     /// skills section of the system prompt and to hand read-paths to tools.
     skills: Option<super::skills::SkillCatalog>,
+    file_search_index: Option<std::sync::Arc<super::FileSearchIndex>>,
 }
 
 impl ToolRegistry {
@@ -50,6 +50,7 @@ impl ToolRegistry {
             tools: Vec::new(),
             workspace_root: workspace_root.into(),
             skills: None,
+            file_search_index: None,
         };
         for tool in tools {
             registry.register(tool)?;
@@ -68,6 +69,16 @@ impl ToolRegistry {
     /// Set the discovered skill catalog (called by `default_registry`).
     pub fn set_skills(&mut self, skills: super::skills::SkillCatalog) {
         self.skills = Some(skills);
+    }
+
+    /// Retain the workspace search index used by built-in search tools so
+    /// assembly can inject the same watcher into child registries.
+    pub fn set_file_search_index(&mut self, index: std::sync::Arc<super::FileSearchIndex>) {
+        self.file_search_index = Some(index);
+    }
+
+    pub fn file_search_index(&self) -> Option<&std::sync::Arc<super::FileSearchIndex>> {
+        self.file_search_index.as_ref()
     }
 
     /// Register the subagent tool with an injected runner.  Kept off
@@ -142,11 +153,9 @@ impl ToolRegistry {
         }
     }
 
-    #[tracing::instrument(
-        name = "tool",
-        skip_all,
-        fields(name = %name, args = %truncate_utf8(&args.to_string(), 512))
-    )]
+    // Tool arguments routinely contain commands, source text, and delegated
+    // prompts. Never serialize them into tracing fields.
+    #[tracing::instrument(name = "tool", skip_all, fields(name = %name))]
     pub async fn execute(&self, name: &str, args: Value, cancel: CancellationToken) -> ToolOutput {
         let Some(tool) = self.tools.iter().find(|tool| tool.name == name) else {
             return ToolOutput {

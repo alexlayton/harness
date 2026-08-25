@@ -249,14 +249,6 @@ fn parse_args(args: &Value) -> Result<(String, Vec<Edit>), String> {
 
     let edits = match args.get("edits") {
         Some(Value::Array(values)) => parse_edit_array(values)?,
-        Some(Value::String(serialized)) => {
-            let parsed: Value = serde_json::from_str(serialized)
-                .map_err(|_| "edits must be an array of replacement objects".to_owned())?;
-            let Some(values) = parsed.as_array() else {
-                return Err("edits must be an array of replacement objects".into());
-            };
-            parse_edit_array(values)?
-        }
         Some(_) => return Err("edits must be an array of replacement objects".into()),
         None => Vec::new(),
     };

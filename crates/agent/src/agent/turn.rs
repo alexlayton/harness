@@ -52,8 +52,8 @@ impl Agent {
         }
 
         let user_message = Message::user(user_text);
-        self.history.push(user_message.clone());
         self.persist_user_message(&user_message, events)?;
+        self.history.push(user_message.clone());
         let mut recoveries = 0;
         let mut overflow_recoveries = 0;
         loop {
@@ -207,6 +207,7 @@ impl Agent {
             }
 
             if cancelled {
+                self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
                 append_assistant(
                     &mut self.history,
                     &reasoning,
@@ -214,15 +215,14 @@ impl Agent {
                     &opaque,
                     tool_calls.clone(),
                 );
-                self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
                 for call in &tool_calls {
                     let cancelled_result = "cancelled before tool execution";
+                    self.persist_tool_result(call, cancelled_result, true, events)?;
                     self.history.push(Message::tool_result(
                         call.id.clone(),
                         cancelled_result,
                         true,
                     ));
-                    self.persist_tool_result(call, cancelled_result, true, events)?;
                 }
                 self.persist_cancelled("turn interrupted", events);
                 send(events, AgentEvent::TurnFinished);
@@ -232,6 +232,7 @@ impl Agent {
                 return Ok(());
             }
 
+            self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
             append_assistant(
                 &mut self.history,
                 &reasoning,
@@ -239,31 +240,29 @@ impl Agent {
                 &opaque,
                 tool_calls.clone(),
             );
-            self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
 
             if let Some(error) = stream_error {
+                let message = error.to_string();
+                // Calls emitted before a broken stream must be closed before any
+                // compaction/reload. Otherwise the compactor observes an invalid
+                // assistant tail containing dangling provider tool calls.
+                for call in &tool_calls {
+                    let error_result = format!("provider stream interrupted: {message}");
+                    self.persist_tool_result(call, &error_result, true, events)?;
+                    self.history.push(Message::tool_result(
+                        call.id.clone(),
+                        error_result.clone(),
+                        true,
+                    ));
+                }
                 // A mid-stream context overflow (provider tears down an SSE
-                // request that outgrew the window) can also be recovered by
-                // compacting and re-streaming.
+                // request that outgrew the window) can now compact valid history.
                 if self
                     .try_overflow_recovery(&error, events, cancel, &mut overflow_recoveries)
                     .await?
                 {
-                    // Mark this turn's calls as failed so the retry request
-                    // sees consistent history (mirrors the error path below).
-                    let message = error.to_string();
-                    for call in &tool_calls {
-                        let error_result = format!("provider stream interrupted: {message}");
-                        self.history.push(Message::tool_result(
-                            call.id.clone(),
-                            error_result.clone(),
-                            true,
-                        ));
-                        self.persist_tool_result(call, &error_result, true, events)?;
-                    }
                     continue;
                 }
-                let message = error.to_string();
                 self.persist_event(
                     SessionEvent::Error {
                         message: message.clone(),
@@ -271,18 +270,6 @@ impl Agent {
                     events,
                 )?;
                 send(events, AgentEvent::Error(message.clone()));
-                // Any calls already streamed before the failure must not
-                // dangle; mark them failed so the next request (retry or next
-                // turn) sees a consistent history.
-                for call in &tool_calls {
-                    let error_result = format!("provider stream interrupted: {message}");
-                    self.history.push(Message::tool_result(
-                        call.id.clone(),
-                        error_result.clone(),
-                        true,
-                    ));
-                    self.persist_tool_result(call, &error_result, true, events)?;
-                }
                 let mut retried = false;
                 if let LlmError::Parse(parse_message) = &error {
                     // A tool call whose arguments failed to parse (usually

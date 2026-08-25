@@ -4,9 +4,8 @@ use llm::ToolDefinition;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
@@ -41,9 +40,8 @@ const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
 /// commands) but 0.45.0 exited 3 on success.  Only versions at or above this
 /// release are trusted to follow the documented exit-code semantics; older
 /// and unrecognized versions fall back to the non-empty-stdout heuristic.
+#[cfg(test)]
 const RTK_TRUSTED_EXIT_CODE_VERSION: (u64, u64, u64) = (0, 46, 0);
-
-static RTK_VERSION: OnceLock<Option<(u64, u64, u64)>> = OnceLock::new();
 
 /// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
 /// signals support by printing the rewritten command on stdout; unsupported
@@ -52,29 +50,42 @@ static RTK_VERSION: OnceLock<Option<(u64, u64, u64)>> = OnceLock::new();
 /// is only authoritative for versions known to implement the documented
 /// semantics: relying on stdout alone would misread a future version that
 /// prints diagnostics but exits non-zero on error.
-async fn rtk_rewrite(command: &str) -> Option<String> {
-    let output = tokio::time::timeout(
-        RTK_REWRITE_TIMEOUT,
-        Command::new("rtk")
-            .arg("rewrite")
-            .arg(command)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if rtk_exit_codes_trustworthy().await && !output.status.success() {
+async fn rtk_rewrite_cancellable(
+    command: &str,
+    cancel: &CancellationToken,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    if command.trim_start().starts_with("rtk ") {
         return None;
     }
-    if rewritten.is_empty() {
-        None
-    } else {
-        Some(rewritten)
-    }
+    let mut process = Command::new("rtk");
+    process
+        .arg("rewrite")
+        .arg(command)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let rewrite_deadline = deadline.min(tokio::time::Instant::now() + RTK_REWRITE_TIMEOUT);
+    let output = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return None,
+        output = process.output() => output.ok()?,
+        _ = tokio::time::sleep_until(rewrite_deadline) => return None,
+    };
+    let accepted = matches!(output.status.code(), Some(0 | 3));
+    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (accepted && !rewritten.is_empty()).then_some(rewritten)
+}
+
+#[cfg(test)]
+async fn rtk_rewrite(command: &str) -> Option<String> {
+    rtk_rewrite_cancellable(
+        command,
+        &CancellationToken::new(),
+        tokio::time::Instant::now() + RTK_REWRITE_TIMEOUT,
+    )
+    .await
 }
 
 /// rtk's compound-command support is selective: some `cd X && cmd` shapes
@@ -83,6 +94,7 @@ async fn rtk_rewrite(command: &str) -> Option<String> {
 /// `&&`/`;` groups and rewrite each operand individually, keeping unchanged
 /// operands verbatim.  Returns `None` when nothing was rewritten or the
 /// command is not safely splittable.
+#[cfg(test)]
 async fn rtk_rewrite_compound(command: &str) -> Option<String> {
     let parts = split_compound(command)?;
     let mut rewritten_any = false;
@@ -114,6 +126,7 @@ async fn rtk_rewrite_compound(command: &str) -> Option<String> {
 /// backslash escapes, trims operands, and refuses commands whose structure a
 /// naive split would change: pipes, subshells, heredocs, command substitution,
 /// brace groups, or control-flow keywords.
+#[cfg(test)]
 fn split_compound(command: &str) -> Option<Vec<&str>> {
     let bytes = command.as_bytes();
     let mut parts: Vec<&str> = Vec::new();
@@ -393,11 +406,9 @@ const READ_ONLY_COMMANDS: &[&str] = &[
     "df",
     "tree",
     "uname",
-    "date",
     "printenv",
     "id",
     "whoami",
-    "hostname",
     "basename",
     "dirname",
     "realpath",
@@ -564,40 +575,7 @@ async fn resolve_workspace_dir(root: &Path, dir: &str) -> Result<PathBuf, String
     Ok(candidate)
 }
 
-/// Detect and cache the installed rtk version.  The binary cannot change
-/// during the process lifetime, so a miss is cached too.
-async fn rtk_version() -> Option<(u64, u64, u64)> {
-    if let Some(cached) = RTK_VERSION.get() {
-        return *cached;
-    }
-    let detected = detect_rtk_version().await;
-    let _ = RTK_VERSION.set(detected);
-    detected
-}
-
-async fn detect_rtk_version() -> Option<(u64, u64, u64)> {
-    let output = tokio::time::timeout(
-        RTK_REWRITE_TIMEOUT,
-        Command::new("rtk")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    parse_rtk_version(&String::from_utf8_lossy(&output.stdout))
-}
-
-async fn rtk_exit_codes_trustworthy() -> bool {
-    match rtk_version().await {
-        Some(version) => rtk_exit_codes_trustworthy_for(version),
-        None => false,
-    }
-}
-
+#[cfg(test)]
 fn rtk_exit_codes_trustworthy_for(version: (u64, u64, u64)) -> bool {
     version >= RTK_TRUSTED_EXIT_CODE_VERSION
 }
@@ -605,6 +583,7 @@ fn rtk_exit_codes_trustworthy_for(version: (u64, u64, u64)) -> bool {
 /// Extract the first `major.minor.patch` triplet from `rtk --version` output
 /// (e.g. `rtk 0.45.0` or `0.46.0-beta.1`), tolerating suffixes and arbitrary
 /// surrounding text.
+#[cfg(test)]
 fn parse_rtk_version(value: &str) -> Option<(u64, u64, u64)> {
     let bytes = value.as_bytes();
     let mut index = 0;
@@ -644,7 +623,7 @@ impl Tool for BashTool {
         ToolSpec {
             definition: ToolDefinition {
             name: "bash".into(),
-            description: "Run a shell command in the working directory. Returns stdout and stderr; output keeps the tail. Optionally run in a workspace-relative directory via the dir argument.".into(),
+            description: "Run a shell command in the working directory. Returns bounded stdout and stderr tails. Optionally run in a workspace-relative directory via the dir argument. Workspace cwd/path resolution is not an OS sandbox; shell commands can access paths allowed by the operating-system user.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -661,7 +640,6 @@ impl Tool for BashTool {
                 [
                     "Use bash for tests, builds, git, and operations not covered by a dedicated tool.".to_owned(),
                     "When a command must run in a subdirectory, pass it as the dir argument instead of prefixing the command with cd <dir> && ...".to_owned(),
-                    "Clearly read-only commands (git status, ls, cargo --version) may be batched in one response; anything with side effects must stay in its own response.".to_owned(),
                 ],
             ),
         }
@@ -702,18 +680,13 @@ impl Tool for BashTool {
             return error(&format!("bash: {}", first_line(&command)), "cancelled");
         }
 
-        // With rtk enabled, supported commands run through their compact rtk
-        // equivalent; anything else runs verbatim.  rtk rewrites most single
-        // commands and many `cd X && cmd` compounds, but its compound support
-        // is selective; when the whole command comes back untouched we split
-        // and rewrite each operand so the real work still gets the rtk form.
+        // RTK owns rewrite policy: one cancellable whole-command request,
+        // with rewrite time charged to the bash call's total deadline.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
         let run_command = if self.rtk {
-            match rtk_rewrite(&command).await {
-                Some(rewritten) => rewritten,
-                None => rtk_rewrite_compound(&command)
-                    .await
-                    .unwrap_or_else(|| command.clone()),
-            }
+            rtk_rewrite_cancellable(&command, &cancel, deadline)
+                .await
+                .unwrap_or_else(|| command.clone())
         } else {
             command.clone()
         };
@@ -738,18 +711,10 @@ impl Tool for BashTool {
             }
         };
 
-        let mut stdout = child.stdout.take().expect("stdout was piped");
-        let mut stderr = child.stderr.take().expect("stderr was piped");
-        let stdout_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            let result = stdout.read_to_end(&mut bytes).await;
-            (result, bytes)
-        });
-        let stderr_task = tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            let result = stderr.read_to_end(&mut bytes).await;
-            (result, bytes)
-        });
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let mut stdout_task = tokio::spawn(read_bounded_tail(stdout));
+        let mut stderr_task = tokio::spawn(read_bounded_tail(stderr));
 
         enum End {
             Exited(std::process::ExitStatus),
@@ -761,7 +726,7 @@ impl Tool for BashTool {
                 Ok(status) => End::Exited(status),
                 Err(_) => End::Cancelled,
             },
-            _ = tokio::time::sleep(Duration::from_secs(timeout)) => {
+            _ = tokio::time::sleep_until(deadline) => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
                 End::TimedOut
@@ -773,15 +738,29 @@ impl Tool for BashTool {
             },
         };
 
-        let (_, stdout) = stdout_task.await.unwrap_or_else(|_| (Ok(0), Vec::new()));
-        let (_, stderr) = stderr_task.await.unwrap_or_else(|_| (Ok(0), Vec::new()));
-        let mut output = String::from_utf8_lossy(&stdout).into_owned();
-        if !stderr.is_empty() {
+        // A descendant can inherit a pipe after the shell exits. Bound drain
+        // time so such a process cannot keep the tool alive indefinitely.
+        let stdout = match tokio::time::timeout(Duration::from_secs(1), &mut stdout_task).await {
+            Ok(Ok(capture)) => capture,
+            _ => {
+                stdout_task.abort();
+                TailCapture::default()
+            }
+        };
+        let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
+            Ok(Ok(capture)) => capture,
+            _ => {
+                stderr_task.abort();
+                TailCapture::default()
+            }
+        };
+        let mut output = stdout.render();
+        if !stderr.bytes.is_empty() {
             if !output.is_empty() {
                 output.push('\n');
             }
             output.push_str("--- stderr ---\n");
-            output.push_str(&String::from_utf8_lossy(&stderr));
+            output.push_str(&stderr.render());
         }
         let mut is_error = false;
         let mut suffix = String::new();
@@ -822,6 +801,62 @@ impl Tool for BashTool {
             },
         }
     }
+}
+
+#[derive(Default)]
+struct TailCapture {
+    bytes: Vec<u8>,
+    omitted_lines: usize,
+    truncated: bool,
+}
+
+impl TailCapture {
+    fn render(&self) -> String {
+        let body = String::from_utf8_lossy(&self.bytes);
+        if self.truncated {
+            format!(
+                "[truncated while running: at least {} lines omitted]\n{body}",
+                self.omitted_lines
+            )
+        } else {
+            body.into_owned()
+        }
+    }
+}
+
+async fn read_bounded_tail<R: AsyncRead + Unpin>(mut reader: R) -> TailCapture {
+    let mut capture = TailCapture::default();
+    let mut chunk = [0u8; 8 * 1024];
+    while let Ok(read) = reader.read(&mut chunk).await {
+        if read == 0 {
+            break;
+        }
+        capture.bytes.extend_from_slice(&chunk[..read]);
+        if capture.bytes.len() > MAX_BYTES {
+            let drain = capture.bytes.len() - MAX_BYTES;
+            capture.omitted_lines += capture.bytes[..drain]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count();
+            capture.bytes.drain(..drain);
+            capture.truncated = true;
+        }
+        let line_count = capture.bytes.iter().filter(|&&byte| byte == b'\n').count();
+        if line_count > MAX_LINES {
+            let skip = line_count - MAX_LINES;
+            let boundary = capture
+                .bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'\n')
+                .nth(skip - 1)
+                .map_or(0, |(index, _)| index + 1);
+            capture.bytes.drain(..boundary);
+            capture.omitted_lines += skip;
+            capture.truncated = true;
+        }
+    }
+    capture
 }
 
 /// Keep the tail of a command's output.  Shell commands often print the useful
@@ -1142,7 +1177,6 @@ mod tests {
             "stat Cargo.toml",
             "du -sh target",
             "uname -a",
-            "date +%Y",
             "true",
         ];
         for command in concurrent {
@@ -1157,6 +1191,8 @@ mod tests {
     #[test]
     fn mutating_or_unanalyzable_commands_stay_serial() {
         let exclusive = [
+            "date +%Y",
+            "hostname",
             "cargo test",
             "cargo build --release",
             "rm -rf target",
