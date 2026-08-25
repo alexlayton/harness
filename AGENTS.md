@@ -4,11 +4,12 @@ Guidance for coding agents (and humans) working in this repository.
 
 ## What this is
 
-Harness is a terminal coding-agent harness written in Rust: a workspace of 7
+Harness is a terminal coding-agent harness written in Rust: a workspace of 8
 crates that streams LLM responses, runs workspace-scoped tools, and persists
-durable sessions. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the crate map,
-data flow, and invariants before making non-trivial changes — it explains where
-each responsibility lives and why.
+durable sessions. Before a non-trivial change, use
+[ARCHITECTURE.md](./ARCHITECTURE.md) as an index: read the crate map and only
+the section relevant to the task. Read the complete file only for changes that
+cross several subsystems.
 
 ## Commands
 
@@ -22,8 +23,9 @@ cargo run -p agent -- -p "hi"   # run the `harness` binary headless
 cargo run -p agent              # run the TUI
 ```
 
-There is no CI, no clippy.toml, and no rust-toolchain pin; follow rustfmt and
-clippy defaults (stable, edition 2024).
+GitHub CI runs the workspace checks on Linux and macOS. There is no
+`clippy.toml` or Rust toolchain pin; follow rustfmt and Clippy defaults (stable,
+edition 2024).
 
 ## Conventions
 
