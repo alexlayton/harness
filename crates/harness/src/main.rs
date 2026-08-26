@@ -1,19 +1,28 @@
-use agent::acp;
-use agent::agent::spawn_model_list;
+mod acp;
+mod config;
+mod context;
+mod headless;
+mod login;
+mod tui_adapter;
+
 use agent::assembly::AgentBuilder;
-use agent::config::{Cli, Command, Config, ProviderArg, build_provider_with_auths, init_logging};
-use agent::headless::run_headless;
-use agent::project_context_for;
-use agent::tools::{ToolConfig, default_registry};
+use agent::{AgentEvent, InputMessage, spawn_model_list};
 use anyhow::{Context, Result};
 use clap::Parser;
+use config::{
+    Cli, Command, Config, ProviderArg, build_provider_with_auths, init_logging, provider_factory,
+    save_settings,
+};
+use context::project_context_for;
+use headless::run_headless;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::{ContextFileEntry, CrossTerm, InputMessage};
+use tools::{ToolConfig, default_registry};
+use tui::{ContextFileEntry, CrossTerm};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -32,7 +41,7 @@ async fn main_inner() -> Result<ExitCode> {
     // Login is credential-only and intentionally precedes config/provider
     // resolution: a stale configured API key cannot prevent signing in.
     if let Some(Command::Login(args)) = &cli.command {
-        return agent::login::run(args).await;
+        return login::run(args).await;
     }
 
     let prompt_args = match &cli.command {
@@ -56,6 +65,7 @@ async fn main_inner() -> Result<ExitCode> {
     // auth.json. OAuth providers remain constructible without credentials so
     // their local model catalogs work before login.
     let copilot_auth = config.copilot_auth.clone();
+    let provider_factory = provider_factory(copilot_auth.clone(), config.codex_auth.clone());
     let provider: Arc<dyn Provider> = build_provider_with_auths(
         &config.provider.to_string(),
         copilot_auth.clone(),
@@ -158,28 +168,52 @@ async fn main_inner() -> Result<ExitCode> {
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     let cancel = CancellationToken::new();
-    let (input_tx, input_rx): (
+    let (tui_input_tx, tui_input_rx) = mpsc::unbounded_channel();
+    let (runtime_input_tx, runtime_input_rx): (
         mpsc::UnboundedSender<InputMessage>,
         mpsc::UnboundedReceiver<InputMessage>,
     ) = mpsc::unbounded_channel();
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
+    let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
 
     // A model-list failure is informational and must not delay the first UI
     // frame or agent construction.
-    spawn_model_list(provider_name.clone(), provider.clone(), event_tx.clone());
+    spawn_model_list(
+        provider_name.clone(),
+        provider.clone(),
+        runtime_event_tx.clone(),
+    );
 
-    let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+    let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_project_context(project_context)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())
-        .with_session(session_store, session);
-    if let Some(auth) = copilot_auth {
-        builder = builder.with_copilot_auth(auth);
-    }
+        .with_session(session_store, session)
+        .with_provider_factory(provider_factory);
     let agent = builder.build().await?;
 
-    let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+    let input_task = tokio::spawn(tui_adapter::forward_inputs(tui_input_rx, runtime_input_tx));
+    let event_task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                event = runtime_event_rx.recv() => {
+                    let Some(event) = event else { break };
+                    if let AgentEvent::ModelChanged { provider, model } = &event
+                        && let Err(error) = save_settings(provider, model)
+                    {
+                        tracing::warn!(error = %error, "could not persist model settings");
+                    }
+                    if ui_event_tx.send(tui_adapter::into_ui_event(event)).is_err() {
+                        break;
+                    }
+                }
+                _ = ui_event_tx.closed() => break,
+            }
+        }
+    });
+    let agent_task = tokio::spawn(agent.run(runtime_input_rx, runtime_event_tx));
 
     // The crossterm frontend drives the same agent as headless mode and
     // differs only in rendering and input handling. The first paint happens
@@ -196,8 +230,11 @@ async fn main_inner() -> Result<ExitCode> {
             .collect(),
         config.tui_minimal,
     )?;
-    ui.run(event_rx, input_tx, cancel.clone()).await?;
+    let ui_result = ui.run(ui_event_rx, tui_input_tx, cancel.clone()).await;
     cancel.cancel();
+    let _ = input_task.await;
     let _ = agent_task.await;
+    let _ = event_task.await;
+    ui_result?;
     Ok(ExitCode::SUCCESS)
 }

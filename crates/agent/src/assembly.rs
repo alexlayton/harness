@@ -3,17 +3,33 @@
 //! Frontends decide where a workspace/session comes from; this builder makes
 //! the resulting agent policy identical once those inputs have been resolved.
 
-use crate::agent::{Agent, SubagentLimits};
-use crate::config::SubagentPolicy;
+use crate::agent::{Agent, AgentEvent, InputMessage, ProviderFactory, SubagentLimits};
 use crate::subagent::SubagentRunnerImpl;
 use anyhow::{Context, Result};
-use auth::CopilotAuth;
 use compact::CompactionPolicy;
 use llm::Provider;
 use session::{Session, SessionStore};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tools::ToolRegistry;
+
+/// Resolved subagent execution bounds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SubagentPolicy {
+    /// Maximum nested request/tool rounds for one delegation; zero disables it.
+    pub max_turns: usize,
+    /// Maximum concurrently running delegations per turn.
+    pub max_concurrent: usize,
+}
+
+impl Default for SubagentPolicy {
+    fn default() -> Self {
+        Self {
+            max_turns: 25,
+            max_concurrent: 4,
+        }
+    }
+}
 
 /// Common agent assembly used by every frontend.
 ///
@@ -29,7 +45,7 @@ pub struct AgentBuilder {
     subagents: SubagentPolicy,
     rtk: bool,
     session: Option<(SessionStore, Session)>,
-    copilot_auth: Option<Arc<CopilotAuth>>,
+    provider_factory: Option<ProviderFactory>,
     mcp_servers: Vec<mcp::McpServerConfig>,
 }
 
@@ -51,7 +67,7 @@ impl AgentBuilder {
             subagents: SubagentPolicy::default(),
             rtk: false,
             session: None,
-            copilot_auth: None,
+            provider_factory: None,
             mcp_servers: Vec::new(),
         }
     }
@@ -81,9 +97,9 @@ impl AgentBuilder {
         self
     }
 
-    /// Attach the shared Copilot authentication handle.
-    pub fn with_copilot_auth(mut self, auth: Arc<CopilotAuth>) -> Self {
-        self.copilot_auth = Some(auth);
+    /// Attach host-owned provider construction for `/model` and `/models`.
+    pub fn with_provider_factory(mut self, factory: ProviderFactory) -> Self {
+        self.provider_factory = Some(factory);
         self
     }
 
@@ -144,8 +160,8 @@ impl AgentBuilder {
             .with_subagent_limits(SubagentLimits {
                 max_concurrent: self.subagents.max_concurrent,
             });
-        if let Some(auth) = self.copilot_auth {
-            agent = agent.with_copilot_auth(auth);
+        if let Some(factory) = self.provider_factory {
+            agent = agent.with_provider_factory(factory);
         }
         if let Some(runner) = runner {
             agent = agent.with_subagent_runner(runner);
@@ -169,8 +185,8 @@ impl AssembledAgent {
     /// Run the contained agent, then close every MCP server and reap children.
     pub async fn run(
         self,
-        input: tokio::sync::mpsc::UnboundedReceiver<tui::InputMessage>,
-        events: tokio::sync::mpsc::UnboundedSender<crate::agent::AgentEvent>,
+        input: tokio::sync::mpsc::UnboundedReceiver<InputMessage>,
+        events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     ) {
         self.agent.run(input, events).await;
         if let Some(mcp) = self.mcp {

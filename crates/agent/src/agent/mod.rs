@@ -1,5 +1,3 @@
-use crate::tools::ToolRegistry;
-use auth::CopilotAuth;
 use compact::CompactionPolicy;
 use llm::{Message, Provider};
 use session::{Session, SessionStore, snapshot_entries};
@@ -7,16 +5,16 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::InputMessage;
+use tools::ToolRegistry;
 
-#[cfg(test)]
-use crate::tools::{Concurrency, ToolOutput};
 #[cfg(test)]
 use llm::{CompletionRequest, Content, Role, StreamEvent, ToolCall};
 #[cfg(test)]
 use session::{SessionCreateOptions, SessionEvent, StoredMessage};
 #[cfg(test)]
 use std::time::Instant;
+#[cfg(test)]
+use tools::{Concurrency, ToolOutput};
 
 mod commands;
 mod compaction;
@@ -25,8 +23,10 @@ mod persistence;
 mod tool_dispatch;
 mod turn;
 
-pub use commands::spawn_model_list;
-pub use events::{AgentEvent, CompactionReason, SessionListItem, SessionSnapshotEntry, TurnError};
+pub use commands::{ProviderFactory, spawn_model_list};
+pub use events::{
+    AgentEvent, CompactionReason, InputMessage, SessionListItem, SessionSnapshotEntry, TurnError,
+};
 pub use persistence::AgentSessionState;
 use persistence::{ui_snapshot_entries, usage_event};
 pub use tool_dispatch::SubagentLimits;
@@ -58,9 +58,8 @@ pub struct Agent {
     pub history: Vec<Message>,
     pub cancel: CancellationToken,
     pub session: Option<AgentSessionState>,
-    /// Shared with the Copilot provider so automatic refreshes survive model
-    /// switches without rebuilding the agent.
-    pub copilot_auth: Option<Arc<CopilotAuth>>,
+    /// Host-supplied provider construction used by `/model` and `/models`.
+    provider_factory: Option<ProviderFactory>,
     /// Input messages received while a turn is running.  They are drained by
     /// `run` before the next turn starts.
     queued: VecDeque<InputMessage>,
@@ -107,7 +106,7 @@ impl Agent {
             history: Vec::new(),
             cancel,
             session: None,
-            copilot_auth: None,
+            provider_factory: None,
             queued: VecDeque::new(),
             input_open: true,
             last_context_tokens: None,
@@ -156,9 +155,9 @@ impl Agent {
         self
     }
 
-    /// Attach the shared Copilot authentication handle for provider switches.
-    pub fn with_copilot_auth(mut self, auth: Arc<CopilotAuth>) -> Self {
-        self.copilot_auth = Some(auth);
+    /// Attach host-owned provider construction for runtime model commands.
+    pub fn with_provider_factory(mut self, factory: ProviderFactory) -> Self {
+        self.provider_factory = Some(factory);
         self
     }
 
@@ -346,7 +345,6 @@ fn send(events: &mpsc::UnboundedSender<AgentEvent>, event: AgentEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolRegistry;
     use async_trait::async_trait;
     use futures_util::stream;
     use llm::{EventStream, LlmError, ModelInfo, Usage};
@@ -356,6 +354,7 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use tools::Tool;
+    use tools::ToolRegistry;
 
     /// One step of a canned provider script.  Errors are carried as strings
     /// because `LlmError` embeds a non-cloneable `reqwest::Error`; `stream`
@@ -1136,7 +1135,7 @@ mod tests {
             }
             first.push(StreamEvent::ToolCallComplete(ToolCall {
                 id: (*id).into(),
-                name: crate::tools::SUBAGENT_TOOL_NAME.into(),
+                name: tools::SUBAGENT_TOOL_NAME.into(),
                 arguments: Value::Object(arguments),
             }));
         }

@@ -1,17 +1,15 @@
 use super::persistence::{ui_snapshot_entries, usage_event};
 use super::{
-    Agent, AgentEvent, AgentSessionState, CompactionReason, SessionListItem, TurnError, send,
+    Agent, AgentEvent, AgentSessionState, CompactionReason, InputMessage, SessionListItem,
+    TurnError, send,
 };
-use crate::config::{build_provider_with_auth, save_settings};
-use crate::tools::SkillEntry;
-use auth::CopilotAuth;
 use llm::Provider;
 use session::{ExportOptions, SessionCreateOptions, SessionEvent, export_jsonl, snapshot_entries};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::InputMessage;
+use tools::SkillEntry;
 
 impl Agent {
     pub(crate) fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
@@ -215,79 +213,30 @@ impl Agent {
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        let needs_auth = provider
-            .as_deref()
-            .and_then(crate::config::ProviderArg::from_name)
-            == Some(crate::config::ProviderArg::GithubCopilot)
-            || self.provider.name() == "github-copilot";
-        let mut auth = self.copilot_auth.clone();
-        if needs_auth && auth.is_none() {
-            match CopilotAuth::from_default() {
-                Ok(value) => {
-                    let value = Arc::new(value);
-                    self.copilot_auth = Some(value.clone());
-                    auth = Some(value);
-                }
-                Err(error) => {
-                    send(events, AgentEvent::Error(error.to_string()));
-                    return;
-                }
-            }
-        }
-        self.handle_set_model_with_factory(
-            provider,
-            model,
-            events,
-            Box::new(move |name| {
-                let copilot_auth = if crate::config::ProviderArg::from_name(name)
-                    == Some(crate::config::ProviderArg::GithubCopilot)
-                {
-                    auth.clone()
-                } else {
-                    None
-                };
-                build_provider_with_auth(name, copilot_auth)
-            }),
-        );
-        // A different model may have a different context window and stale
-        // token counts; reset both so the next trigger re-baselines.
-        self.last_context_tokens = None;
-        self.refresh_context_window().await;
-    }
-
-    pub(crate) fn handle_set_model_with_factory(
-        &mut self,
-        provider: Option<String>,
-        model: String,
-        events: &mpsc::UnboundedSender<AgentEvent>,
-        factory: ProviderFactory,
-    ) {
-        let explicit_provider = provider.is_some();
         let requested = provider.unwrap_or_else(|| self.provider.name().to_owned());
-        let known_provider = crate::config::ProviderArg::ALL
-            .iter()
-            .find(|known| known.to_string().eq_ignore_ascii_case(&requested));
-        let canonical = known_provider
-            .map(ToString::to_string)
-            .unwrap_or_else(|| requested.clone());
         let current = self.provider.name().to_owned();
-        let provider_changed =
-            (explicit_provider && known_provider.is_none()) || current != canonical;
-        let next_provider = if provider_changed {
-            match factory(&canonical) {
+        let next_provider = if requested.eq_ignore_ascii_case(&current) {
+            None
+        } else {
+            let Some(factory) = &self.provider_factory else {
+                send(
+                    events,
+                    AgentEvent::Error("provider switching is unavailable".into()),
+                );
+                return;
+            };
+            match factory(&requested) {
                 Ok(provider) => Some(provider),
                 Err(error) => {
                     send(events, AgentEvent::Error(error.to_string()));
                     return;
                 }
             }
-        } else {
-            None
         };
-
         if let Some(provider) = next_provider {
             self.provider = provider;
         }
+        let canonical = self.provider.name().to_owned();
         self.model = model.clone();
         // Future subagents must follow the parent's active selection; a
         // failed switch already returned above, so children never see a
@@ -307,9 +256,6 @@ impl Agent {
         {
             return;
         }
-        if let Err(error) = save_settings(&canonical, &model) {
-            tracing::warn!(error = %error, "could not persist model settings");
-        }
         send(
             events,
             AgentEvent::ModelChanged {
@@ -322,6 +268,10 @@ impl Agent {
             AgentEvent::Notice(format!("Using {canonical} · {model}")),
         );
         spawn_model_list(canonical, self.provider.clone(), events.clone());
+        // A different model may have a different context window and stale
+        // token counts; reset both so the next trigger re-baselines.
+        self.last_context_tokens = None;
+        self.refresh_context_window().await;
     }
 
     /// Fetch subscription allowance usage from the provider active when the
@@ -361,17 +311,16 @@ impl Agent {
         provider: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        let provider_name = crate::config::ProviderArg::ALL
-            .iter()
-            .find(|known| known.to_string().eq_ignore_ascii_case(&provider))
-            .map(ToString::to_string)
-            .unwrap_or(provider.clone());
-        let auth = if provider_name == "github-copilot" {
-            self.copilot_auth.clone()
-        } else {
-            None
+        let Some(factory) = &self.provider_factory else {
+            send(
+                events,
+                AgentEvent::Notice(
+                    "could not fetch model list: provider construction is unavailable".into(),
+                ),
+            );
+            return;
         };
-        let provider = match build_provider_with_auth(&provider_name, auth) {
+        let provider = match factory(&provider) {
             Ok(provider) => provider,
             Err(error) => {
                 send(
@@ -381,7 +330,7 @@ impl Agent {
                 return;
             }
         };
-        spawn_model_list(provider_name, provider, events.clone());
+        spawn_model_list(provider.name().to_owned(), provider, events.clone());
     }
 
     /// Reply to `/skills` with the discovered-skill view: invocable skills
@@ -471,10 +420,9 @@ impl Agent {
     }
 }
 
-/// Factory used to build providers when the model/provider selection changes.
-/// A `Box<dyn Fn>` (rather than a generic) keeps the call site simple; the
-/// dispatch cost is negligible because it only runs when `/model` is used.
-type ProviderFactory = Box<dyn Fn(&str) -> anyhow::Result<Arc<dyn Provider>>>;
+/// Host-owned provider construction used for model selection commands.
+pub type ProviderFactory =
+    Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn Provider>> + Send + Sync + 'static>;
 
 /// Fetch a provider's model list on a background task, reporting
 /// `AgentEvent::ModelList` on success and a notice on failure.  Shared by the

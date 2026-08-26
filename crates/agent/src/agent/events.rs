@@ -1,4 +1,36 @@
-use crate::tools::SkillEntry;
+use tools::SkillEntry;
+
+/// Frontend-neutral input commands consumed by the agent runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InputMessage {
+    /// Normal user text for the model.
+    Message(String),
+    /// Turn-local interrupt.
+    Interrupt,
+    /// Start and persist a new conversation without deleting the old one.
+    NewConversation,
+    /// Load a session by ID, unique prefix, `latest`, or path.
+    LoadSession { selector: String },
+    /// List sessions for the current workspace.
+    ListSessions,
+    /// Export the current session to JSONL.
+    ExportSession { destination: Option<String> },
+    /// Run the deterministic local compactor.
+    CompactSession,
+    /// Switch model, and provider when present.
+    SetModel {
+        provider: Option<String>,
+        model: String,
+    },
+    /// Fetch a provider's model list.
+    ListModels { provider: String },
+    /// Start a turn from a discovered skill's instructions.
+    InvokeSkill { name: String },
+    /// Fetch current subscription allowance usage.
+    SubscriptionUsage,
+    /// Return the discovered-skill view.
+    ListSkills,
+}
 
 /// Events emitted by the agent for frontend rendering and lifecycle tracking.
 #[derive(Clone, Debug, PartialEq, Eq)]

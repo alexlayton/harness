@@ -1,5 +1,5 @@
+use super::InputMessage;
 use super::{Agent, AgentEvent, TurnError, send};
-use crate::tools::{Concurrency, ToolOutput, ToolRegistry, call_summary};
 use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use llm::{Content, Message, Role, ToolCall};
@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::InputMessage;
+use tools::{Concurrency, ToolOutput, ToolRegistry, call_summary};
 
 /// Upper bound on read-only tool calls running at once.  Read tools are
 /// cheap, but the shared `FileSearchIndex` already gates its own concurrency

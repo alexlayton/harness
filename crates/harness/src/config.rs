@@ -1,3 +1,4 @@
+use agent::assembly::SubagentPolicy;
 use anyhow::{Context, Result, anyhow};
 use auth::OpenAiCodexAuth;
 use auth::{CopilotAuth, sku_from_proxy_token};
@@ -123,35 +124,14 @@ pub struct TuiConfig {
     pub minimal: bool,
 }
 
-/// Resolved subagent bounds. Mirrors how [`CompactionPolicy`] relates to
-/// [`CompactConfig`]: file overrides layer over these defaults.
-#[derive(Clone, Copy, Debug)]
-pub struct SubagentPolicy {
-    /// Maximum nested request/tool rounds for one delegation.
-    pub max_turns: usize,
-    /// Maximum concurrently running delegations per turn.
-    pub max_concurrent: usize,
-}
-
-impl Default for SubagentPolicy {
-    fn default() -> Self {
-        Self {
-            max_turns: 25,
-            max_concurrent: 4,
-        }
-    }
-}
-
-impl From<&SubagentConfig> for SubagentPolicy {
-    fn from(config: &SubagentConfig) -> Self {
-        let defaults = SubagentPolicy::default();
-        Self {
-            max_turns: config.max_turns.unwrap_or(defaults.max_turns),
-            max_concurrent: config
-                .max_concurrent
-                .unwrap_or(defaults.max_concurrent)
-                .max(1),
-        }
+fn resolve_subagents(config: &SubagentConfig) -> SubagentPolicy {
+    let defaults = SubagentPolicy::default();
+    SubagentPolicy {
+        max_turns: config.max_turns.unwrap_or(defaults.max_turns),
+        max_concurrent: config
+            .max_concurrent
+            .unwrap_or(defaults.max_concurrent)
+            .max(1),
     }
 }
 
@@ -465,8 +445,10 @@ pub enum LoginProvider {
 pub struct Config {
     pub provider: ProviderArg,
     pub model: String,
+    /// Resolved key retained for config diagnostics and boundary tests;
+    /// provider construction reads the environment directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub api_key: String,
-    pub config_path: PathBuf,
     pub rtk: bool,
     pub compaction: CompactionPolicy,
     /// Resolved subagent bounds (file `[subagents]` over defaults).
@@ -519,6 +501,7 @@ impl Config {
     }
 
     /// Testable form that also covers the legacy `OPENCODE_API_KEY` fallback.
+    #[cfg(test)]
     pub fn resolve_with_key_values(
         cli: &Cli,
         opencode_go_key: Option<&str>,
@@ -594,7 +577,6 @@ impl Config {
             provider,
             model,
             api_key,
-            config_path: path,
             rtk: file.rtk,
             compaction: file
                 .compaction
@@ -604,7 +586,7 @@ impl Config {
             subagents: file
                 .subagents
                 .as_ref()
-                .map(SubagentPolicy::from)
+                .map(resolve_subagents)
                 .unwrap_or_default(),
             mcp_servers: mcp_servers.unwrap_or_default(),
             tui_minimal: file.tui.as_ref().is_some_and(|tui| tui.minimal),
@@ -632,16 +614,6 @@ fn entitled_copilot_default(auth: Option<&Arc<CopilotAuth>>) -> Option<String> {
     let credential = auth?.credential().ok()??;
     let sku = sku_from_proxy_token(&credential.access);
     default_model_for(sku, &credential.available_model_ids)
-}
-
-/// Construct a provider while reusing the auth state owned by the agent.  The
-/// shared handle is important for token refreshes: rebuilding a Copilot
-/// provider must not hide credentials updated by a concurrent login.
-pub fn build_provider_with_auth(
-    name: &str,
-    copilot_auth: Option<Arc<CopilotAuth>>,
-) -> Result<Arc<dyn Provider>> {
-    build_provider_with_auths(name, copilot_auth, None)
 }
 
 /// Construct a provider with shared OAuth handles. Keeping refresh state in
@@ -687,6 +659,14 @@ pub fn build_provider_with_auths(
             Arc::new(OpenAiCodexProvider::new(auth)) as Arc<dyn Provider>
         }
     })
+}
+
+/// Build the runtime's provider factory while retaining shared OAuth state.
+pub fn provider_factory(
+    copilot_auth: Option<Arc<CopilotAuth>>,
+    codex_auth: Option<Arc<OpenAiCodexAuth>>,
+) -> agent::ProviderFactory {
+    Arc::new(move |name| build_provider_with_auths(name, copilot_auth.clone(), codex_auth.clone()))
 }
 
 /// Install file-only tracing when requested. stdout is intentionally left

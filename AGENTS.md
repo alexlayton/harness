@@ -4,7 +4,7 @@ Guidance for coding agents (and humans) working in this repository.
 
 ## What this is
 
-Harness is a terminal coding-agent harness written in Rust: a workspace of 8
+Harness is a terminal coding-agent harness written in Rust: a workspace of 9
 crates that streams LLM responses, runs workspace-scoped tools, and persists
 durable sessions. Before a non-trivial change, use
 [ARCHITECTURE.md](./ARCHITECTURE.md) as an index: read the crate map and only
@@ -16,11 +16,11 @@ cross several subsystems.
 ```sh
 cargo fmt                       # required before every commit
 cargo clippy --workspace        # keep it clean
-cargo build                     # builds only the `agent` crate (default-members)
+cargo build                     # builds the `harness` binary and `agent` runtime
 cargo build --workspace         # everything
-cargo test --workspace          # all tests; plain `cargo test` covers agent only
-cargo run -p agent -- prompt "hi" # run the `harness` binary headless
-cargo run -p agent              # run the TUI
+cargo test --workspace          # all tests; plain `cargo test` covers host + runtime
+cargo run -p harness -- prompt "hi" # run the `harness` binary headless
+cargo run -p harness            # run the TUI
 ```
 
 GitHub CI runs the workspace checks on Linux and macOS. There is no
@@ -38,7 +38,7 @@ edition 2024).
   can be unit-tested without network or provider access.
 - **New providers** must not leak wire formats into `agent`. Add a dialect
   (wire format translation) in `llm/src/dialects/` and endpoint/auth handling
-  in `llm/src/providers/`, then register it in `agent/src/config.rs`.
+  in `llm/src/providers/`, then register it in `crates/harness/src/config.rs`.
 - **New tools** implement the `Tool` trait (spec + prompt metadata) in
   `crates/tools` and get registered in `default_registry`. Tools must confine
   paths to the workspace root.
@@ -67,5 +67,5 @@ edition 2024).
 - Sessions are append-only JSONL. Never rewrite history; emit events.
 - Headless mode must keep stdout to the answer only; all chatter goes to
   stderr behind `-v`.
-- The TUI crate must not depend on the agent crate (the event adapter in
-  `agent/src/lib.rs` exists precisely to avoid that cycle).
+- The TUI crate must not depend on the agent crate. The explicit adapters in
+  `crates/harness/src/tui_adapter.rs` keep both frontend protocols independent.

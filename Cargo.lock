@@ -12,28 +12,19 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agent"
 version = "0.1.0"
 dependencies = [
- "agent-client-protocol",
  "anyhow",
  "async-trait",
- "auth",
- "clap",
  "compact",
- "dirs 6.0.0",
  "futures-util",
  "llm",
  "mcp",
- "serde",
  "serde_json",
  "session",
  "tempfile",
  "tokio",
  "tokio-util",
- "toml",
  "tools",
  "tracing",
- "tracing-subscriber",
- "tui",
- "uuid",
 ]
 
 [[package]]
@@ -1273,6 +1264,35 @@ dependencies = [
  "log",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "harness"
+version = "0.1.0"
+dependencies = [
+ "agent",
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "auth",
+ "clap",
+ "compact",
+ "dirs 6.0.0",
+ "futures-util",
+ "llm",
+ "mcp",
+ "serde",
+ "serde_json",
+ "session",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tools",
+ "tracing",
+ "tracing-subscriber",
+ "tui",
+ "uuid",
 ]
 
 [[package]]

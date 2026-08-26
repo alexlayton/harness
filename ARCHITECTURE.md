@@ -10,22 +10,22 @@ are changing.
 
 ## Crate map
 
-Harness is a Cargo workspace of eight crates. `agent` builds the only binary,
-`harness`; all other crates are libraries.
+Harness is a Cargo workspace of nine crates. `harness` builds the only binary;
+all other crates are libraries.
 
 ```text
-agent ──┬── tui
-        ├── compact ── llm, session
-        ├── session ── llm
-        ├── mcp ────── tools, llm
-        ├── tools ──── llm
-        ├── llm ────── auth
-        └── auth
+harness ──┬── agent ──┬── compact ── llm, session
+          │           ├── session ── llm
+          │           ├── mcp ────── tools, llm
+          │           ├── tools ──── llm
+          │           └── llm ────── auth
+          └── tui
 ```
 
 | Crate | Responsibility |
 |---|---|
-| `agent` | Application assembly, agent loop, retries, tool dispatch, persistence adapter, authentication UX, and the TUI/headless/ACP frontends. |
+| `harness` | CLI, configuration, authentication UX, logging, frontend adapters, and process orchestration. |
+| `agent` | Frontend-independent runtime assembly, agent loop, events, retries, tool dispatch, persistence integration, MCP lifecycle, and subagents. |
 | `tui` | Terminal rendering, input, slash commands, and path completion. It must not depend on `agent`. |
 | `compact` | Token estimation, compaction policy and planning, and summary generation. |
 | `session` | Append-only JSONL format, locking, replay, export, and provider-history reconstruction. |
@@ -35,9 +35,9 @@ agent ──┬── tui
 | `mcp` | External MCP process lifecycle, tool discovery, namespacing, and tool adapters. |
 
 Dependency direction is one-way. Provider wire formats stay in `llm`; auth
-storage stays in `auth`; rendering stays in `tui`. The adapter in
-`agent/src/lib.rs` converts agent events to TUI events and prevents an
-`agent`/`tui` dependency cycle.
+storage stays in `auth`; rendering stays in `tui`. Explicit input/event adapters
+in `crates/harness/src/tui_adapter.rs` compose the independent `agent` and `tui`
+protocols without a dependency in either direction.
 
 ## Request flow
 
@@ -72,7 +72,7 @@ MCP, and subagent setup has one implementation.
   JSON-RPC only and tracing remains file-only. Each ACP session owns an agent,
   registry, and session store rooted at the editor workspace.
 
-See `crates/agent/src/headless.rs`, `crates/agent/src/acp.rs`, and
+See `crates/harness/src/headless.rs`, `crates/harness/src/acp.rs`, and
 [`docs/editor-integration.md`](./docs/editor-integration.md) for frontend
 protocol detail.
 
@@ -88,7 +88,8 @@ Adding a provider requires:
 1. A dialect when no existing wire format applies.
 2. A provider implementation in `llm/src/providers/`.
 3. Authentication support in `auth` when required.
-4. Registration through `ProviderArg` in `agent/src/config.rs`.
+4. Registration through `ProviderArg` in `crates/harness/src/config.rs`; the
+   runtime receives provider construction as an injected factory.
 
 Do not put endpoint paths, provider headers, or wire-format types in `agent`.
 See [`docs/providers.md`](./docs/providers.md) for supported providers and
@@ -184,9 +185,9 @@ then inspect these sources:
 | Authentication | `crates/auth/src/` |
 | Tool behavior or path safety | `crates/tools/src/` |
 | MCP integration | `crates/mcp/src/` |
-| Compaction | `crates/compact/src/` and `agent/src/agent/compaction.rs` |
+| Compaction | `crates/compact/src/` and `crates/agent/src/agent/compaction.rs` |
 | Session durability or format | `crates/session/src/` and `crates/session/README.md` |
-| ACP | `crates/agent/src/acp.rs`, `docs/editor-integration.md` |
+| ACP | `crates/harness/src/acp.rs`, `docs/editor-integration.md` |
 
 Historical scratch notes are not authoritative. Verify detailed behavior
 against source and tests.

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent", "crates/auth", "crates/compact", "crates/llm", "crates/mcp", "crates/session", "crates/tui", "crates/tools"]
-default-members = ["crates/agent"]
+members = ["crates/agent", "crates/auth", "crates/compact", "crates/harness", "crates/llm", "crates/mcp", "crates/session", "crates/tui", "crates/tools"]
+default-members = ["crates/harness", "crates/agent"]
 
 # Release ships lean: symbol tables stripped, cross-crate DCE via fat LTO,
 # one codegen unit for inlining, and abort-on-panic to drop unwind tables.
@@ -35,6 +35,7 @@ edition = "2024"
 publish = false
 
 [workspace.dependencies]
+agent = { path = "crates/agent" }
 auth = { path = "crates/auth" }
 compact = { path = "crates/compact" }
 llm = { path = "crates/llm" }
@@ -42,7 +43,7 @@ mcp = { path = "crates/mcp" }
 session = { path = "crates/session" }
 tools = { path = "crates/tools" }
 tui = { path = "crates/tui" }
-# The exact tokio feature set the agent binary needs — `full` used to pull in
+# The exact tokio feature set the harness binary needs — `full` used to pull in
 # `net` (unused) and bloated the feature union. Library crates keep their own
 # precise declarations.
 tokio = { version = "1", features = [

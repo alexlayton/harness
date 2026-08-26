@@ -160,7 +160,7 @@ Source package managers can avoid the expensive fat LTO used for official
 release artifacts while retaining an optimized, stripped binary:
 
 ```text
-cargo install --locked --profile fast-release --path crates/agent
+cargo install --locked --profile fast-release --path crates/harness
 ```
 
 The common workspace checks are:

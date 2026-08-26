@@ -832,6 +832,9 @@ mod tests {
             short_id: short_id.into(),
             title: title.map(str::to_owned),
             updated_at: "2026-08-13 12:00".into(),
+            workspace: "/workspace".into(),
+            provider: None,
+            model: None,
         }
     }
 

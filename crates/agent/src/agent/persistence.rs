@@ -1,8 +1,8 @@
 use super::{Agent, AgentEvent, SessionSnapshotEntry, TurnError, send};
-use crate::tools::call_summary;
 use llm::{Content, Message, ToolCall};
 use session::{Session, SessionEvent, SessionStore, StoredMessage, StoredToolCall};
 use tokio::sync::mpsc;
+use tools::call_summary;
 
 /// Durable session state owned by the agent. The TUI only receives status
 /// events; it never reads or writes session files directly.

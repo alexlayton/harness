@@ -67,7 +67,7 @@ use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
 use crate::{
     ContextFileEntry, InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, SkillEntry,
-    SubscriptionUsage, SubscriptionUsageWindow, TuiEvent, UiEvent,
+    SubscriptionUsage, SubscriptionUsageWindow, UiEvent,
 };
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
@@ -421,29 +421,23 @@ impl CrossTerm {
         Ok(ui)
     }
 
-    pub async fn run<E>(
+    pub async fn run(
         mut self,
-        mut events: mpsc::UnboundedReceiver<E>,
+        mut events: mpsc::UnboundedReceiver<UiEvent>,
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
-    ) -> Result<()>
-    where
-        E: TuiEvent + 'static,
-    {
+    ) -> Result<()> {
         let result = self.run_inner(&mut events, input_tx, cancel).await;
         let restore = self.restore();
         result.and(restore)
     }
 
-    async fn run_inner<E>(
+    async fn run_inner(
         &mut self,
-        events: &mut mpsc::UnboundedReceiver<E>,
+        events: &mut mpsc::UnboundedReceiver<UiEvent>,
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
-    ) -> Result<()>
-    where
-        E: TuiEvent + 'static,
-    {
+    ) -> Result<()> {
         // The startup header: the wordmark banner augmented with the
         // cwd/branch and provider/model metadata line.
         if !self.minimal {
@@ -462,7 +456,7 @@ impl CrossTerm {
             tokio::select! {
                 maybe_event = events.recv() => {
                     let Some(event) = maybe_event else { return Ok(()) };
-                    self.apply_event(event.into_ui_event());
+                    self.apply_event(event);
                     // Coalesced painting: an agent burst (streaming deltas,
                     // tool start/finish pairs, notices) arrives as many
                     // channel events within a few milliseconds. Drain
@@ -471,7 +465,7 @@ impl CrossTerm {
                     // path. `try_recv` never blocks, so this only ever
                     // consumes what has already been sent — no added latency.
                     while let Ok(event) = events.try_recv() {
-                        self.apply_event(event.into_ui_event());
+                        self.apply_event(event);
                     }
                     self.paint()?;
                 }

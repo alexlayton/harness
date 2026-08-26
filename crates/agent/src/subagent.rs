@@ -27,12 +27,8 @@
 //! UI concerns it must not have.
 
 use crate::agent::plan_tool_batches;
-use crate::config::SubagentPolicy;
+use crate::assembly::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
-use crate::tools::{
-    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry, call_summary,
-    default_registry_with_index, read_only_registry_with_index,
-};
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use llm::{
@@ -47,6 +43,10 @@ use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tools::{
+    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry, call_summary,
+    default_registry_with_index, read_only_registry_with_index,
+};
 
 /// Upper bound on the final report handed back to the parent conversation:
 /// large enough for a thorough audit, small enough not to blow the parent's
@@ -60,8 +60,7 @@ const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 8;
 
 /// One in-flight child tool execution carrying its slot index so results
 /// land in original call order rather than completion order.
-type ChildToolRun<'a> =
-    Pin<Box<dyn Future<Output = (usize, crate::tools::ToolOutput)> + Send + 'a>>;
+type ChildToolRun<'a> = Pin<Box<dyn Future<Output = (usize, tools::ToolOutput)> + Send + 'a>>;
 
 /// One delegated subagent run.
 pub(crate) struct SubagentRun {
@@ -531,7 +530,7 @@ impl SubagentRunnerImpl {
                 ));
                 next_launch += 1;
             }
-            let mut slots: Vec<Option<crate::tools::ToolOutput>> =
+            let mut slots: Vec<Option<tools::ToolOutput>> =
                 (0..batch.calls.len()).map(|_| None).collect();
             let mut finished = 0usize;
             loop {
@@ -564,7 +563,7 @@ impl SubagentRunnerImpl {
                     Some(output) => output,
                     None => {
                         cancelled = true;
-                        crate::tools::ToolOutput {
+                        tools::ToolOutput {
                             content: "cancelled".to_owned(),
                             is_error: true,
                             summary: call_summary(&call.name, &call.arguments),
@@ -1122,8 +1121,8 @@ mod tests {
 
     #[tokio::test]
     async fn end_to_end_parent_agent_delegates_and_receives_report() {
-        use crate::tools::{ToolConfig, default_registry};
-        use tui::InputMessage;
+        use crate::agent::InputMessage;
+        use tools::{ToolConfig, default_registry};
         // Child script: one text-only reply (the report).
         let child_provider = Arc::new(ScriptProvider::new(vec![vec![
             Ok(StreamEvent::TextDelta("crate tui: 0 issues".into())),
@@ -1151,7 +1150,7 @@ mod tests {
             vec![
                 Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
                     id: "t1".into(),
-                    name: crate::tools::SUBAGENT_TOOL_NAME.into(),
+                    name: tools::SUBAGENT_TOOL_NAME.into(),
                     arguments: json!({
                         "description": "audit tui",
                         "prompt": "count issues in crates/tui"

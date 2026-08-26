@@ -23,11 +23,10 @@
 //! stays behind `HARNESS_LOG` (file-only), and this module never writes to
 //! stderr either — editors surface child stderr as agent noise.
 
-use crate::agent::AgentEvent;
-use crate::assembly::AgentBuilder;
-use crate::config::{Config, ProviderArg};
-use crate::project_context_for;
-use crate::tools::{ToolConfig, ToolRegistry, default_registry};
+use crate::config::{Config, ProviderArg, provider_factory};
+use crate::context::project_context_for;
+use agent::assembly::AgentBuilder;
+use agent::{AgentEvent, InputMessage};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, CancelNotification, ContentBlock, ContentChunk,
     DeleteSessionRequest, DeleteSessionResponse, InitializeRequest, InitializeResponse,
@@ -51,7 +50,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::InputMessage;
+use tools::{ToolConfig, ToolRegistry, default_registry};
 
 /// The single mode advertised for every session: harness has no permission
 /// levels to switch between (tools always run), so `set_mode` stays
@@ -803,7 +802,7 @@ async fn spawn_agent(
 
     let project_context = project_context_for(tools.workspace_root(), state.no_context_files);
 
-    let mut builder = AgentBuilder::new(
+    let builder = AgentBuilder::new(
         state.provider.clone(),
         state.config.model.clone(),
         tools,
@@ -813,10 +812,11 @@ async fn spawn_agent(
     .with_subagents(state.config.subagents, false)
     .with_mcp_servers(mcp_servers)
     .with_project_context(project_context)
-    .with_session(store, session);
-    if let Some(auth) = &state.copilot_auth {
-        builder = builder.with_copilot_auth(auth.clone());
-    }
+    .with_session(store, session)
+    .with_provider_factory(provider_factory(
+        state.copilot_auth.clone(),
+        state.config.codex_auth.clone(),
+    ));
     let agent = builder.build().await?;
     tokio::spawn(agent.run(input_rx, event_tx));
 
@@ -1099,7 +1099,7 @@ mod tests {
                 compacted_through: 3,
                 summary_bytes: 100,
                 auto: true,
-                reason: crate::agent::CompactionReason::Auto,
+                reason: agent::CompactionReason::Auto,
             },
         ];
         for event in &events {

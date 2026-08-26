@@ -1,7 +1,7 @@
 //! A direct-crossterm terminal UI for Harness: plain rows committed into the
 //! terminal's native scrollback, a small live region at the bottom, and a
-//! `›` input line. The event adapter keeps this crate independent from the
-//! agent crate, avoiding a library dependency cycle.
+//! `›` input line. The host adapts runtime events into this crate's independent
+//! protocol, avoiding a library dependency cycle.
 
 mod app;
 mod commands;
@@ -207,14 +207,7 @@ pub struct SessionListEntry {
     pub short_id: String,
     pub title: Option<String>,
     pub updated_at: String,
-}
-
-pub trait TuiEvent: Send {
-    fn into_ui_event(self) -> UiEvent;
-}
-
-impl TuiEvent for UiEvent {
-    fn into_ui_event(self) -> UiEvent {
-        self
-    }
+    pub workspace: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }

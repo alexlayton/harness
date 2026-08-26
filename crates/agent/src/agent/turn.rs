@@ -1,3 +1,4 @@
+use super::InputMessage;
 use super::persistence::usage_event;
 use super::{Agent, AgentEvent, CompactionReason, MAX_TURN_RECOVERIES, TurnError, send};
 use crate::prompt::system_prompt_with_workspace_context;
@@ -10,7 +11,6 @@ use session::{SessionEvent, usage_summary};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::InputMessage;
 
 impl Agent {
     /// Run one user turn: persist the message, stream the provider response,

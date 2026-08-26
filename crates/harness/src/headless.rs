@@ -1,17 +1,16 @@
 //! Headless / non-interactive runtime: `harness prompt "…"`.
 //!
 //! This is an alternative *frontend* that drives the exact same
-//! [`Agent`](crate::agent::Agent) stack the TUI uses.  One prompt is ingested
+//! [`agent::Agent`] stack the TUI uses.  One prompt is ingested
 //! (positional argument, or stdin when no positional is given), the agent runs
 //! to completion, the model's answer is written to stdout, and the process
 //! exits.  All progress chatter is optional and goes to stderr behind `-v`;
 //! stdout carries only the answer.
 
-use crate::agent::AgentEvent;
-use crate::assembly::AgentBuilder;
-use crate::config::{Config, PromptArgs};
-use crate::project_context_for;
-use crate::tools::ToolRegistry;
+use crate::config::{Config, PromptArgs, provider_factory};
+use crate::context::project_context_for;
+use agent::assembly::AgentBuilder;
+use agent::{AgentEvent, InputMessage};
 use anyhow::{Context, Result, anyhow};
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
@@ -20,7 +19,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tui::InputMessage;
+use tools::ToolRegistry;
 
 /// Resolve the one-shot prompt for the `prompt` command.
 ///
@@ -318,10 +317,11 @@ async fn run_headless_with_cancel(
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())
-        .with_project_context(project_context);
-    if let Some(auth) = config.copilot_auth.clone() {
-        builder = builder.with_copilot_auth(auth);
-    }
+        .with_project_context(project_context)
+        .with_provider_factory(provider_factory(
+            config.copilot_auth.clone(),
+            config.codex_auth.clone(),
+        ));
     if let (Some(store), Some(session)) = (&store, session) {
         builder = builder.with_session(store.clone(), session);
     }
