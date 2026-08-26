@@ -241,6 +241,8 @@ pub struct CrossTerm {
     model: String,
     provider: String,
     environment: EnvironmentInfo,
+    /// Skip the welcome banner and metadata while retaining normal turn UI.
+    minimal: bool,
 
     /// Cached terminal size, refreshed on resize events.
     width: u16,
@@ -339,6 +341,7 @@ impl CrossTerm {
             model: model.to_owned(),
             provider: provider.to_owned(),
             environment,
+            minimal: false,
             width,
             height,
             transcript: Vec::new(),
@@ -377,13 +380,15 @@ impl CrossTerm {
     }
 
     /// `skills` and `context_files` come from the startup discovery in main
-    /// (the TUI never touches the filesystem for them).
+    /// (the TUI never touches the filesystem for them). `minimal` suppresses
+    /// only the initial banner and metadata.
     pub fn new(
         model: &str,
         provider: &str,
         providers: Vec<String>,
         skills: Vec<SkillEntry>,
         context_files: Vec<ContextFileEntry>,
+        minimal: bool,
     ) -> Result<Self> {
         install_panic_hook();
         let (width, height) = terminal::size().unwrap_or((80, 24));
@@ -396,6 +401,7 @@ impl CrossTerm {
             width,
             height,
         );
+        ui.minimal = minimal;
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
         if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
             let _ = terminal::disable_raw_mode();
@@ -440,10 +446,12 @@ impl CrossTerm {
     {
         // The startup header: the wordmark banner augmented with the
         // cwd/branch and provider/model metadata line.
-        self.pending.push(Entry::Banner {
-            tagline: render::pick_tagline().to_owned(),
-        });
-        self.pending.push(self.metadata_entry());
+        if !self.minimal {
+            self.pending.push(Entry::Banner {
+                tagline: render::pick_tagline().to_owned(),
+            });
+            self.pending.push(self.metadata_entry());
+        }
         self.paint()?;
 
         let mut input_events = EventStream::new();

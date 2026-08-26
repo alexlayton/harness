@@ -196,6 +196,7 @@ async fn main_inner() -> Result<ExitCode> {
             .into_iter()
             .map(|path| ContextFileEntry { path })
             .collect(),
+        config.tui_minimal,
     )?;
     ui.run(event_rx, input_tx, cancel.clone()).await?;
     cancel.cancel();

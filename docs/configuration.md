@@ -41,6 +41,18 @@ Set `rtk = true` to let the bash tool rewrite supported commands through an
 installed `rtk` executable for smaller tool output. This feature is off by
 default.
 
+## Terminal UI
+
+To start directly at the input field without printing the welcome banner and
+workspace/provider metadata, enable minimal mode:
+
+```toml
+[tui]
+minimal = true
+```
+
+Turn activity, usage, completion, and session output are unchanged.
+
 ## Compaction
 
 Harness automatically summarizes older context when token pressure reaches a

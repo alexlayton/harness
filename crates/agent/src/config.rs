@@ -115,6 +115,14 @@ pub struct SubagentConfig {
     pub max_concurrent: Option<usize>,
 }
 
+/// Terminal UI presentation settings parsed from `[tui]`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TuiConfig {
+    /// Start directly at the input field without printing the welcome header.
+    #[serde(default)]
+    pub minimal: bool,
+}
+
 /// Resolved subagent bounds. Mirrors how [`CompactionPolicy`] relates to
 /// [`CompactConfig`]: file overrides layer over these defaults.
 #[derive(Clone, Copy, Debug)]
@@ -197,6 +205,9 @@ pub struct FileConfig {
     /// External MCP servers configured under `[[mcp.servers]]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<mcp::McpConfig>,
+    /// Terminal UI presentation settings (`[tui]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tui: Option<TuiConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -212,6 +223,7 @@ impl PartialEq for FileConfig {
             && self.compaction == other.compaction
             && self.subagents == other.subagents
             && self.mcp == other.mcp
+            && self.tui == other.tui
             && self.extra == other.extra
     }
 }
@@ -462,6 +474,8 @@ pub struct Config {
     pub subagents: SubagentPolicy,
     /// MCP servers after deterministic validation and `${ENV_VAR}` expansion.
     pub mcp_servers: Vec<mcp::McpServerConfig>,
+    /// Whether the interactive frontend skips its welcome header.
+    pub tui_minimal: bool,
     /// The Copilot credential handle loaded once during resolution. Startup
     /// used to construct `CopilotAuth::from_default()` twice — once for the
     /// entitled-model default inside `resolve`, again in `main` — reading and
@@ -594,6 +608,7 @@ impl Config {
                 .map(SubagentPolicy::from)
                 .unwrap_or_default(),
             mcp_servers: mcp_servers.unwrap_or_default(),
+            tui_minimal: file.tui.as_ref().is_some_and(|tui| tui.minimal),
             // Only the process-wide [`Config::resolve`] loads credentials;
             // the testable forms never touch auth.json.
             copilot_auth: None,
@@ -864,6 +879,7 @@ mod tests {
                 max_concurrent: Some(2),
             }),
             mcp: None,
+            tui: Some(TuiConfig { minimal: true }),
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),
@@ -881,6 +897,7 @@ mod tests {
         assert_eq!(saved.provider.as_deref(), Some("openrouter"));
         assert_eq!(saved.model.as_deref(), Some("router/demo"));
         assert!(saved.rtk);
+        assert!(saved.tui.is_some_and(|tui| tui.minimal));
         assert_eq!(
             saved.extra.get("future"),
             Some(&toml::Value::String("kept".into()))
