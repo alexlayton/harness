@@ -68,7 +68,25 @@ options.
 
 ## Installation
 
-Download the archive for your system from [GitHub Releases][releases]. Each
+The installer downloads the latest release, verifies its SHA-256 checksum, and
+puts `harness` in `~/.local/bin` (or a directory passed with `--bin-dir`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/alexlayton/harness/main/install.sh | bash
+```
+
+To install a specific release, pass the version through to the script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/alexlayton/harness/main/install.sh \
+  | bash -s -- --version v0.1.0
+```
+
+The script uses `curl` rather than a browser, so macOS downloads normally do
+not acquire a browser quarantine attribute. It does not invoke `sudo` or modify
+shell startup files.
+
+Alternatively, download the archive from [GitHub Releases][releases]. Each
 archive contains the `harness` binary, this README, and the license. Verify the
 archive with `SHA256SUMS`, then put the binary in a directory on your `PATH`.
 
@@ -80,7 +98,11 @@ Initial releases provide these builds:
 
 Windows is not supported in the initial release.
 
-Homebrew installation is planned, but it is not available yet.
+Homebrew users can install the source formula:
+
+```text
+brew install alexlayton/tap/harness
+```
 
 ## Quick start
 
