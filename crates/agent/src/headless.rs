@@ -692,7 +692,10 @@ mod tests {
     fn headless_config(cli: &Cli) -> Config {
         Config::resolve_from_file(
             cli,
-            &FileConfig::default(),
+            &FileConfig {
+                provider: Some("opencode-go".into()),
+                ..FileConfig::default()
+            },
             PathBuf::from("/tmp/harness-headless-config.toml"),
             |_| Some("secret".into()),
         )

@@ -353,6 +353,22 @@ pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> 
     save_file_config(path, &config)
 }
 
+/// Select an OAuth provider after login when the user has not already made a
+/// choice. Login must never unexpectedly replace an existing provider.
+pub fn select_provider_after_login(provider: ProviderArg) -> Result<bool> {
+    select_provider_after_login_at(&config_path(), provider)
+}
+
+fn select_provider_after_login_at(path: &Path, provider: ProviderArg) -> Result<bool> {
+    let mut config = load_file_config(path)?;
+    if config.provider.is_some() {
+        return Ok(false);
+    }
+    config.provider = Some(provider.to_string());
+    save_file_config(path, &config)?;
+    Ok(true)
+}
+
 #[derive(Clone, Debug, Default, Parser)]
 #[command(name = "harness", version, about = "A minimal coding-agent harness")]
 pub struct Cli {
@@ -465,12 +481,11 @@ impl Config {
         // an unrelated `--provider` override.
         let effective_provider = cli
             .provider
-            .or_else(|| file.provider.as_deref().and_then(ProviderArg::from_name))
-            .unwrap_or(ProviderArg::OpencodeGo);
-        let copilot_auth = (effective_provider == ProviderArg::GithubCopilot)
+            .or_else(|| file.provider.as_deref().and_then(ProviderArg::from_name));
+        let copilot_auth = (effective_provider == Some(ProviderArg::GithubCopilot))
             .then(|| CopilotAuth::from_default().map(Arc::new))
             .transpose()?;
-        let codex_auth = (effective_provider == ProviderArg::OpenAiCodex)
+        let codex_auth = (effective_provider == Some(ProviderArg::OpenAiCodex))
             .then(|| OpenAiCodexAuth::from_default().map(Arc::new))
             .transpose()?;
         let mut config = Self::resolve_from_file(cli, &file, path, env_api_key)?;
@@ -529,10 +544,12 @@ impl Config {
             })?),
             None => None,
         };
-        let provider = cli
-            .provider
-            .or(file_provider)
-            .unwrap_or(ProviderArg::OpencodeGo);
+        let provider = cli.provider.or(file_provider).ok_or_else(|| {
+            anyhow!(
+                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go      OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter       OpenRouter; set OPENROUTER_API_KEY\n  github-copilot   GitHub Copilot; run `harness login github-copilot`\n  openai-codex     OpenAI Codex; run `harness login openai-codex`",
+                path.display()
+            )
+        })?;
         // GitHub Copilot authenticates through the private auth store and is
         // intentionally constructible before the first login.  Existing API
         // key providers retain their old environment-only requirement.
@@ -621,7 +638,12 @@ pub fn build_provider_with_auths(
     codex_auth: Option<Arc<OpenAiCodexAuth>>,
 ) -> Result<Arc<dyn Provider>> {
     let provider = ProviderArg::from_name(name).ok_or_else(|| {
-        anyhow!("unknown provider: {name} (expected opencode-go, openrouter, or github-copilot)")
+        let expected = ProviderArg::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow!("unknown provider: {name} (expected one of: {expected})")
     })?;
     Ok(match provider {
         ProviderArg::OpencodeGo => {
@@ -676,21 +698,17 @@ mod tests {
     fn resolves_defaults_and_overrides() {
         // Resolve against an explicit file config so the developer's real
         // ~/.config/harness/config.toml cannot leak into the assertions.
-        let cli = Cli::default();
-        let config = Config::resolve_from_file(
-            &cli,
+        let error = Config::resolve_from_file(
+            &Cli::default(),
             &FileConfig::default(),
             PathBuf::from("/tmp/harness-config.toml"),
-            |provider| match provider {
-                ProviderArg::OpencodeGo => Some("secret".into()),
-                ProviderArg::Openrouter | ProviderArg::GithubCopilot | ProviderArg::OpenAiCodex => {
-                    None
-                }
-            },
+            |_| None,
         )
-        .unwrap();
-        assert_eq!(config.provider, ProviderArg::OpencodeGo);
-        assert_eq!(config.model, "gpt-5.6-luna");
+        .unwrap_err()
+        .to_string();
+        for provider in ProviderArg::ALL {
+            assert!(error.contains(&provider.to_string()));
+        }
 
         let cli = Cli {
             provider: Some(ProviderArg::Openrouter),
@@ -777,6 +795,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("/tmp/bad-config.toml"));
+    }
+
+    #[test]
+    fn login_selects_only_when_provider_is_unset() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+
+        assert!(select_provider_after_login_at(&path, ProviderArg::OpenAiCodex).unwrap());
+        assert_eq!(
+            load_file_config(&path).unwrap().provider.as_deref(),
+            Some("openai-codex")
+        );
+        assert!(!select_provider_after_login_at(&path, ProviderArg::GithubCopilot).unwrap());
+        assert_eq!(
+            load_file_config(&path).unwrap().provider.as_deref(),
+            Some("openai-codex")
+        );
     }
 
     #[test]

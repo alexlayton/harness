@@ -1,7 +1,8 @@
 # Providers and authentication
 
 Harness supports four providers. Select one with `--provider`, in
-`config.toml`, or with `/model` in the terminal UI.
+`config.toml`, or with `/model` in the terminal UI. If none is selected,
+Harness prints setup instructions instead of assuming an API-key provider.
 
 | Provider | Configuration name | Authentication |
 |---|---|---|
@@ -45,9 +46,9 @@ harness login github-copilot
 The command shows GitHub's device URL and one-time code. It also tries to open
 the URL in a browser. `Ctrl+C` cancels login.
 
-Login stores credentials only. It does not change the provider or model in
-`config.toml`. Select an available model with `/model` or explicit
-configuration after login.
+When no provider is configured, a successful login selects GitHub Copilot as
+the default provider. It never replaces an existing provider choice. Harness
+selects an available default model at startup; use `/model` to change it.
 
 Harness stores the short-lived Copilot access token and GitHub OAuth refresh
 token in:
@@ -99,8 +100,10 @@ harness login codex --device-code
 ```
 
 Credentials are stored in the same private `auth.json` file as Copilot
-credentials. Login does not change the configured provider or model. Select
-`openai-codex` and a model through `/model` or `config.toml`.
+credentials. When no provider is configured, a successful login selects
+`openai-codex` without replacing any existing choice. Harness uses the
+provider's default model until you select another through `/model` or
+`config.toml`.
 
 Codex uses a dedicated, SSE-only provider and dialect because its ChatGPT
 subscription protocol differs from the normal OpenAI API.

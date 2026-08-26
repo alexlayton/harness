@@ -89,17 +89,19 @@ prompt in the current workspace:
 
 ```text
 harness login github-copilot
-harness --provider github-copilot -p "Summarize this workspace"
+harness -p "Summarize this workspace"
 ```
 
-The login command shows a device URL and one-time code. Harness selects an
-available Copilot model when no model is configured. See [Providers and
-authentication][providers] for API-key providers and OpenAI Codex.
+The login command shows a device URL and one-time code. When no provider is
+configured, login selects Copilot without replacing an existing choice.
+Harness selects an available Copilot model when no model is configured. See
+[Providers and authentication][providers] for API-key providers and OpenAI
+Codex.
 
 Start the terminal UI with the same provider:
 
 ```text
-harness --provider github-copilot
+harness
 ```
 
 ## Usage overview

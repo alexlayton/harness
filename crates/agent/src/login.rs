@@ -1,5 +1,5 @@
 //! Human-facing standalone credential login.
-use crate::config::{LoginArgs, LoginProvider};
+use crate::config::{LoginArgs, LoginProvider, ProviderArg, select_provider_after_login};
 use anyhow::{Result, bail};
 use auth::{AuthEvent, CopilotAuth, OpenAiCodexAuth};
 use std::process::ExitCode;
@@ -15,11 +15,12 @@ pub async fn run(args: &LoginArgs) -> Result<ExitCode> {
         let _ = tokio::signal::ctrl_c().await;
         signal.cancel();
     });
-    match args.provider {
+    let provider = match args.provider {
         LoginProvider::GithubCopilot => {
             let auth = CopilotAuth::from_default()?;
             auth.login_with_events(None, &cancel, render_event).await?;
             eprintln!("GitHub Copilot login complete.");
+            ProviderArg::GithubCopilot
         }
         LoginProvider::OpenAiCodex => {
             let auth = OpenAiCodexAuth::from_default()?;
@@ -37,7 +38,11 @@ pub async fn run(args: &LoginArgs) -> Result<ExitCode> {
                 .await?;
             }
             eprintln!("OpenAI Codex login complete.");
+            ProviderArg::OpenAiCodex
         }
+    };
+    if select_provider_after_login(provider)? {
+        eprintln!("Selected {provider} as the default provider.");
     }
     Ok(ExitCode::SUCCESS)
 }

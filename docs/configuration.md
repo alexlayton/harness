@@ -29,6 +29,11 @@ The command line overrides `provider` and `model` for the current process:
 harness --provider openrouter --model openai/<model>
 ```
 
+Harness requires a provider choice rather than assuming one from an API key.
+When no provider is configured, startup lists the available providers and their
+setup commands. A successful OAuth login selects that provider only when this
+setting is absent.
+
 The `/model` terminal command updates the saved provider and model. Harness
 preserves configuration keys that it does not know when it saves these values.
 

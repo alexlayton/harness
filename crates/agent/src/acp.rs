@@ -1204,7 +1204,10 @@ mod tests {
     fn acp_config() -> Config {
         Config::resolve_from_file(
             &Cli::default(),
-            &FileConfig::default(),
+            &FileConfig {
+                provider: Some("opencode-go".into()),
+                ..FileConfig::default()
+            },
             PathBuf::from("/tmp/harness-acp-config.toml"),
             |_| Some("secret".into()),
         )
