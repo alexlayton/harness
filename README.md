@@ -134,6 +134,13 @@ map, data flow, and project invariants.
 Development uses the current stable Rust toolchain. The project does not yet
 declare a minimum supported Rust version (MSRV).
 
+Source package managers can avoid the expensive fat LTO used for official
+release artifacts while retaining an optimized, stripped binary:
+
+```text
+cargo install --locked --profile fast-release --path crates/agent
+```
+
 The common workspace checks are:
 
 ```text

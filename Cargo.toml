@@ -16,6 +16,13 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+# Source package managers still produce an optimized, stripped binary, but
+# avoid the fat-LTO/single-codegen-unit cost paid by official artifacts.
+[profile.fast-release]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 # Debug builds keep backtraces usable while shrinking the binary and target/
 # dramatically — full DWARF is most of the ~80 MB dev artifact and dominates
 # link time.
