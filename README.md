@@ -89,7 +89,7 @@ prompt in the current workspace:
 
 ```text
 harness login github-copilot
-harness -p "Summarize this workspace"
+harness prompt "Summarize this workspace"
 ```
 
 The login command shows a device URL and one-time code. When no provider is
@@ -113,13 +113,13 @@ compaction, and discovered skills.
 Run one prompt without the terminal UI:
 
 ```text
-harness -p "Summarize this workspace"
+harness prompt "Summarize this workspace"
 ```
 
 Run Harness as an ACP subprocess for an editor:
 
 ```text
-harness --acp
+harness acp
 ```
 
 For provider selection, sign-in commands, configuration paths, MCP setup, and

@@ -387,63 +387,62 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    #[arg(long, value_enum)]
+    /// Override the configured provider for this process.
+    #[arg(long, value_enum, global = true)]
     pub provider: Option<ProviderArg>,
 
-    #[arg(long)]
+    /// Override the configured model for this process.
+    #[arg(long, global = true)]
     pub model: Option<String>,
 
-    /// Non-interactive mode: run one prompt to completion and print the answer.
-    #[arg(short = 'p', long = "print", default_value_t = false)]
-    pub print: bool,
-
-    /// Verbose: stream reasoning + tool activity + full (bounded) tool output
-    /// to stderr. Default stderr is silent except for hard errors.
-    #[arg(short = 'v', long = "verbose", default_value_t = false)]
-    pub verbose: bool,
-
-    /// Resume an existing session instead of creating a fresh one.
-    /// Accepts a session id, unique prefix, `latest`, or a file path.
-    #[arg(long, value_name = "ID|latest|PATH")]
-    pub resume: Option<String>,
-
     /// Disable AGENTS.md / CLAUDE.md project-context injection.
-    #[arg(long = "no-context-files", default_value_t = false)]
+    #[arg(long = "no-context-files", default_value_t = false, global = true)]
     pub no_context_files: bool,
 
     /// Defer session fsyncs to turn boundaries instead of syncing every
     /// persisted event. Faster chatty tool loops at the cost of losing the
     /// current turn's tail (not just the in-flight record) on power loss.
-    #[arg(long = "defer-session-sync", default_value_t = false)]
+    #[arg(long = "defer-session-sync", default_value_t = false, global = true)]
     pub defer_session_sync: bool,
+}
 
-    /// Run without persisting a session at all (headless only). For one-shot
-    /// scripting where the transcript has no value; nothing is written to
-    /// `~/.harness/sessions`.
-    #[arg(long = "no-session", default_value_t = false)]
+/// Frontend and authentication commands. With no command Harness starts the
+/// interactive terminal UI.
+#[derive(Clone, Debug, clap::Subcommand)]
+pub enum Command {
+    /// Authenticate with an OAuth provider.
+    Login(LoginArgs),
+    /// Run one prompt and print only the final answer to stdout.
+    Prompt(PromptArgs),
+    /// Serve Agent Client Protocol over stdio for editor integrations.
+    Acp,
+}
+
+#[derive(Clone, Debug, Default, clap::Args)]
+pub struct PromptArgs {
+    /// Stream reasoning and tool activity to stderr.
+    #[arg(short = 'v', long = "verbose", default_value_t = false)]
+    pub verbose: bool,
+
+    /// Resume a session by id, unique prefix, `latest`, or file path.
+    #[arg(long, value_name = "ID|latest|PATH")]
+    pub resume: Option<String>,
+
+    /// Run without persisting a session.
+    #[arg(
+        long = "no-session",
+        default_value_t = false,
+        conflicts_with = "resume"
+    )]
     pub no_session: bool,
 
-    /// Serve the agent over stdio using the Agent Client Protocol (ACP), so
-    /// editors (Zed natively; Neovim/JetBrains via plugins) can drive harness.
-    /// Mutually exclusive with `--print`; provider/model/config flags still
-    /// apply. Tools run without an approval step, same as every frontend.
-    #[arg(long = "acp", conflicts_with = "print", default_value_t = false)]
-    pub acp: bool,
-
-    /// Prompt for non-interactive mode. Joined with spaces. When `--print` is
-    /// set and no positional is given, the prompt is read from stdin.
-    /// Only meaningful with `--print`; passing it without `--print` is an
-    /// error.
+    /// Prompt text, joined with spaces. When absent, read it from stdin.
     #[arg(value_name = "PROMPT")]
     pub prompt: Vec<String>,
 }
 
 /// Credential-only login command. It is dispatched before configuration
 /// resolution, so an unrelated configured API-key provider cannot block it.
-#[derive(Clone, Debug, clap::Subcommand)]
-pub enum Command {
-    Login(LoginArgs),
-}
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct LoginArgs {
@@ -708,6 +707,23 @@ pub fn init_logging() -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn frontends_parse_as_subcommands() {
+        let prompt =
+            Cli::try_parse_from(["harness", "prompt", "--provider", "openai-codex", "hello"])
+                .unwrap();
+        assert_eq!(prompt.provider, Some(ProviderArg::OpenAiCodex));
+        assert!(matches!(
+            prompt.command,
+            Some(Command::Prompt(PromptArgs { prompt, .. })) if prompt == ["hello"]
+        ));
+
+        let acp = Cli::try_parse_from(["harness", "acp", "--provider", "openai-codex"]).unwrap();
+        assert!(matches!(acp.command, Some(Command::Acp)));
+        assert!(Cli::try_parse_from(["harness", "--acp"]).is_err());
+        assert!(Cli::try_parse_from(["harness", "-p", "hello"]).is_err());
+    }
 
     #[test]
     fn resolves_defaults_and_overrides() {

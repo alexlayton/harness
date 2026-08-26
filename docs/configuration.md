@@ -151,7 +151,7 @@ The session format is documented in
 Headless mode can skip persistence for one run:
 
 ```text
-harness --print --no-session "prompt"
+harness prompt --no-session "prompt"
 ```
 
 `--defer-session-sync` syncs at turn boundaries instead of after each event.
@@ -184,16 +184,25 @@ HARNESS_LOG=/tmp/harness.log harness
 Tracing is file-only. This keeps terminal rendering clean and keeps headless
 and ACP stdout suitable for machine use.
 
-## Useful command-line options
+## Command-line interface
 
-| Option | Purpose |
+With no subcommand, Harness starts the terminal UI. Other frontends use
+subcommands:
+
+```text
+harness prompt --provider openrouter "Summarize this workspace"
+harness acp --provider openai-codex
+```
+
+| Command or option | Purpose |
 |---|---|
+| `prompt [PROMPT]` | Run one prompt and print only the final answer to stdout. Reads piped stdin when the prompt is omitted. |
+| `acp` | Serve ACP over stdio. |
+| `login <provider>` | Authenticate with an OAuth provider. |
 | `--provider <provider>` | Override the configured provider. |
 | `--model <model>` | Override the configured model. |
-| `-p`, `--print` | Run one prompt and print only the final answer to stdout. |
-| `-v`, `--verbose` | In headless mode, write reasoning and tool progress to stderr. |
-| `--resume <selector>` | Resume a session by ID, unique prefix, `latest`, or path in headless mode. |
-| `--no-session` | Do not persist a headless run. |
+| `-v`, `--verbose` | In prompt mode, write reasoning and tool progress to stderr. |
+| `--resume <selector>` | Resume a session by ID, unique prefix, `latest`, or path in prompt mode. |
+| `--no-session` | Do not persist a prompt-mode run. |
 | `--defer-session-sync` | Sync session records at turn boundaries. |
 | `--no-context-files` | Disable project instruction files. |
-| `--acp` | Serve ACP over stdio. |

@@ -156,7 +156,7 @@ impl AcpState {
     }
 }
 
-/// Entry point for `harness --acp`: serve one ACP agent over stdio until the
+/// Entry point for `harness acp`: serve one ACP agent over stdio until the
 /// client disconnects.
 pub async fn run(
     provider: Arc<dyn Provider>,

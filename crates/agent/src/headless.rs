@@ -1,4 +1,4 @@
-//! Headless / non-interactive runtime: `harness -p "…"`.
+//! Headless / non-interactive runtime: `harness prompt "…"`.
 //!
 //! This is an alternative *frontend* that drives the exact same
 //! [`Agent`](crate::agent::Agent) stack the TUI uses.  One prompt is ingested
@@ -9,7 +9,7 @@
 
 use crate::agent::AgentEvent;
 use crate::assembly::AgentBuilder;
-use crate::config::{Cli, Config};
+use crate::config::{Config, PromptArgs};
 use crate::project_context_for;
 use crate::tools::ToolRegistry;
 use anyhow::{Context, Result, anyhow};
@@ -22,15 +22,13 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tui::InputMessage;
 
-/// Resolve the one-shot prompt for `--print` mode.
+/// Resolve the one-shot prompt for the `prompt` command.
 ///
-/// Precedence: a positional prompt wins over stdin; absent a positional, a
-/// pipe (non-tty stdin) is read in full; a tty with no positional is an error.
-/// Without `--print`, a positional is an error and the result is unused (the
-/// interactive TUI path takes over).
-pub fn resolve_prompt(cli: &Cli) -> Result<String> {
+/// A positional prompt wins over stdin; absent a positional, a pipe (non-tty
+/// stdin) is read in full; a tty with no positional is an error.
+pub fn resolve_prompt(args: &PromptArgs) -> Result<String> {
     resolve_prompt_with(
-        cli,
+        args,
         || std::io::stdin().is_terminal(),
         || {
             let mut buffer = String::new();
@@ -45,18 +43,12 @@ pub fn resolve_prompt(cli: &Cli) -> Result<String> {
 /// Testable core of [`resolve_prompt`]: the tty probe and the stdin read are
 /// injected so unit tests need neither a real terminal nor a real pipe.
 fn resolve_prompt_with(
-    cli: &Cli,
+    args: &PromptArgs,
     stdin_is_tty: impl FnOnce() -> bool,
     read_stdin: impl FnOnce() -> Result<String>,
 ) -> Result<String> {
-    if !cli.print {
-        if cli.prompt.is_empty() {
-            return Ok(String::new());
-        }
-        return Err(anyhow!("prompt requires --print"));
-    }
-    if !cli.prompt.is_empty() {
-        return Ok(cli.prompt.join(" ").trim().to_owned());
+    if !args.prompt.is_empty() {
+        return Ok(args.prompt.join(" ").trim().to_owned());
     }
     if stdin_is_tty() {
         return Err(anyhow!(
@@ -269,12 +261,13 @@ async fn drive_headless_events_into(
 /// interactive path uses.
 pub async fn run_headless(
     config: &Config,
-    cli: &Cli,
+    args: &PromptArgs,
+    no_context_files: bool,
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
     store: Option<SessionStore>,
 ) -> Result<ExitCode> {
-    run_headless_with_cancel(config, cli, provider, tools, store, None).await
+    run_headless_with_cancel(config, args, no_context_files, provider, tools, store, None).await
 }
 
 /// [`run_headless`] with an optional externally supplied cancellation token so
@@ -282,15 +275,16 @@ pub async fn run_headless(
 /// passes `None`, which installs the real SIGINT handler.
 async fn run_headless_with_cancel(
     config: &Config,
-    cli: &Cli,
+    args: &PromptArgs,
+    no_context_files: bool,
     provider: Arc<dyn Provider>,
     tools: ToolRegistry,
     store: Option<SessionStore>,
     external_cancel: Option<CancellationToken>,
 ) -> Result<ExitCode> {
-    let prompt = resolve_prompt(cli)?;
+    let prompt = resolve_prompt(args)?;
 
-    let session = match (&cli.resume, &store) {
+    let session = match (&args.resume, &store) {
         (Some(selector), Some(store)) => Some(
             store
                 .load(selector)
@@ -318,7 +312,7 @@ async fn run_headless_with_cancel(
     ) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
-    let project_context = project_context_for(tools.workspace_root(), cli.no_context_files);
+    let project_context = project_context_for(tools.workspace_root(), no_context_files);
 
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_compaction(config.compaction.clone())
@@ -346,7 +340,7 @@ async fn run_headless_with_cancel(
         cancel_on_sigint(cancel.clone());
     }
 
-    let exit_code = drive_headless_events(event_rx, cli.verbose).await;
+    let exit_code = drive_headless_events(event_rx, args.verbose).await;
     let interrupted = cancel.is_cancelled();
     cancel.cancel();
     let _ = agent_task.await;
@@ -361,7 +355,7 @@ async fn run_headless_with_cancel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::FileConfig;
+    use crate::config::{Cli, FileConfig};
     use async_trait::async_trait;
     use futures_util::stream;
     use llm::{
@@ -377,57 +371,31 @@ mod tests {
 
     #[test]
     fn positional_prompt_wins_over_stdin() {
-        let cli = Cli {
-            print: true,
+        let args = PromptArgs {
             prompt: vec!["write".into(), "a".into(), "poem".into()],
-            ..Cli::default()
+            ..PromptArgs::default()
         };
-        let prompt = resolve_prompt_with(&cli, || true, || unreachable!()).unwrap();
+        let prompt = resolve_prompt_with(&args, || true, || unreachable!()).unwrap();
         assert_eq!(prompt, "write a poem");
     }
 
     #[test]
     fn stdin_is_used_when_no_positional_and_stdin_is_not_a_tty() {
-        let cli = Cli {
-            print: true,
-            ..Cli::default()
-        };
-        let prompt = resolve_prompt_with(&cli, || false, || Ok("piped\nprompt\n".into())).unwrap();
+        let prompt = resolve_prompt_with(
+            &PromptArgs::default(),
+            || false,
+            || Ok("piped\nprompt\n".into()),
+        )
+        .unwrap();
         assert_eq!(prompt, "piped\nprompt");
     }
 
     #[test]
     fn tty_without_positional_is_an_error() {
-        let cli = Cli {
-            print: true,
-            ..Cli::default()
-        };
-        let error = resolve_prompt_with(&cli, || true, || unreachable!())
+        let error = resolve_prompt_with(&PromptArgs::default(), || true, || unreachable!())
             .err()
             .unwrap();
         assert!(error.to_string().contains("no prompt"));
-    }
-
-    #[test]
-    fn positional_without_print_is_an_error() {
-        let cli = Cli {
-            print: false,
-            prompt: vec!["hello".into()],
-            ..Cli::default()
-        };
-        let error = resolve_prompt_with(&cli, || true, || unreachable!())
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("prompt requires --print"));
-    }
-
-    #[test]
-    fn interactive_without_prompt_is_empty() {
-        let cli = Cli::default();
-        assert_eq!(
-            resolve_prompt_with(&cli, || true, || unreachable!()).unwrap(),
-            ""
-        );
     }
 
     // ------------------------------------------------------------- event routing
@@ -689,9 +657,9 @@ mod tests {
         }
     }
 
-    fn headless_config(cli: &Cli) -> Config {
+    fn headless_config() -> Config {
         Config::resolve_from_file(
-            cli,
+            &Cli::default(),
             &FileConfig {
                 provider: Some("opencode-go".into()),
                 ..FileConfig::default()
@@ -738,16 +706,16 @@ mod tests {
                 .unwrap();
 
             let provider = Arc::new(RecordingProvider::default());
-            let cli = Cli {
-                print: true,
+            let args = PromptArgs {
                 resume: Some(session.id().to_string()),
                 prompt: vec!["follow up".into()],
-                ..Cli::default()
+                ..PromptArgs::default()
             };
-            let config = headless_config(&cli);
+            let config = headless_config();
             let code = run_headless(
                 &config,
-                &cli,
+                &args,
+                false,
                 provider.clone(),
                 ToolRegistry::empty(),
                 Some(store),
@@ -776,15 +744,21 @@ mod tests {
         runtime.block_on(async {
             let root = tempdir().unwrap();
             let provider = Arc::new(RecordingProvider::default());
-            let cli = Cli {
-                print: true,
+            let args = PromptArgs {
                 prompt: vec!["ephemeral".into()],
-                ..Cli::default()
+                ..PromptArgs::default()
             };
-            let config = headless_config(&cli);
-            let code = run_headless(&config, &cli, provider.clone(), ToolRegistry::empty(), None)
-                .await
-                .unwrap();
+            let config = headless_config();
+            let code = run_headless(
+                &config,
+                &args,
+                false,
+                provider.clone(),
+                ToolRegistry::empty(),
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(code, ExitCode::SUCCESS);
             assert_eq!(provider.texts(), vec!["ephemeral".to_owned()]);
             // Nothing was written: the store root never even materialized.
@@ -800,15 +774,15 @@ mod tests {
             let workspace = tempdir().unwrap();
             let store = SessionStore::new(root.path(), workspace.path()).unwrap();
             let provider = Arc::new(RecordingProvider::default());
-            let cli = Cli {
-                print: true,
+            let args = PromptArgs {
                 prompt: vec!["hello".into()],
-                ..Cli::default()
+                ..PromptArgs::default()
             };
-            let config = headless_config(&cli);
+            let config = headless_config();
             let code = run_headless(
                 &config,
-                &cli,
+                &args,
+                false,
                 provider.clone(),
                 ToolRegistry::empty(),
                 Some(store),
@@ -860,20 +834,20 @@ mod tests {
                 .unwrap();
             let id = session.id().to_string();
 
-            let cli = Cli {
-                print: true,
+            let args = PromptArgs {
                 resume: Some(id.clone()),
                 prompt: vec!["hello".into()],
-                ..Cli::default()
+                ..PromptArgs::default()
             };
-            let config = headless_config(&cli);
+            let config = headless_config();
             let cancel = CancellationToken::new();
             let store_for_run = store.clone();
             let cancel_for_run = cancel.clone();
             let task = tokio::spawn(async move {
                 run_headless_with_cancel(
                     &config,
-                    &cli,
+                    &args,
+                    false,
                     Arc::new(HangingProvider),
                     ToolRegistry::empty(),
                     Some(store_for_run),

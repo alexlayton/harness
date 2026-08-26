@@ -8,7 +8,7 @@ compatible plugins.
 Configure the editor to start this subprocess:
 
 ```text
-harness --acp
+harness acp
 ```
 
 The editor sends `session/new`, `session/load`, `session/prompt`, and

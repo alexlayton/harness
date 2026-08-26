@@ -5,7 +5,7 @@ use agent::config::{Cli, Command, Config, ProviderArg, build_provider_with_auths
 use agent::headless::run_headless;
 use agent::project_context_for;
 use agent::tools::{ToolConfig, default_registry};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
@@ -35,23 +35,13 @@ async fn main_inner() -> Result<ExitCode> {
         return agent::login::run(args).await;
     }
 
-    // `--print`-only flags have no meaning in the interactive TUI, which
-    // exposes the same capabilities through its own slash commands.
-    if !cli.print && !cli.prompt.is_empty() {
-        bail!("prompt requires --print");
-    }
-    if !cli.print && cli.resume.is_some() {
-        bail!("--resume requires --print");
-    }
-    if !cli.print && cli.no_session {
-        bail!("--no-session requires --print");
-    }
-    if cli.no_session && cli.resume.is_some() {
-        bail!("--resume conflicts with --no-session");
-    }
+    let prompt_args = match &cli.command {
+        Some(Command::Prompt(args)) => Some(args),
+        _ => None,
+    };
     // Whether any part of this run touches the session store: interactive
-    // mode always persists; headless mode skips it under `--no-session`.
-    let needs_session_store = !cli.print || !cli.no_session;
+    // mode always persists; prompt mode skips it under `--no-session`.
+    let needs_session_store = prompt_args.is_none_or(|args| !args.no_session);
 
     init_logging()?;
     // Startup tracing: one log line per stage so "fast" stays measurable and
@@ -81,7 +71,7 @@ async fn main_inner() -> Result<ExitCode> {
     // workspace root stays the launch directory; per-session roots come from
     // each `session/new` request, so none of the process-cwd startup work
     // below (registry, store, context files) is built.
-    if cli.acp {
+    if matches!(&cli.command, Some(Command::Acp)) {
         return acp::run(provider, config, copilot_auth, cli.no_context_files).await;
     }
 
@@ -141,12 +131,20 @@ async fn main_inner() -> Result<ExitCode> {
         .map(|store| store.with_deferred_sync(cli.defer_session_sync));
     tracing::info!(stage = "registry+store+context", elapsed_ms = since_start());
 
-    if cli.print {
-        return run_headless(&config, &cli, provider, tools, session_store).await;
+    if let Some(args) = prompt_args {
+        return run_headless(
+            &config,
+            args,
+            cli.no_context_files,
+            provider,
+            tools,
+            session_store,
+        )
+        .await;
     }
 
     // Interactive mode always has a store (enforced by needs_session_store
-    // being true when !cli.print); headless may run without one.
+    // being true without the prompt subcommand); headless may run without one.
     let session_store = session_store.expect("interactive mode always builds the session store");
 
     let session = session_store.create(SessionCreateOptions {

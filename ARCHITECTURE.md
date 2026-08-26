@@ -66,9 +66,9 @@ MCP, and subagent setup has one implementation.
 
 - **TUI:** direct Crossterm UI with completed output in native terminal
   scrollback. `tui` receives only provider-independent `UiEvent`s.
-- **Headless:** `harness -p "…"` writes only the final answer to stdout.
+- **Headless:** `harness prompt "…"` writes only the final answer to stdout.
   Optional progress goes to stderr behind `-v`; stdout purity is an invariant.
-- **ACP:** `harness --acp` serves Agent Client Protocol over stdio. Stdout is
+- **ACP:** `harness acp` serves Agent Client Protocol over stdio. Stdout is
   JSON-RPC only and tracing remains file-only. Each ACP session owns an agent,
   registry, and session store rooted at the editor workspace.
 

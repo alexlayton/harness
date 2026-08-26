@@ -19,7 +19,7 @@ cargo clippy --workspace        # keep it clean
 cargo build                     # builds only the `agent` crate (default-members)
 cargo build --workspace         # everything
 cargo test --workspace          # all tests; plain `cargo test` covers agent only
-cargo run -p agent -- -p "hi"   # run the `harness` binary headless
+cargo run -p agent -- prompt "hi" # run the `harness` binary headless
 cargo run -p agent              # run the TUI
 ```
 
