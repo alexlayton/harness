@@ -10,7 +10,7 @@ use serde::Deserialize;
 
 pub const BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
-pub const RESPONSES_MODELS: &[&str] = &["gpt-5.6-luna"];
+pub const RESPONSES_MODELS: &[&str] = &["gpt-5.6-luna", "grok-4.6"];
 pub const MESSAGES_MODELS: &[&str] = &[
     "minimax-m3",
     "minimax-m2.7",
