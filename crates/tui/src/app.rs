@@ -106,7 +106,10 @@ const INPUT_PREFIX_WIDTH: usize = 2;
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Entry {
     /// The startup wordmark and discoverability footer.
-    Banner,
+    Banner {
+        /// Random launch order retained so resize repaints stay consistent.
+        title_order: render::WelcomeTitleOrder,
+    },
     /// The header metadata line: `cwd  (branch)` left, `provider · model`
     /// right — the same metadata a classic status bar would show above
     /// its input box.
@@ -454,7 +457,9 @@ impl CrossTerm {
         // The startup header: the wordmark banner augmented with the
         // cwd/branch and provider/model metadata line.
         if !self.minimal {
-            self.pending.push(Entry::Banner);
+            self.pending.push(Entry::Banner {
+                title_order: render::WelcomeTitleOrder::random(),
+            });
             self.pending.push(self.metadata_entry());
         }
         self.paint()?;
@@ -2009,7 +2014,7 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     let mut index = 0usize;
     transcript.retain(|entry| {
         let keep = match entry {
-            Entry::Banner | Entry::Metadata { .. } => true,
+            Entry::Banner { .. } | Entry::Metadata { .. } => true,
             Entry::Separator { .. } => Some(index) == last_separator,
             _ => false,
         };
@@ -2047,7 +2052,7 @@ fn entry_lines(
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     match entry {
-        Entry::Banner => render::welcome_lines(width, theme),
+        Entry::Banner { title_order } => render::welcome_lines(width, theme, title_order),
         Entry::Metadata {
             cwd,
             branch,

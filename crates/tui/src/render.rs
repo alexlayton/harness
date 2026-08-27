@@ -82,32 +82,108 @@ pub(crate) fn content_width(width: u16) -> usize {
     width.saturating_sub(2 * horizontal_pad(width)).max(1) as usize
 }
 
-/// The startup banner committed into scrollback on startup.
-pub(crate) fn welcome_lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
-    // Block-letter wordmark (figlet "DemonicLand"), rendered in the accent
-    // colour used elsewhere for UI highlights (activity marker, message
-    // prefixes, links) so it reads as part of the UI rather than an imported
-    // graphic. Kept verbatim: 4 lines x 48 cols, single-space letter
-    // spacing.
-    const TITLE: &[&str] = &[
+// The startup wordmarks are embedded rather than read from a workspace file:
+// installed binaries should have the same welcome screen regardless of cwd.
+// Each inner slice is one font from `headers.txt`, plus the original wordmark.
+const WELCOME_TITLES: &[&[&str]] = &[
+    &[
         "██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██",
         "██▀▀██ ▒▓  ██ ██     ██  ██ ██▄▄▓▒ ▓█▄▄▄▄ ▓█▄▄▄▄",
         "██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▒▒ ▄▄  ▒▒",
         "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
-    ];
-    // Same role as the prompt activity marker / message accents.
-    let title_style = Style::default().fg(theme.accent);
-    let title_width = TITLE
+    ],
+    &[
+        " ▄▀▀▄ ▄▄   ▄▀▀█▄   ▄▀▀▄▀▀▀▄  ▄▀▀▄ ▀▄  ▄▀▀█▄▄▄▄  ▄▀▀▀▀▄  ▄▀▀▀▀▄",
+        "█  █   ▄▀ ▐ ▄▀ ▀▄ █   █   █ █  █ █ █ ▐  ▄▀   ▐ █ █   ▐ █ █   ▐",
+        "▐  █▄▄▄█    █▄▄▄█ ▐  █▀▀█▀  ▐  █  ▀█   █▄▄▄▄▄     ▀▄      ▀▄",
+        "   █   █   ▄▀   █  ▄▀    █    █   █    █    ▌  ▀▄   █  ▀▄   █",
+        "  ▄▀  ▄▀  █   ▄▀  █     █   ▄▀   █    ▄▀▄▄▄▄    █▀▀▀    █▀▀▀",
+        " █   █    ▐   ▐   ▐     ▐   █    ▐    █    ▐    ▐       ▐",
+        " ▐   ▐                      ▐         ▐",
+    ],
+    &[
+        " ▄  █ ██   █▄▄▄▄   ▄   ▄███▄     ▄▄▄▄▄    ▄▄▄▄▄",
+        "█   █ █ █  █  ▄▀    █  █▀   ▀   █     ▀▄ █     ▀▄",
+        "██▀▀█ █▄▄█ █▀▀▌ ██   █ ██▄▄   ▄  ▀▀▀▀▄ ▄  ▀▀▀▀▄",
+        "█   █ █  █ █  █ █ █  █ █▄   ▄▀ ▀▄▄▄▄▀   ▀▄▄▄▄▀",
+        "   █     █   █  █  █ █ ▀███▀",
+        "  ▀     █   ▀   █   ██",
+        "       ▀",
+    ],
+    &[
+        " ██░ ██  ▄▄▄       ██▀███   ███▄    █ ▓█████   ██████   ██████",
+        "▓██░ ██▒▒████▄    ▓██ ▒ ██▒ ██ ▀█   █ ▓█   ▀ ▒██    ▒ ▒██    ▒",
+        "▒██▀▀██░▒██  ▀█▄  ▓██ ░▄█ ▒▓██  ▀█ ██▒▒███   ░ ▓██▄   ░ ▓██▄",
+        "░▓█ ░██ ░██▄▄▄▄██ ▒██▀▀█▄  ▓██▒  ▐▌██▒▒▓█  ▄   ▒   ██▒  ▒   ██▒",
+        "░▓█▒░██▓ ▓█   ▓██▒░██▓ ▒██▒▒██░   ▓██░░▒████▒▒██████▒▒▒██████▒▒",
+        " ▒ ░░▒░▒ ▒▒   ▓▒█░░ ▒▓ ░▒▓░░ ▒░   ▒ ▒ ░░ ▒░ ░▒ ▒▓▒ ▒ ░▒ ▒▓▒ ▒ ░",
+        " ▒ ░▒░ ░  ▒   ▒▒ ░  ░▒ ░ ▒░░ ░░   ░ ▒░ ░ ░  ░░ ░▒  ░ ░░ ░▒  ░ ░",
+        " ░  ░░ ░  ░   ▒     ░░   ░    ░   ░ ░    ░   ░  ░  ░  ░  ░  ░",
+        " ░  ░  ░      ░  ░   ░              ░    ░  ░      ░        ░",
+    ],
+    &[
+        "▄█    █▄       ▄████████    ▄████████ ███▄▄▄▄      ▄████████    ▄████████    ▄████████",
+        "  ███    ███     ███    ███   ███    ███ ███▀▀▀██▄   ███    ███   ███    ███   ███    ███",
+        "  ███    ███     ███    ███   ███    ███ ███   ███   ███    █▀    ███    █▀    ███    █▀",
+        " ▄███▄▄▄▄███▄▄   ███    ███  ▄███▄▄▄▄██▀ ███   ███  ▄███▄▄▄       ███          ███",
+        "▀▀███▀▀▀▀███▀  ▀███████████ ▀▀███▀▀▀▀▀   ███   ███ ▀▀███▀▀▀     ▀███████████ ▀███████████",
+        "  ███    ███     ███    ███ ▀███████████ ███   ███   ███    █▄           ███          ███",
+        "  ███    ███     ███    ███   ███    ███ ███   ███   ███    ███    ▄█    ███    ▄█    ███",
+        "  ███    █▀      ███    █▀    ███    ███  ▀█   █▀    ██████████  ▄████████▀   ▄████████▀",
+        "                              ███    ███",
+    ],
+    &[
+        " ▄ .▄ ▄▄▄· ▄▄▄   ▐ ▄ ▄▄▄ ..▄▄ · .▄▄ ·",
+        "██▪▐█▐█ ▀█ ▀▄ █·•█▌▐█▀▄.▀·▐█ ▀. ▐█ ▀.",
+        "██▀▐█▄█▀▀█ ▐▀▀▄ ▐█▐▐▌▐▀▀▪▄▄▀▀▀█▄▄▀▀▀█▄",
+        "██▌▐▀▐█ ▪▐▌▐█•█▌██▐█▌▐█▄▄▌▐█▄▪▐█▐█▄▪▐█",
+        "▀▀▀ · ▀  ▀ .▀  ▀▀▀ █▪ ▀▀▀  ▀▀▀▀  ▀▀▀▀",
+    ],
+];
+
+/// A launch-randomized priority order. Keeping it in the transcript entry
+/// makes resize repaints stable while still allowing a narrower title to take
+/// over if the terminal no longer has room for the first choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WelcomeTitleOrder(Vec<usize>);
+
+impl WelcomeTitleOrder {
+    pub(crate) fn random() -> Self {
+        let mut order = (0..WELCOME_TITLES.len()).collect::<Vec<_>>();
+        fastrand::shuffle(&mut order);
+        Self(order)
+    }
+
+    fn fitting_title(&self, width: usize) -> Option<&'static [&'static str]> {
+        self.0
+            .iter()
+            .map(|index| WELCOME_TITLES[*index])
+            .find(|title| title_width(title) <= width)
+    }
+}
+
+fn title_width(title: &[&str]) -> usize {
+    title
         .iter()
         .map(|line| UnicodeWidthStr::width(*line))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+}
+
+/// The startup banner committed into scrollback on startup.
+pub(crate) fn welcome_lines(
+    width: usize,
+    theme: Theme,
+    title_order: &WelcomeTitleOrder,
+) -> Vec<Line<'static>> {
+    // Same role as the prompt activity marker / message accents.
+    let title_style = Style::default().fg(theme.accent);
     let mut lines = Vec::new();
     // The banner opens scrollback immediately below whatever the shell left
     // on screen; give the title the design system's breathing room.
     push_blank(&mut lines, SECTION_GAP);
-    if width >= title_width + 2 {
-        lines.extend(TITLE.iter().map(|line| line_with_style(*line, title_style)));
+    if let Some(title) = title_order.fitting_title(width) {
+        lines.extend(title.iter().map(|line| line_with_style(*line, title_style)));
     } else {
         lines.push(line_with_style("Harness", title_style));
     }
@@ -624,6 +700,50 @@ mod tests {
             .iter()
             .map(span_contents)
             .collect()
+    }
+
+    #[test]
+    fn welcome_title_falls_back_to_a_shorter_font() {
+        let (shortest, shortest_width) = WELCOME_TITLES
+            .iter()
+            .enumerate()
+            .map(|(index, title)| (index, title_width(title)))
+            .min_by_key(|(_, width)| *width)
+            .unwrap();
+        let (widest, widest_width) = WELCOME_TITLES
+            .iter()
+            .enumerate()
+            .map(|(index, title)| (index, title_width(title)))
+            .max_by_key(|(_, width)| *width)
+            .unwrap();
+        assert!(widest_width > shortest_width);
+
+        let order = WelcomeTitleOrder(vec![widest, shortest]);
+        assert_eq!(
+            order.fitting_title(shortest_width),
+            Some(WELCOME_TITLES[shortest])
+        );
+    }
+
+    #[test]
+    fn welcome_title_uses_plain_text_when_no_font_fits() {
+        let minimum_width = WELCOME_TITLES
+            .iter()
+            .map(|title| title_width(title))
+            .min()
+            .unwrap();
+        let order = WelcomeTitleOrder((0..WELCOME_TITLES.len()).collect());
+        let lines = welcome_lines(minimum_width - 1, Theme::default(), &order);
+
+        // The first row is the standard opening gap.
+        assert_eq!(span_contents(&lines[1]), "Harness");
+    }
+
+    #[test]
+    fn random_welcome_order_contains_every_font_once() {
+        let mut order = WelcomeTitleOrder::random().0;
+        order.sort_unstable();
+        assert_eq!(order, (0..WELCOME_TITLES.len()).collect::<Vec<_>>());
     }
 
     #[test]

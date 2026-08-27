@@ -3770,6 +3770,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossterm",
+ "fastrand",
  "futures-util",
  "ignore",
  "proptest",
