@@ -31,11 +31,11 @@ headless scripts, or from an editor through the Agent Client Protocol (ACP).
 
 ## The gimmick: spend fewer tokens
 
-Harness has built-in support for [RTK (Rust Token Killer)][rtk]. When enabled,
-the bash tool asks an installed `rtk` binary to rewrite supported commands into
-token-optimized equivalents. Unsupported commands, rewrite failures, and a
-missing RTK binary fall back to the original command. RTK is optional and off
-by default; set `rtk = true` in `config.toml` to enable it.
+Harness bundles [RTK (Rust Token Killer)][rtk] as a library. When enabled,
+the bash tool routes supported commands through RTK's token-optimized filters
+in process; unsupported or complex shell commands execute unchanged through
+RTK's shell passthrough. No separate `rtk` executable is required. RTK is
+optional and off by default; set `rtk = true` in `config.toml` to enable it.
 
 The `find`, `grep`, and `multigrep` tools use the [fff-search crate][fff]. They
 share one lazy, watched workspace index. The `grep` tool uses fff-search's

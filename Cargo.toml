@@ -40,6 +40,7 @@ auth = { path = "crates/auth" }
 compact = { path = "crates/compact" }
 llm = { path = "crates/llm" }
 mcp = { path = "crates/mcp" }
+rtk = { git = "https://github.com/alexlayton/rtk.git", rev = "d8ff04d7952d27bf33f320cf5790640b9d17f9a2" }
 session = { path = "crates/session" }
 tools = { path = "crates/tools" }
 tui = { path = "crates/tui" }
