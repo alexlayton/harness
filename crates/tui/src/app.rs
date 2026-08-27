@@ -592,12 +592,19 @@ impl CrossTerm {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if control => {
-                if self.busy {
-                    let _ = input_tx.send(InputMessage::Interrupt);
-                } else {
-                    cancel.cancel();
-                    return Ok(true);
+                if !self.input.is_empty() {
+                    // Match readline-style two-step Ctrl+C behavior: discard
+                    // the current draft first, then let a subsequent press
+                    // close Harness. Esc remains the turn-local interrupt.
+                    self.input.clear();
+                    self.cursor = 0;
+                    self.history_pos = None;
+                    self.draft.clear();
+                    self.close_completion();
+                    return Ok(false);
                 }
+                cancel.cancel();
+                return Ok(true);
             }
             KeyCode::Char('d') if control => {
                 cancel.cancel();
@@ -611,8 +618,8 @@ impl CrossTerm {
                 self.repaint_all()?;
                 return Ok(false);
             }
-            // Esc interrupts a running turn (the same intent as Ctrl+C); when
-            // a completion list is open, Esc closes the list instead.
+            // Esc interrupts a running turn; when a completion list is open,
+            // Esc closes the list instead.
             KeyCode::Esc => {
                 if self.busy {
                     let _ = input_tx.send(InputMessage::Interrupt);
@@ -2911,6 +2918,34 @@ mod tests {
             .iter()
             .map(|running| running.record.summary.clone())
             .collect()
+    }
+
+    #[test]
+    fn ctrl_c_clears_a_draft_before_closing_harness() {
+        let mut ui = ui(80, 24);
+        ui.input = "unfinished prompt".into();
+        ui.cursor = ui.input.len();
+        ui.history_pos = Some(0);
+        ui.draft = "older draft".into();
+        ui.busy = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert!(!ui.handle_input(&ctrl_c, &tx, &cancel).unwrap());
+        assert!(ui.input.is_empty());
+        assert_eq!(ui.cursor, 0);
+        assert_eq!(ui.history_pos, None);
+        assert!(ui.draft.is_empty());
+        assert!(!cancel.is_cancelled());
+        assert!(
+            rx.try_recv().is_err(),
+            "clearing must not interrupt the turn"
+        );
+
+        assert!(ui.handle_input(&ctrl_c, &tx, &cancel).unwrap());
+        assert!(cancel.is_cancelled());
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
