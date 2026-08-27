@@ -1,4 +1,4 @@
-use crate::dialects::openai_chat::OpenAiChatClient;
+use crate::dialects::openai_chat::{ChatReasoningFormat, OpenAiChatClient};
 use crate::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider};
 use reqwest::header::{HeaderMap, HeaderValue};
 
@@ -14,7 +14,8 @@ impl OpenRouterProvider {
         let mut headers = HeaderMap::new();
         headers.insert("X-OpenRouter-Title", HeaderValue::from_static("harness"));
         Self {
-            chat: OpenAiChatClient::with_headers(BASE_URL, api_key, headers),
+            chat: OpenAiChatClient::with_headers(BASE_URL, api_key, headers)
+                .with_reasoning_format(ChatReasoningFormat::OpenRouter),
         }
     }
 }

@@ -215,6 +215,11 @@ async fn drive_headless_events_into(
                     let _ = writeln!(stderr, "model → {provider} · {model}");
                 }
             }
+            AgentEvent::ReasoningChanged { level } => {
+                if verbose {
+                    let _ = writeln!(stderr, "reasoning → {level}");
+                }
+            }
             AgentEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
@@ -314,6 +319,7 @@ async fn run_headless_with_cancel(
     let project_context = project_context_for(tools.workspace_root(), no_context_files);
 
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+        .with_reasoning(config.reasoning)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())

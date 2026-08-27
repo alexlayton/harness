@@ -70,7 +70,7 @@ impl Agent {
                 tools: tool_snapshot.definitions,
                 max_tokens: None,
                 temperature: None,
-                reasoning: true,
+                reasoning: self.reasoning,
             };
 
             let retry_events = events.clone();

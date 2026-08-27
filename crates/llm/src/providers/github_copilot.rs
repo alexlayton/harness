@@ -7,7 +7,9 @@
 use crate::dialects::anthropic::AnthropicMessagesClient;
 use crate::dialects::openai_chat::OpenAiChatClient;
 use crate::dialects::openai_responses::OpenAiResponsesClient;
-use crate::{CompletionRequest, EventStream, LlmError, Message, ModelInfo, Provider, Role};
+use crate::{
+    CompletionRequest, EventStream, LlmError, Message, ModelInfo, Provider, ReasoningPolicy, Role,
+};
 use auth::{
     COPILOT_EDITOR_PLUGIN_VERSION, COPILOT_EDITOR_VERSION, COPILOT_INTEGRATION_ID,
     COPILOT_USER_AGENT, CopilotAuth,
@@ -465,6 +467,14 @@ impl Provider for GithubCopilotProvider {
                 req.model
             ))
         })?;
+        if matches!(req.reasoning, ReasoningPolicy::Effort(_))
+            && model.dialect != Dialect::OpenAiResponses
+        {
+            return Err(LlmError::Parse(format!(
+                "GitHub Copilot model `{}` does not expose portable reasoning effort on its {:?} endpoint; use `auto` or `off`",
+                req.model, model.dialect
+            )));
+        }
         let credential = self.auth.ensure_valid().await.map_err(auth_error)?;
         let sku = auth::sku_from_proxy_token(&credential.access).map(str::to_owned);
         let sku = sku.as_deref();
@@ -479,7 +489,7 @@ impl Provider for GithubCopilotProvider {
             request.max_tokens = Some(model.max_tokens);
         }
         if !model.reasoning_supported {
-            request.reasoning = false;
+            request.reasoning = ReasoningPolicy::Off;
         }
         let access = credential.access;
         let result = match model.dialect {
@@ -727,7 +737,7 @@ mod tests {
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
-            reasoning: true,
+            reasoning: ReasoningPolicy::Auto,
         };
         let error = match provider.stream(&request).await {
             Ok(_) => panic!("missing auth unexpectedly produced a stream"),

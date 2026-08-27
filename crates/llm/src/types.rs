@@ -1,4 +1,7 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use std::fmt;
+use std::str::FromStr;
 
 /// The role of a message in a conversation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +52,91 @@ pub struct ToolDefinition {
     pub parameters: Value,
 }
 
+/// Portable reasoning effort requested from a model.
+///
+/// Providers translate these semantic levels to their own wire values. A
+/// provider may reject levels that the selected model does not support.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Maximum,
+}
+
+/// Provider-neutral control over model reasoning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningPolicy {
+    /// Preserve the provider/model default behavior.
+    #[default]
+    Auto,
+    /// Do not request extended reasoning.
+    Off,
+    /// Request a portable effort level.
+    Effort(ReasoningEffort),
+}
+
+impl ReasoningPolicy {
+    /// Stable configuration and CLI spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+            Self::Effort(ReasoningEffort::Minimal) => "minimal",
+            Self::Effort(ReasoningEffort::Low) => "low",
+            Self::Effort(ReasoningEffort::Medium) => "medium",
+            Self::Effort(ReasoningEffort::High) => "high",
+            Self::Effort(ReasoningEffort::Maximum) => "maximum",
+        }
+    }
+}
+
+impl fmt::Display for ReasoningPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReasoningPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "off" | "none" => Ok(Self::Off),
+            "minimal" => Ok(Self::Effort(ReasoningEffort::Minimal)),
+            "low" => Ok(Self::Effort(ReasoningEffort::Low)),
+            "medium" => Ok(Self::Effort(ReasoningEffort::Medium)),
+            "high" => Ok(Self::Effort(ReasoningEffort::High)),
+            "maximum" | "max" | "xhigh" => Ok(Self::Effort(ReasoningEffort::Maximum)),
+            _ => Err(format!(
+                "invalid reasoning effort `{value}` (expected auto, off, minimal, low, medium, high, or maximum)"
+            )),
+        }
+    }
+}
+
+impl Serialize for ReasoningPolicy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningPolicy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompletionRequest {
     pub model: String,
@@ -57,7 +145,7 @@ pub struct CompletionRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
-    pub reasoning: bool,
+    pub reasoning: ReasoningPolicy,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

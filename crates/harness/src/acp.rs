@@ -808,6 +808,7 @@ async fn spawn_agent(
         tools,
         state.app_cancel.clone(),
     )
+    .with_reasoning(state.config.reasoning)
     .with_compaction(state.config.compaction.clone())
     .with_subagents(state.config.subagents, false)
     .with_mcp_servers(mcp_servers)

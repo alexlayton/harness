@@ -52,6 +52,8 @@ pub struct Agent {
     pub provider: Arc<dyn Provider>,
     pub tools: ToolRegistry,
     pub model: String,
+    /// Reasoning policy applied to normal parent requests.
+    pub reasoning: llm::ReasoningPolicy,
     /// Kept public as a short-term compatibility path for existing callers.
     /// When a durable session is attached it is rebuilt from the session
     /// events whenever a session is loaded or created.
@@ -103,6 +105,7 @@ impl Agent {
             provider,
             tools,
             model: model.into(),
+            reasoning: llm::ReasoningPolicy::Auto,
             history: Vec::new(),
             cancel,
             session: None,
@@ -116,6 +119,12 @@ impl Agent {
             subagent_limits: SubagentLimits::default(),
             subagent_runner: None,
         }
+    }
+
+    /// Configure reasoning for subsequent normal requests.
+    pub fn with_reasoning(mut self, reasoning: llm::ReasoningPolicy) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     /// Configure fan-out bounds for `Parallel` batches (subagents).
@@ -315,6 +324,10 @@ impl Agent {
                 }
                 InputMessage::SetModel { provider, model } => {
                     self.handle_set_model(provider, model, &events).await;
+                    continue;
+                }
+                InputMessage::SetReasoning { level } => {
+                    self.handle_set_reasoning(level, &events);
                     continue;
                 }
                 InputMessage::ListModels { provider } => {

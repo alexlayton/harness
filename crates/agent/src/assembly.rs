@@ -7,7 +7,7 @@ use crate::agent::{Agent, AgentEvent, InputMessage, ProviderFactory, SubagentLim
 use crate::subagent::SubagentRunnerImpl;
 use anyhow::{Context, Result};
 use compact::CompactionPolicy;
-use llm::Provider;
+use llm::{Provider, ReasoningPolicy};
 use session::{Session, SessionStore};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +38,7 @@ impl Default for SubagentPolicy {
 pub struct AgentBuilder {
     provider: Arc<dyn Provider>,
     model: String,
+    reasoning: ReasoningPolicy,
     tools: ToolRegistry,
     cancel: CancellationToken,
     project_context: String,
@@ -60,6 +61,7 @@ impl AgentBuilder {
         Self {
             provider,
             model: model.into(),
+            reasoning: ReasoningPolicy::Auto,
             tools,
             cancel,
             project_context: String::new(),
@@ -70,6 +72,12 @@ impl AgentBuilder {
             provider_factory: None,
             mcp_servers: Vec::new(),
         }
+    }
+
+    /// Configure reasoning policy for parent and nested model requests.
+    pub fn with_reasoning(mut self, reasoning: ReasoningPolicy) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     /// Attach the rendered workspace instructions.
@@ -141,7 +149,8 @@ impl AgentBuilder {
                 self.subagents,
                 self.session.as_ref().map(|(store, _)| store.clone()),
                 parent_session,
-            );
+            )
+            .with_reasoning(self.reasoning);
             if let Some(index) = search_index {
                 runner = runner.with_file_search_index(index);
             }
@@ -155,6 +164,7 @@ impl AgentBuilder {
         };
 
         let mut agent = Agent::new(self.provider, self.tools, self.model, self.cancel)
+            .with_reasoning(self.reasoning)
             .with_project_context(self.project_context)
             .with_compaction(self.compaction)
             .with_subagent_limits(SubagentLimits {

@@ -274,6 +274,34 @@ impl Agent {
         self.refresh_context_window().await;
     }
 
+    pub(crate) fn handle_set_reasoning(
+        &mut self,
+        level: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let reasoning = match level.parse::<llm::ReasoningPolicy>() {
+            Ok(reasoning) => reasoning,
+            Err(error) => {
+                send(events, AgentEvent::Error(error));
+                return;
+            }
+        };
+        self.reasoning = reasoning;
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_reasoning(reasoning);
+        }
+        send(
+            events,
+            AgentEvent::ReasoningChanged {
+                level: reasoning.to_string(),
+            },
+        );
+        send(
+            events,
+            AgentEvent::Notice(format!("Reasoning effort: {reasoning}")),
+        );
+    }
+
     /// Fetch subscription allowance usage from the provider active when the
     /// command was submitted. The request runs in the background so a slow
     /// account endpoint cannot block subsequent input processing.

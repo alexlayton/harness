@@ -1,24 +1,37 @@
 use crate::as_u64;
+use crate::dialects::openai_reasoning_effort;
 use crate::http::HttpClient;
 use crate::sse::{SseEvent, stream_response};
 use crate::{
-    CompletionRequest, Content, EventStream, LlmError, Message, ModelInfo, Role, StreamEvent,
-    ToolCall, ToolDefinition, Usage,
+    CompletionRequest, Content, EventStream, LlmError, Message, ModelInfo, ReasoningPolicy, Role,
+    StreamEvent, ToolCall, ToolDefinition, Usage,
 };
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 
+/// Provider-specific reasoning extension for OpenAI-compatible Chat APIs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatReasoningFormat {
+    /// Do not speculate about extensions on a generic compatible endpoint.
+    #[default]
+    None,
+    /// OpenRouter's unified `reasoning` object.
+    OpenRouter,
+}
+
 #[derive(Clone)]
 pub struct OpenAiChatClient {
     http: HttpClient,
+    reasoning_format: ChatReasoningFormat,
 }
 
 impl OpenAiChatClient {
     pub fn new(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self {
             http: HttpClient::new(base_url, api_key),
+            reasoning_format: ChatReasoningFormat::None,
         }
     }
 
@@ -29,14 +42,25 @@ impl OpenAiChatClient {
     ) -> Self {
         Self {
             http: HttpClient::with_headers(base_url, api_key, extra_headers),
+            reasoning_format: ChatReasoningFormat::None,
         }
+    }
+
+    /// Enable a documented provider extension without affecting generic Chat
+    /// endpoints that may reject unknown fields.
+    pub fn with_reasoning_format(mut self, format: ChatReasoningFormat) -> Self {
+        self.reasoning_format = format;
+        self
     }
 
     pub async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
         tracing::debug!(provider = "openai-chat", model = %req.model, "starting stream request");
         let response = self
             .http
-            .post_json("/chat/completions", &build_request_body(req))
+            .post_json(
+                "/chat/completions",
+                &build_request_body_with_reasoning(req, self.reasoning_format),
+            )
             .await?;
         Ok(event_stream(stream_response(response)))
     }
@@ -50,6 +74,14 @@ impl OpenAiChatClient {
 
 /// Build an OpenAI-compatible chat request without making a network call.
 pub fn build_request_body(req: &CompletionRequest) -> Value {
+    build_request_body_with_reasoning(req, ChatReasoningFormat::None)
+}
+
+/// Build a request with a provider's documented reasoning extension.
+pub fn build_request_body_with_reasoning(
+    req: &CompletionRequest,
+    reasoning_format: ChatReasoningFormat,
+) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(req.model.clone()));
 
@@ -69,6 +101,22 @@ pub fn build_request_body(req: &CompletionRequest) -> Value {
     }
     if let Some(temperature) = req.temperature {
         body.insert("temperature".into(), json!(temperature));
+    }
+    if reasoning_format == ChatReasoningFormat::OpenRouter {
+        match req.reasoning {
+            ReasoningPolicy::Off => {
+                body.insert("reasoning".into(), json!({ "enabled": false }));
+            }
+            // Omission preserves the model/provider default and matches the
+            // pre-setting OpenRouter request shape.
+            ReasoningPolicy::Auto => {}
+            ReasoningPolicy::Effort(_) => {
+                body.insert(
+                    "reasoning".into(),
+                    json!({ "effort": openai_reasoning_effort(req.reasoning) }),
+                );
+            }
+        }
     }
     body.insert("stream".into(), Value::Bool(true));
     body.insert("stream_options".into(), json!({ "include_usage": true }));
@@ -412,8 +460,27 @@ mod tests {
             }],
             max_tokens: None,
             temperature: None,
-            reasoning: true,
+            reasoning: ReasoningPolicy::Auto,
         }
+    }
+
+    #[test]
+    fn openrouter_serializes_reasoning_without_affecting_generic_chat() {
+        let mut req = request();
+        req.reasoning = ReasoningPolicy::Off;
+        let generic = build_request_body(&req);
+        assert!(generic.get("reasoning").is_none());
+
+        let off = build_request_body_with_reasoning(&req, ChatReasoningFormat::OpenRouter);
+        assert_eq!(off["reasoning"]["enabled"], false);
+
+        req.reasoning = ReasoningPolicy::Auto;
+        let auto = build_request_body_with_reasoning(&req, ChatReasoningFormat::OpenRouter);
+        assert!(auto.get("reasoning").is_none());
+
+        req.reasoning = ReasoningPolicy::Effort(crate::ReasoningEffort::High);
+        let high = build_request_body_with_reasoning(&req, ChatReasoningFormat::OpenRouter);
+        assert_eq!(high["reasoning"]["effort"], "high");
     }
 
     #[test]

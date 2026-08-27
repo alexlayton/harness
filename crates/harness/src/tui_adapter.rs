@@ -16,6 +16,7 @@ pub fn into_agent_input(message: tui::InputMessage) -> InputMessage {
         tui::InputMessage::SetModel { provider, model } => {
             InputMessage::SetModel { provider, model }
         }
+        tui::InputMessage::SetReasoning { level } => InputMessage::SetReasoning { level },
         tui::InputMessage::ListModels { provider } => InputMessage::ListModels { provider },
         tui::InputMessage::InvokeSkill { name } => InputMessage::InvokeSkill { name },
         tui::InputMessage::SubscriptionUsage => InputMessage::SubscriptionUsage,
@@ -80,6 +81,7 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
         AgentEvent::ModelChanged { provider, model } => {
             tui::UiEvent::ModelChanged { provider, model }
         }
+        AgentEvent::ReasoningChanged { level } => tui::UiEvent::ReasoningChanged { level },
         AgentEvent::ModelList { provider, models } => tui::UiEvent::ModelList {
             provider,
             models: models
@@ -248,6 +250,14 @@ mod tests {
                 },
             ),
             (
+                tui::InputMessage::SetReasoning {
+                    level: "high".into(),
+                },
+                InputMessage::SetReasoning {
+                    level: "high".into(),
+                },
+            ),
+            (
                 tui::InputMessage::ListModels {
                     provider: "p".into(),
                 },
@@ -319,6 +329,9 @@ mod tests {
             AgentEvent::ModelChanged {
                 provider: "provider".into(),
                 model: "model".into(),
+            },
+            AgentEvent::ReasoningChanged {
+                level: "high".into(),
             },
             AgentEvent::ModelList {
                 provider: "provider".into(),
@@ -402,25 +415,29 @@ mod tests {
         assert!(matches!(converted[6], tui::UiEvent::Error(_)));
         assert!(matches!(converted[7], tui::UiEvent::Notice(_)));
         assert!(matches!(converted[8], tui::UiEvent::ModelChanged { .. }));
-        assert!(matches!(converted[9], tui::UiEvent::ModelList { .. }));
-        assert!(matches!(converted[10], tui::UiEvent::SessionChanged { .. }));
         assert!(matches!(
-            converted[11],
+            converted[9],
+            tui::UiEvent::ReasoningChanged { .. }
+        ));
+        assert!(matches!(converted[10], tui::UiEvent::ModelList { .. }));
+        assert!(matches!(converted[11], tui::UiEvent::SessionChanged { .. }));
+        assert!(matches!(
+            converted[12],
             tui::UiEvent::SessionSnapshot { .. }
         ));
-        assert!(matches!(converted[12], tui::UiEvent::SessionList { .. }));
+        assert!(matches!(converted[13], tui::UiEvent::SessionList { .. }));
         assert!(matches!(
-            converted[13],
+            converted[14],
             tui::UiEvent::SessionExported { .. }
         ));
-        assert!(matches!(converted[14], tui::UiEvent::SkillsLoaded { .. }));
-        assert!(matches!(converted[15], tui::UiEvent::UsageUpdated { .. }));
+        assert!(matches!(converted[15], tui::UiEvent::SkillsLoaded { .. }));
+        assert!(matches!(converted[16], tui::UiEvent::UsageUpdated { .. }));
         assert!(matches!(
-            converted[16],
+            converted[17],
             tui::UiEvent::SubscriptionUsageLoaded { .. }
         ));
         assert!(matches!(
-            converted[17],
+            converted[18],
             tui::UiEvent::CompactionFinished { .. }
         ));
     }

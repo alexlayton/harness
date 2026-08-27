@@ -22,6 +22,8 @@ pub enum InputMessage {
         provider: Option<String>,
         model: String,
     },
+    /// Set reasoning effort for subsequent parent and subagent requests.
+    SetReasoning { level: String },
     /// Fetch a provider's model list.
     ListModels { provider: String },
     /// Start a turn from a discovered skill's instructions.
@@ -66,6 +68,10 @@ pub enum AgentEvent {
     ModelChanged {
         provider: String,
         model: String,
+    },
+    /// Confirmed portable reasoning policy.
+    ReasoningChanged {
+        level: String,
     },
     ModelList {
         provider: String,

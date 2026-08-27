@@ -240,6 +240,7 @@ pub struct CrossTerm {
     theme: Theme,
     model: String,
     provider: String,
+    reasoning: String,
     environment: EnvironmentInfo,
     /// Skip the welcome banner and metadata while retaining normal turn UI.
     minimal: bool,
@@ -340,6 +341,7 @@ impl CrossTerm {
             theme: Theme::default(),
             model: model.to_owned(),
             provider: provider.to_owned(),
+            reasoning: "auto".to_owned(),
             environment,
             minimal: false,
             width,
@@ -379,15 +381,16 @@ impl CrossTerm {
         }
     }
 
-    /// `skills` and `context_files` come from the startup discovery in main
-    /// (the TUI never touches the filesystem for them). `minimal` suppresses
-    /// only the initial banner and metadata.
+    /// `skills`, `context_files`, and the initial reasoning label come from
+    /// startup configuration (the TUI never touches their backing stores).
+    /// `minimal` suppresses only the initial banner and metadata.
     pub fn new(
         model: &str,
         provider: &str,
         providers: Vec<String>,
         skills: Vec<SkillEntry>,
         context_files: Vec<ContextFileEntry>,
+        reasoning: &str,
         minimal: bool,
     ) -> Result<Self> {
         install_panic_hook();
@@ -401,6 +404,7 @@ impl CrossTerm {
             width,
             height,
         );
+        ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
         if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
@@ -1231,6 +1235,13 @@ impl CrossTerm {
             ));
             return Ok(());
         }
+        if matches!(&command, ParsedCommand::SetReasoning { level: None }) {
+            self.add_notice(format!(
+                "usage: /reasoning [auto|off|minimal|low|medium|high|maximum] (current: {})",
+                self.reasoning
+            ));
+            return Ok(());
+        }
         // The typed command is echoed without the ⌘ glyph: the input line the
         // user already sees carries the `› ` prefix, so the notice is the raw
         // command text.
@@ -1256,6 +1267,10 @@ impl CrossTerm {
             ParsedCommand::SetModel { provider, model } => {
                 InputMessage::SetModel { provider, model }
             }
+            ParsedCommand::SetReasoning { level: Some(level) } => {
+                InputMessage::SetReasoning { level }
+            }
+            ParsedCommand::SetReasoning { level: None } => unreachable!("handled above"),
             ParsedCommand::Usage => InputMessage::SubscriptionUsage,
             ParsedCommand::InvokeSkill { name, alias } => {
                 // The echo already shows what was typed; label the alias form
@@ -1398,6 +1413,9 @@ impl CrossTerm {
                 // The startup header is immutable scrollback; surface the new
                 // model as a fresh metadata line instead.
                 self.pending.push(self.metadata_entry());
+            }
+            UiEvent::ReasoningChanged { level } => {
+                self.reasoning = level;
             }
             UiEvent::ModelList { provider, models } => {
                 self.model_lists.insert(provider, models);
@@ -2851,6 +2869,35 @@ mod tests {
             .iter()
             .map(|running| running.record.summary.clone())
             .collect()
+    }
+
+    #[test]
+    fn reasoning_command_reports_current_value_and_sends_changes() {
+        let mut ui = ui(80, 24);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        ui.submit_command("/reasoning", &tx).unwrap();
+        assert!(rx.try_recv().is_err());
+        assert!(matches!(
+            ui.pending.last(),
+            Some(Entry::Notice { text }) if text.contains("current: auto")
+        ));
+
+        ui.submit_command("/reasoning high", &tx).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            InputMessage::SetReasoning {
+                level: "high".into()
+            }
+        );
+        ui.apply_event(UiEvent::ReasoningChanged {
+            level: "high".into(),
+        });
+        ui.submit_command("/reasoning", &tx).unwrap();
+        assert!(matches!(
+            ui.pending.last(),
+            Some(Entry::Notice { text }) if text.contains("current: high")
+        ));
     }
 
     #[test]

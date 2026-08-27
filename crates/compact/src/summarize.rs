@@ -11,7 +11,9 @@ use crate::policy::CompactionPolicy;
 use crate::policy::DEFAULT_TOOL_RESULT_CHARS;
 use crate::serialize::{extract_file_operations, format_file_operations, serialize_events};
 use futures_util::StreamExt;
-use llm::{CompletionRequest, Message, Provider, StreamEvent, Usage, truncate_utf8};
+use llm::{
+    CompletionRequest, Message, Provider, ReasoningPolicy, StreamEvent, Usage, truncate_utf8,
+};
 use tokio_util::sync::CancellationToken;
 
 /// System prompt: marks the task as summarization and forbids continuing the
@@ -130,7 +132,7 @@ async fn model_summarize(
         tools: Vec::new(),
         max_tokens: Some(summary_max_tokens(policy)),
         temperature: None,
-        reasoning: false,
+        reasoning: ReasoningPolicy::Off,
     };
 
     let mut stream = provider.stream(&request).await?;

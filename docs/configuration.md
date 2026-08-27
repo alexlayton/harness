@@ -20,14 +20,22 @@ environment. For provider-specific setup, see
 ```toml
 provider = "opencode-go"
 model = "gpt-5.6-luna"
+reasoning_effort = "auto"
 rtk = false
 ```
 
-The command line overrides `provider` and `model` for the current process:
+The command line overrides `provider`, `model`, and reasoning effort for the
+current process:
 
 ```text
-harness --provider openrouter --model openai/<model>
+harness --provider openrouter --model openai/<model> --reasoning-effort high
 ```
+
+Reasoning accepts `auto`, `off`, `minimal`, `low`, `medium`, `high`, and
+`maximum`. `auto` preserves the provider/model default. Named effort is a
+portable preference: supported models translate it to their native control,
+while providers may reject levels unavailable for a selected model. The TUI
+`/reasoning` command displays or changes the active value and persists changes.
 
 Harness requires a provider choice rather than assuming one from an API key.
 When no provider is configured, startup lists the available providers and their
@@ -201,6 +209,7 @@ harness acp --provider openai-codex
 | `login <provider>` | Authenticate with an OAuth provider. |
 | `--provider <provider>` | Override the configured provider. |
 | `--model <model>` | Override the configured model. |
+| `--reasoning-effort <level>` | Override reasoning (`auto`, `off`, `minimal`, `low`, `medium`, `high`, or `maximum`). |
 | `-v`, `--verbose` | In prompt mode, write reasoning and tool progress to stderr. |
 | `--resume <selector>` | Resume a session by ID, unique prefix, `latest`, or path in prompt mode. |
 | `--no-session` | Do not persist a prompt-mode run. |

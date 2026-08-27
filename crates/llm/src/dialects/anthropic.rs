@@ -525,7 +525,7 @@ mod tests {
             }],
             max_tokens: None,
             temperature: None,
-            reasoning: true,
+            reasoning: crate::ReasoningPolicy::Auto,
         };
         let body = build_request_body(&request);
         let system = body.get("system").unwrap().as_array().unwrap();

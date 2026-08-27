@@ -4,11 +4,11 @@ use auth::OpenAiCodexAuth;
 use auth::{CopilotAuth, sku_from_proxy_token};
 use clap::{Parser, ValueEnum};
 use compact::policy::CompactionPolicy;
-use llm::Provider;
 use llm::providers::github_copilot::default_model_for;
 use llm::providers::{
     GithubCopilotProvider, OpenAiCodexProvider, OpenCodeGoProvider, OpenRouterProvider,
 };
+use llm::{Provider, ReasoningPolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -168,8 +168,11 @@ impl From<&CompactConfig> for CompactionPolicy {
 pub struct FileConfig {
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Portable reasoning effort for normal agent and subagent requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningPolicy>,
     /// Opt-in RTK integration: rewrite supported bash commands to their
-    /// token-optimized `rtk` equivalents before execution.  Off unless the
+    /// token-optimized `rtk` equivalents before execution. Off unless the
     /// user explicitly sets `rtk = true`.
     #[serde(default)]
     pub rtk: bool,
@@ -199,6 +202,7 @@ impl PartialEq for FileConfig {
     fn eq(&self, other: &Self) -> bool {
         self.provider == other.provider
             && self.model == other.model
+            && self.reasoning_effort == other.reasoning_effort
             && self.rtk == other.rtk
             && self.compaction == other.compaction
             && self.subagents == other.subagents
@@ -345,6 +349,19 @@ pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> 
     save_file_config(path, &config)
 }
 
+/// Persist a reasoning policy while retaining provider, model, and unknown
+/// settings already present in the file.
+pub fn save_reasoning(reasoning: ReasoningPolicy) -> Result<()> {
+    save_reasoning_at(&config_path(), reasoning)
+}
+
+/// Path-injectable reasoning save used by tests.
+pub fn save_reasoning_at(path: &Path, reasoning: ReasoningPolicy) -> Result<()> {
+    let mut config = load_file_config(path)?;
+    config.reasoning_effort = Some(reasoning);
+    save_file_config(path, &config)
+}
+
 /// Select an OAuth provider after login when the user has not already made a
 /// choice. Login must never unexpectedly replace an existing provider.
 pub fn select_provider_after_login(provider: ProviderArg) -> Result<bool> {
@@ -374,6 +391,10 @@ pub struct Cli {
     /// Override the configured model for this process.
     #[arg(long, global = true)]
     pub model: Option<String>,
+
+    /// Override model reasoning effort for this process.
+    #[arg(long = "reasoning-effort", value_name = "LEVEL", global = true)]
+    pub reasoning_effort: Option<ReasoningPolicy>,
 
     /// Disable AGENTS.md / CLAUDE.md project-context injection.
     #[arg(long = "no-context-files", default_value_t = false, global = true)]
@@ -445,6 +466,7 @@ pub enum LoginProvider {
 pub struct Config {
     pub provider: ProviderArg,
     pub model: String,
+    pub reasoning: ReasoningPolicy,
     /// Resolved key retained for config diagnostics and boundary tests;
     /// provider construction reads the environment directly.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -576,6 +598,10 @@ impl Config {
         Ok(Self {
             provider,
             model,
+            reasoning: cli
+                .reasoning_effort
+                .or(file.reasoning_effort)
+                .unwrap_or_default(),
             api_key,
             rtk: file.rtk,
             compaction: file
@@ -735,6 +761,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider, ProviderArg::Openrouter);
         assert_eq!(config.model, "anthropic/demo");
+        assert_eq!(config.reasoning, ReasoningPolicy::Auto);
     }
 
     #[test]
@@ -761,6 +788,7 @@ mod tests {
         let file = FileConfig {
             provider: Some("openrouter".into()),
             model: Some("file-model".into()),
+            reasoning_effort: Some(ReasoningPolicy::Effort(llm::ReasoningEffort::Low)),
             ..FileConfig::default()
         };
         let cli = Cli::default();
@@ -778,10 +806,15 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider, ProviderArg::Openrouter);
         assert_eq!(config.model, "file-model");
+        assert_eq!(
+            config.reasoning,
+            ReasoningPolicy::Effort(llm::ReasoningEffort::Low)
+        );
 
         let cli = Cli {
             provider: Some(ProviderArg::OpencodeGo),
             model: Some("cli-model".into()),
+            reasoning_effort: Some(ReasoningPolicy::Off),
             ..Cli::default()
         };
         let config = Config::resolve_from_file(
@@ -793,6 +826,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider, ProviderArg::OpencodeGo);
         assert_eq!(config.model, "cli-model");
+        assert_eq!(config.reasoning, ReasoningPolicy::Off);
 
         let invalid = FileConfig {
             provider: Some("typo".into()),
@@ -865,6 +899,7 @@ mod tests {
         let original = FileConfig {
             provider: Some("opencode-go".into()),
             model: Some("demo".into()),
+            reasoning_effort: Some(ReasoningPolicy::Effort(llm::ReasoningEffort::High)),
             rtk: true,
             compaction: Some(CompactConfig {
                 keep_recent_turns: Some(5),
@@ -892,8 +927,18 @@ mod tests {
         let saved = load_file_config(&path).unwrap();
         assert_eq!(saved.provider.as_deref(), Some("openrouter"));
         assert_eq!(saved.model.as_deref(), Some("router/demo"));
+        assert_eq!(saved.reasoning_effort, original.reasoning_effort);
         assert!(saved.rtk);
         assert!(saved.tui.is_some_and(|tui| tui.minimal));
+        assert_eq!(
+            saved.extra.get("future"),
+            Some(&toml::Value::String("kept".into()))
+        );
+
+        save_reasoning_at(&path, ReasoningPolicy::Off).unwrap();
+        let saved = load_file_config(&path).unwrap();
+        assert_eq!(saved.reasoning_effort, Some(ReasoningPolicy::Off));
+        assert_eq!(saved.provider.as_deref(), Some("openrouter"));
         assert_eq!(
             saved.extra.get("future"),
             Some(&toml::Value::String("kept".into()))

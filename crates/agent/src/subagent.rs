@@ -32,7 +32,8 @@ use crate::prompt::subagent_system_prompt;
 use async_trait::async_trait;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use llm::{
-    CompletionRequest, Content, Message, Provider, RetryCallback, Role, StreamEvent, truncate_utf8,
+    CompletionRequest, Content, Message, Provider, ReasoningPolicy, RetryCallback, Role,
+    StreamEvent, truncate_utf8,
 };
 use session::{SessionCreateOptions, SessionStore, usage_summary};
 use std::future::Future;
@@ -68,12 +69,13 @@ pub(crate) struct SubagentRun {
     pub prompt: String,
 }
 
-/// The active provider/model pair used by future child runs. Held behind a
+/// The active provider/model/reasoning selection used by future child runs. Held behind a
 /// short-held synchronous lock so a parent `/model` switch can retarget
 /// subagents without rebuilding the runner; never held across `.await`.
 struct SubagentModelState {
     provider: Arc<dyn Provider>,
     model: String,
+    reasoning: ReasoningPolicy,
 }
 
 /// Everything a nested loop needs from the host process. One instance is
@@ -138,6 +140,7 @@ impl SubagentRunnerImpl {
             model_state: RwLock::new(SubagentModelState {
                 provider,
                 model: model.into(),
+                reasoning: ReasoningPolicy::Auto,
             }),
             workspace_root,
             search_index,
@@ -150,6 +153,12 @@ impl SubagentRunnerImpl {
             #[cfg(test)]
             test_registry_builds: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// Set the initial reasoning policy before the runner is shared.
+    pub fn with_reasoning(self, reasoning: ReasoningPolicy) -> Self {
+        self.update_reasoning(reasoning);
+        self
     }
 
     /// Replace the compatibility constructor's index with the assembly-owned
@@ -169,6 +178,14 @@ impl SubagentRunnerImpl {
             .expect("subagent model state lock poisoned");
         state.provider = provider;
         state.model = model.into();
+    }
+
+    /// Retarget future child runs after `/reasoning` changes.
+    pub fn update_reasoning(&self, reasoning: ReasoningPolicy) {
+        self.model_state
+            .write()
+            .expect("subagent model state lock poisoned")
+            .reasoning = reasoning;
     }
 
     /// Retarget child-session lineage after the host starts or loads another
@@ -264,12 +281,12 @@ impl SubagentRunnerImpl {
             .parent_session_id
             .read()
             .expect("subagent parent session lock poisoned");
-        let (provider, model) = {
+        let (provider, model, reasoning) = {
             let state = self
                 .model_state
                 .read()
                 .expect("subagent model state lock poisoned");
-            (state.provider.clone(), state.model.clone())
+            (state.provider.clone(), state.model.clone(), state.reasoning)
         };
         let registry = self.registry(mode)?;
         let registry_snapshot = registry.snapshot();
@@ -301,6 +318,7 @@ impl SubagentRunnerImpl {
                 &model,
                 &registry,
                 &system,
+                reasoning,
                 &mut history,
                 &mut session,
                 cancel,
@@ -351,6 +369,7 @@ impl SubagentRunnerImpl {
         model: &str,
         registry: &ToolRegistry,
         system: &str,
+        reasoning: ReasoningPolicy,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         cancel: CancellationToken,
@@ -397,7 +416,7 @@ impl SubagentRunnerImpl {
                 },
                 max_tokens: None,
                 temperature: None,
-                reasoning: true,
+                reasoning,
             };
             // Standard initial-request retry policy, same as the parent: a
             // transient 429/5xx while *obtaining* the stream must not

@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 pub enum ArgumentKind {
     None,
     Model,
+    Reasoning,
     Session,
     Path,
     Skill,
@@ -68,6 +69,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::Model,
     },
     CommandSpec {
+        name: "/reasoning",
+        description: "Set model reasoning effort",
+        usage: "/reasoning [auto|off|minimal|low|medium|high|maximum]",
+        argument_kind: ArgumentKind::Reasoning,
+    },
+    CommandSpec {
         name: "/usage",
         description: "Show active subscription allowance usage",
         usage: "/usage",
@@ -86,6 +93,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::None,
     },
 ];
+
+/// Canonical portable reasoning policies, in suggestion order.
+pub const REASONING_LEVELS: &[&str] =
+    &["auto", "off", "minimal", "low", "medium", "high", "maximum"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateKind {
@@ -138,6 +149,9 @@ pub enum ParsedCommand {
     SetModel {
         provider: Option<String>,
         model: String,
+    },
+    SetReasoning {
+        level: Option<String>,
     },
     Usage,
     Skills,
@@ -217,6 +231,21 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /usage".into())
             } else {
                 Ok(ParsedCommand::Usage)
+            }
+        }
+        "/reasoning" => {
+            let values = words.collect::<Vec<_>>();
+            let usage = "usage: /reasoning [auto|off|minimal|low|medium|high|maximum]";
+            match values.as_slice() {
+                [] => Ok(ParsedCommand::SetReasoning { level: None }),
+                [level] => REASONING_LEVELS
+                    .iter()
+                    .find(|candidate| candidate.eq_ignore_ascii_case(level))
+                    .map(|level| ParsedCommand::SetReasoning {
+                        level: Some((*level).to_owned()),
+                    })
+                    .ok_or_else(|| usage.to_owned()),
+                _ => Err(usage.to_owned()),
             }
         }
         "/model" => {
@@ -381,6 +410,7 @@ pub fn candidates_at_cursor(
         CompletionTarget::Argument(ArgumentKind::Model) => {
             model_candidates(query, providers, model_lists, current_provider)
         }
+        CompletionTarget::Argument(ArgumentKind::Reasoning) => reasoning_candidates(query),
         CompletionTarget::Argument(ArgumentKind::Session) => session_candidates(query, sessions),
         CompletionTarget::Argument(ArgumentKind::Skill) => skill_candidates(query, skills),
         CompletionTarget::Argument(ArgumentKind::Path)
@@ -491,6 +521,29 @@ fn command_candidates(query: &str, skills: &[SkillEntry]) -> Vec<Candidate> {
         });
     }
     candidates
+}
+
+fn reasoning_candidates(query: &str) -> Vec<Candidate> {
+    let query = query.to_ascii_lowercase();
+    REASONING_LEVELS
+        .iter()
+        .filter(|level| level.starts_with(&query))
+        .map(|level| Candidate {
+            value: (*level).to_owned(),
+            description: match *level {
+                "auto" => "Use the provider/model default",
+                "off" => "Do not request extended reasoning",
+                "minimal" => "Use minimal reasoning",
+                "low" => "Use low reasoning effort",
+                "medium" => "Use medium reasoning effort",
+                "high" => "Use high reasoning effort",
+                "maximum" => "Use the highest available effort",
+                _ => "Reasoning effort",
+            }
+            .to_owned(),
+            kind: CandidateKind::Slash,
+        })
+        .collect()
 }
 
 fn skill_candidates(query: &str, skills: &[SkillEntry]) -> Vec<Candidate> {
@@ -887,6 +940,39 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_suggestions_and_completion_use_canonical_levels() {
+        let lists = HashMap::new();
+        assert!(
+            candidates("/rea", &providers(), &lists, "opencode-go")
+                .iter()
+                .any(|candidate| candidate.value == "/reasoning")
+        );
+
+        let values = candidates("/reasoning ", &providers(), &lists, "opencode-go")
+            .into_iter()
+            .map(|candidate| candidate.value)
+            .collect::<Vec<_>>();
+        assert_eq!(values, REASONING_LEVELS);
+
+        let high = candidates("/reasoning hi", &providers(), &lists, "opencode-go");
+        assert_eq!(high.len(), 1);
+        assert_eq!(high[0].value, "high");
+
+        let result =
+            candidates_at_cursor("/reas", 5, &providers(), &lists, "opencode-go", &[], &[])
+                .unwrap();
+        let candidate = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.value == "/reasoning")
+            .unwrap();
+        assert_eq!(
+            apply_completion("/reas", 5, &result.context, candidate, &[]),
+            Some(("/reasoning ".into(), 11))
+        );
+    }
+
+    #[test]
     fn argument_phase_starts_only_after_whitespace() {
         let lists = HashMap::from([(
             "opencode-go".into(),
@@ -1260,6 +1346,20 @@ mod tests {
         assert_eq!(parse_command("/usage"), Ok(ParsedCommand::Usage));
         assert_eq!(parse_command("/USAGE"), Ok(ParsedCommand::Usage));
         assert_eq!(parse_command("/usage now"), Err("usage: /usage".into()));
+        assert_eq!(
+            parse_command("/reasoning"),
+            Ok(ParsedCommand::SetReasoning { level: None })
+        );
+        assert_eq!(
+            parse_command("/reasoning HIGH"),
+            Ok(ParsedCommand::SetReasoning {
+                level: Some("high".into())
+            })
+        );
+        assert_eq!(
+            parse_command("/reasoning extreme"),
+            Err("usage: /reasoning [auto|off|minimal|low|medium|high|maximum]".into())
+        );
         assert_eq!(
             parse_command("/model gpt-5.6-luna"),
             Ok(ParsedCommand::SetModel {

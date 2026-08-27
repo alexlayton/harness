@@ -3,12 +3,13 @@
 //! This is intentionally separate from the public OpenAI Responses API: the
 //! subscription service uses a different endpoint and requires Codex-specific
 //! request fields even though it streams familiar Responses SSE events.
+use crate::dialects::openai_reasoning_effort;
 use crate::dialects::openai_responses::{
     ResponsesParser, convert_input as base_convert_input, convert_tools,
 };
 use crate::http::HttpClient;
 use crate::sse::stream_response;
-use crate::{CompletionRequest, EventStream, LlmError};
+use crate::{CompletionRequest, EventStream, LlmError, ReasoningPolicy};
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
@@ -44,9 +45,22 @@ pub fn build_request_body(request: &CompletionRequest) -> Value {
         "parallel_tool_calls": true,
         "store": false,
         "stream": true,
-        "reasoning": { "effort": "medium", "summary": "auto" },
-        "include": ["reasoning.encrypted_content"],
     });
+    match request.reasoning {
+        ReasoningPolicy::Off => {}
+        ReasoningPolicy::Auto => {
+            // Preserve the subscription endpoint's historical default.
+            body["reasoning"] = json!({ "effort": "medium", "summary": "auto" });
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+        ReasoningPolicy::Effort(_) => {
+            body["reasoning"] = json!({
+                "effort": openai_reasoning_effort(request.reasoning),
+                "summary": "auto"
+            });
+            body["include"] = json!(["reasoning.encrypted_content"]);
+        }
+    }
     if let Some(system) = &request.system {
         body["instructions"] = Value::String(system.clone());
     }
@@ -94,4 +108,37 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
         }
         if !parser.is_done() { for value in parser.finish()? { yield value; } }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Message, ReasoningEffort};
+
+    fn request(reasoning: ReasoningPolicy) -> CompletionRequest {
+        CompletionRequest {
+            model: "gpt-test".into(),
+            system: None,
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            reasoning,
+        }
+    }
+
+    #[test]
+    fn reasoning_policy_controls_codex_fields() {
+        let off = build_request_body(&request(ReasoningPolicy::Off));
+        assert!(off.get("reasoning").is_none());
+        assert!(off.get("include").is_none());
+
+        let auto = build_request_body(&request(ReasoningPolicy::Auto));
+        assert_eq!(auto["reasoning"]["effort"], "medium");
+        assert_eq!(auto["include"][0], "reasoning.encrypted_content");
+
+        let maximum =
+            build_request_body(&request(ReasoningPolicy::Effort(ReasoningEffort::Maximum)));
+        assert_eq!(maximum["reasoning"]["effort"], "xhigh");
+    }
 }

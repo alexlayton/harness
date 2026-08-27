@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use config::{
     Cli, Command, Config, ProviderArg, build_provider_with_auths, init_logging, provider_factory,
-    save_settings,
+    save_reasoning, save_settings,
 };
 use context::project_context_for;
 use headless::run_headless;
@@ -185,6 +185,7 @@ async fn main_inner() -> Result<ExitCode> {
     );
 
     let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+        .with_reasoning(config.reasoning)
         .with_project_context(project_context)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
@@ -204,6 +205,12 @@ async fn main_inner() -> Result<ExitCode> {
                         && let Err(error) = save_settings(provider, model)
                     {
                         tracing::warn!(error = %error, "could not persist model settings");
+                    }
+                    if let AgentEvent::ReasoningChanged { level } = &event
+                        && let Ok(reasoning) = level.parse()
+                        && let Err(error) = save_reasoning(reasoning)
+                    {
+                        tracing::warn!(error = %error, "could not persist reasoning setting");
                     }
                     if ui_event_tx.send(tui_adapter::into_ui_event(event)).is_err() {
                         break;
@@ -228,6 +235,7 @@ async fn main_inner() -> Result<ExitCode> {
             .into_iter()
             .map(|path| ContextFileEntry { path })
             .collect(),
+        config.reasoning.as_str(),
         config.tui_minimal,
     )?;
     let ui_result = ui.run(ui_event_rx, tui_input_tx, cancel.clone()).await;

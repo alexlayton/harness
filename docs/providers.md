@@ -108,6 +108,33 @@ provider's default model until you select another through `/model` or
 Codex uses a dedicated, SSE-only provider and dialect because its ChatGPT
 subscription protocol differs from the normal OpenAI API.
 
+## Reasoning effort
+
+Set a portable reasoning preference in `config.toml` or on the command line:
+
+```toml
+reasoning_effort = "high"
+```
+
+```text
+harness --reasoning-effort high
+```
+
+The interactive command supports inline suggestions and Tab completion:
+
+```text
+/reasoning
+/reasoning high
+```
+
+Supported values are `auto`, `off`, `minimal`, `low`, `medium`, `high`, and
+`maximum`. OpenAI Responses and Codex translate explicit levels directly;
+`maximum` uses their `xhigh` wire value. OpenRouter uses its unified reasoning
+extension. Generic Chat-compatible and Anthropic-compatible routes remain
+conservative when their endpoint does not advertise a portable effort control;
+models can still reason according to their own defaults. Explicit unsupported
+values may be rejected by the provider rather than silently downgraded.
+
 ## Change the active model
 
 In the terminal UI, select a model from the active provider:

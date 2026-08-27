@@ -3,8 +3,8 @@ use crate::dialects::openai_chat::OpenAiChatClient;
 use crate::dialects::openai_responses::OpenAiResponsesClient;
 use crate::http::HttpClient;
 use crate::{
-    CompletionRequest, EventStream, LlmError, ModelInfo, Provider, SubscriptionUsage,
-    SubscriptionUsageWindow,
+    CompletionRequest, EventStream, LlmError, ModelInfo, Provider, ReasoningPolicy,
+    SubscriptionUsage, SubscriptionUsageWindow,
 };
 use serde::Deserialize;
 
@@ -80,7 +80,14 @@ impl Provider for OpenCodeGoProvider {
     }
 
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        match dialect_for_model(&req.model) {
+        let dialect = dialect_for_model(&req.model);
+        if matches!(req.reasoning, ReasoningPolicy::Effort(_)) && dialect != Dialect::Responses {
+            return Err(LlmError::Parse(format!(
+                "OpenCode Go model `{}` does not expose portable reasoning effort on its {:?} endpoint; use `auto` or `off`",
+                req.model, dialect
+            )));
+        }
+        match dialect {
             Dialect::Responses => self.responses.stream(req).await,
             Dialect::Messages => self.messages.stream(req).await,
             Dialect::Chat => self.chat.stream(req).await,

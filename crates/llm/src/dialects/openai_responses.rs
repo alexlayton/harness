@@ -1,9 +1,10 @@
 use crate::as_u64;
+use crate::dialects::openai_reasoning_effort;
 use crate::http::HttpClient;
 use crate::sse::{SseEvent, stream_response};
 use crate::{
-    CompletionRequest, Content, EventStream, LlmError, Message, Role, StreamEvent, ToolCall,
-    ToolDefinition, Usage,
+    CompletionRequest, Content, EventStream, LlmError, Message, ReasoningPolicy, Role, StreamEvent,
+    ToolCall, ToolDefinition, Usage,
 };
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
@@ -42,13 +43,16 @@ impl OpenAiResponsesClient {
             .await
         {
             Ok(response) => response,
+            // `Auto` is deliberately best-effort so compatible proxies retain
+            // the old fallback. Explicit user choices are never silently
+            // discarded.
             Err(error)
-                if req.reasoning
+                if req.reasoning == ReasoningPolicy::Auto
                     && matches!(&error, LlmError::Http { status: 400, body } if body.to_ascii_lowercase().contains("reasoning")) =>
             {
                 tracing::debug!("Responses endpoint rejected reasoning; retrying without it");
                 self.http
-                    .post_json("/responses", &build_request_body(req, false))
+                    .post_json("/responses", &build_request_body(req, ReasoningPolicy::Off))
                     .await?
             }
             Err(error) => return Err(error),
@@ -57,7 +61,7 @@ impl OpenAiResponsesClient {
     }
 }
 
-pub fn build_request_body(req: &CompletionRequest, include_reasoning: bool) -> Value {
+pub fn build_request_body(req: &CompletionRequest, reasoning: ReasoningPolicy) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(req.model.clone()));
     if let Some(system) = &req.system {
@@ -68,8 +72,17 @@ pub fn build_request_body(req: &CompletionRequest, include_reasoning: bool) -> V
         body.insert("tools".into(), Value::Array(convert_tools(&req.tools)));
         body.insert("tool_choice".into(), Value::String("auto".into()));
     }
-    if include_reasoning && req.reasoning {
-        body.insert("reasoning".into(), json!({ "summary": "auto" }));
+    match reasoning {
+        ReasoningPolicy::Off => {}
+        ReasoningPolicy::Auto => {
+            body.insert("reasoning".into(), json!({ "summary": "auto" }));
+        }
+        ReasoningPolicy::Effort(_) => {
+            body.insert(
+                "reasoning".into(),
+                json!({ "effort": openai_reasoning_effort(reasoning), "summary": "auto" }),
+            );
+        }
     }
     if let Some(max_tokens) = req.max_tokens {
         body.insert("max_output_tokens".into(), json!(max_tokens));
@@ -335,6 +348,33 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn request(reasoning: ReasoningPolicy) -> CompletionRequest {
+        CompletionRequest {
+            model: "demo".into(),
+            system: None,
+            messages: vec![Message::user("hello")],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            reasoning,
+        }
+    }
+
+    #[test]
+    fn serializes_reasoning_policy() {
+        let off = build_request_body(&request(ReasoningPolicy::Off), ReasoningPolicy::Off);
+        assert!(off.get("reasoning").is_none());
+
+        let auto = build_request_body(&request(ReasoningPolicy::Auto), ReasoningPolicy::Auto);
+        assert_eq!(auto["reasoning"]["summary"], "auto");
+        assert!(auto["reasoning"].get("effort").is_none());
+
+        let maximum = ReasoningPolicy::Effort(crate::ReasoningEffort::Maximum);
+        let explicit = build_request_body(&request(maximum), maximum);
+        assert_eq!(explicit["reasoning"]["effort"], "xhigh");
+        assert_eq!(explicit["reasoning"]["summary"], "auto");
+    }
 
     #[test]
     fn converts_input_items() {
