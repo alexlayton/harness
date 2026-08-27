@@ -105,11 +105,8 @@ const INPUT_PREFIX_WIDTH: usize = 2;
 /// resize can re-render it at a new width.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Entry {
-    /// The startup wordmark; `tagline` is picked once per launch so
-    /// re-rendering after a resize does not re-roll it.
-    Banner {
-        tagline: String,
-    },
+    /// The startup wordmark and discoverability footer.
+    Banner,
     /// The header metadata line: `cwd  (branch)` left, `provider · model`
     /// right — the same metadata a classic status bar would show above
     /// its input box.
@@ -139,7 +136,7 @@ enum Entry {
     Error {
         text: String,
     },
-    /// A centered `── label ──` rule marking a conversation boundary.
+    /// A left-oriented rule marking a session boundary.
     Separator {
         label: String,
     },
@@ -175,16 +172,22 @@ struct InputLayout {
 }
 
 /// Token usage reported by [`UiEvent::UsageUpdated`], kept for the inline
-/// counter trailer on the input placeholder row (`↑ in ↓ out · cost`).
+/// counter trailer on the input placeholder row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Usage {
     input_tokens: u64,
     output_tokens: u64,
-    cost: String,
+}
+
+/// Current context occupation and effective maximum reported by the agent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContextUsage {
+    used_tokens: u64,
+    max_tokens: u64,
 }
 
 /// An open completion list driving the fish-style ghost preview, the Tab
-/// accept, and the one-row hint above the input.
+/// accept, and the one-row hint below the input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Completion {
     context: CompletionContext,
@@ -272,8 +275,12 @@ pub struct CrossTerm {
     history_pos: Option<usize>,
     draft: String,
 
-    /// Most recent turn usage for the placeholder counter trailer.
+    /// Active session usage for the placeholder counter trailer.
     usage: Option<Usage>,
+    /// Current versus maximum context for the same trailer.
+    context_usage: Option<ContextUsage>,
+    /// Whether the runtime's initial session announcement has been handled.
+    initial_session_seen: bool,
 
     /// Global tool expansion state: Ctrl+O toggles every tool call's output
     /// expanded or collapsed and repaints the whole visible session. Rows
@@ -356,6 +363,8 @@ impl CrossTerm {
             history_pos: None,
             draft: String::new(),
             usage: None,
+            context_usage: None,
+            initial_session_seen: false,
             tools_expanded: false,
             providers,
             model_lists: HashMap::new(),
@@ -445,9 +454,7 @@ impl CrossTerm {
         // The startup header: the wordmark banner augmented with the
         // cwd/branch and provider/model metadata line.
         if !self.minimal {
-            self.pending.push(Entry::Banner {
-                tagline: render::pick_tagline().to_owned(),
-            });
+            self.pending.push(Entry::Banner);
             self.pending.push(self.metadata_entry());
         }
         self.paint()?;
@@ -1133,7 +1140,7 @@ impl CrossTerm {
         // the next Tab inserts — as the untyped remainder of the token. A
         // fuzzy match (`agent.rs` → `crates/agent/src/agent.rs`) shares no
         // literal prefix, so there is nothing honest to dim inline; the hint
-        // row above the input carries those suggestions instead.
+        // row below the input carries those suggestions instead.
         if completion.kind == CompletionKind::Path {
             let candidate = &completion.candidates[completion.selected];
             let token_end = completion.context.token_end.min(self.input.len());
@@ -1176,7 +1183,7 @@ impl CrossTerm {
         )
     }
 
-    /// One dim hint row above the input. It is fitted to the actual content
+    /// One dim hint row below the input. It is fitted to the actual content
     /// width so long provider-qualified model IDs can never soft-wrap behind
     /// the region bookkeeping and leave apparent duplicate suggestion rows.
     fn completion_hint(&self, width: usize) -> String {
@@ -1426,13 +1433,20 @@ impl CrossTerm {
             UiEvent::UsageUpdated {
                 input_tokens,
                 output_tokens,
-                cost,
                 ..
             } => {
                 self.usage = Some(Usage {
                     input_tokens,
                     output_tokens,
-                    cost,
+                });
+            }
+            UiEvent::ContextUsageUpdated {
+                used_tokens,
+                max_tokens,
+            } => {
+                self.context_usage = Some(ContextUsage {
+                    used_tokens,
+                    max_tokens,
                 });
             }
             UiEvent::SubscriptionUsageLoaded { provider, usage } => {
@@ -1446,12 +1460,22 @@ impl CrossTerm {
                 // chrome (banner, metadata, and the boundary separator that
                 // follows) must survive the conversation switch.
                 retain_chrome(&mut self.transcript);
-                let label = if loaded {
-                    format!("loaded session {}", &id[..id.len().min(8)])
+                if !self.initial_session_seen && !loaded {
+                    self.initial_session_seen = true;
+                    if !self.minimal {
+                        self.pending.push(Entry::Separator {
+                            label: String::new(),
+                        });
+                    }
                 } else {
-                    "new conversation".to_owned()
-                };
-                self.pending.push(Entry::Separator { label });
+                    self.initial_session_seen = true;
+                    let label = if loaded {
+                        format!("Loaded Session {}", &id[..id.len().min(8)])
+                    } else {
+                        "New Session".to_owned()
+                    };
+                    self.pending.push(Entry::Separator { label });
+                }
             }
             UiEvent::SessionSnapshot { entries } => {
                 self.finalize_stream();
@@ -1600,11 +1624,17 @@ impl CrossTerm {
     fn input_layout(&self) -> InputLayout {
         let content = render::content_width(self.width);
         let usage_trailer = self.usage.as_ref().map_or_else(String::new, |usage| {
+            let context = self.context_usage.map_or_else(String::new, |context| {
+                format!(
+                    " · {}/{} ctx",
+                    format_tokens(context.used_tokens),
+                    format_tokens(context.max_tokens)
+                )
+            });
             format!(
-                "   ↑ {} ↓ {} · {}",
+                "   ↑ {} ↓ {}{context}",
                 format_tokens(usage.input_tokens),
                 format_tokens(usage.output_tokens),
-                usage.cost
             )
         });
         let input_width = content.saturating_sub(INPUT_PREFIX_WIDTH).max(1);
@@ -1972,7 +2002,7 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     let mut index = 0usize;
     transcript.retain(|entry| {
         let keep = match entry {
-            Entry::Banner { .. } | Entry::Metadata { .. } => true,
+            Entry::Banner | Entry::Metadata { .. } => true,
             Entry::Separator { .. } => Some(index) == last_separator,
             _ => false,
         };
@@ -2010,7 +2040,7 @@ fn entry_lines(
 ) -> Vec<Line<'static>> {
     let width = width.max(1);
     match entry {
-        Entry::Banner { tagline } => render::welcome_lines_with_tagline(width, theme, tagline),
+        Entry::Banner => render::welcome_lines(width, theme),
         Entry::Metadata {
             cwd,
             branch,
@@ -2098,7 +2128,9 @@ fn tool_lines(
         ToolStatus::Running => {}
         ToolStatus::Success => spans.push(Span::styled(
             format!(" · {}", render::duration_text(record.duration_ms)),
-            Style::default().fg(theme.dim_text),
+            Style::default()
+                .fg(theme.dim_text)
+                .add_modifier(Modifier::DIM),
         )),
         ToolStatus::Failure => {
             let preview = record
@@ -2214,15 +2246,22 @@ fn metadata_lines(
     lines
 }
 
-/// A centered `── label ──` rule marking a conversation boundary.
+/// A left-oriented rule marking a session boundary. An empty label is the
+/// unlabelled initial boundary below the full startup header.
 fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'static> {
-    let text = format!("── {label} ──");
-    let padding = width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
-    let left = padding / 2;
-    let right = padding - left;
+    let text = if label.is_empty() {
+        "─".repeat(width)
+    } else {
+        let prefix = format!("── {label} ");
+        let prefix = ghost_to_width(&prefix, width);
+        let remaining = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
+        format!("{prefix}{}", "─".repeat(remaining))
+    };
     Line::from(Span::styled(
-        format!("{}{}{}", "─".repeat(left), text, "─".repeat(right)),
-        Style::default().fg(theme.dim_text),
+        text,
+        Style::default()
+            .fg(theme.dim_text)
+            .add_modifier(Modifier::DIM),
     ))
 }
 
@@ -2252,7 +2291,7 @@ fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'stat
 /// nothing is shown while typing (the counter reappears after a submit
 /// because the input empties again). `ghost` is the fish-style dim suffix
 /// preview painted after the cursor (only at end-of-input, clamped to the row
-/// width), and `completion_hint` is one dim candidate row above the input.
+/// width), and `completion_hint` is one dim candidate row below the input.
 fn input_layout(
     input: &str,
     cursor: usize,
@@ -2284,14 +2323,14 @@ fn input_layout(
         }
         let mut rows = vec![Line::from(spans)];
         if !completion_hint.is_empty() {
-            rows.insert(
-                0,
-                Line::from(Span::styled(completion_hint.to_owned(), dim_style)),
-            );
+            rows.push(Line::from(vec![
+                Span::raw(INPUT_CONTINUATION),
+                Span::styled(completion_hint.to_owned(), dim_style),
+            ]));
         }
         return InputLayout {
             rows,
-            cursor_row: usize::from(!completion_hint.is_empty()),
+            cursor_row: 0,
             cursor_col: 0,
         };
     }
@@ -2374,13 +2413,13 @@ fn input_layout(
         rows.push(Line::from(Span::styled(INPUT_PREFIX, prefix_style)));
     }
 
-    // The list hint is one dim row above the input.
+    // The list hint sits below the draft so opening completion never moves
+    // the input or its real terminal cursor.
     if !completion_hint.is_empty() {
-        rows.insert(
-            0,
-            Line::from(Span::styled(completion_hint.to_owned(), dim_style)),
-        );
-        cursor_row += 1;
+        rows.push(Line::from(vec![
+            Span::raw(INPUT_CONTINUATION),
+            Span::styled(completion_hint.to_owned(), dim_style),
+        ]));
     }
     // Ghost preview: append the dim suffix after the typed text on the
     // cursor's row. Only at end-of-input, clamped to the remaining width so
@@ -2498,7 +2537,10 @@ fn clip_input(
         .cursor_row
         .saturating_sub(cap - 1)
         .min(input.rows.len() - cap);
-    (input.rows[start..].to_vec(), input.cursor_row - start)
+    (
+        input.rows[start..start + cap].to_vec(),
+        input.cursor_row - start,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -3016,10 +3058,14 @@ mod tests {
             reasoning_tokens: 2,
             cost: "$0.01".into(),
         });
+        ui.apply_event(UiEvent::ContextUsageUpdated {
+            used_tokens: 24_000,
+            max_tokens: 128_000,
+        });
         let layout = ui.input_layout();
         assert_eq!(
             row_text(&layout.rows[0]),
-            "› Type your message...   ↑ 1.2k ↓ 3.5k · $0.01"
+            "› Type your message...   ↑ 1.2k ↓ 3.5k · 24k/128k ctx"
         );
     }
 
@@ -3374,22 +3420,51 @@ mod tests {
 
     #[test]
     fn session_events_reset_the_transcript_and_queue_a_separator() {
-        let mut ui = ui(80, 24);
-        ui.transcript.push(Entry::User { text: "old".into() });
-        ui.stream = Some(StreamState {
+        let mut loaded_ui = ui(80, 24);
+        loaded_ui
+            .transcript
+            .push(Entry::User { text: "old".into() });
+        loaded_ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: "live".into(),
         });
-        ui.apply_event(UiEvent::SessionChanged {
+        loaded_ui.apply_event(UiEvent::SessionChanged {
             id: "abcd1234efgh".into(),
             title: None,
             loaded: true,
         });
-        assert!(ui.transcript.is_empty());
-        assert!(ui.stream.is_none());
+        assert!(loaded_ui.transcript.is_empty());
+        assert!(loaded_ui.stream.is_none());
         // The live message finalizes first, then the separator follows it.
-        assert!(matches!(&ui.pending[0], Entry::Assistant { .. }));
-        assert!(matches!(&ui.pending[1], Entry::Separator { label } if label.contains("abcd1234")));
+        assert!(matches!(&loaded_ui.pending[0], Entry::Assistant { .. }));
+        assert!(
+            matches!(&loaded_ui.pending[1], Entry::Separator { label } if label == "Loaded Session abcd1234")
+        );
+
+        let mut startup = ui(80, 24);
+        startup.apply_event(UiEvent::SessionChanged {
+            id: "initial".into(),
+            title: None,
+            loaded: false,
+        });
+        assert!(matches!(&startup.pending[0], Entry::Separator { label } if label.is_empty()));
+        startup.apply_event(UiEvent::SessionChanged {
+            id: "next".into(),
+            title: None,
+            loaded: false,
+        });
+        assert!(
+            matches!(&startup.pending[1], Entry::Separator { label } if label == "New Session")
+        );
+
+        let mut minimal = ui(80, 24);
+        minimal.minimal = true;
+        minimal.apply_event(UiEvent::SessionChanged {
+            id: "initial".into(),
+            title: None,
+            loaded: false,
+        });
+        assert!(minimal.pending.is_empty());
     }
 
     #[test]
@@ -3702,7 +3777,7 @@ mod tests {
         assert_eq!(row_text(&layout.rows[0]), "› /model opencode-go:");
         assert_eq!(layout.cursor_row, 0);
 
-        // The completion hint row sits above the input.
+        // The completion hint row sits below the input without moving it.
         let layout = input_layout(
             "/model",
             6,
@@ -3712,8 +3787,8 @@ mod tests {
             "",
             "opencode-go: · openrouter:",
         );
-        assert_eq!(row_text(&layout.rows[0]), "opencode-go: · openrouter:");
-        assert_eq!(row_text(&layout.rows[1]), "› /model");
-        assert_eq!(layout.cursor_row, 1);
+        assert_eq!(row_text(&layout.rows[0]), "› /model");
+        assert_eq!(row_text(&layout.rows[1]), "  opencode-go: · openrouter:");
+        assert_eq!(layout.cursor_row, 0);
     }
 }

@@ -169,6 +169,13 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
             reasoning_tokens,
             cost,
         },
+        AgentEvent::ContextUsageUpdated {
+            used_tokens,
+            max_tokens,
+        } => tui::UiEvent::ContextUsageUpdated {
+            used_tokens,
+            max_tokens,
+        },
         AgentEvent::SubscriptionUsageLoaded { provider, usage } => {
             tui::UiEvent::SubscriptionUsageLoaded {
                 provider,
@@ -382,6 +389,10 @@ mod tests {
                 reasoning_tokens: 4,
                 cost: "$0.01".into(),
             },
+            AgentEvent::ContextUsageUpdated {
+                used_tokens: 5,
+                max_tokens: 128_000,
+            },
             AgentEvent::SubscriptionUsageLoaded {
                 provider: "provider".into(),
                 usage: llm::SubscriptionUsage {
@@ -434,10 +445,14 @@ mod tests {
         assert!(matches!(converted[16], tui::UiEvent::UsageUpdated { .. }));
         assert!(matches!(
             converted[17],
-            tui::UiEvent::SubscriptionUsageLoaded { .. }
+            tui::UiEvent::ContextUsageUpdated { .. }
         ));
         assert!(matches!(
             converted[18],
+            tui::UiEvent::SubscriptionUsageLoaded { .. }
+        ));
+        assert!(matches!(
+            converted[19],
             tui::UiEvent::CompactionFinished { .. }
         ));
     }

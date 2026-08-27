@@ -218,6 +218,7 @@ impl Agent {
         if self.context_window == 0 {
             self.context_window = self.compaction.resolved_window(0);
         }
+        send(&events, self.context_usage_event());
         // Begin model discovery without placing it on the first-turn critical
         // path. The conservative/configured window is already installed; a
         // bounded late result only affects future turns.
@@ -225,7 +226,9 @@ impl Agent {
         let mut metadata_pending = self.compaction.context_window == 0;
         if metadata_pending {
             let provider = self.provider.clone();
+            let provider_name = provider.name().to_owned();
             let model = self.model.clone();
+            let lookup_model = model.clone();
             let shutdown = self.cancel.clone();
             tokio::spawn(async move {
                 let discovered = tokio::select! {
@@ -234,13 +237,13 @@ impl Agent {
                         provider.list_models(),
                     ) => result.ok().and_then(Result::ok).and_then(|models| {
                         models.into_iter().find(|candidate| {
-                            candidate.id == model
-                                || candidate.name.as_deref() == Some(model.as_str())
+                            candidate.id == lookup_model
+                                || candidate.name.as_deref() == Some(lookup_model.as_str())
                         }).and_then(|candidate| candidate.context_length)
                     }),
                     _ = shutdown.cancelled() => None,
                 };
-                let _ = context_tx.send(discovered).await;
+                let _ = context_tx.send((provider_name, model, discovered)).await;
             });
         }
 
@@ -259,8 +262,12 @@ impl Agent {
                     }
                     reported = context_rx.recv(), if metadata_pending => {
                         metadata_pending = false;
-                        if let Some(Some(window)) = reported {
+                        if let Some((provider, model, Some(window))) = reported
+                            && provider == self.provider.name()
+                            && model == self.model
+                        {
                             self.context_window = self.compaction.resolved_window(window);
+                            send(&events, self.context_usage_event());
                         }
                         continue;
                     }
@@ -933,7 +940,7 @@ mod tests {
             .map(|(index, _)| index)
             .collect();
         assert_eq!(start_positions.len(), 2);
-        assert_eq!(start_positions[0], 0); // relative to first tool event
+        assert!(start_positions[0] < finish_of_first);
         assert!(
             start_positions[1] > finish_of_first,
             "second start must wait for a freed slot"

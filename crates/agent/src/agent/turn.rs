@@ -178,6 +178,7 @@ impl Agent {
                                     } else {
                                         send(events, usage_event(&summary));
                                     }
+                                    send(events, self.context_usage_event());
                                 }
                             }
                             Err(error) => {

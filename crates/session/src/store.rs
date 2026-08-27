@@ -50,6 +50,9 @@ pub struct SessionIndexEntry {
     pub model: Option<String>,
     pub parent_session: Option<SessionId>,
     pub event_count: usize,
+    /// Whether replay produces any provider conversation context. Metadata,
+    /// usage, diagnostics, and cancellation-only files remain false.
+    pub has_conversation: bool,
     pub path: PathBuf,
     pub bytes: u64,
 }
@@ -287,14 +290,12 @@ impl SessionStore {
                     .cmp(&left.updated_at)
                     .then_with(|| right.created_at.cmp(&left.created_at))
             });
-            // A freshly started Harness process creates an empty session
-            // immediately.  Treating that placeholder as "latest" would
-            // make `/load latest` unable to resume the previous conversation.
-            if entries.first().is_some_and(|entry| entry.event_count == 0) && entries.len() > 1 {
-                entries.remove(0);
-            }
+            // Harness creates a persisted header immediately. Skip every
+            // session without provider conversation context so repeated
+            // `/new` commands cannot make `latest` select a placeholder.
             return entries
-                .first()
+                .iter()
+                .find(|entry| entry.has_conversation)
                 .map(|entry| self.load_path(&entry.path))
                 .unwrap_or(Err(SessionError::NoSession));
         }
@@ -501,6 +502,7 @@ fn list_directory(directory: &Path, workspace: Option<&Path>) -> Result<Vec<Sess
             model: session.metadata.model.clone(),
             parent_session: session.metadata.parent_session,
             event_count: session.events.len(),
+            has_conversation: !session.context_messages().is_empty(),
             path,
             bytes,
         });
@@ -817,7 +819,36 @@ mod tests {
             .unwrap();
         let loaded = store.open(&session.id()).unwrap();
         assert_eq!(loaded.context_messages(), session.context_messages());
-        assert_eq!(store.list().unwrap().len(), 1);
+
+        // Metadata-only sessions remain durable but do not count as
+        // conversational choices or win the `latest` selector.
+        let mut metadata_only = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut metadata_only,
+                SessionEvent::ModelChange {
+                    provider: "mock".into(),
+                    model: "other".into(),
+                },
+            )
+            .unwrap();
+        let entries = store.list().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .find(|entry| entry.id == session.id())
+                .unwrap()
+                .has_conversation
+        );
+        assert!(
+            !entries
+                .iter()
+                .find(|entry| entry.id == metadata_only.id())
+                .unwrap()
+                .has_conversation
+        );
+        assert_eq!(store.load("latest").unwrap().id(), session.id());
     }
 
     #[test]

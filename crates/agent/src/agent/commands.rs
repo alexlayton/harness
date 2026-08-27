@@ -58,6 +58,10 @@ impl Agent {
                 entries: Vec::new(),
             },
         );
+        if let Some(state) = self.session.as_ref() {
+            send(events, usage_event(&state.session.metadata.usage));
+        }
+        send(events, self.context_usage_event());
         send(
             events,
             AgentEvent::Notice("Started a new conversation".into()),
@@ -127,6 +131,7 @@ impl Agent {
         if let Some(state) = self.session.as_ref() {
             send(events, usage_event(&state.session.metadata.usage));
         }
+        send(events, self.context_usage_event());
         send(
             events,
             AgentEvent::Notice(format!(
@@ -148,6 +153,7 @@ impl Agent {
                 AgentEvent::SessionList {
                     sessions: entries
                         .into_iter()
+                        .filter(|entry| entry.has_conversation)
                         .map(|entry| SessionListItem {
                             id: entry.id.to_string(),
                             short_id: entry.short_id,
@@ -271,7 +277,7 @@ impl Agent {
         // A different model may have a different context window and stale
         // token counts; reset both so the next trigger re-baselines.
         self.last_context_tokens = None;
-        self.refresh_context_window().await;
+        self.refresh_context_window(events).await;
     }
 
     pub(crate) fn handle_set_reasoning(

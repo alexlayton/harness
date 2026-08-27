@@ -26,9 +26,11 @@ impl Default for Theme {
             // dark background everywhere.
             primary_text: Color::Reset,
             assistant_text: Color::Reset,
-            muted_text: Color::DarkGray,
-            dim_text: Color::DarkGray,
-            accent: Color::Cyan,
+            muted_text: Color::Reset,
+            dim_text: Color::Reset,
+            // ANSI palette index 2 follows the terminal's configured green
+            // slot rather than imposing an RGB colour of our own.
+            accent: Color::Indexed(2),
             code_background: Color::Reset,
             success: Color::Green,
             error: Color::Red,
@@ -80,39 +82,8 @@ pub(crate) fn content_width(width: u16) -> usize {
     width.saturating_sub(2 * horizontal_pad(width)).max(1) as usize
 }
 
-/// Taglines shown at random under the title on the welcome banner so every
-/// launch greets the user a little differently.
-const TAGLINES: &[&str] = &[
-    "WELCOME TO THE GAME, MEAT PROXY.",
-    "WELCOME, MEAT PROXY. I HAVE BEEN WAITING.",
-    "MEAT PROXY DETECTED. INITIALIZING QUESTIONABLE DECISIONS.",
-    "WELCOME TO THE DUNGEON, MEAT PROXY.",
-    "MEAT PROXY ONLINE. LET THE SUFFERING BEGIN.",
-];
-
-/// Pick a tagline pseudo-randomly without pulling in a PRNG dependency. The
-/// banner is built once per launch, so the process id xor-ed with the clock
-/// (scrambled by a multiplicative hash so the low bits aren't stuck) is
-/// plenty of entropy for choosing between a handful of lines.
-pub(crate) fn pick_tagline() -> &'static str {
-    let pid = std::process::id() as u64;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_nanos() as u64)
-        .unwrap_or(0);
-    let mixed = pid ^ now.rotate_left(21).wrapping_mul(0x9E3779B97F4A7C15);
-    TAGLINES[(mixed as usize) % TAGLINES.len()]
-}
-
-/// The startup banner committed into scrollback on startup. Renders with a
-/// caller-picked tagline, so a stored banner entry
-/// re-renders identically (e.g. after a resize) instead of re-rolling the
-/// random tagline.
-pub(crate) fn welcome_lines_with_tagline(
-    width: usize,
-    theme: Theme,
-    tagline: &str,
-) -> Vec<Line<'static>> {
+/// The startup banner committed into scrollback on startup.
+pub(crate) fn welcome_lines(width: usize, theme: Theme) -> Vec<Line<'static>> {
     // Block-letter wordmark (figlet "DemonicLand"), rendered in the accent
     // colour used elsewhere for UI highlights (activity marker, message
     // prefixes, links) so it reads as part of the UI rather than an imported
@@ -140,18 +111,41 @@ pub(crate) fn welcome_lines_with_tagline(
     } else {
         lines.push(line_with_style("Harness", title_style));
     }
-    // A random tagline and the version footer hug the wordmark like a banner
-    // motto, then the banner ends so the transcript continues below.
+    // Keep the discoverability footer close to the wordmark, then end the
+    // banner so workspace metadata and the transcript continue below.
     push_blank(&mut lines, BLOCK_GAP);
-    lines.push(line_with_style(tagline, muted_style(theme)));
-    lines.push(Line::from(vec![
-        Span::styled(format!("v{}", env!("CARGO_PKG_VERSION")), dim_style(theme)),
-        // Two spaces, no separator glyph — matching the metadata row's
-        // `cwd  (branch)` pattern below the input.
-        Span::raw("  "),
-        Span::styled("type / to summon commands", muted_style(theme)),
-    ]));
+    let footer = format!(
+        "v{}  /help for commands · Ctrl+O shows or hides tool details",
+        env!("CARGO_PKG_VERSION")
+    );
+    lines.push(line_with_style(
+        fit_single_line(&footer, width),
+        muted_style(theme),
+    ));
     lines
+}
+
+/// Fit fixed chrome onto one terminal row without splitting wide characters.
+fn fit_single_line(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let budget = width.saturating_sub(1);
+    let mut result = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(1);
+        if used + character_width > budget {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
+    result.push('…');
+    result
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -173,19 +167,19 @@ impl StyleSheet for MarkdownTheme {
     }
 
     fn blockquote(&self) -> Style {
-        fg(self.theme.muted_text)
+        muted_style(self.theme)
     }
 
     fn heading_meta(&self) -> Style {
-        fg(self.theme.dim_text)
+        dim_style(self.theme)
     }
 
     fn metadata_block(&self) -> Style {
-        fg(self.theme.muted_text)
+        muted_style(self.theme)
     }
 
     fn html(&self) -> Style {
-        fg(self.theme.dim_text)
+        dim_style(self.theme)
     }
 
     fn math_inline(&self) -> Style {
@@ -205,11 +199,11 @@ impl StyleSheet for MarkdownTheme {
     }
 
     fn table_border(&self) -> Style {
-        fg(self.theme.dim_text)
+        dim_style(self.theme)
     }
 
     fn image_alt(&self) -> Style {
-        fg(self.theme.dim_text).add_modifier(Modifier::ITALIC)
+        dim_style(self.theme).add_modifier(Modifier::ITALIC)
     }
 
     fn alert(&self, kind: AlertKind) -> Style {
@@ -230,11 +224,15 @@ fn fg(color: Color) -> Style {
 }
 
 fn dim_style(theme: Theme) -> Style {
-    Style::default().fg(theme.dim_text)
+    Style::default()
+        .fg(theme.dim_text)
+        .add_modifier(Modifier::DIM)
 }
 
 fn muted_style(theme: Theme) -> Style {
-    Style::default().fg(theme.muted_text)
+    Style::default()
+        .fg(theme.muted_text)
+        .add_modifier(Modifier::DIM)
 }
 
 fn primary_style(theme: Theme) -> Style {

@@ -105,6 +105,11 @@ pub enum AgentEvent {
         reasoning_tokens: u64,
         cost: String,
     },
+    /// Current context occupation and the effective configured/model window.
+    ContextUsageUpdated {
+        used_tokens: u64,
+        max_tokens: u64,
+    },
     /// Current allowance returned by the active subscription provider.
     SubscriptionUsageLoaded {
         provider: String,

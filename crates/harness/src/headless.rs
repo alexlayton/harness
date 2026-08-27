@@ -237,6 +237,7 @@ async fn drive_headless_events_into(
             AgentEvent::SessionSnapshot { .. }
             | AgentEvent::SessionList { .. }
             | AgentEvent::ModelList { .. }
+            | AgentEvent::ContextUsageUpdated { .. }
             // `/skills` is a TUI command; headless stdout stays answer-only.
             | AgentEvent::SkillsLoaded { .. }
             | AgentEvent::SessionExported { .. } => {}

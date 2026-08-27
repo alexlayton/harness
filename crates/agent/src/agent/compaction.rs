@@ -13,24 +13,38 @@ impl Agent {
 
     /// Resolve the provider context window: config override → model-reported
     /// `context_length` → conservative default. Runs once at startup and again
-    /// after a model switch; a failed fetch keeps the current value.
-    pub(crate) async fn refresh_context_window(&mut self) {
-        let resolved = self.compaction.resolved_window(0);
-        if self.compaction.context_window > 0 {
-            self.context_window = resolved;
-            return;
+    /// after a model switch.
+    pub(crate) async fn refresh_context_window(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let reported = if self.compaction.context_window > 0 {
+            0
+        } else {
+            self.provider
+                .list_models()
+                .await
+                .ok()
+                .and_then(|models| {
+                    models.into_iter().find(|model| {
+                        model.id == self.model || model.name.as_deref() == Some(self.model.as_str())
+                    })
+                })
+                .and_then(|model| model.context_length)
+                .unwrap_or(0)
+        };
+        self.context_window = self.compaction.resolved_window(reported);
+        send(events, self.context_usage_event());
+    }
+
+    /// Frontend-neutral snapshot for the input trailer. The current value is
+    /// exact after a provider usage report and estimated from live context
+    /// after startup, loading, model changes, or compaction.
+    pub(crate) fn context_usage_event(&self) -> AgentEvent {
+        AgentEvent::ContextUsageUpdated {
+            used_tokens: self.context_tokens_estimate(0),
+            max_tokens: self.context_window,
         }
-        if let Ok(models) = self.provider.list_models().await
-            && let Some(model) = models.iter().find(|model| {
-                model.id == self.model || model.name.as_deref() == Some(self.model.as_str())
-            })
-        {
-            self.context_window = self
-                .compaction
-                .resolved_window(model.context_length.unwrap_or(0));
-            return;
-        }
-        self.context_window = self.compaction.resolved_window(0);
     }
 
     /// Approximate current context occupation: exact from the last request's
@@ -171,6 +185,8 @@ impl Agent {
             self.history = state.session.context_messages();
             send(events, usage_event(&state.session.metadata.usage));
         }
+        self.last_context_tokens = None;
+        send(events, self.context_usage_event());
 
         send(
             events,
