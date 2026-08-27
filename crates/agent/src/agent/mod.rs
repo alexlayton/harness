@@ -373,6 +373,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::sync::Notify;
     use tools::Tool;
     use tools::ToolRegistry;
 
@@ -423,6 +424,39 @@ mod tests {
                     })
                 },
             ))))
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Holds a retryable stream error until the test has also queued an
+    /// interrupt, making both branches ready in the same scheduler tick.
+    struct InterruptRaceProvider {
+        calls: AtomicUsize,
+        stream_polled: Arc<Notify>,
+        release_error: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for InterruptRaceProvider {
+        fn name(&self) -> &str {
+            "interrupt-race"
+        }
+
+        async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let stream_polled = self.stream_polled.clone();
+            let release_error = self.release_error.clone();
+            Ok(Box::pin(stream::once(async move {
+                stream_polled.notify_one();
+                release_error.notified().await;
+                Err(LlmError::Http {
+                    status: 500,
+                    body: "connection dropped".into(),
+                })
+            })))
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -1674,6 +1708,52 @@ mod tests {
                 "the retried answer should be persisted"
             );
         });
+    }
+
+    /// Esc and a retryable stream failure can become ready together. The
+    /// explicit interrupt must win, rather than allowing recovery to start a
+    /// fresh provider request after the user stopped the turn.
+    #[tokio::test]
+    async fn interrupt_wins_race_with_retryable_stream_error() {
+        let stream_polled = Arc::new(Notify::new());
+        let release_error = Arc::new(Notify::new());
+        let provider = Arc::new(InterruptRaceProvider {
+            calls: AtomicUsize::new(0),
+            stream_polled: stream_polled.clone(),
+            release_error: release_error.clone(),
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("keep going".into()))
+            .unwrap();
+
+        let agent_task = tokio::spawn(
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .run(input_rx, event_tx),
+        );
+        stream_polled.notified().await;
+        input_tx.send(InputMessage::Interrupt).unwrap();
+        release_error.notify_one();
+        drop(input_tx);
+        agent_task.await.unwrap();
+
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "manual interruption must prevent a recovery request"
+        );
+        let mut got = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            got.push(event);
+        }
+        assert!(got.contains(&AgentEvent::TurnFinished));
+        assert!(
+            !got.iter()
+                .any(|event| matches!(event, AgentEvent::Retrying { .. } | AgentEvent::Error(_))),
+            "the raced provider failure must not override manual interruption"
+        );
     }
 
     /// A transient mid-stream failure (connection drop / decode error) must

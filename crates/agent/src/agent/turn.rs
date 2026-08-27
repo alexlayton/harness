@@ -88,7 +88,16 @@ impl Agent {
             tokio::pin!(provider_future);
             let stream_result = loop {
                 tokio::select! {
-                    result = &mut provider_future => break Some(result),
+                    // Once an interrupt is queued it must win over a provider
+                    // result that becomes ready at the same time. Otherwise a
+                    // failed request can enter its retry path after Esc.
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        self.persist_cancelled("application shutdown", events);
+                        send(events, AgentEvent::TurnFinished);
+                        return Err(TurnError::Shutdown);
+                    }
+                    _ = cancel.cancelled() => break None,
                     message = input.recv(), if self.input_open => match message {
                         Some(InputMessage::Interrupt) => {
                             cancel.cancel();
@@ -97,12 +106,7 @@ impl Agent {
                         Some(message) => self.queued.push_back(message),
                         None => self.input_open = false,
                     },
-                    _ = cancel.cancelled() => break None,
-                    _ = self.cancel.cancelled() => {
-                        self.persist_cancelled("application shutdown", events);
-                        send(events, AgentEvent::TurnFinished);
-                        return Err(TurnError::Shutdown);
-                    }
+                    result = &mut provider_future => break Some(result),
                 }
             };
             let Some(stream_result) = stream_result else {
@@ -145,6 +149,27 @@ impl Agent {
 
             loop {
                 tokio::select! {
+                    // Prefer cancellation/input when the stream completes or
+                    // errors in the same scheduler tick as an Esc interrupt.
+                    // Recovery decisions below must never outrun manual stop.
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        break;
+                    }
+                    message = input.recv(), if self.input_open => match message {
+                        Some(InputMessage::Interrupt) => {
+                            cancel.cancel();
+                            cancelled = true;
+                            break;
+                        }
+                        Some(message) => self.queued.push_back(message),
+                        None => self.input_open = false,
+                    },
                     next = stream.next() => {
                         let Some(next) = next else {
                             break;
@@ -186,23 +211,6 @@ impl Agent {
                                 break;
                             }
                         }
-                    }
-                    message = input.recv(), if self.input_open => match message {
-                        Some(InputMessage::Interrupt) => {
-                            cancel.cancel();
-                            cancelled = true;
-                            break;
-                        }
-                        Some(message) => self.queued.push_back(message),
-                        None => self.input_open = false,
-                    },
-                    _ = cancel.cancelled() => {
-                        cancelled = true;
-                        break;
-                    }
-                    _ = self.cancel.cancelled() => {
-                        cancelled = true;
-                        break;
                     }
                 }
             }
