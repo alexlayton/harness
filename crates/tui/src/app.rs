@@ -2949,6 +2949,28 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_inserts_a_newline_without_submitting() {
+        let mut ui = ui(80, 24);
+        ui.input = "first line".into();
+        ui.cursor = ui.input.len();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let shift_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        assert!(!ui.handle_input(&shift_enter, &tx, &cancel).unwrap());
+        assert_eq!(ui.input, "first line\n");
+        assert_eq!(ui.cursor, ui.input.len());
+        assert!(rx.try_recv().is_err());
+
+        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!ui.handle_input(&enter, &tx, &cancel).unwrap());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            InputMessage::Message("first line\n".into())
+        );
+    }
+
+    #[test]
     fn reasoning_command_reports_current_value_and_sends_changes() {
         let mut ui = ui(80, 24);
         let (tx, mut rx) = mpsc::unbounded_channel();
