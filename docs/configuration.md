@@ -45,9 +45,10 @@ setting is absent.
 The `/model` terminal command updates the saved provider and model. Harness
 preserves configuration keys that it does not know when it saves these values.
 
-Set `rtk = true` to let the bash tool rewrite supported commands through an
-installed `rtk` executable for smaller tool output. This feature is off by
-default.
+Set `rtk = true` to route supported bash commands through the bundled RTK
+library for smaller tool output. Unsupported or complex shell commands execute
+unchanged through RTK's shell passthrough, and no separate `rtk` executable is
+required. This feature is off by default.
 
 ## Terminal UI
 

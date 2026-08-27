@@ -734,9 +734,8 @@ async fn prompt(
 
 /// Build the `(store, registry)` pair for a session root. This mirrors what
 /// `main.rs` assembles for the TUI, rooted at the request's `cwd` instead of
-/// the process cwd. `rtk` stays off: it is a local shell-output preference
-/// from the developer's config file, and editor sessions should not depend on
-/// it being installed.
+/// the process cwd. `rtk` stays off intentionally: ACP editor sessions use the
+/// baseline shell-output behavior rather than this local output preference.
 fn build_session_stack(
     cwd: &std::path::Path,
     session_root: &std::path::Path,

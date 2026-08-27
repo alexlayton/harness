@@ -171,9 +171,9 @@ pub struct FileConfig {
     /// Portable reasoning effort for normal agent and subagent requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningPolicy>,
-    /// Opt-in RTK integration: rewrite supported bash commands to their
-    /// token-optimized `rtk` equivalents before execution. Off unless the
-    /// user explicitly sets `rtk = true`.
+    /// Opt-in RTK integration: route supported bash commands through the
+    /// bundled token-optimized execution filters. Off unless the user
+    /// explicitly sets `rtk = true`.
     #[serde(default)]
     pub rtk: bool,
     /// Compact settings. Anything the compiler cannot answer comes from

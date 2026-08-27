@@ -1,6 +1,10 @@
 use super::{Concurrency, Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root};
 use async_trait::async_trait;
 use llm::ToolDefinition;
+use rtk::{
+    BeforeStartError, CancellationToken as RtkCancellationToken, ExecuteError, ExecuteOptions,
+    MayHaveStartedKind,
+};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,8 +19,7 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    /// A tool that rewrites supported commands to their token-optimized `rtk`
-    /// equivalents before execution (see [`rtk_rewrite`]).
+    /// A shell tool rooted at `root`, with in-process RTK execution disabled.
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
         Self {
             rtk: false,
@@ -24,6 +27,7 @@ impl BashTool {
         }
     }
 
+    /// A shell tool rooted at `root`, optionally using RTK's execution API.
     pub fn with_rtk_and_workspace_root(rtk: bool, root: impl Into<PathBuf>) -> Self {
         Self {
             rtk,
@@ -34,46 +38,20 @@ impl BashTool {
 
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
-const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
-/// signals support by printing the rewritten command on stdout; unsupported
-/// commands, a missing rtk binary, and timeouts all degrade to `None`, in
-/// which case the caller runs the original command unchanged.  The exit code
-/// is only authoritative for versions known to implement the documented
-/// semantics: relying on stdout alone would misread a future version that
-/// prints diagnostics but exits non-zero on error.
-async fn rtk_rewrite_cancellable(
-    command: &str,
-    cancel: &CancellationToken,
-    deadline: tokio::time::Instant,
-) -> Option<String> {
-    if command.trim_start().starts_with("rtk ") {
-        return None;
+/// Cancels detached RTK work if the agent drops the Bash future while
+/// interrupting a tool batch. `spawn_blocking` itself cannot be force-stopped.
+struct CancelRtkOnDrop(RtkCancellationToken);
+
+impl Drop for CancelRtkOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
-    let mut process = Command::new("rtk");
-    process
-        .arg("rewrite")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let rewrite_deadline = deadline.min(tokio::time::Instant::now() + RTK_REWRITE_TIMEOUT);
-    let output = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => return None,
-        output = process.output() => output.ok()?,
-        _ = tokio::time::sleep_until(rewrite_deadline) => return None,
-    };
-    let accepted = matches!(output.status.code(), Some(0 | 3));
-    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    (accepted && !rewritten.is_empty()).then_some(rewritten)
 }
 
 /// True when a shell operand contains a control-flow keyword as a word, which
-/// would make per-operand rewriting unsafe.  Conservative: a false positive
-/// only skips the rtk split optimization, never alters execution.
+/// makes word-level read-only classification unsafe. Conservative: a false
+/// positive only serializes execution.
 fn has_control_keyword(operand: &str) -> bool {
     const KEYWORDS: &[&str] = &[
         "if ",
@@ -448,6 +426,168 @@ async fn resolve_workspace_dir(root: &Path, dir: &str) -> Result<PathBuf, String
     Ok(candidate)
 }
 
+/// Run one command through RTK's synchronous embedding API. Cancellation is
+/// bridged explicitly, then the blocking task is awaited so RTK can terminate
+/// and reap the complete child process tree before the tool call returns.
+async fn execute_with_rtk(
+    command: String,
+    timeout: u64,
+    dir: Option<String>,
+    cwd: PathBuf,
+    cancel: CancellationToken,
+) -> ToolOutput {
+    let summary = bash_summary(&command, dir.as_deref());
+    let rtk_cancel = RtkCancellationToken::new();
+    let _cancel_on_drop = CancelRtkOnDrop(rtk_cancel.clone());
+    let options = ExecuteOptions::default()
+        .with_cwd(cwd)
+        .with_timeout(Duration::from_secs(timeout))
+        .with_cancellation(rtk_cancel.clone())
+        .with_output_limit(MAX_BYTES);
+    let task_command = command.clone();
+    let mut task =
+        tokio::task::spawn_blocking(move || rtk::execute_with_options(&task_command, &options));
+
+    let joined = tokio::select! {
+        biased;
+        result = &mut task => result,
+        _ = cancel.cancelled() => {
+            rtk_cancel.cancel();
+            task.await
+        }
+    };
+
+    match joined {
+        Ok(Ok(result)) => {
+            tracing::debug!(command = %command, route = ?result.route, "RTK execution completed");
+            let suffix =
+                (result.exit_code != 0).then(|| format!("[exit code {}]", result.exit_code));
+            ToolOutput {
+                content: render_rtk_output(
+                    &result.stdout,
+                    result.stdout_truncated,
+                    &result.stderr,
+                    result.stderr_truncated,
+                    suffix.as_deref(),
+                ),
+                is_error: result.exit_code != 0,
+                summary,
+            }
+        }
+        Ok(Err(error)) => rtk_error_output(error, timeout, summary),
+        Err(join_error) => error(
+            &summary,
+            &format!("RTK execution worker failed: {join_error}"),
+        ),
+    }
+}
+
+fn rtk_error_output(error: ExecuteError, timeout: u64, summary: String) -> ToolOutput {
+    let (stdout, stdout_truncated, stderr, stderr_truncated, suffix) = match error {
+        ExecuteError::BeforeStart(error) => {
+            let suffix = match error {
+                BeforeStartError::Cancelled => "[cancelled]".to_owned(),
+                BeforeStartError::TimedOut => format!("[timed out after {timeout}s]"),
+                BeforeStartError::WorkingDirectory(error) => {
+                    format!("[RTK execution failed: working directory: {error}]")
+                }
+            };
+            (String::new(), false, String::new(), false, suffix)
+        }
+        ExecuteError::MayHaveStarted(error) => {
+            let suffix = match error.kind {
+                MayHaveStartedKind::Cancelled => "[cancelled]".to_owned(),
+                MayHaveStartedKind::TimedOut => format!("[timed out after {timeout}s]"),
+                MayHaveStartedKind::Spawn(error) => {
+                    format!("[RTK execution failed while spawning: {error}]")
+                }
+                MayHaveStartedKind::Wait(error) => {
+                    format!("[RTK execution failed while waiting: {error}]")
+                }
+                MayHaveStartedKind::Terminate(error) => {
+                    format!("[RTK process termination failed: {error}]")
+                }
+                MayHaveStartedKind::Capture(error) => {
+                    format!("[RTK output capture failed: {error}]")
+                }
+                MayHaveStartedKind::Filter(error) => {
+                    format!("[RTK output filter failed: {error}]")
+                }
+            };
+            (
+                error.partial_output.stdout,
+                error.partial_output.stdout_truncated,
+                error.partial_output.stderr,
+                error.partial_output.stderr_truncated,
+                suffix,
+            )
+        }
+    };
+
+    ToolOutput {
+        content: render_rtk_output(
+            &stdout,
+            stdout_truncated,
+            &stderr,
+            stderr_truncated,
+            Some(&suffix),
+        ),
+        is_error: true,
+        summary,
+    }
+}
+
+fn render_rtk_output(
+    stdout: &str,
+    stdout_truncated: bool,
+    stderr: &str,
+    stderr_truncated: bool,
+    suffix: Option<&str>,
+) -> String {
+    let mut output = stdout.to_owned();
+    if !stderr.is_empty() || stderr_truncated {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str("--- stderr ---\n");
+        output.push_str(stderr);
+    }
+    output = truncate_command_output(&output);
+
+    let mut markers = Vec::new();
+    if stdout_truncated {
+        markers.push(format!(
+            "[truncated while running: stdout exceeded the {MAX_BYTES}-byte capture limit]"
+        ));
+    }
+    if stderr_truncated {
+        markers.push(format!(
+            "[truncated while running: stderr exceeded the {MAX_BYTES}-byte capture limit]"
+        ));
+    }
+    if !markers.is_empty() {
+        if !output.is_empty() {
+            markers.push(output);
+        }
+        output = markers.join("\n");
+    }
+
+    if let Some(suffix) = suffix {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(suffix);
+    }
+    output
+}
+
+fn bash_summary(command: &str, dir: Option<&str>) -> String {
+    match dir {
+        Some(dir) => format!("bash: {} (in {dir})", first_line(command)),
+        None => format!("bash: {}", first_line(command)),
+    }
+}
+
 #[async_trait]
 impl Tool for BashTool {
     fn spec(&self) -> ToolSpec {
@@ -458,7 +598,7 @@ impl Tool for BashTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Command passed to sh -c" },
+                    "command": { "type": "string", "description": "Shell command to execute" },
                     "dir": { "type": "string", "description": "Optional working directory for the command, relative to the workspace root (e.g. \"crates/tools\"). Prefer this over prefixing the command with cd <dir> && ..." },
                     "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" }
                 },
@@ -511,22 +651,16 @@ impl Tool for BashTool {
             return error(&format!("bash: {}", first_line(&command)), "cancelled");
         }
 
-        // RTK owns rewrite policy: one cancellable whole-command request,
-        // with rewrite time charged to the bash call's total deadline.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
-        let run_command = if self.rtk {
-            rtk_rewrite_cancellable(&command, &cancel, deadline)
-                .await
-                .unwrap_or_else(|| command.clone())
-        } else {
-            command.clone()
-        };
+        let run_cwd = run_dir.unwrap_or_else(|| self.cwd.clone());
+        if self.rtk {
+            return execute_with_rtk(command, timeout, dir, run_cwd, cancel).await;
+        }
 
-        let cwd = self.cwd.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
         let mut child = match Command::new("sh")
             .arg("-c")
-            .arg(&run_command)
-            .current_dir(run_dir.as_deref().unwrap_or(&cwd))
+            .arg(&command)
+            .current_dir(&run_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -626,10 +760,7 @@ impl Tool for BashTool {
         ToolOutput {
             content: output,
             is_error,
-            summary: match dir.as_deref() {
-                Some(dir) => format!("bash: {} (in {dir})", first_line(&run_command)),
-                None => format!("bash: {}", first_line(&run_command)),
-            },
+            summary: bash_summary(&command, dir.as_deref()),
         }
     }
 }
@@ -784,18 +915,14 @@ mod tests {
         assert!(!output.contains("\n0\n"));
     }
 
-    /// rtk is an optional external binary; tests that need it skip silently
-    /// when it is not installed.
-    async fn rtk_available() -> bool {
-        Command::new("rtk")
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|status| status.success())
-            .unwrap_or(false)
+    #[test]
+    fn rtk_output_preserves_truncation_markers_and_error_suffix() {
+        let oversized = "x".repeat(MAX_BYTES);
+        let output = render_rtk_output(&oversized, true, "stderr tail", true, Some("[cancelled]"));
+        assert!(output.contains("stdout exceeded"));
+        assert!(output.contains("stderr exceeded"));
+        assert!(output.contains("stderr tail"));
+        assert!(output.ends_with("[cancelled]"));
     }
 
     #[tokio::test]
@@ -842,48 +969,200 @@ mod tests {
         assert!(missing.content.contains("nope"));
     }
 
-    /// The end-to-end rewrite test runs `git status` in the crate directory,
-    /// so it also needs to be inside a git work tree.
-    async fn git_work_tree_available() -> bool {
-        Command::new("git")
-            .arg("status")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
             .status()
-            .await
-            .map(|status| status.success())
-            .unwrap_or(false)
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
     }
 
     #[tokio::test]
-    async fn rtk_enabled_tool_executes_rewritten_command() {
-        if !rtk_available().await || !git_work_tree_available().await {
-            return;
-        }
-        let cwd = std::env::current_dir().unwrap();
-        let output = BashTool::with_rtk_and_workspace_root(true, &cwd)
+    async fn rtk_enabled_tool_filters_git_status_in_process() {
+        let directory = tempfile::tempdir().unwrap();
+        run_git(directory.path(), &["init", "-q"]);
+        run_git(
+            directory.path(),
+            &["config", "user.email", "harness@example.com"],
+        );
+        run_git(directory.path(), &["config", "user.name", "Harness Test"]);
+        std::fs::write(directory.path().join("file.txt"), "first\n").unwrap();
+        run_git(directory.path(), &["add", "file.txt"]);
+        run_git(directory.path(), &["commit", "-qm", "initial"]);
+        std::fs::write(directory.path().join("file.txt"), "first\nsecond\n").unwrap();
+
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
             .execute(json!({"command": "git status"}), CancellationToken::new())
             .await;
         assert!(!output.is_error, "{}", output.content);
-        // `rtk git status` prints a compact `* <branch>` header instead of
-        // git's "On branch", proving the rewrite path ran.
         assert!(output.content.starts_with("* "), "{}", output.content);
-        // The summary names the command that actually ran.
-        assert_eq!(output.summary, "bash: rtk git status");
+        assert_eq!(output.summary, "bash: git status");
     }
 
     #[tokio::test]
-    async fn rtk_enabled_tool_falls_back_for_unsupported_commands() {
-        if !rtk_available().await {
-            return;
-        }
-        let cwd = std::env::current_dir().unwrap();
-        let output = BashTool::with_rtk_and_workspace_root(true, &cwd)
+    async fn rtk_enabled_tool_filters_wc_without_an_rtk_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("lines.txt"), "one\ntwo\n").unwrap();
+
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
+            .execute(
+                json!({"command": "wc -l lines.txt"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content.trim(), "2");
+        assert_eq!(output.summary, "bash: wc -l lines.txt");
+    }
+
+    #[tokio::test]
+    async fn rtk_enabled_tool_uses_shell_passthrough_for_unsupported_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
             .execute(json!({"command": "echo hi"}), CancellationToken::new())
             .await;
         assert!(!output.is_error);
         assert_eq!(output.content.trim(), "hi");
+    }
+
+    #[tokio::test]
+    async fn rtk_shell_passthrough_executes_a_mutation_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
+            .execute(
+                json!({"command": "printf x >> marker.txt"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("marker.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn rtk_enabled_dir_is_used_as_the_execution_cwd() {
+        let directory = tempfile::tempdir().unwrap();
+        let subdirectory = directory.path().join("src");
+        std::fs::create_dir(&subdirectory).unwrap();
+        std::fs::write(subdirectory.join("lines.txt"), "one\n").unwrap();
+
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
+            .execute(
+                json!({"command": "wc -l lines.txt", "dir": "src"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.content.trim(), "1");
+        assert_eq!(output.summary, "bash: wc -l lines.txt (in src)");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtk_bounded_stdout_retains_the_stream_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
+            .execute(
+                json!({"command": "printf START; yes x | head -c 60000; printf END"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("stdout exceeded"));
+        assert!(output.content.contains("END"));
+        assert!(!output.content.contains("START"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rtk_bounded_stderr_retains_the_stream_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
+            .execute(
+                json!({
+                    "command": "{ printf START; yes x | head -c 60000; printf END; } >&2"
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("stderr exceeded"));
+        assert!(output.content.contains("END"));
+        assert!(!output.content.contains("START"));
+    }
+
+    #[tokio::test]
+    async fn rtk_enabled_timeout_preserves_partial_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_rtk_and_workspace_root(true, directory.path())
+            .execute(
+                json!({"command": "printf started; sleep 5", "timeout": 1}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("started"), "{}", output.content);
+        assert!(
+            output.content.contains("[timed out after 1s]"),
+            "{}",
+            output.content
+        );
+    }
+
+    #[tokio::test]
+    async fn harness_cancellation_is_bridged_to_rtk() {
+        let directory = tempfile::tempdir().unwrap();
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let root = directory.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            BashTool::with_rtk_and_workspace_root(true, root)
+                .execute(json!({"command": "printf started; sleep 5"}), task_cancel)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+
+        let output = task.await.unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("started"), "{}", output.content);
+        assert!(output.content.contains("[cancelled]"), "{}", output.content);
+    }
+
+    #[tokio::test]
+    async fn dropping_rtk_tool_future_cancels_detached_blocking_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            BashTool::with_rtk_and_workspace_root(true, root)
+                .execute(
+                    json!({
+                        "command": "printf started > started.marker; sleep 1; printf finished > finished.marker"
+                    }),
+                    CancellationToken::new(),
+                )
+                .await
+        });
+
+        let started = directory.path().join("started.marker");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !started.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "RTK command did not start");
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        // Wait beyond the command's natural completion time: without the
+        // drop guard the detached worker would create the final marker.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            !directory.path().join("finished.marker").exists(),
+            "detached RTK command survived its dropped tool future"
+        );
     }
 
     #[test]

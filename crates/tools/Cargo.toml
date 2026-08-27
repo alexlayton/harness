@@ -10,6 +10,7 @@ diff = "0.1"
 fff-search = { version = "0.10.3", default-features = false, features = ["ripgrep"] }
 ignore = "0.4"
 llm.workspace = true
+rtk.workspace = true
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
