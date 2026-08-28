@@ -79,7 +79,7 @@ To install a specific release, pass the version through to the script:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alexlayton/harness/main/install.sh \
-  | bash -s -- --version v0.1.0
+  | bash -s -- --version v0.2.0
 ```
 
 The script uses `curl` rather than a browser, so macOS downloads normally do
