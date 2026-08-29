@@ -415,8 +415,25 @@ pub enum Command {
     Login(LoginArgs),
     /// Run one prompt and print only the final answer to stdout.
     Prompt(PromptArgs),
+    /// Create or reuse a Git worktree and start the terminal UI there.
+    Worktree(WorktreeArgs),
     /// Serve Agent Client Protocol over stdio for editor integrations.
     Acp,
+}
+
+#[derive(Clone, Debug, clap::Args)]
+pub struct WorktreeArgs {
+    /// Local branch to create from HEAD or check out when it already exists.
+    #[arg(value_name = "BRANCH")]
+    pub branch: String,
+
+    /// Worktree directory. Relative paths are resolved from the launch directory.
+    #[arg(long, value_name = "PATH")]
+    pub dir: Option<PathBuf>,
+
+    /// Leave the worktree registered and on disk when Harness exits.
+    #[arg(long, default_value_t = false)]
+    pub keep: bool,
 }
 
 #[derive(Clone, Debug, Default, clap::Args)]
@@ -724,6 +741,24 @@ mod tests {
             prompt.command,
             Some(Command::Prompt(PromptArgs { prompt, .. })) if prompt == ["hello"]
         ));
+
+        let worktree = Cli::try_parse_from([
+            "harness",
+            "worktree",
+            "feat/new-feature",
+            "--dir",
+            "../feature",
+            "--keep",
+        ])
+        .unwrap();
+        assert!(matches!(
+            worktree.command,
+            Some(Command::Worktree(WorktreeArgs { branch, dir: Some(dir), keep }))
+                if branch == "feat/new-feature"
+                    && dir == Path::new("../feature")
+                    && keep
+        ));
+        assert!(Cli::try_parse_from(["harness", "worktree"]).is_err());
 
         let acp = Cli::try_parse_from(["harness", "acp", "--provider", "openai-codex"]).unwrap();
         assert!(matches!(acp.command, Some(Command::Acp)));

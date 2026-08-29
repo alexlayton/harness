@@ -1279,6 +1279,7 @@ dependencies = [
  "compact",
  "dirs 6.0.0",
  "futures-util",
+ "libc",
  "llm",
  "mcp",
  "serde",

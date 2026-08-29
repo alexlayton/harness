@@ -132,6 +132,19 @@ Start the terminal UI by running `harness`. Use `/help` to list its commands.
 The main commands include session management, model selection, usage reporting,
 compaction, and discovered skills.
 
+Start the terminal UI in a dedicated Git worktree, creating the branch from the
+current `HEAD` when it does not already exist:
+
+```text
+harness worktree feat/new-feature
+```
+
+Harness stores automatic worktrees below `~/.harness/worktrees`. It removes a
+clean worktree when the TUI exits but always leaves the branch in place.
+Modified, untracked, or ignored files cause a worktree to be retained rather
+than force-removed. Pass `--keep` to retain one unconditionally, or use
+`--dir PATH` to select its location.
+
 Run one prompt without the terminal UI:
 
 ```text

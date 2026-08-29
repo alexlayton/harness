@@ -4,6 +4,7 @@ mod context;
 mod headless;
 mod login;
 mod tui_adapter;
+mod worktree;
 
 use agent::assembly::AgentBuilder;
 use agent::{AgentEvent, InputMessage, spawn_model_list};
@@ -36,7 +37,7 @@ async fn main() -> ExitCode {
 }
 
 async fn main_inner() -> Result<ExitCode> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // Login is credential-only and intentionally precedes config/provider
     // resolution: a stale configured API key cannot prevent signing in.
@@ -44,6 +45,46 @@ async fn main_inner() -> Result<ExitCode> {
         return login::run(args).await;
     }
 
+    // Worktree is a TUI launch mode rather than a separate frontend. Enter it
+    // before resolving any workspace-scoped tools, context, or session state,
+    // then always restore the launch directory and attempt safe cleanup after
+    // application startup or shutdown.
+    if let Some(Command::Worktree(args)) = cli.command.clone() {
+        let lease = worktree::prepare(&args)?;
+        let action = if lease.was_created() {
+            "created"
+        } else {
+            "reusing"
+        };
+        eprintln!("worktree: {action} {}", lease.path().display());
+        cli.command = None;
+
+        let application_result = run_application(cli).await;
+        match lease.finish() {
+            Ok(worktree::CleanupOutcome::Removed(path)) => {
+                eprintln!("worktree: removed {}", path.display());
+            }
+            Ok(worktree::CleanupOutcome::Kept(path)) => {
+                eprintln!("worktree: kept {}", path.display());
+            }
+            Ok(worktree::CleanupOutcome::Retained { path, reason }) => {
+                eprintln!(
+                    "worktree: retained {} because it could not be safely removed: {reason}",
+                    path.display()
+                );
+            }
+            Err(cleanup_error) if application_result.is_ok() => return Err(cleanup_error),
+            Err(cleanup_error) => {
+                eprintln!("worktree: cleanup failed: {cleanup_error:#}");
+            }
+        }
+        return application_result;
+    }
+
+    run_application(cli).await
+}
+
+async fn run_application(cli: Cli) -> Result<ExitCode> {
     let prompt_args = match &cli.command {
         Some(Command::Prompt(args)) => Some(args),
         _ => None,
