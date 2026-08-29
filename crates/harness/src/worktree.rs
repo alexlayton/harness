@@ -1,24 +1,26 @@
 use crate::config::WorktreeArgs;
 use anyhow::{Context, Result, anyhow};
+use fs2::FileExt;
 use std::ffi::OsStr;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output, Stdio};
-use std::time::{Duration, SystemTime};
 
-/// A prepared Git worktree whose lifetime surrounds one interactive run.
+/// A prepared Git worktree whose lifetime surrounds one frontend run.
 pub(crate) struct WorktreeLease {
     original_cwd: PathBuf,
     repository: Repository,
     worktree_path: PathBuf,
     keep: bool,
     created: bool,
+    managed_destination: bool,
+    source_was_dirty: bool,
     finished: bool,
     _run_lock: WorktreeRunLock,
 }
 
-/// The result of safely releasing a worktree after the TUI exits.
+/// The result of safely releasing a worktree after its frontend exits.
 pub(crate) enum CleanupOutcome {
     Removed(PathBuf),
     Kept(PathBuf),
@@ -37,11 +39,11 @@ struct WorktreeEntry {
     branch: Option<String>,
 }
 
-/// Process lease stored beside (never inside) the worktree. Git does not track
-/// whether a process is actively using a worktree, so this prevents one
-/// Harness run from removing a clean tree beneath another run.
+/// OS-backed process lease stored in the repository's common Git directory.
+/// Git does not track whether a process is actively using a worktree, so this
+/// prevents one Harness run from removing a clean tree beneath another run.
 struct WorktreeRunLock {
-    path: PathBuf,
+    file: File,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,8 +53,8 @@ enum EnsureOutcome {
 }
 
 /// Create or reuse the requested worktree and enter its corresponding launch
-/// directory. The caller must call [`WorktreeLease::finish`] after the UI has
-/// shut down so the process leaves the directory before Git removes it.
+/// directory. The caller must call [`WorktreeLease::finish`] after the frontend
+/// shuts down so the process leaves the directory before Git removes it.
 pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
     let original_cwd =
         fs::canonicalize(std::env::current_dir().context("resolve the worktree launch directory")?)
@@ -70,12 +72,13 @@ pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
             )
         })?
         .to_path_buf();
+    let managed_destination = args.dir.is_none();
     let worktree_path = match &args.dir {
         Some(path) if path.is_absolute() => path.clone(),
         Some(path) => original_cwd.join(path),
         None => default_destination(&repository, &args.branch)?,
     };
-    let worktree_path = absolute_path(&worktree_path)?;
+    let worktree_path = normalized_destination(&worktree_path)?;
     if let Ok(existing_path) = fs::canonicalize(&worktree_path)
         && original_cwd.starts_with(&existing_path)
     {
@@ -84,9 +87,15 @@ pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
             existing_path.display()
         ));
     }
-    let run_lock = WorktreeRunLock::acquire(&worktree_path)?;
+    let run_lock = WorktreeRunLock::acquire(&repository, &args.branch)?;
 
-    let ensured = ensure_worktree(&repository, &args.branch, &worktree_path)?;
+    let source_was_dirty = source_has_changes(&repository)?;
+    let ensured = ensure_worktree(
+        &repository,
+        &args.branch,
+        args.start_point.as_deref(),
+        &worktree_path,
+    )?;
     let created = ensured == EnsureOutcome::Created;
     let resolved_worktree = match fs::canonicalize(&worktree_path) {
         Ok(path) => path,
@@ -109,13 +118,23 @@ pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
         rollback_created(&repository, &worktree_path, created);
         return Err(error).with_context(|| format!("enter worktree `{}`", workspace.display()));
     }
+    let keep = match resolve_keep_policy(&repository, &args.branch, &resolved_worktree, args) {
+        Ok(keep) => keep,
+        Err(error) => {
+            let _ = std::env::set_current_dir(&original_cwd);
+            rollback_created(&repository, &resolved_worktree, created);
+            return Err(error);
+        }
+    };
 
     Ok(WorktreeLease {
         original_cwd,
         repository,
         worktree_path: resolved_worktree,
-        keep: args.keep,
+        keep,
         created,
+        managed_destination,
+        source_was_dirty: created && source_was_dirty,
         finished: false,
         _run_lock: run_lock,
     })
@@ -130,9 +149,13 @@ impl WorktreeLease {
         self.created
     }
 
+    pub(crate) fn source_was_dirty(&self) -> bool {
+        self.source_was_dirty
+    }
+
     /// Restore the launch directory, then remove the worktree without force.
-    /// Git refusal is a retained outcome rather than an error; modified,
-    /// untracked, or ignored files always keep the worktree in place.
+    /// Git refusal is a retained outcome rather than an error. Modified or
+    /// untracked files keep the tree; ignored-only output follows Git cleanup.
     pub(crate) fn finish(mut self) -> Result<CleanupOutcome> {
         std::env::set_current_dir(&self.original_cwd).with_context(|| {
             format!(
@@ -145,7 +168,11 @@ impl WorktreeLease {
         if self.keep {
             return Ok(CleanupOutcome::Kept(self.worktree_path.clone()));
         }
-        Ok(remove_worktree(&self.repository, &self.worktree_path))
+        let outcome = remove_worktree(&self.repository, &self.worktree_path);
+        if self.managed_destination && matches!(outcome, CleanupOutcome::Removed(_)) {
+            remove_empty_managed_parent(&self.worktree_path);
+        }
+        Ok(outcome)
     }
 }
 
@@ -160,62 +187,47 @@ impl Drop for WorktreeLease {
 }
 
 impl WorktreeRunLock {
-    fn acquire(destination: &Path) -> Result<Self> {
-        let parent = destination.parent().ok_or_else(|| {
-            anyhow!(
-                "worktree destination `{}` has no parent directory",
-                destination.display()
-            )
-        })?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create worktree parent `{}`", parent.display()))?;
-        let name = destination.file_name().ok_or_else(|| {
-            anyhow!(
-                "worktree destination `{}` has no directory name",
-                destination.display()
-            )
-        })?;
-        let path = parent.join(format!(".{}.harness.lock", name.to_string_lossy()));
+    fn acquire(repository: &Repository, branch: &str) -> Result<Self> {
+        let directory = repository.common_dir.join("harness").join("worktree-locks");
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("create worktree lock directory `{}`", directory.display()))?;
+        let path = directory.join(format!(
+            "{}-{:016x}.lock",
+            slug(branch, "branch"),
+            stable_hash(branch.as_bytes())
+        ));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open worktree lease `{}`", path.display()))?;
 
-        for _ in 0..2 {
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    if let Err(error) = writeln!(file, "pid={}", std::process::id()) {
-                        let _ = fs::remove_file(&path);
-                        return Err(error)
-                            .with_context(|| format!("write worktree lease `{}`", path.display()));
-                    }
-                    return Ok(Self { path });
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        let _ = fs::remove_file(&path);
-                        continue;
-                    }
-                    let owner = lock_owner(&path)
-                        .map(|pid| format!(" by process {pid}"))
-                        .unwrap_or_default();
-                    return Err(anyhow!(
-                        "worktree `{}` is already in use{owner}",
-                        destination.display()
-                    ));
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("create worktree lease `{}`", path.display()));
-                }
+        if let Err(error) = file.try_lock_exclusive() {
+            let owner = read_lock_owner(&mut file)
+                .map(|pid| format!(" by process {pid}"))
+                .unwrap_or_default();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(anyhow!("branch `{branch}` is already in use{owner}"));
             }
+            return Err(error).with_context(|| format!("lock worktree lease `{}`", path.display()));
         }
-        Err(anyhow!(
-            "could not acquire worktree lease `{}`",
-            path.display()
-        ))
+        file.set_len(0)
+            .with_context(|| format!("reset worktree lease `{}`", path.display()))?;
+        file.seek(SeekFrom::Start(0))
+            .with_context(|| format!("seek worktree lease `{}`", path.display()))?;
+        writeln!(file, "pid={}", std::process::id())
+            .with_context(|| format!("write worktree lease `{}`", path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("sync worktree lease `{}`", path.display()))?;
+        Ok(Self { file })
     }
 }
 
 impl Drop for WorktreeRunLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -281,6 +293,7 @@ fn branch_exists(repository: &Repository, branch: &str) -> Result<bool> {
 fn ensure_worktree(
     repository: &Repository,
     branch: &str,
+    start_point: Option<&str>,
     destination: &Path,
 ) -> Result<EnsureOutcome> {
     let entries = list_worktrees(repository)?;
@@ -302,7 +315,23 @@ fn ensure_worktree(
                 destination.display()
             ));
         }
+        if start_point.is_some() {
+            return Err(anyhow!(
+                "--start-point can only be used when creating a missing branch"
+            ));
+        }
         return Ok(EnsureOutcome::Reused);
+    }
+
+    let expected = format!("refs/heads/{branch}");
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.branch.as_deref() == Some(expected.as_str()))
+    {
+        return Err(anyhow!(
+            "branch `{branch}` is already checked out at `{}`; run Harness there or choose another branch",
+            entry.path.display()
+        ));
     }
 
     if destination.exists() {
@@ -311,12 +340,22 @@ fn ensure_worktree(
             destination.display()
         ));
     }
+
+    let exists = branch_exists(repository, branch)?;
+    if exists && start_point.is_some() {
+        return Err(anyhow!(
+            "--start-point can only be used when creating a missing branch"
+        ));
+    }
+    let start_point = start_point.unwrap_or("HEAD");
+    if !exists {
+        validate_start_point(repository, start_point)?;
+    }
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("create worktree parent `{}`", parent.display()))?;
     }
 
-    let exists = branch_exists(repository, branch)?;
     let mut command = git(&repository.root);
     command.arg("worktree").arg("add");
     if exists {
@@ -327,14 +366,26 @@ fn ensure_worktree(
             .arg(branch)
             .arg("--")
             .arg(destination)
-            .arg("HEAD");
+            .arg(start_point);
     }
     let output = command.output().context("run Git to create the worktree")?;
     if !output.status.success() {
+        // Translate the most common race into the same actionable diagnostic
+        // used by the preflight check.
+        if let Ok(entries) = list_worktrees(repository)
+            && let Some(entry) = entries
+                .iter()
+                .find(|entry| entry.branch.as_deref() == Some(expected.as_str()))
+        {
+            return Err(anyhow!(
+                "branch `{branch}` is already checked out at `{}`; run Harness there or choose another branch",
+                entry.path.display()
+            ));
+        }
         let action = if exists {
             format!("check out existing branch `{branch}` in a worktree")
         } else {
-            format!("create branch `{branch}` from HEAD in a worktree")
+            format!("create branch `{branch}` from `{start_point}` in a worktree")
         };
         return Err(git_failure(&action, &output));
     }
@@ -347,6 +398,12 @@ fn list_worktrees(repository: &Repository) -> Result<Vec<WorktreeEntry>> {
         .output()
         .context("run Git to list worktrees")?;
     if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("unknown option") || stderr.contains("unknown switch") {
+            return Err(anyhow!(
+                "could not list Git worktrees: Harness requires Git 2.36 or newer for porcelain worktree output"
+            ));
+        }
         return Err(git_failure("list Git worktrees", &output));
     }
 
@@ -373,8 +430,32 @@ fn list_worktrees(repository: &Repository) -> Result<Vec<WorktreeEntry>> {
     Ok(entries)
 }
 
+fn validate_start_point(repository: &Repository, start_point: &str) -> Result<()> {
+    let revision = format!("{start_point}^{{commit}}");
+    let output = git(&repository.root)
+        .args(["rev-parse", "--verify", "--end-of-options"])
+        .arg(&revision)
+        .output()
+        .context("run Git to validate the branch start point")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(git_failure(
+            &format!("resolve start point `{start_point}` to a commit"),
+            &output,
+        ))
+    }
+}
+
 fn default_destination(repository: &Repository, branch: &str) -> Result<PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine the home directory"))?;
+    default_destination_in(repository, branch, &default_state_root()?)
+}
+
+fn default_destination_in(
+    repository: &Repository,
+    branch: &str,
+    state_root: &Path,
+) -> Result<PathBuf> {
     let project_name = repository
         .common_dir
         .parent()
@@ -392,11 +473,24 @@ fn default_destination(repository: &Repository, branch: &str) -> Result<PathBuf>
         slug(branch, "branch"),
         stable_hash(branch.as_bytes())
     );
-    Ok(home
-        .join(".harness")
-        .join("worktrees")
-        .join(project)
-        .join(branch))
+    Ok(state_root.join("worktrees").join(project).join(branch))
+}
+
+fn default_state_root() -> Result<PathBuf> {
+    resolve_state_root(
+        std::env::var_os("HARNESS_STATE_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from),
+        dirs::home_dir(),
+    )
+}
+
+fn resolve_state_root(state_override: Option<PathBuf>, home: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = state_override {
+        return absolute_path(&path);
+    }
+    home.map(|home| home.join(".harness"))
+        .ok_or_else(|| anyhow!("could not determine the Harness state directory"))
 }
 
 fn slug(value: &str, fallback: &str) -> String {
@@ -458,6 +552,107 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
     std::path::absolute(path).with_context(|| format!("resolve path `{}`", path.display()))
 }
 
+/// Resolve aliases in the existing portion of a destination while allowing
+/// Git to create its missing final components.
+fn normalized_destination(path: &Path) -> Result<PathBuf> {
+    if path.exists() {
+        return fs::canonicalize(path)
+            .with_context(|| format!("resolve worktree destination `{}`", path.display()));
+    }
+
+    let absolute = absolute_path(path)?;
+    let mut existing = absolute.as_path();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let name = existing.file_name().ok_or_else(|| {
+            anyhow!(
+                "worktree destination `{}` has no existing ancestor",
+                path.display()
+            )
+        })?;
+        missing.push(name.to_os_string());
+        existing = existing.parent().ok_or_else(|| {
+            anyhow!(
+                "worktree destination `{}` has no existing ancestor",
+                path.display()
+            )
+        })?;
+    }
+    let mut resolved = fs::canonicalize(existing)
+        .with_context(|| format!("resolve destination ancestor `{}`", existing.display()))?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn source_has_changes(repository: &Repository) -> Result<bool> {
+    let output = git(&repository.root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()
+        .context("run Git to inspect the launch checkout")?;
+    if output.status.success() {
+        Ok(!output.stdout.is_empty())
+    } else {
+        Err(git_failure("inspect the launch checkout", &output))
+    }
+}
+
+fn retention_marker(repository: &Repository, branch: &str, destination: &Path) -> PathBuf {
+    let key = stable_hash(path_hash_bytes(destination));
+    repository
+        .common_dir
+        .join("harness")
+        .join("kept-worktrees")
+        .join(format!(
+            "{}-{:016x}-{key:016x}",
+            slug(branch, "branch"),
+            stable_hash(branch.as_bytes())
+        ))
+}
+
+fn resolve_keep_policy(
+    repository: &Repository,
+    branch: &str,
+    destination: &Path,
+    args: &WorktreeArgs,
+) -> Result<bool> {
+    let marker = retention_marker(repository, branch, destination);
+    if args.ephemeral {
+        match fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("remove retention marker `{}`", marker.display()));
+            }
+        }
+        return Ok(false);
+    }
+    if args.keep {
+        let parent = marker
+            .parent()
+            .expect("retention markers always have a parent");
+        fs::create_dir_all(parent).with_context(|| {
+            format!("create worktree retention directory `{}`", parent.display())
+        })?;
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&marker)
+            .with_context(|| format!("write retention marker `{}`", marker.display()))?;
+        return Ok(true);
+    }
+    Ok(marker.is_file())
+}
+
+fn remove_empty_managed_parent(path: &Path) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::remove_dir(parent);
+    }
+}
+
 fn paths_match(left: &Path, right: &Path) -> bool {
     match (fs::canonicalize(left), fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
@@ -467,19 +662,13 @@ fn paths_match(left: &Path, right: &Path) -> bool {
 
 fn remove_worktree(repository: &Repository, path: &Path) -> CleanupOutcome {
     let status = git(path)
-        .args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignored",
-        ])
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .output();
     match status {
         Ok(output) if output.status.success() && !output.stdout.is_empty() => {
             return CleanupOutcome::Retained {
                 path: path.to_path_buf(),
-                reason: "the worktree contains modified, untracked, or ignored files".into(),
+                reason: "the worktree contains modified or untracked files".into(),
             };
         }
         Ok(output) if !output.status.success() => {
@@ -516,40 +705,13 @@ fn remove_worktree(repository: &Repository, path: &Path) -> CleanupOutcome {
     }
 }
 
-fn lock_is_stale(path: &Path) -> bool {
-    if let Some(pid) = lock_owner(path) {
-        return !pid_is_alive(pid);
-    }
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age > Duration::from_secs(5 * 60))
-}
-
-fn lock_owner(path: &Path) -> Option<u32> {
-    fs::read_to_string(path)
-        .ok()?
+fn read_lock_owner(file: &mut File) -> Option<u32> {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    contents
         .lines()
         .find_map(|line| line.strip_prefix("pid=")?.trim().parse().ok())
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: signal 0 probes process existence without delivering a signal.
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        // Harness currently ships on Unix. Be conservative on other targets:
-        // an existing lock must not be stolen while its owner may be alive.
-        true
-    }
 }
 
 fn rollback_created(repository: &Repository, path: &Path, created: bool) {
@@ -560,6 +722,23 @@ fn rollback_created(repository: &Repository, path: &Path, created: bool) {
 
 fn git(cwd: &Path) -> ProcessCommand {
     let mut command = ProcessCommand::new("git");
+    #[cfg(test)]
+    {
+        let null_device = if cfg!(windows) { "NUL" } else { "/dev/null" };
+        command
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", null_device)
+            .env("GIT_CONFIG_COUNT", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .args(["-c", "commit.gpgSign=false"]);
+    }
     command
         .arg("-C")
         .arg(cwd)
@@ -603,8 +782,9 @@ mod tests {
             root: root.path().join("two/project"),
             common_dir: root.path().join("two/project/.git"),
         };
-        let first_path = default_destination(&first, "feat/new-feature").unwrap();
-        let second_path = default_destination(&second, "feat/new-feature").unwrap();
+        let state_root = root.path().join("state");
+        let first_path = default_destination_in(&first, "feat/new-feature", &state_root).unwrap();
+        let second_path = default_destination_in(&second, "feat/new-feature", &state_root).unwrap();
 
         assert_ne!(first_path, second_path);
         assert!(
@@ -614,22 +794,29 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("feat-new-feature-")
         );
-        assert!(
-            first_path
-                .to_string_lossy()
-                .contains("/.harness/worktrees/")
+        assert!(first_path.to_string_lossy().contains("/state/worktrees/"));
+    }
+
+    #[test]
+    fn state_override_controls_the_automatic_worktree_root() {
+        let root = tempdir().unwrap();
+        assert_eq!(
+            resolve_state_root(Some(root.path().join("custom")), None).unwrap(),
+            root.path().join("custom")
+        );
+        assert_eq!(
+            resolve_state_root(None, Some(root.path().join("home"))).unwrap(),
+            root.path().join("home/.harness")
         );
     }
 
     #[test]
     fn creates_missing_branch_and_removes_clean_worktree() {
-        let Some((root, repository)) = test_repository() else {
-            return;
-        };
+        let (root, repository) = test_repository();
         let destination = root.path().join("worktrees/feature");
 
         assert_eq!(
-            ensure_worktree(&repository, "feat/new-feature", &destination).unwrap(),
+            ensure_worktree(&repository, "feat/new-feature", None, &destination).unwrap(),
             EnsureOutcome::Created
         );
         assert_eq!(
@@ -647,13 +834,11 @@ mod tests {
 
     #[test]
     fn reuses_matching_worktree_and_retains_dirty_files() {
-        let Some((root, repository)) = test_repository() else {
-            return;
-        };
+        let (root, repository) = test_repository();
         let destination = root.path().join("worktrees/feature");
-        ensure_worktree(&repository, "feature", &destination).unwrap();
+        ensure_worktree(&repository, "feature", None, &destination).unwrap();
         assert_eq!(
-            ensure_worktree(&repository, "feature", &destination).unwrap(),
+            ensure_worktree(&repository, "feature", None, &destination).unwrap(),
             EnsureOutcome::Reused
         );
 
@@ -669,34 +854,129 @@ mod tests {
     }
 
     #[test]
-    fn ignored_files_are_never_deleted_by_automatic_cleanup() {
-        let Some((root, repository)) = test_repository() else {
-            return;
-        };
+    fn ignored_build_output_does_not_pin_an_ephemeral_worktree() {
+        let (root, repository) = test_repository();
         let destination = root.path().join("worktrees/ignored");
-        ensure_worktree(&repository, "ignored", &destination).unwrap();
-        fs::write(destination.join("local.ignored"), "keep me\n").unwrap();
+        ensure_worktree(&repository, "ignored", None, &destination).unwrap();
+        fs::write(destination.join("local.ignored"), "generated output\n").unwrap();
 
         assert!(matches!(
             remove_worktree(&repository, &destination),
-            CleanupOutcome::Retained { .. }
+            CleanupOutcome::Removed(_)
         ));
-        assert_eq!(
-            fs::read_to_string(destination.join("local.ignored")).unwrap(),
-            "keep me\n"
-        );
+        assert!(!destination.exists());
+    }
 
+    #[test]
+    fn process_lock_excludes_another_harness_run_for_the_branch() {
+        let (_root, repository) = test_repository();
+        let first = WorktreeRunLock::acquire(&repository, "feature").unwrap();
+        assert!(WorktreeRunLock::acquire(&repository, "feature").is_err());
+        assert!(WorktreeRunLock::acquire(&repository, "other").is_ok());
+        drop(first);
+        assert!(WorktreeRunLock::acquire(&repository, "feature").is_ok());
+    }
+
+    #[test]
+    fn creates_a_missing_branch_from_an_explicit_start_point() {
+        let (root, repository) = test_repository();
+        fs::write(repository.root.join("README.md"), "second\n").unwrap();
+        run_test_git(&repository.root, &["add", "README.md"]);
+        run_test_git(&repository.root, &["commit", "-m", "second"]);
+        let destination = root.path().join("worktrees/from-first");
+
+        ensure_worktree(&repository, "from-first", Some("HEAD^"), &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join("README.md")).unwrap(),
+            "initial\n"
+        );
         force_remove(&repository, &destination);
     }
 
     #[test]
-    fn process_lock_excludes_another_harness_run() {
-        let root = tempdir().unwrap();
-        let destination = root.path().join("feature");
-        let first = WorktreeRunLock::acquire(&destination).unwrap();
-        assert!(WorktreeRunLock::acquire(&destination).is_err());
-        drop(first);
-        assert!(WorktreeRunLock::acquire(&destination).is_ok());
+    fn reports_where_a_branch_is_already_checked_out() {
+        let (root, repository) = test_repository();
+        let branch = test_git_text(&repository.root, &["branch", "--show-current"]);
+        let destination = root.path().join("worktrees/duplicate");
+
+        let error = ensure_worktree(&repository, &branch, None, &destination)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already checked out at"));
+        assert!(error.contains(&repository.root.display().to_string()));
+    }
+
+    #[test]
+    fn keep_policy_is_sticky_until_explicitly_ephemeral() {
+        let (root, repository) = test_repository();
+        let destination = root.path().join("worktrees/sticky");
+        let mut args = worktree_args("sticky", destination.clone());
+        args.keep = true;
+        assert!(resolve_keep_policy(&repository, "sticky", &destination, &args).unwrap());
+
+        args.keep = false;
+        assert!(resolve_keep_policy(&repository, "sticky", &destination, &args).unwrap());
+
+        args.ephemeral = true;
+        assert!(!resolve_keep_policy(&repository, "sticky", &destination, &args).unwrap());
+    }
+
+    #[test]
+    fn prepare_and_finish_restore_the_launch_directory() {
+        const CHILD: &str = "HARNESS_WORKTREE_LIFECYCLE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let destination = PathBuf::from(std::env::var_os("HARNESS_TEST_DEST").unwrap());
+            let original = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+            let args = worktree_args("lifecycle", destination.clone());
+            let lease = prepare(&args).unwrap();
+            assert_eq!(
+                fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+                fs::canonicalize(destination.join("nested")).unwrap()
+            );
+            assert!(lease.was_created());
+            assert!(matches!(
+                lease.finish().unwrap(),
+                CleanupOutcome::Removed(_)
+            ));
+            assert_eq!(
+                fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+                original
+            );
+            return;
+        }
+
+        let (root, repository) = test_repository();
+        let destination = root.path().join("worktrees/lifecycle");
+        let output = ProcessCommand::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worktree::tests::prepare_and_finish_restore_the_launch_directory",
+            ])
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env("HARNESS_TEST_DEST", &destination)
+            .current_dir(repository.root.join("nested"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child lifecycle test failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!destination.exists());
+        assert!(branch_exists(&repository, "lifecycle").unwrap());
+    }
+
+    fn worktree_args(branch: &str, destination: PathBuf) -> WorktreeArgs {
+        WorktreeArgs {
+            branch: branch.into(),
+            start_point: None,
+            dir: Some(destination),
+            keep: false,
+            ephemeral: false,
+            command: None,
+        }
     }
 
     fn force_remove(repository: &Repository, destination: &Path) {
@@ -708,14 +988,7 @@ mod tests {
         assert!(output.status.success());
     }
 
-    fn test_repository() -> Option<(tempfile::TempDir, Repository)> {
-        if ProcessCommand::new("git")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return None;
-        }
+    fn test_repository() -> (tempfile::TempDir, Repository) {
         let root = tempdir().unwrap();
         let repository_path = root.path().join("project");
         fs::create_dir(&repository_path).unwrap();
@@ -727,10 +1000,15 @@ mod tests {
         run_test_git(&repository_path, &["config", "user.name", "Harness Tests"]);
         fs::write(repository_path.join("README.md"), "initial\n").unwrap();
         fs::write(repository_path.join(".gitignore"), "*.ignored\n").unwrap();
-        run_test_git(&repository_path, &["add", "README.md", ".gitignore"]);
+        fs::create_dir(repository_path.join("nested")).unwrap();
+        fs::write(repository_path.join("nested/marker.txt"), "nested\n").unwrap();
+        run_test_git(
+            &repository_path,
+            &["add", "README.md", ".gitignore", "nested/marker.txt"],
+        );
         run_test_git(&repository_path, &["commit", "-m", "initial"]);
         let repository = Repository::discover(&repository_path).unwrap();
-        Some((root, repository))
+        (root, repository)
     }
 
     fn run_test_git(cwd: &Path, args: &[&str]) {

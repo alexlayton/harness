@@ -11,8 +11,8 @@ use agent::{AgentEvent, InputMessage, spawn_model_list};
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::{
-    Cli, Command, Config, ProviderArg, build_provider_with_auths, init_logging, provider_factory,
-    save_reasoning, save_settings,
+    Cli, Command, Config, ProviderArg, WorktreeCommand, build_provider_with_auths, init_logging,
+    provider_factory, save_reasoning, save_settings,
 };
 use context::project_context_for;
 use headless::run_headless;
@@ -45,28 +45,46 @@ async fn main_inner() -> Result<ExitCode> {
         return login::run(args).await;
     }
 
-    // Worktree is a TUI launch mode rather than a separate frontend. Enter it
+    // Worktree is a launch mode rather than a separate frontend. Enter it
     // before resolving any workspace-scoped tools, context, or session state,
     // then always restore the launch directory and attempt safe cleanup after
     // application startup or shutdown.
     if let Some(Command::Worktree(args)) = cli.command.clone() {
+        // Relative state/session overrides must retain launch-directory
+        // semantics after prepare changes the process cwd.
+        let session_root = std::path::absolute(session::default_session_dir())
+            .context("resolve the session state directory")?;
+        let report_lifecycle = args
+            .command
+            .as_ref()
+            .is_none_or(|WorktreeCommand::Prompt(prompt)| prompt.verbose);
         let lease = worktree::prepare(&args)?;
-        let action = if lease.was_created() {
-            "created"
-        } else {
-            "reusing"
-        };
-        eprintln!("worktree: {action} {}", lease.path().display());
-        cli.command = None;
+        if report_lifecycle {
+            let action = if lease.was_created() {
+                "created"
+            } else {
+                "reusing"
+            };
+            eprintln!("worktree: {action} {}", lease.path().display());
+        }
+        if lease.source_was_dirty() {
+            eprintln!(
+                "worktree: warning: the launch checkout has uncommitted changes; the new worktree contains committed Git state only"
+            );
+        }
+        cli.command = args
+            .command
+            .map(|WorktreeCommand::Prompt(prompt)| Command::Prompt(prompt));
 
-        let application_result = run_application(cli).await;
+        let application_result = run_application(cli, Some(session_root)).await;
         match lease.finish() {
-            Ok(worktree::CleanupOutcome::Removed(path)) => {
+            Ok(worktree::CleanupOutcome::Removed(path)) if report_lifecycle => {
                 eprintln!("worktree: removed {}", path.display());
             }
-            Ok(worktree::CleanupOutcome::Kept(path)) => {
+            Ok(worktree::CleanupOutcome::Kept(path)) if report_lifecycle => {
                 eprintln!("worktree: kept {}", path.display());
             }
+            Ok(worktree::CleanupOutcome::Removed(_) | worktree::CleanupOutcome::Kept(_)) => {}
             Ok(worktree::CleanupOutcome::Retained { path, reason }) => {
                 eprintln!(
                     "worktree: retained {} because it could not be safely removed: {reason}",
@@ -81,10 +99,10 @@ async fn main_inner() -> Result<ExitCode> {
         return application_result;
     }
 
-    run_application(cli).await
+    run_application(cli, None).await
 }
 
-async fn run_application(cli: Cli) -> Result<ExitCode> {
+async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> Result<ExitCode> {
     let prompt_args = match &cli.command {
         Some(Command::Prompt(args)) => Some(args),
         _ => None,
@@ -138,7 +156,10 @@ async fn run_application(cli: Cli) -> Result<ExitCode> {
         // first-write salt bootstrap would touch `~/.harness/sessions`.
         async {
             match needs_session_store {
-                true => Some(SessionStore::default_for_workspace(&workspace_root)),
+                true => Some(match session_root {
+                    Some(root) => SessionStore::new(root, &workspace_root),
+                    None => SessionStore::default_for_workspace(&workspace_root),
+                }),
                 false => None,
             }
         },
