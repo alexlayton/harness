@@ -415,8 +415,44 @@ pub enum Command {
     Login(LoginArgs),
     /// Run one prompt and print only the final answer to stdout.
     Prompt(PromptArgs),
+    /// Create or reuse a Git worktree and start a frontend there.
+    Worktree(WorktreeArgs),
     /// Serve Agent Client Protocol over stdio for editor integrations.
     Acp,
+}
+
+#[derive(Clone, Debug, clap::Args)]
+pub struct WorktreeArgs {
+    /// Local branch to create or check out.
+    #[arg(value_name = "BRANCH")]
+    pub branch: String,
+
+    /// Commit-ish from which to create a missing branch. Defaults to HEAD.
+    #[arg(long = "start-point", alias = "base", value_name = "REV")]
+    pub start_point: Option<String>,
+
+    /// Worktree directory. Relative paths are resolved from the launch directory.
+    #[arg(long, value_name = "PATH")]
+    pub dir: Option<PathBuf>,
+
+    /// Retain this worktree across this and future Harness runs.
+    #[arg(long, default_value_t = false, conflicts_with = "ephemeral")]
+    pub keep: bool,
+
+    /// Remove a clean worktree on exit even if an earlier run used --keep.
+    #[arg(long, default_value_t = false)]
+    pub ephemeral: bool,
+
+    /// Optional non-interactive frontend to run in the worktree.
+    #[command(subcommand)]
+    pub command: Option<WorktreeCommand>,
+}
+
+/// Frontends that can sensibly inherit a prepared process worktree.
+#[derive(Clone, Debug, clap::Subcommand)]
+pub enum WorktreeCommand {
+    /// Run one prompt in the worktree and print only the final answer to stdout.
+    Prompt(PromptArgs),
 }
 
 #[derive(Clone, Debug, Default, clap::Args)]
@@ -723,6 +759,48 @@ mod tests {
         assert!(matches!(
             prompt.command,
             Some(Command::Prompt(PromptArgs { prompt, .. })) if prompt == ["hello"]
+        ));
+
+        let worktree = Cli::try_parse_from([
+            "harness",
+            "worktree",
+            "feat/new-feature",
+            "--dir",
+            "../feature",
+            "--keep",
+        ])
+        .unwrap();
+        assert!(matches!(
+            worktree.command,
+            Some(Command::Worktree(WorktreeArgs {
+                branch,
+                dir: Some(dir),
+                keep,
+                ..
+            })) if branch == "feat/new-feature"
+                    && dir == Path::new("../feature")
+                    && keep
+        ));
+        assert!(Cli::try_parse_from(["harness", "worktree"]).is_err());
+
+        let worktree_prompt = Cli::try_parse_from([
+            "harness",
+            "worktree",
+            "feat/headless",
+            "--start-point",
+            "main~2",
+            "prompt",
+            "--no-session",
+            "summarize",
+        ])
+        .unwrap();
+        assert!(matches!(
+            worktree_prompt.command,
+            Some(Command::Worktree(WorktreeArgs {
+                start_point: Some(start_point),
+                command: Some(WorktreeCommand::Prompt(PromptArgs { no_session: true, prompt, .. })),
+                ..
+            })) if start_point == "main~2" && prompt == ["summarize"]
         ));
 
         let acp = Cli::try_parse_from(["harness", "acp", "--provider", "openai-codex"]).unwrap();

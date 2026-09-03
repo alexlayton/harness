@@ -72,6 +72,12 @@ MCP, and subagent setup has one implementation.
   JSON-RPC only and tracing remains file-only. Each ACP session owns an agent,
   registry, and session store rooted at the editor workspace.
 
+`harness worktree BRANCH` is a launch mode around the TUI or a nested `prompt`
+command, not a fourth frontend. It enters a dedicated Git worktree before
+workspace-scoped setup and restores the original directory before conservative
+cleanup. Worktree process leases and sticky-retention markers live in Git's
+common directory; automatic destinations live under the Harness state root.
+
 See `crates/harness/src/headless.rs`, `crates/harness/src/acp.rs`, and
 [`docs/editor-integration.md`](./docs/editor-integration.md) for frontend
 protocol detail.

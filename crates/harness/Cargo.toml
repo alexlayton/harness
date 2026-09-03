@@ -23,6 +23,7 @@ tools.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 dirs = "6"
+fs2 = "0.4"
 tokio.workspace = true
 tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["v4"] }

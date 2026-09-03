@@ -132,6 +132,38 @@ Start the terminal UI by running `harness`. Use `/help` to list its commands.
 The main commands include session management, model selection, usage reporting,
 compaction, and discovered skills.
 
+Start the terminal UI in a dedicated Git worktree, creating the branch from the
+current `HEAD` when it does not already exist:
+
+```text
+harness worktree feat/new-feature
+```
+
+Use `--start-point REV` (also accepted as `--base REV`) to create a missing
+branch from another commit, and `--dir PATH` to select its location. Automatic
+worktrees live below `~/.harness/worktrees`, or
+`$HARNESS_STATE_DIR/worktrees` when the state root is overridden.
+
+Harness removes a clean ephemeral worktree when the frontend exits but always
+leaves the branch in place. Modified or untracked files cause the worktree to
+be retained rather than force-removed. Ignored-only files do not pin an
+ephemeral worktree and are removed with it, so use `--keep` if an ignored file
+contains data you need. `--keep` makes retention sticky across later Harness
+runs at the same branch and path; `--ephemeral` clears
+that policy and restores automatic cleanup.
+
+A new worktree contains committed Git state, not uncommitted changes from the
+launch checkout; Harness warns when it detects those changes. To run a
+headless prompt with the same lifecycle, nest the prompt command:
+
+```text
+harness worktree feat/new-feature prompt --no-session "Implement the change"
+```
+
+Sessions remain scoped to the physical worktree path. Recreating an automatic
+worktree at its stable default path sees its previous sessions, while choosing
+a different `--dir` creates a separate session namespace.
+
 Run one prompt without the terminal UI:
 
 ```text
