@@ -18,7 +18,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "time", "net", "io-util"] }
 tokio-util = "0.7"
 url = "2"
-base64 = "0.22"
+base64 = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
