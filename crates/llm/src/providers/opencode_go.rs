@@ -10,7 +10,12 @@ use serde::Deserialize;
 
 pub const BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
-pub const RESPONSES_MODELS: &[&str] = &["gpt-5.6-luna", "grok-4.6"];
+pub const RESPONSES_MODELS: &[&str] = &[
+    "gpt-5.6-luna",
+    "grok-4.6",
+    "muse-spark-1.3-contributor",
+    "muse-spark-1.2-contributor",
+];
 pub const MESSAGES_MODELS: &[&str] = &[
     "minimax-m3",
     "minimax-m2.7",
@@ -161,6 +166,10 @@ mod tests {
         for model in RESPONSES_MODELS {
             assert_eq!(dialect_for_model(model), Dialect::Responses);
         }
+        assert_eq!(
+            dialect_for_model("muse-spark-1.3-contributor"),
+            Dialect::Responses
+        );
         for model in MESSAGES_MODELS {
             assert_eq!(dialect_for_model(model), Dialect::Messages);
         }
