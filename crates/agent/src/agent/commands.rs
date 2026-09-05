@@ -5,6 +5,7 @@ use super::{
 };
 use llm::Provider;
 use session::{ExportOptions, SessionCreateOptions, SessionEvent, export_jsonl, snapshot_entries};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -205,7 +206,10 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
         if self.session.is_none() {
-            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            send(
+                events,
+                AgentEvent::Notice("compaction is unavailable without a session".into()),
+            );
             return Ok(());
         }
         self.compact_and_reload(events, cancel, CompactionReason::Manual)
@@ -219,10 +223,44 @@ impl Agent {
     pub(crate) async fn handle_compact_session_boundary(
         &mut self,
         events: &mpsc::UnboundedSender<AgentEvent>,
-        cancel: &CancellationToken,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
     ) -> TurnControl {
-        let outcome = self.handle_compact_session(events, cancel).await;
+        let cancel = self.cancel.child_token();
+        let application = self.cancel.clone();
+        let mut buffered = VecDeque::new();
+        let mut input_open = self.input_open;
+        let mut interrupted = false;
+        let outcome = {
+            let mut application_open = true;
+            let operation = self.handle_compact_session(events, &cancel);
+            tokio::pin!(operation);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut operation => break result,
+                    _ = application.cancelled(), if application_open => {
+                        application_open = false;
+                        cancel.cancel();
+                    }
+                    message = input.recv(), if input_open => match message {
+                        Some(InputMessage::Interrupt) => {
+                            interrupted = true;
+                            cancel.cancel();
+                        }
+                        Some(message) => buffered.push_back(message),
+                        None => input_open = false,
+                    },
+                }
+            }
+        };
+        self.input_open = input_open;
+        self.queued.extend(buffered);
         self.flush_deferred_sync();
+        if interrupted && !application.is_cancelled() {
+            // `handle_compact_session` has already observed the cancelled
+            // operation and deliberately persisted no summary.
+            return TurnControl::Continue;
+        }
         match outcome {
             Ok(()) => TurnControl::Continue,
             Err(TurnError::Shutdown) => TurnControl::Shutdown,
@@ -241,13 +279,13 @@ impl Agent {
     ) -> TurnControl {
         // Resolve without mutating live state; `handle_set_model` persists
         // first and only commits after persistence succeeds.
-        self.handle_set_model(provider, model, events).await;
+        let outcome = self.handle_set_model(provider, model, events).await;
         self.flush_deferred_sync();
-        // `handle_set_model` reports persistence failures by returning
-        // early without emitting `ModelChanged`; detect that by checking
-        // whether the run loop should quarantine. The handler itself sends
-        // the terminal `Error` at the failure source.
-        TurnControl::Continue
+        match outcome {
+            Ok(()) => TurnControl::Continue,
+            Err(TurnError::Shutdown) => TurnControl::Shutdown,
+            Err(TurnError::Persist(_)) => TurnControl::Quarantine,
+        }
     }
 
     pub(crate) async fn handle_set_model(
@@ -255,7 +293,7 @@ impl Agent {
         provider: Option<String>,
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) {
+    ) -> Result<(), TurnError> {
         // Resolve the candidate provider and canonical model name without
         // mutating live state; commit only after persistence succeeds, so
         // a failed `ModelChange` persist leaves parent and subagent
@@ -270,13 +308,13 @@ impl Agent {
                     events,
                     AgentEvent::Error("provider switching is unavailable".into()),
                 );
-                return;
+                return Ok(());
             };
             match factory(&requested) {
                 Ok(provider) => Some(provider),
                 Err(error) => {
                     send(events, AgentEvent::Error(error.to_string()));
-                    return;
+                    return Ok(());
                 }
             }
         };
@@ -286,18 +324,13 @@ impl Agent {
             .unwrap_or_else(|| current.clone());
         // Persist first: only after this succeeds do live parent/provider
         // state and the subagent runner move.
-        if self
-            .persist_event(
-                SessionEvent::ModelChange {
-                    provider: canonical.clone(),
-                    model: model.clone(),
-                },
-                events,
-            )
-            .is_err()
-        {
-            return;
-        }
+        self.persist_event(
+            SessionEvent::ModelChange {
+                provider: canonical.clone(),
+                model: model.clone(),
+            },
+            events,
+        )?;
         if let Some(provider) = next_provider {
             self.provider = provider;
         }
@@ -319,11 +352,22 @@ impl Agent {
             events,
             AgentEvent::Notice(format!("Using {canonical} · {model}")),
         );
-        spawn_model_list(canonical, self.provider.clone(), events.clone());
         // A different model may have a different context window and stale
-        // token counts; reset both so the next trigger re-baselines.
+        // token counts; reset both so the next trigger re-baselines. Metadata
+        // is fetched in the background so a slow catalogue cannot block the
+        // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
-        self.refresh_context_window(events).await;
+        self.context_window = self.compaction.resolved_window(0);
+        if let Some(metadata_tx) = &self.model_metadata_tx {
+            spawn_model_metadata(
+                metadata_tx.clone(),
+                self.provider.clone(),
+                canonical,
+                self.model.clone(),
+                self.cancel.clone(),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn handle_set_reasoning(
@@ -501,26 +545,55 @@ impl Agent {
 pub type ProviderFactory =
     Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn Provider>> + Send + Sync + 'static>;
 
+/// Fetch model metadata for the active selection on a bounded background
+/// task. The run loop consumes the result and derives both context-window and
+/// model-list updates from this one request.
+pub(crate) fn spawn_model_metadata(
+    sender: mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>,
+    provider: Arc<dyn Provider>,
+    provider_name: String,
+    model: String,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let models = tokio::select! {
+            result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                provider.list_models(),
+            ) => result.ok().and_then(Result::ok),
+            _ = cancel.cancelled() => None,
+        };
+        if let Some(models) = models {
+            let _ = sender.send((provider_name, model, models));
+        }
+    });
+}
+
 /// Fetch a provider's model list on a background task, reporting
-/// `AgentEvent::ModelList` on success and a notice on failure.  Shared by the
-/// startup fetch in `main` and the `/model` and `/models` handlers.
+/// `AgentEvent::ModelList` on success and a notice on failure. Shared by the
+/// `/model` and `/models` handlers.
 pub fn spawn_model_list(
     provider_name: String,
     provider: Arc<dyn Provider>,
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
     tokio::spawn(async move {
-        match provider.list_models().await {
-            Ok(models) => send(
+        match tokio::time::timeout(std::time::Duration::from_secs(5), provider.list_models()).await
+        {
+            Ok(Ok(models)) => send(
                 &events,
                 AgentEvent::ModelList {
                     provider: provider_name,
                     models,
                 },
             ),
-            Err(error) => send(
+            Ok(Err(error)) => send(
                 &events,
                 AgentEvent::Notice(format!("could not fetch model list: {error}")),
+            ),
+            Err(_) => send(
+                &events,
+                AgentEvent::Notice("could not fetch model list: request timed out".into()),
             ),
         }
     });

@@ -1,9 +1,7 @@
 use super::persistence::usage_event;
 use super::{Agent, AgentEvent, CompactionReason, MAX_OVERFLOW_RECOVERIES, TurnError, send};
-use compact::{
-    SummaryOutcome, estimate_live_tokens, plan_compaction, summarize as compact_summarize,
-};
-use llm::{Content, LlmError};
+use compact::{SummaryOutcome, plan_compaction, summarize as compact_summarize};
+use llm::LlmError;
 use session::{SessionEvent, usage_summary};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -11,30 +9,28 @@ use tokio_util::sync::CancellationToken;
 impl Agent {
     // ------------------------------------------------------------------ compaction
 
-    /// Resolve the provider context window: config override → model-reported
-    /// `context_length` → generous default. Runs once at startup and again
-    /// after a model switch.
-    pub(crate) async fn refresh_context_window(
+    /// Apply one bounded model catalogue result. The catalogue is forwarded
+    /// to frontends and the selected model's context length is applied only
+    /// when the result still belongs to the active provider/model.
+    pub(crate) fn apply_model_metadata(
         &mut self,
+        provider: String,
+        model: String,
+        models: Vec<llm::ModelInfo>,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        let reported = if self.compaction.context_window > 0 {
-            0
-        } else {
-            self.provider
-                .list_models()
-                .await
-                .ok()
-                .and_then(|models| {
-                    models.into_iter().find(|model| {
-                        model.id == self.model || model.name.as_deref() == Some(self.model.as_str())
-                    })
+        if provider == self.provider.name() && model == self.model {
+            let reported = models
+                .iter()
+                .find(|candidate| {
+                    candidate.id == model || candidate.name.as_deref() == Some(model.as_str())
                 })
-                .and_then(|model| model.context_length)
-                .unwrap_or(0)
-        };
-        self.context_window = self.compaction.resolved_window(reported);
-        send(events, self.context_usage_event());
+                .and_then(|candidate| candidate.context_length)
+                .unwrap_or(0);
+            self.context_window = self.compaction.resolved_window(reported);
+            send(events, self.context_usage_event());
+        }
+        send(events, AgentEvent::ModelList { provider, models });
     }
 
     /// Frontend-neutral snapshot for the input trailer. The current value is
@@ -48,22 +44,21 @@ impl Agent {
     }
 
     /// Approximate current context occupation: exact from the last request's
-    /// `Done` usage when available, else an estimate over the live session.
-    /// `extra_bytes` covers material added since that request (the new user
-    /// message); it is small relative to the reserved response slack.
+    /// `Done` usage when available, else an estimate over the complete
+    /// provider request inputs. `extra_bytes` covers material added since that
+    /// request (the new user message) and is counted once.
     pub(crate) fn context_tokens_estimate(&self, extra_bytes: usize) -> u64 {
-        let base = match self.last_context_tokens {
-            Some(exact) => exact,
-            None => match self.session.as_ref() {
-                Some(state) => estimate_live_tokens(&state.session),
-                None => self.estimate_history_tokens(),
-            },
-        };
+        let base = self
+            .last_context_tokens
+            .unwrap_or_else(|| self.estimate_history_tokens());
         base.saturating_add(compact::estimate::estimate_tokens(extra_bytes))
     }
 
-    /// Estimate context tokens directly from `self.history` (no durable
-    /// session / no provider usage yet).
+    /// Estimate context tokens directly from the same system prompt, tool
+    /// definitions, and message history used to build a normal request. This
+    /// deliberately uses `self.history` for both durable and ephemeral
+    /// agents: durable sessions have already reconstructed that history from
+    /// their append-only events, so the two paths cannot silently diverge.
     pub(crate) fn estimate_history_tokens(&self) -> u64 {
         let snapshot = self.tools.snapshot();
         let system = crate::prompt::system_prompt_with_workspace_context(
@@ -72,51 +67,21 @@ impl Agent {
             self.tools.skills(),
             &self.project_context,
         );
-        let definition_bytes = snapshot
-            .definitions
-            .iter()
-            .fold(0usize, |total, definition| {
-                total
-                    .saturating_add(definition.name.len())
-                    .saturating_add(definition.description.len())
-                    .saturating_add(definition.parameters.to_string().len())
-            });
-        let mut bytes = system.len().saturating_add(definition_bytes);
-        for message in &self.history {
-            for content in &message.content {
-                match content {
-                    Content::Text(text) => bytes = bytes.saturating_add(text.len()),
-                    // Neutral reasoning deltas are display-only and provider
-                    // dialects do not resend them as conversation context.
-                    Content::Reasoning(_) => {}
-                    Content::ToolResult { content, .. } => {
-                        bytes = bytes.saturating_add(content.len())
-                    }
-                    Content::Opaque { data, .. } => {
-                        bytes = bytes.saturating_add(
-                            serde_json::to_string(data)
-                                .map(|value| value.len())
-                                .unwrap_or(0),
-                        );
-                    }
-                    Content::ToolCall(call) => {
-                        bytes = bytes.saturating_add(call.name.len());
-                        bytes = bytes.saturating_add(
-                            serde_json::to_string(&call.arguments)
-                                .map(|rendered| rendered.len())
-                                .unwrap_or(0),
-                        );
-                    }
-                }
-            }
-        }
-        compact::estimate::estimate_tokens(bytes)
+        compact::estimate_provider_context_tokens(
+            Some(&system),
+            &snapshot.definitions,
+            &self.history,
+        )
     }
 
     /// Whether the pre-turn auto-compaction trigger fires for a turn adding
     /// `user_text`.
     pub(crate) fn should_auto_compact(&self, user_text: &str) -> bool {
-        if !self.compaction.auto {
+        if !self.compaction.auto || self.session.is_none() {
+            // Automatic compaction is a durable-history operation. With
+            // --no-session there is no event boundary to persist, so leave
+            // the in-memory conversation alone rather than emitting the same
+            // failure on every subsequent turn.
             return false;
         }
         let context = self.context_tokens_estimate(user_text.len());
@@ -137,7 +102,10 @@ impl Agent {
         reason: CompactionReason,
     ) -> Result<bool, TurnError> {
         let Some(state) = self.session.as_ref() else {
-            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            send(
+                events,
+                AgentEvent::Notice("compaction is unavailable without a session".into()),
+            );
             return Ok(false);
         };
         let session = state.session.clone();
@@ -159,9 +127,24 @@ impl Agent {
         )
         .await;
 
+        if matches!(outcome, SummaryOutcome::Cancelled) {
+            // Cancellation is control flow, not a summarizer failure: do not
+            // write a fallback summary or usage for an operation the caller
+            // explicitly stopped.
+            if self.cancel.is_cancelled() {
+                return Err(TurnError::Shutdown);
+            }
+            send(events, AgentEvent::Notice("compaction cancelled".into()));
+            return Ok(false);
+        }
+
         // Persist the summarizer's own usage so session cost totals stay
-        // honest and the UI reflects it.
-        if let SummaryOutcome::Model { usage, .. } = &outcome {
+        // honest and the UI reflects it. A provider that omitted usage must
+        // not create a synthetic zero-token turn.
+        if let SummaryOutcome::Model {
+            usage: Some(usage), ..
+        } = &outcome
+        {
             let summary = usage_summary(usage);
             self.persist_usage_best_effort(summary, events);
         }
@@ -169,6 +152,7 @@ impl Agent {
         let compacted_through = plan.boundary;
         let summary = match &outcome {
             SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text } => text,
+            SummaryOutcome::Cancelled => unreachable!("cancelled outcome handled above"),
         };
         let summary_bytes = summary.len();
 

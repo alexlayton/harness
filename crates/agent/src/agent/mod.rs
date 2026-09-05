@@ -23,6 +23,7 @@ mod persistence;
 mod tool_dispatch;
 mod turn;
 
+use commands::spawn_model_metadata;
 pub use commands::{ProviderFactory, spawn_model_list};
 pub use events::{
     AgentEvent, CompactionReason, InputMessage, SessionListItem, SessionSnapshotEntry, TurnError,
@@ -30,7 +31,10 @@ pub use events::{
 pub use persistence::AgentSessionState;
 use persistence::{ui_snapshot_entries, usage_event};
 pub use tool_dispatch::SubagentLimits;
-pub(crate) use tool_dispatch::plan_tool_batches;
+pub(crate) use tool_dispatch::{
+    CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
+    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch, plan_tool_batches,
+};
 pub(crate) use turn::TurnControl;
 
 /// Maximum number of times a turn re-streams after a recoverable failure:
@@ -91,6 +95,10 @@ pub struct Agent {
     /// successful `/model` switch can retarget future child runs to the new
     /// provider/model (`SubagentRunnerImpl::update_model`).
     subagent_runner: Option<Arc<crate::subagent::SubagentRunnerImpl>>,
+    /// Channel used by background model metadata requests. Keeping the sender
+    /// on the agent lets model changes remain non-blocking while the run loop
+    /// applies ready results at every operation boundary.
+    model_metadata_tx: Option<mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>>,
 }
 
 impl Agent {
@@ -119,6 +127,7 @@ impl Agent {
             project_context: String::new(),
             subagent_limits: SubagentLimits::default(),
             subagent_runner: None,
+            model_metadata_tx: None,
         }
     }
 
@@ -220,35 +229,30 @@ impl Agent {
             self.context_window = self.compaction.resolved_window(0);
         }
         send(&events, self.context_usage_event());
-        // Begin model discovery without placing it on the first-turn critical
-        // path. The generous/configured window is already installed; a
-        // bounded late result only affects future turns.
-        let (context_tx, mut context_rx) = mpsc::channel(1);
-        let mut metadata_pending = self.compaction.context_window == 0;
-        if metadata_pending {
-            let provider = self.provider.clone();
-            let provider_name = provider.name().to_owned();
-            let model = self.model.clone();
-            let lookup_model = model.clone();
-            let shutdown = self.cancel.clone();
-            tokio::spawn(async move {
-                let discovered = tokio::select! {
-                    result = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        provider.list_models(),
-                    ) => result.ok().and_then(Result::ok).and_then(|models| {
-                        models.into_iter().find(|candidate| {
-                            candidate.id == lookup_model
-                                || candidate.name.as_deref() == Some(lookup_model.as_str())
-                        }).and_then(|candidate| candidate.context_length)
-                    }),
-                    _ = shutdown.cancelled() => None,
-                };
-                let _ = context_tx.send((provider_name, model, discovered)).await;
-            });
-        }
+        // Begin one model metadata request without placing it on the
+        // first-turn critical path. The same result supplies both the model
+        // catalogue and the selected model's context window; model switches
+        // enqueue through this channel instead of issuing a second request.
+        let (metadata_tx, mut metadata_rx) = mpsc::unbounded_channel();
+        self.model_metadata_tx = Some(metadata_tx.clone());
+        spawn_model_metadata(
+            metadata_tx,
+            self.provider.clone(),
+            self.provider.name().to_owned(),
+            self.model.clone(),
+            self.cancel.clone(),
+        );
 
         loop {
+            // Apply every result that is already ready before selecting the
+            // next queued operation. Otherwise a busy queued-turn stream can
+            // starve startup metadata indefinitely.
+            while let Ok((provider, model, models)) = metadata_rx.try_recv() {
+                self.apply_model_metadata(provider, model, models, &events);
+            }
+            if metadata_rx.is_closed() {
+                self.model_metadata_tx = None;
+            }
             let next_message = if let Some(message) = self.queued.pop_front() {
                 Some(message)
             } else if !self.input_open {
@@ -261,14 +265,11 @@ impl Agent {
                         }
                         message
                     }
-                    reported = context_rx.recv(), if metadata_pending => {
-                        metadata_pending = false;
-                        if let Some((provider, model, Some(window))) = reported
-                            && provider == self.provider.name()
-                            && model == self.model
-                        {
-                            self.context_window = self.compaction.resolved_window(window);
-                            send(&events, self.context_usage_event());
+                    metadata = metadata_rx.recv() => {
+                        if let Some((provider, model, models)) = metadata {
+                            self.apply_model_metadata(provider, model, models, &events);
+                        } else {
+                            self.model_metadata_tx = None;
                         }
                         continue;
                     }
@@ -320,7 +321,7 @@ impl Agent {
                     // Manual compaction shares the boundary policy: persist
                     // failures quarantine with exactly one terminal event.
                     match self
-                        .handle_compact_session_boundary(&events, &self.cancel.clone())
+                        .handle_compact_session_boundary(&events, &mut input)
                         .await
                     {
                         TurnControl::Shutdown | TurnControl::Quarantine => {
@@ -367,7 +368,11 @@ impl Agent {
                     // of being swallowed, with deferred sync flushed at the
                     // operation boundary.
                     match self.handle_invoke_skill(name, &events, &mut input).await {
-                        TurnControl::Shutdown | TurnControl::Quarantine => break,
+                        TurnControl::Shutdown => break,
+                        TurnControl::Quarantine => {
+                            send(&events, AgentEvent::TurnFinished);
+                            break;
+                        }
                         TurnControl::Continue => {}
                     }
                     continue;
@@ -1534,9 +1539,7 @@ mod tests {
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             // One terminal Error at the failure source; the run loop
             // quarantines with exactly one TurnFinished — never a successful
-            // skill turn, never a second turn for the queued message. (The
-            // skill-turn path emits no TurnFinished of its own on persist
-            // failure: the boundary owns the single terminal event.)
+            // skill turn, never a second turn for the queued message.
             assert_eq!(
                 events
                     .iter()
@@ -1550,7 +1553,7 @@ mod tests {
                     .iter()
                     .filter(|event| matches!(event, AgentEvent::TurnFinished))
                     .count(),
-                0,
+                1,
                 "events: {events:?}"
             );
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);

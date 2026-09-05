@@ -26,26 +26,27 @@
 //! triggers, or slash commands, and sharing those would couple the child to
 //! UI concerns it must not have.
 
-use crate::agent::plan_tool_batches;
+use crate::agent::{
+    CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
+    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch, plan_tool_batches,
+};
 use crate::assembly::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
 use async_trait::async_trait;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use futures_util::stream::StreamExt;
 use llm::{
     CompletionRequest, Content, Message, Provider, ReasoningPolicy, RetryCallback, Role,
     StreamEvent, truncate_utf8,
 };
 use session::{SessionCreateOptions, SessionStore, usage_summary};
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tools::{
-    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry, call_summary,
+    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry,
     default_registry_with_index, read_only_registry_with_index,
 };
 
@@ -53,15 +54,6 @@ use tools::{
 /// large enough for a thorough audit, small enough not to blow the parent's
 /// context when several reports land in one turn.
 const REPORT_MAX_BYTES: usize = 20_000;
-
-/// Upper bound on read-only tool calls running at once inside one subagent.
-/// Mirrors the parent's cap; children never see `Parallel` tools, so this is
-/// the only in-flight limit they need.
-const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 8;
-
-/// One in-flight child tool execution carrying its slot index so results
-/// land in original call order rather than completion order.
-type ChildToolRun<'a> = Pin<Box<dyn Future<Output = (usize, tools::ToolOutput)> + Send + 'a>>;
 
 /// One delegated subagent run.
 pub(crate) struct SubagentRun {
@@ -517,11 +509,11 @@ impl SubagentRunnerImpl {
         }
     }
 
-    /// Program-order dispatch mirroring the parent agent: maximal read-only
-    /// runs batch concurrently, adjacent same-tool `Parallel` calls would fan
-    /// out (the child has no such tool), everything else serializes. Results
-    /// land in original call order; cancellation synthesizes "cancelled"
-    /// results for unfilled slots before unwinding.
+    /// Program-order dispatch mirroring the parent agent through the shared
+    /// batch executor. Results are persisted in provider call order even when
+    /// independent tools complete in another order. A launched non-read-only
+    /// call that is interrupted is reported as having unknown execution
+    /// status, never as a confirmed ordinary cancellation.
     async fn dispatch_tool_batches(
         &self,
         registry: &ToolRegistry,
@@ -531,71 +523,29 @@ impl SubagentRunnerImpl {
         cancel: &CancellationToken,
     ) -> Result<(), String> {
         for batch in plan_tool_batches(tool_calls, registry) {
-            // The batch shares a child token so a cancel kills exactly this
-            // phase while leaving the outer token untouched for cleanup.
-            let batch_cancel = cancel.child_token();
-            let mut futures: FuturesUnordered<ChildToolRun<'_>> = FuturesUnordered::new();
             let launch_limit = if batch.concurrent() {
-                MAX_CONCURRENT_READ_ONLY_TOOLS
+                match batch.class {
+                    tools::Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
+                    tools::Concurrency::Parallel => MAX_CONCURRENT_PARALLEL_TOOLS,
+                    tools::Concurrency::Exclusive => 1,
+                }
             } else {
                 1
             };
-            let mut next_launch = 0usize;
-            while next_launch < batch.calls.len().min(launch_limit) {
-                futures.push(Self::launch(
-                    registry,
-                    &batch.calls[next_launch],
-                    next_launch,
-                    batch_cancel.clone(),
-                ));
-                next_launch += 1;
-            }
-            let mut slots: Vec<Option<tools::ToolOutput>> =
-                (0..batch.calls.len()).map(|_| None).collect();
-            let mut finished = 0usize;
-            loop {
-                tokio::select! {
-                    item = futures.next() => match item {
-                        Some((index, output)) => {
-                            slots[index] = Some(output);
-                            finished += 1;
-                            if finished == slots.len() {
-                                break;
-                            }
-                            if next_launch < batch.calls.len() {
-                                futures.push(Self::launch(registry, &batch.calls[next_launch], next_launch, batch_cancel.clone()));
-                                next_launch += 1;
-                            }
-                        }
-                        None => break,
-                    },
-                    _ = cancel.cancelled() => {
-                        batch_cancel.cancel();
-                        break;
-                    }
-                }
-            }
-            drop(futures);
+            let mut control = CancellationControl::new(cancel, DispatchCancellation::Explicit);
+            let mut hooks = NoopToolDispatchHooks;
+            let outcome =
+                execute_tool_batch(registry, &batch, launch_limit, &mut control, &mut hooks).await;
 
-            let mut cancelled = false;
-            for (call, slot) in batch.calls.iter().zip(&mut slots) {
-                let output = match slot.take() {
-                    Some(output) => output,
-                    None => {
-                        cancelled = true;
-                        tools::ToolOutput {
-                            content: "cancelled".to_owned(),
-                            is_error: true,
-                            summary: call_summary(&call.name, &call.arguments),
-                        }
-                    }
-                };
+            for (call, call_outcome) in batch.calls.iter().zip(outcome.outcomes) {
+                let content = call_outcome.output.content;
+                let is_error = call_outcome.output.is_error;
                 history.push(Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
                         tool_call_id: call.id.clone(),
-                        content: output.content.clone(),
-                        is_error: output.is_error,
+                        content: content.clone(),
+                        is_error,
                     }],
                 });
                 Self::persist(
@@ -603,32 +553,17 @@ impl SubagentRunnerImpl {
                     session,
                     session::SessionEvent::ToolResult {
                         tool_call_id: call.id.clone(),
-                        content: output.content.clone(),
-                        is_error: output.is_error,
+                        content,
+                        is_error,
                         tool_name: Some(call.name.clone()),
                     },
                 );
             }
-            if cancelled {
+            if outcome.cancellation.is_some() {
                 return Err("cancelled by user".into());
             }
         }
         Ok(())
-    }
-
-    /// Start one registry execution as a slot-carrying future.
-    fn launch<'a>(
-        registry: &'a ToolRegistry,
-        call: &'a llm::ToolCall,
-        index: usize,
-        cancel: CancellationToken,
-    ) -> ChildToolRun<'a> {
-        let name = call.name.clone();
-        let arguments = call.arguments.clone();
-        Box::pin(async move {
-            let output = registry.execute(&name, arguments, cancel).await;
-            (index, output)
-        })
     }
 }
 

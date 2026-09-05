@@ -8,6 +8,7 @@ use llm::{
     truncate_utf8,
 };
 use session::{SessionEvent, usage_summary};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -74,10 +75,53 @@ impl Agent {
             } else {
                 0
             };
-            if self
-                .compact_and_reload(events, cancel, CompactionReason::Auto)
-                .await?
-            {
+            let application = self.cancel.clone();
+            let mut buffered = VecDeque::new();
+            let mut input_open = self.input_open;
+            let mut interrupted = false;
+            let compacted = {
+                let mut application_open = true;
+                let compaction = self.compact_and_reload(events, cancel, CompactionReason::Auto);
+                tokio::pin!(compaction);
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut compaction => break result,
+                        _ = application.cancelled(), if application_open => {
+                            application_open = false;
+                            cancel.cancel();
+                        }
+                        message = input.recv(), if input_open => match message {
+                            Some(InputMessage::Interrupt) => {
+                                interrupted = true;
+                                cancel.cancel();
+                            }
+                            Some(message) => buffered.push_back(message),
+                            None => input_open = false,
+                        },
+                    }
+                }
+            };
+            self.input_open = input_open;
+            self.queued.extend(buffered);
+            let compacted = match compacted {
+                Ok(compacted) => compacted,
+                Err(TurnError::Shutdown) => {
+                    self.persist_cancelled("application shutdown", events);
+                    send(events, AgentEvent::TurnFinished);
+                    return Err(TurnError::Shutdown);
+                }
+                Err(error) => return Err(error),
+            };
+            if interrupted || cancel.is_cancelled() {
+                self.persist_cancelled("turn interrupted during compaction", events);
+                send(events, AgentEvent::TurnFinished);
+                if application.is_cancelled() {
+                    return Err(TurnError::Shutdown);
+                }
+                return Ok(());
+            }
+            if compacted {
                 send(
                     events,
                     AgentEvent::Notice(format!("auto-compacted: context at {percent}% of window")),
@@ -239,6 +283,13 @@ impl Agent {
                                         send(events, usage_event(&summary));
                                     }
                                     send(events, self.context_usage_event());
+                                } else {
+                                    // A provider may omit usage on a valid
+                                    // terminal event. Do not keep using an
+                                    // older exact count; fall back to the
+                                    // current full-request estimator.
+                                    self.last_context_tokens = None;
+                                    send(events, self.context_usage_event());
                                 }
                             }
                             Err(error) => {
@@ -284,6 +335,12 @@ impl Agent {
                 &opaque,
                 tool_calls.clone(),
             );
+            if stream_error.is_some() || !tool_calls.is_empty() {
+                // A stream may have emitted partial assistant content or tool
+                // calls before its next request. The old Done count no longer
+                // covers that newly appended history.
+                self.last_context_tokens = None;
+            }
 
             if let Some(error) = stream_error {
                 let message = error.to_string();
@@ -376,6 +433,16 @@ impl Agent {
 
             self.dispatch_tool_batches(tool_calls, events, input, cancel)
                 .await?;
+            // The dispatcher emits the terminal event and marks the
+            // turn-scoped token when tool execution is interrupted. Do not
+            // issue another provider request (or a second TurnFinished).
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            // Tool results are appended after the provider's Done usage was
+            // observed. That exact snapshot no longer describes the next
+            // request, so use the complete-history estimator instead.
+            self.last_context_tokens = None;
         }
     }
 }
