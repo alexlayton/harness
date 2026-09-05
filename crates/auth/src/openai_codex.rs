@@ -236,10 +236,20 @@ impl OpenAiCodexAuth {
         let deadline = std::time::Instant::now() + Duration::from_secs(device.expires_in);
         let mut interval = device.interval;
         loop {
+            // Check expiry before sleeping so an already-expired grant
+            // fails fast, and re-check after the sleep and around the
+            // request (inside `token`) so cancellation/expiry interrupt
+            // both waits and in-flight polls.
             if std::time::Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
             }
             cancellable_sleep(interval, cancel).await?;
+            if std::time::Instant::now() >= deadline {
+                return Err(AuthError::DeviceCodeExpired);
+            }
+            if cancel.is_cancelled() {
+                return Err(AuthError::Cancelled);
+            }
             let value = self.token(json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code", "device_code":device.device_code, "client_id":OPENAI_CODEX_CLIENT_ID}), cancel).await?;
             if let Some(error) = value.get("error").and_then(Value::as_str) {
                 match error {
@@ -264,11 +274,41 @@ impl OpenAiCodexAuth {
         }
     }
     async fn token(&self, body: Value, cancel: &CancellationToken) -> Result<Value> {
-        self.request_json(
+        self.request_token(
             self.http.post(&self.endpoints.token_url).form(&body),
             cancel,
         )
         .await
+    }
+    /// Token endpoint with RFC 8628 device-polling semantics: read a bounded
+    /// response body regardless of HTTP status, then map recognized `error`
+    /// values (`authorization_pending`, `slow_down`, `expired_token`,
+    /// `access_denied`) before treating other non-success statuses as
+    /// errors.  Cancellation and expiry are checked around both sleeps and
+    /// requests; token bodies never enter errors or logs.
+    async fn request_token(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        let response = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), result = request.send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))? };
+        let status = response.status();
+        let body = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), body = read_bounded_body(response) => body? };
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))?;
+        if status.is_success() && value.get("error").is_none() {
+            return Ok(value);
+        }
+        match value.get("error").and_then(Value::as_str) {
+            Some("authorization_pending") => Ok(value),
+            Some("slow_down") => Ok(value),
+            Some("expired_token") => Ok(value),
+            Some("access_denied") => Ok(value),
+            _ => Err(AuthError::Http {
+                status: status.as_u16(),
+                endpoint: "auth.openai.com".into(),
+            }),
+        }
     }
     async fn request_json(
         &self,
@@ -284,6 +324,28 @@ impl OpenAiCodexAuth {
         }
         tokio::select! { _ = cancel.cancelled() => Err(AuthError::Cancelled), value = response.json() => value.map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into())) }
     }
+}
+
+/// Read at most `OAUTH_BODY_LIMIT` bytes of a token/authorize response.
+/// OAuth error payloads are small JSON objects; bounding the read keeps a
+/// malicious endpoint from filling memory before the RFC 8628 error mapping
+/// runs.  Bodies are parsed, never echoed into errors or logs.
+const OAUTH_BODY_LIMIT: usize = 64 * 1024;
+
+async fn read_bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk: bytes::Bytes =
+            chunk.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))?;
+        let remaining = OAUTH_BODY_LIMIT.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            return Err(AuthError::OpenAiCodex("invalid OAuth response".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 async fn wait_for_callback(
@@ -420,6 +482,10 @@ pub fn account_id_from_jwt(token: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     #[test]
     fn pkce_is_url_safe_and_changes_each_time() {
         let a = pkce().unwrap();
@@ -438,5 +504,256 @@ mod tests {
                 .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct"}}"#)
         );
         assert_eq!(account_id_from_jwt(&token).unwrap(), "acct");
+    }
+
+    /// Minimal HTTP fixture: scripted `(status, body)` replies in order.
+    struct Fixture {
+        addr: std::net::SocketAddr,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn fixture(replies: Vec<(u16, String)>) -> Fixture {
+        let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let replies_task = replies.clone();
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let next = replies_task.lock().unwrap().pop_front();
+                let Some((status, body)) = next else {
+                    return;
+                };
+                // Drain the request head so the client can finish sending.
+                let mut scratch = [0u8; 4096];
+                let _ = socket.read(&mut scratch).await;
+                seen_task
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&scratch).into_owned());
+                let reason = match status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    _ => "Error",
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        Fixture { addr, seen }
+    }
+
+    fn token_endpoints(addr: &std::net::SocketAddr) -> OpenAiCodexEndpoints {
+        OpenAiCodexEndpoints {
+            authorize_url: format!("http://{addr}/authorize"),
+            token_url: format!("http://{addr}/token"),
+            device_code_url: format!("http://{addr}/device"),
+        }
+    }
+
+    fn success_token_body(refresh: &str) -> String {
+        // A JWT whose payload carries the account id and expiry.
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+        let access = format!("head.{payload}.sig");
+        serde_json::json!({
+            "access_token": access,
+            "refresh_token": refresh,
+            "expires_in": 3600,
+            "id_token": access,
+        })
+        .to_string()
+    }
+
+    async fn auth_with_fixture(
+        store_dir: &tempfile::TempDir,
+        fixture: &Fixture,
+    ) -> OpenAiCodexAuth {
+        let store = AuthStore::new(store_dir.path().join("auth.json"));
+        OpenAiCodexAuth::new(store)
+            .unwrap()
+            .with_endpoints(token_endpoints(&fixture.addr))
+    }
+
+    #[tokio::test]
+    async fn device_poll_pending_then_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![
+            (400, r#"{"error":"authorization_pending"}"#.into()),
+            (200, success_token_body("refresh-1")),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let cancel = CancellationToken::new();
+        let credential = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            credential.get("error").and_then(Value::as_str),
+            Some("authorization_pending")
+        );
+        let credential = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let parsed = credential_from_token(&credential, None).unwrap();
+        assert_eq!(parsed.refresh, "refresh-1");
+        // Request bodies never carry tokens into errors: a bad reply maps to
+        // a status-only error with no body echo.
+        assert_eq!(fix.seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn device_poll_errors_map_before_status() {
+        let dir = tempfile::tempdir().unwrap();
+        // `expired_token` on a 400 surface as the parsed error value (the
+        // caller maps it to expiry), not as a generic HTTP failure.
+        let fix = fixture(vec![(400, r#"{"error":"expired_token"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let value = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            value.get("error").and_then(Value::as_str),
+            Some("expired_token")
+        );
+
+        // `access_denied` likewise parses so the caller can deny sanitely.
+        let fix = fixture(vec![(400, r#"{"error":"access_denied"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let value = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            value.get("error").and_then(Value::as_str),
+            Some("access_denied")
+        );
+
+        // Unrecognized errors on non-success stay generic HTTP failures with
+        // no body echo (never leak token response bodies).
+        let fix = fixture(vec![(400, r#"{"error":"weird","token":"abc"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("400"), "unexpected: {rendered}");
+        assert!(!rendered.contains("abc"), "body leaked: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn slow_down_increases_the_poll_interval() {
+        // `request_token` surfaces the parsed `slow_down`; the device loop
+        // maps it to `interval + 5`.  Assert the mapping contract directly.
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![(400, r#"{"error":"slow_down"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let value = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let interval = 5u64;
+        let next = match value.get("error").and_then(Value::as_str) {
+            Some("slow_down") => interval.saturating_add(5),
+            _ => interval,
+        };
+        assert_eq!(next, 10);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_oversized_bodies_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![(200, "not json".into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid OAuth response"));
+
+        // Oversized bodies fail before unbounded allocation.
+        let big = "x".repeat(OAUTH_BODY_LIMIT + 1024);
+        let fix = fixture(vec![(200, big)]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid OAuth response"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_sleep_and_request() {
+        // Cancelled sleep resolves promptly.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(cancellable_sleep(60, &cancel).await.is_err());
+
+        // Cancelled request never hits the network.
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![(200, success_token_body("r"))]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({})),
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is_cancelled());
+        assert!(fix.seen.lock().unwrap().is_empty());
     }
 }
