@@ -634,10 +634,17 @@ impl Session {
 /// validation and provider-context reconstruction so both functions agree on
 /// which calls are pending, completed, or cancelled — a change to the
 /// bookkeeping no longer needs to be replicated in both places.
+///
+/// Tool-call IDs are globally unique for the life of the log: once an ID has
+/// been used (pending or completed), it is never reused.  `TurnCancelled`
+/// marks the tail explicitly cancelled and clears the pending queue; `Error`
+/// marks it cancelled without clearing so a crash tail stays recoverable.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ToolCallTracker {
     /// Call IDs awaiting a result, in emission order.
     pending: Vec<String>,
+    /// Every call ID ever seen (pending or completed), for reuse detection.
+    seen: HashSet<String>,
     /// Call IDs that have received a result.
     completed: HashSet<String>,
     /// True when the tail was explicitly cancelled (`TurnCancelled`/`Error`).
@@ -657,12 +664,21 @@ impl ToolCallTracker {
         self.completed.contains(id)
     }
 
+    pub(crate) fn is_seen(&self, id: &str) -> bool {
+        self.seen.contains(id)
+    }
+
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancelled
     }
 
     /// Apply one event's effect on the tool-call lifecycle.  Events that do
-    /// not carry tool state are no-ops.
+    /// not carry tool state are no-ops.  `TurnCancelled` abandons the pending
+    /// queue so a late result for a pre-cancellation call is rejected;
+    /// crash-tail repair appends durable synthetic `ToolResult` events before
+    /// its marker, so repaired pairs are already complete when the marker
+    /// lands.  `Error` leaves the queue intact so a crash tail stays
+    /// recoverable and `context_messages` can strip the incomplete calls.
     pub(crate) fn record(&mut self, event: &SessionEvent) {
         match event {
             SessionEvent::AssistantMessage { message } => {
@@ -679,6 +695,7 @@ impl ToolCallTracker {
             }
             SessionEvent::ToolResult { tool_call_id, .. } => {
                 self.completed.insert(tool_call_id.clone());
+                self.seen.insert(tool_call_id.clone());
                 if let Some(index) = self.pending.iter().position(|id| id == tool_call_id) {
                     self.pending.remove(index);
                 }
@@ -698,6 +715,7 @@ impl ToolCallTracker {
     }
 
     fn push_pending(&mut self, id: &str) {
+        self.seen.insert(id.to_owned());
         if !self.is_pending(id) {
             self.pending.push(id.to_owned());
         }
@@ -802,6 +820,11 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
 /// Find the most recent compaction summary and the sequence boundary it
 /// replaces, if any.  Shared by provider-context reconstruction and the
 /// compactor so a change to the summary format stays in one place.
+///
+/// The returned tuple is `(summary_sequence, compacted_through)`: the
+/// sequence of the summary event itself and the boundary it declares.  A
+/// valid boundary satisfies `compacted_through < summary_sequence` and
+/// advances strictly across repeated compactions; see `validate_events`.
 pub fn latest_compaction_boundary(events: &[SessionEventRecord]) -> Option<(u64, u64)> {
     events.iter().rev().find_map(|record| {
         if let SessionEvent::CompactionSummary {
@@ -815,27 +838,51 @@ pub fn latest_compaction_boundary(events: &[SessionEventRecord]) -> Option<(u64,
     })
 }
 
+/// Events that remain live after the latest compaction, in provider-context
+/// order: the latest summary first, then every non-compaction record with
+/// `sequence > compacted_through` in original event order.
+///
+/// The summary is appended after the events it summarizes, so the live tail
+/// spans both sides of it: events with `compacted_through < sequence <
+/// summary_sequence` (the preserved recent tail) followed by events with
+/// `sequence > summary_sequence` (appended after compaction).  Older
+/// compaction summaries are excluded; only the newest summary is retained.
 pub fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&SessionEventRecord> {
     let Some((summary_sequence, compacted_through)) = latest_compaction_boundary(events) else {
         return events.iter().collect();
     };
 
-    events
+    let summary = events
         .iter()
-        .filter(|record| {
-            record.sequence == summary_sequence
-                || record.sequence > compacted_through && record.sequence > summary_sequence
-        })
-        .collect()
+        .find(|record| record.sequence == summary_sequence);
+    let mut retained = Vec::new();
+    if let Some(summary) = summary {
+        retained.push(summary);
+    }
+    retained.extend(events.iter().filter(|record| {
+        record.sequence != summary_sequence
+            && record.sequence > compacted_through
+            && !matches!(record.event, SessionEvent::CompactionSummary { .. })
+    }));
+    retained
 }
 
 /// Validate envelope-level ordering and tool-result references.  An unmatched
 /// tool call is allowed only at the end of a log: it is the recoverable state
 /// produced by a process crash and is omitted by `context_messages`.
+///
+/// Validation also enforces compaction-boundary integrity: a summary must not
+/// compact through itself or a future event, and repeated compaction
+/// boundaries must advance monotonically.
+///
+/// Tool-call IDs are globally unique across standalone and embedded calls; a
+/// reused ID is rejected even after completion or cancellation, because the
+/// durable log has no call-instance identity beyond the ID.
 pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
     let mut expected_sequence = 1u64;
     let mut ids = HashSet::new();
     let mut tracker = ToolCallTracker::default();
+    let mut compaction_boundary: Option<u64> = None;
 
     for record in events {
         if record.sequence != expected_sequence {
@@ -897,12 +944,22 @@ pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                     ));
                 }
                 for content in &message.content {
-                    if let StoredContent::ToolCall { id, .. } = content
-                        && tracker.is_pending(id)
-                    {
-                        return Err(SessionError::InvalidEvent(format!(
-                            "duplicate pending tool call {id}"
-                        )));
+                    if let StoredContent::ToolCall { id, name, .. } = content {
+                        if id.trim().is_empty() || name.trim().is_empty() {
+                            return Err(SessionError::InvalidEvent(
+                                "assistant tool call requires a non-empty ID and name".into(),
+                            ));
+                        }
+                        if tracker.is_pending(id) {
+                            return Err(SessionError::InvalidEvent(format!(
+                                "duplicate pending tool call {id}"
+                            )));
+                        }
+                        if tracker.is_seen(id) {
+                            return Err(SessionError::InvalidEvent(format!(
+                                "reused tool call ID {id}"
+                            )));
+                        }
                     }
                 }
             }
@@ -918,12 +975,23 @@ pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                         call.id
                     )));
                 }
+                if tracker.is_seen(&call.id) {
+                    return Err(SessionError::InvalidEvent(format!(
+                        "reused tool call ID {}",
+                        call.id
+                    )));
+                }
             }
             SessionEvent::ToolResult { tool_call_id, .. } => {
                 if tool_call_id.trim().is_empty() {
                     return Err(SessionError::InvalidEvent(
                         "tool result requires a non-empty tool_call_id".into(),
                     ));
+                }
+                if !tracker.is_pending(tool_call_id) {
+                    return Err(SessionError::InvalidEvent(format!(
+                        "tool result {tool_call_id} has no preceding tool call"
+                    )));
                 }
                 let Some(first) = tracker.pending().first() else {
                     return Err(SessionError::InvalidEvent(format!(
@@ -937,6 +1005,24 @@ pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
                 }
             }
             SessionEvent::TurnCancelled { .. } | SessionEvent::Error { .. } => {}
+            SessionEvent::CompactionSummary {
+                compacted_through, ..
+            } => {
+                if *compacted_through >= record.sequence {
+                    return Err(SessionError::InvalidEvent(format!(
+                        "compaction boundary {compacted_through} must precede its summary event {}",
+                        record.sequence
+                    )));
+                }
+                if let Some(previous) = compaction_boundary
+                    && *compacted_through <= previous
+                {
+                    return Err(SessionError::InvalidEvent(format!(
+                        "compaction boundary {compacted_through} does not advance past {previous}"
+                    )));
+                }
+                compaction_boundary = Some(*compacted_through);
+            }
             _ => {}
         }
         tracker.record(&record.event);
@@ -1240,5 +1326,348 @@ mod tests {
                 error: Some("lonely output".into()),
             }]
         );
+    }
+
+    // --- SESSION-1: compaction tail preservation --------------------------
+
+    fn push_user(session: &mut Session, text: &str) {
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        });
+    }
+
+    fn push_assistant(session: &mut Session, text: &str) {
+        session.append(SessionEvent::AssistantMessage {
+            message: StoredMessage::from_llm(&Message::assistant(vec![Content::Text(text.into())])),
+        });
+    }
+
+    fn push_tool_call(session: &mut Session, id: &str, name: &str) {
+        session.append(SessionEvent::ToolCall {
+            call: StoredToolCall {
+                id: id.into(),
+                name: name.into(),
+                arguments: json!({}),
+            },
+        });
+    }
+
+    fn push_tool_result(session: &mut Session, id: &str) {
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: id.into(),
+            content: "output".into(),
+            is_error: false,
+            tool_name: Some("read".into()),
+        });
+    }
+
+    fn push_summary(session: &mut Session, summary: &str, compacted_through: u64) {
+        session.append(SessionEvent::CompactionSummary {
+            summary: summary.into(),
+            compacted_through,
+        });
+    }
+
+    fn retained_sequences(session: &Session) -> Vec<u64> {
+        events_after_latest_compaction(&session.events)
+            .iter()
+            .map(|record| record.sequence)
+            .collect()
+    }
+
+    fn message_text(message: &Message) -> String {
+        message
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn compaction_keeps_summary_first_then_the_live_tail() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "user1");
+        push_assistant(&mut session, "assistant1");
+        push_user(&mut session, "user2");
+        push_assistant(&mut session, "assistant2");
+        push_summary(&mut session, "summary-one", 2);
+
+        validate_events(&session.events).unwrap();
+        // The summary (sequence 5) leads; the preserved recent tail (3, 4)
+        // follows in original event order.
+        assert_eq!(retained_sequences(&session), vec![5, 3, 4]);
+
+        let messages = session.context_messages();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(messages[0].role, Role::User));
+        assert!(message_text(&messages[0]).contains("summary-one"));
+        assert!(matches!(messages[1].role, Role::User));
+        assert_eq!(message_text(&messages[1]), "user2");
+        assert!(matches!(messages[2].role, Role::Assistant));
+        assert_eq!(message_text(&messages[2]), "assistant2");
+    }
+
+    #[test]
+    fn events_appended_after_compaction_follow_the_retained_tail() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "user1");
+        push_assistant(&mut session, "assistant1");
+        push_user(&mut session, "user2");
+        push_assistant(&mut session, "assistant2");
+        push_summary(&mut session, "summary-one", 2);
+        push_user(&mut session, "user3");
+
+        validate_events(&session.events).unwrap();
+        assert_eq!(retained_sequences(&session), vec![5, 3, 4, 6]);
+
+        let messages = session.context_messages();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(message_text(&messages[3]), "user3");
+    }
+
+    #[test]
+    fn repeated_compaction_retains_only_the_newest_summary() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "user1");
+        push_assistant(&mut session, "assistant1");
+        push_user(&mut session, "user2");
+        push_assistant(&mut session, "assistant2");
+        push_summary(&mut session, "summary-one", 2);
+        push_user(&mut session, "user3");
+        push_assistant(&mut session, "assistant3");
+        push_summary(&mut session, "summary-two", 6);
+
+        validate_events(&session.events).unwrap();
+        // Only the newest summary survives, followed by its live tail.
+        assert_eq!(retained_sequences(&session), vec![8, 7]);
+
+        let messages = session.context_messages();
+        assert_eq!(messages.len(), 2);
+        assert!(message_text(&messages[0]).contains("summary-two"));
+        assert!(
+            !message_text(&messages[0]).contains("summary-one"),
+            "the older summary must not leak into the retained tail"
+        );
+        assert_eq!(message_text(&messages[1]), "assistant3");
+    }
+
+    #[test]
+    fn invalid_compaction_boundaries_fail_validation() {
+        // A summary must not compact through itself.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "user1");
+        push_assistant(&mut session, "assistant1");
+        push_summary(&mut session, "bad", 3);
+        assert!(validate_events(&session.events).is_err());
+
+        // Nor through a future event.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "user1");
+        push_assistant(&mut session, "assistant1");
+        push_summary(&mut session, "bad", 99);
+        assert!(validate_events(&session.events).is_err());
+
+        // Repeated compaction boundaries must advance monotonically.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "user1");
+        push_assistant(&mut session, "assistant1");
+        push_user(&mut session, "user2");
+        push_assistant(&mut session, "assistant2");
+        push_summary(&mut session, "first", 2);
+        push_user(&mut session, "user3");
+        push_assistant(&mut session, "assistant3");
+        push_summary(&mut session, "second", 2);
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn compaction_boundary_keeps_tool_call_result_pairs() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "read this");
+        push_tool_call(&mut session, "call-1", "read");
+        push_tool_result(&mut session, "call-1");
+        push_assistant(&mut session, "done");
+        push_summary(&mut session, "summary-one", 1);
+
+        validate_events(&session.events).unwrap();
+        assert_eq!(retained_sequences(&session), vec![5, 2, 3, 4]);
+
+        // The retained result still has its call: every tool result in the
+        // reconstructed provider history is paired with a tool call.
+        let messages = session.context_messages();
+        let mut calls = HashSet::new();
+        let mut results = Vec::new();
+        for message in &messages {
+            for content in &message.content {
+                match content {
+                    Content::ToolCall(call) => {
+                        calls.insert(call.id.clone());
+                    }
+                    Content::ToolResult { tool_call_id, .. } => results.push(tool_call_id.clone()),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(results, vec!["call-1".to_owned()]);
+        assert!(calls.contains("call-1"));
+    }
+
+    // --- SESSION-5: tool-call replay validation ---------------------------
+
+    fn push_assistant_call(session: &mut Session, id: &str, name: &str) {
+        session.append(SessionEvent::AssistantMessage {
+            message: StoredMessage {
+                role: StoredRole::Assistant,
+                content: vec![StoredContent::ToolCall {
+                    id: id.into(),
+                    name: name.into(),
+                    arguments: json!({}),
+                }],
+            },
+        });
+    }
+
+    #[test]
+    fn completed_tool_call_ids_cannot_be_reused() {
+        // Reuse with a second result is still reuse.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_tool_result(&mut session, "call-1");
+        session.append(SessionEvent::TurnCancelled {
+            reason: "done".into(),
+        });
+        push_tool_call(&mut session, "call-1", "read");
+        push_tool_result(&mut session, "call-1");
+        assert!(validate_events(&session.events).is_err());
+
+        // Reuse without any second result is also rejected.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_tool_result(&mut session, "call-1");
+        session.append(SessionEvent::TurnCancelled {
+            reason: "done".into(),
+        });
+        push_tool_call(&mut session, "call-1", "read");
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn empty_tool_call_ids_and_names_are_rejected() {
+        for (id, name) in [("", "read"), ("call-1", ""), ("  ", "read")] {
+            let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+            push_user(&mut session, "hi");
+            push_tool_call(&mut session, id, name);
+            assert!(
+                validate_events(&session.events).is_err(),
+                "standalone call id={id:?} name={name:?} must be rejected"
+            );
+
+            let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+            push_user(&mut session, "hi");
+            push_assistant_call(&mut session, id, name);
+            assert!(
+                validate_events(&session.events).is_err(),
+                "embedded call id={id:?} name={name:?} must be rejected"
+            );
+        }
+
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_assistant_call(&mut session, "call-1", "read");
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: String::new(),
+            content: "output".into(),
+            is_error: false,
+            tool_name: Some("read".into()),
+        });
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn cancelled_tool_call_ids_cannot_be_reused() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_tool_result(&mut session, "call-1");
+        session.append(SessionEvent::TurnCancelled {
+            reason: "user stopped".into(),
+        });
+        push_tool_call(&mut session, "call-1", "read");
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn standalone_and_embedded_calls_share_one_id_namespace() {
+        // Standalone first, embedded reuse second.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_tool_result(&mut session, "call-1");
+        session.append(SessionEvent::TurnCancelled {
+            reason: "done".into(),
+        });
+        push_assistant_call(&mut session, "call-1", "read");
+        assert!(validate_events(&session.events).is_err());
+
+        // Embedded first, standalone reuse second.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_assistant_call(&mut session, "call-1", "read");
+        push_tool_result(&mut session, "call-1");
+        session.append(SessionEvent::TurnCancelled {
+            reason: "done".into(),
+        });
+        push_tool_call(&mut session, "call-1", "read");
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn context_reconstruction_never_yields_orphan_results_or_dangling_calls() {
+        // A valid mixed standalone/embedded batch reconstructs paired.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_assistant_call(&mut session, "embedded-1", "read");
+        push_tool_call(&mut session, "standalone-1", "bash");
+        push_tool_result(&mut session, "embedded-1");
+        push_tool_result(&mut session, "standalone-1");
+        validate_events(&session.events).unwrap();
+
+        let messages = session.context_messages();
+        let mut calls = HashSet::new();
+        let mut results = Vec::new();
+        for message in &messages {
+            for content in &message.content {
+                match content {
+                    Content::ToolCall(call) => {
+                        calls.insert(call.id.clone());
+                    }
+                    Content::ToolResult { tool_call_id, .. } => results.push(tool_call_id.clone()),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(calls.len(), 2);
+        assert_eq!(results.len(), 2);
+        for result in &results {
+            assert!(
+                calls.contains(result),
+                "tool result {result} has no paired call in provider context"
+            );
+        }
+
+        // An incomplete crash tail is stripped, never dangled.
+        push_tool_call(&mut session, "dangling-1", "read");
+        let messages = session.context_messages();
+        let dangling = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .any(|content| matches!(content, Content::ToolCall(call) if call.id == "dangling-1"));
+        assert!(!dangling);
     }
 }

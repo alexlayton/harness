@@ -359,6 +359,10 @@ impl SessionStore {
     /// Repair tool calls left at the end of a file by a process crash.  The
     /// synthetic error results are durable, so subsequent user messages pass
     /// strict ordering validation and providers receive a valid history.
+    ///
+    /// The repair marker is itself an ordinary `TurnCancelled` event: repair
+    /// appends synthetic `ToolResult` events before the marker, so every
+    /// repaired call is already complete when the marker lands.
     pub fn repair_incomplete_tool_calls(&self, session: &mut Session) -> Result<usize> {
         let mut pending = Vec::<StoredToolCall>::new();
         for record in &session.events {
