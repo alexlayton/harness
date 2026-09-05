@@ -22,7 +22,7 @@ pub mod model;
 pub mod store;
 
 pub use codec::{
-    decode_session, decode_session_file, encode_header, encode_record, encode_session,
+    TailRecovery, decode_session, decode_session_file, encode_header, encode_record, encode_session,
 };
 pub use error::{Result, SessionError};
 pub use export::{ExportOptions, export_jsonl, export_transcript};

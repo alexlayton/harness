@@ -1,4 +1,4 @@
-use crate::codec::{decode_session_file, encode_header, encode_record};
+use crate::codec::{TailRecovery, decode_session_file, encode_header, encode_record};
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{
     EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, StoredContent,
@@ -211,6 +211,14 @@ impl SessionStore {
     /// `sync_all` when deferred sync is enabled — see the store field docs).
     /// A sidecar create-new lock prevents two Harness processes from
     /// interleaving JSON records.  Every record is followed by a newline.
+    ///
+    /// When the file ends with an incomplete crash tail (an unterminated
+    /// malformed final line), the tail is truncated to the last valid record
+    /// under the lock before appending, so the next write cannot cement the
+    /// fragment into a terminated corrupt line.  Loading alone never repairs
+    /// the file; only this locked append path truncates, and only the
+    /// incomplete tail fragment.  Terminated malformed lines and mid-file
+    /// corruption remain hard errors.
     #[tracing::instrument(
         name = "session_persist",
         skip_all,
@@ -229,11 +237,18 @@ impl SessionStore {
         // Re-read under the lock.  Two processes may each hold an older
         // in-memory Session; deriving the sequence from disk prevents
         // duplicate sequence numbers and keeps append-only ordering valid.
-        let mut disk_session = load_session_file(&path)?;
+        let (mut disk_session, recovery) = load_session_file_for_append(&path)?;
         if disk_session.id() != session.id() {
             return Err(SessionError::InvalidEvent(
                 "session object does not match its file".into(),
             ));
+        }
+        if recovery.recovered {
+            // Repair the incomplete crash tail before appending: truncate to
+            // the last valid record so the fragment never becomes a
+            // terminated corrupt line.  This keeps the session append-only
+            // with respect to every previously valid record.
+            truncate_to_valid_tail(&path, &recovery)?;
         }
         let record = SessionEventRecord {
             id: EventId::new(),
@@ -461,6 +476,31 @@ fn load_session_file(path: &Path) -> Result<Session> {
     let (mut session, _) = decode_session_file(&contents, path)?;
     session.path = Some(path.to_path_buf());
     Ok(session)
+}
+
+/// Re-read a session file for appending: returns the decoded session plus
+/// the crash-tail recovery metadata.  The file is never mutated here; the
+/// locked `append_event` path truncates only after this reports an
+/// incomplete tail.
+fn load_session_file_for_append(path: &Path) -> Result<(Session, TailRecovery)> {
+    let contents = read_file(path)?;
+    let (mut session, recovery) = decode_session_file(&contents, path)?;
+    session.path = Some(path.to_path_buf());
+    Ok((session, recovery))
+}
+
+/// Truncate an incomplete crash tail to the last valid record, then flush
+/// and sync before the next append.  Only the malformed trailing fragment
+/// is removed; valid records are never rewritten.
+fn truncate_to_valid_tail(path: &Path, recovery: &TailRecovery) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| io_error("open session for repair", path, source))?;
+    file.set_len(recovery.valid_bytes as u64)
+        .map_err(|source| io_error("truncate incomplete session tail", path, source))?;
+    file.sync_all()
+        .map_err(|source| io_error("sync repaired session", path, source))
 }
 
 fn read_file(path: &Path) -> Result<String> {
@@ -897,6 +937,53 @@ mod tests {
                 .iter()
                 .any(|record| matches!(record.event, SessionEvent::TurnCancelled { .. }))
         );
+    }
+
+    #[test]
+    fn append_repairs_an_unterminated_crash_tail() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("hello")),
+                },
+            )
+            .unwrap();
+        let valid_events = session.events.clone();
+        // Simulate a crash mid-append: a partial JSON fragment with no
+        // trailing newline.
+        let path = session.path().unwrap().clone();
+        use std::io::Write as _;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"version\":1,\"type\":\"user_message\"")
+            .unwrap();
+        // Loading alone does not mutate the file.
+        let loaded = store.open(&session.id()).unwrap();
+        assert_eq!(loaded.events, valid_events);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(raw.ends_with("user_message\""));
+        // The next locked append truncates only the fragment, then writes.
+        let mut repaired = loaded;
+        store
+            .append_event(
+                &mut repaired,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("after crash")),
+                },
+            )
+            .unwrap();
+        let mut expected = valid_events;
+        expected.push(repaired.events.last().unwrap().clone());
+        assert_eq!(repaired.events, expected);
+        let reopened = store.open(&session.id()).unwrap();
+        assert_eq!(reopened.events, expected);
     }
 
     #[test]
