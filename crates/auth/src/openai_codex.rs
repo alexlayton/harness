@@ -86,6 +86,10 @@ pub struct OpenAiCodexAuth {
     http: Client,
     endpoints: OpenAiCodexEndpoints,
     credential: Arc<Mutex<Option<OpenAiCodexCredential>>>,
+    /// Serializes rotating refresh-token exchanges so concurrent
+    /// `ensure_valid` calls produce one network refresh and never let an
+    /// older completion overwrite newer credentials.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 impl fmt::Debug for OpenAiCodexAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,6 +112,7 @@ impl OpenAiCodexAuth {
             http,
             endpoints: OpenAiCodexEndpoints::default(),
             credential: Arc::new(Mutex::new(credential)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
     pub fn from_default() -> Result<Self> {
@@ -163,16 +168,69 @@ impl OpenAiCodexAuth {
         self.refresh().await
     }
     pub async fn refresh(&self) -> Result<OpenAiCodexCredential> {
+        // Single-flight: concurrent refreshers queue here, then recheck the
+        // credential before refreshing so only the first waiter hits the
+        // network.  Never hold the blocking cache mutex across the network;
+        // the async guard is released before any `.await` on the mutex.
+        let _guard = self.refresh_lock.lock().await;
+        // Reload: another waiter (or process) may have already refreshed.
+        if let Ok(Some(current)) = self.store.openai_codex() {
+            let cached = self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))?
+                .clone();
+            // Prefer the newest of cache vs. disk; disk wins ties only when
+            // it is unexpired (a fresh rotation another process persisted).
+            if let Some(cached) = cached {
+                if !cached.is_expired() {
+                    return Ok(cached);
+                }
+                if !current.is_expired()
+                    && current.refresh != cached.refresh
+                    && current.access != cached.access
+                {
+                    *self
+                        .credential
+                        .lock()
+                        .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                        Some(current.clone());
+                    return Ok(current);
+                }
+            } else if !current.is_expired() {
+                *self
+                    .credential
+                    .lock()
+                    .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                    Some(current.clone());
+                return Ok(current);
+            }
+        }
         let old = self
             .credential()?
             .ok_or(AuthError::OpenAiCodexNotAuthenticated)?;
+        let old_refresh = old.refresh.clone();
         let value = self
             .token(
                 json!({"grant_type":"refresh_token", "refresh_token":old.refresh, "client_id": OPENAI_CODEX_CLIENT_ID} ),
                 &CancellationToken::new(),
             )
             .await?;
-        let credential = credential_from_token(&value, Some(&old.refresh))?;
+        let credential = credential_from_token(&value, Some(&old_refresh))?;
+        // Prevent an older refresh completion from overwriting newer
+        // rotating credentials persisted while this exchange was in flight.
+        if let Ok(Some(current)) = self.store.openai_codex()
+            && current.refresh != old_refresh
+            && current.refresh == credential.refresh
+            && current.access != credential.access
+        {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                Some(current.clone());
+            return Ok(current);
+        }
         self.persist(credential.clone())?;
         Ok(credential)
     }

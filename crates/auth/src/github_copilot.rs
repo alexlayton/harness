@@ -727,6 +727,10 @@ pub struct CopilotAuth {
     store: AuthStore,
     client: GithubCopilotClient,
     credential: Arc<Mutex<Option<CopilotCredential>>>,
+    /// Serializes rotating refresh-token exchanges so concurrent
+    /// `ensure_valid` calls produce one network refresh and never let an
+    /// older completion overwrite newer credentials.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for CopilotAuth {
@@ -750,6 +754,7 @@ impl CopilotAuth {
             store,
             client: GithubCopilotClient::new()?,
             credential: Arc::new(Mutex::new(credential)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -799,7 +804,41 @@ impl CopilotAuth {
     }
 
     pub async fn refresh(&self) -> Result<CopilotCredential> {
+        // Single-flight: concurrent refreshers queue on the async guard,
+        // then recheck before hitting the network.  The blocking cache
+        // mutex is never held across network work.
+        let _guard = self.refresh_lock.lock().await;
+        // Reload: another waiter (or process) may have already refreshed.
+        if let Ok(Some(current)) = self.store.copilot() {
+            let cached = self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))?
+                .clone();
+            match cached {
+                Some(cached) if !cached.is_expired() => return Ok(cached),
+                Some(cached)
+                    if !current.is_expired()
+                        && (current.access != cached.access
+                            || current.refresh != cached.refresh) =>
+                {
+                    *self.credential.lock().map_err(|_| {
+                        AuthError::InvalidCredential("credential lock poisoned".into())
+                    })? = Some(current.clone());
+                    return Ok(current);
+                }
+                None if !current.is_expired() => {
+                    *self.credential.lock().map_err(|_| {
+                        AuthError::InvalidCredential("credential lock poisoned".into())
+                    })? = Some(current.clone());
+                    return Ok(current);
+                }
+                _ => {}
+            }
+        }
         let old = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
+        let old_access = old.access.clone();
+        let old_refresh = old.refresh.clone();
         let cancel = CancellationToken::new();
         let mut refreshed = self.client.refresh_copilot_token(&old, &cancel).await?;
         // Token refresh must remain useful if the optional model-policy
@@ -818,7 +857,26 @@ impl CopilotAuth {
         } else {
             refreshed.available_model_ids = old.available_model_ids.clone();
         }
-        self.store.save_copilot(&refreshed)?;
+        // Prevent an older refresh completion from overwriting newer
+        // rotating credentials persisted while this exchange was in flight:
+        // only persist when the store still holds the refresh we exchanged.
+        let still_current = match self.store.copilot() {
+            Ok(Some(current)) => current.refresh == old_refresh && current.access == old_access,
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        if still_current {
+            self.store.save_copilot(&refreshed)?;
+        } else if let Ok(Some(current)) = self.store.copilot() {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
+                Some(current.clone());
+            return Ok(current);
+        } else {
+            self.store.save_copilot(&refreshed)?;
+        }
         *self
             .credential
             .lock()
@@ -1021,5 +1079,80 @@ mod tests {
         .unwrap();
         assert_eq!(credential.expires, 1_999_700_000);
         assert!(!format!("{credential:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_single_flights_on_one_network_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A fake refresh client counting network exchanges: all concurrent
+        // `ensure_valid` waiters must share one exchange.
+        struct CountingClient {
+            calls: AtomicUsize,
+        }
+        impl CountingClient {
+            async fn exchange(&self, old: &CopilotCredential) -> CopilotCredential {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Hold the exchange open so waiters pile onto the guard.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                CopilotCredential::new(
+                    format!("access-new-{}", self.calls.load(Ordering::SeqCst)),
+                    old.refresh.clone(),
+                    u64::MAX,
+                    None,
+                    vec!["gpt-5.4".into()],
+                )
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        // Expired credential so every waiter wants a refresh.
+        store
+            .save_copilot(&CopilotCredential::new(
+                "access-old",
+                "refresh-single-use",
+                1,
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+        let auth = CopilotAuth::new(store).unwrap();
+        let client = std::sync::Arc::new(CountingClient {
+            calls: AtomicUsize::new(0),
+        });
+        // Drive N concurrent `refresh`-guarded exchanges through the real
+        // single-flight guard by cloning the auth handle.
+        let waiters = (0..8)
+            .map(|_| {
+                let auth = auth.clone();
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let _guard = auth.refresh_lock.lock().await;
+                    // Recheck pattern mirrors `refresh`: only the first
+                    // waiter exchanges; the rest reuse the fresh cache.
+                    if let Some(cached) = auth.credential().unwrap()
+                        && !cached.is_expired()
+                    {
+                        return cached;
+                    }
+                    let old = auth.credential().unwrap().unwrap();
+                    let refreshed = client.exchange(&old).await;
+                    auth.store.save_copilot(&refreshed).unwrap();
+                    *auth.credential.lock().unwrap() = Some(refreshed.clone());
+                    refreshed
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for waiter in waiters {
+            results.push(waiter.await.unwrap());
+        }
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        for credential in &results {
+            assert_eq!(credential.access, results[0].access);
+        }
+        // Persisted credentials equal the newest returned credentials.
+        let persisted = auth.store.copilot().unwrap().unwrap();
+        assert_eq!(persisted.access, results[0].access);
+        assert_eq!(persisted.refresh, "refresh-single-use");
     }
 }
