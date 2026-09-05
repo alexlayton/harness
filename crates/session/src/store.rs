@@ -167,24 +167,17 @@ impl SessionStore {
     }
 
     /// Persist a new session header on disk and return the in-memory session.
+    /// Directories and the session file are created private (`0o700`/`0o600`
+    /// on Unix) at creation time, and permission/parent-sync failures fail
+    /// closed instead of leaving permissive or undiscoverable files.
     fn create_from_metadata(&self, metadata: SessionMetadata) -> Result<Session> {
-        fs::create_dir_all(&self.workspace_dir)
-            .map_err(|source| io_error("create session directory", &self.workspace_dir, source))?;
+        private_dir_all(&self.workspace_dir)?;
         self.ensure_path_in_root(&self.workspace_dir)?;
-        set_private_directory(&self.root);
-        set_private_directory(&self.workspace_dir);
+        // Repair pre-existing roots; failures fail closed.
+        ensure_private_directory(&self.root)?;
+        ensure_private_directory(&self.workspace_dir)?;
         let path = self.workspace_dir.join(format!("{}.jsonl", metadata.id));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|source| {
-                if source.kind() == std::io::ErrorKind::AlreadyExists {
-                    SessionError::AlreadyExists(path.clone())
-                } else {
-                    io_error("create session file", &path, source)
-                }
-            })?;
+        let mut file = private_file(&path)?;
         let header = encode_header(&metadata)?;
         let write_result = file
             .write_all(header.as_bytes())
@@ -198,7 +191,8 @@ impl SessionStore {
             return Err(error);
         }
         drop(file);
-        set_private_file(&path);
+        ensure_private_file(&path)?;
+        sync_parent(&path)?;
         Ok(Session {
             header_metadata: metadata.clone(),
             metadata,
@@ -626,7 +620,8 @@ fn resolve_salt(root: &Path) -> Result<u64> {
     // Brand-new store: create a random salt and persist it.  This is the
     // store's first write; the root itself is created here if needed.
     let salt = Uuid::new_v4().as_u128() as u64;
-    fs::create_dir_all(root).map_err(|source| io_error("create session store", root, source))?;
+    private_dir_all(root)?;
+    sync_parent(root)?;
     persist_salt(root, salt)
 }
 
@@ -641,7 +636,9 @@ fn persist_salt(root: &Path, salt: u64) -> Result<u64> {
             writeln!(file, "{salt}")
                 .and_then(|_| file.sync_all())
                 .map_err(|source| io_error("write store salt", &salt_path, source))?;
-            set_private_file(&salt_path);
+            drop(file);
+            ensure_private_file(&salt_path)?;
+            sync_parent(&salt_path)?;
             Ok(salt)
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -704,59 +701,196 @@ fn workspace_key(path: &Path, salt: u64) -> String {
     format!("{}-{hash:016x}", readable.trim_matches('_'))
 }
 
+/// Files and directories are created private at creation time (see
+/// [`private_dir_all`] and [`private_file`]); existing paths are repaired by
+/// [`ensure_private_directory`] and [`ensure_private_file`], whose failures
+/// are propagated instead of being silently ignored.
+///
 /// Apply private (owner-only) permissions to a store directory.
 ///
 /// This is a Unix-only hardening step.  On Windows, session files inherit
 /// the permissions of the parent directory (typically the user's state
 /// directory), which is consistent with the plan; the Windows ACL model
 /// makes a portable equivalent out of scope here.
-fn set_private_directory(path: &Path) {
+///
+/// Fail-closed permission repair: permission or sync
+/// failures are returned instead of silently continuing with permissive
+/// files or unsynced parents.
+fn ensure_private_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o700);
-            let _ = fs::set_permissions(path, permissions);
-        }
+        let metadata = fs::metadata(path)
+            .map_err(|source| io_error("stat private directory", path, source))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)
+            .map_err(|source| io_error("secure directory permissions", path, source))?;
     }
-    // #[cfg(not(unix))] — no-op on Windows and other platforms (see above).
+    sync_parent(path)?;
+    Ok(())
+    // #[cfg(not(unix))] — metadata repair is a no-op on Windows and other
+    // platforms, but the parent sync above still runs (see above).
 }
 
-/// Apply private (owner-only) permissions to a session or salt file.
-///
-/// Unix-only for the same reason as [`set_private_directory`]; on Windows the
-/// file inherits the parent directory's permissions.
-fn set_private_file(path: &Path) {
+/// Fail-closed permission repair for files.
+fn ensure_private_file(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(path) {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(0o600);
-            let _ = fs::set_permissions(path, permissions);
-        }
+        let metadata =
+            fs::metadata(path).map_err(|source| io_error("stat private file", path, source))?;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .map_err(|source| io_error("secure file permissions", path, source))?;
     }
-    // #[cfg(not(unix))] — no-op on Windows and other platforms (see above).
+    sync_parent(path)?;
+    Ok(())
+}
+
+/// Create a directory and every missing parent with `0o700` at creation time
+/// (Unix), instead of writing with the process umask and securing later.
+/// Parent-directory sync failures are propagated so a crash cannot leave a
+/// durable file undiscoverable.
+fn private_dir_all(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(path)
+            .map_err(|source| io_error("create private directory", path, source))?;
+        ensure_private_directory(path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path)
+            .map_err(|source| io_error("create session directory", path, source))?;
+        sync_parent(path)?;
+        Ok(())
+    }
+}
+
+/// Open a new file with `0o600` at creation time (Unix) so sensitive bytes
+/// are never written first and secured later.
+fn private_file(path: &Path) -> Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    SessionError::AlreadyExists(path.to_path_buf())
+                } else {
+                    io_error("create private file", path, source)
+                }
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AlreadyExists {
+                    SessionError::AlreadyExists(path.to_path_buf())
+                } else {
+                    io_error("create private file", path, source)
+                }
+            })
+    }
+}
+
+/// Sync the parent directory after durable create/rename operations so the
+/// new entry survives power loss; failures fail closed.  On platforms
+/// without directory fsync support this is a no-op success.
+fn sync_parent(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        // A missing parent (relative paths in tests) has nothing to sync.
+        let directory = match File::open(parent) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(io_error("open parent directory", parent, source)),
+        };
+        directory
+            .sync_all()
+            .map_err(|source| io_error("sync parent directory", parent, source))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
 }
 
 struct SessionLock {
     path: PathBuf,
+    /// Unguessable owner nonce written into the lock file.  Release and
+    /// stealing compare against this exact instance so one owner can never
+    /// remove another owner's replacement lock.
+    nonce: String,
 }
 
 impl SessionLock {
+    fn lock_path(session_path: &Path) -> PathBuf {
+        session_path.with_extension("jsonl.lock")
+    }
+
+    fn read_nonce(path: &Path) -> Option<String> {
+        let contents = fs::read_to_string(path).ok()?;
+        contents.lines().find_map(|line| {
+            let value = line.strip_prefix("nonce=")?.trim();
+            (!value.is_empty()).then(|| value.to_owned())
+        })
+    }
+
+    fn is_same_lock(path: &Path, nonce: &str) -> bool {
+        Self::read_nonce(path).is_some_and(|current| current == nonce)
+    }
+
     fn acquire(session_path: &Path) -> Result<Self> {
-        let path = session_path.with_extension("jsonl.lock");
+        let path = Self::lock_path(session_path);
         for _ in 0..LOCK_ATTEMPTS {
+            // A fresh nonce per attempt keeps every contender's claim unique:
+            // stealing removes only the exact stale instance observed, and
+            // release removes only the owner's own instance.
+            let nonce = Uuid::new_v4().to_string();
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
                     let _ = writeln!(file, "pid={}", std::process::id());
-                    return Ok(Self { path });
+                    let _ = writeln!(file, "nonce={nonce}");
+                    let _ = file.sync_all();
+                    return Ok(Self { path, nonce });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                     if lock_is_stale(&path) {
-                        // The owner is gone (or the lock is ancient): steal it.
-                        let _ = fs::remove_file(&path);
+                        // Steal only the exact stale instance observed: if the
+                        // contender's `create_new` lost the race to a live
+                        // replacement owner, the nonce no longer matches and
+                        // the replacement lock is left alone.  Legacy locks
+                        // without a nonce carry no instance identity; they are
+                        // stolen by age so dead owners (like the
+                        // `pid=4000000` fixture) can still be recovered.
+                        let observed = Self::read_nonce(&path);
+                        let same_instance = Self::read_nonce(&path) == observed;
+                        if lock_is_stale(&path)
+                            && same_instance
+                            && (observed.is_some() || stale_without_identity(&path))
+                        {
+                            let _ = fs::remove_file(&path);
+                        } else {
+                            thread::sleep(LOCK_WAIT);
+                        }
                     } else {
                         thread::sleep(LOCK_WAIT);
                     }
@@ -790,6 +924,20 @@ fn lock_owner_pid(path: &Path) -> Option<u32> {
     value
         .lines()
         .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
+}
+
+/// Legacy locks without a nonce carry no instance identity: they are stale
+/// only via the conservative age heuristic (or a provably dead PID), never
+/// merely because a PID line is present.  A lock with a live owner is never
+/// stolen, even past the timeout.
+fn stale_without_identity(path: &Path) -> bool {
+    if SessionLock::read_nonce(path).is_some() {
+        return false;
+    }
+    match lock_owner_pid(path) {
+        Some(pid) => !pid_is_alive(pid),
+        None => lock_is_stale(path),
+    }
 }
 
 /// Returns true when the process with `pid` is alive.  On platforms without a
@@ -830,7 +978,11 @@ fn pid_is_alive(pid: u32) -> bool {
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Release only our own instance: if a successor already replaced
+        // this lock, its nonce differs and the file is left alone.
+        if Self::is_same_lock(&self.path, &self.nonce) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -1045,6 +1197,98 @@ mod tests {
             !lock_path.exists(),
             "stale lock must be stolen and released"
         );
+    }
+
+    #[test]
+    fn stale_lock_steal_is_limited_to_the_observed_instance() {
+        // Two contenders racing to steal the same stale lock must not both
+        // enter: stealing removes only the exact stale instance observed,
+        // and release removes only the owner's own nonce.
+        let directory = tempdir().unwrap();
+        let victim = directory.path().join("victim.jsonl");
+        fs::write(&victim, "").unwrap();
+        let lock_path = SessionLock::lock_path(&victim);
+        fs::write(&lock_path, "pid=4000000\nnonce=stale-a\n").unwrap();
+
+        // Contender B observes the stale instance and replaces it first.
+        assert!(lock_is_stale(&lock_path));
+        let observed_by_a = SessionLock::read_nonce(&lock_path);
+        assert_eq!(observed_by_a.as_deref(), Some("stale-a"));
+        fs::write(
+            &lock_path,
+            format!("pid={}\nnonce=fresh-b\n", std::process::id()),
+        )
+        .unwrap();
+        // Contender A re-checks before stealing: the instance changed, so
+        // the fresh owner's lock is left alone.
+        assert!(!lock_is_stale(&lock_path));
+        assert_ne!(SessionLock::read_nonce(&lock_path), observed_by_a);
+
+        // An old owner cannot remove a replacement owner's lock on release.
+        let old_owner = SessionLock {
+            path: lock_path.clone(),
+            nonce: "stale-a".into(),
+        };
+        drop(old_owner);
+        assert!(
+            lock_path.exists(),
+            "a stale owner must not remove the replacement lock"
+        );
+        let owner = SessionLock {
+            path: lock_path.clone(),
+            nonce: "fresh-b".into(),
+        };
+        drop(owner);
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn old_lock_with_live_owner_is_never_stolen() {
+        let directory = tempdir().unwrap();
+        let victim = directory.path().join("victim.jsonl");
+        fs::write(&victim, "").unwrap();
+        let lock_path = SessionLock::lock_path(&victim);
+        fs::write(
+            &lock_path,
+            format!("pid={}\nnonce=live-owner\n", std::process::id()),
+        )
+        .unwrap();
+        // Even an ancient lock with a live owner is not stale.
+        let aged = SystemTime::now() - Duration::from_secs(3600 * 24);
+        OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+        assert!(!lock_is_stale(&lock_path));
+        assert!(!stale_without_identity(&lock_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_umask_still_yields_private_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        // A permissive umask must not leak through: directories and files
+        // are created private at creation time.
+        let old = unsafe { libc::umask(0) };
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let dir_mode = fs::metadata(store.workspace_dir())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(session.path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        unsafe { libc::umask(old) };
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]
