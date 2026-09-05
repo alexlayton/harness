@@ -14,8 +14,7 @@ use config::{
     Cli, Command, Config, ProviderArg, WorktreeCommand, build_provider_with_auths, init_logging,
     provider_factory, save_reasoning, save_settings,
 };
-use context::project_context_for;
-use headless::run_headless;
+use headless::run_headless_with_prompt;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
 use std::process::ExitCode;
@@ -107,6 +106,10 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         Some(Command::Prompt(args)) => Some(args),
         _ => None,
     };
+    // Resolve one-shot input before constructing the session store, registry,
+    // or context bundle. A blank/invalid prompt must not leave startup state
+    // behind, and stdin must only be consumed once.
+    let resolved_prompt = prompt_args.map(headless::resolve_prompt).transpose()?;
     // Whether any part of this run touches the session store: interactive
     // mode always persists; prompt mode skips it under `--no-session`.
     let needs_session_store = prompt_args.is_none_or(|args| !args.no_session);
@@ -144,44 +147,42 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         return acp::run(provider, config, copilot_auth, cli.no_context_files).await;
     }
 
-    // Independent startup work runs concurrently: skills discovery, context
-    // files, and the session store are all filesystem walks/hashing that
-    // don't depend on each other or the tool registry.  On a cold cache these
-    // each cost real I/O, so serializing them delayed the first frame.  The
-    // FFF index is no longer built here at all — it is created lazily on
-    // first `find`/`grep` call.
-    let (tools_result, session_store_result, project_context, context_files) = tokio::join!(
-        async { default_registry(ToolConfig::new(&workspace_root, config.rtk)) },
-        // Under `--no-session` the store is never constructed: even its
-        // first-write salt bootstrap would touch `~/.harness/sessions`.
-        async {
-            match needs_session_store {
-                true => Some(match session_root {
-                    Some(root) => SessionStore::new(root, &workspace_root),
-                    None => SessionStore::default_for_workspace(&workspace_root),
-                }),
-                false => None,
-            }
-        },
-        async {
-            let context = project_context_for(&workspace_root, cli.no_context_files);
-            tracing::debug!(bytes = context.len(), "project context rendered");
-            context
-        },
-        // UI-facing list of which AGENTS.md / CLAUDE.md files were injected;
-        // the TUI only renders the names.
-        async {
-            if cli.no_context_files {
-                Vec::new()
-            } else {
-                tools::load_context_files(&workspace_root)
-                    .iter()
-                    .map(|file| tools::display_path(&file.path))
-                    .collect::<Vec<_>>()
-            }
-        },
+    // These are synchronous filesystem operations, so `join!` would only add
+    // ceremony: there are no await points to overlap. Discover context once
+    // and reuse its rendered prompt and display paths.
+    let context_bundle =
+        context::load_context_bundle(&workspace_root, cli.no_context_files, prompt_args.is_none());
+    tracing::debug!(
+        bytes = context_bundle.rendered.len(),
+        "project context rendered"
     );
-    let tools = tools_result?;
+    let tools = default_registry(ToolConfig::new(&workspace_root, config.rtk))?;
+    // Under `--no-session` the store is never constructed: even its first-write
+    // salt bootstrap would touch `~/.harness/sessions`.
+    let session_store = if needs_session_store {
+        Some(match session_root {
+            Some(root) => SessionStore::new(root, &workspace_root),
+            None => SessionStore::default_for_workspace(&workspace_root),
+        })
+    } else {
+        None
+    }
+    .transpose()?
+    .map(|store| store.with_deferred_sync(cli.defer_session_sync));
+    tracing::info!(stage = "registry+store+context", elapsed_ms = since_start());
+
+    if let (Some(args), Some(prompt)) = (prompt_args, resolved_prompt) {
+        return run_headless_with_prompt(
+            &config,
+            args,
+            provider,
+            tools,
+            session_store,
+            prompt,
+            context_bundle.rendered,
+        )
+        .await;
+    }
 
     // Which skills were discovered; built from the registry-owned catalog
     // once, here, so the TUI only renders the names.
@@ -198,22 +199,6 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let session_store = session_store_result
-        .transpose()?
-        .map(|store| store.with_deferred_sync(cli.defer_session_sync));
-    tracing::info!(stage = "registry+store+context", elapsed_ms = since_start());
-
-    if let Some(args) = prompt_args {
-        return run_headless(
-            &config,
-            args,
-            cli.no_context_files,
-            provider,
-            tools,
-            session_store,
-        )
-        .await;
-    }
 
     // Interactive mode always has a store (enforced by needs_session_store
     // being true without the prompt subcommand); headless may run without one.
@@ -240,7 +225,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
 
     let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_reasoning(config.reasoning)
-        .with_project_context(project_context)
+        .with_project_context(context_bundle.rendered)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())
@@ -285,7 +270,8 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         &provider_name,
         providers,
         skill_entries,
-        context_files
+        context_bundle
+            .display_paths
             .into_iter()
             .map(|path| ContextFileEntry { path })
             .collect(),

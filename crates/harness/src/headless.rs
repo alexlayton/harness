@@ -315,6 +315,7 @@ async fn drive_headless_events_into(
 /// no durable state at all — no header, no events, nothing to resume. The
 /// agent, its channels, and the cancellation token are the same objects the
 /// interactive path uses.
+#[allow(dead_code)]
 pub async fn run_headless(
     config: &Config,
     args: &PromptArgs,
@@ -323,12 +324,50 @@ pub async fn run_headless(
     tools: ToolRegistry,
     store: Option<SessionStore>,
 ) -> Result<ExitCode> {
-    run_headless_with_cancel(config, args, no_context_files, provider, tools, store, None).await
+    let prompt = resolve_prompt(args)?;
+    let project_context = project_context_for(tools.workspace_root(), no_context_files);
+    run_headless_resolved(
+        config,
+        args,
+        provider,
+        tools,
+        store,
+        None,
+        prompt,
+        project_context,
+    )
+    .await
+}
+
+/// Headless entry point used by the host after it has already loaded startup
+/// context and resolved the prompt. This avoids duplicate stdin/context work
+/// in the main frontend dispatcher.
+pub(crate) async fn run_headless_with_prompt(
+    config: &Config,
+    args: &PromptArgs,
+    provider: Arc<dyn Provider>,
+    tools: ToolRegistry,
+    store: Option<SessionStore>,
+    prompt: String,
+    project_context: String,
+) -> Result<ExitCode> {
+    run_headless_resolved(
+        config,
+        args,
+        provider,
+        tools,
+        store,
+        None,
+        prompt,
+        project_context,
+    )
+    .await
 }
 
 /// [`run_headless`] with an optional externally supplied cancellation token so
-/// tests can interrupt a turn at a deterministic point.  Production always
+/// tests can interrupt a turn at a deterministic point. Production always
 /// passes `None`, which installs the real SIGINT handler.
+#[allow(dead_code)]
 async fn run_headless_with_cancel(
     config: &Config,
     args: &PromptArgs,
@@ -339,7 +378,31 @@ async fn run_headless_with_cancel(
     external_cancel: Option<CancellationToken>,
 ) -> Result<ExitCode> {
     let prompt = resolve_prompt(args)?;
+    let project_context = project_context_for(tools.workspace_root(), no_context_files);
+    run_headless_resolved(
+        config,
+        args,
+        provider,
+        tools,
+        store,
+        external_cancel,
+        prompt,
+        project_context,
+    )
+    .await
+}
 
+#[allow(clippy::too_many_arguments)]
+async fn run_headless_resolved(
+    config: &Config,
+    args: &PromptArgs,
+    provider: Arc<dyn Provider>,
+    tools: ToolRegistry,
+    store: Option<SessionStore>,
+    external_cancel: Option<CancellationToken>,
+    prompt: String,
+    project_context: String,
+) -> Result<ExitCode> {
     let session = match (&args.resume, &store) {
         (Some(selector), Some(store)) => Some(
             store
@@ -367,8 +430,6 @@ async fn run_headless_with_cancel(
         mpsc::UnboundedReceiver<InputMessage>,
     ) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-
-    let project_context = project_context_for(tools.workspace_root(), no_context_files);
 
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_reasoning(config.reasoning)
