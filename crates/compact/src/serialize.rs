@@ -28,8 +28,9 @@ pub fn serialize_events(
     max_tool_result_chars: usize,
 ) -> SerializedTranscript {
     // Walk newest → oldest, keeping lines until the budget is exhausted. The
-    // budget is measured by the head line count so that even a single
-    // oversized (newest) line is retained rather than dropping the tail.
+    // budget includes the newline separators in the final joined string. If
+    // the newest line alone is too large, retain its newest prefix at a UTF-8
+    // boundary rather than allowing one event to defeat the cap.
     let mut kept = Vec::<String>::new();
     let mut bytes = 0usize;
     let mut truncated = false;
@@ -38,11 +39,16 @@ pub fn serialize_events(
         if line.is_empty() {
             continue;
         }
-        if !kept.is_empty() && bytes.saturating_add(line.len()) > max_input_bytes {
+        let separator = usize::from(!kept.is_empty());
+        let available = max_input_bytes.saturating_sub(bytes.saturating_add(separator));
+        if line.len() > available {
             truncated = true;
+            if kept.is_empty() && available > 0 {
+                kept.push(truncate_bytes(&line, available).to_owned());
+            }
             break;
         }
-        bytes = bytes.saturating_add(line.len());
+        bytes = bytes.saturating_add(separator).saturating_add(line.len());
         kept.push(line);
     }
     kept.reverse();
@@ -50,6 +56,18 @@ pub fn serialize_events(
         text: kept.join("\n"),
         truncated,
     }
+}
+
+/// Return the longest UTF-8 prefix that fits within `max_bytes`.
+pub(crate) fn truncate_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Serialize one event to its transcript line (empty for events that do not
@@ -389,6 +407,32 @@ mod tests {
             !transcript.text.contains("oldest"),
             "oldest material must be dropped first"
         );
+        assert!(transcript.truncated);
+    }
+
+    #[test]
+    fn transcript_budget_includes_separators_and_oversized_newest_lines() {
+        let mut session = Session::new(SessionMetadata::new("/tmp", None, None));
+        user(&mut session, &"é".repeat(200));
+        assistant(&mut session, "newest");
+
+        for budget in 0..=128 {
+            let transcript = serialize_events(&session.events, budget, 2_000);
+            assert!(
+                transcript.text.len() <= budget,
+                "budget {budget} exceeded by {} bytes",
+                transcript.text.len()
+            );
+            assert!(std::str::from_utf8(transcript.text.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn zero_transcript_budget_keeps_no_event_bytes() {
+        let mut session = Session::new(SessionMetadata::new("/tmp", None, None));
+        user(&mut session, "message");
+        let transcript = serialize_events(&session.events, 0, 2_000);
+        assert!(transcript.text.is_empty());
         assert!(transcript.truncated);
     }
 

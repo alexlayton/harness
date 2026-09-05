@@ -9,9 +9,8 @@
 //! `keep_recent_tokens`, the cut moves to an assistant message mid-turn — a
 //! "split turn".
 
-use crate::estimate::estimate_tokens;
+use crate::estimate::estimate_provider_context_tokens;
 use crate::policy::CompactionPolicy;
-use crate::serialize::serialize_record;
 use session::model::{Session, SessionEvent, SessionEventRecord};
 use session::model::{events_after_latest_compaction, latest_compaction_boundary};
 
@@ -133,20 +132,22 @@ fn is_cut_point(record: &SessionEventRecord) -> bool {
 }
 
 /// Estimated provider-context tokens represented by a live event.
-fn event_tokens(record: &SessionEventRecord, max_tool_result_chars: usize) -> u64 {
-    let text = serialize_record(&record.event, max_tool_result_chars);
-    if text.is_empty() {
+fn event_tokens(record: &SessionEventRecord) -> u64 {
+    // Planning must budget the provider context, not the shorter summarizer
+    // transcript. In particular, retained tool results are sent in full and
+    // provider-owned opaque state may be required for replay.
+    let messages = record.event.to_messages();
+    if messages.is_empty() {
         return 0;
     }
-    estimate_tokens(text.len()).saturating_add(4)
+    estimate_provider_context_tokens(None, &[], &messages).saturating_add(4)
 }
 
 /// Sum of estimated tokens for `live[from..]`.
 fn live_tokens(live: &[&SessionEventRecord], from: usize) -> u64 {
-    let max_chars = crate::policy::DEFAULT_TOOL_RESULT_CHARS;
     let mut total = 0u64;
     for record in live.iter().skip(from) {
-        total = total.saturating_add(event_tokens(record, max_chars));
+        total = total.saturating_add(event_tokens(record));
     }
     total
 }
@@ -158,12 +159,10 @@ fn choose_cut(live: &[&SessionEventRecord], policy: &CompactionPolicy) -> Option
     if live.is_empty() {
         return None;
     }
-    let max_chars = crate::policy::DEFAULT_TOOL_RESULT_CHARS;
-
     // Prefix-sum of estimated tokens so suffix totals are O(1).
     let mut suffix = vec![0u64; live.len() + 1];
     for i in (0..live.len()).rev() {
-        suffix[i] = suffix[i + 1].saturating_add(event_tokens(live[i], max_chars));
+        suffix[i] = suffix[i + 1].saturating_add(event_tokens(live[i]));
     }
     let cut_points: Vec<usize> = (0..live.len()).filter(|&i| is_cut_point(live[i])).collect();
 
@@ -203,15 +202,40 @@ fn choose_cut(live: &[&SessionEventRecord], policy: &CompactionPolicy) -> Option
     for i in (0..live.len()).rev() {
         accumulated = accumulated.saturating_add(suffix[i].saturating_sub(suffix[i + 1]));
         if accumulated >= policy.keep_recent_tokens {
-            cut = cut_points
-                .iter()
-                .copied()
-                .find(|&candidate| candidate >= i)
-                .unwrap_or(cut);
+            cut = snap_cut_point(live, &cut_points, i).unwrap_or(cut);
             break;
         }
     }
     Some(cut)
+}
+
+/// Snap a token-driven cut to a valid boundary. Prefer splitting before an
+/// assistant response when a huge retained tool result would otherwise make
+/// the nearest boundary the standalone tool call; this preserves the whole
+/// call/result pair while keeping the cut semantically at a turn boundary.
+fn snap_cut_point(
+    live: &[&SessionEventRecord],
+    cut_points: &[usize],
+    index: usize,
+) -> Option<usize> {
+    let tool_index = cut_points
+        .iter()
+        .copied()
+        .rev()
+        .find(|&candidate| candidate <= index)?;
+    if matches!(live[tool_index].event, SessionEvent::ToolCall { .. }) {
+        cut_points
+            .iter()
+            .copied()
+            .rev()
+            .find(|&prior| {
+                prior < tool_index
+                    && matches!(live[prior].event, SessionEvent::AssistantMessage { .. })
+            })
+            .or(Some(tool_index))
+    } else {
+        Some(tool_index)
+    }
 }
 
 /// Estimated tokens currently occupied by the live conversation region
