@@ -23,7 +23,10 @@ pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
         return value.to_owned();
     }
     let suffix = "…";
-    let mut end = max_bytes.saturating_sub(suffix.len());
+    if max_bytes < suffix.len() {
+        return String::new();
+    }
+    let mut end = max_bytes - suffix.len();
     while end > 0 && !value.is_char_boundary(end) {
         end -= 1;
     }
@@ -71,7 +74,8 @@ mod tests {
     fn truncate_utf8_zero_budget_is_empty() {
         assert_eq!(truncate_utf8("hello", 0), "");
         assert_eq!(truncate_utf8_prefix("hello", 0), "");
-        // A single-byte ellipsis budget yields just the ellipsis.
-        assert_eq!(truncate_utf8("hello", 1), "…");
+        // The ellipsis is three UTF-8 bytes; never exceed a smaller budget.
+        assert_eq!(truncate_utf8("hello", 1), "");
+        assert_eq!(truncate_utf8("hello", 2), "");
     }
 }
