@@ -3655,6 +3655,7 @@ dependencies = [
  "diff",
  "fff-search",
  "ignore",
+ "libc",
  "llm",
  "proptest",
  "rustix",
