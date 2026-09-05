@@ -9,7 +9,6 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
-use unicode_normalization::UnicodeNormalization;
 
 const MAX_DIFF_LINES: usize = 80;
 const MAX_DIFF_INPUT_LINES: usize = 10_000;
@@ -35,14 +34,6 @@ struct MatchedEdit {
 struct AppliedEdits {
     base_content: String,
     new_content: String,
-    /// Set when a match had to fall back to the lenient whitespace mode.
-    notice: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LineEnding {
-    Lf,
-    Crlf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,10 +144,6 @@ impl Tool for EditTool {
                     content.push('\n');
                     content.push_str(&diff.text);
                 }
-                if let Some(notice) = result.notice.as_deref() {
-                    content.push('\n');
-                    content.push_str(notice);
-                }
                 ToolOutput {
                     content,
                     is_error: false,
@@ -173,7 +160,6 @@ struct EditResult {
     base_content: String,
     new_content: String,
     replacement_count: usize,
-    notice: Option<String>,
 }
 
 async fn execute_edit(
@@ -204,16 +190,18 @@ async fn execute_edit(
         format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
     })?;
 
+    // Byte-exact editing: match every `oldText` against the original bytes
+    // (BOM-aware, mixed line endings preserved) with no LF normalization
+    // and no Unicode or whitespace folding.  All spans are computed against
+    // the original content, overlaps rejected, then applied in one pass.
+    // Every byte outside the replacement spans is preserved.
     let (bom, content) = strip_bom(&raw_content);
-    let original_ending = detect_line_ending(content);
-    let normalized_content = normalize_to_lf(content);
-    let applied = apply_edits_to_normalized_content(&normalized_content, edits, path)?;
+    let applied = apply_edits_exact(content, edits, path)?;
     check_cancelled(cancel)?;
 
-    let restored_content = restore_line_endings(&applied.new_content, original_ending);
-    let mut final_content = String::with_capacity(bom.len() + restored_content.len());
+    let mut final_content = String::with_capacity(bom.len() + applied.new_content.len());
     final_content.push_str(bom);
-    final_content.push_str(&restored_content);
+    final_content.push_str(&applied.new_content);
     let final_bytes = final_content.as_bytes();
 
     // Re-read the snapshot immediately before committing. The per-file queue
@@ -237,7 +225,6 @@ async fn execute_edit(
         base_content: applied.base_content,
         new_content: applied.new_content,
         replacement_count: edits.len(),
-        notice: applied.notice,
     })
 }
 
@@ -283,11 +270,14 @@ fn parse_edit_array(values: &[Value]) -> Result<Vec<Edit>, String> {
         .collect()
 }
 
-fn apply_edits_to_normalized_content(
-    normalized_content: &str,
-    edits: &[Edit],
-    path: &str,
-) -> Result<AppliedEdits, String> {
+/// Match every edit exactly and uniquely against the original content
+/// (post-BOM), with no normalization and no fuzzy fallback.  Replacement
+/// spans are computed against the original string, checked for overlap,
+/// then applied from the end so earlier spans stay valid.  The caller
+/// reattaches the BOM, preserving it and every byte outside the spans —
+/// including mixed CRLF/LF endings, typographic characters, and trailing
+/// whitespace.
+fn apply_edits_exact(content: &str, edits: &[Edit], path: &str) -> Result<AppliedEdits, String> {
     for (index, edit) in edits.iter().enumerate() {
         if edit.old_text.is_empty() {
             return Err(format!(
@@ -296,47 +286,23 @@ fn apply_edits_to_normalized_content(
         }
     }
 
-    let normalized_edits = edits
-        .iter()
-        .map(|edit| Edit {
-            old_text: normalize_to_lf(&edit.old_text),
-            new_text: normalize_to_lf(&edit.new_text),
-        })
-        .collect::<Vec<_>>();
-
-    // Match every edit against a single base content normalized at the most
-    // aggressive mode any edit needs, so all match indices share one
-    // coordinate space for the replacement pass.
-    let mode = normalized_edits
-        .iter()
-        .filter_map(|edit| find_best_match(normalized_content, &edit.old_text))
-        .map(|result| result.mode)
-        .max()
-        .unwrap_or(MatchMode::Exact);
-    let base_content = match mode {
-        MatchMode::Exact => normalized_content.to_owned(),
-        MatchMode::Unicode => normalize_for_fuzzy_match(normalized_content),
-        MatchMode::LenientWhitespace => normalize_lenient_whitespace(normalized_content),
-    };
-
-    let mut matched_edits = Vec::with_capacity(normalized_edits.len());
-    for (index, edit) in normalized_edits.iter().enumerate() {
-        let Some(found) = find_best_match(&base_content, &edit.old_text) else {
-            return Err(not_found_error(path, index, normalized_edits.len()));
-        };
-        let occurrences = count_occurrences(&base_content, &edit.old_text, found.mode);
-        if occurrences > 1 {
+    let mut matched_edits = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let first = content
+            .find(&edit.old_text)
+            .ok_or_else(|| not_found_error(path, index, edits.len()))?;
+        if content[first + edit.old_text.len()..].contains(&edit.old_text) {
             return Err(duplicate_error(
                 path,
                 index,
-                normalized_edits.len(),
-                occurrences,
+                edits.len(),
+                count_occurrences(content, &edit.old_text),
             ));
         }
         matched_edits.push(MatchedEdit {
             edit_index: index,
-            match_index: found.index,
-            match_length: found.length,
+            match_index: first,
+            match_length: edit.old_text.len(),
             new_text: edit.new_text.clone(),
         });
     }
@@ -353,111 +319,16 @@ fn apply_edits_to_normalized_content(
         }
     }
 
-    let original = normalized_content.to_owned();
-    let new_content = if mode == MatchMode::Exact {
-        apply_replacements(&base_content, &matched_edits)
-    } else {
-        // The base differs from the original (unicode folding and/or
-        // whitespace trimming), so rebuild the file from the original,
-        // swapping in the base's replaced regions.
-        apply_replacements_preserving_unchanged_lines(
-            normalized_content,
-            &base_content,
-            &matched_edits,
-        )?
-    };
+    let original = content.to_owned();
+    let new_content = apply_replacements(content, &matched_edits);
     if original == new_content {
-        return Err(no_change_error(path, normalized_edits.len()));
+        return Err(no_change_error(path, edits.len()));
     }
-
-    let notice = (mode == MatchMode::LenientWhitespace).then(|| {
-        "note: oldText was matched leniently — trailing whitespace on matched lines was ignored."
-            .to_owned()
-    });
 
     Ok(AppliedEdits {
         base_content: original,
         new_content,
-        notice,
     })
-}
-
-/// How aggressively an `oldText` match had to be relaxed before it succeeded.
-/// `Exact` matches the literal text; `Unicode` folds NFKC and typographic
-/// variants; the lenient mode additionally ignores trailing whitespace on
-/// each line and is always reported to the user.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum MatchMode {
-    Exact,
-    Unicode,
-    LenientWhitespace,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct FoundMatch {
-    index: usize,
-    length: usize,
-    mode: MatchMode,
-}
-
-fn find_best_match(content: &str, old_text: &str) -> Option<FoundMatch> {
-    if let Some(index) = content.find(old_text) {
-        return Some(FoundMatch {
-            index,
-            length: old_text.len(),
-            mode: MatchMode::Exact,
-        });
-    }
-
-    let fuzzy_content = normalize_for_fuzzy_match(content);
-    let fuzzy_old_text = normalize_for_fuzzy_match(old_text);
-    if !fuzzy_old_text.is_empty()
-        && let Some(index) = fuzzy_content.find(&fuzzy_old_text)
-    {
-        return Some(FoundMatch {
-            index,
-            length: fuzzy_old_text.len(),
-            mode: MatchMode::Unicode,
-        });
-    }
-
-    let lenient_content = normalize_lenient_whitespace(content);
-    let lenient_old_text = normalize_lenient_whitespace(old_text);
-    if lenient_old_text.is_empty() {
-        return None;
-    }
-    lenient_content
-        .find(&lenient_old_text)
-        .map(|index| FoundMatch {
-            index,
-            length: lenient_old_text.len(),
-            mode: MatchMode::LenientWhitespace,
-        })
-}
-
-fn count_occurrences(content: &str, old_text: &str, mode: MatchMode) -> usize {
-    let (haystack, needle) = match mode {
-        MatchMode::Exact => (content.to_owned(), old_text.to_owned()),
-        MatchMode::Unicode => (
-            normalize_for_fuzzy_match(content),
-            normalize_for_fuzzy_match(old_text),
-        ),
-        MatchMode::LenientWhitespace => (
-            normalize_lenient_whitespace(content),
-            normalize_lenient_whitespace(old_text),
-        ),
-    };
-    if needle.is_empty() {
-        return 0;
-    }
-
-    let mut count = 0;
-    let mut offset = 0;
-    while let Some(index) = haystack[offset..].find(&needle) {
-        count += 1;
-        offset += index + needle.len();
-    }
-    count
 }
 
 fn apply_replacements(content: &str, replacements: &[MatchedEdit]) -> String {
@@ -470,201 +341,23 @@ fn apply_replacements(content: &str, replacements: &[MatchedEdit]) -> String {
     result
 }
 
-#[derive(Clone, Debug)]
-struct LineSpan {
-    start: usize,
-    end: usize,
-}
-
-#[derive(Clone, Debug)]
-struct ReplacementGroup {
-    start_line: usize,
-    end_line: usize,
-    replacements: Vec<MatchedEdit>,
-}
-
-fn apply_replacements_preserving_unchanged_lines(
-    original_content: &str,
-    base_content: &str,
-    replacements: &[MatchedEdit],
-) -> Result<String, String> {
-    let original_lines = split_lines_with_endings(original_content);
-    let base_lines = line_spans(base_content);
-    if original_lines.len() != base_lines.len() {
-        return Err("cannot preserve unchanged lines after fuzzy matching".into());
+fn count_occurrences(content: &str, old_text: &str) -> usize {
+    if old_text.is_empty() {
+        return 0;
     }
-
-    let mut groups = Vec::<ReplacementGroup>::new();
-    for replacement in replacements {
-        let range = replacement_line_range(&base_lines, replacement)?;
-        if let Some(current) = groups.last_mut()
-            && range.0 < current.end_line
-        {
-            current.end_line = current.end_line.max(range.1);
-            current.replacements.push(replacement.clone());
-        } else {
-            groups.push(ReplacementGroup {
-                start_line: range.0,
-                end_line: range.1,
-                replacements: vec![replacement.clone()],
-            });
-        }
+    let mut count = 0;
+    let mut offset = 0;
+    while let Some(index) = content[offset..].find(old_text) {
+        count += 1;
+        offset += index + old_text.len();
     }
-
-    let mut result = String::new();
-    let mut original_line_index = 0;
-    for group in groups {
-        for line in &original_lines[original_line_index..group.start_line] {
-            result.push_str(line);
-        }
-
-        let group_start = base_lines[group.start_line].start;
-        let group_end = base_lines[group.end_line - 1].end;
-        result.push_str(&apply_replacements_in_range(
-            &base_content[group_start..group_end],
-            &group.replacements,
-            group_start,
-        ));
-        original_line_index = group.end_line;
-    }
-    for line in &original_lines[original_line_index..] {
-        result.push_str(line);
-    }
-    Ok(result)
-}
-
-fn apply_replacements_in_range(
-    content: &str,
-    replacements: &[MatchedEdit],
-    offset: usize,
-) -> String {
-    let mut result = content.to_owned();
-    for replacement in replacements.iter().rev() {
-        let start = replacement.match_index - offset;
-        let end = start + replacement.match_length;
-        result.replace_range(start..end, &replacement.new_text);
-    }
-    result
-}
-
-fn replacement_line_range(
-    lines: &[LineSpan],
-    replacement: &MatchedEdit,
-) -> Result<(usize, usize), String> {
-    let replacement_start = replacement.match_index;
-    let replacement_end = replacement.match_index + replacement.match_length;
-    let Some(start_line) = lines
-        .iter()
-        .position(|line| replacement_start >= line.start && replacement_start < line.end)
-    else {
-        return Err("replacement range is outside the file".into());
-    };
-    let mut end_line = start_line;
-    while end_line < lines.len() && lines[end_line].end < replacement_end {
-        end_line += 1;
-    }
-    if end_line >= lines.len() {
-        return Err("replacement range is outside the file".into());
-    }
-    Ok((start_line, end_line + 1))
-}
-
-fn split_lines_with_endings(content: &str) -> Vec<&str> {
-    let mut lines = Vec::new();
-    let mut start = 0;
-    for (index, byte) in content.bytes().enumerate() {
-        if byte == b'\n' {
-            lines.push(&content[start..index + 1]);
-            start = index + 1;
-        }
-    }
-    if start < content.len() {
-        lines.push(&content[start..]);
-    }
-    lines
-}
-
-fn line_spans(content: &str) -> Vec<LineSpan> {
-    let mut spans = Vec::new();
-    let mut start = 0;
-    for (index, byte) in content.bytes().enumerate() {
-        if byte == b'\n' {
-            spans.push(LineSpan {
-                start,
-                end: index + 1,
-            });
-            start = index + 1;
-        }
-    }
-    if start < content.len() {
-        spans.push(LineSpan {
-            start,
-            end: content.len(),
-        });
-    }
-    spans
-}
-
-fn normalize_to_lf(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-/// Unicode-only fuzzy normalization: NFKC plus folding of typographic quotes,
-/// dashes, and whitespace variants.  Trailing whitespace is deliberately
-/// preserved, so oldText that includes trailing spaces only matches lines
-/// that actually have them.
-fn normalize_for_fuzzy_match(text: &str) -> String {
-    text.nfkc()
-        .collect::<String>()
-        .chars()
-        .map(|character| match character {
-            '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}' => '\'',
-            '\u{201c}' | '\u{201d}' | '\u{201e}' | '\u{201f}' => '"',
-            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
-            | '\u{2212}' => '-',
-            '\u{00a0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
-            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200a}' | '\u{202f}' | '\u{205f}'
-            | '\u{3000}' => ' ',
-            character => character,
-        })
-        .collect()
-}
-
-/// A separate, lenient mode that additionally ignores trailing whitespace on
-/// every line.  Matches that only succeed here are reported to the user.
-fn normalize_lenient_whitespace(text: &str) -> String {
-    normalize_for_fuzzy_match(text)
-        .split('\n')
-        .map(str::trim_end)
-        .collect::<Vec<_>>()
-        .join("\n")
+    count
 }
 
 fn strip_bom(content: &str) -> (&str, &str) {
     content
         .strip_prefix('\u{feff}')
         .map_or(("", content), |content| ("\u{feff}", content))
-}
-
-fn detect_line_ending(content: &str) -> LineEnding {
-    let Some(crlf_index) = content.find("\r\n") else {
-        return LineEnding::Lf;
-    };
-    let Some(lf_index) = content.find('\n') else {
-        return LineEnding::Lf;
-    };
-    if crlf_index <= lf_index {
-        LineEnding::Crlf
-    } else {
-        LineEnding::Lf
-    }
-}
-
-fn restore_line_endings(content: &str, ending: LineEnding) -> String {
-    match ending {
-        LineEnding::Lf => content.to_owned(),
-        LineEnding::Crlf => content.replace('\n', "\r\n"),
-    }
 }
 
 fn not_found_error(path: &str, index: usize, total: usize) -> String {
@@ -962,193 +655,115 @@ mod tests {
     }
 
     #[test]
-    fn fuzzy_matching_handles_whitespace_and_typographic_variants() {
+    fn mixed_crlf_endings_are_preserved_outside_spans() {
+        // Only the replaced span changes; untouched CRLF/LF endings stay.
+        let content = "first\r\nsecond\r\nthird\nfourth\r\n";
         let edits = vec![Edit {
-            old_text: "let value = 1;".into(),
-            new_text: "let value = 2;".into(),
+            old_text: "second".into(),
+            new_text: "CHANGED".into(),
         }];
-        let result =
-            apply_edits_to_normalized_content("let value = 1;   \n", &edits, "file.rs").unwrap();
-        assert_eq!(result.new_content, "let value = 2;   \n");
-
-        let edits = vec![Edit {
-            old_text: "say 'hello'".into(),
-            new_text: "say 'goodbye'".into(),
-        }];
-        let result =
-            apply_edits_to_normalized_content("say ‘hello’\n", &edits, "file.txt").unwrap();
-        assert_eq!(result.new_content, "say 'goodbye'\n");
+        let result = apply_edits_exact(content, &edits, "file.txt").unwrap();
+        assert_eq!(result.new_content, "first\r\nCHANGED\r\nthird\nfourth\r\n");
     }
 
     #[test]
-    fn unicode_fuzzy_match_preserves_trailing_whitespace_of_untouched_text() {
-        // Quote folding must not silently trim trailing whitespace: the
-        // untouched portion of the matched line keeps its trailing spaces.
+    fn typographic_chars_and_trailing_spaces_require_exact_match() {
+        // Curly quotes, dashes, compat chars, and trailing spaces no longer
+        // fold: they must match byte-exactly or fail as not-found.
+        for (content, old) in [
+            ("say \u{2018}hello\u{2019}\n", "say 'hello'"),
+            ("a\u{2014}b\n", "a-b"),
+            ("caf\u{00e9}\n", "cafe\u{0301}"),
+            ("foo\n", "foo  "),
+        ] {
+            let edits = vec![Edit {
+                old_text: old.into(),
+                new_text: "x".into(),
+            }];
+            let error = apply_edits_exact(content, &edits, "file.txt").unwrap_err();
+            assert!(
+                error.contains("Could not find"),
+                "{content:?} vs {old:?}: {error}"
+            );
+        }
+        // Substring matching is exact: "foo" matches inside "foo  ", but
+        // trailing spaces in oldText must be present in the file.
         let edits = vec![Edit {
-            old_text: "say 'hello'".into(),
-            new_text: "say 'goodbye'".into(),
+            old_text: "foo".into(),
+            new_text: "x".into(),
         }];
-        let result =
-            apply_edits_to_normalized_content("say ‘hello’  \n", &edits, "file.txt").unwrap();
-        assert_eq!(result.new_content, "say 'goodbye'  \n");
-        assert!(result.notice.is_none());
+        let result = apply_edits_exact("foo  \n", &edits, "file.txt").unwrap();
+        assert_eq!(result.new_content, "x  \n");
+        // Exact duplicates still report uniqueness errors.
+        let edits = vec![Edit {
+            old_text: "same".into(),
+            new_text: "x".into(),
+        }];
+        let error = apply_edits_exact("same\nsame\n", &edits, "file.txt").unwrap_err();
+        assert!(error.contains("Found 2 occurrences"), "{error}");
     }
 
     #[test]
-    fn lenient_whitespace_matches_are_reported() {
-        let edits = vec![Edit {
-            old_text: "foo\nbar".into(),
-            new_text: "one\ntwo".into(),
-        }];
-        let result = apply_edits_to_normalized_content("foo  \nbar\n", &edits, "file.txt").unwrap();
-        assert_eq!(result.new_content, "one\ntwo\n");
-        let notice = result
-            .notice
-            .as_deref()
-            .expect("lenient match must be reported");
-        assert!(notice.contains("lenient"), "{notice}");
-    }
-
-    #[test]
-    fn old_text_trailing_spaces_do_not_match_clean_line_silently() {
-        // oldText with intentional trailing spaces only matches lines that
-        // actually have them; the fallback is the reported lenient mode.
-        let edits = vec![Edit {
-            old_text: "foo  ".into(),
-            new_text: "bar".into(),
-        }];
-        let result = apply_edits_to_normalized_content("foo\n", &edits, "file.txt").unwrap();
-        assert!(result.notice.is_some());
-        assert_eq!(result.new_content, "bar\n");
-    }
-
-    #[test]
-    fn trailing_whitespace_distinguishes_otherwise_identical_lines() {
-        // "same  " matches only the line that has the trailing spaces, so
-        // the replacement is unambiguous.
-        let edits = vec![Edit {
-            old_text: "same  ".into(),
-            new_text: "changed".into(),
-        }];
-        let result =
-            apply_edits_to_normalized_content("same  \nsame\n", &edits, "file.txt").unwrap();
-        assert_eq!(result.new_content, "changed\nsame\n");
-        assert!(result.notice.is_none());
-    }
-
-    #[test]
-    fn preserves_untouched_lines_across_multiline_replacement() {
-        let original = "first  \nsecond\nthird  \nfourth\n";
-        let base = "first\nsecond\nthird\nfourth\n";
-        let replacements = vec![MatchedEdit {
-            edit_index: 0,
-            match_index: 0,
-            match_length: "first\nsecond".len(),
-            new_text: "replaced".into(),
-        }];
-        let output =
-            apply_replacements_preserving_unchanged_lines(original, base, &replacements).unwrap();
-        assert_eq!(output, "replaced\nthird  \nfourth\n");
+    fn batch_edits_match_independently_and_overlap_is_rejected() {
+        let edits = vec![
+            Edit {
+                old_text: "alpha".into(),
+                new_text: "one".into(),
+            },
+            Edit {
+                old_text: "gamma".into(),
+                new_text: "three".into(),
+            },
+        ];
+        let result = apply_edits_exact("alpha\nbeta\ngamma\n", &edits, "file.txt").unwrap();
+        assert_eq!(result.new_content, "one\nbeta\nthree\n");
+        let edits = vec![
+            Edit {
+                old_text: "abcdef".into(),
+                new_text: "x".into(),
+            },
+            Edit {
+                old_text: "cde".into(),
+                new_text: "y".into(),
+            },
+        ];
+        let error = apply_edits_exact("abcdef\n", &edits, "file.txt").unwrap_err();
+        assert!(error.contains("overlap"), "{error}");
     }
 
     proptest! {
-        /// The fuzzy rebuild pass must leave untouched lines byte-identical
-        /// to the original and apply every replacement exactly once, even
-        /// when replacements span multiple lines.
+        /// Every byte outside the replacement spans is unchanged: remove the
+        /// replaced spans from both sides and require identical remainders.
         #[test]
-        fn fuzzy_rebuild_preserves_untouched_lines_and_applies_every_replacement(
-            specs in prop::collection::vec(
-                ("[a-z]{1,6}", any::<bool>(), any::<bool>(), any::<bool>()),
-                2..6,
-            ),
+        fn byte_preservation_outside_spans(
+            lines in prop::collection::vec("[a-zA-Z0-9 \t\u{00e9}\u{2019}\u{2014}]{0,12}", 2..8),
         ) {
-            let mut base_lines = Vec::with_capacity(specs.len());
-            let mut original_lines = Vec::with_capacity(specs.len());
-            for (index, (word, trailing, _, _)) in specs.iter().enumerate() {
-                // Prefix each line with its index so line content is unique;
-                // otherwise identical words make "appears exactly once"
-                // assertions ambiguous.
-                let line = format!("{index}_{word}");
-                base_lines.push(line.clone());
-                original_lines.push(format!(
-                    "{line}{}",
-                    if *trailing { "  " } else { "" }
-                ));
-            }
-            let base_content = format!("{}\n", base_lines.join("\n"));
-            let original_content = format!("{}\n", original_lines.join("\n"));
-            let spans = line_spans(&base_content);
-
-            // Build non-overlapping replacements.  Each lives on its own
-            // line; an extension flag swallows the following lines up to the
-            // next line that wants its own replacement.
-            let mut replacements = Vec::new();
-            let mut skip_until = 0usize;
-            for (index, (_, _, has_replacement, extend)) in specs.iter().enumerate() {
-                if index < skip_until || !has_replacement {
-                    continue;
-                }
-                let line_start = spans[index].start;
-                let line_len = spans[index].end - spans[index].start;
-                let start = line_start + (index * 7) % (line_len - 1);
-                let mut end = line_start + line_len;
-                if *extend {
-                    let next = (index + 1..specs.len()).find(|&j| specs[j].2);
-                    match next {
-                        Some(next) => {
-                            end = spans[next].start;
-                            skip_until = next;
-                        }
-                        None => {
-                            end = base_content.len();
-                            skip_until = specs.len();
-                        }
-                    }
-                } else {
-                    skip_until = index + 1;
-                }
-                replacements.push(MatchedEdit {
-                    edit_index: index,
-                    match_index: start,
-                    match_length: end - start,
-                    new_text: format!("newtext{index}"),
-                });
-            }
-
-            let output = apply_replacements_preserving_unchanged_lines(
-                &original_content,
-                &base_content,
-                &replacements,
-            )
-            .unwrap();
-
-            // Every replacement's new text appears exactly once.
-            for replacement in &replacements {
-                prop_assert_eq!(
-                    output.matches(&replacement.new_text).count(),
-                    1,
-                    "replacement {} should appear exactly once",
-                    replacement.new_text
-                );
-            }
-
-            // Lines whose base span no replacement intersects are untouched
-            // and must appear byte-identical (exactly once) in the output.
-            let original_lines = split_lines_with_endings(&original_content);
-            for (index, original_line) in original_lines.iter().enumerate() {
-                let touched = replacements.iter().any(|replacement| {
-                    replacement.match_index < spans[index].end
-                        && spans[index].start < replacement.match_index + replacement.match_length
-                });
-                if !touched {
-                    prop_assert_eq!(
-                        output.matches(original_line).count(),
-                        1,
-                        "untouched line {:?} should appear exactly once",
-                        index
-                    );
+            use std::collections::HashSet;
+            // Build content with unique lines so spans are unambiguous.
+            let mut seen = HashSet::new();
+            let mut unique = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                let candidate = format!("{i}_{line}");
+                if seen.insert(candidate.clone()) {
+                    unique.push(candidate);
                 }
             }
+            prop_assume!(unique.len() >= 2);
+            let content = format!("{}\n", unique.join("\n"));
+            // Two disjoint single-line edits.
+            let edits = vec![
+                Edit { old_text: unique[0].clone(), new_text: "NEW0".into() },
+                Edit { old_text: unique[unique.len() - 1].clone(), new_text: "NEW1".into() },
+            ];
+            let result = apply_edits_exact(&content, &edits, "file.txt").unwrap();
+            // Mask out the replaced spans on both sides; remainders match.
+            let mut masked_original = content.clone();
+            let mut masked_new = result.new_content.clone();
+            for (old, new) in [(unique[0].as_str(), "NEW0"), (unique[unique.len()-1].as_str(), "NEW1")] {
+                masked_original = masked_original.replacen(old, "\0", 1);
+                masked_new = masked_new.replacen(new, "\0", 1);
+            }
+            prop_assert_eq!(masked_original, masked_new);
         }
     }
 
