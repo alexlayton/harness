@@ -13,16 +13,50 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 impl Agent {
-    /// Run one user turn: persist the message, stream the provider response,
-    /// execute any tool calls, and persist every durable event.  Returns
-    /// [`TurnError::Shutdown`] only when the application cancellation token
-    /// fired mid-turn, so `run` can stop immediately.
+    /// The single shared turn executor used by normal user messages and
+    /// skill-invoked messages alike. It owns the whole operation boundary:
+    ///
+    /// - builds a turn-scoped child token of the application token;
+    /// - propagates shutdown (`TurnControl::Shutdown`);
+    /// - quarantines/stops after persistence failure
+    ///   (`TurnControl::Quarantine`, mirroring the run-loop quarantine);
+    /// - flushes deferred session writes exactly once at the boundary;
+    /// - emits terminal events exactly once (the body sends `TurnFinished`
+    ///   on every completed path; early shutdown returns before any).
+    pub(crate) async fn execute_turn(
+        &mut self,
+        user_text: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+    ) -> TurnControl {
+        let turn_cancel = self.cancel.child_token();
+        let outcome = self
+            .run_turn_body(user_text, events, input, &turn_cancel)
+            .await;
+        // Deferred-sync boundary: one durable flush per operation, for both
+        // normal and skill-invoked turns.
+        self.flush_deferred_sync();
+        match outcome {
+            Ok(()) => TurnControl::Continue,
+            Err(TurnError::Shutdown) => TurnControl::Shutdown,
+            Err(TurnError::Persist(_)) => {
+                // Mirror the run-loop quarantine: the terminal event was
+                // already emitted at the failure source; stop here so no
+                // queued work runs on divergent history.
+                TurnControl::Quarantine
+            }
+        }
+    }
+
+    /// Turn body: everything `run_turn` historically did, minus token
+    /// construction and the deferred-sync flush (both owned by
+    /// [`Self::execute_turn`]).
     #[tracing::instrument(
         name = "turn",
         skip(self, events, input, cancel),
         fields(user_text = %truncate_utf8(&user_text, 200))
     )]
-    pub(crate) async fn run_turn(
+    async fn run_turn_body(
         &mut self,
         user_text: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
@@ -344,6 +378,22 @@ impl Agent {
                 .await?;
         }
     }
+}
+
+/// Explicit control flow for command handlers and turn execution.
+/// Replaces the old pattern of swallowing `TurnError::Shutdown` and
+/// `TurnError::Persist` at skill-invocation sites: every handler returns
+/// how the run loop must proceed, and the loop acts on it in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnControl {
+    /// Operation completed (or reported its own terminal event); keep
+    /// draining queued input.
+    Continue,
+    /// Application shutdown fired: stop the run loop immediately.
+    Shutdown,
+    /// Persistence failed mid-operation: stop like the run-loop
+    /// quarantine so no queued work runs on divergent history.
+    Quarantine,
 }
 
 /// Push a non-durable recovery note into history, preserving provider role

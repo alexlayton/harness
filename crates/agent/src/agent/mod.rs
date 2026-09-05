@@ -31,6 +31,7 @@ pub use persistence::AgentSessionState;
 use persistence::{ui_snapshot_entries, usage_event};
 pub use tool_dispatch::SubagentLimits;
 pub(crate) use tool_dispatch::plan_tool_batches;
+pub(crate) use turn::TurnControl;
 
 /// Maximum number of times a turn re-streams after a recoverable failure:
 /// malformed tool-call arguments, a retryable mid-stream error, or an empty
@@ -279,28 +280,23 @@ impl Agent {
             };
             match message {
                 InputMessage::Message(text) if !text.trim().is_empty() => {
-                    // A turn is independently interruptible, but application shutdown must
-                    // propagate through the same token to tools and compaction work.
-                    let turn_cancel = self.cancel.child_token();
-                    let result = self.run_turn(text, &events, &mut input, &turn_cancel).await;
-                    // Turn-boundary durable flush: with deferred sync enabled
-                    // the events of this turn were written+flushed but not
-                    // fsynced; make them all durable once here instead of
-                    // paying an fsync per streamed event.
-                    self.flush_deferred_sync();
-                    match result {
-                        Err(TurnError::Shutdown) => break,
+                    // One shared executor owns the whole operation boundary
+                    // (shutdown propagation, quarantine, deferred flush,
+                    // exactly-once terminal events) for normal and
+                    // skill-invoked turns alike.
+                    match self.execute_turn(text, &events, &mut input).await {
+                        TurnControl::Shutdown => break,
                         // Persistence errors are emitted at their source; the
-                        // outer boundary owns the single terminal event.
-                        Err(TurnError::Persist(_)) => {
+                        // executor already flushed and owns the single
+                        // terminal event. Live state may include an executed
+                        // side effect whose durable result could not be
+                        // appended: quarantine rather than sending divergent
+                        // history on a later queued turn.
+                        TurnControl::Quarantine => {
                             send(&events, AgentEvent::TurnFinished);
-                            // Live state may include an executed side effect whose
-                            // durable result could not be appended. Quarantine this
-                            // agent instance rather than sending divergent history
-                            // on a later queued turn.
                             break;
                         }
-                        Ok(()) => {}
+                        TurnControl::Continue => {}
                     }
                 }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
@@ -321,16 +317,32 @@ impl Agent {
                     continue;
                 }
                 InputMessage::CompactSession => {
-                    let cancel = self.cancel.clone();
-                    if let Err(TurnError::Persist(_)) =
-                        self.handle_compact_session(&events, &cancel).await
+                    // Manual compaction shares the boundary policy: persist
+                    // failures quarantine with exactly one terminal event.
+                    match self
+                        .handle_compact_session_boundary(&events, &self.cancel.clone())
+                        .await
                     {
-                        send(&events, AgentEvent::TurnFinished);
+                        TurnControl::Shutdown | TurnControl::Quarantine => {
+                            send(&events, AgentEvent::TurnFinished);
+                        }
+                        TurnControl::Continue => {}
                     }
                     continue;
                 }
                 InputMessage::SetModel { provider, model } => {
-                    self.handle_set_model(provider, model, &events).await;
+                    // Model changes persist first and commit atomically;
+                    // failures leave parent and subagent selection unchanged
+                    // and surface one terminal event via quarantine.
+                    match self
+                        .handle_set_model_boundary(provider, model, &events)
+                        .await
+                    {
+                        TurnControl::Shutdown | TurnControl::Quarantine => {
+                            send(&events, AgentEvent::TurnFinished);
+                        }
+                        TurnControl::Continue => {}
+                    }
                     continue;
                 }
                 InputMessage::SetReasoning { level } => {
@@ -350,7 +362,14 @@ impl Agent {
                     continue;
                 }
                 InputMessage::InvokeSkill { name } => {
-                    self.handle_invoke_skill(name, &events, &mut input).await;
+                    // Skill turns run through the same executor: shutdown
+                    // propagates and persistence failures quarantine instead
+                    // of being swallowed, with deferred sync flushed at the
+                    // operation boundary.
+                    match self.handle_invoke_skill(name, &events, &mut input).await {
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
+                    }
                     continue;
                 }
             };
@@ -1447,6 +1466,155 @@ mod tests {
                     .filter(|event| matches!(event, AgentEvent::TurnFinished))
                     .count(),
                 1
+            );
+        });
+    }
+
+    #[test]
+    fn skill_turn_failure_quarantines_and_never_runs_queued_work() {
+        // Persistence failure during a skill turn (deleted session file)
+        // must quarantine through the shared executor: exactly one
+        // terminal event, provider never called again, queued message
+        // never runs.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let mut session = store.create(SessionCreateOptions::default()).unwrap();
+            // Seed a skill the catalog can find: write SKILL.md through the
+            // real discovery path (temp skill root + HARNESS_SKILLS_DIR).
+            let skill_root = tempdir().unwrap();
+            let skill_dir = skill_root.path().join("demo-skill");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: demo-skill\ndescription: Demo\n---\nDo the thing.\n",
+            )
+            .unwrap();
+            // SAFETY: tests run single-threaded here (current-thread
+            // runtime); the env mutation is scoped to this test body.
+            unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+            let registry =
+                tools::default_registry(tools::ToolConfig::new(workspace.path(), false)).unwrap();
+            unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+            assert!(
+                registry.skills().is_some_and(|catalog| catalog
+                    .invocable()
+                    .iter()
+                    .any(|skill| skill.name == "demo-skill")),
+                "skill discovery must find demo-skill"
+            );
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![],
+                error_kind: MockErrorKind::Stream,
+            });
+            // Delete the session file so the first persist fails.
+            let path = session.file_path().unwrap().to_path_buf();
+            std::fs::remove_file(&path).unwrap();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::InvokeSkill {
+                    name: "demo-skill".into(),
+                })
+                .unwrap();
+            input_tx
+                .send(InputMessage::Message("queued must never run".into()))
+                .unwrap();
+            drop(input_tx);
+            // Keep `session` (with its path) for the agent; the store still
+            // points at the deleted file.
+            let _ = &mut session;
+            Agent::new(provider.clone(), registry, "demo", CancellationToken::new())
+                .with_session(store, session)
+                .run(input_rx, event_tx)
+                .await;
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            // One terminal Error at the failure source; the run loop
+            // quarantines with exactly one TurnFinished — never a successful
+            // skill turn, never a second turn for the queued message. (The
+            // skill-turn path emits no TurnFinished of its own on persist
+            // failure: the boundary owns the single terminal event.)
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::Error(_)))
+                    .count(),
+                1,
+                "events: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                    .count(),
+                0,
+                "events: {events:?}"
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                )),
+                "queued work ran: {events:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_during_skill_turn_exits_the_agent() {
+        // Cancelling the application token mid-skill-turn must propagate
+        // Shutdown through the shared executor and stop the run loop.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![script(vec![
+                    StreamEvent::TextDelta("skill answer".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ])],
+                error_kind: MockErrorKind::Stream,
+            });
+            let skill_root = tempdir().unwrap();
+            let skill_dir = skill_root.path().join("stop-skill");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: stop-skill\ndescription: Stop\n---\nDo it.\n",
+            )
+            .unwrap();
+            unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+            let workspace = tempdir().unwrap();
+            let registry =
+                tools::default_registry(tools::ToolConfig::new(workspace.path(), false)).unwrap();
+            unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::InvokeSkill {
+                    name: "stop-skill".into(),
+                })
+                .unwrap();
+            drop(input_tx);
+            cancel.cancel();
+            Agent::new(provider, registry, "demo", cancel)
+                .run(input_rx, event_tx)
+                .await;
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            // Shutdown propagates: no successful skill turn completes.
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text.contains("skill answer")
+                )),
+                "turn completed despite shutdown: {events:?}"
             );
         });
     }

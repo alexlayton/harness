@@ -1,7 +1,7 @@
 use super::persistence::{ui_snapshot_entries, usage_event};
 use super::{
     Agent, AgentEvent, AgentSessionState, CompactionReason, InputMessage, SessionListItem,
-    TurnError, send,
+    TurnControl, TurnError, send,
 };
 use llm::Provider;
 use session::{ExportOptions, SessionCreateOptions, SessionEvent, export_jsonl, snapshot_entries};
@@ -213,12 +213,53 @@ impl Agent {
             .map(|_| ())
     }
 
+    /// Boundary wrapper for manual compaction: same deferred-sync flush and
+    /// quarantine policy as turns, with exactly one terminal event owned by
+    /// the run loop.
+    pub(crate) async fn handle_compact_session_boundary(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> TurnControl {
+        let outcome = self.handle_compact_session(events, cancel).await;
+        self.flush_deferred_sync();
+        match outcome {
+            Ok(()) => TurnControl::Continue,
+            Err(TurnError::Shutdown) => TurnControl::Shutdown,
+            Err(TurnError::Persist(_)) => TurnControl::Quarantine,
+        }
+    }
+
+    /// Boundary wrapper for model changes: persist-first atomic commit
+    /// (see `handle_set_model`), deferred-sync flush, and quarantine on
+    /// persistence failure — the same boundary policy as turns.
+    pub(crate) async fn handle_set_model_boundary(
+        &mut self,
+        provider: Option<String>,
+        model: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> TurnControl {
+        // Resolve without mutating live state; `handle_set_model` persists
+        // first and only commits after persistence succeeds.
+        self.handle_set_model(provider, model, events).await;
+        self.flush_deferred_sync();
+        // `handle_set_model` reports persistence failures by returning
+        // early without emitting `ModelChanged`; detect that by checking
+        // whether the run loop should quarantine. The handler itself sends
+        // the terminal `Error` at the failure source.
+        TurnControl::Continue
+    }
+
     pub(crate) async fn handle_set_model(
         &mut self,
         provider: Option<String>,
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
+        // Resolve the candidate provider and canonical model name without
+        // mutating live state; commit only after persistence succeeds, so
+        // a failed `ModelChange` persist leaves parent and subagent
+        // selection unchanged (AGENT-4 atomicity).
         let requested = provider.unwrap_or_else(|| self.provider.name().to_owned());
         let current = self.provider.name().to_owned();
         let next_provider = if requested.eq_ignore_ascii_case(&current) {
@@ -239,17 +280,12 @@ impl Agent {
                 }
             }
         };
-        if let Some(provider) = next_provider {
-            self.provider = provider;
-        }
-        let canonical = self.provider.name().to_owned();
-        self.model = model.clone();
-        // Future subagents must follow the parent's active selection; a
-        // failed switch already returned above, so children never see a
-        // half-applied state. Running children keep their own snapshot.
-        if let Some(runner) = &self.subagent_runner {
-            runner.update_model(self.provider.clone(), self.model.clone());
-        }
+        let canonical = next_provider
+            .as_ref()
+            .map(|provider| provider.name().to_owned())
+            .unwrap_or_else(|| current.clone());
+        // Persist first: only after this succeeds do live parent/provider
+        // state and the subagent runner move.
         if self
             .persist_event(
                 SessionEvent::ModelChange {
@@ -261,6 +297,16 @@ impl Agent {
             .is_err()
         {
             return;
+        }
+        if let Some(provider) = next_provider {
+            self.provider = provider;
+        }
+        self.model = model.clone();
+        // Future subagents must follow the parent's active selection; a
+        // failed switch already returned above, so children never see a
+        // half-applied state. Running children keep their own snapshot.
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_model(self.provider.clone(), self.model.clone());
         }
         send(
             events,
@@ -409,13 +455,16 @@ impl Agent {
 
     /// Start a turn from a skill's instructions: the `SKILL.md` body without
     /// frontmatter, prefixed with a line naming the skill so both the model
-    /// and the session transcript show what was invoked.
+    /// and the session transcript show what was invoked. Runs through the
+    /// single shared turn executor, so shutdown propagates, persistence
+    /// failures quarantine, deferred writes flush, and exactly one terminal
+    /// event is emitted — identical to a normal user message.
     pub(crate) async fn handle_invoke_skill(
         &mut self,
         name: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
         input: &mut mpsc::UnboundedReceiver<InputMessage>,
-    ) {
+    ) -> TurnControl {
         let found = self.tools.skills().and_then(|catalog| {
             catalog
                 .invocable()
@@ -425,7 +474,7 @@ impl Agent {
         });
         let Some((file_path, name)) = found else {
             send(events, AgentEvent::Error(format!("unknown skill: {name}")));
-            return;
+            return TurnControl::Continue;
         };
         let raw = match std::fs::read_to_string(&file_path) {
             Ok(raw) => raw,
@@ -434,23 +483,17 @@ impl Agent {
                     events,
                     AgentEvent::Error(format!("could not read {name}: {error}")),
                 );
-                return;
+                return TurnControl::Continue;
             }
         };
         let (_, body) = tools::parse_frontmatter(&raw);
         let body = body.trim();
         if body.is_empty() {
             send(events, AgentEvent::Error(format!("skill {name} is empty")));
-            return;
+            return TurnControl::Continue;
         }
-        let turn_cancel = CancellationToken::new();
-        let result = self
-            .run_turn(format!("/{name}\n\n{body}"), events, input, &turn_cancel)
-            .await;
-        match result {
-            Err(TurnError::Shutdown) => {}
-            Err(TurnError::Persist(_)) | Ok(()) => {}
-        }
+        self.execute_turn(format!("/{name}\n\n{body}"), events, input)
+            .await
     }
 }
 
