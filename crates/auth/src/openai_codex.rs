@@ -19,10 +19,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 /// Public OAuth client identity used by the Codex subscription login.
@@ -210,8 +207,10 @@ impl OpenAiCodexAuth {
             .credential()?
             .ok_or(AuthError::OpenAiCodexNotAuthenticated)?;
         let old_refresh = old.refresh.clone();
+        // Refresh exchanges use strict status handling like the browser
+        // flow: only 2xx with a token payload succeeds.
         let value = self
-            .token(
+            .token_strict(
                 json!({"grant_type":"refresh_token", "refresh_token":old.refresh, "client_id": OPENAI_CODEX_CLIENT_ID} ),
                 &CancellationToken::new(),
             )
@@ -261,7 +260,7 @@ impl OpenAiCodexAuth {
         emit(AuthEvent::Started);
         emit(AuthEvent::Prompt { message: url });
         let code = wait_for_callback(listener, &values.state, cancel).await?;
-        let value = self.token(json!({"grant_type":"authorization_code", "client_id":OPENAI_CODEX_CLIENT_ID, "code":code, "code_verifier":values.verifier, "redirect_uri":"http://localhost:1455/auth/callback"}), cancel).await?;
+        let value = self.token_strict(json!({"grant_type":"authorization_code", "client_id":OPENAI_CODEX_CLIENT_ID, "code":code, "code_verifier":values.verifier, "redirect_uri":"http://localhost:1455/auth/callback"}), cancel).await?;
         let credential = credential_from_token(&value, None)?;
         self.persist(credential.clone())?;
         emit(AuthEvent::Finished);
@@ -330,6 +329,22 @@ impl OpenAiCodexAuth {
             emit(AuthEvent::Finished);
             return Ok(credential);
         }
+    }
+    /// Browser authorization exchange: strict status handling (no RFC 8628
+    /// polling semantics).  Only 2xx with a token payload succeeds; error
+    /// bodies are bounded and never echoed.
+    async fn token_strict(&self, body: Value, cancel: &CancellationToken) -> Result<Value> {
+        let response = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), result = self.http.post(&self.endpoints.token_url).form(&body).send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))? };
+        let status = response.status();
+        let body = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), body = read_bounded_body(response) => body? };
+        if !status.is_success() {
+            return Err(AuthError::Http {
+                status: status.as_u16(),
+                endpoint: "auth.openai.com".into(),
+            });
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))
     }
     async fn token(&self, body: Value, cancel: &CancellationToken) -> Result<Value> {
         self.request_token(
@@ -406,44 +421,165 @@ async fn read_bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
     Ok(body)
 }
 
+/// Browser-flow listener timeouts: an idle connection cannot park login
+/// forever, and the whole flow is bounded so a hanging browser tab fails
+/// with actionable device-flow advice instead of blocking shutdown.
+/// `idle_timeout` is exposed for tests; production uses 10 seconds.
+const CALLBACK_OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Maximum callback request head: headers are read incrementally through
+/// the `\r\n\r\n` terminator under this cap so a slowloris-style sender
+/// cannot grow memory without bound.
+const CALLBACK_HEAD_LIMIT: usize = 16 * 1024;
+
 async fn wait_for_callback(
     listener: TcpListener,
     expected_state: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
+    wait_for_callback_with_idle(listener, expected_state, cancel, Duration::from_secs(10)).await
+}
+
+async fn wait_for_callback_with_idle(
+    listener: TcpListener,
+    expected_state: &str,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + CALLBACK_OVERALL_TIMEOUT;
     loop {
-        let (mut stream, _) = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), value = listener.accept() => value.map_err(|_| AuthError::OpenAiCodex("callback listener failed".into()))? };
-        let mut request = vec![0; 8192];
-        let size = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), value = stream.read(&mut request) => value.map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))? };
-        let target = std::str::from_utf8(&request[..size])
-            .ok()
-            .and_then(|s| s.lines().next())
-            .and_then(|line| line.split_whitespace().nth(1));
-        let outcome = target
-            .and_then(|target| Url::parse(&format!("http://localhost{target}")).ok())
-            .and_then(|url| (url.path() == CALLBACK_PATH).then_some(url))
-            .and_then(|url| {
-                let pairs: std::collections::HashMap<_, _> =
-                    url.query_pairs().into_owned().collect();
-                (pairs
-                    .get("state")
-                    .is_some_and(|state| state == expected_state))
-                .then(|| pairs.get("code").cloned())
-                .flatten()
-            });
-        let (body, code) = match outcome {
-            Some(code) => ("Login complete. You may close this window.", Some(code)),
-            None => ("Login failed. Return to Harness and try again.", None),
+        if std::time::Instant::now() >= deadline {
+            return Err(AuthError::OpenAiCodex(
+                "browser login timed out; use `harness login openai-codex --device-code`".into(),
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let accept = listener.accept();
+        let (mut stream, _) = tokio::select! {
+            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+            _ = tokio::time::sleep(remaining) => return Err(AuthError::OpenAiCodex("browser login timed out; use `harness login openai-codex --device-code`".into())),
+            value = accept => value.map_err(|_| AuthError::OpenAiCodex("callback listener failed".into()))?
         };
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n<html><body>{body}</body></html>",
-            body.len() + 26
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        if let Some(code) = code {
+        let request = match read_callback_head(&stream, cancel, idle_timeout).await {
+            Ok(request) => request,
+            // Idle/slow senders time out per-connection without blocking a
+            // later valid callback; malformed heads are answered as failure.
+            Err(_) => {
+                let _ = respond_callback(&mut stream, false).await;
+                continue;
+            }
+        };
+        let outcome = parse_callback_target(&request, expected_state);
+        // A valid-state OAuth denial (`error=access_denied`) terminates
+        // promptly as a sanitized denial, not a retried code exchange.
+        if is_callback_denial(&request, expected_state) {
+            let _ = respond_callback(&mut stream, false).await;
+            return Err(AuthError::OpenAiCodex(
+                "browser authorization was denied".into(),
+            ));
+        }
+        let success = outcome.is_some();
+        let _ = respond_callback(&mut stream, success).await;
+        if let Some(code) = outcome {
             return Ok(code);
         }
     }
+}
+
+/// Read one HTTP request head incrementally through the `\r\n\r\n`
+/// terminator under [`CALLBACK_HEAD_LIMIT`], timing out idle connections so
+/// one hanging sender cannot block later callbacks.
+async fn read_callback_head(
+    stream: &tokio::net::TcpStream,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Result<String> {
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        if head.len() > CALLBACK_HEAD_LIMIT {
+            return Err(AuthError::OpenAiCodex("callback request too large".into()));
+        }
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        let read = async {
+            stream
+                .readable()
+                .await
+                .and_then(|_| stream.try_read(&mut chunk))
+        };
+        let size = tokio::select! {
+            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+            _ = tokio::time::sleep(idle_timeout) => return Err(AuthError::OpenAiCodex("callback read timed out".into())),
+            value = read => value.map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))?,
+        };
+        if size == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..size]);
+    }
+    String::from_utf8(head).map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))
+}
+
+/// Parse the request target from a callback head: the authorization `code`
+/// when the path and PKCE `state` match.
+fn parse_callback_target(request: &str, expected_state: &str) -> Option<String> {
+    let target = request.lines().next()?.split_whitespace().nth(1)?;
+    let url = Url::parse(&format!("http://localhost{target}")).ok()?;
+    if url.path() != CALLBACK_PATH {
+        return None;
+    }
+    let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    if pairs
+        .get("state")
+        .is_none_or(|state| state != expected_state)
+    {
+        return None;
+    }
+    pairs.get("code").cloned()
+}
+
+/// True when the callback is a valid-state OAuth denial rather than a code:
+/// `?error=access_denied&state=<expected>`.
+fn is_callback_denial(request: &str, expected_state: &str) -> bool {
+    let Some(target) = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+    else {
+        return false;
+    };
+    let Ok(url) = Url::parse(&format!("http://localhost{target}")) else {
+        return false;
+    };
+    if url.path() != CALLBACK_PATH {
+        return false;
+    }
+    let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    pairs
+        .get("state")
+        .is_some_and(|state| state == expected_state)
+        && pairs
+            .get("error")
+            .is_some_and(|error| error == "access_denied")
+}
+
+async fn respond_callback(stream: &mut tokio::net::TcpStream, success: bool) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let body = if success {
+        "Login complete. You may close this window."
+    } else {
+        "Login failed. Return to Harness and try again."
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n<html><body>{body}</body></html>",
+        body.len() + 26
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|_| AuthError::OpenAiCodex("callback write failed".into()))?;
+    Ok(())
 }
 
 fn credential_from_token(
@@ -813,5 +949,67 @@ mod tests {
             .unwrap_err();
         assert!(error.is_cancelled());
         assert!(fix.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn callback_target_parsing_accepts_codes_and_denials() {
+        let request = "GET /auth/callback?code=abc&state=s1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(parse_callback_target(request, "s1").as_deref(), Some("abc"));
+        assert!(parse_callback_target(request, "other").is_none());
+        assert!(!is_callback_denial(request, "s1"));
+        // Fragmented-style denial: valid state + access_denied terminates.
+        let denial = "GET /auth/callback?error=access_denied&state=s1 HTTP/1.1\r\n\r\n";
+        assert!(parse_callback_target(denial, "s1").is_none());
+        assert!(is_callback_denial(denial, "s1"));
+        assert!(!is_callback_denial(denial, "other"));
+    }
+
+    #[tokio::test]
+    async fn idle_connection_does_not_block_a_later_valid_callback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            wait_for_callback_with_idle(
+                listener,
+                "s1",
+                &CancellationToken::new(),
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        // First connection: idle, sends nothing (holds the socket open).
+        let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Second connection: a fragmented valid callback.
+        let mut valid = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = b"GET /auth/callback?code=frag&state=s1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        valid.write_all(&head[..20]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        valid.write_all(&head[20..]).await.unwrap();
+        let mut reply = Vec::new();
+        // Read until the response head terminator.
+        let mut chunk = [0u8; 512];
+        loop {
+            let size =
+                tokio::time::timeout(std::time::Duration::from_secs(15), valid.read(&mut chunk))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if size == 0 {
+                break;
+            }
+            reply.extend_from_slice(&chunk[..size]);
+            if reply.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&reply).contains("Login complete"));
+        let code = tokio::time::timeout(std::time::Duration::from_secs(15), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, "frag");
+        drop(idle);
     }
 }

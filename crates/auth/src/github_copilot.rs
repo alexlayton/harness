@@ -433,6 +433,29 @@ impl GithubCopilotClient {
         parse_available_model_ids_value(&value, fallback)
     }
 
+    /// Token-derived Copilot proxy endpoints must be HTTPS without embedded
+    /// credentials: accept only `https://host[:port]` with no userinfo,
+    /// query, or fragment.  HTTP or credential-bearing endpoints are
+    /// rejected rather than used for bearer-token requests.
+    pub fn proxy_endpoint(&self, token: &str) -> Result<String> {
+        let url = base_url_from_proxy_token(token)
+            .ok_or_else(|| AuthError::InvalidCredential("invalid Copilot proxy endpoint".into()))?;
+        let parsed = Url::parse(&url)
+            .map_err(|_| AuthError::InvalidCredential("invalid Copilot proxy endpoint".into()))?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(AuthError::InvalidCredential(
+                "untrusted Copilot proxy endpoint".into(),
+            ));
+        }
+        Ok(url)
+    }
+
     /// Enablement is best effort: some accounts reject policy writes even
     /// though already-enabled models work.  Cancellation remains fatal.
     pub async fn enable_known_models(
@@ -536,23 +559,28 @@ impl GithubCopilotClient {
             emit(AuthEvent::Progress {
                 message: "GitHub authorized; exchanging Copilot token...".into(),
             });
-            let mut credential = client
+            // Persist the exchanged credential before optional model
+            // discovery: a models/policy failure must still leave a usable
+            // login.  Discovery and enrichment stay best effort.
+            let credential = client
                 .exchange_copilot_token(&github_token, domain.as_deref(), cancel)
                 .await?;
-            emit(AuthEvent::Progress {
-                message: "Enabling available Copilot models...".into(),
-            });
-            client
-                .enable_known_models(&credential.access, domain.as_deref(), cancel)
-                .await?;
-            credential.available_model_ids = client
+            let mut enriched = credential.clone();
+            if let Ok(ids) = client
                 .fetch_available_model_ids(&credential.access, domain.as_deref(), cancel)
-                .await?;
-            Ok::<_, AuthError>(credential)
+                .await
+            {
+                enriched.available_model_ids = ids;
+            }
+            Ok::<_, AuthError>(enriched)
         }
         .await;
         match result {
             Ok(credential) => {
+                // The client owns no store, so it persists nothing itself;
+                // the `CopilotAuth` wrapper persists exactly once.  A models
+                // failure was already swallowed above and can never lose the
+                // login.
                 emit(AuthEvent::Finished);
                 Ok(credential)
             }
@@ -598,6 +626,10 @@ pub fn parse_copilot_token(
 }
 
 /// Derive the API host from Copilot's semicolon-delimited token metadata.
+/// The `proxy-ep` value may be a bare host or a full URL; userinfo-bearing
+/// values are rejected here (returning `None`) so neither
+/// `base_url_from_proxy_token` nor its trusted callers can launder
+/// `user@host` into a bearer-token endpoint.
 pub fn base_url_from_proxy_token(token: &str) -> Option<String> {
     let proxy = token.split(';').find_map(|part| {
         part.trim()
@@ -606,6 +638,11 @@ pub fn base_url_from_proxy_token(token: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
     })?;
     let (scheme, host) = if let Ok(url) = Url::parse(proxy) {
+        // Reject embedded credentials at parse time: `Url` splits
+        // `user@host`, and a laundered host must never become an API base.
+        if !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
         let host = url.host_str()?.to_owned();
         let host = url
             .port()
@@ -649,7 +686,19 @@ pub fn sku_from_proxy_token(token: &str) -> Option<&str> {
 }
 
 pub fn copilot_base_url(token: &str, enterprise_domain: Option<&str>) -> String {
-    if let Some(url) = base_url_from_proxy_token(token) {
+    // Only HTTPS token-derived endpoints are trusted for bearer-token use;
+    // anything else (HTTP, userinfo, query) falls through to the pinned
+    // enterprise/individual hosts so a malicious token cannot redirect API
+    // calls.
+    if let Some(url) = base_url_from_proxy_token(token)
+        && let Ok(parsed) = Url::parse(&url)
+        && parsed.scheme() == "https"
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+    {
         return url;
     }
     if let Ok(Some(domain)) = normalize_domain(enterprise_domain) {
@@ -927,6 +976,11 @@ impl CopilotAuth {
     where
         F: FnMut(AuthEvent) + Send,
     {
+        // `GithubCopilotClient::login_with_events` (no store) already
+        // persists nothing; this wrapper persists exactly once, after the
+        // client returns the exchanged (and optionally enriched)
+        // credential.  Model discovery failures are swallowed inside the
+        // client so they can never lose the login.
         let domain = normalize_domain(enterprise_domain)?;
         let client = if domain.is_some() {
             self.client.for_domain(domain.as_deref())?
@@ -1034,6 +1088,35 @@ mod tests {
         );
         assert_eq!(
             copilot_base_url("no-proxy", None),
+            "https://api.individual.githubcopilot.com"
+        );
+    }
+
+    #[test]
+    fn untrusted_proxy_endpoints_fall_back_and_are_rejected() {
+        // HTTP token-derived endpoints are never trusted for bearer use.
+        assert_eq!(
+            copilot_base_url(
+                "tid=x;proxy-ep=http://proxy.individual.githubcopilot.com;exp=1",
+                None
+            ),
+            "https://api.individual.githubcopilot.com"
+        );
+        let client = GithubCopilotClient::new().unwrap();
+        assert!(
+            client
+                .proxy_endpoint("tid=x;proxy-ep=http://evil.example.com;exp=1")
+                .is_err()
+        );
+        assert!(
+            client
+                .proxy_endpoint("tid=x;proxy-ep=https://evil.example.com@other.example.com;exp=1")
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .proxy_endpoint("tid=x;proxy-ep=proxy.individual.githubcopilot.com;exp=1")
+                .unwrap(),
             "https://api.individual.githubcopilot.com"
         );
     }
