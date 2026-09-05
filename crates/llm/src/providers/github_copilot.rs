@@ -537,20 +537,10 @@ fn auth_error(error: auth::AuthError) -> LlmError {
     LlmError::Auth(error.to_string())
 }
 
+/// Consolidated OAuth-provider redaction: delegate to the shared
+/// [`LlmError::redacted`] point so every variant is covered once.
 fn redact_error(error: LlmError, secret: &str) -> LlmError {
-    if secret.is_empty() {
-        return error;
-    }
-    match error {
-        LlmError::Http { status, body } => LlmError::Http {
-            status,
-            body: body.replace(secret, "[redacted]"),
-        },
-        LlmError::Stream(message) => LlmError::Stream(message.replace(secret, "[redacted]")),
-        LlmError::Parse(message) => LlmError::Parse(message.replace(secret, "[redacted]")),
-        LlmError::Auth(message) => LlmError::Auth(message.replace(secret, "[redacted]")),
-        other => other,
-    }
+    error.redacted(secret)
 }
 
 #[cfg(test)]

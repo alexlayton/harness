@@ -12,6 +12,7 @@ bytes = "1"
 eventsource-stream = "0.2"
 futures-core = "0.3"
 futures-util = "0.3"
+httpdate = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream", "json"] }
 # Installs the process-wide rustls crypto provider before any reqwest client
 # is built. reqwest's default `rustls` feature hard-wires aws-lc-rs (C/asm,

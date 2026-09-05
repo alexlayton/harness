@@ -268,17 +268,10 @@ fn count_label(count: u64, unit: &str) -> String {
     format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
 }
 
+/// Consolidated OAuth-provider redaction: delegate to the shared
+/// [`LlmError::redacted`] point so every variant is covered once.
 fn redact(error: LlmError, secret: &str) -> LlmError {
-    match error {
-        LlmError::Http { status, body } => LlmError::Http {
-            status,
-            body: body.replace(secret, "[redacted]"),
-        },
-        LlmError::Network(error) => LlmError::Network(error),
-        LlmError::Stream(message) => LlmError::Stream(message.replace(secret, "[redacted]")),
-        LlmError::Parse(message) => LlmError::Parse(message.replace(secret, "[redacted]")),
-        LlmError::Auth(message) => LlmError::Auth(message.replace(secret, "[redacted]")),
-    }
+    error.redacted(secret)
 }
 
 #[cfg(test)]

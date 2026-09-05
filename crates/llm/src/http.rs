@@ -134,19 +134,69 @@ impl HttpClient {
 /// Map a non-success HTTP status to `LlmError::Http` with a bounded body.
 /// `LlmError::http` is the single constructor that enforces the truncation
 /// invariant, so every status-mapped error (OpenAI dialects and Anthropic
-/// alike) is bounded here.
+/// alike) is bounded here.  The body is streamed as a bounded prefix — never
+/// an unbounded `response.text()` — and the final error stays within the
+/// byte cap as valid UTF-8.  A 429 `Retry-After` hint is preserved (bounded)
+/// so `retry.rs` can honor `max(backoff+jitter, retry_after)`.
 pub(crate) async fn check_status(
     response: reqwest::Response,
 ) -> Result<reqwest::Response, LlmError> {
     if response.status().is_success() {
         return Ok(response);
     }
+    check_status_with_secret(response, "").await
+}
+
+/// Like [`check_status`], but redacts the active API key/token before the
+/// error becomes visible.  Providers holding a secret must use this so
+/// echoed bodies can never leak credentials.
+pub(crate) async fn check_status_with_secret(
+    response: reqwest::Response,
+    secret: &str,
+) -> Result<reqwest::Response, LlmError> {
+    if response.status().is_success() {
+        return Ok(response);
+    }
     let status = response.status().as_u16();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unable to read response body>".into());
-    Err(LlmError::http(status, body))
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = bounded_error_body(response).await;
+    let mut rendered = body;
+    if let Some(hint) = retry_after {
+        // Bounded: header values are capped by reqwest; truncate defensively.
+        let hint: String = hint.chars().take(64).collect();
+        rendered.push_str("\nretry-after: ");
+        rendered.push_str(hint.trim());
+    }
+    Err(LlmError::http_redacted(status, rendered, secret))
+}
+
+/// Maximum bytes read from a non-success response body.  Multi-megabyte or
+/// chunked error bodies stay bounded in memory and output.
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+
+async fn bounded_error_body(response: reqwest::Response) -> String {
+    use futures_util::StreamExt;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(chunk.len());
+        body.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 #[cfg(test)]
