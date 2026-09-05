@@ -374,12 +374,26 @@ impl AnthropicParser {
                     .get("message")
                     .and_then(|message| message.get("usage"))
                 {
-                    self.input_tokens = usage.get("input_tokens").and_then(as_u64);
-                    // Cached tokens are reported separately from input;
-                    // surface them so session cost/usage reflects cache hits.
-                    self.cached_tokens = usage
+                    // Full prompt usage: uncached input plus both cache
+                    // categories, with saturating addition so large cached
+                    // prompts cannot wrap.  `cached_tokens` keeps the
+                    // cache-read portion for billing/reporting semantics.
+                    let uncached = usage.get("input_tokens").and_then(as_u64).unwrap_or(0);
+                    let cache_creation = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(as_u64)
+                        .unwrap_or(0);
+                    let cache_read = usage
                         .get("cache_read_input_tokens")
                         .and_then(as_u64)
+                        .unwrap_or(0);
+                    self.input_tokens = Some(
+                        uncached
+                            .saturating_add(cache_creation)
+                            .saturating_add(cache_read),
+                    );
+                    self.cached_tokens = (cache_read > 0)
+                        .then_some(cache_read)
                         .or(self.cached_tokens);
                 }
                 Ok(Vec::new())
@@ -470,32 +484,18 @@ impl AnthropicParser {
         self.done
     }
 
-    /// Emit a fallback `Done` when the SSE stream ended without a
-    /// `message_stop` (e.g. a proxy dropped the connection after the last text
-    /// delta). Mirrors `ChatStreamParser::finish` / `ResponsesParser::finish` so
-    /// the agent loop always receives a terminal `Done` and the turn's usage is
-    /// accounted for rather than dropped.
+    /// Clean transport EOF without `message_stop` is a truncated stream,
+    /// not a successful turn: surface it as `LlmError::Stream` so the
+    /// agent's recovery path handles it.  Never manufacture `Done` and
+    /// never finalize unfinished tool calls here.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         if self.done {
             return Ok(Vec::new());
         }
-        let mut output = Vec::new();
-        let indices: Vec<u64> = self.tools.keys().copied().collect();
-        for index in indices {
-            output.extend(self.finish_tool(index)?);
-        }
         self.done = true;
-        output.push(StreamEvent::Done {
-            stop_reason: self.stop_reason.clone(),
-            usage: Some(Usage {
-                input_tokens: self.input_tokens.unwrap_or(0),
-                output_tokens: self.output_tokens.unwrap_or(0),
-                cached_tokens: self.cached_tokens,
-                reasoning_tokens: None,
-                cost: None,
-            }),
-        });
-        Ok(output)
+        Err(LlmError::Stream(
+            "Anthropic stream ended without a terminal event (expected message_stop)".into(),
+        ))
     }
 }
 
@@ -574,10 +574,12 @@ mod tests {
 
     #[test]
     fn cached_tokens_are_surfaced_from_message_start() {
+        // Uncached input plus cache-read: total is the saturating sum,
+        // cached keeps the cache-read portion for billing.
         let mut parser = AnthropicParser::new();
         parser
             .parse_payload(
-                r#"{"type":"message_start","message":{"usage":{"input_tokens":100,
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":20,
                 "cache_read_input_tokens":80}}}"#,
             )
             .unwrap();
@@ -587,6 +589,31 @@ mod tests {
             StreamEvent::Done {
                 usage: Some(Usage {
                     input_tokens: 100,
+                    cached_tokens: Some(80),
+                    ..
+                }),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn full_prompt_usage_sums_all_input_categories() {
+        // Fixture with all three input categories: total is the saturating
+        // sum, cached keeps the cache-read portion for billing.
+        let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":100,
+                "cache_creation_input_tokens":50,"cache_read_input_tokens":80}}}"#,
+            )
+            .unwrap();
+        let done = parser.parse_payload(r#"{"type":"message_stop"}"#).unwrap();
+        assert!(matches!(
+            &done[0],
+            StreamEvent::Done {
+                usage: Some(Usage {
+                    input_tokens: 230,
                     cached_tokens: Some(80),
                     ..
                 }),
@@ -729,7 +756,9 @@ mod tests {
     }
 
     #[test]
-    fn finish_emits_done_with_usage_when_stream_ends_without_message_stop() {
+    fn finish_without_message_stop_is_a_stream_error() {
+        // Clean EOF with no `message_stop` is a truncated stream: `finish`
+        // returns `LlmError::Stream` and emits no completed calls.
         let mut parser = AnthropicParser::new();
         parser
             .parse_payload(r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#)
@@ -749,20 +778,18 @@ mod tests {
             .unwrap();
 
         assert!(!parser.is_done());
-        let done = parser.finish().unwrap();
-        assert_eq!(done.len(), 1);
-        assert!(matches!(
-            &done[0],
-            StreamEvent::Done {
-                usage: Some(Usage {
-                    input_tokens: 5,
-                    output_tokens: 0,
-                    ..
-                }),
-                ..
-            }
-        ));
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
         assert!(parser.is_done());
         assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_tool_call_then_eof_fails_and_emits_no_completed_call() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read","input":{}}}"#).unwrap();
+        parser.parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#).unwrap();
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
     }
 }

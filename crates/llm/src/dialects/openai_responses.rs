@@ -273,14 +273,32 @@ impl ResponsesParser {
                     arguments,
                 })])
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 self.done = true;
                 let response = value.get("response").unwrap_or(&Value::Null);
                 let usage = response.get("usage").map(parse_usage).transpose()?;
-                let stop_reason = response
+                // Preserve the terminal status verbatim: `completed` and
+                // each `incomplete` reason (e.g. `max_output_tokens`) are
+                // normal stop reasons the agent records, not errors.  The
+                // `incomplete_details.reason` (when present) is surfaced by
+                // mapping it into the stop reason so it survives in
+                // `Done` even though no separate event carries it.
+                let mut stop_reason = response
                     .get("status")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                if kind == "response.incomplete" {
+                    let detail = response
+                        .get("incomplete_details")
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str);
+                    stop_reason = Some(match (stop_reason, detail) {
+                        (Some(status), Some(reason)) => format!("{status}: {reason}"),
+                        (Some(status), None) => status,
+                        (None, Some(reason)) => format!("incomplete: {reason}"),
+                        (None, None) => "incomplete".to_owned(),
+                    });
+                }
                 Ok(vec![StreamEvent::Done { stop_reason, usage }])
             }
             "response.failed" => Err(LlmError::Stream(error_message(&value, "response failed"))),
@@ -296,19 +314,19 @@ impl ResponsesParser {
         self.done
     }
 
-    /// Emit a fallback `Done` event when the SSE stream ended without a
-    /// `response.completed` (e.g. a proxy dropped the connection after the last
-    /// text delta).  Mirrors `ChatStreamParser::finish` so the agent loop always
-    /// receives `TurnFinished` rather than staying busy forever.
+    /// Clean transport EOF without `response.completed`/`response.incomplete`
+    /// is a truncated stream, not a successful turn: surface it as
+    /// `LlmError::Stream` so the agent's recovery path handles it.  Never
+    /// manufacture `Done` and never finalize unfinished tool calls here.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         if self.done {
             return Ok(Vec::new());
         }
         self.done = true;
-        Ok(vec![StreamEvent::Done {
-            stop_reason: None,
-            usage: None,
-        }])
+        Err(LlmError::Stream(
+            "Responses stream ended without a terminal event (expected response.completed or response.incomplete)"
+                .into(),
+        ))
     }
 }
 
@@ -421,20 +439,42 @@ mod tests {
     }
 
     #[test]
-    fn finish_emits_fallback_done_only_once() {
+    fn finish_without_terminal_event_is_a_stream_error() {
+        // Clean EOF with no `response.completed`/`response.incomplete` is
+        // a truncated stream, not success: `finish` returns
+        // `LlmError::Stream` and emits no completed calls.
         let mut parser = ResponsesParser::new();
         assert!(!parser.is_done());
-        let events = parser.finish().unwrap();
-        assert!(matches!(
-            events.as_slice(),
-            [StreamEvent::Done {
-                stop_reason: None,
-                usage: None
-            }]
-        ));
-        // A second finish (or a later completed event) is a no-op.
-        assert!(parser.finish().unwrap().is_empty());
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
         assert!(parser.is_done());
+        // A second finish after the error is a no-op.
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_then_eof_fails_and_partial_tool_call_emits_nothing() {
+        let mut parser = ResponsesParser::new();
+        parser
+            .parse_payload(r#"{"type":"response.output_text.delta","delta":"hi"}"#)
+            .unwrap();
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn incomplete_terminal_event_succeeds_with_reason_and_usage() {
+        let mut parser = ResponsesParser::new();
+        let done = parser.parse_payload(r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}}"#).unwrap();
+        assert!(matches!(
+            &done[0],
+            StreamEvent::Done {
+                stop_reason: Some(reason),
+                usage: Some(Usage { input_tokens: 10, output_tokens: 20, .. }),
+            } if reason.contains("max_output_tokens")
+        ));
+        assert!(parser.is_done());
+        assert!(parser.finish().unwrap().is_empty());
     }
 
     #[test]

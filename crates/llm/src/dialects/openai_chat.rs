@@ -278,7 +278,10 @@ impl ChatStreamParser {
 
     pub fn parse_payload(&mut self, payload: &str) -> Result<Vec<StreamEvent>, LlmError> {
         if payload.trim() == "[DONE]" {
-            return self.finish();
+            // The documented Chat terminator: even without a finish_reason
+            // or usage chunk, the endpoint explicitly closed the turn.
+            self.done = true;
+            return Ok(Vec::new());
         }
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| LlmError::Parse(format!("chat SSE payload: {error}")))?;
@@ -335,13 +338,16 @@ impl ChatStreamParser {
         if self.done {
             return Ok(Vec::new());
         }
-        let mut output = self.flush_calls()?;
-        output.push(StreamEvent::Done {
-            stop_reason: self.stop_reason.clone(),
-            usage: None,
-        });
+        // Clean transport EOF without a protocol terminal event is a
+        // truncated stream, not a successful turn: surface it as
+        // `LlmError::Stream` so the agent's recovery path (persist partial
+        // text, emit a diagnostic, retry or fail loudly) handles it.  Never
+        // manufacture `Done` and never finalize unfinished tool calls here.
         self.done = true;
-        Ok(output)
+        Err(LlmError::Stream(
+            "chat stream ended without a terminal event (expected [DONE], a finish_reason, or a usage chunk)"
+                .into(),
+        ))
     }
 
     fn accumulate_tool_call(&mut self, item: &Value, fallback_index: u64) {
@@ -548,6 +554,43 @@ mod tests {
             events.last(),
             Some(StreamEvent::Done { usage: Some(_), .. })
         ));
+    }
+
+    #[test]
+    fn valid_done_terminator_succeeds() {
+        // The documented `[DONE]` terminator closes the turn without a
+        // `Done` event of its own; the stream simply ends successfully.
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+            .unwrap();
+        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
+        assert!(parser.done);
+    }
+
+    #[test]
+    fn text_then_eof_without_terminator_fails() {
+        // Text followed by clean EOF with no `[DONE]`, finish_reason, or
+        // usage chunk is a truncated stream: `finish` is a `Stream` error.
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+            .unwrap();
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn partial_tool_call_then_eof_fails_and_emits_no_completed_call() {
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+            )
+            .unwrap();
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(parser.seen_ids.is_empty());
     }
 
     #[test]

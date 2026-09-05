@@ -73,19 +73,57 @@ pub fn build_request_body(request: &CompletionRequest) -> Value {
     body
 }
 
-/// Replay only Codex-owned opaque items. Other provider metadata is ignored
-/// rather than leaking a foreign wire format into this endpoint.
+/// Convert neutral harness history to the subset accepted by Codex.
+///
+/// Assistant content is serialized in one ordered pass so Codex opaque
+/// reasoning state stays in its original position relative to the function
+/// calls it precedes (the Responses base converter emits text first, then
+/// all calls, which would reorder interleaved opaque items).  Only
+/// Codex-owned opaque items are replayed; foreign-provider state is
+/// omitted rather than leaking another wire format into this endpoint.
 pub fn convert_input(messages: &[crate::Message]) -> Vec<Value> {
+    use crate::{Content, Role};
     let mut input = Vec::new();
     for message in messages {
-        // Convert one neutral message at a time so opaque response items stay
-        // adjacent to the assistant turn which produced them.
-        input.extend(base_convert_input(std::slice::from_ref(message)));
-        for content in &message.content {
-            if let crate::Content::Opaque { provider, data } = content
-                && provider == "openai-codex"
-            {
-                input.push(data.clone());
+        match message.role {
+            Role::Assistant => {
+                // Ordered pass: text block first (matching base behavior),
+                // then each tool call / Codex opaque item in content order.
+                let text: String = message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::Text(text) => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                if !text.is_empty() {
+                    input.push(serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": text }]
+                    }));
+                }
+                for content in &message.content {
+                    match content {
+                        Content::ToolCall(call) => input.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": call.id,
+                            "name": call.name,
+                            "arguments": serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into()),
+                        })),
+                        Content::Opaque { provider, data } if provider == "openai-codex" => {
+                            input.push(data.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {
+                // Non-assistant messages keep base conversion (which skips
+                // opaque items entirely); Codex opaque items only ever ride
+                // on assistant turns.
+                input.extend(base_convert_input(std::slice::from_ref(message)));
             }
         }
     }
@@ -113,7 +151,7 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Message, ReasoningEffort};
+    use crate::{Message, ReasoningEffort, StreamEvent};
 
     fn request(reasoning: ReasoningPolicy) -> CompletionRequest {
         CompletionRequest {
@@ -141,5 +179,74 @@ mod tests {
         let maximum =
             build_request_body(&request(ReasoningPolicy::Effort(ReasoningEffort::Maximum)));
         assert_eq!(maximum["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn incomplete_terminal_event_succeeds_with_reason_and_usage() {
+        // Codex shares the Responses terminal contract: `response.incomplete`
+        // is a handled terminal event preserving reason, status, and usage.
+        let mut parser = crate::dialects::openai_responses::ResponsesParser::new();
+        let done = parser.parse_payload(r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":7,"output_tokens":3}}}"#).unwrap();
+        assert!(
+            matches!(&done[0], StreamEvent::Done { stop_reason: Some(reason), usage: Some(usage) }
+                if reason.contains("content_filter") && usage.input_tokens == 7 && usage.output_tokens == 3),
+            "got {done:?}"
+        );
+        assert!(parser.is_done());
+    }
+
+    #[test]
+    fn codex_opaque_state_preserves_order_before_multiple_tool_calls() {
+        // Opaque Codex reasoning items stay in original content order
+        // relative to the function calls they precede; foreign-provider
+        // state is omitted by `convert_input`.
+        use crate::{Content, Role};
+        let opaque = |n: u64| serde_json::json!({"type": "reasoning", "id": format!("rs_{n}"), "encrypted_content": format!("enc{n}")});
+        let messages = vec![crate::Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::Opaque {
+                    provider: "openai-codex".into(),
+                    data: opaque(1),
+                },
+                Content::ToolCall(crate::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                }),
+                Content::Opaque {
+                    provider: "other-provider".into(),
+                    data: opaque(9),
+                },
+                Content::Opaque {
+                    provider: "openai-codex".into(),
+                    data: opaque(2),
+                },
+                Content::ToolCall(crate::ToolCall {
+                    id: "c2".into(),
+                    name: "bash".into(),
+                    arguments: serde_json::json!({}),
+                }),
+            ],
+        }];
+        let input = convert_input(&messages);
+        let rendered: Vec<String> = input.iter().map(|item| item.to_string()).collect();
+        assert!(
+            !rendered.iter().any(|item| item.contains("rs_9")),
+            "foreign state leaked: {rendered:?}"
+        );
+        // Exact content order: rs_1, c1, rs_2, c2 — interleaved as authored.
+        // (Call IDs serialize as `call_id`, so match the encrypted payload
+        // marker plus the call_id value to stay unambiguous.)
+        let positions = ["enc1", "\"c1\"", "enc2", "\"c2\""].map(|needle| {
+            rendered
+                .iter()
+                .position(|item| item.contains(needle))
+                .unwrap()
+        });
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "order violated: {rendered:?}"
+        );
     }
 }
