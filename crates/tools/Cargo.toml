@@ -20,6 +20,8 @@ tracing = "0.1"
 # Directory-handle-relative path resolution (`openat`/`O_NOFOLLOW`) for the
 # TOCTOU-safe open path in `vfs.rs`. No new dependency on other platforms.
 rustix = { version = "1.1", features = ["fs", "process"] }
+# Process-group signalling (`killpg`-equivalent) for bash tree teardown.
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1"

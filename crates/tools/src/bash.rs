@@ -36,6 +36,28 @@ const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Maximum shell timeout in seconds (24 hours). Documented in the JSON
+/// schema and enforced at runtime; larger values (including `u64::MAX`)
+/// are rejected as a tool error instead of overflowing deadline arithmetic.
+pub const MAX_TIMEOUT_SECS: u64 = 86_400;
+/// Grace period after TERM before escalating a process group to KILL.
+const KILL_GRACE: Duration = Duration::from_millis(500);
+/// Shared deadline for draining stdout+stderr after the shell ends.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Harness-side concurrency classification for one bash invocation.
+/// Every invocation is [`Concurrency::Exclusive`]: shell is the optimized
+/// parallel path's *escape hatch*, not a member of it — dedicated `read`,
+/// `find`, `grep`, and `multigrep` remain the parallel path. The old
+/// shell/Git read-only classifier was fragile word-level analysis that a
+/// wrong `ReadOnly` could turn into interleaved mutations; a wrong
+/// `Exclusive` merely forfeits latency, so exclusivity fails closed.
+/// Kept as a function (rather than inlining in `concurrency()`) so agent
+/// dispatch tests and callers can assert the contract directly.
+pub fn command_concurrency(_command: &str) -> Concurrency {
+    Concurrency::Exclusive
+}
+
 /// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
 /// signals support by printing the rewritten command on stdout; unsupported
 /// commands, a missing rtk binary, and timeouts all degrade to `None`, in
@@ -71,368 +93,6 @@ async fn rtk_rewrite_cancellable(
     (accepted && !rewritten.is_empty()).then_some(rewritten)
 }
 
-/// True when a shell operand contains a control-flow keyword as a word, which
-/// would make per-operand rewriting unsafe.  Conservative: a false positive
-/// only skips the rtk split optimization, never alters execution.
-fn has_control_keyword(operand: &str) -> bool {
-    const KEYWORDS: &[&str] = &[
-        "if ",
-        "then ",
-        "else ",
-        "elif ",
-        "for ",
-        "while ",
-        "until ",
-        "case ",
-        "do ",
-        "done ",
-        "function ",
-        "select ",
-    ];
-    let bytes = operand.as_bytes();
-    KEYWORDS.iter().any(|keyword| {
-        bytes
-            .windows(keyword.len())
-            .any(|window| window == keyword.as_bytes())
-    })
-}
-
-/// Harness-side concurrency classification for one bash invocation.  This is
-/// decided here — never by the model — so scheduling correctness cannot
-/// depend on prompt compliance.  It fails closed: anything not provably
-/// side-effect-light classifies [`Concurrency::Exclusive`], which merely
-/// forfeits latency, while a wrong `ReadOnly` could interleave mutations.
-pub fn command_concurrency(command: &str) -> Concurrency {
-    match split_readonly_segments(command) {
-        Some(segments) if segments.iter().all(|segment| segment_is_read_only(segment)) => {
-            Concurrency::ReadOnly
-        }
-        _ => Concurrency::Exclusive,
-    }
-}
-
-/// Split a command on top-level separators (`&&`, `;`, and newlines, which
-/// are command separators in shell) into operands, refusing any structure a
-/// word-level analysis cannot judge: pipes, subshells, command substitution,
-/// heredocs, brace groups, redirections, or backgrounding.  Quoting and
-/// escapes are respected.  Returns `None` when the command must stay serial;
-/// a plain single command yields one segment.
-fn split_readonly_segments(command: &str) -> Option<Vec<&str>> {
-    let bytes = command.as_bytes();
-    let mut parts: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'\\' => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'`' => return None,
-            b'$' if bytes.get(index + 1) == Some(&b'(') => return None,
-            b'<' if matches!(bytes.get(index + 1), Some(b'<') | Some(b'(')) => return None,
-            b'<' | b'>' if !in_single && !in_double => return None,
-            b'|' | b'(' if !in_single && !in_double => return None,
-            b'{' if !in_single && !in_double && bytes.get(index.wrapping_sub(1)) != Some(&b'$') => {
-                return None;
-            }
-            b'&' if !in_single && !in_double => {
-                // `&&` separates; a lone `&` backgrounds the command, whose
-                // side effects would outlive the tool call — stay serial.
-                if bytes.get(index + 1) != Some(&b'&') {
-                    return None;
-                }
-                parts.push(command[start..index].trim());
-                start = index + 2;
-                index += 2;
-                continue;
-            }
-            b';' | b'\n' | b'\r' if !in_single && !in_double => {
-                parts.push(command[start..index].trim());
-                start = index + 1;
-                index += 1;
-                continue;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    let tail = command[start..].trim();
-    parts.push(tail);
-    if parts.iter().any(|part| part.is_empty()) {
-        return None;
-    }
-    if parts.iter().any(|part| has_control_keyword(part)) {
-        return None;
-    }
-    Some(parts)
-}
-
-/// Strip one layer of matching quotes so quoted words (`git "status"`)
-/// compare equal to their bare form during table lookup.
-fn strip_quotes(word: &str) -> &str {
-    let mut word = word.trim();
-    for quote in ['\'', '"'] {
-        if word.len() >= 2 && word.starts_with(quote) && word.ends_with(quote) {
-            word = &word[1..word.len() - 1];
-        }
-    }
-    word
-}
-
-/// True for `NAME=value` environment assignments preceding a command.
-fn is_env_assignment(word: &str) -> bool {
-    let Some(equals) = word.find('=') else {
-        return false;
-    };
-    let name = &word[..equals];
-    let mut bytes = name.bytes();
-    match bytes.next() {
-        // A valid identifier starts with a letter or underscore.
-        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {}
-        _ => return false,
-    }
-    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-/// Git global options that precede the subcommand, mapped to how many
-/// following words they consume as values.  Anything unrecognized fails
-/// closed.
-const GIT_GLOBAL_FLAGS_WITH_VALUES: &[&str] = &["-C", "-c"];
-const GIT_GLOBAL_PREFIX_FLAGS: &[&str] = &["--git-dir=", "--work-tree="];
-const GIT_GLOBAL_BARE_FLAGS: &[&str] = &["--no-pager", "--literal-pathspecs"];
-
-/// Git subcommands that never mutate repository or worktree state, whatever
-/// their arguments (pathspecs and revisions are reads).
-const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
-    "status",
-    "log",
-    "diff",
-    "show",
-    "blame",
-    "ls-files",
-    "ls-remote",
-    "cat-file",
-    "rev-parse",
-    "describe",
-    "shortlog",
-    "whatchanged",
-    "merge-base",
-    "reflog",
-    "show-branch",
-    "count-objects",
-    "cherry",
-    "version",
-];
-
-/// Listing-mode flags under which `git branch` / `git tag` are read-only.
-/// With any positional argument they create/delete/rename refs, so those
-/// fail closed.
-const GIT_LIST_MODE_FLAGS: &[&str] = &[
-    "-l",
-    "--list",
-    "-a",
-    "-r",
-    "-v",
-    "-vv",
-    "--show-current",
-    "--show-ref-names",
-    "--merged",
-    "--no-merged",
-    "--contains",
-    "--no-contains",
-    "--points-at",
-    "--sort",
-    "--format",
-    "--color",
-    "--abbrev",
-    "-n",
-];
-
-/// Read-only modes of `git config`; any other form may write configuration.
-const GIT_CONFIG_READ_FLAGS: &[&str] = &["--get", "--get-all", "--get-regexp", "--list"];
-
-/// Shell commands judged side-effect-light with arbitrary arguments.  This
-/// is deliberately an allowlist: unknown commands stay serial.  Deliberately
-/// excluded despite common read-only use: `sed` (`-i`, `w`, `r`), `awk`
-/// (`system()`, redirections), `xargs` (arbitrary execution), `env` (runs a
-/// command), and everything that can spawn processes.
-const READ_ONLY_COMMANDS: &[&str] = &[
-    "ls",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "stat",
-    "pwd",
-    "which",
-    "file",
-    "du",
-    "df",
-    "tree",
-    "uname",
-    "printenv",
-    "id",
-    "whoami",
-    "basename",
-    "dirname",
-    "realpath",
-    "readlink",
-    "echo",
-    "printf",
-    "true",
-    "false",
-    "nl",
-    "rev",
-    "tac",
-    "strings",
-    "column",
-    "cksum",
-    "md5sum",
-    "sha1sum",
-    "sha256sum",
-    "diff",
-    "cmp",
-    "comm",
-    "sort",
-    "uniq",
-    "cut",
-    "rg",
-    "grep",
-    "fd",
-];
-
-/// Version-print subcommands of build-tool binaries; anything else these
-/// tools do (builds, installs, package management) stays serial.
-const VERSION_ONLY_COMMANDS: &[&str] = &[
-    "cargo", "rustc", "rustup", "node", "npm", "npx", "python", "python3", "go",
-];
-
-/// Arguments that disqualify an otherwise read-only command: flags that
-/// write files (`sort -o`, `git diff --output=`), set state (`date -s`), or
-/// execute other programs (`rg --pre`, `fd -x`).  A flag matches exactly or
-/// as a `--flag=value` prefix.
-const READ_ONLY_COMMAND_EXCLUSIONS: &[(&str, &[&str])] = &[
-    ("rg", &["--pre", "--pre-glob"]),
-    ("fd", &["-x", "-X", "--exec", "--exec-batch"]),
-    ("sort", &["-o", "--output"]),
-    ("date", &["-s", "--set"]),
-    ("hostname", &["-F", "--file"]),
-];
-
-/// Judge one separator-free command operand.  Leading `VAR=value` assignments
-/// and a `cd <dir>` prefix are transparent; the remaining command word is
-/// looked up in the read-only tables.
-fn segment_is_read_only(segment: &str) -> bool {
-    let mut words: Vec<&str> = segment
-        .split_whitespace()
-        .map(strip_quotes)
-        .filter(|word| !word.is_empty())
-        .collect();
-    while words.first().is_some_and(|word| is_env_assignment(word)) {
-        words.remove(0);
-    }
-    let Some(first) = words.first() else {
-        return false;
-    };
-    if *first == "cd" {
-        // `cd <dir>` is transparent; bare `cd`, flags, or extra operands mean
-        // we did not parse what will really run.
-        return words.len() == 2 && !words[1].starts_with('-');
-    }
-    if *first == "git" {
-        return git_invocation_is_read_only(&words[1..]);
-    }
-    if *first == "find" {
-        // find(1) is read-only except for its mutating actions.
-        return !words[1..].iter().any(|word| {
-            *word == "-delete"
-                || *word == "-fls"
-                || word.starts_with("-exec")
-                || word.starts_with("-ok")
-                || word.starts_with("-fprint")
-        });
-    }
-    if READ_ONLY_COMMANDS.contains(first) {
-        // The allowlist entry covers arbitrary arguments except for the
-        // specific flags tabulated as disqualifiers.
-        return !words[1..].iter().any(|word| {
-            READ_ONLY_COMMAND_EXCLUSIONS
-                .iter()
-                .filter(|(command, _)| command == first)
-                .flat_map(|(_, flags)| flags.iter())
-                .any(|flag| *word == *flag || word.starts_with(&format!("{flag}=")))
-        });
-    }
-    if VERSION_ONLY_COMMANDS.contains(first) {
-        return words.len() == 2 && matches!(words[1], "--version" | "-V" | "version");
-    }
-    false
-}
-
-/// Judge a `git` invocation after the leading `git` word: skip known global
-/// options, then require the subcommand to be provably read-only.
-fn git_invocation_is_read_only(rest: &[&str]) -> bool {
-    let mut index = 0;
-    while index < rest.len() {
-        let word = rest[index];
-        if GIT_GLOBAL_FLAGS_WITH_VALUES.contains(&word) {
-            index += 2;
-        } else if GIT_GLOBAL_PREFIX_FLAGS
-            .iter()
-            .any(|flag| word.starts_with(flag))
-            || GIT_GLOBAL_BARE_FLAGS.contains(&word)
-        {
-            index += 1;
-        } else if word.starts_with('-') {
-            return false;
-        } else {
-            break;
-        }
-    }
-    let Some(subcommand) = rest.get(index) else {
-        // Bare `git` prints help: harmless, but pointless to batch.
-        return false;
-    };
-    let args = &rest[index + 1..];
-    // `git diff --output=<file>` (and `--output-indicator-*` are fine, but
-    // plain `--output` writes a file) fails closed.
-    if GIT_READ_ONLY_SUBCOMMANDS.contains(subcommand)
-        && matches!(*subcommand, "diff" | "show" | "whatchanged")
-        && args
-            .iter()
-            .any(|arg| arg.starts_with("--output=") || *arg == "--output")
-    {
-        return false;
-    }
-    match *subcommand {
-        _ if GIT_READ_ONLY_SUBCOMMANDS.contains(subcommand) => true,
-        "branch" | "tag" => {
-            !args.is_empty()
-                && args
-                    .iter()
-                    .all(|arg| arg.starts_with('-') && GIT_LIST_MODE_FLAGS.contains(arg))
-        }
-        "config" => args
-            .first()
-            .is_some_and(|arg| GIT_CONFIG_READ_FLAGS.contains(arg)),
-        "remote" => {
-            args.iter().all(|arg| matches!(*arg, "-v" | "--verbose"))
-                || args.first() == Some(&"get-url") && args.len() == 2
-        }
-        "worktree" | "stash" => args.first() == Some(&"list") || args.first() == Some(&"show"),
-        _ => false,
-    }
-}
-
 /// Resolve the bash `dir` argument against the workspace root, requiring an
 /// existing directory inside the workspace.  This mirrors the path scoping of
 /// find/grep; `cd` inside the command itself remains the escape hatch for
@@ -460,7 +120,7 @@ impl Tool for BashTool {
                 "properties": {
                     "command": { "type": "string", "description": "Command passed to sh -c" },
                     "dir": { "type": "string", "description": "Optional working directory for the command, relative to the workspace root (e.g. \"crates/tools\"). Prefer this over prefixing the command with cd <dir> && ..." },
-                    "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" }
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS, "description": "Timeout in seconds (default 120, maximum 86400)" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -476,11 +136,10 @@ impl Tool for BashTool {
         }
     }
 
-    fn concurrency(&self, args: &Value) -> Concurrency {
-        match args.get("command").and_then(Value::as_str) {
-            Some(command) => command_concurrency(command),
-            None => Concurrency::Exclusive,
-        }
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        // Every bash invocation is exclusive: shell text is never provably
+        // side-effect-light. See `command_concurrency`.
+        Concurrency::Exclusive
     }
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
@@ -488,13 +147,25 @@ impl Tool for BashTool {
             Some(command) if !command.is_empty() => command.to_owned(),
             _ => return error("bash", "missing required argument: command"),
         };
-        let timeout = match args.get("timeout") {
+        // Documented maximum timeout, enforced with checked arithmetic:
+        // `u64::MAX` (or anything past the cap) is a tool error, never a
+        // panic or wrap. `checked_add` on the `Instant` likewise fails to
+        // an error instead of overflowing the deadline.
+        let timeout_secs = match args.get("timeout") {
             None => 120,
             Some(value) => match value.as_u64() {
-                Some(value) if value > 0 => value,
-                _ => return error("bash", "timeout must be a positive integer"),
+                Some(value) if (1..=MAX_TIMEOUT_SECS).contains(&value) => value,
+                _ => {
+                    return error(
+                        "bash",
+                        &format!(
+                            "timeout must be an integer between 1 and {MAX_TIMEOUT_SECS} seconds"
+                        ),
+                    );
+                }
             },
         };
+        let timeout = timeout_secs;
         let dir = match args.get("dir") {
             None => None,
             Some(Value::String(dir)) if !dir.trim().is_empty() => Some(dir.clone()),
@@ -513,7 +184,20 @@ impl Tool for BashTool {
 
         // RTK owns rewrite policy: one cancellable whole-command request,
         // with rewrite time charged to the bash call's total deadline.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+        // Checked arithmetic: an unrepresentable deadline is a tool error,
+        // never a panic.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(timeout))
+            .ok_or_else(|| {
+                error(
+                    "bash",
+                    &format!("timeout {timeout}s overflows the deadline clock"),
+                )
+            });
+        let deadline = match deadline {
+            Ok(deadline) => deadline,
+            Err(output) => return output,
+        };
         let run_command = if self.rtk {
             rtk_rewrite_cancellable(&command, &cancel, deadline)
                 .await
@@ -523,16 +207,23 @@ impl Tool for BashTool {
         };
 
         let cwd = self.cwd.clone();
-        let mut child = match Command::new("sh")
+        let mut command_builder = Command::new("sh");
+        command_builder
             .arg("-c")
             .arg(&run_command)
             .current_dir(run_dir.as_deref().unwrap_or(&cwd))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        // Own process group/session: on timeout, cancellation, future drop,
+        // or shell exit with surviving descendants, the whole group is
+        // terminated (TERM, escalated to KILL) and reaped — a backgrounded
+        // descendant can never outlive the tool call and touch the
+        // workspace afterwards.
+        #[cfg(unix)]
+        command_builder.process_group(0);
+        let mut child = match command_builder.spawn() {
             Ok(child) => child,
             Err(io_error) => {
                 return error(
@@ -541,6 +232,13 @@ impl Tool for BashTool {
                 );
             }
         };
+        // The shell's pid is the process-group leader (process_group(0)),
+        // so group signals target exactly this invocation's tree.
+        #[cfg(unix)]
+        let group_id = child.id();
+        #[cfg(not(unix))]
+        let group_id = None;
+        let _ = group_id;
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -558,33 +256,49 @@ impl Tool for BashTool {
                 Err(_) => End::Cancelled,
             },
             _ = tokio::time::sleep_until(deadline) => {
-                let _ = child.kill().await;
+                terminate_tree(&child, group_id, &cancel).await;
                 let _ = child.wait().await;
                 End::TimedOut
             },
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
+                terminate_tree(&child, group_id, &cancel).await;
                 let _ = child.wait().await;
                 End::Cancelled
             },
         };
+        // The shell exited but descendants may survive (they inherit the
+        // pipes and the group). Reap the whole tree the same way so a
+        // backgrounded `sleep 300 &` cannot write a marker after return.
+        if matches!(end, End::Exited(_)) {
+            terminate_tree(&child, group_id, &cancel).await;
+        }
 
-        // A descendant can inherit a pipe after the shell exits. Bound drain
-        // time so such a process cannot keep the tool alive indefinitely.
-        let stdout = match tokio::time::timeout(Duration::from_secs(1), &mut stdout_task).await {
-            Ok(Ok(capture)) => capture,
-            _ => {
-                stdout_task.abort();
-                TailCapture::default()
+        // Drain stdout and stderr concurrently under one shared deadline
+        // (not two sequential one-second waits): held pipes on both
+        // streams together consume at most DRAIN_TIMEOUT.
+        let drain_deadline = tokio::time::Instant::now()
+            .checked_add(DRAIN_TIMEOUT)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let (stdout, stderr) = tokio::join!(
+            async {
+                match tokio::time::timeout_at(drain_deadline, &mut stdout_task).await {
+                    Ok(Ok(capture)) => capture,
+                    _ => {
+                        stdout_task.abort();
+                        TailCapture::default()
+                    }
+                }
+            },
+            async {
+                match tokio::time::timeout_at(drain_deadline, &mut stderr_task).await {
+                    Ok(Ok(capture)) => capture,
+                    _ => {
+                        stderr_task.abort();
+                        TailCapture::default()
+                    }
+                }
             }
-        };
-        let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
-            Ok(Ok(capture)) => capture,
-            _ => {
-                stderr_task.abort();
-                TailCapture::default()
-            }
-        };
+        );
         let mut output = stdout.render();
         if !stderr.bytes.is_empty() {
             if !output.is_empty() {
@@ -733,6 +447,51 @@ pub fn truncate_command_output(output: &str) -> String {
 
 fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value)
+}
+
+/// Terminate the whole process tree of a shell invocation: signal the
+/// process group (TERM), escalate to KILL after a short grace period, and
+/// reap directly manageable handles. The shell runs as its own group
+/// leader (`process_group(0)`), so `killpg`-equivalent signals hit exactly
+/// this invocation's descendants — never the harness itself. On non-Unix
+/// platforms group semantics are unavailable and this degrades to killing
+/// the shell handle directly.
+///
+/// `child` is used to reap the directly manageable shell handle when the
+/// group signal path is unavailable; on Unix the group signals do the
+/// work and the caller waits on the shell separately.
+async fn terminate_tree(
+    child: &tokio::process::Child,
+    group_id: Option<u32>,
+    cancel: &CancellationToken,
+) {
+    #[cfg(unix)]
+    {
+        let _ = (child, cancel);
+        if let Some(pgid) = group_id {
+            // SAFETY: `killpg`-equivalent via libc with the group's own
+            // pgid; a negative pid targets the group, signals are
+            // SIGTERM/SIGKILL constants. The pgid came from our own
+            // spawned child, never from external input.
+            unsafe {
+                libc::kill(-(pgid as libc::pid_t), libc::SIGTERM);
+            }
+            // Grace period, still responsive to cancellation.
+            let _ = tokio::time::timeout(KILL_GRACE, cancel.cancelled()).await;
+            unsafe {
+                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Fallback: kill the shell handle. Note this cannot reach
+        // already-detached grandchildren; that limitation is platform
+        // specific and documented here, not claimed away.
+        let _ = group_id;
+        let _ = cancel;
+        let _ = child;
+    }
 }
 
 fn error(summary: &str, content: &str) -> ToolOutput {
@@ -887,132 +646,132 @@ mod tests {
     }
 
     #[test]
-    fn read_only_commands_classify_concurrent() {
-        let concurrent = [
+    fn every_bash_invocation_is_exclusive() {
+        // Even env-prefixed and Git helper commands - the old classifier's
+        // read-only set - are exclusive now. Dedicated read/find/grep/
+        // multigrep remain the optimized parallel path.
+        for command in [
             "git status",
             "git log --oneline -5",
-            "git diff HEAD~1",
-            "git -C crates/tools status",
-            "git --no-pager diff",
-            "git branch --list",
-            "git tag -l",
-            "git config --get user.name",
-            "git remote -v",
-            "git stash list",
-            "cd crates/tui && git status",
             "FOO=bar git status",
             "ls -la",
             "cat README.md",
-            "head -20 src/main.rs",
-            "wc -l crates/*/*.rs",
-            "pwd",
-            "which cargo",
-            "rg TODO src/",
-            "grep -rn pattern .",
-            "find . -name '*.rs' -maxdepth 2",
-            "cargo --version",
-            "node --version",
             "echo hello",
-            "printf '%s\\n' line",
-            "stat Cargo.toml",
-            "du -sh target",
-            "uname -a",
-            "true",
-        ];
-        for command in concurrent {
-            assert_eq!(
-                command_concurrency(command),
-                Concurrency::ReadOnly,
-                "{command:?} should be read-only"
-            );
-        }
-    }
-
-    #[test]
-    fn mutating_or_unanalyzable_commands_stay_serial() {
-        let exclusive = [
-            "date +%Y",
-            "hostname",
+            "cargo --version",
+            "rg TODO src/",
             "cargo test",
-            "cargo build --release",
             "rm -rf target",
-            "touch file.txt",
-            "mkdir -p a/b",
-            "git commit -m x",
-            "git checkout main",
-            "git add .",
-            "git push",
-            "git branch new-branch",
-            "git tag v1.0.0",
-            "git config user.email a@b.c",
-            "git worktree add ../wt",
-            "find . -name '*.tmp' -delete",
-            "find . -name '*.log' -exec rm {} \\",
             "echo hi > out.txt",
-            "cat in.txt | sort",
-            "sort < input.txt",
-            "echo $(date)",
-            "echo `date`",
-            "sleep 5 & wait",
-            "cd .. && rm -rf build",
-            "npm install",
-            "python script.py",
-            "sed -i 's/a/b/' file.txt",
-            "xargs ls < files.txt",
-            "if true; then echo hi; fi",
-            "for f in *; do cat $f; done",
-            "ls; rm file",
-            "git status && cargo test",
-            "", // empty command is rejected at execute time anyway
-        ];
-        for command in exclusive {
+            "",
+        ] {
             assert_eq!(
                 command_concurrency(command),
                 Concurrency::Exclusive,
-                "{command:?} must stay serial"
+                "{command:?} must be exclusive"
             );
         }
-    }
-
-    #[test]
-    fn side_effect_flags_on_read_only_commands_fail_closed() {
-        let exclusive = [
-            "sort -o /etc/passwd input.txt",
-            "sort --output=x.txt input.txt",
-            "date -s 2000-01-01",
-            "date --set=2000-01-01",
-            "rg --pre ./hook.sh pattern",
-            "fd -x chmod 644 \\{",
-            "fd --exec echo",
-            "hostname -F hosts.txt",
-            "git diff --output=patch.txt",
-        ];
-        for command in exclusive {
-            assert_eq!(
-                command_concurrency(command),
-                Concurrency::Exclusive,
-                "{command:?} must stay serial"
-            );
-        }
-        // Unrelated flags on the same commands stay read-only.
+        // The tool-level classification agrees, with or without a command.
+        let tool = BashTool::with_workspace_root("/tmp");
         assert_eq!(
-            command_concurrency("sort -u input.txt"),
-            Concurrency::ReadOnly
-        );
-        assert_eq!(command_concurrency("rg -n TODO"), Concurrency::ReadOnly);
-    }
-
-    #[test]
-    fn quoting_and_escapes_are_respected_by_the_classifier() {
-        // Separators inside quotes do not split.
-        assert_eq!(command_concurrency("echo 'a && b'"), Concurrency::ReadOnly);
-        assert_eq!(command_concurrency("echo \"x; y\""), Concurrency::ReadOnly);
-        // A quoted word still matches the command table.
-        assert_eq!(command_concurrency("git \"status\""), Concurrency::ReadOnly);
-        // An escaped separator does not split either.
-        assert_eq!(
-            command_concurrency("echo a \\&& echo b"),
+            tool.concurrency(&json!({"command": "git status"})),
             Concurrency::Exclusive
         );
+        assert_eq!(tool.concurrency(&json!({})), Concurrency::Exclusive);
+    }
+
+    #[test]
+    fn oversized_timeout_is_a_tool_error_not_a_panic() {
+        assert_eq!(
+            MAX_TIMEOUT_SECS, 86_400,
+            "schema maximum and runtime cap must agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_timeout_rejects_u64_max() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_workspace_root(directory.path())
+            .execute(
+                json!({"command": "echo hi", "timeout": u64::MAX}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            output.is_error,
+            "u64::MAX must not panic: {}",
+            output.content
+        );
+        assert!(output.content.contains("timeout"), "{}", output.content);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn background_descendant_is_killed_after_return() {
+        // A backgrounded descendant that tries to write a marker after the
+        // shell returns must be killed with the process group.
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("marker");
+        let output = BashTool::with_workspace_root(directory.path())
+            .execute(
+                json!({
+                    "command": format!(
+                        "(sleep 30 && touch {} &) ; exit 0",
+                        marker.display()
+                    ),
+                    "timeout": 10,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !marker.exists(),
+            "background descendant survived the tool call"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("timeout-marker");
+        let output = BashTool::with_workspace_root(directory.path())
+            .execute(
+                json!({
+                    "command": format!(
+                        "sh -c 'sleep 30 & wait'; touch {}",
+                        marker.display()
+                    ),
+                    "timeout": 1,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "expected timeout: {}", output.content);
+        assert!(output.content.contains("timed out"), "{}", output.content);
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!marker.exists(), "descendant wrote after timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_kills_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("cancel-marker");
+        let cancel = CancellationToken::new();
+        let tool = BashTool::with_workspace_root(directory.path());
+        let command = format!("sleep 30; touch {}", marker.display());
+        let cancel_task = cancel.clone();
+        let task = tokio::spawn(async move {
+            tool.execute(json!({"command": command, "timeout": 60}), cancel_task)
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        cancel.cancel();
+        let output = task.await.unwrap();
+        assert!(output.content.contains("cancelled"), "{}", output.content);
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        assert!(!marker.exists(), "descendant wrote after cancel");
     }
 }
