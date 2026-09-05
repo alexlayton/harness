@@ -67,12 +67,12 @@ impl fmt::Debug for McpTransportConfig {
             Self::Stdio { command, args, env } => f
                 .debug_struct("Stdio")
                 .field("command", command)
-                .field("args", args)
+                .field("args", &format_args!("<{} entries redacted>", args.len()))
                 .field("env", &format_args!("<{} entries redacted>", env.len()))
                 .finish(),
             Self::Http { url, headers } => f
                 .debug_struct("Http")
-                .field("url", &redact_url_userinfo(url))
+                .field("url", &redact_url(url))
                 .field(
                     "headers",
                     &format_args!("<{} entries redacted>", headers.len()),
@@ -195,18 +195,17 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
     Ok(())
 }
 
-fn redact_url_userinfo(url: &str) -> String {
-    match url.find("://") {
-        Some(scheme_end) => match url[scheme_end + 3..].find('@') {
-            Some(userinfo_end) => format!(
-                "{}://<redacted>@{}",
-                &url[..scheme_end],
-                &url[scheme_end + 4 + userinfo_end..]
-            ),
-            None => url.to_owned(),
-        },
-        None => url.to_owned(),
+fn redact_url(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "<redacted URL>".into();
+    };
+    if url.username() != "" {
+        let _ = url.set_username("<redacted>");
     }
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
 }
 
 pub(crate) fn expand_environment(
@@ -265,7 +264,40 @@ mod tests {
         };
         assert_eq!(args, &["secret"]);
         assert_eq!(env["AUTH"], "Bearer secret");
-        assert!(format!("{:?}", resolved[0]).contains("redacted"));
+        let debug = format!("{:?}", resolved[0]);
+        assert!(debug.contains("redacted"));
+        assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn debug_redacts_http_credentials_query_and_fragment() {
+        let config = McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransportConfig::Http {
+                url: "https://user:password@example.test/path?token=resolved-secret#fragment"
+                    .into(),
+                headers: BTreeMap::new(),
+            },
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("example.test/path"));
+        assert!(!debug.contains("password"));
+        assert!(!debug.contains("resolved-secret"));
+        assert!(!debug.contains("fragment"));
+    }
+
+    #[test]
+    fn debug_redacts_unparseable_urls() {
+        let config = McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransportConfig::Http {
+                url: "https://[not-a-url]?secret=raw".into(),
+                headers: BTreeMap::new(),
+            },
+        };
+        let debug = format!("{config:?}");
+        assert!(debug.contains("<redacted URL>"));
+        assert!(!debug.contains("not-a-url"));
     }
 
     #[test]

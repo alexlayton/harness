@@ -1,14 +1,17 @@
-use crate::McpError;
 use crate::client::HarnessClient;
 use crate::config::{McpServerConfig, McpTransportConfig};
 use crate::tool::McpTool;
+use crate::{
+    MCP_INITIALIZE_TIMEOUT, MCP_LIST_TIMEOUT, MCP_SHUTDOWN_TIMEOUT, MCP_STDERR_CHUNK_BYTES,
+    McpError,
+};
 use rmcp::ClientLifecycleMode;
 use rmcp::model::Tool as RemoteTool;
 use rmcp::service::{RoleClient, RunningService, serve_client_with_lifecycle_and_ct};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use std::path::Path;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tools::ToolRegistry;
@@ -75,18 +78,24 @@ impl McpRuntime {
         Ok(())
     }
 
-    /// Close protocol services, reap stdio children, and stop stderr readers.
+    /// Close protocol services, reap stdio children, and stop stderr readers
+    /// under one global deadline rather than one timeout per server.
     pub async fn shutdown(mut self) {
-        for server in &mut self.servers {
-            let _ = server
-                .client
-                .close_with_timeout(std::time::Duration::from_secs(4))
-                .await;
+        let mut servers = std::mem::take(&mut self.servers);
+        let _ = tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, async {
+            for server in &mut servers {
+                let _ = server.client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
+            }
+        })
+        .await;
+        for server in &mut servers {
             if let Some(task) = server.stderr_task.take() {
                 task.abort();
                 let _ = task.await;
             }
         }
+        // Dropping the services after the deadline releases their transports;
+        // the configured child process uses kill-on-drop below.
     }
 }
 
@@ -104,6 +113,7 @@ async fn connect_server(
     };
     let mut command = tokio::process::Command::new(command);
     command
+        .kill_on_drop(true)
         .args(args)
         .current_dir(workspace_root)
         .envs(env)
@@ -118,19 +128,52 @@ async fn connect_server(
         .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
     let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
     let handler = HarnessClient::new(workspace_root)?;
-    let client = serve_client_with_lifecycle_and_ct(
-        handler,
-        transport,
-        ClientLifecycleMode::Initialize,
-        cancel,
+    let server_cancel = cancel.child_token();
+    let mut client = match tokio::time::timeout(
+        MCP_INITIALIZE_TIMEOUT,
+        serve_client_with_lifecycle_and_ct(
+            handler,
+            transport,
+            ClientLifecycleMode::Initialize,
+            server_cancel.clone(),
+        ),
     )
     .await
-    .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
-    let tools = client
-        .peer()
-        .list_all_tools()
-        .await
-        .map_err(|error| McpError::operation(&server.name, "tools/list", error))?;
+    {
+        Ok(Ok(client)) => client,
+        Ok(Err(error)) => {
+            abort_stderr_task(stderr_task).await;
+            return Err(McpError::operation(&server.name, "initialize", error));
+        }
+        Err(_) => {
+            server_cancel.cancel();
+            abort_stderr_task(stderr_task).await;
+            return Err(McpError::operation(
+                &server.name,
+                "initialize",
+                "request timed out",
+            ));
+        }
+    };
+    let tools = match tokio::time::timeout(MCP_LIST_TIMEOUT, client.peer().list_all_tools()).await {
+        Ok(Ok(tools)) => tools,
+        Ok(Err(error)) => {
+            server_cancel.cancel();
+            let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
+            abort_stderr_task(stderr_task).await;
+            return Err(McpError::operation(&server.name, "tools/list", error));
+        }
+        Err(_) => {
+            server_cancel.cancel();
+            let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
+            abort_stderr_task(stderr_task).await;
+            return Err(McpError::operation(
+                &server.name,
+                "tools/list",
+                "request timed out",
+            ));
+        }
+    };
     tracing::debug!(server = %server.name, tools = tools.len(), "connected MCP server");
     Ok(ConnectedServer {
         name: server.name.clone(),
@@ -140,12 +183,25 @@ async fn connect_server(
     })
 }
 
-fn spawn_stderr_reader(name: String, stderr: tokio::process::ChildStderr) -> JoinHandle<()> {
+fn spawn_stderr_reader(name: String, mut stderr: tokio::process::ChildStderr) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let line = llm::util::truncate_utf8(&line, 2048);
-            tracing::debug!(server = %name, stderr = %line, "MCP server stderr");
+        let mut buffer = [0u8; MCP_STDERR_CHUNK_BYTES];
+        let mut bytes = 0usize;
+        while let Ok(read) = stderr.read(&mut buffer).await {
+            if read == 0 {
+                break;
+            }
+            bytes = bytes.saturating_add(read);
+        }
+        if bytes > 0 {
+            tracing::debug!(server = %name, bytes, "MCP server emitted stderr");
         }
     })
+}
+
+async fn abort_stderr_task(task: Option<JoinHandle<()>>) {
+    if let Some(task) = task {
+        task.abort();
+        let _ = task.await;
+    }
 }

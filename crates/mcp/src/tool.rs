@@ -1,3 +1,4 @@
+use crate::MCP_CALL_TIMEOUT;
 use crate::output::flatten;
 use crate::{McpError, normalized_tool_name};
 use async_trait::async_trait;
@@ -9,6 +10,8 @@ use rmcp::model::{
 };
 use rmcp::service::{PeerRequestOptions, RoleClient};
 use serde_json::Value;
+use std::fmt;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tools::{Tool, ToolOutput, ToolPrompt, ToolSpec};
 
@@ -82,23 +85,35 @@ impl Tool for McpTool {
         let params =
             CallToolRequestParams::new(self.original_name.clone()).with_arguments(arguments);
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
+        let deadline = tokio::time::Instant::now().checked_add(MCP_CALL_TIMEOUT);
+        let Some(deadline) = deadline else {
+            return self.error("MCP tool call deadline overflow");
+        };
         let mut handle = tokio::select! {
             _ = cancel.cancelled() => return self.error("MCP tool call cancelled"),
-            result = self.peer.send_cancellable_request(request, PeerRequestOptions::no_options()) => match result {
-                Ok(handle) => handle,
-                Err(error) => return self.error(&format!("MCP tools/call failed: {error}")),
+            result = tokio::time::timeout_at(
+                deadline,
+                self.peer.send_cancellable_request(request, PeerRequestOptions::no_options()),
+            ) => match result {
+                Ok(Ok(handle)) => handle,
+                Ok(Err(error)) => return self.error(format_args!("MCP tools/call failed: {error}")),
+                Err(_) => return self.error("MCP tools/call request timed out"),
             }
         };
         tokio::select! {
             _ = cancel.cancelled() => {
-                let _ = self.cancel_request(&handle).await;
+                self.cancel_request_bounded(&handle).await;
                 self.error("MCP tool call cancelled")
             }
-            result = &mut handle.rx => match result {
-                Ok(Ok(ServerResult::CallToolResult(result))) => ToolOutput { content: flatten(&result), is_error: result.is_error.unwrap_or(false), summary: self.summary() },
-                Ok(Ok(_)) => self.error("MCP tools/call returned an unsupported non-final response"),
-                Ok(Err(error)) => self.error(&format!("MCP tools/call failed: {error}")),
-                Err(_) => self.error("MCP tools/call connection closed before a response"),
+            result = tokio::time::timeout_at(deadline, &mut handle.rx) => match result {
+                Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => ToolOutput { content: flatten(&result), is_error: result.is_error.unwrap_or(false), summary: self.summary() },
+                Ok(Ok(Ok(_))) => self.error("MCP tools/call returned an unsupported non-final response"),
+                Ok(Ok(Err(error))) => self.error(format_args!("MCP tools/call failed: {error}")),
+                Ok(Err(_)) => self.error("MCP tools/call connection closed before a response"),
+                Err(_) => {
+                    self.cancel_request_bounded(&handle).await;
+                    self.error("MCP tool call timed out")
+                }
             }
         }
     }
@@ -108,6 +123,10 @@ impl McpTool {
     fn summary(&self) -> String {
         format!("{}:{}", self.server, self.original_name)
     }
+    async fn cancel_request_bounded(&self, handle: &rmcp::service::RequestHandle<RoleClient>) {
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.cancel_request(handle)).await;
+    }
+
     async fn cancel_request(
         &self,
         handle: &rmcp::service::RequestHandle<RoleClient>,
@@ -124,9 +143,9 @@ impl McpTool {
             .await
     }
 
-    fn error(&self, message: &str) -> ToolOutput {
+    fn error(&self, message: impl fmt::Display) -> ToolOutput {
         ToolOutput {
-            content: message.into(),
+            content: crate::output::cap_display(message),
             is_error: true,
             summary: self.summary(),
         }
