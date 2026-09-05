@@ -353,6 +353,42 @@ fn line_width(line: &Line<'_>) -> usize {
         .sum()
 }
 
+/// Fit a styled row to a terminal-column budget without leaking controls or
+/// emitting a wide glyph into a smaller remaining space.
+pub(crate) fn fit_line_to_width(line: &Line<'_>, width: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for span in &line.spans {
+        let content = sanitize_terminal_text(span.content.as_ref());
+        let mut kept = String::new();
+        for character in content.chars() {
+            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+            if character_width > 0 && used.saturating_add(character_width) > width {
+                continue;
+            }
+            kept.push(character);
+            used = used.saturating_add(character_width);
+        }
+        if !kept.is_empty() {
+            spans.push(Span::styled(kept, span.style));
+        }
+        if used >= width {
+            break;
+        }
+    }
+    Line::from(spans).style(line.style)
+}
+
+fn fit_text_to_width(text: &str, width: usize) -> String {
+    let line = Line::from(text.to_owned());
+    let fitted = fit_line_to_width(&line, width);
+    fitted
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 /// Wrap a styled Ratatui text value while preserving span styles. Text is
 /// wrapped at whitespace when possible; a single word is split only when it
 /// is wider than the available line. This is the common measurement/rendering
@@ -383,7 +419,7 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
             let style = line_base.patch(source_span.style);
             let content = sanitize_terminal_text(source_span.content.as_ref());
             source_chars.extend(content.chars().map(|character| {
-                let character_width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
+                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
                 (character, style, character_width)
             }));
         }
@@ -412,8 +448,18 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
 
             if is_whitespace {
                 if current.is_empty() {
-                    current.extend_from_slice(group);
-                    current_width = current_width.saturating_add(group_width);
+                    // Leading indentation is meaningful, but it still has to
+                    // be chunked so a long run cannot overflow a narrow row.
+                    for &(character, style, character_width) in group {
+                        if character_width > 0
+                            && current_width.saturating_add(character_width) > width
+                        {
+                            result.push(wrapped_line(std::mem::take(&mut current)));
+                            current_width = 0;
+                        }
+                        current.push((character, style, character_width));
+                        current_width = current_width.saturating_add(character_width);
+                    }
                 } else {
                     pending_whitespace.extend_from_slice(group);
                     pending_width = pending_width.saturating_add(group_width);
@@ -440,7 +486,17 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
             }
 
             for &(character, style, character_width) in group {
-                if current_width > 0 && current_width.saturating_add(character_width) > width {
+                if character_width > width {
+                    // A width-two glyph cannot fit a one-column terminal. It
+                    // is safer to omit that glyph than to let the terminal
+                    // wrap it into an untracked row.
+                    if !current.is_empty() {
+                        result.push(wrapped_line(std::mem::take(&mut current)));
+                        current_width = 0;
+                    }
+                    continue;
+                }
+                if character_width > 0 && current_width.saturating_add(character_width) > width {
                     result.push(wrapped_line(std::mem::take(&mut current)));
                     current_width = 0;
                 }
@@ -603,9 +659,15 @@ pub(crate) fn prefix_message_lines(
     lines: Vec<Line<'static>>,
     prefix: &str,
     theme: Theme,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let prefix_style = message_prefix_style(theme);
-    let continuation = " ".repeat(UnicodeWidthStr::width(prefix));
+    // A terminal narrower than the normal two-column prefix gets a shortened
+    // prefix rather than an over-wide row. Content is fitted after the prefix
+    // so this invariant also holds for width 1.
+    let prefix = fit_text_to_width(prefix, width);
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let continuation = " ".repeat(prefix_width);
     let mut has_prefix = false;
     lines
         .into_iter()
@@ -617,11 +679,12 @@ pub(crate) fn prefix_message_lines(
                 Span::raw(continuation.clone())
             } else {
                 has_prefix = true;
-                Span::styled(prefix.to_owned(), prefix_style)
+                Span::styled(prefix.clone(), prefix_style)
             };
+            let content = fit_line_to_width(&line, width.saturating_sub(prefix_width));
             Line::from(
                 std::iter::once(prefix)
-                    .chain(line.spans)
+                    .chain(content.spans)
                     .collect::<Vec<_>>(),
             )
         })
@@ -629,9 +692,7 @@ pub(crate) fn prefix_message_lines(
 }
 
 fn message_content_width(width: usize) -> usize {
-    width
-        .saturating_sub(UnicodeWidthStr::width(USER_PREFIX))
-        .max(1)
+    width.saturating_sub(UnicodeWidthStr::width(USER_PREFIX))
 }
 
 pub(crate) fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
@@ -645,6 +706,7 @@ pub(crate) fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<
         wrap_text(&text, message_content_width(width), assistant_style(theme)),
         ASSISTANT_PREFIX,
         theme,
+        width,
     )
 }
 
@@ -657,6 +719,7 @@ pub(crate) fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Line<'s
         ),
         USER_PREFIX,
         theme,
+        width,
     )
 }
 
@@ -669,7 +732,7 @@ pub(crate) fn notice_lines(notice: &str, theme: Theme, width: usize) -> Vec<Line
             let prefix = if index == 0 { "· " } else { "  " };
             let mut spans = vec![Span::styled(prefix, dim_style(theme))];
             spans.extend(line.spans);
-            Line::from(spans)
+            fit_line_to_width(&Line::from(spans), width)
         })
         .collect()
 }
@@ -683,7 +746,7 @@ pub(crate) fn error_lines(error: &str, theme: Theme, width: usize) -> Vec<Line<'
             let prefix = if index == 0 { "✗ " } else { "  " };
             let mut spans = vec![Span::styled(prefix, error_style(theme))];
             spans.extend(line.spans);
-            Line::from(spans)
+            fit_line_to_width(&Line::from(spans), width)
         })
         .collect()
 }
@@ -804,6 +867,47 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(user_values, vec!["› I can", "  still"]);
         assert_eq!(assistant_values, vec!["‹ I can", "  still"]);
+    }
+
+    #[test]
+    fn narrow_rows_never_exceed_their_display_budget() {
+        for width in 1..=3 {
+            let text = Text::from(Line::from("   \t你好👨‍👩‍👧‍👦"));
+            let lines = wrap_text(&text, width, Style::default());
+            assert!(
+                lines.iter().all(|line| line_width(line) <= width),
+                "width {width}: {lines:?}"
+            );
+            assert!(
+                user_lines("  你好\ttext", Theme::default(), width)
+                    .iter()
+                    .all(|line| line_width(line) <= width)
+            );
+            assert!(
+                markdown_lines("**你好\ttext**", Theme::default(), width)
+                    .iter()
+                    .all(|line| line_width(line) <= width)
+            );
+            assert!(
+                notice_lines("notice\t你好", Theme::default(), width)
+                    .iter()
+                    .all(|line| line_width(line) <= width)
+            );
+            assert!(
+                error_lines("error\t你好", Theme::default(), width)
+                    .iter()
+                    .all(|line| line_width(line) <= width)
+            );
+        }
+    }
+
+    #[test]
+    fn fit_line_preserves_styles_while_dropping_wide_overflow() {
+        let style = Style::default().fg(Theme::default().accent);
+        let line = fit_line_to_width(&Line::from(Span::styled("a你b", style)), 2);
+        assert_eq!(line_width(&line), 2);
+        assert_eq!(span_contents(&line), "ab");
+        assert_eq!(line.spans[0].style, style);
     }
 
     #[test]

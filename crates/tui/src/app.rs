@@ -88,6 +88,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -237,6 +238,17 @@ struct RunningRegion {
     rows: usize,
 }
 
+/// Terminal modes successfully enabled by one UI instance. Cleanup only
+/// reverses modes recorded here, so a partial setup cannot pop another
+/// component's keyboard state.
+#[derive(Default)]
+struct TerminalModes {
+    raw_mode: bool,
+    bracketed_paste: bool,
+    keyboard_flags: bool,
+    newline_written: bool,
+}
+
 /// The direct-crossterm UI. See the module docs for the screen model; the
 /// struct is consumed externally only through `CrossTerm::new` and
 /// `CrossTerm::run`.
@@ -328,6 +340,7 @@ pub struct CrossTerm {
     /// that row instead of the whole region.
     activity_region_row: Option<usize>,
 
+    modes: Arc<Mutex<TerminalModes>>,
     restored: bool,
 }
 
@@ -389,6 +402,7 @@ impl CrossTerm {
             cursor_row: 0,
             cursor_col: 0,
             activity_region_row: None,
+            modes: Arc::new(Mutex::new(TerminalModes::default())),
             restored: false,
         }
     }
@@ -405,7 +419,6 @@ impl CrossTerm {
         reasoning: &str,
         minimal: bool,
     ) -> Result<Self> {
-        install_panic_hook();
         let (width, height) = terminal::size().unwrap_or((80, 24));
         let mut ui = Self::base(
             model,
@@ -418,20 +431,31 @@ impl CrossTerm {
         );
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
+        install_panic_hook(ui.modes.clone());
         terminal::enable_raw_mode().context("enable terminal raw mode")?;
+        ui.modes.lock().unwrap().raw_mode = true;
         if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
-            let _ = terminal::disable_raw_mode();
-            return Err(error).context("configure terminal input");
+            let mut result = anyhow::Error::new(error).context("configure terminal input");
+            if let Some(restore_error) = ui.restore().err() {
+                result =
+                    result.context(format!("terminal restoration also failed: {restore_error}"));
+            }
+            return Err(result);
         }
+        ui.modes.lock().unwrap().bracketed_paste = true;
         // The kitty keyboard protocol makes Shift+Enter report as `Enter` with
         // the SHIFT modifier, which the input handler already maps to a newline
         // (works on Ghostty; iTerm/Terminal.app do not support it). Only
         // `DISAMBIGUATE_ESCAPE_CODES` is pushed — `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
         // would swallow plain characters. Popped in `restore` and the panic hook.
-        let _ = execute!(
+        if execute!(
             ui.out,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
+        )
+        .is_ok()
+        {
+            ui.modes.lock().unwrap().keyboard_flags = true;
+        }
         // The cursor stays visible: it *is* the input caret, sitting right
         // after the `› ` prefix. No hide, no fake cell.
         Ok(ui)
@@ -445,7 +469,14 @@ impl CrossTerm {
     ) -> Result<()> {
         let result = self.run_inner(&mut events, input_tx, cancel).await;
         let restore = self.restore();
-        result.and(restore)
+        match (result, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(restore_error)) => {
+                Err(error.context(format!("terminal restoration also failed: {restore_error}")))
+            }
+        }
     }
 
     async fn run_inner(
@@ -536,6 +567,9 @@ impl CrossTerm {
         let Some(row) = self.activity_region_row else {
             return Ok(false);
         };
+        if row >= self.region.len() {
+            return Ok(false);
+        }
         let theme = self.theme;
         let gutter = render::horizontal_pad(self.width) as usize;
         let line = activity_line(self.activity, self.spinner, theme);
@@ -545,7 +579,7 @@ impl CrossTerm {
             let _ = write!(buffer, "{}", MoveUp(up as u16));
         }
         let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
-        write_row(&mut buffer, &line, gutter);
+        write_row(&mut buffer, &line, gutter, self.width as usize);
         if up > 0 {
             let _ = write!(buffer, "\r{}", MoveDown(up as u16));
         }
@@ -647,10 +681,16 @@ impl CrossTerm {
             KeyCode::Delete => delete_forward(&mut self.input, &mut self.cursor),
             KeyCode::Left => move_left(&self.input, &mut self.cursor),
             KeyCode::Right => move_right(&self.input, &mut self.cursor),
-            KeyCode::Home | KeyCode::Char('a') if control => {
+            KeyCode::Home => {
                 self.cursor = line_bounds(&self.input, self.cursor).0;
             }
-            KeyCode::End | KeyCode::Char('e') if control => {
+            KeyCode::End => {
+                self.cursor = line_bounds(&self.input, self.cursor).1;
+            }
+            KeyCode::Char('a') if control => {
+                self.cursor = line_bounds(&self.input, self.cursor).0;
+            }
+            KeyCode::Char('e') if control => {
                 self.cursor = line_bounds(&self.input, self.cursor).1;
             }
             // Up/Down move within a multi-line draft; at the top/bottom edge
@@ -1653,10 +1693,11 @@ impl CrossTerm {
         let input_width = content.saturating_sub(INPUT_PREFIX_WIDTH).max(1);
         let ghost = self.ghost_text();
         let hint = self.completion_hint(input_width);
-        input_layout(
+        input_layout_with_row_width(
             &self.input,
             self.cursor,
             input_width,
+            content,
             self.theme,
             &usage_trailer,
             &ghost,
@@ -1707,6 +1748,12 @@ impl CrossTerm {
         }
         let mut cursor_row = rows.len() + input_cursor_row;
         rows.extend(input_rows);
+        // Every producer has a local budget, but keep one final guard here so
+        // newly added metadata/tool rows cannot invalidate terminal geometry.
+        rows = rows
+            .into_iter()
+            .map(|line| render::fit_line_to_width(&line, content))
+            .collect();
 
         // Degenerate-terminal guard: the region must never exceed the screen
         // or cursor-relative moves would clamp at the top and corrupt the
@@ -1715,13 +1762,19 @@ impl CrossTerm {
             let dropped = rows.len() - self.height as usize;
             rows.drain(..dropped);
             cursor_row = cursor_row.saturating_sub(dropped).min(rows.len() - 1);
+            activity_row_index = activity_row_index.and_then(|row| row.checked_sub(dropped));
         }
 
         let gutter = render::horizontal_pad(self.width) as usize;
+        let prefix_width = INPUT_PREFIX_WIDTH.min(content);
+        let cursor_col = gutter
+            .saturating_add(prefix_width)
+            .saturating_add(input.cursor_col)
+            .min(self.width.saturating_sub(1) as usize);
         RegionBuild {
             rows,
             cursor_row,
-            cursor_col: gutter + INPUT_PREFIX_WIDTH + input.cursor_col,
+            cursor_col,
             activity_row: activity_row_index,
         }
     }
@@ -1924,7 +1977,7 @@ impl CrossTerm {
 
         for (index, line) in rows.iter().enumerate() {
             let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
-            write_row(&mut buffer, line, gutter);
+            write_row(&mut buffer, line, gutter, self.width as usize);
             if index + 1 < total {
                 buffer.push('\n');
             }
@@ -1976,13 +2029,49 @@ impl CrossTerm {
         if self.restored {
             return Ok(());
         }
-        self.restored = true;
-        terminal::disable_raw_mode().context("restore terminal raw mode")?;
-        execute!(self.out, DisableBracketedPaste).context("restore terminal input")?;
-        let _ = execute!(self.out, PopKeyboardEnhancementFlags);
-        // Leave one blank line so the shell prompt lands below the UI.
-        writeln!(self.out).context("leave terminal")?;
-        Ok(())
+        let mut first_error = None;
+        let mut modes = self.modes.lock().unwrap();
+        if modes.raw_mode {
+            if let Err(error) = terminal::disable_raw_mode().context("restore terminal raw mode") {
+                first_error.get_or_insert(error);
+            } else {
+                modes.raw_mode = false;
+            }
+        }
+        if modes.bracketed_paste {
+            if let Err(error) =
+                execute!(self.out, DisableBracketedPaste).context("restore bracketed paste")
+            {
+                first_error.get_or_insert(error);
+            } else {
+                modes.bracketed_paste = false;
+            }
+        }
+        if modes.keyboard_flags {
+            if let Err(error) = execute!(self.out, PopKeyboardEnhancementFlags)
+                .context("restore keyboard enhancement flags")
+            {
+                first_error.get_or_insert(error);
+            } else {
+                modes.keyboard_flags = false;
+            }
+        }
+        if !modes.newline_written {
+            if let Err(error) = writeln!(self.out).context("leave terminal") {
+                first_error.get_or_insert(error);
+            } else {
+                modes.newline_written = true;
+            }
+        }
+        self.restored = !modes.raw_mode
+            && !modes.bracketed_paste
+            && !modes.keyboard_flags
+            && modes.newline_written;
+        drop(modes);
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -2024,13 +2113,23 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     });
 }
 
-fn install_panic_hook() {
+fn install_panic_hook(modes: Arc<Mutex<TerminalModes>>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        let _ = writeln!(io::stdout());
+        let mut stdout = io::stdout();
+        let mut modes = modes.lock().unwrap();
+        if modes.raw_mode && terminal::disable_raw_mode().is_ok() {
+            modes.raw_mode = false;
+        }
+        if modes.bracketed_paste && execute!(stdout, DisableBracketedPaste).is_ok() {
+            modes.bracketed_paste = false;
+        }
+        if modes.keyboard_flags && execute!(stdout, PopKeyboardEnhancementFlags).is_ok() {
+            modes.keyboard_flags = false;
+        }
+        if !modes.newline_written && writeln!(stdout).is_ok() {
+            modes.newline_written = true;
+        }
         previous(panic);
     }));
 }
@@ -2069,7 +2168,10 @@ fn entry_lines(
             context_files,
             skills,
             theme,
-        ),
+        )
+        .into_iter()
+        .map(|line| render::fit_line_to_width(&line, width))
+        .collect(),
         Entry::User { text } => render::user_lines(text, theme, width),
         Entry::Assistant {
             markdown,
@@ -2314,6 +2416,7 @@ fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'stat
 /// because the input empties again). `ghost` is the fish-style dim suffix
 /// preview painted after the cursor (only at end-of-input, clamped to the row
 /// width), and `completion_hint` is one dim candidate row below the input.
+#[allow(dead_code)]
 fn input_layout(
     input: &str,
     cursor: usize,
@@ -2323,7 +2426,31 @@ fn input_layout(
     ghost: &str,
     completion_hint: &str,
 ) -> InputLayout {
+    input_layout_with_row_width(
+        input,
+        cursor,
+        width,
+        width.saturating_add(INPUT_PREFIX_WIDTH),
+        theme,
+        usage_trailer,
+        ghost,
+        completion_hint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn input_layout_with_row_width(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    row_width: usize,
+    theme: Theme,
+    usage_trailer: &str,
+    ghost: &str,
+    completion_hint: &str,
+) -> InputLayout {
     let width = width.max(1);
+    let row_width = row_width.max(1);
     let cursor = cursor.min(input.len());
     let prefix_style = Style::default()
         .fg(theme.accent)
@@ -2343,12 +2470,15 @@ fn input_layout(
         if !usage_trailer.is_empty() {
             spans.push(Span::styled(usage_trailer.to_owned(), dim_style));
         }
-        let mut rows = vec![Line::from(spans)];
+        let mut rows = vec![render::fit_line_to_width(&Line::from(spans), row_width)];
         if !completion_hint.is_empty() {
-            rows.push(Line::from(vec![
-                Span::raw(INPUT_CONTINUATION),
-                Span::styled(completion_hint.to_owned(), dim_style),
-            ]));
+            rows.push(render::fit_line_to_width(
+                &Line::from(vec![
+                    Span::raw(INPUT_CONTINUATION),
+                    Span::styled(completion_hint.to_owned(), dim_style),
+                ]),
+                row_width,
+            ));
         }
         return InputLayout {
             rows,
@@ -2367,7 +2497,7 @@ fn input_layout(
         let cursor_here = cursor >= byte_base && cursor <= line_end;
         let chars: Vec<(char, usize)> = logical
             .chars()
-            .map(|c| (c, UnicodeWidthChar::width(c).unwrap_or(1).max(1)))
+            .map(|c| (c, UnicodeWidthChar::width(c).unwrap_or(0)))
             .collect();
         let cursor_char = if cursor_here {
             Some(input[byte_base..cursor].chars().count())
@@ -2381,7 +2511,14 @@ fn input_layout(
         let mut current: Vec<(char, usize)> = Vec::new();
         let mut current_width = 0usize;
         for &(character, character_width) in &chars {
-            if current_width > 0 && current_width + character_width > width {
+            if character_width > width {
+                if !current.is_empty() {
+                    visual.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                continue;
+            }
+            if character_width > 0 && current_width + character_width > width {
                 visual.push(std::mem::take(&mut current));
                 current_width = 0;
             }
@@ -2425,7 +2562,10 @@ fn input_layout(
             } else {
                 Span::raw(INPUT_CONTINUATION)
             };
-            rows.push(Line::from(vec![lead, Span::styled(text, text_style)]));
+            rows.push(render::fit_line_to_width(
+                &Line::from(vec![lead, Span::styled(text, text_style)]),
+                row_width,
+            ));
         }
 
         byte_base = line_end + 1;
@@ -2438,10 +2578,13 @@ fn input_layout(
     // The list hint sits below the draft so opening completion never moves
     // the input or its real terminal cursor.
     if !completion_hint.is_empty() {
-        rows.push(Line::from(vec![
-            Span::raw(INPUT_CONTINUATION),
-            Span::styled(completion_hint.to_owned(), dim_style),
-        ]));
+        rows.push(render::fit_line_to_width(
+            &Line::from(vec![
+                Span::raw(INPUT_CONTINUATION),
+                Span::styled(completion_hint.to_owned(), dim_style),
+            ]),
+            row_width,
+        ));
     }
     // Ghost preview: append the dim suffix after the typed text on the
     // cursor's row. Only at end-of-input, clamped to the remaining width so
@@ -2455,7 +2598,7 @@ fn input_layout(
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum();
-        let available = width.saturating_sub(used);
+        let available = row_width.saturating_sub(used);
         let fits = ghost_to_width(ghost, available);
         if !fits.is_empty() {
             row.spans.push(Span::styled(fits, dim_style));
@@ -2866,11 +3009,13 @@ fn ansi_color(color: ratatui_core::style::Color) -> AnsiColor {
 
 /// Write one row: the shared left gutter plus the line's ANSI serialization.
 /// Blank rows become gutter-width space runs, which render identically.
-fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize) {
+fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize, width: usize) {
     if gutter > 0 {
-        buffer.push_str(&" ".repeat(gutter));
+        buffer.push_str(&" ".repeat(gutter.min(width)));
     }
-    buffer.push_str(&line_to_ansi(line));
+    let content_width = width.saturating_sub(gutter);
+    let line = render::fit_line_to_width(line, content_width);
+    buffer.push_str(&line_to_ansi(&line));
 }
 
 #[cfg(test)]
@@ -2895,6 +3040,13 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn row_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
     }
 
     fn record(status: ToolStatus) -> ToolRecord {
@@ -3198,7 +3350,7 @@ mod tests {
 
         // Empty input shows the placeholder with the cursor after `› `.
         let layout = input_layout("", 0, 10, Theme::default(), "", "", "");
-        assert_eq!(row_text(&layout.rows[0]), format!("› {PLACEHOLDER}"));
+        assert_eq!(row_text(&layout.rows[0]), "› Type your ");
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 0);
     }
@@ -3393,6 +3545,81 @@ mod tests {
         assert_eq!(vertical_move(input, 1, 1), Some(5)); // after "a" → "d|efghi"
         assert_eq!(vertical_move(input, 1, -1), None); // already on the first line
         assert_eq!(vertical_move(input, input.len(), 1), None); // last line
+    }
+
+    #[test]
+    fn narrow_build_regions_keep_rows_and_cursor_bounded() {
+        for width in 1..=3 {
+            let mut ui = ui(width, 4);
+            ui.input = "你好\ttext".into();
+            ui.cursor = ui.input.len();
+            ui.busy = true;
+            let input = ui.input_layout();
+            let build = ui.build_region(&input);
+            assert!(build.rows.len() <= 4);
+            assert!(
+                build
+                    .rows
+                    .iter()
+                    .all(|line| row_width(line) <= render::content_width(width))
+            );
+            assert!(build.cursor_row < build.rows.len());
+            assert!(build.cursor_col < width as usize);
+        }
+    }
+
+    #[test]
+    fn activity_row_is_cleared_when_height_clipping_drops_it() {
+        for height in [1, 2] {
+            let mut ui = ui(20, height);
+            ui.busy = true;
+            let input = ui.input_layout();
+            let build = ui.build_region(&input);
+            assert_eq!(build.activity_row, None, "height {height}");
+            ui.region = build.rows;
+            ui.activity_region_row = build.activity_row;
+            assert!(!ui.repaint_activity_only().unwrap());
+        }
+    }
+
+    #[test]
+    fn plain_home_and_end_match_ctrl_a_and_ctrl_e() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let mut ui = ui(40, 10);
+        ui.input = "first\nsecond".into();
+        ui.cursor = ui.input.len();
+
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, "first\n".len());
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, ui.input.len());
+
+        ui.cursor = ui.input.len();
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, "first\n".len());
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, ui.input.len());
     }
 
     #[test]
