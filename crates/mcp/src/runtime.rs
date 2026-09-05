@@ -1,12 +1,12 @@
 use crate::client::HarnessClient;
 use crate::config::{McpServerConfig, McpTransportConfig};
-use crate::tool::McpTool;
+use crate::tool::{MAX_REMOTE_DEFINITION_BYTES, MAX_REMOTE_TOOLS, McpTool, validate_remote_tool};
 use crate::{
     MCP_INITIALIZE_TIMEOUT, MCP_LIST_TIMEOUT, MCP_SHUTDOWN_TIMEOUT, MCP_STDERR_CHUNK_BYTES,
     McpError,
 };
 use rmcp::ClientLifecycleMode;
-use rmcp::model::Tool as RemoteTool;
+use rmcp::model::{PaginatedRequestParams, Tool as RemoteTool};
 use rmcp::service::{RoleClient, RunningService, serve_client_with_lifecycle_and_ct};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use std::path::Path;
@@ -44,22 +44,57 @@ impl McpRuntime {
             servers: configs.clone(),
         }
         .validate()?;
-        let mut connected = Self {
-            servers: Vec::new(),
-        };
-        for server in &configs {
-            if cancel.is_cancelled() {
-                connected.shutdown().await;
+        let startup_cancel = cancel.child_token();
+        let mut tasks = tokio::task::JoinSet::new();
+        for server in configs {
+            if startup_cancel.is_cancelled() {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
                 return Err(McpError::operation(&server.name, "initialize", "cancelled"));
             }
-            match connect_server(server, workspace_root, cancel.clone()).await {
-                Ok(server) => connected.servers.push(server),
+            let workspace_root = workspace_root.to_path_buf();
+            let server_cancel = startup_cancel.clone();
+            tasks.spawn(async move {
+                connect_server(&server, &workspace_root, server_cancel)
+                    .await
+                    .map(|connected| (server.name.clone(), connected))
+            });
+        }
+
+        let mut connected = Self {
+            servers: Vec::with_capacity(tasks.len()),
+        };
+        let mut failure = None;
+        while let Some(result) = tasks.join_next().await {
+            match result {
+                Ok(Ok((_, server))) => connected.servers.push(server),
+                Ok(Err(error)) => {
+                    failure = Some(error);
+                    startup_cancel.cancel();
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    break;
+                }
                 Err(error) => {
-                    connected.shutdown().await;
-                    return Err(error);
+                    failure = Some(McpError::operation(
+                        "<mcp>",
+                        "initialize",
+                        format!("connection task failed: {error}"),
+                    ));
+                    startup_cancel.cancel();
+                    tasks.abort_all();
+                    while tasks.join_next().await.is_some() {}
+                    break;
                 }
             }
         }
+        if let Some(error) = failure {
+            connected.shutdown().await;
+            return Err(error);
+        }
+        connected
+            .servers
+            .sort_by(|left, right| left.name.cmp(&right.name));
         Ok(connected)
     }
 
@@ -155,23 +190,13 @@ async fn connect_server(
             ));
         }
     };
-    let tools = match tokio::time::timeout(MCP_LIST_TIMEOUT, client.peer().list_all_tools()).await {
-        Ok(Ok(tools)) => tools,
-        Ok(Err(error)) => {
+    let tools = match list_tools_bounded(&client, &server.name).await {
+        Ok(tools) => tools,
+        Err(error) => {
             server_cancel.cancel();
             let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
             abort_stderr_task(stderr_task).await;
-            return Err(McpError::operation(&server.name, "tools/list", error));
-        }
-        Err(_) => {
-            server_cancel.cancel();
-            let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
-            abort_stderr_task(stderr_task).await;
-            return Err(McpError::operation(
-                &server.name,
-                "tools/list",
-                "request timed out",
-            ));
+            return Err(error);
         }
     };
     tracing::debug!(server = %server.name, tools = tools.len(), "connected MCP server");
@@ -197,6 +222,53 @@ fn spawn_stderr_reader(name: String, mut stderr: tokio::process::ChildStderr) ->
             tracing::debug!(server = %name, bytes, "MCP server emitted stderr");
         }
     })
+}
+
+async fn list_tools_bounded(
+    client: &RunningService<RoleClient, HarnessClient>,
+    server: &str,
+) -> Result<Vec<RemoteTool>, McpError> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(MCP_LIST_TIMEOUT)
+        .ok_or_else(|| McpError::operation(server, "tools/list", "deadline overflow"))?;
+    let mut tools = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut cursor = None;
+    loop {
+        let page = tokio::time::timeout_at(
+            deadline,
+            client
+                .peer()
+                .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor))),
+        )
+        .await
+        .map_err(|_| McpError::operation(server, "tools/list", "request timed out"))?
+        .map_err(|error| McpError::operation(server, "tools/list", error))?;
+        for tool in page.tools {
+            if tools.len() >= MAX_REMOTE_TOOLS {
+                return Err(McpError::Operation {
+                    server: server.into(),
+                    operation: "tools/list",
+                    message: format!("tool catalogue exceeds limit of {MAX_REMOTE_TOOLS} entries"),
+                });
+            }
+            total_bytes = total_bytes.saturating_add(validate_remote_tool(server, &tool)?);
+            if total_bytes > MAX_REMOTE_DEFINITION_BYTES {
+                return Err(McpError::Operation {
+                    server: server.into(),
+                    operation: "tools/list",
+                    message: format!(
+                        "tool catalogue exceeds definition limit of {MAX_REMOTE_DEFINITION_BYTES} bytes"
+                    ),
+                });
+            }
+            tools.push(tool);
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Ok(tools);
+        }
+    }
 }
 
 async fn abort_stderr_task(task: Option<JoinHandle<()>>) {
