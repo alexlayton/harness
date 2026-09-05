@@ -46,15 +46,20 @@ fn resolve_prompt_with(
     stdin_is_tty: impl FnOnce() -> bool,
     read_stdin: impl FnOnce() -> Result<String>,
 ) -> Result<String> {
-    if !args.prompt.is_empty() {
-        return Ok(args.prompt.join(" ").trim().to_owned());
+    let prompt = if !args.prompt.is_empty() {
+        args.prompt.join(" ").trim().to_owned()
+    } else {
+        if stdin_is_tty() {
+            return Err(anyhow!(
+                "no prompt: pass a prompt argument or pipe one on stdin"
+            ));
+        }
+        read_stdin()?.trim().to_owned()
+    };
+    if prompt.is_empty() {
+        return Err(anyhow!("prompt cannot be blank"));
     }
-    if stdin_is_tty() {
-        return Err(anyhow!(
-            "no prompt: pass a prompt argument or pipe one on stdin"
-        ));
-    }
-    Ok(read_stdin()?.trim().to_owned())
+    Ok(prompt)
 }
 
 /// Install a SIGINT handler that cancels the agent's application token.  The
@@ -72,25 +77,39 @@ fn cancel_on_sigint(cancel: CancellationToken) {
 /// Drive the headless event stream until the agent task closes the channel.
 /// Writes the answer to real stdout and maps the event stream to stderr per
 /// the stdout/stderr contract.  Returns the process exit code.
+#[allow(dead_code)]
 pub async fn drive_headless_events(
     event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     verbose: bool,
+) -> ExitCode {
+    drive_headless_events_with_cancel(event_rx, verbose, None).await
+}
+
+/// Headless event driver variant that knows the application cancellation
+/// token, allowing it to discard a cancelled round's buffered prose.
+async fn drive_headless_events_with_cancel(
+    event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    verbose: bool,
+    cancellation: Option<&CancellationToken>,
 ) -> ExitCode {
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
     let mut stderr = std::io::stderr();
     // A terminal wants per-delta flushes so the answer streams visibly; pipes
     // (CI, scripting) are better served by flushing on line boundaries.
     let interactive_stdout = std::io::stdout().is_terminal();
-    let code = drive_headless_events_into(
+    let result = drive_headless_events_into(
         event_rx,
         verbose,
         &mut stdout,
         &mut stderr,
         interactive_stdout,
+        cancellation,
     )
     .await;
-    let _ = stdout.flush();
-    code
+    if stdout.flush().is_err() {
+        return ExitCode::from(1);
+    }
+    result.unwrap_or(ExitCode::from(1))
 }
 
 /// Writer-injectable core of [`drive_headless_events`] so tests can assert the
@@ -101,39 +120,49 @@ async fn drive_headless_events_into(
     stdout: &mut (impl Write + Unpin),
     stderr: &mut (impl Write + Unpin),
     interactive_stdout: bool,
-) -> ExitCode {
-    // An `AgentEvent::Error` marks the turn as failed unless a later event
-    // proves the agent recovered (it re-streamed and produced output or more
-    // tool activity).  `TurnFinished` does not clear it: it is the point where
-    // a trailing unrecovered error is turned into exit code 1.
+    cancellation: Option<&CancellationToken>,
+) -> Result<ExitCode> {
+    // Text is held until the model round is known to be text-only. Prose
+    // emitted before a tool call is an intermediate thought, not the answer a
+    // shell pipeline should consume.
+    let mut pending_text = String::new();
+    let mut active_tools = 0usize;
+    let mut reasoning_open = false;
     let mut error_pending = false;
-    // Only terminate the answer with a newline if something was actually
-    // written; a tool-only turn whose final answer is the filesystem change
-    // leaves stdout empty.
-    let mut wrote_text = false;
+    let mut saw_turn_finished = false;
 
     while let Some(event) = event_rx.recv().await {
-        let is_error = matches!(event, AgentEvent::Error(_));
-        let is_turn_finished = matches!(event, AgentEvent::TurnFinished);
         match &event {
             AgentEvent::TextDelta(delta) => {
-                wrote_text = true;
-                let _ = write!(stdout, "{delta}");
-                // Terminals flush per delta (visible streaming); piped
-                // consumers flush per line — one syscall per token buys
-                // nothing when nobody is watching live.
-                if interactive_stdout || delta.contains('\n') {
-                    let _ = stdout.flush();
+                pending_text.push_str(delta);
+                // A text delta after an error belongs to a genuine recovery;
+                // metadata, retries, and tool lifecycle events do not clear
+                // the failure state.
+                error_pending = false;
+                if interactive_stdout && active_tools == 0 {
+                    stdout.flush()?;
                 }
             }
             AgentEvent::ReasoningDelta(delta) => {
                 if verbose {
-                    let _ = writeln!(stderr, "{delta}");
+                    write!(stderr, "{delta}")?;
+                    reasoning_open = true;
                 }
             }
             AgentEvent::ToolCallStarted { summary, .. } => {
+                if !pending_text.is_empty() {
+                    if verbose {
+                        writeln!(stderr, "intermediate: {pending_text}")?;
+                    }
+                    pending_text.clear();
+                }
+                active_tools = active_tools.saturating_add(1);
+                if reasoning_open {
+                    writeln!(stderr)?;
+                    reasoning_open = false;
+                }
                 if verbose {
-                    let _ = writeln!(stderr, "▸ {summary}");
+                    writeln!(stderr, "▸ {summary}")?;
                 }
             }
             AgentEvent::ToolCallFinished {
@@ -144,28 +173,37 @@ async fn drive_headless_events_into(
                 error,
                 ..
             } => {
+                active_tools = active_tools.saturating_sub(1);
+                if active_tools == 0 {
+                    // Any text that appeared in a tool-bearing round is
+                    // intermediate as well. The next text delta starts the
+                    // final text-only round.
+                    pending_text.clear();
+                }
                 if verbose {
                     let mark = if *ok { "✓" } else { "✗" };
-                    let _ = writeln!(stderr, "{mark} {summary} ({duration_ms}ms)");
+                    writeln!(stderr, "{mark} {summary} ({duration_ms}ms)")?;
                     if let Some(error) = error {
-                        let _ = writeln!(stderr, "{error}");
+                        writeln!(stderr, "{error}")?;
                     } else if !output.is_empty() {
-                        let _ = writeln!(stderr, "{output}");
+                        writeln!(stderr, "{output}")?;
                     }
                 }
             }
             AgentEvent::Retrying { attempt, message } => {
                 if verbose {
-                    let _ = writeln!(stderr, "retry #{attempt}: {message}");
+                    writeln!(stderr, "retry #{attempt}: {message}")?;
                 }
             }
             AgentEvent::Notice(message) => {
                 if verbose {
-                    let _ = writeln!(stderr, "{message}");
+                    writeln!(stderr, "{message}")?;
                 }
             }
             AgentEvent::Error(message) => {
-                let _ = writeln!(stderr, "error: {message}");
+                pending_text.clear();
+                writeln!(stderr, "error: {message}")?;
+                error_pending = true;
             }
             AgentEvent::UsageUpdated {
                 input_tokens,
@@ -175,11 +213,11 @@ async fn drive_headless_events_into(
                 cost,
             } => {
                 if verbose {
-                    let _ = writeln!(
+                    writeln!(
                         stderr,
                         "tokens {input_tokens}/{output_tokens} (cached {cached_tokens}, \
                          reasoning {reasoning_tokens}) · ${cost}"
-                    );
+                    )?;
                 }
             }
             AgentEvent::SubscriptionUsageLoaded { provider, usage } => {
@@ -189,35 +227,48 @@ async fn drive_headless_events_into(
                         .as_deref()
                         .map(|plan| format!(" · {plan}"))
                         .unwrap_or_default();
-                    let _ = writeln!(stderr, "{provider} subscription usage{plan}");
+                    writeln!(stderr, "{provider} subscription usage{plan}")?;
                     for window in &usage.windows {
-                        let _ = writeln!(
-                            stderr,
-                            "{}: {}% used",
-                            window.label, window.used_percent
-                        );
+                        writeln!(stderr, "{}: {}% used", window.label, window.used_percent)?;
                     }
                 }
             }
             AgentEvent::TurnFinished => {
-                if wrote_text {
-                    let _ = writeln!(stdout);
+                if reasoning_open {
+                    writeln!(stderr)?;
+                    reasoning_open = false;
                 }
-                let _ = stdout.flush();
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    // A cancelled provider round may have emitted prose
+                    // before its tool calls were complete, but it is not a
+                    // final answer and must never leak to stdout.
+                    pending_text.clear();
+                    active_tools = 0;
+                }
+                if active_tools == 0 && !pending_text.is_empty() {
+                    stdout.write_all(pending_text.as_bytes())?;
+                    stdout.write_all(b"\n")?;
+                    stdout.flush()?;
+                } else {
+                    stdout.flush()?;
+                }
+                pending_text.clear();
+                active_tools = 0;
+                saw_turn_finished = true;
             }
             AgentEvent::SessionChanged { id, .. } => {
                 if verbose {
-                    let _ = writeln!(stderr, "session {id}");
+                    writeln!(stderr, "session {id}")?;
                 }
             }
             AgentEvent::ModelChanged { provider, model } => {
                 if verbose {
-                    let _ = writeln!(stderr, "model → {provider} · {model}");
+                    writeln!(stderr, "model → {provider} · {model}")?;
                 }
             }
             AgentEvent::ReasoningChanged { level } => {
                 if verbose {
-                    let _ = writeln!(stderr, "reasoning → {level}");
+                    writeln!(stderr, "reasoning → {level}")?;
                 }
             }
             AgentEvent::CompactionFinished {
@@ -227,11 +278,11 @@ async fn drive_headless_events_into(
                 reason,
             } => {
                 if verbose {
-                    let _ = writeln!(
+                    writeln!(
                         stderr,
                         "{}compacted through {compacted_through} ({summary_bytes}b) [{reason}]",
                         if *auto { "auto-" } else { "" }
-                    );
+                    )?;
                 }
             }
             AgentEvent::SessionSnapshot { .. }
@@ -242,18 +293,18 @@ async fn drive_headless_events_into(
             | AgentEvent::SkillsLoaded { .. }
             | AgentEvent::SessionExported { .. } => {}
         }
-        if is_error {
-            error_pending = true;
-        } else if !is_turn_finished {
-            error_pending = false;
-        }
     }
 
-    if error_pending {
+    if !saw_turn_finished {
+        return Err(anyhow!(
+            "agent event stream ended before the turn completed"
+        ));
+    }
+    Ok(if error_pending {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
-    }
+    })
 }
 
 /// Run one non-interactive prompt to completion and return the process code.
@@ -347,10 +398,12 @@ async fn run_headless_with_cancel(
         cancel_on_sigint(cancel.clone());
     }
 
-    let exit_code = drive_headless_events(event_rx, args.verbose).await;
+    let exit_code = drive_headless_events_with_cancel(event_rx, args.verbose, Some(&cancel)).await;
     let interrupted = cancel.is_cancelled();
     cancel.cancel();
-    let _ = agent_task.await;
+    // A closed event channel is not proof that the agent completed: preserve
+    // panics and runtime task failures instead of returning a blank success.
+    agent_task.await.context("headless agent task failed")?;
     if interrupted {
         // The agent has already persisted `TurnCancelled`; 130 mirrors the
         // conventional SIGINT status while the session flush is awaited above.
@@ -398,6 +451,23 @@ mod tests {
     }
 
     #[test]
+    fn blank_positional_prompt_is_rejected() {
+        let args = PromptArgs {
+            prompt: vec!["  ".into(), "\n".into()],
+            ..PromptArgs::default()
+        };
+        let error = resolve_prompt_with(&args, || true, || unreachable!()).unwrap_err();
+        assert!(error.to_string().contains("blank"));
+    }
+
+    #[test]
+    fn blank_stdin_prompt_is_rejected() {
+        let error =
+            resolve_prompt_with(&PromptArgs::default(), || false, || Ok(" \n".into())).unwrap_err();
+        assert!(error.to_string().contains("blank"));
+    }
+
+    #[test]
     fn tty_without_positional_is_an_error() {
         let error = resolve_prompt_with(&PromptArgs::default(), || true, || unreachable!())
             .err()
@@ -419,8 +489,30 @@ mod tests {
             let mut stderr = Vec::new();
             // Piped mode: flushes only on newlines, like CI consumers see.
             let code =
-                drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, false).await;
+                drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, false, None)
+                    .await
+                    .unwrap();
             (stdout, stderr, code)
+        })
+    }
+
+    fn route_result(
+        events: Vec<AgentEvent>,
+        verbose: bool,
+    ) -> Result<(Vec<u8>, Vec<u8>, ExitCode)> {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            for event in events {
+                tx.send(event).unwrap();
+            }
+            drop(tx);
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code =
+                drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, false, None)
+                    .await?;
+            Ok((stdout, stderr, code))
         })
     }
 
@@ -438,10 +530,74 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_round_does_not_emit_buffered_prose() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (stdout, code) = runtime.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(AgentEvent::TextDelta("partial tool request".into()))
+                .unwrap();
+            tx.send(AgentEvent::TurnFinished).unwrap();
+            drop(tx);
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let code = drive_headless_events_into(
+                rx,
+                false,
+                &mut stdout,
+                &mut stderr,
+                false,
+                Some(&cancel),
+            )
+            .await
+            .unwrap();
+            (stdout, code)
+        });
+        assert!(stdout.is_empty());
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn channel_close_without_turn_finished_is_failure() {
+        let error = route_result(vec![AgentEvent::TextDelta("partial".into())], false).unwrap_err();
+        assert!(error.to_string().contains("before the turn completed"));
+    }
+
+    #[test]
     fn default_mode_prints_text_and_stays_silent_on_stderr() {
         let (stdout, stderr, code) = route(clean_turn(), false);
         assert_eq!(String::from_utf8(stdout).unwrap(), "answer text\n");
         assert!(stderr.is_empty(), "default stderr must stay silent");
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn intermediate_round_text_is_not_written_to_stdout() {
+        let (stdout, stderr, code) = route(
+            vec![
+                AgentEvent::TextDelta("planning".into()),
+                AgentEvent::ToolCallStarted {
+                    call_id: "c".into(),
+                    name: "read".into(),
+                    summary: "read file".into(),
+                },
+                AgentEvent::ToolCallFinished {
+                    call_id: "c".into(),
+                    name: "read".into(),
+                    summary: "read file".into(),
+                    ok: true,
+                    duration_ms: 1,
+                    output: "contents".into(),
+                    error: None,
+                },
+                AgentEvent::TextDelta("final answer".into()),
+                AgentEvent::TurnFinished,
+            ],
+            false,
+        );
+        assert_eq!(stdout, b"final answer\n");
+        assert!(stderr.is_empty());
         assert_eq!(code, ExitCode::SUCCESS);
     }
 
@@ -521,7 +677,10 @@ mod tests {
             ],
             false,
         );
-        assert_eq!(String::from_utf8(stdout).unwrap(), "extra\n");
+        assert!(
+            stdout.is_empty(),
+            "failed intermediate output must not leak"
+        );
         assert!(
             String::from_utf8(stderr)
                 .unwrap()
@@ -552,6 +711,39 @@ mod tests {
                 .contains("error: http 500")
         );
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "closed",
+            ))
+        }
+    }
+
+    #[test]
+    fn writer_failure_is_reported() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let error = runtime.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tx.send(AgentEvent::TextDelta("answer".into())).unwrap();
+            tx.send(AgentEvent::TurnFinished).unwrap();
+            drop(tx);
+            let mut stdout = FailingWriter;
+            let mut stderr = Vec::new();
+            drive_headless_events_into(rx, false, &mut stdout, &mut stderr, false, None).await
+        });
+        assert!(error.is_err());
     }
 
     #[test]

@@ -7,7 +7,7 @@ mod tui_adapter;
 mod worktree;
 
 use agent::assembly::AgentBuilder;
-use agent::{AgentEvent, InputMessage, spawn_model_list};
+use agent::{AgentEvent, InputMessage};
 use anyhow::{Context, Result};
 use clap::Parser;
 use config::{
@@ -237,14 +237,6 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     ) = mpsc::unbounded_channel();
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
-
-    // A model-list failure is informational and must not delay the first UI
-    // frame or agent construction.
-    spawn_model_list(
-        provider_name.clone(),
-        provider.clone(),
-        runtime_event_tx.clone(),
-    );
 
     let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_reasoning(config.reasoning)

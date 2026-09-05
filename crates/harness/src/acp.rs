@@ -49,6 +49,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tools::{ToolConfig, ToolRegistry, default_registry};
 
@@ -59,9 +60,16 @@ const MODE_ID: &str = "work";
 
 /// Everything needed to drive one live session.
 struct SessionHandle {
-    /// Commands for the agent's run loop. Held open for the session's
-    /// lifetime; dropping the last sender lets the agent task wind down.
+    /// Commands for the agent's run loop.
     input_tx: mpsc::UnboundedSender<InputMessage>,
+    /// Cancellation owned by this ACP session, rather than shared across all
+    /// editor sessions.
+    cancel: CancellationToken,
+    /// The agent task must stop before its session file is removed.
+    agent_task: JoinHandle<()>,
+    /// The forwarder must also stop before a deleted session can emit late
+    /// protocol updates.
+    forwarder_task: JoinHandle<()>,
 }
 
 /// A prompt request parked until its turn ends. Stored in
@@ -72,6 +80,9 @@ struct InFlight {
     /// Set by `session/cancel` before the interrupt lands; distinguishes a
     /// cancelled stop from a natural end when the turn finishes.
     cancelled: bool,
+    /// Terminal agent failures are retained until `TurnFinished`, because a
+    /// recoverable provider error may be followed by a successful retry.
+    error: Option<String>,
 }
 
 /// The slice of [`AcpState`] the forwarder tasks share. Keeping it separate
@@ -90,12 +101,33 @@ impl PromptTracker {
         let Some(entry) = self.in_flight.lock().unwrap().remove(session_id) else {
             return;
         };
-        let response = match stop_reason {
-            Some(reason) => Ok(PromptResponse::new(reason)),
-            None => Err(AcError::internal_error()
-                .data("agent task ended before the turn completed".to_owned())),
+        let response = if entry.cancelled {
+            Ok(PromptResponse::new(StopReason::Cancelled))
+        } else {
+            match (entry.error, stop_reason) {
+                (Some(error), _) => Err(AcError::internal_error().data(error)),
+                (None, Some(reason)) => Ok(PromptResponse::new(reason)),
+                (None, None) => Err(AcError::internal_error()
+                    .data("agent task ended before the turn completed".to_owned())),
+            }
         };
         let _ = entry.responder.respond_with_result(response);
+    }
+
+    /// Record an agent error for the current prompt. It is resolved at the
+    /// turn boundary so recoverable provider errors can still succeed.
+    fn mark_error(&self, session_id: &str, message: &str) {
+        if let Some(entry) = self.in_flight.lock().unwrap().get_mut(session_id) {
+            entry.error = Some(format!("agent turn failed: {message}"));
+        }
+    }
+
+    /// Clear a previously observed error only when a new assistant text delta
+    /// proves the provider recovered; unrelated metadata must not do this.
+    fn clear_error(&self, session_id: &str) {
+        if let Some(entry) = self.in_flight.lock().unwrap().get_mut(session_id) {
+            entry.error = None;
+        }
     }
 
     /// Mark a pending prompt as cancelled. Returns false when nothing is in
@@ -131,25 +163,23 @@ struct AcpState {
     config: Config,
     copilot_auth: Option<Arc<CopilotAuth>>,
     no_context_files: bool,
-    /// Process-lifetime token handed to every `Agent::new`; never fired by
-    /// this frontend. Turns are interrupted with `InputMessage::Interrupt`,
-    /// mirroring how the TUI cancels a turn without killing the run loop.
-    app_cancel: CancellationToken,
     sessions: Mutex<HashMap<String, SessionHandle>>,
     prompts: Arc<PromptTracker>,
 }
 
 impl AcpState {
     fn cancel_session(&self, session_id: &str) {
-        // Mark the pending prompt first so its finishing `TurnFinished`
-        // resolves as `Cancelled`, then deliver the native interrupt.
+        // Keep the same sessions → prompts lock order as prompt submission and
+        // deletion, preventing a cancel/delete race from deadlocking.
+        let sessions = self.sessions.lock().unwrap();
+        let Some(handle) = sessions.get(session_id) else {
+            return;
+        };
         if !self.prompts.mark_cancelled(session_id) {
             // No prompt in flight: nothing meaningful to cancel.
             return;
         }
-        if let Some(handle) = self.sessions.lock().unwrap().get(session_id)
-            && handle.input_tx.send(InputMessage::Interrupt).is_err()
-        {
+        if handle.input_tx.send(InputMessage::Interrupt).is_err() {
             tracing::warn!(session = %session_id, "cancel arrived after the agent stopped");
         }
     }
@@ -206,7 +236,6 @@ where
         config,
         copilot_auth,
         no_context_files,
-        app_cancel: CancellationToken::new(),
         sessions: Mutex::new(HashMap::new()),
         prompts: Arc::new(PromptTracker {
             in_flight: Mutex::new(HashMap::new()),
@@ -415,13 +444,13 @@ impl ToolCallIds {
 
 /// Translate one agent event into at most one ACP session update. Events
 /// without an ACP counterpart (auth UX, retries, compaction notices, …) map
-/// to `None`; they stay visible in `HARNESS_LOG`. `context_window == 0`
-/// (unknown until the provider reports usage or a model catalog) suppresses
-/// usage updates rather than advertise a wrong window size.
+/// to `None`; they stay visible in `HARNESS_LOG`. Context occupancy comes from
+/// the agent's dedicated `ContextUsageUpdated` event, while cumulative billing
+/// usage is intentionally not used as a context-size proxy.
 fn translate_event(
     event: &AgentEvent,
     ids: &mut ToolCallIds,
-    context_window: u64,
+    _context_window: u64,
 ) -> Option<SessionUpdate> {
     match event {
         AgentEvent::TextDelta(delta) => Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
@@ -471,22 +500,20 @@ fn translate_event(
                 fields,
             )))
         }
-        AgentEvent::UsageUpdated { .. } if context_window == 0 => None,
-        AgentEvent::UsageUpdated {
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            reasoning_tokens: _,
-            cost,
-        } => Some(SessionUpdate::UsageUpdate(
-            UsageUpdate::new(
-                input_tokens
-                    .saturating_add(*output_tokens)
-                    .saturating_sub(*cached_tokens),
-                context_window,
-            )
-            .cost(v1::Cost::new(cost.parse().unwrap_or(0.0), "USD")),
-        )),
+        // UsageUpdated is cumulative billing telemetry. It must not be
+        // interpreted as current context occupancy and is therefore consumed
+        // only by the forwarder's cost bookkeeping.
+        AgentEvent::UsageUpdated { .. } => None,
+        AgentEvent::ContextUsageUpdated {
+            used_tokens,
+            max_tokens,
+        } => Some(SessionUpdate::UsageUpdate(UsageUpdate::new(
+            *used_tokens,
+            *max_tokens,
+        ))),
+        AgentEvent::Error(message) => Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::from(format!("error: {message}")),
+        ))),
         _ => None,
     }
 }
@@ -525,7 +552,7 @@ async fn new_session(
         Ok(servers) => servers,
         Err(error) => return respond_invalid_params(responder, error),
     };
-    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root) {
+    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root).await {
         Ok(stack) => stack,
         Err(error) => return respond_anyhow(responder, error),
     };
@@ -565,16 +592,33 @@ async fn load_session(
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
+    let raw_id = request.session_id.0.to_string();
+    if raw_id.trim() != raw_id {
+        return respond_invalid_params(
+            responder,
+            anyhow::anyhow!("ACP session IDs must be an exact UUID"),
+        );
+    }
+    let parsed_id = match session::SessionId::parse(&raw_id) {
+        Ok(id) => id,
+        Err(error) => return respond_invalid_params(responder, anyhow::Error::new(error)),
+    };
+    let id = parsed_id.to_string();
+    if state.sessions.lock().unwrap().contains_key(&id) {
+        return respond_invalid_params(
+            responder,
+            anyhow::anyhow!("session `{id}` is already loaded"),
+        );
+    }
     let mcp_servers = match acp_mcp_servers(&request.mcp_servers) {
         Ok(servers) => servers,
         Err(error) => return respond_invalid_params(responder, error),
     };
-    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root) {
+    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root).await {
         Ok(stack) => stack,
         Err(error) => return respond_anyhow(responder, error),
     };
-    let id = request.session_id.0.to_string();
-    let session = match store.load(&id) {
+    let session = match store.open(&parsed_id) {
         Ok(session) => session,
         Err(error) => {
             return respond_anyhow(
@@ -628,21 +672,62 @@ fn list_sessions(request: &ListSessionsRequest, state: &AcpState) -> ListSession
     )
 }
 
+const SESSION_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn delete_session(
     request: DeleteSessionRequest,
     responder: Responder<DeleteSessionResponse>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
     let id = request.session_id.0.to_string();
-    // Dropping the live handle closes the agent's input channel, so the run
-    // loop exits after any in-flight turn instead of fighting the deletion.
-    let _ = state.sessions.lock().unwrap().remove(&id);
+    // Reject deletion while a prompt is active. This keeps the protocol
+    // response tied to a live session and avoids deleting a file whose agent
+    // is still allowed to append a turn.
+    let handle = {
+        let mut sessions = state.sessions.lock().unwrap();
+        if state.prompts.in_flight.lock().unwrap().contains_key(&id) {
+            let _ = responder.respond_with_error(AcError::invalid_request().data(
+                "cannot delete a session while a prompt is running; cancel it first".to_owned(),
+            ));
+            return Ok(());
+        }
+        sessions.remove(&id)
+    };
+    if let Some(handle) = handle {
+        shutdown_session(handle).await;
+    }
     if let Err(error) = delete_session_everywhere(&id, &state.session_root) {
         return respond_anyhow(responder, error);
     }
     tracing::info!(session = %id, "ACP session deleted");
     let _ = responder.respond(DeleteSessionResponse::new());
     Ok(())
+}
+
+/// Stop both owners of an ACP session before its durable file is removed.
+/// Hanging tasks are aborted after one shared deadline, not one timeout per
+/// task, so a broken provider cannot delay deletion indefinitely.
+async fn shutdown_session(handle: SessionHandle) {
+    let SessionHandle {
+        input_tx,
+        cancel,
+        mut agent_task,
+        mut forwarder_task,
+    } = handle;
+    cancel.cancel();
+    drop(input_tx);
+    let stopped = tokio::time::timeout(SESSION_TASK_TIMEOUT, async {
+        let _ = (&mut agent_task).await;
+        let _ = (&mut forwarder_task).await;
+    })
+    .await
+    .is_ok();
+    if !stopped {
+        agent_task.abort();
+        forwarder_task.abort();
+        let _ = agent_task.await;
+        let _ = forwarder_task.await;
+    }
 }
 
 /// `session/delete` supplies only an id, not a cwd, so scan every workspace
@@ -674,39 +759,38 @@ async fn prompt(
     state: Arc<AcpState>,
 ) -> AcResult<()> {
     let session_id = request.session_id.0.to_string();
-    let input_tx = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions
-            .get(&session_id)
-            .map(|handle| handle.input_tx.clone())
-    };
-    let Some(input_tx) = input_tx else {
+    // Exactly one prompt in flight per session: a concurrent second prompt
+    // would interleave two conversations into one history. Acquire locks in
+    // sessions → prompts order, matching deletion and cancellation, so a
+    // prompt cannot slip in while deletion checks activity.
+    let sessions = state.sessions.lock().unwrap();
+    let Some(handle) = sessions.get(&session_id) else {
         let _ = responder.respond_with_error(
             AcError::invalid_params().data(format!("unknown session `{session_id}`")),
         );
         return Ok(());
     };
-
-    // Exactly one prompt in flight per session: a concurrent second prompt
-    // would interleave two conversations into one history.
-    {
-        let mut in_flight = state.prompts.in_flight.lock().unwrap();
-        if in_flight.contains_key(&session_id) {
-            drop(in_flight);
-            let _ =
-                responder.respond_with_error(AcError::invalid_request().data(
-                    "a prompt is already running for this session; cancel it first".to_owned(),
-                ));
-            return Ok(());
-        }
-        in_flight.insert(
-            session_id.clone(),
-            InFlight {
-                responder,
-                cancelled: false,
-            },
+    let mut in_flight = state.prompts.in_flight.lock().unwrap();
+    if in_flight.contains_key(&session_id) {
+        drop(in_flight);
+        drop(sessions);
+        let _ = responder.respond_with_error(
+            AcError::invalid_request()
+                .data("a prompt is already running for this session; cancel it first".to_owned()),
         );
+        return Ok(());
     }
+    in_flight.insert(
+        session_id.clone(),
+        InFlight {
+            responder,
+            cancelled: false,
+            error: None,
+        },
+    );
+    let input_tx = handle.input_tx.clone();
+    drop(in_flight);
+    drop(sessions);
 
     let text = flatten_prompt(&request.prompt);
     if text.trim().is_empty() {
@@ -737,15 +821,25 @@ async fn prompt(
 /// the process cwd. `rtk` stays off: it is a local shell-output preference
 /// from the developer's config file, and editor sessions should not depend on
 /// it being installed.
-fn build_session_stack(
+async fn build_session_stack(
     cwd: &std::path::Path,
     session_root: &std::path::Path,
 ) -> Result<(SessionStore, ToolRegistry)> {
-    let workspace_root = std::fs::canonicalize(cwd)
-        .with_context(|| format!("resolve session cwd `{}`", cwd.display()))?;
-    let store = SessionStore::new(session_root, &workspace_root)?;
-    let tools = default_registry(ToolConfig::new(&workspace_root, false))?;
-    Ok((store, tools))
+    let cwd = cwd.to_path_buf();
+    let session_root = session_root.to_path_buf();
+    let joined = tokio::time::timeout(
+        SESSION_TASK_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            let workspace_root = std::fs::canonicalize(&cwd)
+                .with_context(|| format!("resolve session cwd `{}`", cwd.display()))?;
+            let store = SessionStore::new(&session_root, &workspace_root)?;
+            let tools = default_registry(ToolConfig::new(&workspace_root, false))?;
+            Ok::<_, anyhow::Error>((store, tools))
+        }),
+    )
+    .await
+    .context("build ACP session stack timed out")?;
+    joined.context("build ACP session stack task failed")?
 }
 
 /// Convert ACP's session-local stdio declarations without retaining ACP wire
@@ -787,7 +881,9 @@ fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
 
 /// Spawn the agent task plus its event forwarder and register the session's
 /// input channel under `acp_session_id`. The forwarder owns everything
-/// event-shaped: notification translation and prompt-turn resolution.
+/// event-shaped: notification translation and prompt-turn resolution. The
+/// resulting task handles are retained by `SessionHandle` so lifecycle
+/// operations can stop both owners before touching session files.
 async fn spawn_agent(
     state: &AcpState,
     store: SessionStore,
@@ -797,8 +893,12 @@ async fn spawn_agent(
     acp_session_id: String,
     mcp_servers: Vec<mcp::McpServerConfig>,
 ) -> Result<()> {
+    if state.sessions.lock().unwrap().contains_key(&acp_session_id) {
+        anyhow::bail!("session `{acp_session_id}` is already loaded");
+    }
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let cancel = CancellationToken::new();
 
     let project_context = project_context_for(tools.workspace_root(), state.no_context_files);
 
@@ -806,7 +906,7 @@ async fn spawn_agent(
         state.provider.clone(),
         state.config.model.clone(),
         tools,
-        state.app_cancel.clone(),
+        cancel.clone(),
     )
     .with_reasoning(state.config.reasoning)
     .with_compaction(state.config.compaction.clone())
@@ -818,29 +918,47 @@ async fn spawn_agent(
         state.copilot_auth.clone(),
         state.config.codex_auth.clone(),
     ));
-    let agent = builder.build().await?;
-    tokio::spawn(agent.run(input_rx, event_tx));
+    let agent = tokio::time::timeout(SESSION_TASK_TIMEOUT, builder.build())
+        .await
+        .context("build ACP agent timed out")??;
+    let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
-    tokio::spawn(forward_events(
+    let forwarder_task = tokio::spawn(forward_events(
         event_rx,
         connection,
         state.prompts.clone(),
         acp_session_id.clone(),
     ));
 
-    state
-        .sessions
-        .lock()
-        .unwrap()
-        .insert(acp_session_id, SessionHandle { input_tx });
+    let duplicate = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.contains_key(&acp_session_id)
+    };
+    if duplicate {
+        // A duplicate load can race another request during assembly. Keep the
+        // original live session and stop the newly assembled pair.
+        agent_task.abort();
+        forwarder_task.abort();
+        let _ = agent_task.await;
+        let _ = forwarder_task.await;
+        anyhow::bail!("session `{acp_session_id}` is already loaded");
+    }
+    state.sessions.lock().unwrap().insert(
+        acp_session_id,
+        SessionHandle {
+            input_tx,
+            cancel,
+            agent_task,
+            forwarder_task,
+        },
+    );
     Ok(())
 }
 
 /// Consume one session's agent events until the agent task exits: translate
 /// each into a `session/update` notification and resolve the parked prompt on
-/// `TurnFinished`. Deliberately holds no input sender: the only live clones
-/// belong to the sessions map, so `session/delete` dropping the handle closes
-/// the channel and lets the agent run loop wind down.
+/// `TurnFinished`. Its task handle is owned by `SessionHandle`, and deletion
+/// waits for it after cancelling the session.
 async fn forward_events(
     mut event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     connection: ConnectionTo<agent_client_protocol::Client>,
@@ -848,9 +966,9 @@ async fn forward_events(
     acp_session_id: String,
 ) {
     let mut ids = ToolCallIds::default();
-    // Context window starts unknown (0); the model catalog refines it.
-    let mut context_window = 0u64;
-    let mut turn_done = false;
+    // Billing is cumulative and only attached to the next authoritative
+    // context update; it never determines the context occupancy itself.
+    let mut cumulative_cost = None;
     while let Some(event) = event_rx.recv().await {
         match &event {
             AgentEvent::TurnFinished => {
@@ -859,20 +977,33 @@ async fn forward_events(
                 } else {
                     StopReason::EndTurn
                 };
-                turn_done = true;
                 prompts.resolve(&acp_session_id, Some(reason));
             }
-            AgentEvent::ModelList { models, .. } => {
-                // The provider's catalog carries authoritative context
-                // lengths; prefer them over config overrides so usage updates
-                // match what the model actually accepts.
-                if let Some(window) = models.iter().find_map(|model| model.context_length) {
-                    context_window = window;
-                }
+            AgentEvent::Error(message) => {
+                prompts.mark_error(&acp_session_id, message);
+            }
+            AgentEvent::TextDelta(_) => {
+                prompts.clear_error(&acp_session_id);
+            }
+            AgentEvent::UsageUpdated { cost, .. } => {
+                cumulative_cost = cost.parse::<f64>().ok();
             }
             _ => {}
         }
-        if let Some(update) = translate_event(&event, &mut ids, context_window) {
+        let update = if let AgentEvent::ContextUsageUpdated {
+            used_tokens,
+            max_tokens,
+        } = &event
+        {
+            let update = UsageUpdate::new(*used_tokens, *max_tokens);
+            Some(SessionUpdate::UsageUpdate(match cumulative_cost {
+                Some(cost) => update.cost(v1::Cost::new(cost, "USD")),
+                None => update,
+            }))
+        } else {
+            translate_event(&event, &mut ids, 0)
+        };
+        if let Some(update) = update {
             let notification =
                 SessionNotification::new(SessionId::from(acp_session_id.clone()), update);
             // A send error means the client connection is gone; stop feeding
@@ -882,12 +1013,11 @@ async fn forward_events(
             }
         }
     }
-    // Agent task gone: fail a still-parked prompt so the editor is not left
-    // waiting on a turn that will never finish (`turn_done` distinguishes a
-    // clean shutdown after a completed turn from a crashed one).
-    if !turn_done {
-        prompts.resolve(&acp_session_id, None);
-    }
+    // Agent task gone: fail any still-parked prompt so the editor is not left
+    // waiting on a turn that will never finish. This is unconditional because
+    // completed prompts are removed at their own turn boundary; a lifetime
+    // completion flag can strand a later prompt.
+    prompts.resolve(&acp_session_id, None);
 }
 
 #[cfg(test)]
@@ -1061,24 +1191,25 @@ mod tests {
     }
 
     #[test]
-    fn usage_updates_are_suppressed_until_context_window_is_known() {
-        let event = AgentEvent::UsageUpdated {
+    fn context_usage_is_authoritative_and_billing_usage_is_not_occupancy() {
+        let billing = AgentEvent::UsageUpdated {
             input_tokens: 100,
             output_tokens: 20,
             cached_tokens: 10,
             reasoning_tokens: 5,
             cost: "0.5".into(),
         };
-        let mut ids = ToolCallIds::default();
-        assert!(
-            translate_event(&event, &mut ids, 0).is_none(),
-            "no window estimate yet: must not advertise a wrong size"
-        );
-        let update = match translate_event(&event, &mut ids, 128_000) {
-            Some(SessionUpdate::UsageUpdate(update)) => update,
-            other => panic!("expected usage update, got {other:?}"),
+        let context = AgentEvent::ContextUsageUpdated {
+            used_tokens: 95,
+            max_tokens: 128_000,
         };
-        assert_eq!(update.used, 110); // input + output - cached
+        let mut ids = ToolCallIds::default();
+        assert!(translate_event(&billing, &mut ids, 0).is_none());
+        let update = match translate_event(&context, &mut ids, 0) {
+            Some(SessionUpdate::UsageUpdate(update)) => update,
+            other => panic!("expected context usage update, got {other:?}"),
+        };
+        assert_eq!(update.used, 95);
         assert_eq!(update.size, 128_000);
     }
 
