@@ -1,3 +1,4 @@
+use super::vfs::{WorkspaceFs, split_relative};
 use super::{
     Concurrency, Tool, ToolOutput, ToolPrompt, ToolSpec, expand_tilde, normalize_workspace_root,
     resolve_workspace_path,
@@ -41,13 +42,46 @@ const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 
 impl ReadTool {
-    async fn resolve_path(&self, path: &str) -> Result<PathBuf, String> {
-        // First try the workspace-rooted resolution (handles containment,
-        // lexical `..`, symlink escapes).
-        if let Ok(resolved) =
-            resolve_workspace_path(path, self.workspace_root.as_deref(), false).await
-        {
-            return Ok(resolved);
+    /// Resolve `path` to workspace-relative components, or to an allowed
+    /// skill path. Returns the components plus an optional pre-opened
+    /// skill file (skill paths live outside the workspace handle).
+    async fn resolve_components(&self, path: &str) -> Result<ReadTarget, String> {
+        if let Some(root) = self.workspace_root.as_deref() {
+            // Workspace-relative (or absolute-but-inside) paths become
+            // components for the handle-relative open below. Absolute
+            // paths inside the root are relativized; anything else falls
+            // through to the skill allowlist.
+            let candidate = PathBuf::from(path);
+            let as_relative = if candidate.is_absolute() {
+                let canonical_root = std::fs::canonicalize(root)
+                    .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
+                let canonical = std::fs::canonicalize(&candidate).map_err(|_| String::new())?;
+                canonical
+                    .strip_prefix(&canonical_root)
+                    .ok()
+                    .map(|rel| rel.to_string_lossy().into_owned())
+            } else {
+                Some(path.to_owned())
+            };
+            if let Some(relative) = as_relative {
+                match split_relative(&relative) {
+                    Ok(components) => return Ok(ReadTarget::Workspace(components)),
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                        return Err(format!("cannot read {path}: {error}"));
+                    }
+                    Err(_) => {}
+                }
+            }
+            // Fall back to the legacy validator for its precise
+            // workspace-relative error messages (tests assert on them).
+            if resolve_workspace_path(path, Some(root), false)
+                .await
+                .is_ok()
+            {
+                return split_relative(path)
+                    .map(ReadTarget::Workspace)
+                    .map_err(|error| format!("cannot read {path}: {error}"));
+            }
         }
         // Otherwise, allow an absolute path that is under one of the allowed
         // skill paths (or a `~`-expanded absolute under one of them). `read`
@@ -67,12 +101,67 @@ impl ReadTool {
                 if let Ok(base) = fs::canonicalize(base).await
                     && canonical.starts_with(&base)
                 {
-                    return Ok(canonical);
+                    return Ok(ReadTarget::Skill(canonical));
                 }
             }
         }
         Err("path is outside workspace root and not an allowed skill path".to_owned())
     }
+}
+
+/// Where a `read` resolves to: workspace components opened through the
+/// validated handle, or an allowlisted skill file opened directly.
+enum ReadTarget {
+    Workspace(Vec<String>),
+    Skill(PathBuf),
+}
+
+/// Open a resolved target, preserving workspace-relative error messages
+/// without leaking outside paths. Workspace files go through the
+/// validated handle (`O_NOFOLLOW` per component); skill files keep the
+/// existing canonicalize-and-compare allowlist check.
+async fn open_target(
+    target: &ReadTarget,
+    root: Option<&std::path::Path>,
+) -> Result<fs::File, String> {
+    match target {
+        ReadTarget::Skill(path) => fs::File::open(path)
+            .await
+            .map_err(|error| format!("cannot read file: {error}")),
+        ReadTarget::Workspace(components) => {
+            let Some(root) = root else {
+                return Err("cannot read file: no workspace root".into());
+            };
+            #[cfg(unix)]
+            {
+                let fs = WorkspaceFs::open_root(root)
+                    .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
+                let fd = super::vfs::unix::open_file_relative(&fs, components)
+                    .map_err(|error| format!("cannot read file: {error}"))?;
+                Ok(fd_into_tokio_file(fd))
+            }
+            #[cfg(not(unix))]
+            {
+                let candidate = components
+                    .iter()
+                    .fold(root.to_path_buf(), |base, part| base.join(part));
+                fs::File::open(&candidate)
+                    .await
+                    .map_err(|error| format!("cannot read file: {error}"))
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn fd_into_tokio_file(fd: std::os::fd::OwnedFd) -> fs::File {
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: `fd` is owned (came from `openat`); transferring it to a
+    // `std::fs::File` preserves single ownership, then into tokio.
+    let raw = fd.into_raw_fd();
+    let std_file = unsafe { std::fs::File::from_raw_fd(raw) };
+    fs::File::from_std(std_file)
 }
 
 #[async_trait]
@@ -121,8 +210,12 @@ impl Tool for ReadTool {
             return error(&format!("read {path}"), "cancelled");
         }
 
-        let full_path = match self.resolve_path(&path).await {
-            Ok(path) => path,
+        // Resolve to components first (lexical confinement + legacy error
+        // messages), then open through the validated workspace handle so
+        // the file read is the file that was validated — not a later name
+        // lookup through mutable ancestors.
+        let target = match self.resolve_components(&path).await {
+            Ok(target) => target,
             Err(message) => {
                 return error(
                     &format!("read {path}"),
@@ -130,28 +223,10 @@ impl Tool for ReadTool {
                 );
             }
         };
-        let metadata = match fs::metadata(&full_path).await {
-            Ok(metadata) => metadata,
-            Err(io_error) => {
-                return error(
-                    &format!("read {path}"),
-                    &format!("cannot read {path}: {io_error}"),
-                );
-            }
-        };
-        if metadata.is_dir() {
-            return error(
-                &format!("read {path}"),
-                &format!("cannot read {path}: is a directory"),
-            );
-        }
-        let file = match fs::File::open(&full_path).await {
+        let file = match open_target(&target, self.workspace_root.as_deref()).await {
             Ok(file) => file,
-            Err(io_error) => {
-                return error(
-                    &format!("read {path}"),
-                    &format!("cannot read {path}: {io_error}"),
-                );
+            Err(message) => {
+                return error(&format!("read {path}"), &message);
             }
         };
         let selected = match stream_range(file, offset, limit, &cancel).await {
@@ -374,5 +449,41 @@ mod tests {
             output.content
         );
         assert!(!output.content.contains("top secret"));
+    }
+
+    /// End-to-end TOCTOU barrier for `read`: resolve, swap an ancestor for
+    /// an external symlink, then execute. The handle-relative open must
+    /// refuse the swapped tree and leave both files unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_cannot_read_through_swapped_ancestor() {
+        let workspace = tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "EXTERNAL-SECRET").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), "inside-content").unwrap();
+        let tool = ReadTool::with_workspace_root(&root);
+        // Warm the resolution path, then swap the ancestor.
+        let before = tool
+            .execute(json!({"path": "sub/file.txt"}), CancellationToken::new())
+            .await;
+        assert!(!before.is_error, "{}", before.content);
+        assert!(before.content.contains("inside-content"));
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+        let output = tool
+            .execute(json!({"path": "sub/file.txt"}), CancellationToken::new())
+            .await;
+        assert!(output.is_error, "read escaped: {}", output.content);
+        assert!(
+            !output.content.contains("EXTERNAL-SECRET"),
+            "leaked: {}",
+            output.content
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "EXTERNAL-SECRET"
+        );
     }
 }

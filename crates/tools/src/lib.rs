@@ -9,6 +9,7 @@ mod read;
 mod registry;
 pub mod skills;
 mod subagent;
+pub mod vfs;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
@@ -695,5 +696,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
+    }
+
+    /// Swap an ancestor directory for an external symlink between the
+    /// production resolution step and the handle-relative open, and assert
+    /// the open still cannot escape. This is the deterministic TOCTOU
+    /// barrier the plan requires: resolution and I/O are separated by an
+    /// explicit filesystem mutation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ancestor_swap_between_resolve_and_open_cannot_escape() {
+        use crate::vfs::{WorkspaceFs, split_relative};
+        let workspace = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), "inside").unwrap();
+
+        // 1. Resolve while the tree is intact (production step).
+        let resolved = resolve_workspace_path("sub/file.txt", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("sub/file.txt"));
+        let components = split_relative("sub/file.txt").unwrap();
+
+        // 2. Barrier: swap the ancestor for an external symlink.
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+
+        // 3. The handle-relative open must not follow the swapped ancestor.
+        let fs = WorkspaceFs::open_root(&root).unwrap();
+        let error = crate::vfs::unix::open_file_relative(&fs, &components).unwrap_err();
+        assert!(
+            error.to_string().contains("outside workspace")
+                || error.to_string().contains("symlink"),
+            "unexpected: {error:?}"
+        );
+        // And the workspace file is untouched, as is the outside file.
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
     }
 }

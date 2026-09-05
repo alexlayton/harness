@@ -16,6 +16,11 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt",
 tokio-util = "0.7"
 tracing = "0.1"
 
+[target.'cfg(unix)'.dependencies]
+# Directory-handle-relative path resolution (`openat`/`O_NOFOLLOW`) for the
+# TOCTOU-safe open path in `vfs.rs`. No new dependency on other platforms.
+rustix = { version = "1.1", features = ["fs", "process"] }
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

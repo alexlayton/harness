@@ -1,4 +1,5 @@
 use super::file_mutation::{atomic_write, with_file_mutation_lock};
+use super::vfs::{WorkspaceFs, split_relative};
 use super::{
     Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
 };
@@ -60,9 +61,21 @@ impl Tool for WriteTool {
             return error(&format!("write {path}"), "cancelled");
         }
 
-        let full_path =
+        // Resolve lexically first (for precise workspace-relative errors),
+        // then commit through the validated parent handle: the temp file is
+        // created and renamed relative to the same handle, so the path
+        // written is the path that was validated.
+        let components =
             match resolve_workspace_path(&path, self.workspace_root.as_deref(), false).await {
-                Ok(path) => path,
+                Ok(_) => match split_relative(&path) {
+                    Ok(components) => components,
+                    Err(io_error) => {
+                        return error(
+                            &format!("write {path}"),
+                            &format!("cannot write {path}: {io_error}"),
+                        );
+                    }
+                },
                 Err(message) => {
                     return error(
                         &format!("write {path}"),
@@ -71,22 +84,19 @@ impl Tool for WriteTool {
                 }
             };
         let summary = format!("write {path}");
-        let Some(result) = with_file_mutation_lock(&full_path, &cancel, || async {
-            if cancel.is_cancelled() {
-                return Err("cancelled".to_owned());
-            }
-            if let Some(parent) = full_path.parent()
-                && let Err(io_error) = fs::create_dir_all(parent).await
-            {
-                return Err(format!("cannot create parent directory: {io_error}"));
-            }
-            if cancel.is_cancelled() {
-                return Err("cancelled".to_owned());
-            }
-            atomic_write(&full_path, content.as_bytes(), &cancel)
-                .await
-                .map_err(|io_error| format!("cannot write {path}: {io_error}"))
-        })
+        let root = self.workspace_root.clone();
+        let Some(result) = with_file_mutation_lock(
+            &root
+                .as_deref()
+                .unwrap_or(std::path::Path::new("."))
+                .join(components.join("/")),
+            &cancel,
+            || async {
+                write_validated(&root, &components, content, &cancel)
+                    .await
+                    .map_err(|io_error| format!("cannot write {path}: {io_error}"))
+            },
+        )
         .await
         else {
             return error(&summary, "cancelled");
@@ -108,6 +118,72 @@ fn error(summary: &str, content: &str) -> ToolOutput {
         is_error: true,
         summary: summary.to_owned(),
     }
+}
+
+/// Write `content` through validated handles: open the workspace root,
+/// create missing parents handle-relatively, then commit the temp file
+/// with a handle-relative rename. Falls back to path-based
+/// [`atomic_write`] where handles are unavailable (non-Unix) or no root
+/// is configured (compatibility mode).
+async fn write_validated(
+    root: &Option<PathBuf>,
+    components: &[String],
+    content: &str,
+    cancel: &CancellationToken,
+) -> Result<(), std::io::Error> {
+    if cancel.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ));
+    }
+    #[cfg(unix)]
+    if let Some(root) = root.as_deref() {
+        let fs = WorkspaceFs::open_root(root).map_err(|error| {
+            std::io::Error::other(format!("cannot resolve workspace root: {error}"))
+        })?;
+        let (parent_fd, name) = super::vfs::unix::open_parent_relative(&fs, components)?;
+        // Preserve existing permissions without re-walking names from `/`:
+        // stat the destination through the validated parent handle, then
+        // read its mode via the opened fd. A symlink final component
+        // fails here (SYMLINK_NOFOLLOW) instead of being followed.
+        let existing = rustix::fs::statat(
+            std::os::fd::AsFd::as_fd(&parent_fd),
+            name.as_str(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .and_then(|_| super::vfs::unix::open_file_metadata(&fs, components))
+        .map(|metadata| metadata.permissions());
+        super::file_mutation::atomic_write_at(
+            &parent_fd,
+            &name,
+            content.as_bytes(),
+            existing,
+            cancel,
+        )
+        .await?;
+        return Ok(());
+    }
+    // Fallback: reconstruct the lexical path and use the path-based commit.
+    let base = root.clone().unwrap_or_else(|| PathBuf::from("."));
+    let full_path = components.iter().fold(base, |base, part| base.join(part));
+    if cancel.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ));
+    }
+    if let Some(parent) = full_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    if cancel.is_cancelled() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "cancelled",
+        ));
+    }
+    atomic_write(&full_path, content.as_bytes(), cancel).await
 }
 
 #[cfg(test)]
@@ -139,5 +215,38 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a/b/file.txt")).unwrap(),
             "second"
         );
+    }
+
+    /// End-to-end TOCTOU barrier for `write`: resolve, swap an ancestor
+    /// for an external symlink, then execute. The handle-relative commit
+    /// must refuse and leave both trees unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_cannot_create_through_swapped_ancestor() {
+        let workspace = tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/keep.txt"), "keep").unwrap();
+        let tool = WriteTool::with_workspace_root(&root);
+        // Warm the resolution path, then swap the ancestor.
+        let before = tool
+            .execute(
+                json!({"path": "sub/warm.txt", "content": "warm"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!before.is_error, "{}", before.content);
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+        let output = tool
+            .execute(
+                json!({"path": "sub/evil.txt", "content": "evil"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "write escaped: {}", output.content);
+        assert!(!outside.path().join("evil.txt").exists());
+        assert!(!outside.path().join("sub/evil.txt").exists());
     }
 }

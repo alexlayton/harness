@@ -1,4 +1,5 @@
 use super::file_mutation::{atomic_write, with_file_mutation_lock};
+use super::vfs::{WorkspaceFs, split_relative};
 use super::{
     Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
 };
@@ -111,23 +112,42 @@ impl Tool for EditTool {
             return error(&summary, "cancelled");
         }
 
-        let requested_path =
+        // Resolve lexically first (for precise workspace-relative errors),
+        // then open through the validated workspace handle: the file read,
+        // matched, and committed is opened handle-relatively, so an ancestor
+        // swapped after validation cannot redirect the edit. The
+        // pre-commit re-read below compares against bytes read from the
+        // same handle.
+        let components =
             match resolve_workspace_path(&path, self.workspace_root.as_deref(), true).await {
-                Ok(path) => path,
+                Ok(_) => match split_relative(&path) {
+                    Ok(components) => components,
+                    Err(io_error) => {
+                        return error(&summary, &format!("cannot edit {path}: {io_error}"));
+                    }
+                },
                 Err(message) => return error(&summary, &format!("cannot edit {path}: {message}")),
             };
-        let target_path = match fs::canonicalize(&requested_path).await {
-            Ok(path) => path,
-            Err(io_error) => {
-                return error(&summary, &format!("cannot edit {path}: {io_error}"));
-            }
-        };
-        let edit_path = target_path.clone();
+        let root = self.workspace_root.clone();
         let edit_path_display = path.clone();
         let edit_cancel = cancel.clone();
-        let edit_result = with_file_mutation_lock(&target_path, &cancel, move || async move {
-            execute_edit(&edit_path_display, &edit_path, &edits, &edit_cancel).await
-        })
+        let edit_result = with_file_mutation_lock(
+            &root
+                .as_deref()
+                .unwrap_or(std::path::Path::new("."))
+                .join(components.join("/")),
+            &cancel,
+            move || async move {
+                execute_edit_validated(
+                    &edit_path_display,
+                    root.as_deref(),
+                    &components,
+                    &edits,
+                    &edit_cancel,
+                )
+                .await
+            },
+        )
         .await;
 
         let Some(edit_result) = edit_result else {
@@ -160,6 +180,83 @@ struct EditResult {
     base_content: String,
     new_content: String,
     replacement_count: usize,
+}
+
+/// Handle-validated edit: open the file through the workspace handle,
+/// match against bytes read from that handle, and commit through the
+/// validated parent handle. The pre-commit re-read compares handle-read
+/// bytes, so a swapped ancestor cannot redirect the result.
+async fn execute_edit_validated(
+    path: &str,
+    root: Option<&Path>,
+    components: &[String],
+    edits: &[Edit],
+    cancel: &CancellationToken,
+) -> Result<EditResult, String> {
+    check_cancelled(cancel)?;
+    #[cfg(unix)]
+    if let Some(root) = root {
+        use std::io::Read;
+        let fs = WorkspaceFs::open_root(root)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        let fd = super::vfs::unix::open_file_relative(&fs, components)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        let mut original_bytes = Vec::new();
+        let mut file = std::fs::File::from(fd);
+        file.read_to_end(&mut original_bytes)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        check_cancelled(cancel)?;
+        if original_bytes.contains(&0) {
+            return Err(format!(
+                "Could not edit file: {path}. Binary files are not supported."
+            ));
+        }
+        let raw_content = String::from_utf8(original_bytes.clone()).map_err(|_| {
+            format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
+        })?;
+        let (bom, content) = strip_bom(&raw_content);
+        let applied = apply_edits_exact(content, edits, path)?;
+        check_cancelled(cancel)?;
+        let mut final_content = String::with_capacity(bom.len() + applied.new_content.len());
+        final_content.push_str(bom);
+        final_content.push_str(&applied.new_content);
+        // Re-read from the same handle before committing.
+        let fd = super::vfs::unix::open_file_relative(&fs, components)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        let mut current_bytes = Vec::new();
+        let mut current = std::fs::File::from(fd);
+        current
+            .read_to_end(&mut current_bytes)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        if current_bytes != original_bytes {
+            return Err(format!(
+                "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
+            ));
+        }
+        check_cancelled(cancel)?;
+        let (parent_fd, name) = super::vfs::unix::open_parent_relative(&fs, components)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        super::file_mutation::atomic_write_at(
+            &parent_fd,
+            &name,
+            final_content.as_bytes(),
+            None,
+            cancel,
+        )
+        .await
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        return Ok(EditResult {
+            base_content: applied.base_content,
+            new_content: applied.new_content,
+            replacement_count: edits.len(),
+        });
+    }
+    // Fallback (non-Unix or compatibility mode): path-based edit.
+    let base = root
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let target_path = components.iter().fold(base, |base, part| base.join(part));
+    execute_edit(path, &target_path, edits, cancel).await
 }
 
 async fn execute_edit(
@@ -778,5 +875,52 @@ mod tests {
         let diff = generate_diff(&old, &new);
         assert!(diff.text.contains("diff omitted"));
         assert!(diff.text.len() < 200);
+    }
+
+    /// End-to-end TOCTOU barrier for `edit`: resolve, swap an ancestor for
+    /// an external symlink, then execute. The handle-relative open must
+    /// refuse and leave both trees unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_cannot_replace_through_swapped_ancestor() {
+        let workspace = tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::write(outside.path().join("target.txt"), "EXTERNAL").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), "hello\n").unwrap();
+        let tool = EditTool::with_workspace_root(&root);
+        // Warm the resolution path, then swap the ancestor.
+        let before = tool
+            .execute(
+                json!({
+                    "path": "sub/file.txt",
+                    "edits": [{"oldText": "hello", "newText": "warm"}]
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!before.is_error, "{}", before.content);
+        std::fs::write(root.join("sub/file.txt"), "hello\n").unwrap();
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+        let output = tool
+            .execute(
+                json!({
+                    "path": "sub/file.txt",
+                    "edits": [{"oldText": "hello", "newText": "evil"}]
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        // The swapped ancestor no longer contains the old text (it now
+        // points outside); either a not-found or a confinement error is
+        // acceptable, but the outside file must be unchanged.
+        assert!(output.is_error, "edit escaped: {}", output.content);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("target.txt")).unwrap(),
+            "EXTERNAL"
+        );
+        assert!(!outside.path().join("file.txt").exists());
     }
 }

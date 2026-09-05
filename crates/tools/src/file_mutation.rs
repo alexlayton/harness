@@ -83,6 +83,14 @@ fn sweep_unreferenced_file_locks() {
 /// Keeping the temporary file beside the destination ensures the rename does
 /// not cross filesystems.  Existing permissions are copied to the temporary
 /// file before it replaces the destination.
+///
+/// Handle-relative variant: when `parent_fd` is provided (Unix), the
+/// temporary file is created with `O_TMPFILE`-style semantics relative to
+/// the validated parent handle — `openat(parent, ".tmp", O_TMPFILE)` — so
+/// the temp file itself can never be redirected through a swapped ancestor.
+/// The final rename is `renameat(parent_fd, tmp, parent_fd, name)`, atomic
+/// relative to the same validated handle.  Callers fall back to
+/// [`atomic_write`] (path-based) on non-Unix platforms.
 pub async fn atomic_write(
     path: &Path,
     contents: &[u8],
@@ -123,6 +131,144 @@ pub async fn atomic_write(
         let _ = fs::remove_file(&temporary_path).await;
     }
     result
+}
+
+/// Write `contents` to `name` inside the validated parent directory `parent_fd`
+/// (Unix): anonymous temp file via `O_TMPFILE`, then `linkat` to the final
+/// name (or `renameat` when replacing).  Both the temp creation and the
+/// commit are relative to the validated handle, so a swapped ancestor
+/// cannot redirect the write.  Returns `Ok(true)` when an existing file was
+/// replaced, `Ok(false)` when created.
+#[cfg(unix)]
+pub async fn atomic_write_at(
+    parent_fd: &std::os::fd::OwnedFd,
+    name: &str,
+    contents: &[u8],
+    existing_permissions: Option<std::fs::Permissions>,
+    cancel: &CancellationToken,
+) -> io::Result<bool> {
+    use std::os::fd::AsFd;
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    // O_TMPFILE creates an unnamed inode in the parent directory: no name
+    // exists for an attacker to swap, and the fd is the commit unit.
+    let tmp = rustix::fs::openat(
+        parent_fd.as_fd(),
+        ".",
+        rustix::fs::OFlags::TMPFILE | rustix::fs::OFlags::RDWR | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::RUSR
+            | rustix::fs::Mode::WUSR
+            | rustix::fs::Mode::RGRP
+            | rustix::fs::Mode::ROTH,
+    )
+    .map_err(io::Error::from)?;
+    write_all_chunks(&tmp, contents, cancel).await?;
+    rustix::fs::fsync(&tmp).map_err(io::Error::from)?;
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    if let Some(permissions) = existing_permissions {
+        use std::os::unix::fs::PermissionsExt;
+        rustix::fs::fchmod(
+            &tmp,
+            rustix::fs::Mode::from_bits_truncate(permissions.mode()),
+        )
+        .map_err(io::Error::from)?;
+    }
+    // Did the destination exist? Check via the validated handle (no name
+    // re-walk from `/`).
+    let existed = rustix::fs::statat(
+        parent_fd.as_fd(),
+        name,
+        rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+    )
+    .is_ok();
+    // Commit: link the anonymous file to its name. `linkat` with an empty
+    // old path + AT_EMPTY_PATH materializes the O_TMPFILE. If the name
+    // exists, rename over it atomically instead.
+    let link_result = rustix::fs::linkat(
+        tmp.as_fd(),
+        "",
+        parent_fd.as_fd(),
+        name,
+        rustix::fs::AtFlags::EMPTY_PATH,
+    );
+    match link_result {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::EXIST => {
+            link_tmp_over_existing(&tmp, parent_fd.as_fd(), name)?;
+        }
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    if cancel.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+    }
+    // Persist the directory entry as well as the contents.
+    rustix::fs::fsync(parent_fd.as_fd()).map_err(io::Error::from)?;
+    Ok(existed)
+}
+
+#[cfg(unix)]
+async fn write_all_chunks(
+    tmp: &std::os::fd::OwnedFd,
+    contents: &[u8],
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    use tokio::io::AsyncWriteExt;
+    // `rustix` fds are blocking; wrap the owned fd in a tokio File without
+    // duplicating it by transferring ownership through `File::from`.
+    let std_file = fd_to_std_file(tmp.as_fd())?;
+    let mut file = tokio::fs::File::from_std(std_file);
+    for chunk in contents.chunks(64 * 1024) {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        file.write_all(chunk).await?;
+    }
+    file.sync_all().await?;
+    // Prevent `file`'s Drop from closing the fd: the caller still owns `tmp`.
+    // Re-materialize ownership by forgetting the std wrapper's fd… instead,
+    // simply leak-guard: `into_std` below duplicates. Easiest correct path:
+    // detach by `mem::forget` after converting back — but tokio File owns
+    // the fd. To keep single ownership sound, duplicate first.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fd_to_std_file(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<std::fs::File> {
+    let duplicated = rustix::io::retry_on_intr(|| rustix::io::fcntl_dupfd_cloexec(fd, 0))
+        .map_err(io::Error::from)?;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let raw = duplicated.into_raw_fd();
+    // SAFETY: `raw` was just duplicated from a live fd and is now owned.
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
+}
+
+#[cfg(unix)]
+fn link_tmp_over_existing(
+    tmp: &std::os::fd::OwnedFd,
+    parent: std::os::fd::BorrowedFd<'_>,
+    name: &str,
+) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    // linkat(AT_EMPTY_PATH) fails with EEXIST when the name exists. Stage
+    // through a unique hidden name in the same directory, then renameat —
+    // both relative to the validated parent handle.
+    static LINK_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = LINK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let stage = format!(".harness-tmp-{}-{counter}", std::process::id());
+    rustix::fs::linkat(
+        tmp.as_fd(),
+        "",
+        parent,
+        stage.as_str(),
+        rustix::fs::AtFlags::EMPTY_PATH,
+    )
+    .map_err(io::Error::from)?;
+    rustix::fs::renameat(parent, stage.as_str(), parent, name).map_err(io::Error::from)?;
+    Ok(())
 }
 
 async fn lock_key(path: &Path) -> PathBuf {
