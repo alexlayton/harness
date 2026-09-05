@@ -259,6 +259,10 @@ pub struct AnthropicParser {
     stop_reason: Option<String>,
     done: bool,
     current_index: Option<u64>,
+    /// Call IDs already emitted in this response.  IDs are unique per
+    /// assistant response; a repeated ID is a provider error surfaced as
+    /// `LlmError::Parse` before execution.
+    seen_tool_ids: std::collections::HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -428,6 +432,26 @@ impl AnthropicParser {
         let Some(tool) = self.tools.remove(&index) else {
             return Ok(Vec::new());
         };
+        // Missing or blank IDs/names cannot be replayed, so they fail with
+        // `LlmError::Parse` (handled by the agent's malformed-tool recovery)
+        // and no `ToolCallComplete` is emitted.
+        let id = tool.id.trim();
+        if id.is_empty() {
+            return Err(LlmError::Parse(
+                "Anthropic tool call is missing a call ID".into(),
+            ));
+        }
+        if tool.name.trim().is_empty() {
+            return Err(LlmError::Parse(format!(
+                "Anthropic tool call {id} is missing a name"
+            )));
+        }
+        if self.seen_tool_ids.contains(id) {
+            return Err(LlmError::Parse(format!(
+                "duplicate Anthropic tool call ID {id}"
+            )));
+        }
+        self.seen_tool_ids.insert(id.to_owned());
         let arguments = if tool.arguments.trim().is_empty() {
             json!({})
         } else {
@@ -436,7 +460,7 @@ impl AnthropicParser {
             })?
         };
         Ok(vec![StreamEvent::ToolCallComplete(ToolCall {
-            id: tool.id,
+            id: id.to_owned(),
             name: tool.name,
             arguments,
         })])
@@ -645,6 +669,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rejects_missing_id() {
+        let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","name":"read","input":{}}}"#)
+            .unwrap();
+        let error = parser
+            .parse_payload(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn rejects_blank_name_and_duplicate_ids() {
+        let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"a","name":"  ","input":{}}}"#)
+            .unwrap();
+        let error = parser
+            .parse_payload(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+
+        let mut parser = AnthropicParser::new();
+        for index in [0u64, 1] {
+            parser
+                .parse_payload(&format!(
+                    r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"tool_use","id":"dup","name":"read","input":{{}}}}}}"#
+                ))
+                .unwrap();
+            if index == 0 {
+                parser
+                    .parse_payload(r#"{"type":"content_block_stop","index":0}"#)
+                    .unwrap();
+            }
+        }
+        let error = parser
+            .parse_payload(r#"{"type":"content_block_stop","index":1}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn fragmented_arguments_still_assemble() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"frag","name":"read","input":{}}}"#).unwrap();
+        parser.parse_payload(r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#).unwrap();
+        parser.parse_payload(r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"\"x\"}"}}"#).unwrap();
+        let call = parser
+            .parse_payload(r#"{"type":"content_block_stop","index":3}"#)
+            .unwrap();
+        assert!(
+            matches!(&call[0], StreamEvent::ToolCallComplete(call) if call.id == "frag" && call.name == "read" && call.arguments["path"] == "x"),
+            "got {call:?}"
+        );
     }
 
     #[test]

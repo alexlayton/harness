@@ -9,7 +9,7 @@ use crate::{
 use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Provider-specific reasoning extension for OpenAI-compatible Chat APIs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -254,6 +254,10 @@ pub struct ChatStreamParser {
     stop_reason: Option<String>,
     done: bool,
     calls_flushed: bool,
+    /// Call IDs already emitted in this response.  IDs are unique per
+    /// assistant response; a repeated ID is a provider error, not a second
+    /// call, and surfaces as `LlmError::Parse` before execution.
+    seen_ids: HashSet<String>,
 }
 
 #[derive(Debug, Default)]
@@ -344,7 +348,14 @@ impl ChatStreamParser {
         let index = item.get("index").and_then(as_u64).unwrap_or(fallback_index);
         let call = self.calls.entry(index).or_default();
         if let Some(id) = item.get("id").and_then(Value::as_str) {
-            call.id = id.to_owned();
+            // IDs normally arrive whole in the first delta; append when a
+            // fragment continues a partial ID so split transport chunks
+            // still assemble, while repeated identical IDs stay idempotent.
+            if call.id.is_empty() {
+                call.id = id.to_owned();
+            } else if id != call.id && !call.id.ends_with(id) {
+                call.id.push_str(id);
+            }
         }
         if let Some(function) = item.get("function") {
             if let Some(name) = function.get("name").and_then(Value::as_str) {
@@ -365,8 +376,26 @@ impl ChatStreamParser {
             return Ok(Vec::new());
         }
         self.calls_flushed = true;
-        let mut result = Vec::new();
-        for (_, call) in std::mem::take(&mut self.calls) {
+        // Validate every call before emitting any: a malformed call fails
+        // the response with `LlmError::Parse` (handled by the agent's
+        // malformed-tool recovery) and no `ToolCallComplete` is emitted.
+        let pending = std::mem::take(&mut self.calls);
+        let mut validated = Vec::with_capacity(pending.len());
+        for call in pending.values() {
+            let id = call.id.trim();
+            if id.is_empty() {
+                return Err(LlmError::Parse(
+                    "chat tool call is missing a call ID".into(),
+                ));
+            }
+            if call.name.trim().is_empty() {
+                return Err(LlmError::Parse(format!(
+                    "chat tool call {id} is missing a name"
+                )));
+            }
+            if self.seen_ids.contains(id) || validated.iter().any(|(seen, _)| seen == id) {
+                return Err(LlmError::Parse(format!("duplicate chat tool call ID {id}")));
+            }
             let arguments = if call.arguments.trim().is_empty() {
                 json!({})
             } else {
@@ -374,19 +403,19 @@ impl ChatStreamParser {
                     LlmError::Parse(format!("invalid tool arguments for {}: {error}", call.name))
                 })?
             };
-            result.push(StreamEvent::ToolCallComplete(ToolCall {
-                id: if call.id.is_empty() {
-                    tracing::warn!(
-                        name = %call.name,
-                        "tool call streamed without an id; generated synthetic id that cannot be matched in later turns"
-                    );
-                    format!("call-{}", result.len())
-                } else {
-                    call.id
+            validated.push((
+                id.to_owned(),
+                ToolCall {
+                    id: id.to_owned(),
+                    name: call.name.clone(),
+                    arguments,
                 },
-                name: call.name,
-                arguments,
-            }));
+            ));
+        }
+        let mut result = Vec::with_capacity(validated.len());
+        for (id, call) in validated {
+            self.seen_ids.insert(id);
+            result.push(StreamEvent::ToolCallComplete(call));
         }
         Ok(result)
     }
@@ -519,5 +548,74 @@ mod tests {
             events.last(),
             Some(StreamEvent::Done { usage: Some(_), .. })
         ));
+    }
+
+    #[test]
+    fn rejects_missing_id() {
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{}"}}]}}]}"#,
+            )
+            .unwrap();
+        let error = parser
+            .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+        assert!(!parser.calls_flushed || parser.seen_ids.is_empty());
+    }
+
+    #[test]
+    fn rejects_missing_name() {
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"arguments":"{}"}}]}}]}"#,
+            )
+            .unwrap();
+        let error = parser
+            .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_in_parallel_calls() {
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"dup","function":{"name":"read","arguments":"{}"}},{"index":1,"id":"dup","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            )
+            .unwrap();
+        let error = parser
+            .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn fragmented_valid_ids_and_names_assemble() {
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"ca","function":{"name":"re"}}]}}]}"#,
+            )
+            .unwrap();
+        // A continued fragment appends to the partial ID/name.
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"ll-1","function":{"name":"ad","arguments":"{}"}}]}}]}"#,
+            )
+            .unwrap();
+        let mut events = Vec::new();
+        events.extend(
+            parser
+                .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
+                .unwrap(),
+        );
+        assert!(
+            events.iter().any(|event| matches!(event, StreamEvent::ToolCallComplete(call) if call.id == "call-1" && call.name == "read")),
+            "got {events:?}"
+        );
     }
 }

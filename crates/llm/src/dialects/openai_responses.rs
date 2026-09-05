@@ -190,6 +190,10 @@ fn stringify_arguments(arguments: &Value) -> String {
 #[derive(Debug, Default)]
 pub struct ResponsesParser {
     done: bool,
+    /// Call IDs already emitted in this response.  IDs are unique per
+    /// assistant response; a repeated ID is a provider error surfaced as
+    /// `LlmError::Parse` before execution.
+    seen_ids: std::collections::HashSet<String>,
 }
 
 impl ResponsesParser {
@@ -234,17 +238,35 @@ impl ResponsesParser {
                         LlmError::Parse(format!("invalid Responses tool arguments: {error}"))
                     })?
                 };
+                // Missing or blank IDs/names cannot be replayed to the
+                // provider, so they fail with `LlmError::Parse` (handled by
+                // the agent's malformed-tool recovery) instead of becoming
+                // synthetic IDs.  No `ToolCallComplete` is emitted.
                 let id = item
                     .get("call_id")
                     .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("response-call")
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        LlmError::Parse("Responses tool call is missing a call ID".into())
+                    })?
                     .to_owned();
                 let name = item
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        LlmError::Parse(format!("Responses tool call {id} is missing a name"))
+                    })?
                     .to_owned();
+                if self.seen_ids.contains(&id) {
+                    return Err(LlmError::Parse(format!(
+                        "duplicate Responses tool call ID {id}"
+                    )));
+                }
+                self.seen_ids.insert(id.clone());
                 Ok(vec![StreamEvent::ToolCallComplete(ToolCall {
                     id,
                     name,
@@ -455,5 +477,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rejects_missing_id() {
+        let mut parser = ResponsesParser::new();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"read","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn rejects_blank_id_and_missing_name() {
+        let mut parser = ResponsesParser::new();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"  ","name":"read","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+        let mut parser = ResponsesParser::new();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_in_parallel_calls() {
+        let mut parser = ResponsesParser::new();
+        parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"dup","name":"read","arguments":"{}"}}"#)
+            .unwrap();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"dup","name":"bash","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
     }
 }
