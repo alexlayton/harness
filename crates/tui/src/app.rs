@@ -721,6 +721,7 @@ impl CrossTerm {
         // Recompute completion after any input mutation; refreshing at the
         // end of every handled key keeps the draft's ghost/hint in sync.
         self.refresh_completion();
+        self.request_typed_backend(input_tx)?;
         Ok(false)
     }
 
@@ -829,7 +830,7 @@ impl CrossTerm {
         // Path arguments scan the filesystem on a debounced task.
         if matches!(
             result.context.target,
-            CompletionTarget::Argument(ArgumentKind::Path),
+            CompletionTarget::Argument(ArgumentKind::Path | ArgumentKind::Session),
         ) {
             self.request_path_completion(result.context, result.candidates, old_value, None);
             return;
@@ -851,7 +852,7 @@ impl CrossTerm {
         if result.candidates.is_empty() {
             // Keep a session list open (empty) so Tab can request it; close
             // everything else.
-            if kind == CompletionKind::Session {
+            if matches!(kind, CompletionKind::Session | CompletionKind::Model) {
                 self.completion = Some(Completion {
                     context: result.context,
                     candidates: Vec::new(),
@@ -923,6 +924,40 @@ impl CrossTerm {
         };
         self.input = replacement;
         self.cursor = byte_index_at_char(&self.input, new_cursor_col);
+    }
+
+    /// Request backend data for a directly typed model provider prefix or a
+    /// session/path command. Candidate acceptance already calls
+    /// [`Self::request_backend`]; this covers the equivalent typed form.
+    fn request_typed_backend(
+        &mut self,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<()> {
+        let Some(context) = self
+            .completion
+            .as_ref()
+            .map(|completion| completion.context.clone())
+        else {
+            return Ok(());
+        };
+        let CompletionTarget::Argument(kind) = context.target else {
+            return Ok(());
+        };
+        if !matches!(kind, ArgumentKind::Model | ArgumentKind::Session) {
+            return Ok(());
+        }
+        let start = context.token_start;
+        let end = context.token_end.min(self.input.len());
+        let value = self.input[start..end].to_owned();
+        self.request_backend(
+            input_tx,
+            &context,
+            &Candidate {
+                value,
+                description: String::new(),
+                kind: CandidateKind::Slash,
+            },
+        )
     }
 
     /// Send anything the new draft now needs from the agent: a `ListSessions`
@@ -2199,7 +2234,7 @@ fn entry_lines(
 /// The simplified tool call: one line with the tool type and its primary
 /// parameter — `$ git status`, `read file.txt` — plus a duration on success
 /// or a `✗` error preview on failure. Collapsed this is the compact line;
-/// expanded it adds the bounded output tail, the first error line, and a
+/// expanded it adds the bounded output tail, later error lines, and a
 /// `running…` marker, each indented two spaces.
 fn tool_lines(
     record: &ToolRecord,
@@ -2271,8 +2306,8 @@ fn tool_lines(
         return summary_lines;
     }
 
-    // Expanded: the compact line, then the bounded output tail, the first
-    // error line, and a trailing `running…` marker, each indented two spaces
+    // Expanded: the compact line, then the bounded output tail, later error
+    // lines, and a trailing `running…` marker, each indented two spaces
     // and dimmed so they read as details under the summary.
     let dim_style = Style::default()
         .fg(theme.dim_text)
@@ -2283,10 +2318,10 @@ fn tool_lines(
             push_detail_line(&mut lines, &tail, dim_style, width);
         }
     }
-    if let Some(error) = record.error.as_deref()
-        && let Some(first) = error.lines().next()
-    {
-        push_detail_line(&mut lines, first, Style::default().fg(theme.error), width);
+    if let Some(error) = record.error.as_deref() {
+        for detail in error.lines().skip(1).take(render::DEFAULT_TAIL_LINES) {
+            push_detail_line(&mut lines, detail, Style::default().fg(theme.error), width);
+        }
     }
     if matches!(record.status, ToolStatus::Running) {
         push_detail_line(&mut lines, "running…", dim_style, width);
@@ -3404,7 +3439,8 @@ mod tests {
     #[test]
     fn tool_lines_expanded_show_output_tail_and_error() {
         // A finished tool with output and an error: expanded shows the
-        // bounded tail plus the first error line, indented.
+        // bounded tail plus later diagnostic lines, indented without repeating
+        // the first preview line.
         let mut failed = record(ToolStatus::Failure);
         failed.output = (0..10)
             .map(|i| format!("out line {i}"))
@@ -3416,7 +3452,7 @@ mod tests {
         assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
         assert_eq!(row_text(&lines[1]), "  … 6 lines above");
         assert_eq!(row_text(&lines[5]), "  out line 9");
-        assert_eq!(row_text(&lines[6]), "  boom");
+        assert_eq!(row_text(&lines[6]), "  trace");
 
         // Collapsed stays compact regardless of retained output.
         let collapsed = tool_lines(&failed, false, 60, Theme::default());
@@ -3781,6 +3817,37 @@ mod tests {
             loaded: false,
         });
         assert!(minimal.pending.is_empty());
+    }
+
+    #[test]
+    fn direct_provider_prefix_requests_its_model_catalogue() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model openrouter:".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.request_typed_backend(&tx).unwrap();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(InputMessage::ListModels {
+                provider: "openrouter".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn load_completion_combines_session_and_filesystem_context() {
+        let mut ui = ui(80, 24);
+        ui.input = "/load ./".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let completion = ui.completion.as_ref().expect("load completion");
+        assert_eq!(completion.kind, CompletionKind::Path);
+        assert_eq!(
+            completion.context.target,
+            CompletionTarget::Argument(ArgumentKind::Session)
+        );
+        assert_eq!(completion.context.query, "./");
     }
 
     #[test]

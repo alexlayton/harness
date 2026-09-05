@@ -313,6 +313,7 @@ pub fn parse_command_with_skills(
         other => {
             if let Some(name) = other.strip_prefix('/')
                 && !name.is_empty()
+                && rest.is_empty()
                 && command_spec(command).is_none()
                 && let Some(entry) = skill_entry(skills, name)
             {
@@ -438,7 +439,7 @@ pub fn apply_completion(
     cursor_col: usize,
     context: &CompletionContext,
     candidate: &Candidate,
-    skills: &[SkillEntry],
+    _skills: &[SkillEntry],
 ) -> Option<(String, usize)> {
     if context.token_start > context.token_end
         || context.token_end > line.len()
@@ -451,7 +452,9 @@ pub fn apply_completion(
     let cursor_byte = byte_index_at_char(line, cursor_col);
     let before = &line[..context.token_start];
     let after = &line[context.token_end..];
-    let next_is_whitespace = after.chars().next().is_some_and(char::is_whitespace);
+    let next_character = after.chars().next();
+    let next_is_whitespace = next_character.is_some_and(char::is_whitespace);
+    let next_is_punctuation = next_character.is_some_and(is_closing_punctuation);
     let at_token_end = cursor_byte == context.token_end;
 
     let separator = match context.target {
@@ -460,11 +463,9 @@ pub fn apply_completion(
                 Some(command) => command.argument_kind != ArgumentKind::None,
                 // A skill alias keeps the argument phase open so `/skill <name>`
                 // and `/<skill>` behave identically after acceptance.
-                None => candidate
-                    .value
-                    .strip_prefix('/')
-                    .and_then(|name| skill_entry(skills, name))
-                    .is_some(),
+                // Bare aliases are strict (`/<skill>`), so accepting one
+                // must not append a space that implies free-form input.
+                None => false,
             };
             takes_argument
                 .then_some(" ")
@@ -475,7 +476,7 @@ pub fn apply_completion(
         // space once completed, so typing continues on a fresh token.
         // Directories keep the completion context alive instead.
         CompletionTarget::Argument(_) if candidate.kind == CandidateKind::File && at_token_end => {
-            if next_is_whitespace {
+            if next_is_whitespace || next_is_punctuation {
                 ""
             } else {
                 " "
@@ -488,6 +489,10 @@ pub fn apply_completion(
     let new_cursor =
         before.chars().count() + candidate.value.chars().count() + separator.chars().count();
     Some((replacement, new_cursor))
+}
+
+fn is_closing_punctuation(character: char) -> bool {
+    matches!(character, ')' | ']' | '}' | ',' | ';')
 }
 
 fn command_candidates(query: &str, skills: &[SkillEntry]) -> Vec<Candidate> {
@@ -1440,6 +1445,12 @@ mod tests {
                 alias: true
             })
         );
+        // Aliases are strict, just like `/skill <name>`; trailing text must
+        // not be silently discarded by the command adapter.
+        assert_eq!(
+            parse_command_with_skills("/greeter now", &skills),
+            Err("unknown command: /greeter".into())
+        );
         // …but never shadow static commands, including the skill commands.
         assert_eq!(
             parse_command_with_skills("/model", &skills),
@@ -1536,11 +1547,32 @@ mod tests {
         assert_eq!(result.candidates.len(), 1);
         assert_eq!(result.candidates[0].value, "/greeter");
 
-        // Accepting a skill alias keeps the argument phase open (skill takes
-        // an argument), so the cursor lands after the trailing space.
+        // A bare alias is strict, so completion does not append a separator
+        // that would imply trailing free-form input.
         let (line, cursor) =
             apply_completion("/gree", 5, &result.context, &result.candidates[0], &skills).unwrap();
-        assert_eq!(line, "/greeter ");
+        assert_eq!(line, "/greeter");
         assert_eq!(cursor, line.chars().count());
+    }
+
+    #[test]
+    fn path_completion_preserves_closing_punctuation() {
+        for punctuation in [')', ',', ';'] {
+            let input = format!("(@src/ma{punctuation}");
+            let cursor = input[..input.len() - punctuation.len_utf8()]
+                .chars()
+                .count();
+            let prefix = crate::paths::extract_at_prefix(&input, cursor).unwrap();
+            let context = prefix.into_context();
+            let file = Candidate {
+                value: "@src/main.rs".into(),
+                description: "file".into(),
+                kind: CandidateKind::File,
+            };
+            let (replacement, new_cursor) =
+                apply_completion(&input, cursor, &context, &file, &skills()).unwrap();
+            assert_eq!(replacement, format!("(@src/main.rs{punctuation}"));
+            assert_eq!(new_cursor, "(@src/main.rs".chars().count());
+        }
     }
 }
