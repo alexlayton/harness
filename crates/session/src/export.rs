@@ -68,7 +68,14 @@ pub fn export_jsonl(
             .create_new(true)
             .open(&temp)
             .map_err(|source| io_error("create export file", &temp, source))?;
-        let header = encode_header(session.header_metadata())?;
+        // Header IDs, paths, provider/model names, timestamps, and usage are
+        // structural and preserved so the export stays loadable; only the
+        // free-text title is redacted.
+        let mut header_metadata = session.header_metadata().clone();
+        if options.redact_secrets {
+            header_metadata.title = header_metadata.title.map(|title| redact_text(&title));
+        }
+        let header = encode_header(&header_metadata)?;
         file.write_all(header.as_bytes())
             .and_then(|_| file.write_all(b"\n"))
             .map_err(|source| io_error("write export header", &temp, source))?;
@@ -178,6 +185,9 @@ pub fn export_transcript(session: &Session, destination: Option<&Path>) -> Resul
 
 fn transform_record(record: &SessionEventRecord, options: &ExportOptions) -> SessionEventRecord {
     let mut transformed = record.clone();
+    // Redaction runs after omission/truncation decisions so no unredacted
+    // alternate representation remains: messages, outputs, summaries, and
+    // structured payloads are all transformed through one path.
     transformed.event = match &record.event {
         SessionEvent::AssistantMessage { message } => SessionEvent::AssistantMessage {
             message: transform_message(message, options),
@@ -185,18 +195,17 @@ fn transform_record(record: &SessionEventRecord, options: &ExportOptions) -> Ses
         SessionEvent::UserMessage { message } => SessionEvent::UserMessage {
             message: transform_message(message, options),
         },
-        SessionEvent::Reasoning { text } if !options.include_reasoning => SessionEvent::Reasoning {
-            text: String::new(),
+        SessionEvent::Reasoning { text } => SessionEvent::Reasoning {
+            text: transform_reasoning(text, options),
+        },
+        SessionEvent::ToolCall { call } => SessionEvent::ToolCall {
+            call: transform_tool_call(call, options),
         },
         SessionEvent::CompactionSummary {
             summary,
             compacted_through,
-        } if !options.include_reasoning => SessionEvent::CompactionSummary {
-            summary: summary
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("Reasoning:"))
-                .collect::<Vec<_>>()
-                .join("\n"),
+        } => SessionEvent::CompactionSummary {
+            summary: transform_summary(summary, options),
             compacted_through: *compacted_through,
         },
         SessionEvent::ToolResult {
@@ -210,13 +219,18 @@ fn transform_record(record: &SessionEventRecord, options: &ExportOptions) -> Ses
             is_error: *is_error,
             tool_name: tool_name.clone(),
         },
+        SessionEvent::MetadataChange { title } => SessionEvent::MetadataChange {
+            title: title.as_ref().map(|title| transform_title(title, options)),
+        },
+        SessionEvent::TurnCancelled { reason } => SessionEvent::TurnCancelled {
+            reason: transform_diagnostic(reason, options),
+        },
+        SessionEvent::Error { message } => SessionEvent::Error {
+            message: transform_diagnostic(message, options),
+        },
         SessionEvent::Unknown { kind, data } => SessionEvent::Unknown {
             kind: kind.clone(),
-            data: if options.redact_secrets {
-                redact_json(data)
-            } else {
-                data.clone()
-            },
+            data: transform_unknown(data, options),
         },
         event => event.clone(),
     };
@@ -262,11 +276,90 @@ fn transform_output(value: &str, options: &ExportOptions) -> String {
     output
 }
 
-/// Best-effort, heuristic secret redaction for free-text tool output.
+/// Standalone reasoning: omitted unless included, then redacted.
+fn transform_reasoning(text: &str, options: &ExportOptions) -> String {
+    if !options.include_reasoning {
+        return String::new();
+    }
+    if options.redact_secrets {
+        redact_text(text)
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Compaction summaries: reasoning lines omitted unless included, then the
+/// surviving summary is redacted.
+fn transform_summary(summary: &str, options: &ExportOptions) -> String {
+    let kept = if options.include_reasoning {
+        summary.to_owned()
+    } else {
+        summary
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("Reasoning:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if options.redact_secrets {
+        redact_text(&kept)
+    } else {
+        kept
+    }
+}
+
+/// Standalone tool calls carry secret-bearing arguments; IDs and names are
+/// structural and preserved so call/result pairing stays valid.
+fn transform_tool_call(
+    call: &crate::model::StoredToolCall,
+    options: &ExportOptions,
+) -> crate::model::StoredToolCall {
+    if !options.redact_secrets {
+        return call.clone();
+    }
+    crate::model::StoredToolCall {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        arguments: redact_json(&call.arguments),
+    }
+}
+
+/// Titles, errors, and cancellation reasons are free text: redact them.
+fn transform_title(title: &str, options: &ExportOptions) -> String {
+    if options.redact_secrets {
+        redact_text(title)
+    } else {
+        title.to_owned()
+    }
+}
+
+fn transform_diagnostic(text: &str, options: &ExportOptions) -> String {
+    if options.redact_secrets {
+        redact_text(text)
+    } else {
+        text.to_owned()
+    }
+}
+
+/// Unknown event payloads are structured: recurse so nested secrets are
+/// masked while IDs and structure survive.
+fn transform_unknown(data: &serde_json::Value, options: &ExportOptions) -> serde_json::Value {
+    if options.redact_secrets {
+        redact_json(data)
+    } else {
+        data.clone()
+    }
+}
+
+/// Best-effort, heuristic secret redaction for free text.
 ///
 /// The string scanner masks values following common secret keys
-/// (`token=…`, `"secret": "…"`) while leaving normal tool output intact.  It
-/// is intentionally dependency-free and conservative, but it is *not* a
+/// (`token=…`, `"secret": "…"`) while leaving normal tool output intact.
+/// Export redaction uses this scanner on every secret-bearing text field,
+/// so tests place each sentinel beside a recognized key (as in
+/// `token=<value>`).  Bare secrets with no nearby key are out of scope: the
+/// exporter never learns an out-of-band secret value to search for.
+///
+/// It is intentionally dependency-free and conservative, but it is *not* a
 /// parser, so treat it as a guardrail rather than a guarantee:
 /// - nested quotes or escaped characters (`"secret": "a\\\"b"`) can defeat it;
 /// - multi-line values are only masked up to the first line break;
@@ -436,5 +529,141 @@ mod tests {
         let loaded = decode_session(&content, &destination).unwrap();
         assert_eq!(loaded.metadata.usage.input_tokens, 4);
         assert_eq!(loaded.metadata.provider.as_deref(), Some("mock"));
+    }
+
+    /// A unique sentinel in every supported header/event field must vanish
+    /// from the redacted export while call/result pairing and inclusion
+    /// options keep working.
+    #[test]
+    fn redaction_covers_every_secret_bearing_field() {
+        let directory = tempdir().unwrap();
+        let sentinel = "sentinel-secret-9f3a1c";
+        let mut session = Session::new(SessionMetadata::new(directory.path(), None, None));
+        session.header_metadata.title = Some(format!("title holds token={sentinel}"));
+        session.metadata.title = Some(format!("title holds token={sentinel}"));
+        session.append(SessionEvent::MetadataChange {
+            title: Some(format!("title holds token={sentinel}")),
+        });
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(format!(
+                "user text carries token={sentinel}"
+            ))),
+        });
+        session.append(SessionEvent::AssistantMessage {
+            message: StoredMessage {
+                role: crate::model::StoredRole::Assistant,
+                content: vec![
+                    crate::model::StoredContent::Text {
+                        text: format!("assistant text carries token={sentinel}"),
+                    },
+                    crate::model::StoredContent::Reasoning {
+                        text: format!("assistant reasoning carries token={sentinel}"),
+                    },
+                    crate::model::StoredContent::ToolCall {
+                        id: "embedded-1".into(),
+                        name: "read".into(),
+                        arguments: json!({"token": sentinel}),
+                    },
+                ],
+            },
+        });
+        session.append(SessionEvent::Reasoning {
+            text: format!("standalone reasoning carries token={sentinel}"),
+        });
+        session.append(SessionEvent::ToolCall {
+            call: crate::model::StoredToolCall {
+                id: "call-1".into(),
+                name: "bash".into(),
+                arguments: json!({"secret": sentinel}),
+            },
+        });
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "embedded-1".into(),
+            content: format!("embedded result carries token={sentinel}"),
+            is_error: true,
+            tool_name: Some("read".into()),
+        });
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: format!("tool output carries token={sentinel}"),
+            is_error: false,
+            tool_name: Some("bash".into()),
+        });
+        session.append(SessionEvent::CompactionSummary {
+            summary: format!("summary carries token={sentinel}"),
+            compacted_through: 1,
+        });
+        session.append(SessionEvent::TurnCancelled {
+            reason: format!("cancel carries token={sentinel}"),
+        });
+        session.append(SessionEvent::Error {
+            message: format!("error carries token={sentinel}"),
+        });
+        session.append(SessionEvent::Unknown {
+            kind: "future_event".into(),
+            data: json!({"nested": {"password": sentinel}}),
+        });
+
+        let destination = directory.path().join("redacted.jsonl");
+        export_jsonl(
+            &session,
+            Some(&destination),
+            &ExportOptions {
+                redact_secrets: true,
+                ..ExportOptions::default()
+            },
+        )
+        .unwrap();
+        let content = fs::read_to_string(&destination).unwrap();
+        assert!(
+            !content.contains(sentinel),
+            "redacted export must not contain the sentinel anywhere"
+        );
+        assert!(content.contains("[REDACTED]"));
+        // The export still decodes and pairs calls with results.
+        let loaded = decode_session(&content, &destination).unwrap();
+        let mut calls = std::collections::HashSet::new();
+        let mut results = Vec::new();
+        for record in &loaded.events {
+            match &record.event {
+                SessionEvent::ToolCall { call } => {
+                    calls.insert(call.id.clone());
+                }
+                SessionEvent::AssistantMessage { message } => {
+                    for item in &message.content {
+                        if let crate::model::StoredContent::ToolCall { id, .. } = item {
+                            calls.insert(id.clone());
+                        }
+                    }
+                }
+                SessionEvent::ToolResult { tool_call_id, .. } => {
+                    results.push(tool_call_id.clone());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(results.len(), 2);
+        for result in &results {
+            assert!(calls.contains(result), "orphaned result {result}");
+        }
+
+        // Inclusion options still behave: excluding reasoning/tool output
+        // keeps the export valid and call/result pairing intact.
+        let destination = directory.path().join("redacted-slim.jsonl");
+        export_jsonl(
+            &session,
+            Some(&destination),
+            &ExportOptions {
+                include_reasoning: false,
+                include_tool_output: false,
+                redact_secrets: true,
+                max_tool_output_bytes: Some(64),
+            },
+        )
+        .unwrap();
+        let slim = fs::read_to_string(&destination).unwrap();
+        assert!(!slim.contains(sentinel));
+        let slim_loaded = decode_session(&slim, &destination).unwrap();
+        assert_eq!(slim_loaded.events.len(), loaded.events.len());
     }
 }
