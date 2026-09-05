@@ -88,7 +88,8 @@ context_window = 0
 - `max_summary_input_bytes`: Limit the serialized text sent to the summarizer.
 - `max_summary_bytes`: Limit the generated summary.
 - `context_window`: Override the provider's reported context window. `0` uses
-  provider metadata, then a conservative fallback if metadata is unavailable.
+  provider metadata, then a generous 1M fallback if metadata is unavailable
+  (some providers report no context lengths).
 
 Compaction appends a summary event. It does not rewrite or delete old session
 events.

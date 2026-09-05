@@ -26,7 +26,7 @@ pub struct CompactionPolicy {
     /// Cap on the generated summary itself, in bytes.
     pub max_summary_bytes: usize,
     /// Explicit context window override. `0` = derive from the model's
-    /// reported `context_length`, falling back to a conservative default.
+    /// reported `context_length`, falling back to a generous default.
     pub context_window: u64,
 }
 
@@ -57,7 +57,7 @@ impl CompactionPolicy {
     }
 
     /// The context window to plan against: the config override if set,
-    /// otherwise the model-reported value, otherwise a conservative default.
+    /// otherwise the model-reported value, otherwise a generous default.
     pub fn resolved_window(&self, model_reported: u64) -> u64 {
         if self.context_window > 0 {
             self.context_window
@@ -69,9 +69,12 @@ impl CompactionPolicy {
     }
 }
 
-/// Conservative fallback window when neither a config override nor a
-/// model-reported value is available.
-pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+/// Fallback window when neither a config override nor a
+/// model-reported value is available. This is intentionally generous:
+/// some providers (notably OpenCode Go's `/models` endpoint) report no
+/// `context_length` at all, and underestimating compacts far too early.
+/// Lower it explicitly with `[compaction] context_window` if needed.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 1_000_000;
 
 /// Default per-tool-result truncation for the summarizer transcript.
 pub const DEFAULT_TOOL_RESULT_CHARS: usize = 2_000;

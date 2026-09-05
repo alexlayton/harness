@@ -75,7 +75,7 @@ pub struct Agent {
     /// switch, when the estimator takes over.
     last_context_tokens: Option<u64>,
     /// Resolved provider context window (config override → model-reported
-    /// `context_length` → conservative default).
+    /// `context_length` → generous default).
     context_window: u64,
     /// Token-aware compaction policy.
     compaction: CompactionPolicy,
@@ -213,14 +213,14 @@ impl Agent {
         }
 
         // Tests and embedded callers may update the policy directly instead
-        // of using the builder; establish the conservative/configured value
+        // of using the builder; establish the generous/configured value
         // synchronously, without provider I/O.
         if self.context_window == 0 {
             self.context_window = self.compaction.resolved_window(0);
         }
         send(&events, self.context_usage_event());
         // Begin model discovery without placing it on the first-turn critical
-        // path. The conservative/configured window is already installed; a
+        // path. The generous/configured window is already installed; a
         // bounded late result only affects future turns.
         let (context_tx, mut context_rx) = mpsc::channel(1);
         let mut metadata_pending = self.compaction.context_window == 0;
@@ -2001,7 +2001,7 @@ mod tests {
                         StreamEvent::Done {
                             stop_reason: Some("stop".into()),
                             usage: Some(Usage {
-                                input_tokens: 200_000,
+                                input_tokens: 900_000,
                                 output_tokens: 1_000,
                                 ..Usage::default()
                             }),
@@ -2074,7 +2074,7 @@ mod tests {
             drop(seen);
             let reloaded = store.open(&populated_session_id).unwrap();
             assert!(
-                reloaded.metadata.usage.input_tokens >= 200_100,
+                reloaded.metadata.usage.input_tokens >= 900_100,
                 "summarizer usage (input 100) must be folded into session usage"
             );
             assert!(reloaded.events.iter().any(|record| matches!(
@@ -2103,7 +2103,7 @@ mod tests {
                         StreamEvent::Done {
                             stop_reason: Some("stop".into()),
                             usage: Some(Usage {
-                                input_tokens: 200_000,
+                                input_tokens: 900_000,
                                 output_tokens: 1_000,
                                 ..Usage::default()
                             }),
@@ -2325,7 +2325,7 @@ mod tests {
                         StreamEvent::Done {
                             stop_reason: Some("stop".into()),
                             usage: Some(Usage {
-                                input_tokens: 200_000,
+                                input_tokens: 900_000,
                                 output_tokens: 1_000,
                                 ..Usage::default()
                             }),

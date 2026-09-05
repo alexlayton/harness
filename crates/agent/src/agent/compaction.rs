@@ -12,7 +12,7 @@ impl Agent {
     // ------------------------------------------------------------------ compaction
 
     /// Resolve the provider context window: config override → model-reported
-    /// `context_length` → conservative default. Runs once at startup and again
+    /// `context_length` → generous default. Runs once at startup and again
     /// after a model switch.
     pub(crate) async fn refresh_context_window(
         &mut self,
