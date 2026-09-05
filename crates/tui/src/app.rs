@@ -586,7 +586,8 @@ impl CrossTerm {
     ) -> Result<bool> {
         let Event::Key(key) = event else {
             if let Event::Paste(text) = event {
-                insert_text(&mut self.input, &mut self.cursor, text);
+                let text = render::sanitize_terminal_text(text);
+                insert_text(&mut self.input, &mut self.cursor, &text);
                 self.refresh_completion();
             }
             return Ok(false);
@@ -2217,7 +2218,11 @@ fn fold_entries(entries: &[String]) -> Option<String> {
         return None;
     }
     let shown = entries.len().min(METADATA_MAX_ENTRIES);
-    let mut text = entries[..shown].join(", ");
+    let mut text = entries[..shown]
+        .iter()
+        .map(|entry| render::sanitize_terminal_text(entry))
+        .collect::<Vec<_>>()
+        .join(", ");
     let hidden = entries.len() - shown;
     if hidden > 0 {
         let _ = write!(text, " · +{hidden} more");
@@ -2242,9 +2247,13 @@ fn metadata_lines(
     let style = Style::default()
         .fg(theme.dim_text)
         .add_modifier(Modifier::DIM);
+    let cwd = render::sanitize_terminal_text(cwd);
+    let branch = branch.map(render::sanitize_terminal_text);
+    let provider = render::sanitize_terminal_text(provider);
+    let model = render::sanitize_terminal_text(model);
     let left = match branch {
         Some(branch) => format!("{cwd}  ({branch})"),
-        None => cwd.to_owned(),
+        None => cwd,
     };
     let mut lines = vec![
         Line::from(Span::styled(left, style)),
@@ -2261,6 +2270,7 @@ fn metadata_lines(
 /// A left-oriented rule marking a session boundary. An empty label is the
 /// unlabelled initial boundary below the full startup header.
 fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'static> {
+    let label = render::sanitize_terminal_text(label);
     let text = if label.is_empty() {
         "─".repeat(width)
     } else {
@@ -2775,7 +2785,8 @@ fn line_to_ansi(line: &Line<'_>) -> String {
     let mut previous = None;
     let mut styled = false;
     for span in &line.spans {
-        if span.content.is_empty() {
+        let content = render::sanitize_terminal_text(span.content.as_ref());
+        if content.is_empty() {
             continue;
         }
         let style = line.style.patch(span.style);
@@ -2788,7 +2799,7 @@ fn line_to_ansi(line: &Line<'_>) -> String {
             styled |= !prefix.is_empty();
             out.push_str(&prefix);
         }
-        out.push_str(span.content.as_ref());
+        out.push_str(&content);
         previous = Some(style);
     }
     if styled {
@@ -3303,6 +3314,22 @@ mod tests {
         // Nothing loaded: no extra rows.
         let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], Theme::default());
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn line_to_ansi_sanitizes_untrusted_content_but_keeps_generated_styles() {
+        let line = Line::from(Span::styled(
+            "safe\t\u{1b}[2J\u{1b}]52;c;secret\u{07}done",
+            Style::default().fg(Theme::default().accent),
+        ));
+        let ansi = line_to_ansi(&line);
+        assert!(ansi.contains("safe    done"), "{ansi:?}");
+        assert!(!ansi.contains("secret"), "OSC payload leaked: {ansi:?}");
+        assert!(!ansi.contains("[2J"), "CSI payload leaked: {ansi:?}");
+        assert!(
+            ansi.contains("\u{1b}["),
+            "generated style is missing: {ansi:?}"
+        );
     }
 
     #[test]

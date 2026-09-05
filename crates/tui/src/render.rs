@@ -381,7 +381,8 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
         let mut source_chars = Vec::<(char, Style, usize)>::new();
         for source_span in &source_line.spans {
             let style = line_base.patch(source_span.style);
-            source_chars.extend(source_span.content.chars().map(|character| {
+            let content = sanitize_terminal_text(source_span.content.as_ref());
+            source_chars.extend(content.chars().map(|character| {
                 let character_width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
                 (character, style, character_width)
             }));
@@ -471,7 +472,104 @@ fn wrapped_line(chars: Vec<(char, Style, usize)>) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Sanitize untrusted text before it reaches terminal serialization.
+///
+/// Newlines are intentional display structure and tabs expand to four spaces
+/// so measurement and emission agree. C0/C1 controls, DEL, CSI, OSC, and
+/// other escape strings are removed; generated styling remains separate in
+/// [`line_to_ansi`](crate::app) and is never accepted from content.
+pub(crate) fn sanitize_terminal_text(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    let mut result = String::with_capacity(value.len());
+    let mut index = 0usize;
+    while index < chars.len() {
+        let character = chars[index];
+        match character {
+            '\n' => {
+                result.push('\n');
+                index += 1;
+            }
+            '\t' => {
+                result.push_str("    ");
+                index += 1;
+            }
+            '\u{1b}' => {
+                index += 1;
+                skip_escape_sequence(&chars, &mut index);
+            }
+            '\u{9b}' => {
+                index += 1;
+                skip_csi_sequence(&chars, &mut index);
+            }
+            '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => {
+                index += 1;
+                skip_string_sequence(&chars, &mut index);
+            }
+            '\u{9c}' => index += 1,
+            character if character.is_control() || character == '\u{7f}' => index += 1,
+            character => {
+                result.push(character);
+                index += 1;
+            }
+        }
+    }
+    result
+}
+
+/// Skip an ESC-prefixed terminal sequence after its introducer. CSI and
+/// string sequences have dedicated parsers because they may contain arbitrary
+/// parameters or payload; other ESC sequences terminate at their final byte.
+fn skip_escape_sequence(chars: &[char], index: &mut usize) {
+    let Some(&introducer) = chars.get(*index) else {
+        return;
+    };
+    match introducer {
+        '[' => {
+            *index += 1;
+            skip_csi_sequence(chars, index);
+        }
+        ']' | 'P' | 'X' | '^' | '_' => {
+            *index += 1;
+            skip_string_sequence(chars, index);
+        }
+        _ => {
+            while let Some(&character) = chars.get(*index) {
+                *index += 1;
+                let code = character as u32;
+                if (0x30..=0x7e).contains(&code) {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn skip_csi_sequence(chars: &[char], index: &mut usize) {
+    while let Some(&character) = chars.get(*index) {
+        *index += 1;
+        let code = character as u32;
+        if (0x40..=0x7e).contains(&code) {
+            break;
+        }
+    }
+}
+
+fn skip_string_sequence(chars: &[char], index: &mut usize) {
+    while let Some(&character) = chars.get(*index) {
+        *index += 1;
+        match character {
+            '\u{07}' | '\u{9c}' => break,
+            '\u{1b}' if chars.get(*index) == Some(&'\\') => {
+                *index += 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+}
+
 fn plain_text(value: &str, style: Style) -> Text<'static> {
+    let value = sanitize_terminal_text(value);
     Text::from(
         value
             .split('\n')
@@ -481,8 +579,9 @@ fn plain_text(value: &str, style: Style) -> Text<'static> {
 }
 
 fn owned_markdown(markdown: &str, theme: Theme) -> Text<'static> {
+    let markdown = sanitize_terminal_text(markdown);
     let options = Options::new(MarkdownTheme { theme });
-    let rendered = from_str_with_options(markdown, &options);
+    let rendered = from_str_with_options(&markdown, &options);
     let lines = rendered
         .lines
         .iter()
@@ -615,6 +714,45 @@ pub(crate) fn output_tail(output: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn sanitizer_removes_terminal_controls_and_expands_tabs() {
+        let input = concat!(
+            "before\t",
+            "\u{1b}[2J",
+            "hidden-csi",
+            "\u{1b}]52;c;secret\u{07}",
+            "after\r\u{07}",
+            "\u{009b}31m",
+            "c1-csi",
+            "\u{009d}52;c;more-secret\u{009c}",
+            "done\u{007f}\u{0085}"
+        );
+        let sanitized = sanitize_terminal_text(input);
+        assert_eq!(sanitized, "before    hidden-csiafterc1-csidone");
+        assert!(sanitized.chars().all(|character| {
+            character == '\n' || (!character.is_control() && character != '\u{007f}')
+        }));
+        assert!(!sanitized.contains("secret"));
+    }
+
+    #[test]
+    fn sanitizer_consumes_unterminated_escape_sequences() {
+        assert_eq!(sanitize_terminal_text("safe\u{1b}[31"), "safe");
+        assert_eq!(sanitize_terminal_text("safe\u{1b}]52;c;secret"), "safe");
+        assert_eq!(sanitize_terminal_text("safe\u{1b}(0text"), "safetext");
+    }
+
+    #[test]
+    fn rendered_content_is_sanitized_before_markdown_and_measurement() {
+        let plain = plain_text("a\tb\u{1b}[2Jc", Style::default());
+        assert_eq!(span_contents(&plain.lines[0]), "a    bc");
+        let markdown = markdown_lines("**safe\u{1b}]52;c;secret\u{07}**", Theme::default(), 40);
+        let value: String = markdown.iter().map(span_contents).collect();
+        assert!(value.contains("safe"));
+        assert!(!value.contains("secret"));
+        assert!(markdown.iter().all(|line| line_width(line) <= 40));
+    }
 
     #[test]
     fn markdown_preserves_formatting_styles() {
