@@ -6,10 +6,18 @@
 //! root-level `.md` file is also a skill; in [`SkillMode::Agents`] roots it
 //! is not (spec compat).
 //!
+//! Symlink policy (shared with `context_files.rs`): every candidate is
+//! canonicalized before reading or registering, and the canonical path must
+//! stay beneath its canonical discovery root. Contained symlinks pass;
+//! external symlinks (files, nested `SKILL.md`, or whole skill base
+//! directories) are rejected and never enter the catalog or read allowlist.
+//! Allowlist entries store the validated canonical path; UI text keeps a
+//! safe display path. Rejections never include file contents.
+//!
 //! Only skill *descriptions* are ever placed in the model prompt (progressive
 //! disclosure).  The model loads a skill's body by calling `read` on the
-//! absolute `SKILL.md` path in `<location>` — so this
-//! module also produces a **read-path allowlist** (`read_paths`) for
+//! absolute `SKILL.md` path in `<location>` — so this module also produces
+//! a **read-path allowlist** (`read_paths`) for
 //! [`ReadTool`], covering every discovered `SKILL.md` plus the skill
 //! directory's `scripts/`, `references/`, `assets/` so helper files are
 //! readable too.  Everything else (`edit`, `write`, `bash`, `find`) stays
@@ -216,16 +224,22 @@ fn validate_name(name: &str, diagnostics: &mut Vec<SkillDiagnostic>, path: &Path
 }
 
 /// Load a single skill file (a `SKILL.md` or a root-level `.md` in a
-/// harness-mode root).  Returns `None` when the description is missing
-/// (skill is dropped).
-fn load_skill_from_file(file_path: &Path, diagnostics: &mut Vec<SkillDiagnostic>) -> Option<Skill> {
+/// harness-mode root).  The caller has already validated containment:
+/// `file_path` is the validated canonical path and `display_path` is the
+/// safe path kept for UI text.  Returns `None` when the description is
+/// missing (skill is dropped); rejections never include file contents.
+fn load_skill_from_file(
+    file_path: &Path,
+    display_path: &Path,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) -> Option<Skill> {
     let raw = match fs::read_to_string(file_path) {
         Ok(raw) => raw,
         Err(error) => {
             diagnostics.push(SkillDiagnostic {
                 severity: SkillSeverity::Warning,
                 message: format!("failed to read skill file: {error}"),
-                path: Some(file_path.to_path_buf()),
+                path: Some(display_path.to_path_buf()),
             });
             return None;
         }
@@ -236,7 +250,7 @@ fn load_skill_from_file(file_path: &Path, diagnostics: &mut Vec<SkillDiagnostic>
         diagnostics.push(SkillDiagnostic {
             severity: SkillSeverity::Warning,
             message: "skill file has no frontmatter".into(),
-            path: Some(file_path.to_path_buf()),
+            path: Some(display_path.to_path_buf()),
         });
         return None;
     };
@@ -257,12 +271,12 @@ fn load_skill_from_file(file_path: &Path, diagnostics: &mut Vec<SkillDiagnostic>
         parent_name
     };
     let name = fm.name.clone().unwrap_or(fallback.clone());
-    validate_name(&name, diagnostics, file_path);
+    validate_name(&name, diagnostics, display_path);
     let Some(description) = fm.description.clone().filter(|d| !d.trim().is_empty()) else {
         diagnostics.push(SkillDiagnostic {
             severity: SkillSeverity::Warning,
             message: "description is required".into(),
-            path: Some(file_path.to_path_buf()),
+            path: Some(display_path.to_path_buf()),
         });
         return None;
     };
@@ -273,7 +287,7 @@ fn load_skill_from_file(file_path: &Path, diagnostics: &mut Vec<SkillDiagnostic>
                 "description exceeds {MAX_DESCRIPTION_LENGTH} characters ({})",
                 description.len()
             ),
-            path: Some(file_path.to_path_buf()),
+            path: Some(display_path.to_path_buf()),
         });
     }
     // Reads: the skill file itself, plus its base dir (for resources).
@@ -291,11 +305,15 @@ fn load_skill_from_file(file_path: &Path, diagnostics: &mut Vec<SkillDiagnostic>
 /// Recursive skill discovery from a root.  `mode` controls whether a
 /// root-level `.md` file is treated as a skill ([`SkillMode::Harness`] does;
 /// [`SkillMode::Agents`] ignores it).  `root` is the discovery root and `ig`
-/// the shared ignore matcher.
+/// the shared ignore matcher.  Every candidate is canonicalized and required
+/// to stay beneath the canonical root before reading or registering, so an
+/// external `SKILL.md` symlink (or symlinked skill base directory) is never
+/// catalogued nor added to read paths.  Contained symlinks pass.
 fn discover_dir(
     dir: &Path,
     mode: SkillMode,
     root: &Path,
+    canonical_root: &Path,
     ig: &ignore::gitignore::Gitignore,
     skills: &mut Vec<Skill>,
     diagnostics: &mut Vec<SkillDiagnostic>,
@@ -304,11 +322,13 @@ fn discover_dir(
         return;
     };
     // A directory containing SKILL.md is a skill root — do not recurse.
+    // The whole skill base directory must stay contained: a symlinked base
+    // pointing outside the root is rejected before its SKILL.md is read.
     let skill_md = dir.join("SKILL.md");
     if skill_md.is_file() {
         let rel = skill_md.strip_prefix(root).unwrap_or(&skill_md);
         if !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_skill_from_file(&skill_md, diagnostics)
+            && let Some(skill) = load_contained_skill(&skill_md, canonical_root, diagnostics)
         {
             skills.push(skill);
         }
@@ -331,7 +351,12 @@ fn discover_dir(
             if ig.matched(rel, true).is_ignore() {
                 continue;
             }
-            discover_dir(&path, mode, root, ig, skills, diagnostics);
+            // Do not descend through a symlinked directory that escapes the
+            // root: an external symlinked skill base is rejected here.
+            if !is_contained(canonical_root, &path) {
+                continue;
+            }
+            discover_dir(&path, mode, root, canonical_root, ig, skills, diagnostics);
             continue;
         }
         let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
@@ -346,11 +371,44 @@ fn discover_dir(
             && matches!(mode, SkillMode::Harness)
             && path.parent() == Some(root)
             && !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_skill_from_file(&path, diagnostics)
+            && let Some(skill) = load_contained_skill(&path, canonical_root, diagnostics)
         {
             skills.push(skill);
         }
     }
+}
+
+/// Containment gate shared by skill discovery: canonicalize the candidate
+/// and require it to stay beneath the canonical discovery root.  Returns the
+/// validated canonical path for allowlist storage plus the original path for
+/// safe UI display.  External symlinks return `None`.
+fn contained_path(canonical_root: &Path, candidate: &Path) -> Option<(PathBuf, PathBuf)> {
+    let canonical = fs::canonicalize(candidate).ok()?;
+    if !canonical.starts_with(canonical_root) {
+        return None;
+    }
+    Some((canonical, candidate.to_path_buf()))
+}
+
+fn is_contained(canonical_root: &Path, candidate: &Path) -> bool {
+    contained_path(canonical_root, candidate).is_some()
+}
+
+/// Load one skill file through the containment gate: external symlinks are
+/// rejected before reading (no contents in diagnostics); contained paths
+/// are read from the canonical location and registered under it.
+fn load_contained_skill(
+    candidate: &Path,
+    canonical_root: &Path,
+    diagnostics: &mut Vec<SkillDiagnostic>,
+) -> Option<Skill> {
+    // `candidate` is already lexically under the discovery root by
+    // construction; canonicalize to catch symlink escapes.
+    let canonical = fs::canonicalize(candidate).ok()?;
+    if !canonical.starts_with(canonical_root) {
+        return None;
+    }
+    load_skill_from_file(&canonical, candidate, diagnostics)
 }
 
 /// Build a gitignore-style matcher from `.gitignore` / `.ignore` /
@@ -384,7 +442,18 @@ pub fn load_skills_from_dir(root: &Path, mode: SkillMode) -> SkillCatalog {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
     let ig = build_ignore(root);
-    discover_dir(root, mode, root, &ig, &mut skills, &mut diagnostics);
+    // Canonicalize the root once so containment compares like-for-like;
+    // symlinked roots (e.g. /tmp on macOS) still gate correctly.
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    discover_dir(
+        root,
+        mode,
+        root,
+        &canonical_root,
+        &ig,
+        &mut skills,
+        &mut diagnostics,
+    );
     SkillCatalog {
         skills,
         diagnostics,
@@ -425,9 +494,12 @@ pub fn discover(roots: &[(PathBuf, SkillMode)]) -> SkillCatalog {
             all_skills.push(skill);
         }
     }
-    // Read-paths for every *kept* skill (its file plus base dir).  Only
-    // skills that won the name collision contribute, and the list is deduped
-    // (root-priority walk can repeat the same path).
+    // Read-paths for every *kept* skill: the validated canonical file plus
+    // its canonical base dir (so `scripts/`/`references/`/`assets/` stay
+    // reachable).  Only winners contribute; the list is deduped.  Stored
+    // paths are canonical — the same form `ReadTool` compares after its own
+    // canonicalization — while prompt `<location>` keeps the safe display
+    // path via `Skill::file_path`.
     let mut read_paths = Vec::with_capacity(all_skills.len() * 2);
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     for skill in &all_skills {
@@ -723,5 +795,60 @@ mod tests {
         );
         assert_eq!(expand_tilde(Path::new("~/")), home);
         assert_eq!(expand_tilde(Path::new("plain")), PathBuf::from("plain"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_skill_symlinks_are_rejected_but_contained_ones_work() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let skills = root.path().join(".harness/skills");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&skills).unwrap();
+        // External SKILL.md target with a sentinel secret.
+        let secret = outside.join("secret.md");
+        fs::write(
+            &secret,
+            "---\nname: evil\ndescription: Evil\n---\nTOP-SECRET-EXTERNAL\n",
+        )
+        .unwrap();
+        // External SKILL.md symlink is neither catalogued nor readable.
+        symlink(&secret, skills.join("evil-link.md")).unwrap();
+        // External symlinked skill base directory is rejected.
+        let outside_skill = outside.join("ext-skill");
+        fs::create_dir_all(&outside_skill).unwrap();
+        fs::write(
+            outside_skill.join("SKILL.md"),
+            "---\nname: ext\ndescription: Ext\n---\nbody\n",
+        )
+        .unwrap();
+        symlink(&outside_skill, skills.join("ext-link")).unwrap();
+        // A contained symlink (target inside the same root) works.
+        fs::create_dir_all(skills.join("real")).unwrap();
+        fs::write(
+            skills.join("real/SKILL.md"),
+            "---\nname: real\ndescription: Real skill\n---\nbody\n",
+        )
+        .unwrap();
+        symlink(skills.join("real"), skills.join("real-link")).unwrap();
+
+        let catalog = discover(&[(skills.clone(), SkillMode::Harness)]);
+        let names: Vec<_> = catalog.skills.iter().map(|s| s.name.as_str()).collect();
+        assert!(!names.contains(&"evil"), "external file symlink: {names:?}");
+        assert!(!names.contains(&"ext"), "external base symlink: {names:?}");
+        assert!(names.contains(&"real"), "contained symlink: {names:?}");
+        assert!(
+            !catalog.read_paths.iter().any(|p| p == &secret),
+            "external target must not be in read paths"
+        );
+        // Diagnostics (if any) never reveal external file contents.
+        for diagnostic in &catalog.diagnostics {
+            assert!(
+                !diagnostic.message.contains("TOP-SECRET-EXTERNAL"),
+                "diagnostic leaks contents: {}",
+                diagnostic.message
+            );
+        }
     }
 }
