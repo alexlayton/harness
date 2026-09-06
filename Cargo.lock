@@ -3771,6 +3771,7 @@ dependencies = [
  "fastrand",
  "futures-util",
  "ignore",
+ "memchr",
  "proptest",
  "ratatui-core",
  "tempfile",
