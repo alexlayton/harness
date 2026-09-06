@@ -4017,6 +4017,64 @@ mod tests {
             CompletionTarget::Argument(ArgumentKind::Session)
         );
         assert_eq!(completion.context.query, "./");
+        // The debounced scan merges filesystem candidates with the static
+        // session-ID candidates (TUI-3: `/load` completes both).
+        let scanned = crate::paths::find_path_candidates(
+            &ui.environment.cwd,
+            "./",
+            &CancellationToken::new(),
+        );
+        let merged = merge_candidates(
+            commands::candidates_at_cursor(
+                &ui.input,
+                ui.cursor_char_col(),
+                &ui.providers,
+                &ui.model_lists,
+                &ui.provider,
+                &ui.session_candidates,
+                &ui.skills,
+            )
+            .map(|result| result.candidates)
+            .unwrap_or_default(),
+            scanned,
+        );
+        assert!(
+            !merged.is_empty(),
+            "`/load ./...` must produce filesystem candidates"
+        );
+        // And session IDs survive the merge when present: an empty query
+        // (`/load ` with no prefix) matches every cached session.
+        ui.input = "/load ".into();
+        ui.cursor = ui.input.len();
+        ui.session_candidates = vec![SessionListEntry {
+            id: "abc123-full".into(),
+            short_id: "abc123".into(),
+            title: None,
+            updated_at: "2026-08-13 12:00".into(),
+            workspace: "/workspace".into(),
+            provider: None,
+            model: None,
+        }];
+        let merged_with_session = merge_candidates(
+            commands::candidates_at_cursor(
+                &ui.input,
+                ui.cursor_char_col(),
+                &ui.providers,
+                &ui.model_lists,
+                &ui.provider,
+                &ui.session_candidates,
+                &ui.skills,
+            )
+            .map(|result| result.candidates)
+            .unwrap_or_default(),
+            Vec::new(),
+        );
+        assert!(
+            merged_with_session
+                .iter()
+                .any(|candidate| candidate.value.contains("abc123")),
+            "session IDs must survive alongside path candidates"
+        );
     }
 
     #[test]
