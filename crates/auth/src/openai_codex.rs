@@ -122,7 +122,6 @@ impl OpenAiCodexAuth {
     /// Test seam: same client against a local fixture so refresh tests
     /// exercise the real `ensure_valid` path with one network exchange.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) fn with_http_and_endpoints(
         mut self,
         http: Client,
@@ -1437,5 +1436,111 @@ mod tests {
             .unwrap();
         assert_eq!(code, "frag");
         drop(idle);
+    }
+
+    /// AUTH-2 (Codex counterpart): concurrent `ensure_valid` calls
+    /// single-flight onto one network refresh through the real guard.
+    /// The fixture's token endpoint counts exchanges: the first
+    /// succeeds and rotates the token, a second would fail, so every
+    /// waiter must share the first waiter's result. A barrier releases
+    /// all waiters together so they pile onto the refresh lock while
+    /// the first exchange is in flight.
+    #[tokio::test]
+    async fn codex_concurrent_refresh_single_flights_on_one_network_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let exchanges = std::sync::Arc::new(AtomicUsize::new(0));
+        let exchanges_task = exchanges.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                // Hold the first exchange open so waiters pile onto the
+                // refresh guard; reject any second exchange outright.
+                if n == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let body = if n == 0 {
+                    // Fresh pair: the response carries its own refresh
+                    // token plus a JWT account id and expiry, so the
+                    // parsed credential is complete and unexpired.
+                    let payload = URL_SAFE_NO_PAD
+                        .encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+                    let access = format!("head.{payload}.sig");
+                    serde_json::json!({
+                        "access_token": access,
+                        "refresh_token": "refresh-rotated",
+                        "expires_in": 3600,
+                        "id_token": access,
+                    })
+                    .to_string()
+                } else {
+                    r#"{"error":"rotated token already used"}"#.to_owned()
+                };
+                let (status, reason) = if n == 0 { (200, "OK") } else { (401, "Error") };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Expired credential so every waiter wants a refresh (`expires:
+        // 1` is past, and the 60s Codex early-expiry skew keeps it so).
+        AuthStore::new(path.clone())
+            .save_openai_codex(&OpenAiCodexCredential::new(
+                "access-old",
+                "refresh-single-use",
+                1,
+                "acct",
+            ))
+            .unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_http_and_endpoints(
+                reqwest::Client::new(),
+                OpenAiCodexEndpoints {
+                    authorize_url: format!("http://{addr}/authorize"),
+                    token_url: format!("http://{addr}/token"),
+                    device_code_url: format!("http://{addr}/device"),
+                },
+            );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let waiters = (0..8)
+            .map(|_| {
+                let auth = auth.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    auth.ensure_valid().await.unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for waiter in waiters {
+            results.push(waiter.await.unwrap());
+        }
+        // One network exchange despite 8 concurrent waiters…
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        // …every waiter shares the rotated credential…
+        for credential in &results {
+            assert_eq!(credential.access, results[0].access);
+            assert_eq!(credential.refresh, "refresh-rotated");
+        }
+        // …and the persisted credential equals what the waiters saw.
+        // (Read without the auth handle's cache: the store is the
+        // source of truth a restarted process would observe.)
+        let persisted = AuthStore::new(path).openai_codex().unwrap().unwrap();
+        assert_eq!(persisted.access, results[0].access);
+        assert_eq!(persisted.refresh, "refresh-rotated");
     }
 }
