@@ -21,8 +21,12 @@ impl Agent {
     /// - quarantines/stops after persistence failure
     ///   (`TurnControl::Quarantine`, mirroring the run-loop quarantine);
     /// - flushes deferred session writes exactly once at the boundary;
-    /// - emits terminal events exactly once (the body sends `TurnFinished`
-    ///   on every completed path; early shutdown returns before any).
+    /// - emits terminal events exactly once on early-exit paths (shutdown
+    ///   before any body ran, persistence failure inside the body). A body
+    ///   that already emitted `TurnFinished` and then fails its boundary
+    ///   flush yields a second `TurnFinished` from the run-loop quarantine;
+    ///   the quarantine (loop break, queued work never runs) is what the
+    ///   boundary guarantees, not a literal single event in that corner.
     pub(crate) async fn execute_turn(
         &mut self,
         user_text: String,

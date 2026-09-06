@@ -1473,6 +1473,247 @@ mod tests {
     }
 
     #[test]
+    fn deferred_sync_flush_failure_quarantines_skill_manual_compact_and_model_change() {
+        // Every operation sharing the turn boundary (skill turns,
+        // manual `/compact`, `/model`) must flush deferred-sync writes
+        // and quarantine on a failed flush — even when the body itself
+        // succeeded. The injected `sync_session` failure is the same
+        // `SessionError::Io` a real `fsync` failure would produce.
+        use session::SyncSessionFaultGuard;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // --- Skill turn: body succeeds, flush fails → quarantine. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = store.create(SessionCreateOptions::default()).unwrap();
+                let skill_root = tempdir().unwrap();
+                let skill_dir = skill_root.path().join("flush-skill");
+                std::fs::create_dir_all(&skill_dir).unwrap();
+                std::fs::write(
+                    skill_dir.join("SKILL.md"),
+                    "---\nname: flush-skill\ndescription: Flush\n---\nDo it.\n",
+                )
+                .unwrap();
+                // SAFETY: single-threaded test runtime; scoped env mutation.
+                unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+                let registry =
+                    tools::default_registry(tools::ToolConfig::new(workspace.path(), false))
+                        .unwrap();
+                unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+                let provider = Arc::new(MockProvider {
+                    calls: AtomicUsize::new(0),
+                    scripts: vec![script(vec![
+                        StreamEvent::TextDelta("skill answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ])],
+                    error_kind: MockErrorKind::Stream,
+                });
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::InvokeSkill {
+                        name: "flush-skill".into(),
+                    })
+                    .unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(provider, registry, "demo", CancellationToken::new())
+                    .with_session(store, session)
+                    .run(input_rx, event_tx)
+                    .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                // The skill body ran (text arrived) but the failed flush
+                // quarantined: one sync-failure Error, one TurnFinished,
+                // and the queued message never ran.
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("skill answer")
+                    )),
+                    "skill body should have run before the flush: {events:?}"
+                );
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::Error(message) if message.contains("during sync")
+                    )),
+                    "expected a sync-failure error: {events:?}"
+                );
+                // The body already emitted its own `TurnFinished` before
+                // the boundary flush failed; the run loop quarantines with
+                // a second one. What matters: exactly one sync-failure
+                // error, quarantine (loop breaks), and the queued message
+                // never runs — never a successful second turn.
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    2,
+                    "events: {events:?}"
+                );
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                    )),
+                    "queued work ran: {events:?}"
+                );
+            }
+
+            // --- Manual `/compact`: flush fails → quarantine, no summary. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = populate_session(&store, 12, 12_000);
+                let session_id = session.id();
+                let provider = Arc::new(RecordingProvider {
+                    calls: AtomicUsize::new(0),
+                    scripts: vec![summarizer_script()],
+                    seen: Mutex::new(Vec::new()),
+                });
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx.send(InputMessage::CompactSession).unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(
+                    provider,
+                    ToolRegistry::empty(),
+                    "demo",
+                    CancellationToken::new(),
+                )
+                .with_session(store.clone(), session)
+                .run(input_rx, event_tx)
+                .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                // The boundary flush runs even when compaction itself
+                // fails: one sync-failure error, quarantine (queued work
+                // never runs), and no summary persisted.
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::Error(message) if message.contains("during sync")
+                    )),
+                    "expected a sync-failure error: {events:?}"
+                );
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                    )),
+                    "queued work ran: {events:?}"
+                );
+                let reloaded = store.open(&session_id).unwrap();
+                // The compaction body itself succeeded and persisted its
+                // summary before the boundary flush failed — the flush is
+                // durability of already-written records, not a gate on the
+                // write. What the boundary guarantees is quarantine (queued
+                // work never runs) plus a loud sync-failure error, both
+                // asserted above.
+                assert!(
+                    reloaded.events.iter().any(|record| matches!(
+                        record.event,
+                        SessionEvent::CompactionSummary { .. }
+                    )),
+                    "body summary persists; the failed flush only loses fsync durability"
+                );
+            }
+
+            // --- `/model`: persist-first commit, then boundary flush. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = store.create(SessionCreateOptions::default()).unwrap();
+                let session_id = session.id();
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::SetModel {
+                        provider: None,
+                        model: "switched-model".into(),
+                    })
+                    .unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(
+                    Arc::new(MockProvider {
+                        calls: AtomicUsize::new(0),
+                        scripts: vec![],
+                        error_kind: MockErrorKind::Stream,
+                    }),
+                    ToolRegistry::empty(),
+                    "demo",
+                    CancellationToken::new(),
+                )
+                .with_session(store.clone(), session)
+                .run(input_rx, event_tx)
+                .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                // The `ModelChange` persist succeeded and committed before
+                // the boundary flush failed: selection moved, then the
+                // failed flush quarantined (queued work never runs) with a
+                // loud sync-failure error.
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::ModelChanged { model, .. } if model == "switched-model"
+                    )),
+                    "model change should commit before the flush: {events:?}"
+                );
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::Error(message) if message.contains("during sync")
+                    )),
+                    "expected a sync-failure error: {events:?}"
+                );
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                    )),
+                    "queued work ran: {events:?}"
+                );
+                let reloaded = store.open(&session_id).unwrap();
+                assert!(
+                    reloaded
+                        .events
+                        .iter()
+                        .any(|record| matches!(record.event, SessionEvent::ModelChange { .. })),
+                    "ModelChange persists; the failed flush only loses fsync durability"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn skill_turn_failure_quarantines_and_never_runs_queued_work() {
         // Persistence failure during a skill turn (deleted session file)
         // must quarantine through the shared executor: exactly one
