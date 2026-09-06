@@ -567,8 +567,25 @@ fn reconcile_external_tail(session: &mut Session, path: &Path, file_size: usize)
 
     // A valid unterminated file is made canonical by the next writer. The
     // separator is not an event and belongs to the external append, not the
-    // cached prefix.
+    // cached prefix. An extra separator after an already terminated prefix is
+    // a real blank record and remains a hard error.
     if suffix.starts_with('\n') {
+        if session.validated_bytes > 0 {
+            let mut prefix =
+                File::open(path).map_err(|source| io_error("open session prefix", path, source))?;
+            prefix
+                .seek(SeekFrom::Start(session.validated_bytes as u64 - 1))
+                .map_err(|source| io_error("seek session prefix", path, source))?;
+            let mut byte = [0u8; 1];
+            prefix
+                .read_exact(&mut byte)
+                .map_err(|source| io_error("read session prefix", path, source))?;
+            if byte[0] == b'\n' {
+                return Err(SessionError::InvalidEvent(
+                    "external session suffix starts with a blank line".into(),
+                ));
+            }
+        }
         suffix.remove(0);
     }
     if suffix.is_empty() {

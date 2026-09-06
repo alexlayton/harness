@@ -943,20 +943,27 @@ pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord
 }
 
 /// Validate an on-disk suffix against cached state without cloning the full
-/// event history. The small tool tracker and ID set are copied so a malformed
-/// suffix cannot partially mutate the live session.
+/// event history. Only unresolved calls from the cached tail and IDs created
+/// by this suffix are copied; the completed-call index remains shared through
+/// the overlay's read-only base reference.
 pub(crate) fn validate_event_suffix(
     session: &Session,
     records: &[SessionEventRecord],
 ) -> Result<()> {
-    let mut ids = session.event_ids.clone();
-    let mut tracker = session.tracker.clone();
+    let mut ids = HashSet::new();
+    let mut tracker = SuffixTracker::new(&session.tracker);
     let mut boundary = session.compaction_boundary;
     let mut expected = session
         .events
         .last()
         .map_or(1, |record| record.sequence.saturating_add(1));
     for record in records {
+        if session.event_ids.contains(&record.id) {
+            return Err(SessionError::InvalidEvent(format!(
+                "duplicate event ID {}",
+                record.id
+            )));
+        }
         validate_record(record, expected, &ids, &tracker, boundary)?;
         ids.insert(record.id);
         if let SessionEvent::CompactionSummary {
@@ -971,11 +978,74 @@ pub(crate) fn validate_event_suffix(
     Ok(())
 }
 
-fn validate_record(
+trait ToolValidationState {
+    fn pending(&self) -> &[String];
+    fn is_pending(&self, id: &str) -> bool;
+    fn is_seen(&self, id: &str) -> bool;
+    fn is_cancelled(&self) -> bool;
+}
+
+impl ToolValidationState for ToolCallTracker {
+    fn pending(&self) -> &[String] {
+        ToolCallTracker::pending(self)
+    }
+
+    fn is_pending(&self, id: &str) -> bool {
+        ToolCallTracker::is_pending(self, id)
+    }
+
+    fn is_seen(&self, id: &str) -> bool {
+        ToolCallTracker::is_seen(self, id)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        ToolCallTracker::is_cancelled(self)
+    }
+}
+
+struct SuffixTracker<'a> {
+    base: &'a ToolCallTracker,
+    local: ToolCallTracker,
+}
+
+impl<'a> SuffixTracker<'a> {
+    fn new(base: &'a ToolCallTracker) -> Self {
+        let local = ToolCallTracker {
+            pending: base.pending.clone(),
+            cancelled: base.cancelled,
+            ..ToolCallTracker::default()
+        };
+        Self { base, local }
+    }
+
+    fn record(&mut self, event: &SessionEvent) {
+        self.local.record(event);
+    }
+}
+
+impl ToolValidationState for SuffixTracker<'_> {
+    fn pending(&self) -> &[String] {
+        &self.local.pending
+    }
+
+    fn is_pending(&self, id: &str) -> bool {
+        self.local.is_pending(id)
+    }
+
+    fn is_seen(&self, id: &str) -> bool {
+        self.base.is_seen(id) || self.local.is_seen(id)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.local.is_cancelled()
+    }
+}
+
+fn validate_record<T: ToolValidationState>(
     record: &SessionEventRecord,
     expected_sequence: u64,
     ids: &HashSet<EventId>,
-    tracker: &ToolCallTracker,
+    tracker: &T,
     compaction_boundary: Option<u64>,
 ) -> Result<()> {
     if record.sequence != expected_sequence {
@@ -1096,10 +1166,10 @@ fn validate_record(
     Ok(())
 }
 
-fn validate_tool_call_id(
+fn validate_tool_call_id<T: ToolValidationState>(
     id: &str,
     name: &str,
-    tracker: &ToolCallTracker,
+    tracker: &T,
     record_ids: &HashSet<String>,
 ) -> Result<()> {
     if id.trim().is_empty() || name.trim().is_empty() {
