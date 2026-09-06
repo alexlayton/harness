@@ -55,6 +55,7 @@ options.
   providers.
 - Workspace-scoped file tools, an unrestricted shell, optional MCP servers,
   and bounded subagents.
+- Model-assisted context compaction with a deterministic local fallback.
 - Automatic `AGENTS.md`/`CLAUDE.md` context and Agent Skills discovery.
 - Append-only JSONL sessions with reload, export, and context compaction.
 
