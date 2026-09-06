@@ -942,6 +942,35 @@ pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord
     )
 }
 
+/// Validate an on-disk suffix against cached state without cloning the full
+/// event history. The small tool tracker and ID set are copied so a malformed
+/// suffix cannot partially mutate the live session.
+pub(crate) fn validate_event_suffix(
+    session: &Session,
+    records: &[SessionEventRecord],
+) -> Result<()> {
+    let mut ids = session.event_ids.clone();
+    let mut tracker = session.tracker.clone();
+    let mut boundary = session.compaction_boundary;
+    let mut expected = session
+        .events
+        .last()
+        .map_or(1, |record| record.sequence.saturating_add(1));
+    for record in records {
+        validate_record(record, expected, &ids, &tracker, boundary)?;
+        ids.insert(record.id);
+        if let SessionEvent::CompactionSummary {
+            compacted_through, ..
+        } = &record.event
+        {
+            boundary = Some(*compacted_through);
+        }
+        tracker.record(&record.event);
+        expected = expected.saturating_add(1);
+    }
+    Ok(())
+}
+
 fn validate_record(
     record: &SessionEventRecord,
     expected_sequence: u64,

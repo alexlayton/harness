@@ -136,6 +136,87 @@ pub fn decode_session_file(
     decode_session_lines(content, source.as_ref(), true)
 }
 
+/// Decode one already separated event line while reconciling an append suffix.
+/// Header parsing remains in [`decode_session_file`]; this helper deliberately
+/// performs only envelope decoding so the caller can validate a suffix against
+/// its cached tool state without replaying the complete history.
+pub(crate) fn decode_event_line(
+    line: &str,
+    expected_session_id: SessionId,
+    source: &Path,
+    line_number: usize,
+) -> Result<SessionEventRecord> {
+    let raw: RawEnvelope =
+        serde_json::from_str(line).map_err(|source_error| SessionError::Json {
+            path: source.to_path_buf(),
+            line: line_number,
+            source: source_error,
+        })?;
+    let version = raw.version.ok_or_else(|| SessionError::InvalidLine {
+        path: source.to_path_buf(),
+        line: line_number,
+        message: "missing version".into(),
+    })?;
+    if version > FORMAT_VERSION {
+        return Err(SessionError::UnsupportedVersion {
+            found: version,
+            supported: FORMAT_VERSION,
+        });
+    }
+    let kind = raw.kind.ok_or_else(|| SessionError::InvalidLine {
+        path: source.to_path_buf(),
+        line: line_number,
+        message: "missing type".into(),
+    })?;
+    if kind == "session" {
+        return Err(SessionError::InvalidLine {
+            path: source.to_path_buf(),
+            line: line_number,
+            message: "session header may only occur on the first line".into(),
+        });
+    }
+    let session_id = parse_session_id(raw.session_id.as_deref(), source, line_number)?;
+    if session_id != expected_session_id {
+        return Err(SessionError::InvalidLine {
+            path: source.to_path_buf(),
+            line: line_number,
+            message: format!(
+                "event belongs to session {session_id}, expected {expected_session_id}"
+            ),
+        });
+    }
+    let event_id = raw
+        .event_id
+        .as_deref()
+        .ok_or_else(|| SessionError::InvalidLine {
+            path: source.to_path_buf(),
+            line: line_number,
+            message: "event is missing event_id".into(),
+        })
+        .and_then(EventId::parse)?;
+    let sequence = raw.sequence.ok_or_else(|| SessionError::InvalidLine {
+        path: source.to_path_buf(),
+        line: line_number,
+        message: "event is missing sequence".into(),
+    })?;
+    let timestamp = raw.timestamp.ok_or_else(|| SessionError::InvalidLine {
+        path: source.to_path_buf(),
+        line: line_number,
+        message: "event is missing timestamp".into(),
+    })?;
+    let event = decode_event(&kind, raw.data).map_err(|message| SessionError::InvalidLine {
+        path: source.to_path_buf(),
+        line: line_number,
+        message,
+    })?;
+    Ok(SessionEventRecord {
+        id: event_id,
+        sequence,
+        timestamp,
+        event,
+    })
+}
+
 fn decode_session_lines(
     content: &str,
     source: &Path,

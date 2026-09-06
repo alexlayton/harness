@@ -1,14 +1,16 @@
-use crate::codec::{TailRecovery, decode_session_file, encode_header, encode_record};
+use crate::codec::{
+    TailRecovery, decode_event_line, decode_session_file, encode_header, encode_record,
+};
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{
     EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, StoredContent,
-    StoredToolCall, Timestamp, now_timestamp, validate_next_event,
+    StoredToolCall, Timestamp, now_timestamp, validate_event_suffix, validate_next_event,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -246,8 +248,7 @@ impl SessionStore {
             && usize::try_from(file_size).ok() == Some(session.validated_bytes)
         {
             // The open Session still covers the complete file prefix and its
-            // identity is unchanged. Validate only the new state transition;
-            // stale copies fall through to the full locked replay below.
+            // identity is unchanged. Validate only the new state transition.
             let record = SessionEventRecord {
                 id: EventId::new(),
                 sequence: session
@@ -259,29 +260,41 @@ impl SessionStore {
             };
             validate_next_event(session, &record)?;
             let line = encode_record(session.id(), &record)?;
-            let mut file = OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .map_err(|source| io_error("open session for append", &path, source))?;
-            let write_result = file
-                .write_all(line.as_bytes())
-                .and_then(|_| file.write_all(b"\n"))
-                .and_then(|_| file.flush());
-            let write_result = if write_result.is_err() || !self.deferred_sync() {
-                write_result.and_then(|_| file.sync_all())
-            } else {
-                write_result
-            };
-            write_result.map_err(|source| io_error("append session event", &path, source))?;
-            drop(file);
+            let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
             session.append_record(record.clone());
-            session.validated_bytes = usize::try_from(file_size)
-                .unwrap_or(usize::MAX)
-                .saturating_add(line.len())
-                .saturating_add(1);
+            session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
             drop(lock);
             return Ok(record);
         }
+
+        // A second store may have appended a suffix without replacing the
+        // file. Reconcile just those bytes under the lock; full replay is
+        // reserved for replacement, truncation, or an incomplete suffix.
+        if session.validated_bytes > 0
+            && session.file_identity == Some(current_identity)
+            && usize::try_from(file_size)
+                .ok()
+                .is_some_and(|size| size > session.validated_bytes)
+            && reconcile_external_tail(session, &path, file_size as usize)?
+        {
+            let record = SessionEventRecord {
+                id: EventId::new(),
+                sequence: session
+                    .events
+                    .last()
+                    .map_or(1, |entry| entry.sequence.saturating_add(1)),
+                timestamp: now_timestamp(),
+                event,
+            };
+            validate_next_event(session, &record)?;
+            let line = encode_record(session.id(), &record)?;
+            let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
+            session.append_record(record.clone());
+            session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
+            drop(lock);
+            return Ok(record);
+        }
+
         // Re-read under the lock. Two processes may each hold an older
         // in-memory Session; deriving the sequence from disk prevents
         // duplicate sequence numbers and keeps append-only ordering valid.
@@ -307,30 +320,11 @@ impl SessionStore {
             timestamp: now_timestamp(),
             event,
         };
-        let mut candidate_events = disk_session.events.clone();
-        candidate_events.push(record.clone());
-        crate::model::validate_events(&candidate_events)?;
+        validate_next_event(&disk_session, &record)?;
         let line = encode_record(disk_session.id(), &record)?;
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .map_err(|source| io_error("open session for append", &path, source))?;
-        let write_result = file
-            .write_all(line.as_bytes())
-            .and_then(|_| file.write_all(b"\n"))
-            .and_then(|_| file.flush());
-        let write_result = if write_result.is_err() || !self.deferred_sync() {
-            write_result.and_then(|_| file.sync_all())
-        } else {
-            write_result
-        };
-        write_result.map_err(|source| io_error("append session event", &path, source))?;
-        drop(file);
+        let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
         disk_session.append_record(record.clone());
-        disk_session.validated_bytes = recovery
-            .valid_bytes
-            .saturating_add(line.len())
-            .saturating_add(1);
+        disk_session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
         *session = disk_session;
         drop(lock);
         Ok(record)
@@ -557,6 +551,98 @@ fn truncate_to_valid_tail(path: &Path, recovery: &TailRecovery) -> Result<()> {
         .map_err(|source| io_error("truncate incomplete session tail", path, source))?;
     file.sync_all()
         .map_err(|source| io_error("sync repaired session", path, source))
+}
+
+/// Reconcile records appended by another store while retaining the cached
+/// session vector. Returns `false` when the suffix ends in an unterminated
+/// malformed line; the caller then performs the recovery-aware full reload.
+fn reconcile_external_tail(session: &mut Session, path: &Path, file_size: usize) -> Result<bool> {
+    let mut file =
+        File::open(path).map_err(|source| io_error("open session suffix", path, source))?;
+    file.seek(SeekFrom::Start(session.validated_bytes as u64))
+        .map_err(|source| io_error("seek session suffix", path, source))?;
+    let mut suffix = String::new();
+    file.read_to_string(&mut suffix)
+        .map_err(|source| io_error("read session suffix", path, source))?;
+
+    // A valid unterminated file is made canonical by the next writer. The
+    // separator is not an event and belongs to the external append, not the
+    // cached prefix.
+    if suffix.starts_with('\n') {
+        suffix.remove(0);
+    }
+    if suffix.is_empty() {
+        session.validated_bytes = file_size;
+        return Ok(true);
+    }
+
+    let mut records = Vec::new();
+    let lines = suffix.split_inclusive('\n').collect::<Vec<_>>();
+    for (index, raw_line) in lines.iter().enumerate() {
+        let terminated = raw_line.ends_with('\n');
+        let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+        if line.trim().is_empty() {
+            return Err(SessionError::InvalidEvent(
+                "external session suffix contains a blank line".into(),
+            ));
+        }
+        match decode_event_line(line, session.id(), path, index + 1) {
+            Ok(record) => records.push(record),
+            Err(_error) if !terminated && index + 1 == lines.len() => return Ok(false),
+            Err(error) => return Err(error),
+        }
+    }
+    validate_event_suffix(session, &records)?;
+    for record in records {
+        session.append_record(record);
+    }
+    session.validated_bytes = file_size;
+    Ok(true)
+}
+
+/// Append one canonical record, inserting a separator when the preceding
+/// valid record ended without a newline. Returns the resulting file length.
+fn append_encoded_record(path: &Path, line: &str, deferred_sync: bool) -> Result<u64> {
+    let file_size = fs::metadata(path)
+        .map_err(|source| io_error("stat session for append", path, source))?
+        .len();
+    let needs_separator = file_size > 0 && !file_ends_with_newline(path, file_size)?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|source| io_error("open session for append", path, source))?;
+    let write_result = (|| -> std::io::Result<()> {
+        if needs_separator {
+            file.write_all(b"\n")?;
+        }
+        file.write_all(line.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.flush()
+    })();
+    let write_result = if write_result.is_err() || !deferred_sync {
+        write_result.and_then(|_| file.sync_all())
+    } else {
+        write_result
+    };
+    write_result.map_err(|source| io_error("append session event", path, source))?;
+    Ok(file_size
+        .saturating_add(u64::from(needs_separator))
+        .saturating_add(line.len() as u64)
+        .saturating_add(1))
+}
+
+fn file_ends_with_newline(path: &Path, file_size: u64) -> Result<bool> {
+    if file_size == 0 {
+        return Ok(true);
+    }
+    let mut file =
+        File::open(path).map_err(|source| io_error("open session tail", path, source))?;
+    file.seek(SeekFrom::End(-1))
+        .map_err(|source| io_error("seek session tail", path, source))?;
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte)
+        .map_err(|source| io_error("read session tail", path, source))?;
+    Ok(byte[0] == b'\n')
 }
 
 fn read_file(path: &Path) -> Result<String> {
@@ -1284,6 +1370,163 @@ mod tests {
         let loaded = store.open(&id).unwrap();
         assert_eq!(loaded.events.len(), 2);
         assert_eq!(loaded.events[1].sequence, 2);
+    }
+
+    #[test]
+    fn stale_store_reconciles_repeated_external_tails() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let id = session.id();
+        let mut first = store.open(&id).unwrap();
+        let mut second = store.open(&id).unwrap();
+        for index in 0..40 {
+            let target = if index % 2 == 0 {
+                &mut first
+            } else {
+                &mut second
+            };
+            store
+                .append_event(
+                    target,
+                    if index % 2 == 0 {
+                        SessionEvent::UserMessage {
+                            message: StoredMessage::from_llm(&Message::user(format!(
+                                "user {index}"
+                            ))),
+                        }
+                    } else {
+                        SessionEvent::AssistantMessage {
+                            message: StoredMessage::from_llm(&Message::assistant(vec![
+                                llm::Content::Text(format!("assistant {index}")),
+                            ])),
+                        }
+                    },
+                )
+                .unwrap();
+        }
+        let loaded = store.open(&id).unwrap();
+        assert_eq!(loaded.events.len(), 40);
+        assert_eq!(
+            loaded
+                .events
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            (1..=40).collect::<Vec<_>>()
+        );
+        assert_eq!(second.events.len(), 40);
+    }
+
+    #[test]
+    fn append_after_valid_unterminated_record_inserts_separator() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("before")),
+                },
+            )
+            .unwrap();
+        let path = session.path().unwrap().clone();
+        let mut raw = fs::read(&path).unwrap();
+        assert_eq!(raw.pop(), Some(b'\n'));
+        fs::write(&path, raw).unwrap();
+        let mut loaded = store.open(&session.id()).unwrap();
+        store
+            .append_event(
+                &mut loaded,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("after")),
+                },
+            )
+            .unwrap();
+        let reopened = store.open(&session.id()).unwrap();
+        assert_eq!(reopened.events.len(), 2);
+        assert_eq!(reopened.events[1].sequence, 2);
+        assert!(
+            fs::read(&path)
+                .unwrap()
+                .windows(2)
+                .any(|pair| pair == b"\n{")
+        );
+    }
+
+    #[test]
+    fn replacement_with_same_length_is_reconciled_before_append() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("before")),
+                },
+            )
+            .unwrap();
+        let mut stale = store.open(&session.id()).unwrap();
+        let path = session.path().unwrap().clone();
+        let original = fs::read_to_string(&path).unwrap();
+        fs::write(&path, original.replace("before", "altered")).unwrap();
+        store
+            .append_event(
+                &mut stale,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("after")),
+                },
+            )
+            .unwrap();
+        let reopened = store.open(&session.id()).unwrap();
+        assert_eq!(reopened.events.len(), 2);
+        assert_eq!(reopened.context_messages()[0], Message::user("altered"));
+    }
+
+    #[test]
+    fn truncation_to_valid_boundary_is_reconciled_before_append() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        for text in ["first", "second"] {
+            store
+                .append_event(
+                    &mut session,
+                    SessionEvent::UserMessage {
+                        message: StoredMessage::from_llm(&Message::user(text)),
+                    },
+                )
+                .unwrap();
+        }
+        let mut stale = store.open(&session.id()).unwrap();
+        let path = session.path().unwrap().clone();
+        let raw = fs::read(&path).unwrap();
+        let header_end = raw.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let first_event_end = raw[header_end..]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|offset| header_end + offset + 1)
+            .unwrap();
+        fs::write(&path, &raw[..first_event_end]).unwrap();
+        assert!(first_event_end > header_end);
+        store
+            .append_event(
+                &mut stale,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("replacement")),
+                },
+            )
+            .unwrap();
+        let reopened = store.open(&session.id()).unwrap();
+        assert_eq!(reopened.events.len(), 2);
+        assert_eq!(reopened.events[1].sequence, 2);
+        assert_eq!(reopened.context_messages()[1], Message::user("replacement"));
     }
 
     #[test]
