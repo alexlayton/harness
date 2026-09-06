@@ -68,13 +68,10 @@ pub fn export_jsonl(
             .create_new(true)
             .open(&temp)
             .map_err(|source| io_error("create export file", &temp, source))?;
-        // Header IDs, paths, provider/model names, timestamps, and usage are
-        // structural and preserved so the export stays loadable; only the
-        // free-text title is redacted.
-        let mut header_metadata = session.header_metadata().clone();
-        if options.redact_secrets {
-            header_metadata.title = header_metadata.title.map(|title| redact_text(&title));
-        }
+        // Preserve IDs and numeric fields needed to decode the export, while
+        // transforming every free-text header field that may contain copied
+        // credentials or workspace-specific secrets.
+        let header_metadata = transform_metadata(session.header_metadata(), options);
         let header = encode_header(&header_metadata)?;
         file.write_all(header.as_bytes())
             .and_then(|_| file.write_all(b"\n"))
@@ -217,7 +214,13 @@ fn transform_record(record: &SessionEventRecord, options: &ExportOptions) -> Ses
             tool_call_id: tool_call_id.clone(),
             content: transform_output(content, options),
             is_error: *is_error,
-            tool_name: tool_name.clone(),
+            tool_name: tool_name
+                .as_ref()
+                .map(|tool_name| transform_text(tool_name, options)),
+        },
+        SessionEvent::ModelChange { provider, model } => SessionEvent::ModelChange {
+            provider: transform_text(provider, options),
+            model: transform_text(model, options),
         },
         SessionEvent::MetadataChange { title } => SessionEvent::MetadataChange {
             title: title.as_ref().map(|title| transform_title(title, options)),
@@ -255,10 +258,43 @@ fn transform_message(message: &StoredMessage, options: &ExportOptions) -> Stored
             StoredContent::ToolCall { arguments, .. } if options.redact_secrets => {
                 *arguments = redact_json(arguments)
             }
+            StoredContent::Opaque { data, .. } if options.redact_secrets => {
+                *data = redact_json(data)
+            }
             _ => {}
         }
     }
     message
+}
+
+fn transform_metadata(
+    metadata: &crate::model::SessionMetadata,
+    options: &ExportOptions,
+) -> crate::model::SessionMetadata {
+    let mut metadata = metadata.clone();
+    metadata.title = metadata
+        .title
+        .as_ref()
+        .map(|title| transform_text(title, options));
+    metadata.provider = metadata
+        .provider
+        .as_ref()
+        .map(|provider| transform_text(provider, options));
+    metadata.model = metadata
+        .model
+        .as_ref()
+        .map(|model| transform_text(model, options));
+    let workspace = metadata.workspace_root.to_string_lossy().into_owned();
+    metadata.workspace_root = PathBuf::from(transform_text(&workspace, options));
+    metadata
+}
+
+fn transform_text(value: &str, options: &ExportOptions) -> String {
+    if options.redact_secrets {
+        redact_text(value)
+    } else {
+        value.to_owned()
+    }
 }
 
 fn transform_output(value: &str, options: &ExportOptions) -> String {
@@ -394,12 +430,31 @@ fn redact_text(value: &str) -> String {
                 continue;
             };
             let value_start = after_key + separator + 1;
-            let value_start = value_start
+            let mut value_start = value_start
                 + result[value_start..]
                     .find(|character: char| {
                         !character.is_whitespace() && character != '"' && character != '\''
                     })
                     .unwrap_or(0);
+            // Treat the bearer scheme as part of an Authorization value. The
+            // old scanner replaced only `Bearer`, leaving the token itself in
+            // the export.
+            if key.eq_ignore_ascii_case("authorization") {
+                let remaining = &result[value_start..];
+                if remaining.len() >= 6
+                    && remaining.is_char_boundary(6)
+                    && remaining[..6].eq_ignore_ascii_case("bearer")
+                    && remaining[6..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace)
+                {
+                    value_start += 6;
+                    value_start += result[value_start..]
+                        .find(|character: char| !character.is_whitespace())
+                        .unwrap_or(0);
+                }
+            }
             let value_end = result[value_start..]
                 .find(|character: char| {
                     character.is_whitespace() || matches!(character, ',' | '}' | ']' | '"' | '\'')
@@ -447,6 +502,7 @@ fn redact_json(value: &serde_json::Value) -> serde_json::Value {
         serde_json::Value::Array(values) => {
             serde_json::Value::Array(values.iter().map(redact_json).collect())
         }
+        serde_json::Value::String(text) => serde_json::Value::String(redact_text(text)),
         value => value.clone(),
     }
 }
@@ -540,6 +596,10 @@ mod tests {
         let sentinel = "sentinel-secret-9f3a1c";
         let mut session = Session::new(SessionMetadata::new(directory.path(), None, None));
         session.header_metadata.title = Some(format!("title holds token={sentinel}"));
+        session.header_metadata.provider = Some(format!("provider=token={sentinel}"));
+        session.header_metadata.model = Some(format!("model=token={sentinel}"));
+        session.header_metadata.workspace_root =
+            PathBuf::from(format!("/workspace/token={sentinel}"));
         session.metadata.title = Some(format!("title holds token={sentinel}"));
         session.append(SessionEvent::MetadataChange {
             title: Some(format!("title holds token={sentinel}")),
@@ -559,10 +619,17 @@ mod tests {
                     crate::model::StoredContent::Reasoning {
                         text: format!("assistant reasoning carries token={sentinel}"),
                     },
+                    crate::model::StoredContent::Opaque {
+                        provider: "mock".into(),
+                        data: json!({"continuation": format!("token={sentinel}")}),
+                    },
                     crate::model::StoredContent::ToolCall {
                         id: "embedded-1".into(),
                         name: "read".into(),
-                        arguments: json!({"token": sentinel}),
+                        arguments: json!({
+                            "token": sentinel,
+                            "command": format!("curl -H 'Authorization: Bearer {sentinel}'")
+                        }),
                     },
                 ],
             },
@@ -574,7 +641,10 @@ mod tests {
             call: crate::model::StoredToolCall {
                 id: "call-1".into(),
                 name: "bash".into(),
-                arguments: json!({"secret": sentinel}),
+                arguments: json!({
+                    "secret": sentinel,
+                    "diagnostic": format!("Authorization: Bearer {sentinel}")
+                }),
             },
         });
         session.append(SessionEvent::ToolResult {
