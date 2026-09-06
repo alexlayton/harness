@@ -142,7 +142,6 @@ const MAX_RETRY_AFTER_SECS: u64 = 300;
 /// Parse a bounded `Retry-After` header value as seconds. Both delta-seconds
 /// and HTTP-date forms are accepted; unparseable or over-cap values return
 /// `None`.
-#[allow(dead_code)]
 pub(crate) fn parse_retry_after_value(value: &str) -> Option<u64> {
     let value = value.trim();
     if value.is_empty() {
