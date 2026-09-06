@@ -411,8 +411,9 @@ fn fit_text_to_width(text: &str, width: usize) -> String {
 pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
     let width = width.max(1);
     let mut result = Vec::new();
+    let source_lines = split_embedded_newlines(text);
 
-    for source_line in &text.lines {
+    for source_line in &source_lines {
         let line_base = base.patch(source_line.style);
         let mut source_chars = Vec::<(char, Style, usize)>::new();
         for source_span in &source_line.spans {
@@ -518,6 +519,32 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
         result.push(Line::from("").style(base));
     }
     result
+}
+
+/// Split content-originated newlines into logical rows before wrapping.
+/// Ratatui permits a newline inside a span, but ANSI serialization would emit
+/// it as a physical terminal row that the caller did not count. Keeping the
+/// split here makes height measurement and emission agree for tool paths,
+/// metadata, pasted text, and other untrusted single-line values.
+fn split_embedded_newlines(text: &Text<'_>) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for source_line in &text.lines {
+        let mut spans = Vec::new();
+        for source_span in &source_line.spans {
+            let content = sanitize_terminal_text(source_span.content.as_ref());
+            let parts = content.split('\n').collect::<Vec<_>>();
+            for (index, part) in parts.iter().enumerate() {
+                if !part.is_empty() {
+                    spans.push(Span::styled((*part).to_owned(), source_span.style));
+                }
+                if index + 1 < parts.len() {
+                    lines.push(Line::from(std::mem::take(&mut spans)).style(source_line.style));
+                }
+            }
+        }
+        lines.push(Line::from(spans).style(source_line.style));
+    }
+    lines
 }
 
 fn wrapped_line(chars: Vec<(char, Style, usize)>) -> Line<'static> {
@@ -998,6 +1025,20 @@ mod tests {
         let mut order = WelcomeTitleOrder::random().0;
         order.sort_unstable();
         assert_eq!(order, (0..WELCOME_TITLES.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn embedded_newlines_become_measured_rows() {
+        let text = Text::from(vec![Line::from(Span::raw("before\nafter"))]);
+        let lines = wrap_text(&text, 40, Style::default());
+        assert_eq!(lines.len(), 2);
+        assert_eq!(span_contents(&lines[0]), "before");
+        assert_eq!(span_contents(&lines[1]), "after");
+        assert!(
+            lines
+                .iter()
+                .all(|line| { line.spans.iter().all(|span| !span.content.contains('\n')) })
+        );
     }
 
     #[test]
