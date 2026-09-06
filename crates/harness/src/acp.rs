@@ -1408,6 +1408,7 @@ mod tests {
                 // nor mutates the process-global HARNESS_SESSION_DIR env (which
                 // would race between tests running in parallel threads).
                 let session_root = workspace.path().join("sessions");
+                let server_session_root = session_root.clone();
                 tokio::task::spawn_local({
                     let provider: Arc<dyn Provider> = provider.clone();
                     async move {
@@ -1420,7 +1421,7 @@ mod tests {
                             config,
                             None,
                             true,
-                            session_root,
+                            server_session_root,
                             ByteStreams::new(server_writer, server_reader),
                         )
                         .await
@@ -1484,9 +1485,49 @@ mod tests {
                     "a text-only turn must not emit tool calls: {seen:?}"
                 );
 
-                // The turn was persisted under our session id; loading it again
-                // through a second connection round-trips `session/load`.
-                let _ = session_id;
+                // The turn was persisted under our session id. The first
+                // connection owns the live agent, so use a fresh connection
+                // to exercise the real `session/load` path.
+                drop(updates);
+                let DuplexPair {
+                    server_reader,
+                    server_writer,
+                    client_reader,
+                    client_writer,
+                } = duplex_pair();
+                let server_session_root = session_root.clone();
+                let provider: Arc<dyn Provider> = provider.clone();
+                tokio::task::spawn_local(async move {
+                    let _ = serve(
+                        provider,
+                        acp_config(),
+                        None,
+                        true,
+                        server_session_root,
+                        ByteStreams::new(server_writer, server_reader),
+                    )
+                    .await
+                    .inspect_err(|error| eprintln!("load server error: {error:#}"));
+                });
+                run_client_side(
+                    ByteStreams::new(client_writer, client_reader),
+                    async |cx: ConnectionTo<agent_client_protocol::Agent>,
+                           _updates: mpsc::UnboundedReceiver<SessionUpdate>| {
+                        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .block_task()
+                            .await
+                            .expect("initialize load connection");
+                        cx.send_request(LoadSessionRequest::new(
+                            session_id.clone(),
+                            workspace.path(),
+                        ))
+                        .block_task()
+                        .await
+                        .expect("session/load");
+                        Ok(())
+                    },
+                )
+                .await;
             })
             .await;
     }

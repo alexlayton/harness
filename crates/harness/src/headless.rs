@@ -991,7 +991,6 @@ mod tests {
     fn no_session_mode_runs_without_persisting_anything() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let root = tempdir().unwrap();
             let provider = Arc::new(RecordingProvider::default());
             let args = PromptArgs {
                 prompt: vec!["ephemeral".into()],
@@ -1010,8 +1009,24 @@ mod tests {
             .unwrap();
             assert_eq!(code, ExitCode::SUCCESS);
             assert_eq!(provider.texts(), vec!["ephemeral".to_owned()]);
-            // Nothing was written: the store root never even materialized.
-            assert!(!root.path().exists() || root.path().read_dir().unwrap().next().is_none());
+            // The no-session contract also rejects attempts to resume: there
+            // is no durable history from which a selector could load.
+            let resume = PromptArgs {
+                resume: Some("latest".into()),
+                prompt: vec!["follow up".into()],
+                ..PromptArgs::default()
+            };
+            let error = run_headless(
+                &config,
+                &resume,
+                false,
+                provider,
+                ToolRegistry::empty(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("requires sessions"));
         });
     }
 
