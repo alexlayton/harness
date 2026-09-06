@@ -3647,6 +3647,43 @@ mod tests {
     }
 
     #[test]
+    fn long_metadata_rows_fit_narrow_widths() {
+        // TUI-2: header metadata (cwd/branch/provider·model/context/skills)
+        // goes through `entry_lines` → `fit_line_to_width`, so even
+        // pathological inputs fit widths 1–3 as well as normal widths.
+        let long_cwd = "/very/long/working/directory/that/keeps/going/and/going";
+        let long_branch = "feature/extremely-long-branch-name-that-never-ends";
+        let long_model = "some-provider-model-with-an-absurdly-long-identifier-v99";
+        let many_context: Vec<String> = (0..10)
+            .map(|index| format!("/deep/path/to/AGENTS-{index}.md"))
+            .collect();
+        let many_skills: Vec<String> = (0..10)
+            .map(|index| format!("skill-number-{index}"))
+            .collect();
+        for width in [1usize, 2, 3, 10, 40, 80] {
+            let lines = metadata_lines(
+                long_cwd,
+                Some(long_branch),
+                "provider-with-a-long-name",
+                long_model,
+                &many_context,
+                &many_skills,
+                Theme::default(),
+            );
+            // Mirror the `entry_lines` Metadata path: fit every row.
+            let fitted: Vec<_> = lines
+                .iter()
+                .map(|line| crate::render::fit_line_to_width(line, width))
+                .collect();
+            assert!(
+                fitted.iter().all(|line| row_width(line) <= width),
+                "width {width}: {:?}",
+                fitted.iter().map(row_text).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
     fn line_to_ansi_sanitizes_untrusted_content_but_keeps_generated_styles() {
         let line = Line::from(Span::styled(
             "safe\t\u{1b}[2J\u{1b}]52;c;secret\u{07}done",
