@@ -160,7 +160,7 @@ impl GithubCopilotClient {
     /// endpoint construction untouched. `CopilotAuth` uses this in tests so
     /// concurrent `ensure_valid` exercises the real `refresh` path.
     #[cfg(test)]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // consumed by the rewritten single-flight/login tests
     pub(crate) fn with_client_and_endpoints(
         http: Client,
         endpoints: CopilotEndpoints,
@@ -171,6 +171,17 @@ impl GithubCopilotClient {
             endpoints,
             api_base_url: None,
         })
+    }
+
+    /// Test seam: redirect the model-catalogue base URL at a local
+    /// fixture. Production callers leave this unset so the Copilot token's
+    /// `proxy-ep` (or the pinned host) chooses the host; tests set it so a
+    /// failing `/models` endpoint proves login still persists.
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the model-list-failure login test
+    pub(crate) fn with_api_base_url_for_test(mut self, base_url: impl Into<String>) -> Self {
+        self.api_base_url = Some(base_url.into().trim_end_matches('/').to_owned());
+        self
     }
 
     pub fn with_endpoints(endpoints: CopilotEndpoints) -> Result<Self> {
@@ -852,6 +863,8 @@ impl CopilotAuth {
     /// Test seam: same construction with an injected HTTP client and
     /// endpoints so refresh tests hit a local fixture through the real
     /// `ensure_valid` path instead of reimplementing the guard inline.
+    /// Superseded by `with_client_for_test`, which preserves the seeded
+    /// cache; kept until the rewritten single-flight test lands.
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn with_client(store: AuthStore, client: GithubCopilotClient) -> Result<Self> {
@@ -866,6 +879,21 @@ impl CopilotAuth {
 
     pub fn from_default() -> Result<Self> {
         Self::new(AuthStore::default())
+    }
+
+    /// Test seam: swap the HTTP client/endpoints on a live auth handle
+    /// (which already holds the seeded store + cache) so refresh tests hit
+    /// a local fixture through the real `ensure_valid` path. Takes `&self`
+    /// because `CopilotAuth` is shared by clone across waiter tasks.
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the rewritten single-flight test
+    pub(crate) fn with_client_for_test(&self, client: GithubCopilotClient) -> Self {
+        Self {
+            store: self.store.clone(),
+            client,
+            credential: self.credential.clone(),
+            refresh_lock: self.refresh_lock.clone(),
+        }
     }
 
     pub fn credential(&self) -> Result<Option<CopilotCredential>> {
