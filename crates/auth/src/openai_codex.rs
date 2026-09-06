@@ -859,6 +859,11 @@ mod tests {
 
     #[tokio::test]
     async fn device_poll_pending_then_success() {
+        // Superseded by `device_login_pending_then_success_persists`,
+        // which drives the same two replies through the full
+        // `login_device` loop. Kept as the helper-level contract: the
+        // polling helper surfaces `authorization_pending` instead of
+        // failing on the 400 status.
         let dir = tempfile::tempdir().unwrap();
         let fix = fixture(vec![
             (400, r#"{"error":"authorization_pending"}"#.into()),
@@ -1224,8 +1229,10 @@ mod tests {
 
     #[tokio::test]
     async fn slow_down_increases_the_poll_interval() {
-        // `request_token` surfaces the parsed `slow_down`; the device loop
-        // maps it to `interval + 5`.  Assert the mapping contract directly.
+        // Superseded by `device_login_slow_down_delays_the_next_poll`,
+        // which asserts the real `[5, 10]` wait sequence through the full
+        // loop. Kept as the unit contract for the `slow_down → +5s`
+        // mapping itself.
         let dir = tempfile::tempdir().unwrap();
         let fix = fixture(vec![(400, r#"{"error":"slow_down"}"#.into())]).await;
         let auth = auth_with_fixture(&dir, &fix).await;
