@@ -109,9 +109,14 @@ prompt metadata, concurrency class, and executor. The system prompt and
 `ToolRegistry` snapshot; never maintain a second hand-written tool list.
 
 Dedicated path tools confine resolution to the workspace and reject lexical or
-symlink escapes. The shell starts in the workspace but is not a sandbox; it can
-access anything available to the operating-system user. File mutations also
-use process-local locks to prevent overlapping writes.
+symlink escapes. The shell is not a sandbox and can access anything available
+to the operating-system user, but every bash invocation is exclusive. Bash
+runs with a 120-second default timeout (maximum 86,400 seconds); on Unix it
+uses a separate process group and timeout/cancellation terminates that group,
+escalating after a 500 ms grace period. Output is capped at 2,000 lines or
+50 KiB. Other platforms can terminate direct children but do not promise full
+process-tree isolation. File mutations also use process-local locks to
+prevent overlapping writes.
 
 `mcp` starts configured stdio servers during assembly, discovers their tools,
 namespaces them, and registers adapters in the same registry. MCP calls are
@@ -121,11 +126,12 @@ passed to subagents.
 The subagent schema lives in `tools`, while its runner lives in `agent` to
 preserve dependency direction. Important invariants are:
 
-- Read-only children receive only `read`, `find`, and `grep`; unavailable tools,
-  not prompt wording, enforce the restriction.
+- Read-only children receive only `read`, `find`, `grep`, and `multigrep`;
+  unavailable tools, not prompt wording, enforce the restriction.
 - Workspace children can use normal built-ins and run exclusively.
 - Children cannot create subagents.
-- Each child gets fresh model context and a bounded turn count.
+- Each child gets fresh model context and bounded turns/context; older tool
+  evidence is compacted or truncated before the final synthesis request.
 - Tool call IDs remain stable through scheduling, UI events, and persistence.
 - Child sessions link to their parent, but child usage is not added to parent
   totals.
@@ -162,6 +168,9 @@ See [`docs/configuration.md`](./docs/configuration.md) and
   concurrent writers.
 - `context_messages()` reconstructs valid provider history and handles
   incomplete final tool calls.
+- Model-assisted compaction appends a bounded summary event and falls back to
+  a deterministic local summary when the provider cannot summarize; history
+  remains append-only.
 - Sessions are grouped by workspace and stored outside the project by default.
 
 See [`crates/session/README.md`](./crates/session/README.md) for the format and

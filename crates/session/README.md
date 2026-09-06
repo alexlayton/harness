@@ -65,8 +65,9 @@ so it resumes the previous non-empty conversation. Saved provider/model
 metadata is shown in listings but does **not** replace the
 provider/model selected at startup. `/sessions` lists sessions scoped to the
 current workspace. `/export [path]` writes canonical JSONL to the requested
-path, or to a generated file in the current directory. `/compact` is available
-as a deterministic local hook, although the default policy is intentionally
+path, or to a generated file in the current directory. `/compact` asks the
+active model for a bounded summary and falls back to a deterministic local
+summary when model summarization fails. The default policy is intentionally
 conservative.
 
 Exports are canonical JSONL and can be validated independently by the codec.
@@ -80,7 +81,8 @@ normal persisted log is intended to let a user pick up where they left off.
 It groups standalone tool-call events into assistant messages, preserves call
 IDs and results, and omits an incomplete final tool call rather than sending
 invalid history. The agent writes synthetic cancelled/error tool results when
-it can observe an interruption. A deterministic compaction summary is an
-ordinary durable `compaction` event with a `compacted_through` sequence
-boundary; old events are never deleted. Model-assisted summarization is
-intentionally not part of version 1.
+it can observe an interruption. A compaction summary is an ordinary durable
+`compaction` event with a `compacted_through` sequence boundary; old events
+are never deleted. Model-assisted summarization is bounded and has a
+deterministic local fallback, so provider failure does not prevent a session
+from being compacted.

@@ -58,6 +58,11 @@ options.
 - Automatic `AGENTS.md`/`CLAUDE.md` context and Agent Skills discovery.
 - Append-only JSONL sessions with reload, export, and context compaction.
 
+For scripting, `harness prompt` writes only the final answer to stdout;
+verbose progress and diagnostics go to stderr. The `harness acp` frontend
+writes only JSON-RPC protocol traffic to stdout, keeping both frontends safe
+for pipelines and editor transports.
+
 ## Documentation
 
 - [Providers and authentication][providers]
@@ -94,9 +99,10 @@ Initial releases provide these builds:
 
 - macOS on Apple silicon (`aarch64-apple-darwin`)
 - macOS on Intel (`x86_64-apple-darwin`)
-- Linux x86-64 with glibc (`x86_64-unknown-linux-gnu`)
+- Linux x86-64 with glibc 2.35 or newer (`x86_64-unknown-linux-gnu`)
 
-Windows is not supported in the initial release.
+The GNU Linux artifact is built on Ubuntu 22.04 to keep that minimum runtime
+baseline stable. Windows is not supported in the initial release.
 
 Homebrew users can install the source formula:
 

@@ -91,8 +91,16 @@ context_window = 0
   provider metadata, then a generous 1M fallback if metadata is unavailable
   (some providers report no context lengths).
 
-Compaction appends a summary event. It does not rewrite or delete old session
-events.
+`threshold` must be finite and between `0.0` and `1.0`. Summary byte limits
+must be nonzero and no larger than 16 MiB for input or 1 MiB for output.
+When both are set, `reserve_tokens` must be smaller than a nonzero
+`context_window`. Zero `keep_recent_turns` and `keep_recent_tokens` are
+allowed: they request the smallest valid retained provider-history tail.
+Invalid values identify their exact `[compaction]` key and prevent startup.
+
+Compaction asks the active model for a bounded summary and uses a deterministic
+local fallback when that request fails. It appends a summary event; it does
+not rewrite or delete old session events.
 
 ## Subagents
 
@@ -141,6 +149,14 @@ without a confirmation step. Subagents do not receive MCP tools.
 Only stdio transport is enabled. Streamable HTTP and legacy SSE transports are
 not enabled.
 
+MCP has fixed safety limits rather than per-server TOML overrides: initialize
+and catalogue requests have 15-second deadlines, calls have a 60-second
+deadline, and shutdown has a four-second global deadline. A server may expose
+at most 256 tools with at most 512 KiB of aggregate definitions. Schemas are
+limited to depth 32, 10,000 nodes, 64 KiB strings, and 256 KiB total size.
+Structured/text/error output is compacted and capped at 20 KiB. Stderr is
+bounded and discarded by default.
+
 ## Sessions
 
 Normal sessions are stored under:
@@ -166,6 +182,21 @@ harness prompt --no-session "prompt"
 `--defer-session-sync` syncs at turn boundaries instead of after each event.
 This is faster for tool-heavy turns, but a power failure can lose the current
 turn's tail.
+
+With `--no-session`, Harness does not create a session store, header, event
+file, or resumable history. Automatic compaction is disabled because there is
+no durable session to append a summary to; `/compact` reports that it is
+unavailable, and an over-window provider request cannot recover by compacting
+the ephemeral history.
+
+## Shell execution
+
+The shell starts in the workspace but is not a sandbox. Bash calls are
+exclusive, use a 120-second default timeout (maximum 86,400 seconds), and cap
+output at 2,000 lines or 50 KiB. On Unix each command has its own process group;
+timeout, cancellation, and shell exit terminate surviving descendants and
+escalate after a short grace period. Other platforms only guarantee direct
+child termination.
 
 ## Project context and skills
 

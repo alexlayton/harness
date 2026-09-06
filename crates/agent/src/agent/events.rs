@@ -15,7 +15,7 @@ pub enum InputMessage {
     ListSessions,
     /// Export the current session to JSONL.
     ExportSession { destination: Option<String> },
-    /// Run the deterministic local compactor.
+    /// Compact the session with model assistance and a deterministic fallback.
     CompactSession,
     /// Switch model, and provider when present.
     SetModel {
