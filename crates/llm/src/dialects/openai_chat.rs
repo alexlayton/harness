@@ -287,6 +287,21 @@ impl ChatStreamParser {
             .map_err(|error| LlmError::Parse(format!("chat SSE payload: {error}")))?;
         let mut output = Vec::new();
 
+        if let Some(error_value) = value.get("error")
+            && !error_value.is_null()
+        {
+            // A mid-stream provider error payload (e.g. `{"error": ...}`)
+            // is a terminal failure, not a silent empty chunk: surface it
+            // as `LlmError::Stream` so partial output stays an error and
+            // the agent's recovery path handles it.
+            let detail = error_value
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error_value.as_str())
+                .unwrap_or("provider error");
+            return Err(LlmError::Stream(format!("chat error: {detail}")));
+        }
+
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for (choice_index, choice) in choices.iter().enumerate() {
                 if choice_index > 0 {
@@ -663,5 +678,22 @@ mod tests {
             events.iter().any(|event| matches!(event, StreamEvent::ToolCallComplete(call) if call.id == "call-1" && call.name == "read")),
             "got {events:?}"
         );
+    }
+
+    #[test]
+    fn stream_error_after_partial_output_remains_an_error() {
+        // Partial text followed by a mid-stream provider error payload is
+        // a failure, not a truncated-but-usable turn: the error surfaces
+        // as `LlmError::Stream` (agent recovery path) instead of an empty
+        // `Ok` that a later EOF would turn into a confusing truncation.
+        let mut parser = ChatStreamParser::new();
+        let events = parser
+            .parse_payload(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+            .unwrap();
+        assert_eq!(events, vec![StreamEvent::TextDelta("hi".into())]);
+        let error = parser
+            .parse_payload(r#"{"error":{"message":"boom","type":"server_error"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
     }
 }
