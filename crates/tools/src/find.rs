@@ -159,21 +159,26 @@ impl FileSearchIndex {
         stop_picker(picker);
     }
 
-    async fn search(
+    /// Shared admission for find/grep/multigrep (CLEANUP-3): one shutdown
+    /// check, scope validation, cancellation pre-check, semaphore admission,
+    /// and `spawn_blocking` join — previously copy-pasted across all three
+    /// with only the sync job differing. The job closure receives the cloned
+    /// picker, the validated scope, and the cancellation token.
+    async fn run_search<T, F>(
         &self,
-        query: String,
+        task: &str,
         scope: Option<String>,
-        limit: usize,
         cancel: CancellationToken,
-    ) -> Result<SearchOutput, String> {
+        job: impl FnOnce(SharedFilePicker, Option<String>, CancellationToken) -> F,
+    ) -> Result<T, String>
+    where
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+        T: Send + 'static,
+    {
         if self.shutdown.load(Ordering::Acquire) {
-            return Err("find index is shut down".into());
-        }
-        if query.trim().is_empty() {
-            return Err("query must not be empty".into());
+            return Err(format!("{task} index is shut down"));
         }
         let picker = self.ensure_picker().await?.clone();
-
         let scope = match scope {
             Some(scope) if !scope.trim().is_empty() && scope != "." => {
                 let scope = self.validate_scope(&scope).await?;
@@ -186,39 +191,55 @@ impl FileSearchIndex {
         }
         let permit = tokio::select! {
             permit = Arc::clone(&self.search_slots).acquire_owned() => {
-                permit.map_err(|_| "find index is shut down".to_owned())?
+                permit.map_err(|_| format!("{task} index is shut down"))?
             }
             _ = cancel.cancelled() => return Err("cancelled".into()),
         };
-
-        let scan_timeout = self.config.scan_timeout;
-        let query_for_job = query.clone();
-        let scope_for_job = scope.clone();
         let cancel_for_job = cancel.clone();
+        let run = job(picker, scope, cancel_for_job);
         let join = tokio::task::spawn_blocking(move || {
             // If the caller is cancelled while FFF is doing synchronous work,
-            // the task still owns the semaphore permit.  This keeps repeated
+            // the task still owns the semaphore permit. This keeps repeated
             // cancellations from creating unbounded detached searches.
             let _permit = permit;
-            search_sync(
-                &picker,
-                &query_for_job,
-                scope_for_job.as_deref(),
-                limit,
-                scan_timeout,
-                &cancel_for_job,
-            )
+            run()
         });
-
         tokio::select! {
-            result = join => result.map_err(|error| format!("find search task failed: {error}"))?,
+            result = join => result.map_err(|error| format!("{task} search task failed: {error}"))?,
             _ = cancel.cancelled() => Err("cancelled".into()),
         }
     }
 
+    async fn search(
+        &self,
+        query: String,
+        scope: Option<String>,
+        limit: usize,
+        cancel: CancellationToken,
+    ) -> Result<SearchOutput, String> {
+        if query.trim().is_empty() {
+            return Err("query must not be empty".into());
+        }
+        self.run_search("find", scope, cancel, |picker, scope, cancel| {
+            let query = query.clone();
+            let scan_timeout = self.config.scan_timeout;
+            move || {
+                search_sync(
+                    &picker,
+                    &query,
+                    scope.as_deref(),
+                    limit,
+                    scan_timeout,
+                    &cancel,
+                )
+            }
+        })
+        .await
+    }
+
     /// Search file contents for a pattern across the same watched index used
-    /// by [`Self::search`].  Shares the concurrency semaphore and scope
-    /// validation so grep and find stay bounded and workspace-rooted.
+    /// by [`Self::search`]. Admission (shutdown/scope/cancel/semaphore) is
+    /// the shared [`Self::run_search`]; only the grep job differs.
     pub(crate) async fn grep(
         &self,
         pattern: String,
@@ -228,35 +249,9 @@ impl FileSearchIndex {
         mode: GrepMode,
         cancel: CancellationToken,
     ) -> Result<GrepRawOutput, String> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err("grep index is shut down".into());
-        }
         if pattern.trim().is_empty() {
             return Err("pattern must not be empty".into());
         }
-        let picker = self.ensure_picker().await?.clone();
-
-        let scope = match scope {
-            Some(scope) if !scope.trim().is_empty() && scope != "." => {
-                let scope = self.validate_scope(&scope).await?;
-                (!scope.is_empty()).then_some(scope)
-            }
-            _ => None,
-        };
-        if cancel.is_cancelled() {
-            return Err("cancelled".into());
-        }
-        let permit = tokio::select! {
-            permit = Arc::clone(&self.search_slots).acquire_owned() => {
-                permit.map_err(|_| "grep index is shut down".to_owned())?
-            }
-            _ = cancel.cancelled() => return Err("cancelled".into()),
-        };
-
-        let scan_timeout = self.config.scan_timeout;
-        let pattern_for_job = pattern.clone();
-        let scope_for_job = scope.clone();
-        let cancel_for_job = cancel.clone();
         let options = GrepSearchOptions {
             // Ask FFF for one sentinel match beyond the public hard cap. Its
             // page limit is soft (it finishes the current file), so Harness
@@ -270,26 +265,26 @@ impl FileSearchIndex {
             time_budget_ms: GREP_TIME_BUDGET_MS,
             ..GrepSearchOptions::default()
         };
-        let join = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            grep_sync(
-                &picker,
-                &pattern_for_job,
-                scope_for_job.as_deref(),
-                &options,
-                limit,
-                scan_timeout,
-                &cancel_for_job,
-            )
-        });
-
-        tokio::select! {
-            result = join => result.map_err(|error| format!("grep search task failed: {error}"))?,
-            _ = cancel.cancelled() => Err("cancelled".into()),
-        }
+        self.run_search("grep", scope, cancel, |picker, scope, cancel| {
+            let scan_timeout = self.config.scan_timeout;
+            move || {
+                grep_sync(
+                    &picker,
+                    &pattern,
+                    scope.as_deref(),
+                    &options,
+                    limit,
+                    scan_timeout,
+                    &cancel,
+                )
+            }
+        })
+        .await
     }
 
     /// Search for several literal alternatives in one native FFF traversal.
+    /// Admission is the shared [`Self::run_search`]; only the multigrep job
+    /// differs.
     pub(crate) async fn multi_grep(
         &self,
         patterns: Vec<String>,
@@ -298,23 +293,6 @@ impl FileSearchIndex {
         context: usize,
         cancel: CancellationToken,
     ) -> Result<GrepRawOutput, String> {
-        if self.shutdown.load(Ordering::Acquire) {
-            return Err("grep index is shut down".into());
-        }
-        let picker = self.ensure_picker().await?.clone();
-        let scope = match scope {
-            Some(scope) if !scope.trim().is_empty() && scope != "." => {
-                let scope = self.validate_scope(&scope).await?;
-                (!scope.is_empty()).then_some(scope)
-            }
-            _ => None,
-        };
-        let permit = tokio::select! {
-            permit = Arc::clone(&self.search_slots).acquire_owned() => {
-                permit.map_err(|_| "grep index is shut down".to_owned())?
-            }
-            _ = cancel.cancelled() => return Err("cancelled".into()),
-        };
         let options = GrepSearchOptions {
             page_limit: limit.saturating_add(1),
             max_matches_per_file: limit.saturating_add(1),
@@ -325,25 +303,21 @@ impl FileSearchIndex {
             time_budget_ms: GREP_TIME_BUDGET_MS,
             ..GrepSearchOptions::default()
         };
-        let scope_for_job = scope.clone();
-        let cancel_for_job = cancel.clone();
-        let scan_timeout = self.config.scan_timeout;
-        let join = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            multi_grep_sync(
-                &picker,
-                &patterns,
-                scope_for_job.as_deref(),
-                &options,
-                limit,
-                scan_timeout,
-                &cancel_for_job,
-            )
-        });
-        tokio::select! {
-            result = join => result.map_err(|error| format!("multigrep search task failed: {error}"))?,
-            _ = cancel.cancelled() => Err("cancelled".into()),
-        }
+        self.run_search("grep", scope, cancel, |picker, scope, cancel| {
+            let scan_timeout = self.config.scan_timeout;
+            move || {
+                multi_grep_sync(
+                    &picker,
+                    &patterns,
+                    scope.as_deref(),
+                    &options,
+                    limit,
+                    scan_timeout,
+                    &cancel,
+                )
+            }
+        })
+        .await
     }
 
     async fn validate_scope(&self, scope: &str) -> Result<String, String> {
