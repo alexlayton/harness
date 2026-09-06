@@ -1520,6 +1520,62 @@ mod tests {
     }
 
     #[test]
+    fn two_stores_append_alternately_without_duplicate_sequences() {
+        // PERF-5 two-handle correctness: two `SessionStore` handles over
+        // the same root/workspace (separate `validated_bytes` cursors,
+        // same lock file) append alternately. Disk-derived sequences keep
+        // every record unique and ordered — the cross-handle path the
+        // single-store stale-view tests cannot exercise.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let first_store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let second_store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = first_store.create(SessionCreateOptions::default()).unwrap();
+        let id = session.id();
+        let mut first = first_store.open(&id).unwrap();
+        let mut second = second_store.open(&id).unwrap();
+        for index in 0..20u32 {
+            let (store, target) = if index % 2 == 0 {
+                (&first_store, &mut first)
+            } else {
+                (&second_store, &mut second)
+            };
+            store
+                .append_event(
+                    target,
+                    SessionEvent::UserMessage {
+                        message: StoredMessage::from_llm(&Message::user(format!("user {index}"))),
+                    },
+                )
+                .unwrap();
+        }
+        let loaded = first_store.open(&id).unwrap();
+        assert_eq!(loaded.events.len(), 20);
+        assert_eq!(
+            loaded
+                .events
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            (1..=20).collect::<Vec<_>>(),
+            "alternating two-store appends must not duplicate sequences"
+        );
+        // The idle handle's cursor converges on its next append (it
+        // reconciles the peer's suffix then); disk is authoritative.
+        let (store, target) = (&first_store, &mut first);
+        store
+            .append_event(
+                target,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("converge")),
+                },
+            )
+            .unwrap();
+        assert_eq!(target.events.len(), 21);
+        assert_eq!(second.events.len(), 20);
+    }
+
+    #[test]
     fn stale_store_appends_reconcile_external_tail() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
