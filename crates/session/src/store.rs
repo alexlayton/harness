@@ -1,5 +1,5 @@
 use crate::codec::{
-    TailRecovery, decode_event_line, decode_session_file, encode_header, encode_record,
+    TailRecovery, decode_event_line, decode_session_file_bytes, encode_header, encode_record,
 };
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{
@@ -508,7 +508,7 @@ impl SessionStore {
 
 fn load_session_file(path: &Path) -> Result<Session> {
     let contents = read_file(path)?;
-    let (mut session, recovery) = decode_session_file(&contents, path)?;
+    let (mut session, recovery) = decode_session_file_bytes(&contents, path)?;
     session.path = Some(path.to_path_buf());
     session.validated_bytes = recovery.valid_bytes;
     session.file_identity = Some(file_identity(path)?);
@@ -521,7 +521,7 @@ fn load_session_file(path: &Path) -> Result<Session> {
 /// incomplete tail.
 fn load_session_file_for_append(path: &Path) -> Result<(Session, TailRecovery)> {
     let contents = read_file(path)?;
-    let (mut session, recovery) = decode_session_file(&contents, path)?;
+    let (mut session, recovery) = decode_session_file_bytes(&contents, path)?;
     session.path = Some(path.to_path_buf());
     session.validated_bytes = recovery.valid_bytes;
     session.file_identity = Some(file_identity(path)?);
@@ -550,9 +550,15 @@ fn reconcile_external_tail(session: &mut Session, path: &Path, file_size: usize)
         File::open(path).map_err(|source| io_error("open session suffix", path, source))?;
     file.seek(SeekFrom::Start(session.validated_bytes as u64))
         .map_err(|source| io_error("seek session suffix", path, source))?;
-    let mut suffix = String::new();
-    file.read_to_string(&mut suffix)
+    let mut suffix_bytes = Vec::new();
+    file.read_to_end(&mut suffix_bytes)
         .map_err(|source| io_error("read session suffix", path, source))?;
+    let mut suffix = match String::from_utf8(suffix_bytes) {
+        Ok(suffix) => suffix,
+        // Let the recovery-aware full decoder distinguish an invalid final
+        // byte tail from corruption before the suffix.
+        Err(_) => return Ok(false),
+    };
 
     // A valid unterminated file is made canonical by the next writer. The
     // separator is not an event and belongs to the external append, not the
@@ -651,10 +657,10 @@ fn file_ends_with_newline(path: &Path, file_size: u64) -> Result<bool> {
     Ok(byte[0] == b'\n')
 }
 
-fn read_file(path: &Path) -> Result<String> {
+fn read_file(path: &Path) -> Result<Vec<u8>> {
     let mut file = File::open(path).map_err(|source| io_error("open session", path, source))?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)
         .map_err(|source| io_error("read session", path, source))?;
     Ok(contents)
 }
@@ -1533,6 +1539,46 @@ mod tests {
         assert_eq!(repaired.events, expected);
         let reopened = store.open(&session.id()).unwrap();
         assert_eq!(reopened.events, expected);
+    }
+
+    #[test]
+    fn append_repairs_an_unterminated_utf8_crash_tail() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("hello")),
+                },
+            )
+            .unwrap();
+        let valid_events = session.events.clone();
+        let path = session.path().unwrap().clone();
+        // The first byte of the final `é` is valid UTF-8 only as part of the
+        // next record; it must be treated as an incomplete crash tail.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"message\":\"\xc3")
+            .unwrap();
+
+        let loaded = store.open(&session.id()).unwrap();
+        assert_eq!(loaded.events, valid_events);
+        let mut repaired = loaded;
+        store
+            .append_event(
+                &mut repaired,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("after crash")),
+                },
+            )
+            .unwrap();
+        assert_eq!(repaired.events.len(), valid_events.len() + 1);
+        assert_eq!(store.open(&session.id()).unwrap().events, repaired.events);
     }
 
     #[test]

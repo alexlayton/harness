@@ -136,6 +136,52 @@ pub fn decode_session_file(
     decode_session_lines(content, source.as_ref(), true)
 }
 
+/// Decode a session file directly from bytes so an interrupted final UTF-8
+/// sequence can be identified as crash-tail data instead of rejecting the
+/// entire file before JSONL recovery runs. Complete records must still be
+/// valid UTF-8; only bytes after the final newline may be discarded.
+pub(crate) fn decode_session_file_bytes(
+    content: &[u8],
+    source: impl AsRef<Path>,
+) -> Result<(Session, TailRecovery)> {
+    let source = source.as_ref();
+    match std::str::from_utf8(content) {
+        Ok(text) => decode_session_lines(text, source, true),
+        Err(error) => {
+            let last_newline = content.iter().rposition(|byte| *byte == b'\n');
+            let Some(last_newline) = last_newline else {
+                return Err(SessionError::InvalidLine {
+                    path: source.to_path_buf(),
+                    line: 1,
+                    message: "session file contains invalid UTF-8".into(),
+                });
+            };
+            if error.valid_up_to() <= last_newline {
+                return Err(SessionError::InvalidLine {
+                    path: source.to_path_buf(),
+                    line: 1,
+                    message: "session file contains invalid UTF-8 before its crash tail".into(),
+                });
+            }
+            let prefix = std::str::from_utf8(&content[..=last_newline]).map_err(|_| {
+                SessionError::InvalidLine {
+                    path: source.to_path_buf(),
+                    line: 1,
+                    message: "session file contains invalid UTF-8 before its crash tail".into(),
+                }
+            })?;
+            let (session, _) = decode_session_lines(prefix, source, true)?;
+            Ok((
+                session,
+                TailRecovery {
+                    recovered: true,
+                    valid_bytes: last_newline + 1,
+                },
+            ))
+        }
+    }
+}
+
 /// Decode one already separated event line while reconciling an append suffix.
 /// Header parsing remains in [`decode_session_file`]; this helper deliberately
 /// performs only envelope decoding so the caller can validate a suffix against
