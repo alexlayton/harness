@@ -552,6 +552,27 @@ pub type ProviderFactory =
 /// Fetch model metadata for the active selection on a bounded background
 /// task. The run loop consumes the result and derives both context-window and
 /// model-list updates from this one request.
+/// Bound for one model-catalogue fetch. Both metadata fetchers share it so
+/// a slow provider blocks neither the run loop (metadata) nor the command
+/// loop (`/models`) for longer than this.
+const MODEL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run one bounded, cancellable model-catalogue fetch. Shared by
+/// [`spawn_model_metadata`] (single request feeding both context window and
+/// UI catalogue) and [`spawn_model_list`] (explicit `/models`); only the
+/// result sink differs (CLEANUP-3). Returns `None` on timeout, cancel, or
+/// provider error.
+async fn fetch_model_catalogue(
+    provider: Arc<dyn Provider>,
+    cancel: &CancellationToken,
+) -> Option<Vec<llm::ModelInfo>> {
+    tokio::select! {
+        result = tokio::time::timeout(MODEL_FETCH_TIMEOUT, provider.list_models())
+            => result.ok().and_then(Result::ok),
+        _ = cancel.cancelled() => None,
+    }
+}
+
 pub(crate) fn spawn_model_metadata(
     sender: mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>,
     provider: Arc<dyn Provider>,
@@ -560,14 +581,7 @@ pub(crate) fn spawn_model_metadata(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let models = tokio::select! {
-            result = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                provider.list_models(),
-            ) => result.ok().and_then(Result::ok),
-            _ = cancel.cancelled() => None,
-        };
-        if let Some(models) = models {
+        if let Some(models) = fetch_model_catalogue(provider, &cancel).await {
             let _ = sender.send((provider_name, model, models));
         }
     });
@@ -575,29 +589,32 @@ pub(crate) fn spawn_model_metadata(
 
 /// Fetch a provider's model list on a background task, reporting
 /// `AgentEvent::ModelList` on success and a notice on failure. Shared by the
-/// `/model` and `/models` handlers.
+/// `/model` and `/models` handlers. The fetch itself is the shared
+/// [`fetch_model_catalogue`]; only this explicit-listing sink differs from
+/// the metadata path.
 pub fn spawn_model_list(
     provider_name: String,
     provider: Arc<dyn Provider>,
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
+    // No cancel token on this path today: the timeout still bounds it, and
+    // the task only sends events (never mutates agent state).
+    let never = CancellationToken::new();
     tokio::spawn(async move {
-        match tokio::time::timeout(std::time::Duration::from_secs(5), provider.list_models()).await
-        {
-            Ok(Ok(models)) => send(
+        match fetch_model_catalogue(provider, &never).await {
+            Some(models) => send(
                 &events,
                 AgentEvent::ModelList {
                     provider: provider_name,
                     models,
                 },
             ),
-            Ok(Err(error)) => send(
+            // `fetch_model_catalogue` collapses provider errors to `None`
+            // along with timeout/cancel; the explicit-listing sink reports
+            // failure while the metadata path drops it silently.
+            None => send(
                 &events,
-                AgentEvent::Notice(format!("could not fetch model list: {error}")),
-            ),
-            Err(_) => send(
-                &events,
-                AgentEvent::Notice("could not fetch model list: request timed out".into()),
+                AgentEvent::Notice("could not fetch model list".into()),
             ),
         }
     });
