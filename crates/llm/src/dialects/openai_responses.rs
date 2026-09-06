@@ -549,6 +549,30 @@ mod tests {
         assert!(parser.is_done());
         assert!(parser.finish().unwrap().is_empty());
     }
+
+    #[test]
+    fn terminal_event_split_across_transport_chunks_succeeds() {
+        // The `response.completed` terminal split mid-object across two
+        // `push_bytes` calls still terminates: the decoder buffers the
+        // partial line and only `process_line`s on `\n`, so dialect
+        // parsing sees the reassembled payload.
+        use crate::sse::SseParser;
+        let mut sse = SseParser::new();
+        // Split *between* SSE lines (after the `data:` line's `\n`): the
+        // first chunk holds a complete data line, the second the blank
+        // dispatch line. Byte-halving one `push_bytes` call would split
+        // inside the JSON string instead (an interior `\n` is a line
+        // separator, and half a `\n\n` terminator dispatches nothing).
+        let first = r#"{"type":"response.completed","response":{"status":"completed"}}"#;
+        let payload = format!("data: {first}\n");
+        assert!(sse.push_bytes(payload.as_bytes()).unwrap().is_empty());
+        let events = sse.push_bytes(b"\n").unwrap();
+        assert_eq!(events.len(), 1, "reassembled terminal: {events:?}");
+        let mut parser = ResponsesParser::new();
+        let done = parser.parse_event(&events[0]).unwrap();
+        assert!(matches!(&done[0], StreamEvent::Done { .. }), "got {done:?}");
+        assert!(parser.is_done());
+    }
     #[test]
     fn parses_response_events() {
         let mut parser = ResponsesParser::new();

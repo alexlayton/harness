@@ -575,6 +575,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_usage_chunk_split_across_chunks_succeeds() {
+        // The terminal usage chunk split across two `push_bytes` calls
+        // still terminates with `Done`: the decoder buffers the partial
+        // line and only `process_line`s on `\n`. Split *between* SSE
+        // lines: the first chunk holds a complete data line, the second
+        // the blank dispatch line.
+        use crate::sse::SseParser;
+        let mut sse = SseParser::new();
+        let first = r#"{"choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3}}"#;
+        let payload = format!("data: {first}\n");
+        assert!(sse.push_bytes(payload.as_bytes()).unwrap().is_empty());
+        let events = sse.push_bytes(b"\n").unwrap();
+        assert_eq!(events.len(), 1);
+        let mut parser = ChatStreamParser::new();
+        let done = parser.parse_event(&events[0]).unwrap();
+        assert!(matches!(&done[0], StreamEvent::Done { .. }), "got {done:?}");
+        assert!(parser.done);
+    }
+
+    #[test]
     fn valid_done_terminator_succeeds() {
         // The documented `[DONE]` terminator closes the turn without a
         // `Done` event of its own; the stream simply ends successfully.

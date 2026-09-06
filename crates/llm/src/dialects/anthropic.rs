@@ -822,4 +822,24 @@ mod tests {
         assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
         assert!(!parser.is_done());
     }
+
+    #[test]
+    fn terminal_event_split_across_transport_chunks_succeeds() {
+        // The `message_stop` terminal split across two `push_bytes` calls
+        // still terminates: the decoder buffers the partial line and only
+        // `process_line`s on `\n`, so dialect parsing sees the reassembled
+        // payload. Split *between* SSE lines: the first chunk holds a
+        // complete data line, the second the blank dispatch line.
+        use crate::sse::SseParser;
+        let mut sse = SseParser::new();
+        let first = r#"{"type":"message_stop"}"#;
+        let payload = format!("data: {first}\n");
+        assert!(sse.push_bytes(payload.as_bytes()).unwrap().is_empty());
+        let events = sse.push_bytes(b"\n").unwrap();
+        assert_eq!(events.len(), 1);
+        let mut parser = AnthropicParser::new();
+        let done = parser.parse_event(&events[0]).unwrap();
+        assert!(matches!(&done[0], StreamEvent::Done { .. }), "got {done:?}");
+        assert!(parser.is_done());
+    }
 }
