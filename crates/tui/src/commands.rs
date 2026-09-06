@@ -313,10 +313,15 @@ pub fn parse_command_with_skills(
         other => {
             if let Some(name) = other.strip_prefix('/')
                 && !name.is_empty()
-                && rest.is_empty()
                 && command_spec(command).is_none()
                 && let Some(entry) = skill_entry(skills, name)
             {
+                // A skill alias takes no free-form trailing input: reject
+                // it clearly instead of silently dropping it into
+                // `parse_command`'s "unknown command" path.
+                if !rest.is_empty() {
+                    return Err(format!("usage: /{} (takes no arguments)", entry.name));
+                }
                 return Ok(ParsedCommand::InvokeSkill {
                     name: entry.name.clone(),
                     alias: true,
@@ -1445,11 +1450,12 @@ mod tests {
                 alias: true
             })
         );
-        // Aliases are strict, just like `/skill <name>`; trailing text must
-        // not be silently discarded by the command adapter.
+        // Aliases are strict, just like `/skill <name>`; trailing text is
+        // rejected clearly (never silently discarded, never a bare
+        // "unknown command").
         assert_eq!(
             parse_command_with_skills("/greeter now", &skills),
-            Err("unknown command: /greeter".into())
+            Err("usage: /greeter (takes no arguments)".into())
         );
         // …but never shadow static commands, including the skill commands.
         assert_eq!(
