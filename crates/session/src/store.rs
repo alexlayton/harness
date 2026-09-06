@@ -4,8 +4,11 @@ use crate::model::{
     EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, StoredContent,
     StoredToolCall, Timestamp, now_timestamp,
 };
+use serde::Deserialize;
+use serde_json::Value;
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -505,6 +508,155 @@ fn read_file(path: &Path) -> Result<String> {
     Ok(contents)
 }
 
+#[derive(Deserialize)]
+struct IndexEnvelope {
+    version: Option<u32>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    session_id: Option<String>,
+    event_id: Option<String>,
+    sequence: Option<u64>,
+    timestamp: Option<String>,
+    #[serde(default)]
+    data: Value,
+}
+
+/// Read only the metadata needed by the session picker. This deliberately
+/// avoids rebuilding provider messages or cloning large tool results.
+fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionIndexEntry>> {
+    let file = File::open(path).map_err(|source| io_error("open session index", path, source))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    if reader
+        .read_line(&mut line)
+        .map_err(|source| io_error("read session header", path, source))?
+        == 0
+    {
+        return Ok(None);
+    }
+    let header: IndexEnvelope = match serde_json::from_str(&line) {
+        Ok(header) => header,
+        Err(_) => return Ok(None),
+    };
+    if header.version.is_none()
+        || header.version.unwrap_or_default() > crate::model::FORMAT_VERSION
+        || header.kind.as_deref() != Some("session")
+    {
+        return Ok(None);
+    }
+    let id = match (
+        header
+            .session_id
+            .as_deref()
+            .and_then(|value| SessionId::parse(value).ok()),
+        serde_json::from_value::<SessionMetadata>(header.data),
+    ) {
+        (Some(id), Ok(metadata)) if id == metadata.id => (id, metadata),
+        _ => return Ok(None),
+    };
+    let (id, metadata) = id;
+    if let Some(workspace) = workspace
+        && normalize_workspace(metadata.workspace_root.clone())? != workspace
+    {
+        return Ok(None);
+    }
+
+    let mut title = metadata.title.clone();
+    let mut provider = metadata.provider.clone();
+    let mut model = metadata.model.clone();
+    let mut updated_at = metadata.updated_at.clone();
+    let mut event_count = 0usize;
+    let mut has_conversation = false;
+    let mut expected_sequence = 1u64;
+    let mut event_ids = HashSet::new();
+    line.clear();
+    loop {
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|source| io_error("read session index", path, source))?;
+        if read == 0 {
+            break;
+        }
+        let raw: IndexEnvelope = match serde_json::from_str(&line) {
+            Ok(raw) => raw,
+            Err(_) => return Ok(None),
+        };
+        if raw.version.is_none()
+            || raw.version.unwrap_or_default() > crate::model::FORMAT_VERSION
+            || raw.kind.as_deref() == Some("session")
+            || raw.kind.is_none()
+            || raw
+                .session_id
+                .as_deref()
+                .and_then(|value| SessionId::parse(value).ok())
+                != Some(id)
+            || raw.sequence != Some(expected_sequence)
+            || raw.timestamp.as_deref().is_none_or(str::is_empty)
+            || raw
+                .event_id
+                .as_deref()
+                .and_then(|value| EventId::parse(value).ok())
+                .is_none()
+            || !event_ids.insert(raw.event_id.clone().unwrap_or_default())
+        {
+            return Ok(None);
+        }
+        let kind = raw.kind.as_deref().unwrap_or_default();
+        let timestamp = raw.timestamp.unwrap_or_default();
+        updated_at = timestamp;
+        event_count = event_count.saturating_add(1);
+        expected_sequence = expected_sequence.saturating_add(1);
+        match kind {
+            "user_message" | "assistant_message" => {
+                has_conversation |= raw
+                    .data
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|content| !content.is_empty());
+            }
+            "reasoning" | "tool_call" | "tool_result" | "compaction" => {
+                has_conversation = true;
+            }
+            "model_change" => {
+                if let (Some(next_provider), Some(next_model)) = (
+                    raw.data.get("provider").and_then(Value::as_str),
+                    raw.data.get("model").and_then(Value::as_str),
+                ) {
+                    provider = Some(next_provider.to_owned());
+                    model = Some(next_model.to_owned());
+                }
+            }
+            "metadata_change" => {
+                title = raw
+                    .data
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            _ => {}
+        }
+        line.clear();
+    }
+    let bytes = fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
+    Ok(Some(SessionIndexEntry {
+        id,
+        short_id: id.short(),
+        title,
+        workspace_root: metadata.workspace_root,
+        created_at: metadata.created_at,
+        updated_at,
+        provider,
+        model,
+        parent_session: metadata.parent_session,
+        event_count,
+        has_conversation,
+        path: path.to_path_buf(),
+        bytes,
+    }))
+}
+
 fn list_directory(directory: &Path, workspace: Option<&Path>) -> Result<Vec<SessionIndexEntry>> {
     if !directory.exists() {
         return Ok(Vec::new());
@@ -518,32 +670,9 @@ fn list_directory(directory: &Path, workspace: Option<&Path>) -> Result<Vec<Sess
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(session) = load_session_file(&path) else {
-            continue;
-        };
-        if let Some(workspace) = workspace
-            && normalize_workspace(session.metadata.workspace_root.clone())? != workspace
-        {
-            continue;
+        if let Some(entry) = index_file(&path, workspace)? {
+            result.push(entry);
         }
-        let bytes = fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or_default();
-        result.push(SessionIndexEntry {
-            id: session.id(),
-            short_id: session.id().short(),
-            title: session.metadata.title.clone(),
-            workspace_root: session.metadata.workspace_root.clone(),
-            created_at: session.metadata.created_at.clone(),
-            updated_at: session.metadata.updated_at.clone(),
-            provider: session.metadata.provider.clone(),
-            model: session.metadata.model.clone(),
-            parent_session: session.metadata.parent_session,
-            event_count: session.events.len(),
-            has_conversation: !session.context_messages().is_empty(),
-            path,
-            bytes,
-        });
     }
     result.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(result)
