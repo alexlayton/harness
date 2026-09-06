@@ -287,18 +287,40 @@ impl OpenAiCodexAuth {
     pub async fn login_device<F>(
         &self,
         cancel: &CancellationToken,
-        mut emit: F,
+        emit: F,
     ) -> Result<OpenAiCodexCredential>
     where
         F: FnMut(AuthEvent) + Send,
     {
+        self.login_device_with_sleep(cancel, emit, |seconds, token| async move {
+            cancellable_sleep(seconds, &token).await
+        })
+        .await
+    }
+
+    /// `login_device` with an injectable poll-interval sleep. Production
+    /// passes [`cancellable_sleep`]; tests record the requested waits to
+    /// prove `slow_down` backs off without sleeping the suite or fighting
+    /// Tokio's paused clock over real-socket I/O.
+    async fn login_device_with_sleep<F, S, Fut>(
+        &self,
+        cancel: &CancellationToken,
+        mut emit: F,
+        sleep: S,
+    ) -> Result<OpenAiCodexCredential>
+    where
+        F: FnMut(AuthEvent) + Send,
+        S: Fn(u64, CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        let cancel = cancel.clone();
         emit(AuthEvent::Started);
         let value = self
             .request_json(
                 self.http
                     .post(&self.endpoints.device_code_url)
                     .json(&json!({"client_id":OPENAI_CODEX_CLIENT_ID})),
-                cancel,
+                &cancel,
             )
             .await?;
         let device = parse_device_code(&value)?;
@@ -308,18 +330,28 @@ impl OpenAiCodexAuth {
             expires_in: device.expires_in,
             interval: device.interval,
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(device.expires_in);
+        // Expiry deadline in the Tokio clock domain: `cancellable_sleep`
+        // and `request_token_until` both wait on Tokio time (which paused
+        // test clocks auto-advance past short expiries), so a `std`
+        // wall-clock deadline would never fire there. Conversely, expiry
+        // checks on the Tokio clock DO advance under paused time — the
+        // 900s grant below outlasts the test's ~5s of virtual sleep.
+        // `Duration::from_secs` cannot overflow for a `u64` grant on
+        // 64-bit; clamp anyway so a huge grant never wraps the deadline
+        // into the past.
+        let grant = Duration::from_secs(device.expires_in.min(3600));
+        let deadline = tokio::time::Instant::now() + grant;
         let mut interval = device.interval;
         loop {
             // Check expiry before sleeping so an already-expired grant
             // fails fast, and re-check after the sleep and around the
             // request (inside `token`) so cancellation/expiry interrupt
             // both waits and in-flight polls.
-            if std::time::Instant::now() >= deadline {
+            if tokio::time::Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
             }
-            cancellable_sleep(interval, cancel).await?;
-            if std::time::Instant::now() >= deadline {
+            sleep(interval, cancel.clone()).await?;
+            if tokio::time::Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
             }
             if cancel.is_cancelled() {
@@ -330,7 +362,7 @@ impl OpenAiCodexAuth {
                     self.http
                         .post(&self.endpoints.token_url)
                         .form(&json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code", "device_code":device.device_code, "client_id":OPENAI_CODEX_CLIENT_ID})),
-                    cancel,
+                    &cancel,
                     Some(deadline),
                 )
                 .await?;
@@ -391,10 +423,9 @@ impl OpenAiCodexAuth {
         &self,
         request: reqwest::RequestBuilder,
         cancel: &CancellationToken,
-        deadline: Option<std::time::Instant>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Value> {
         let response = if let Some(deadline) = deadline {
-            let deadline = tokio::time::Instant::from_std(deadline);
             tokio::select! {
                 _ = cancel.cancelled() => return Err(AuthError::Cancelled),
                 _ = tokio::time::sleep_until(deadline) => return Err(AuthError::DeviceCodeExpired),
@@ -408,7 +439,6 @@ impl OpenAiCodexAuth {
         };
         let status = response.status();
         let body = if let Some(deadline) = deadline {
-            let deadline = tokio::time::Instant::from_std(deadline);
             tokio::select! {
                 _ = cancel.cancelled() => return Err(AuthError::Cancelled),
                 _ = tokio::time::sleep_until(deadline) => return Err(AuthError::DeviceCodeExpired),
@@ -864,6 +894,276 @@ mod tests {
         // Request bodies never carry tokens into errors: a bad reply maps to
         // a status-only error with no body echo.
         assert_eq!(fix.seen.lock().unwrap().len(), 2);
+    }
+
+    /// AUTH-1: `authorization_pending` through the full `login_device`
+    /// loop — device-code grant, one pending poll, then success — persists
+    /// the exchanged credential and finishes. The fixture's device grant
+    /// uses `interval: 0` so the loop polls immediately (no suite sleep).
+    #[tokio::test]
+    async fn device_login_pending_then_success_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (400, r#"{"error":"authorization_pending"}"#.into()),
+            (200, success_token_body("refresh-device-1")),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let mut events = Vec::new();
+        let credential = auth
+            .login_device(&CancellationToken::new(), |event| events.push(event))
+            .await
+            .unwrap();
+        assert_eq!(credential.refresh, "refresh-device-1");
+        // The exchanged credential is durable: a fresh handle built on the
+        // same store observes it without another network exchange.
+        let reopened = OpenAiCodexAuth::new(AuthStore::new(dir.path().join("auth.json")))
+            .unwrap()
+            .credential()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.refresh, "refresh-device-1");
+        assert!(events.contains(&AuthEvent::Started));
+        assert!(events.contains(&AuthEvent::Finished));
+        assert_eq!(fix.seen.lock().unwrap().len(), 3);
+    }
+
+    /// AUTH-1: `slow_down` through the full `login_device` loop.
+    /// `slow_down` raises the next poll interval by exactly 5s: the
+    /// device grant's `interval: 0` is normalized to the 5s RFC 8628
+    /// default, so the test records every requested poll wait through
+    /// the injectable sleep and asserts the sequence is `[5, 10]` —
+    /// default first poll, backed-off second poll. No clock is paused
+    /// (real-socket I/O and paused clocks starve each other); the
+    /// recording sleep returns immediately so the suite never waits.
+    #[tokio::test]
+    async fn device_login_slow_down_delays_the_next_poll() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (400, r#"{"error":"slow_down"}"#.into()),
+            (200, success_token_body("refresh-slow-1")),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let waits: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits_task = waits.clone();
+        let cancel = CancellationToken::new();
+        let credential = auth
+            .login_device_with_sleep(
+                &cancel,
+                |_| {},
+                move |seconds, _token| {
+                    waits_task.lock().unwrap().push(seconds);
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(credential.refresh, "refresh-slow-1");
+        assert_eq!(
+            *waits.lock().unwrap(),
+            vec![5, 10],
+            "slow_down must back the next poll off by exactly 5s"
+        );
+        assert_eq!(fix.seen.lock().unwrap().len(), 3);
+    }
+
+    /// AUTH-1: `expired_token` through the full `login_device` loop
+    /// surfaces expiry — not a generic failure — and persists nothing.
+    /// `login_device` itself emits no `Failed` event (only the Copilot
+    /// wrapper does); the terminal `DeviceCodeExpired` error is the
+    /// contract the caller matches on.
+    #[tokio::test]
+    async fn device_login_expired_token_fails_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (400, r#"{"error":"expired_token"}"#.into()),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let mut events = Vec::new();
+        let error = auth
+            .login_device(&CancellationToken::new(), |event| events.push(event))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AuthError::DeviceCodeExpired),
+            "unexpected: {error:?}"
+        );
+        assert!(
+            !dir.path().join("auth.json").exists(),
+            "expired grant must persist nothing"
+        );
+        // The loop emits Started + DeviceCode, then returns the terminal
+        // error with no success event; `Failed` is a wrapper-level event.
+        assert!(events.contains(&AuthEvent::Started));
+        assert!(!events.contains(&AuthEvent::Finished));
+    }
+
+    /// AUTH-1: `access_denied` through the full `login_device` loop
+    /// surfaces the sanitized denial — never a body echo — and persists
+    /// nothing.
+    #[tokio::test]
+    async fn device_login_access_denied_is_sanitized_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (
+                400,
+                r#"{"error":"access_denied","secret":"shh-device-secret"}"#.into(),
+            ),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .login_device(&CancellationToken::new(), |_| {})
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("denied"), "unexpected: {rendered}");
+        assert!(
+            !rendered.contains("shh-device-secret"),
+            "token body leaked: {rendered}"
+        );
+        assert!(
+            !dir.path().join("auth.json").exists(),
+            "denied grant must persist nothing"
+        );
+    }
+
+    /// AUTH-1: strict-status paths stay strict. Browser/refresh exchanges
+    /// (`token_strict`) reject a `400 authorization_pending` that the
+    /// device-polling helper accepts, mapping it to a status-only error
+    /// with no body echo.
+    #[tokio::test]
+    async fn strict_token_exchange_rejects_polling_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"error":"authorization_pending","secret":"shh-strict-secret"}"#;
+        let fix = fixture(vec![(400, body.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .token_strict(
+                serde_json::json!({"grant_type": "refresh_token"}),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("400"), "unexpected: {rendered}");
+        assert!(
+            !rendered.contains("shh-strict-secret"),
+            "token body leaked: {rendered}"
+        );
+    }
+
+    /// AUTH-1: cancelling mid-poll aborts the in-flight request and the
+    /// `login_device` loop surfaces `Cancelled`. The fixture holds the
+    /// token reply until the cancel fires; what matters is the outcome,
+    /// not which `select!` branch won the race.
+    #[tokio::test]
+    async fn cancellation_during_device_poll_aborts_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut gate_rx = gate_rx;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                if request.contains("POST /device ") {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        device_body.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, head.as_bytes()).await;
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, device_body.as_bytes())
+                            .await;
+                } else {
+                    // Token poll: hold the reply until the test cancels.
+                    let _ = (&mut gate_rx).await;
+                    let body = r#"{"error":"authorization_pending"}"#;
+                    let head = format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, head.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, body.as_bytes()).await;
+                }
+            }
+        });
+        let auth = OpenAiCodexAuth::new(AuthStore::new(dir.path().join("auth.json")))
+            .unwrap()
+            .with_endpoints(OpenAiCodexEndpoints {
+                authorize_url: format!("http://{addr}/authorize"),
+                token_url: format!("http://{addr}/token"),
+                device_code_url: format!("http://{addr}/device"),
+            });
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+        let error = auth.login_device(&cancel, |_| {}).await.unwrap_err();
+        assert!(
+            matches!(error, AuthError::Cancelled),
+            "in-flight cancel must surface Cancelled, got: {error:?}"
+        );
+        assert!(
+            !dir.path().join("auth.json").exists(),
+            "cancelled login must persist nothing"
+        );
+        let _ = gate_tx.send(());
     }
 
     #[tokio::test]
