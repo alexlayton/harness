@@ -4,8 +4,7 @@ use super::{Agent, AgentEvent, CompactionReason, MAX_TURN_RECOVERIES, TurnError,
 use crate::prompt::system_prompt_with_workspace_context;
 use futures_util::stream::StreamExt;
 use llm::{
-    CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent, ToolCall,
-    truncate_utf8,
+    CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent, truncate_utf8,
 };
 use session::{SessionEvent, usage_summary};
 use std::collections::VecDeque;
@@ -221,8 +220,10 @@ impl Agent {
 
             let mut text = String::new();
             let mut reasoning = String::new();
-            let mut tool_calls = Vec::<ToolCall>::new();
-            let mut opaque = Vec::<(String, serde_json::Value)>::new();
+            // Preserve the wire order of opaque provider state and function
+            // calls. Codex requires encrypted reasoning to remain interleaved
+            // with calls when the next request is rebuilt.
+            let mut assistant_items = Vec::<Content>::new();
             let mut cancelled = false;
             let mut stream_error = None;
 
@@ -262,8 +263,8 @@ impl Agent {
                                 reasoning.push_str(&delta);
                                 send(events, AgentEvent::ReasoningDelta(delta));
                             }
-                            Ok(StreamEvent::OpaqueState { provider, data }) => opaque.push((provider, data)),
-                            Ok(StreamEvent::ToolCallComplete(call)) => tool_calls.push(call),
+                            Ok(StreamEvent::OpaqueState { provider, data }) => assistant_items.push(Content::Opaque { provider, data }),
+                            Ok(StreamEvent::ToolCallComplete(call)) => assistant_items.push(Content::ToolCall(call)),
                             Ok(StreamEvent::Done { usage: done_usage, .. }) => {
                                 if let Some(done_usage) = done_usage {
                                     // Exact context occupancy of the request
@@ -301,15 +302,17 @@ impl Agent {
                 }
             }
 
+            let tool_calls = assistant_items
+                .iter()
+                .filter_map(|item| match item {
+                    Content::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
             if cancelled {
-                self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
-                append_assistant(
-                    &mut self.history,
-                    &reasoning,
-                    &text,
-                    &opaque,
-                    tool_calls.clone(),
-                );
+                self.persist_assistant(&reasoning, &text, &assistant_items, events)?;
+                append_assistant(&mut self.history, &reasoning, &text, &assistant_items);
                 for call in &tool_calls {
                     let cancelled_result = "cancelled before tool execution";
                     self.persist_tool_result(call, cancelled_result, true, events)?;
@@ -327,14 +330,8 @@ impl Agent {
                 return Ok(());
             }
 
-            self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
-            append_assistant(
-                &mut self.history,
-                &reasoning,
-                &text,
-                &opaque,
-                tool_calls.clone(),
-            );
+            self.persist_assistant(&reasoning, &text, &assistant_items, events)?;
+            append_assistant(&mut self.history, &reasoning, &text, &assistant_items);
             if stream_error.is_some() || !tool_calls.is_empty() {
                 // A stream may have emitted partial assistant content or tool
                 // calls before its next request. The old Done count no longer
@@ -491,10 +488,9 @@ pub(crate) fn append_assistant(
     history: &mut Vec<Message>,
     reasoning: &str,
     text: &str,
-    opaque: &[(String, serde_json::Value)],
-    calls: Vec<ToolCall>,
+    items: &[Content],
 ) {
-    if reasoning.is_empty() && text.is_empty() && opaque.is_empty() && calls.is_empty() {
+    if reasoning.is_empty() && text.is_empty() && items.is_empty() {
         return;
     }
     let mut content = Vec::new();
@@ -504,11 +500,18 @@ pub(crate) fn append_assistant(
     if !text.is_empty() {
         content.push(Content::Text(text.to_owned()));
     }
-    content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-        provider: provider.clone(),
-        data: data.clone(),
-    }));
-    content.extend(calls.into_iter().map(Content::ToolCall));
+    let has_opaque = items
+        .iter()
+        .any(|item| matches!(item, Content::Opaque { .. }));
+    if has_opaque {
+        content.extend(items.iter().cloned());
+    } else {
+        content.extend(items.iter().filter_map(|item| match item {
+            Content::Opaque { .. } => None,
+            Content::ToolCall(call) => Some(Content::ToolCall(call.clone())),
+            _ => None,
+        }));
+    }
     history.push(Message {
         role: Role::Assistant,
         content,

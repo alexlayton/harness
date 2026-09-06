@@ -444,6 +444,7 @@ mod tests {
                         MockErrorKind::Retryable => LlmError::Http {
                             status: 500,
                             body: message,
+                            retry_after_secs: None,
                         },
                     })
                 },
@@ -479,6 +480,7 @@ mod tests {
                 Err(LlmError::Http {
                     status: 500,
                     body: "connection dropped".into(),
+                    retry_after_secs: None,
                 })
             })))
         }

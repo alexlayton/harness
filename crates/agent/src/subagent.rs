@@ -1279,6 +1279,7 @@ mod tests {
                         return Err(LlmError::Http {
                             status: 500,
                             body: message,
+                            retry_after_secs: None,
                         });
                     }
                 }

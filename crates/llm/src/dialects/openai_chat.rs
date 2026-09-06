@@ -451,6 +451,9 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
             for item in parser.parse_event(&event)? {
                 yield item;
             }
+            if parser.done {
+                break;
+            }
         }
         if !parser.done {
             for item in parser.finish()? {

@@ -90,11 +90,10 @@ impl Agent {
         &mut self,
         reasoning: &str,
         text: &str,
-        opaque: &[(String, serde_json::Value)],
-        calls: &[ToolCall],
+        items: &[Content],
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), TurnError> {
-        if reasoning.is_empty() && text.is_empty() && opaque.is_empty() && calls.is_empty() {
+        if reasoning.is_empty() && text.is_empty() && items.is_empty() {
             return Ok(());
         }
         let mut content = Vec::new();
@@ -104,12 +103,15 @@ impl Agent {
         if !text.is_empty() {
             content.push(Content::Text(text.to_owned()));
         }
-        content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-            provider: provider.clone(),
-            data: data.clone(),
-        }));
-        // Tool calls have their own durable events. Keeping them out of this
-        // message avoids duplicates while retaining explicit call events.
+        let has_opaque = items
+            .iter()
+            .any(|item| matches!(item, Content::Opaque { .. }));
+        if has_opaque {
+            // Codex continuation state must remain interleaved with calls in
+            // one assistant message. Embedded calls are validated and replayed
+            // by session using the same state machine as standalone calls.
+            content.extend(items.iter().cloned());
+        }
         let message = Message::assistant(content);
         if !message.content.is_empty() {
             self.persist_event(
@@ -119,13 +121,18 @@ impl Agent {
                 events,
             )?;
         }
-        for call in calls {
-            self.persist_event(
-                SessionEvent::ToolCall {
-                    call: StoredToolCall::from(call),
-                },
-                events,
-            )?;
+        if !has_opaque {
+            for call in items.iter().filter_map(|item| match item {
+                Content::ToolCall(call) => Some(call),
+                _ => None,
+            }) {
+                self.persist_event(
+                    SessionEvent::ToolCall {
+                        call: StoredToolCall::from(call),
+                    },
+                    events,
+                )?;
+            }
         }
         Ok(())
     }

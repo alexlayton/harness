@@ -143,6 +143,7 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
                 yield crate::StreamEvent::OpaqueState { provider: "openai-codex".into(), data: value["item"].clone() };
             }
             for value in parser.parse_event(&event)? { yield value; }
+            if parser.is_done() { break; }
         }
         if !parser.is_done() { for value in parser.finish()? { yield value; } }
     })

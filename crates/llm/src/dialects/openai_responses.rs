@@ -194,10 +194,12 @@ fn stringify_arguments(arguments: &Value) -> String {
 #[derive(Debug, Default)]
 pub struct ResponsesParser {
     done: bool,
-    /// Call IDs already emitted in this response.  IDs are unique per
-    /// assistant response; a repeated ID is a provider error surfaced as
-    /// `LlmError::Parse` before execution.
+    /// Call IDs already observed in this response. IDs are unique per
+    /// assistant response; malformed calls are held until the terminal event
+    /// so an earlier valid call cannot escape before a later invalid one is
+    /// detected.
     seen_ids: std::collections::HashSet<String>,
+    pending_calls: Vec<ToolCall>,
 }
 
 impl ResponsesParser {
@@ -248,7 +250,6 @@ impl ResponsesParser {
                 // synthetic IDs.  No `ToolCallComplete` is emitted.
                 let id = item
                     .get("call_id")
-                    .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|id| !id.is_empty())
@@ -271,11 +272,12 @@ impl ResponsesParser {
                     )));
                 }
                 self.seen_ids.insert(id.clone());
-                Ok(vec![StreamEvent::ToolCallComplete(ToolCall {
+                self.pending_calls.push(ToolCall {
                     id,
                     name,
                     arguments,
-                })])
+                });
+                Ok(Vec::new())
             }
             "response.completed" | "response.incomplete" => {
                 self.done = true;
@@ -303,7 +305,13 @@ impl ResponsesParser {
                         (None, None) => "incomplete".to_owned(),
                     });
                 }
-                Ok(vec![StreamEvent::Done { stop_reason, usage }])
+                let mut output = self
+                    .pending_calls
+                    .drain(..)
+                    .map(StreamEvent::ToolCallComplete)
+                    .collect::<Vec<_>>();
+                output.push(StreamEvent::Done { stop_reason, usage });
+                Ok(output)
             }
             "response.failed" => Err(LlmError::Stream(error_message(&value, "response failed"))),
             "error" => Err(LlmError::Stream(error_message(&value, "Responses error"))),
@@ -378,6 +386,9 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
             let event = event?;
             for item in parser.parse_event(&event)? {
                 yield item;
+            }
+            if parser.is_done() {
+                break;
             }
         }
         if !parser.is_done() {
@@ -508,10 +519,11 @@ mod tests {
             vec![StreamEvent::ReasoningDelta("think".into())]
         );
         let calls = parser.parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"read","arguments":"{\"path\":\"x\"}"}}"#).unwrap();
-        assert!(matches!(&calls[0], StreamEvent::ToolCallComplete(call) if call.name == "read"));
+        assert!(calls.is_empty(), "calls are held until the terminal event");
         let done = parser.parse_payload(r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":4,"output_tokens_details":{"reasoning_tokens":1}}}}"#).unwrap();
+        assert!(matches!(&done[0], StreamEvent::ToolCallComplete(call) if call.name == "read"));
         assert!(matches!(
-            &done[0],
+            &done[1],
             StreamEvent::Done {
                 usage: Some(Usage {
                     input_tokens: 3,

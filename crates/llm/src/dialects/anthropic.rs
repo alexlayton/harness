@@ -259,10 +259,11 @@ pub struct AnthropicParser {
     stop_reason: Option<String>,
     done: bool,
     current_index: Option<u64>,
-    /// Call IDs already emitted in this response.  IDs are unique per
-    /// assistant response; a repeated ID is a provider error surfaced as
-    /// `LlmError::Parse` before execution.
+    /// Call IDs already observed in this response. Completed calls are held
+    /// until `message_stop` so a later malformed block cannot emit a partial
+    /// executable response.
     seen_tool_ids: std::collections::HashSet<String>,
+    completed_tools: Vec<ToolCall>,
 }
 
 #[derive(Debug)]
@@ -412,11 +413,16 @@ impl AnthropicParser {
                 Ok(Vec::new())
             }
             "message_stop" => {
-                let mut output = Vec::new();
-                let indices: Vec<u64> = self.tools.keys().copied().collect();
-                for index in indices {
-                    output.extend(self.finish_tool(index)?);
+                if !self.tools.is_empty() {
+                    return Err(LlmError::Parse(
+                        "Anthropic tool block ended without content_block_stop".into(),
+                    ));
                 }
+                let mut output = self
+                    .completed_tools
+                    .drain(..)
+                    .map(StreamEvent::ToolCallComplete)
+                    .collect::<Vec<_>>();
                 self.done = true;
                 output.push(StreamEvent::Done {
                     stop_reason: self.stop_reason.clone(),
@@ -473,11 +479,12 @@ impl AnthropicParser {
                 LlmError::Parse(format!("invalid Anthropic tool arguments: {error}"))
             })?
         };
-        Ok(vec![StreamEvent::ToolCallComplete(ToolCall {
+        self.completed_tools.push(ToolCall {
             id: id.to_owned(),
             name: tool.name,
             arguments,
-        })])
+        });
+        Ok(Vec::new())
     }
 
     pub fn is_done(&self) -> bool {
@@ -521,6 +528,9 @@ fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
             let event = event?;
             for item in parser.parse_event(&event)? {
                 yield item;
+            }
+            if parser.is_done() {
+                break;
             }
         }
         if !parser.is_done() {
@@ -682,11 +692,12 @@ mod tests {
         let call = parser
             .parse_payload(r#"{"type":"content_block_stop","index":2}"#)
             .unwrap();
-        assert!(matches!(&call[0], StreamEvent::ToolCallComplete(call) if call.name == "read"));
+        assert!(call.is_empty(), "calls are held until message_stop");
         parser.parse_payload(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#).unwrap();
         let done = parser.parse_payload(r#"{"type":"message_stop"}"#).unwrap();
+        assert!(matches!(&done[0], StreamEvent::ToolCallComplete(call) if call.name == "read"));
         assert!(matches!(
-            &done[0],
+            &done[1],
             StreamEvent::Done {
                 usage: Some(Usage {
                     input_tokens: 5,
@@ -749,6 +760,8 @@ mod tests {
         let call = parser
             .parse_payload(r#"{"type":"content_block_stop","index":3}"#)
             .unwrap();
+        assert!(call.is_empty());
+        let call = parser.parse_payload(r#"{"type":"message_stop"}"#).unwrap();
         assert!(
             matches!(&call[0], StreamEvent::ToolCallComplete(call) if call.id == "frag" && call.name == "read" && call.arguments["path"] == "x"),
             "got {call:?}"
