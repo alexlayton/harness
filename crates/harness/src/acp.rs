@@ -248,7 +248,7 @@ where
     //
     // Handlers are async closures (the builder takes `AsyncFnMut`) that
     // respond inline; long work lives in the spawned agent/forwarder tasks.
-    AgentRole
+    let connection_result = AgentRole
         .builder()
         .name("harness")
         .on_receive_request(
@@ -341,7 +341,22 @@ where
         )
         .connect_to(transport)
         .await
-        .context("run ACP connection")?;
+        .context("run ACP connection");
+
+    // Disconnect is a lifecycle boundary too: dropping JoinHandles would
+    // detach agents and leave providers/MCP servers able to append after the
+    // ACP transport is gone. Cancel and await every owned session before the
+    // frontend returns.
+    let handles = {
+        let mut sessions = state.sessions.lock().unwrap();
+        std::mem::take(&mut *sessions)
+            .into_values()
+            .collect::<Vec<_>>()
+    };
+    for handle in handles {
+        shutdown_session(handle).await;
+    }
+    connection_result?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -548,6 +563,20 @@ async fn new_session(
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
+    tokio::spawn(async move {
+        if let Err(error) = new_session_inner(request, responder, connection, state).await {
+            tracing::error!(error = %error, "ACP new-session task failed");
+        }
+    });
+    Ok(())
+}
+
+async fn new_session_inner(
+    request: NewSessionRequest,
+    responder: Responder<NewSessionResponse>,
+    connection: ConnectionTo<agent_client_protocol::Client>,
+    state: Arc<AcpState>,
+) -> AcResult<()> {
     let mcp_servers = match acp_mcp_servers(&request.mcp_servers) {
         Ok(servers) => servers,
         Err(error) => return respond_invalid_params(responder, error),
@@ -587,6 +616,20 @@ async fn new_session(
 }
 
 async fn load_session(
+    request: LoadSessionRequest,
+    responder: Responder<LoadSessionResponse>,
+    connection: ConnectionTo<agent_client_protocol::Client>,
+    state: Arc<AcpState>,
+) -> AcResult<()> {
+    tokio::spawn(async move {
+        if let Err(error) = load_session_inner(request, responder, connection, state).await {
+            tracing::error!(error = %error, "ACP load-session task failed");
+        }
+    });
+    Ok(())
+}
+
+async fn load_session_inner(
     request: LoadSessionRequest,
     responder: Responder<LoadSessionResponse>,
     connection: ConnectionTo<agent_client_protocol::Client>,
@@ -735,19 +778,47 @@ async fn shutdown_session(handle: SessionHandle) {
 fn delete_session_everywhere(id: &str, session_root: &std::path::Path) -> Result<()> {
     let parsed = session::SessionId::parse(id).map_err(anyhow::Error::msg)?;
     let file_name = format!("{parsed}.jsonl");
-    let Ok(entries) = std::fs::read_dir(session_root) else {
-        return Ok(());
+    let entries = match std::fs::read_dir(session_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(anyhow::Error::new(error).context("list session root")),
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.context("read session root entry")?;
         let workspace_dir = entry.path();
-        if !workspace_dir.is_dir() {
+        let metadata = match std::fs::metadata(&workspace_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(anyhow::Error::new(error)
+                    .context(format!("inspect `{}`", workspace_dir.display())));
+            }
+        };
+        if !metadata.is_dir() {
             continue;
         }
         let path = workspace_dir.join(&file_name);
-        if path.exists() {
-            std::fs::remove_file(&path).with_context(|| format!("delete `{}`", path.display()))?;
-            // Best effort: a stale lock sidecar is worthless afterwards.
-            let _ = std::fs::remove_file(path.with_extension("lock"));
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("delete `{}`", path.display()))?;
+                let lock_path = path.with_extension("jsonl.lock");
+                match std::fs::remove_file(&lock_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error)
+                            .context(format!("delete `{}`", lock_path.display())));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(
+                    anyhow::Error::new(error).context(format!("inspect `{}`", path.display()))
+                );
+            }
         }
     }
     Ok(())
