@@ -996,9 +996,14 @@ impl CrossTerm {
                 .send(InputMessage::ListSessions)
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
         }
-        let provider = candidate
-            .value
+        // A bare `provider:` token requests the catalogue; so does a
+        // partially typed `provider:model` token whose provider part is
+        // known but uncached — the user is clearly addressing that
+        // provider's catalogue even before Tab-accepting the prefix.
+        let typed = candidate.value.as_str();
+        let provider = typed
             .strip_suffix(':')
+            .or_else(|| typed.split_once(':').map(|(provider, _)| provider))
             .filter(|name| {
                 self.providers
                     .iter()
@@ -3996,6 +4001,20 @@ mod tests {
         ui.refresh_completion();
         let (tx, mut rx) = mpsc::unbounded_channel();
         ui.request_typed_backend(&tx).unwrap();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(InputMessage::ListModels {
+                provider: "openrouter".into(),
+            })
+        );
+        // A partially typed `provider:model` token addresses the same
+        // catalogue even before the prefix is Tab-accepted.
+        let mut ui2 = tests::ui(80, 24);
+        ui2.input = "/model openrouter:anthropic/claude".into();
+        ui2.cursor = ui2.input.len();
+        ui2.refresh_completion();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui2.request_typed_backend(&tx).unwrap();
         assert_eq!(
             rx.try_recv().ok(),
             Some(InputMessage::ListModels {
