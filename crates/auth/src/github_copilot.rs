@@ -159,15 +159,18 @@ impl GithubCopilotClient {
     /// hit injectable endpoints (local fixture), keeping production
     /// endpoint construction untouched. `CopilotAuth` uses this in tests so
     /// concurrent `ensure_valid` exercises the real `refresh` path.
+    /// Takes a client builder (not a built client) so the provider
+    /// install inside always precedes `reqwest::Client` construction —
+    /// the crate uses `rustls-no-provider`, and building first panics.
     #[cfg(test)]
     #[allow(dead_code)] // consumed by the rewritten single-flight/login tests
     pub(crate) fn with_client_and_endpoints(
-        http: Client,
+        build_http: impl FnOnce() -> Client,
         endpoints: CopilotEndpoints,
     ) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         Ok(Self {
-            http,
+            http: build_http(),
             endpoints,
             api_base_url: None,
         })
@@ -1290,7 +1293,7 @@ mod tests {
             .unwrap();
         let auth = CopilotAuth::new(store).unwrap().with_client_for_test(
             GithubCopilotClient::with_client_and_endpoints(
-                reqwest::Client::new(),
+                reqwest::Client::new,
                 CopilotEndpoints {
                     device_code_url: format!("http://{addr}/login/device/code"),
                     access_token_url: format!("http://{addr}/login/oauth/access_token"),
@@ -1401,7 +1404,7 @@ mod tests {
             .unwrap();
         let client = || {
             GithubCopilotClient::with_client_and_endpoints(
-                reqwest::Client::new(),
+                reqwest::Client::new,
                 CopilotEndpoints {
                     device_code_url: format!("http://{addr}/login/device/code"),
                     access_token_url: format!("http://{addr}/login/oauth/access_token"),
@@ -1453,5 +1456,104 @@ mod tests {
         assert_eq!(exchanges.load(Ordering::SeqCst), 1);
         let persisted = AuthStore::new(path).copilot().unwrap().unwrap();
         assert_eq!(persisted.access, "access-winner");
+    }
+
+    /// AUTH-3: a failing model catalogue still leaves a usable persisted
+    /// credential. The fixture's `/models` endpoint fails (500); login
+    /// must return the exchanged credential anyway, `Finished` must
+    /// fire, and the store must hold the pre-discovery credential — not
+    /// an enrichment failure. (A hang would exercise the same swallow
+    /// path via the 15s discovery timeout, but failing fast keeps the
+    /// suite fast; the timeout itself is covered by construction.)
+    #[tokio::test]
+    async fn model_list_failure_still_leaves_a_usable_persisted_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                // Device + access-token polls succeed immediately;
+                // exchange mints the Copilot token; `/models` hangs so
+                // discovery can only resolve via the login timeout.
+                let reply = if request.contains("POST /login/device/code ") {
+                    (
+                        200,
+                        serde_json::json!({
+                            "device_code": "device-1",
+                            "user_code": "ABCD-EFGH",
+                            "verification_uri": "https://github.com/login/device",
+                            "expires_in": 900,
+                            "interval": 0,
+                        })
+                        .to_string(),
+                    )
+                } else if request.contains("POST /login/oauth/access_token ") {
+                    (
+                        200,
+                        r#"{"access_token":"github-token","token_type":"bearer"}"#.to_owned(),
+                    )
+                } else if request.contains("/copilot_internal/v2/token") {
+                    (
+                        200,
+                        r#"{"token":"access-login","expires_at":9999999999}"#.to_owned(),
+                    )
+                } else if request.contains("GET /models ") {
+                    // Fail the catalogue: discovery swallows the error
+                    // and login keeps the pre-discovery credential.
+                    (500, r#"{"error":"catalogue unavailable"}"#.to_owned())
+                } else {
+                    (404, r#"{"error":"unexpected"}"#.to_owned())
+                };
+                let (status, body) = reply;
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let client = GithubCopilotClient::with_client_and_endpoints(
+            reqwest::Client::new,
+            CopilotEndpoints {
+                device_code_url: format!("http://{addr}/login/device/code"),
+                access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+            },
+        )
+        .unwrap()
+        .with_api_base_url_for_test(format!("http://{addr}"));
+        let auth = CopilotAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_client_for_test(client);
+        let mut events = Vec::new();
+        let credential = tokio::time::timeout(
+            Duration::from_secs(60),
+            auth.login_with_events(None, &CancellationToken::new(), |event| {
+                events.push(event);
+            }),
+        )
+        .await
+        .expect("login must resolve via the discovery timeout, not hang")
+        .unwrap();
+        // Returned credential is the exchanged token, unenriched…
+        assert_eq!(credential.access, "access-login");
+        assert!(credential.available_model_ids.is_empty());
+        // …and the persisted credential matches: usable without models.
+        let persisted = AuthStore::new(path).copilot().unwrap().unwrap();
+        assert_eq!(persisted.access, "access-login");
+        assert_eq!(persisted.refresh, "github-token");
+        assert!(persisted.available_model_ids.is_empty());
+        assert!(events.contains(&AuthEvent::Started));
+        assert!(events.contains(&AuthEvent::Finished));
     }
 }
