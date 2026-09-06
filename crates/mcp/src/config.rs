@@ -82,9 +82,28 @@ impl fmt::Debug for McpTransportConfig {
     }
 }
 
+const MAX_MCP_SERVERS: usize = 64;
+const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_SERVER_NAME_BYTES: usize = 256;
+
 impl McpConfig {
     /// Validate configuration without expanding environment placeholders.
     pub fn validate(&self) -> Result<(), McpError> {
+        if self.servers.len() > MAX_MCP_SERVERS {
+            return Err(McpError::Config {
+                server: "<mcp>".into(),
+                message: format!("too many servers; maximum is {MAX_MCP_SERVERS}"),
+            });
+        }
+        if serde_json::to_vec(self)
+            .map(|bytes| bytes.len() > MAX_MCP_CONFIG_BYTES)
+            .unwrap_or(true)
+        {
+            return Err(McpError::Config {
+                server: "<mcp>".into(),
+                message: format!("configuration exceeds {MAX_MCP_CONFIG_BYTES} bytes"),
+            });
+        }
         let mut names = BTreeSet::new();
         for server in &self.servers {
             validate_server(server, &mut names)?;
@@ -154,8 +173,14 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
         server: server.name.clone(),
         message: message.to_owned(),
     };
-    if server.name.trim().is_empty() || server.name.contains('\0') {
-        return Err(invalid("name must be non-empty and contain no NUL"));
+    if server.name.trim().is_empty()
+        || server.name.contains('\0')
+        || server.name.len() > MAX_SERVER_NAME_BYTES
+        || server.name.chars().any(char::is_control)
+    {
+        return Err(invalid(
+            "name must be non-empty, at most 256 bytes, and contain no control characters",
+        ));
     }
     if !names.insert(server.name.clone()) {
         return Err(invalid("server names must be unique"));
@@ -317,5 +342,32 @@ mod tests {
             .resolve_with(|_| None)
             .is_err()
         );
+    }
+
+    #[test]
+    fn rejects_excessive_server_count_and_control_names() {
+        let servers = (0..65)
+            .map(|index| McpServerConfig {
+                name: format!("server-{index}"),
+                transport: McpTransportConfig::Stdio {
+                    command: "server".into(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                },
+            })
+            .collect();
+        assert!(McpConfig { servers }.validate().is_err());
+
+        let invalid = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "bad\nname".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "server".into(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                },
+            }],
+        };
+        assert!(invalid.validate().is_err());
     }
 }

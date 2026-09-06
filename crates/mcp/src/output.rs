@@ -97,7 +97,9 @@ pub(crate) fn flatten(result: &CallToolResult) -> String {
         }
         flatten_block(&mut writer, block);
     }
-    if let Some(structured) = &result.structured_content {
+    if let Some(structured) = &result.structured_content
+        && !structured_duplicates_text(result, structured)
+    {
         if !result.content.is_empty() {
             writer.push_str("\n\n---\n\n");
         }
@@ -105,6 +107,17 @@ pub(crate) fn flatten(result: &CallToolResult) -> String {
         let _ = serde_json::to_writer(&mut writer, structured);
     }
     writer.finish()
+}
+
+fn structured_duplicates_text(result: &CallToolResult, structured: &serde_json::Value) -> bool {
+    if result.content.len() != 1 {
+        return false;
+    }
+    let ContentBlock::Text(text) = &result.content[0] else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(text.text.trim())
+        .is_ok_and(|value| value == *structured)
 }
 
 fn flatten_block(writer: &mut OutputWriter, block: &ContentBlock) {

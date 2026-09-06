@@ -77,12 +77,29 @@ pub(crate) fn validate_remote_tool(server: &str, remote: &RemoteTool) -> Result<
             message,
         })?;
     }
-    let definition_bytes = name
-        .len()
-        .saturating_add(remote.title.as_ref().map_or(0, String::len))
-        .saturating_add(remote.description.as_ref().map_or(0, |value| value.len()))
-        .saturating_add(stats.bytes);
-    Ok(definition_bytes)
+    // Count the compact serialized Harness definition, including the
+    // namespaced name and generated description. This prevents a long server
+    // name or JSON escaping from bypassing the aggregate catalogue budget.
+    let generated_description = format!(
+        "MCP tool `{name}` from server `{server}`.{}",
+        remote
+            .description
+            .as_deref()
+            .filter(|description| !description.is_empty())
+            .map_or(String::new(), |description| format!(" {description}"))
+    );
+    let definition = serde_json::json!({
+        "name": normalized_tool_name(server, name),
+        "description": generated_description,
+        "parameters": *remote.input_schema,
+    });
+    serde_json::to_vec(&definition)
+        .map(|bytes| bytes.len())
+        .map_err(|error| McpError::Tool {
+            server: server.into(),
+            tool: name.to_owned(),
+            message: format!("tool definition cannot be serialized: {error}"),
+        })
 }
 
 #[derive(Default)]

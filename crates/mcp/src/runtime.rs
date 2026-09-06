@@ -5,6 +5,7 @@ use crate::{
     MCP_INITIALIZE_TIMEOUT, MCP_LIST_TIMEOUT, MCP_SHUTDOWN_TIMEOUT, MCP_STDERR_CHUNK_BYTES,
     McpError,
 };
+use futures_util::future::join_all;
 use rmcp::ClientLifecycleMode;
 use rmcp::model::{PaginatedRequestParams, Tool as RemoteTool};
 use rmcp::service::{RoleClient, RunningService, serve_client_with_lifecycle_and_ct};
@@ -117,20 +118,20 @@ impl McpRuntime {
     /// under one global deadline rather than one timeout per server.
     pub async fn shutdown(mut self) {
         let mut servers = std::mem::take(&mut self.servers);
-        let _ = tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, async {
-            for server in &mut servers {
-                let _ = server.client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
-            }
-        })
-        .await;
+        // Stop diagnostic readers before moving the services into concurrent
+        // close futures. This also prevents a global shutdown timeout from
+        // dropping JoinHandles and detaching stderr tasks.
         for server in &mut servers {
             if let Some(task) = server.stderr_task.take() {
                 task.abort();
-                let _ = task.await;
             }
         }
-        // Dropping the services after the deadline releases their transports;
-        // the configured child process uses kill-on-drop below.
+        let closes = servers.into_iter().map(|mut server| async move {
+            let _ = server.client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
+        });
+        let _ = tokio::time::timeout(MCP_SHUTDOWN_TIMEOUT, join_all(closes)).await;
+        // Dropping the services after the global deadline releases their
+        // transports; the configured child process uses kill-on-drop below.
     }
 }
 
