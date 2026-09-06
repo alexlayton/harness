@@ -88,7 +88,12 @@ thread_local! {
 }
 
 /// Whether the deferred-sync flush should fail. Test-only.
-#[cfg(test)]
+///
+/// Always compiled (not `#[cfg(test)]`): the agent crate's `#[cfg(test)]`
+/// boundary tests call through [`SyncSessionFaultGuard::arm`], and a
+/// `#[cfg(test)]` gate here would not be active when compiling the session
+/// dependency for the agent's test build. The body is test-only — in
+/// production builds the flag is never armed, so this always returns false.
 pub fn injected_sync_session_failure() -> bool {
     INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.get())
 }
@@ -106,7 +111,6 @@ pub struct SyncSessionFaultGuard;
 
 impl SyncSessionFaultGuard {
     pub fn arm() -> Self {
-        #[cfg(test)]
         INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(true));
         Self
     }
@@ -114,7 +118,6 @@ impl SyncSessionFaultGuard {
 
 impl Drop for SyncSessionFaultGuard {
     fn drop(&mut self) {
-        #[cfg(test)]
         INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(false));
     }
 }
@@ -220,7 +223,6 @@ impl SessionStore {
     /// every record appended so far survives power loss. Cheap to call
     /// repeatedly; a no-op when the session has no file (memory-only).
     pub fn sync_session(&self, session: &Session) -> Result<()> {
-        #[cfg(test)]
         if injected_sync_session_failure() {
             return Err(io_error(
                 "sync session",
