@@ -805,4 +805,21 @@ mod tests {
         let error = parser.finish().unwrap_err();
         assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
     }
+
+    #[test]
+    fn stream_error_after_partial_output_remains_an_error() {
+        // Partial text followed by a provider `error` payload stays an
+        // error: it surfaces `LlmError::Stream` (agent recovery path) and
+        // never reaches a terminal `Done`.
+        let mut parser = AnthropicParser::new();
+        let events = parser
+            .parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#)
+            .unwrap();
+        assert_eq!(events, vec![StreamEvent::TextDelta("hi".into())]);
+        let error = parser
+            .parse_payload(r#"{"type":"error","error":{"message":"boom"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(!parser.is_done());
+    }
 }
