@@ -46,9 +46,9 @@ jobs:
           key: ${{ runner.os }}-release-checks-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-release-checks-
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace
-      - run: cargo test --workspace
-      - run: cargo build --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
 
   artifacts:
     name: Build ${{ matrix.target }}
@@ -62,12 +62,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: harness-${{ needs.checks.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
             smoke: true
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
             archive: harness-${{ needs.checks.outputs.tag }}-aarch64-apple-darwin.tar.gz
-            # This can be a cross-build on an Intel runner.
-            smoke: false
-          - os: macos-latest
+            # macos-14 is the native Apple-silicon runner for this artifact.
+            smoke: true
+          - os: macos-13
             target: x86_64-apple-darwin
             archive: harness-${{ needs.checks.outputs.tag }}-x86_64-apple-darwin.tar.gz
             smoke: true

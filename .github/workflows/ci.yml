@@ -42,7 +42,7 @@ jobs:
             target
           key: ${{ runner.os }}-clippy-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-clippy-
-      - run: cargo clippy --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test (Linux)
@@ -61,7 +61,7 @@ jobs:
             target
           key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-test-
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
 
   build:
     name: Build (Linux)
@@ -80,7 +80,7 @@ jobs:
             target
           key: ${{ runner.os }}-build-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-build-
-      - run: cargo build --workspace
+      - run: cargo build --workspace --locked
 
   macos-test:
     name: Test (macOS)
@@ -99,4 +99,4 @@ jobs:
             target
           key: ${{ runner.os }}-platform-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-platform-test-
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
