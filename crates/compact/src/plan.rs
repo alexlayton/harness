@@ -14,8 +14,8 @@ use crate::policy::CompactionPolicy;
 use session::model::{Session, SessionEvent, SessionEventRecord};
 use session::model::{events_after_latest_compaction, latest_compaction_boundary};
 
-/// A completed compaction plan: what to summarize, where the new boundary is,
-/// and how much context the summary is expected to free.
+/// A completed compaction plan: what to summarize and where the new
+/// boundary is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionPlan {
     /// Sequence boundary a new `CompactionSummary { compacted_through: … }`
@@ -29,9 +29,6 @@ pub struct CompactionPlan {
     /// The most recent previous summarizer output, if any, threaded into the
     /// summarizer so context survives across compactions.
     pub previous_summary: Option<String>,
-    /// Estimated context tokens freed by this compaction (whole live region
-    /// minus the kept tail). Informational; the trigger uses exact numbers.
-    pub estimated_tokens_freed: u64,
 }
 
 /// Plan a compaction for `session` under `policy`, or return `None` when
@@ -103,13 +100,10 @@ pub fn plan_compaction(
         return None;
     }
 
-    let estimated_tokens_freed = live_tokens(&live, 0).saturating_sub(live_tokens(&live, cut));
-
     Some(CompactionPlan {
         boundary,
         to_summarize,
         previous_summary,
-        estimated_tokens_freed,
     })
 }
 
@@ -343,7 +337,6 @@ mod tests {
             .count();
         assert_eq!(kept_turns, 2);
         assert!(!plan.to_summarize.is_empty());
-        assert!(plan.estimated_tokens_freed > 0);
     }
 
     #[test]

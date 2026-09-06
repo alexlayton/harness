@@ -16,11 +16,6 @@ pub fn estimate_tokens(bytes: usize) -> u64 {
     (bytes as u64).div_ceil(BYTES_PER_TOKEN)
 }
 
-/// Estimate the token count of a text payload.
-pub fn estimate_text_tokens(text: &str) -> u64 {
-    estimate_tokens(text.len())
-}
-
 /// Estimate the provider-context size from the inputs used to build a
 /// [`llm::CompletionRequest`]. Unlike transcript-only estimates, this counts
 /// the system prompt, full tool schemas, compaction summaries, opaque
@@ -117,11 +112,5 @@ mod tests {
             &[llm::Message::user("hello"), large_result],
         );
         assert!(large > small);
-    }
-
-    #[test]
-    fn multibyte_utf8_counts_bytes_not_chars() {
-        // "é" is two bytes; a 4-char string of them is 8 bytes → 2 tokens.
-        assert_eq!(estimate_text_tokens("éééé"), 2);
     }
 }
