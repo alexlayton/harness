@@ -285,7 +285,8 @@ impl ResponsesParser {
                 let usage = response.get("usage").map(parse_usage).transpose()?;
                 // Preserve the terminal status verbatim: `completed` and
                 // each `incomplete` reason (e.g. `max_output_tokens`) are
-                // normal stop reasons the agent records, not errors.  The
+                // normal stop reasons the agent records, not errors (see
+                // the all-normal rationale below).  The
                 // `incomplete_details.reason` (when present) is surfaced by
                 // mapping it into the stop reason so it survives in
                 // `Done` even though no separate event carries it.
@@ -293,6 +294,12 @@ impl ResponsesParser {
                     .get("status")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                // Every `incomplete` reason is a normal stop: the provider
+                // delivered a complete terminal event (status + reason +
+                // usage), so the turn records it in `Done` rather than
+                // retrying. Only transport-level problems (`Stream`), HTTP
+                // failures, and auth errors are retryable — see
+                // `LlmError::is_retryable`.
                 if kind == "response.incomplete" {
                     let detail = response
                         .get("incomplete_details")
@@ -516,6 +523,10 @@ mod tests {
 
     #[test]
     fn incomplete_terminal_event_succeeds_with_reason_and_usage() {
+        // All `incomplete` reasons are normal stops: the provider sent a
+        // complete terminal event, so the turn records `Done` (with reason
+        // and usage) instead of retrying. Only transport/HTTP/auth
+        // failures are retryable.
         let mut parser = ResponsesParser::new();
         let done = parser.parse_payload(r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}}"#).unwrap();
         assert!(matches!(
