@@ -1576,6 +1576,57 @@ mod tests {
     }
 
     #[test]
+    fn listing_reports_conversation_without_materializing_payloads() {
+        // PERF-5 metadata-only listing: `has_conversation` for a session
+        // with a multi-megabyte tool result must come from the streaming
+        // `index_file` path (kind/text envelope only), never from decoding
+        // or cloning the full payload. A corrupt-payload session still
+        // lists cheaply via the same path when its envelope is intact.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolCall {
+                    call: StoredToolCall {
+                        id: "big-1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "big.txt"}),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolResult {
+                    tool_call_id: "big-1".into(),
+                    content: "y".repeat(4 * 1024 * 1024),
+                    is_error: false,
+                    tool_name: Some("read".into()),
+                },
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        let entries = store.list().unwrap();
+        let elapsed = started.elapsed();
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == session.id())
+            .expect("session must be listed");
+        assert!(entry.has_conversation);
+        assert_eq!(entry.event_count, 2);
+        // 4MB payload indexed in well under a second: the scanner never
+        // built provider messages or cloned the result.
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "listing touched the payload: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn stale_store_appends_reconcile_external_tail() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
