@@ -52,7 +52,7 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - DONE: `CALLBACK_OVERALL_TIMEOUT` 10m, `wait_for_callback`→`with_idle(10s)`, `read_callback_head` 512B chunks through `\r\n\r\n`, `CALLBACK_HEAD_LIMIT` 16KiB; `is_callback_denial` + sanitized denial; `login_with_events_and_persist` persist-before `MODEL_DISCOVERY_TIMEOUT` 15s `fetch_available_model_ids`, best-effort swallow; serial policy off path (`enable_known_models` not in login); `base_url_from_proxy_token`, `copilot_base_url`, `proxy_endpoint` HTTPS-only, reject userinfo/`/?#@`/bad port.
 - Tests DONE: `idle_connection_does_not_block_a_later_valid_callback` (idle+fragmented); `live_denial_terminates_promptly` (live valid-state denial → sanitized `denied`, `Login failed` reply, resolves without idle timeout) + `callback_target_parsing_accepts_codes_and_denials` extended with near-miss non-denials (wrong error/missing state/wrong path); proxy parse/reject; `model_list_failure_still_leaves_a_usable_persisted_credential` (500 `/models` → exchanged `access-login` returned + persisted unenriched, `Finished` fires).
 
-## Phase 3 — Tools (`crates/tools`)
+## Phase 3 — Tools (`crates/tools`) — DONE
 
 ### TOOLS-1 Symlink escapes — DONE
 - `context_files.rs:10-16,223-243 read_contained_candidate`: `WorkspaceFs::open_root` canonical root, `canonicalize(candidate)+starts_with`, final `vfs::unix::open_file_relative(O_NOFOLLOW)`. External silently skipped, no contents in diagnostics. Contained symlinks allowed.
@@ -65,10 +65,9 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - `read.rs:187-240 open_target`, `write.rs:150-195 write_validated` + `file_mutation.rs:atomic_write_at (openat CREATE|EXCL temp + renameat same parent_fd)`, `edit.rs:227-292 execute_edit_validated` (handle read→match→re-read→commit). Errors `cannot read/write/edit {path}: {io}` no outside leak.
 - Tests (resolve→`remove_dir_all`+`symlink(outside)`→execute): `read.rs:547-579`, `write.rs:284-310` + `write.rs:248-283 retained_workspace_capability_survives_root_path_replacement`, `edit.rs:953-993`, `lib.rs:730-767`.
 
-### TOOLS-3 Bash exclusive + tree kill — PARTIAL
+### TOOLS-3 Bash exclusive + tree kill — DONE
 - DONE: `bash.rs:50-62 command_concurrency→Exclusive`, `:129-133 concurrency()`; word-level classifier removed. `MAX_TIMEOUT_SECS=86400 :37-48,72-81,137-160`, `checked_add` → tool error. `process_group(0) :203-210`. `ProcessGroupGuard:461-546 (SIGKILL on drop)` + `terminate_tree (SIGTERM→alive?→KILL_GRACE 500ms→SIGKILL)` on timeout/cancel/drop + after `Exited` for backgrounders; `child.wait()` reaps. `read_bounded_tail :245-305,373-410` + `timeout_at(drain_deadline) join!` one `DRAIN_TIMEOUT=1s`.
-- Tests DONE: `bash.rs:707-734 every_bash_invocation_is_exclusive`, `:741 oversized`, `:749 max_rejects_u64_max`, `:767 background_descendant_killed_after_return`, `:815 timeout_kills_descendants`, `:838 cancellation_kills`, `:794 aborting_execution_kills`, `:583 timeout_kills_command`.
-- MISSING: held stdout+stderr together ≤1× `DRAIN_TIMEOUT` timing test (only comment `:276-278`).
+- Tests DONE: `bash.rs:707-734 every_bash_invocation_is_exclusive`, `:741 oversized`, `:749 max_rejects_u64_max`, `:767 background_descendant_killed_after_return`, `:815 timeout_kills_descendants`, `:838 cancellation_kills`, `:794 aborting_execution_kills`, `:583 timeout_kills_command`; `held_stdout_and_stderr_share_one_drain_deadline` (setsid-detached survivor holds both pipes past shell exit; ~1s outer sleep + ~1s shared drain asserts 1.5s ≤ elapsed < 2.9s, proving one shared `DRAIN_TIMEOUT` instead of two sequential waits; survivor reaped via pid file).
 
 ### TOOLS-4 Exact byte-preserving edit — DONE
 - `edit.rs:415-490 apply_edits_exact` via `match_positions (char_indices+starts_with)` exact bytes; `strip_bom:491-495` split+reattach; spans vs original, overlap rejected, apply `rev`; BOM/mixed CRLF/LF preserved; pre-commit re-read (`:266-280` handle, `:343-351` fallback); `unicode-normalization` removed from `Cargo.toml`.
@@ -178,7 +177,7 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 
 ## Remaining TODO (ordered)
 1. Phase 2 DONE (AUTH-1/2/3). Next: AGENT-3/AGENT-4 + PERF-1 missing tests; PERF-1 triple-scan fix.
-2. TOOLS-3 shared-drain deadline test; TUI-2 metadata fit + width/combining/ZWJ property + height-clamp tests; AGENT-1/AGENT-2 deferred-sync/child-race tests.
+2. TUI-2 metadata fit + width/combining/ZWJ property + height-clamp tests; AGENT-1/AGENT-2 deferred-sync/child-race tests.
 3. PERF-5 benches (1k/10k) + external/replacement reconciliation; PERF-6 TUI quadratic guard (fix `lines().count()` walk, add bench).
 4. CONFIG-1 nested-extra matrix + concurrent-mutator tests; CLEANUP-1 `cargo tree --duplicates` verify + remaining removals; CLEANUP-2/3/4 sweeps.
 5. CI-1 workflow verify + Linux baseline; DOCS-1 contracts.
