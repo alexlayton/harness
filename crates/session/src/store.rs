@@ -32,6 +32,70 @@ impl Clone for DeferredSync {
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
 
+// Test-only fault injection for fail-closed hardening (SESSION-4).
+//
+// Running as root makes real `chmod`/`fsync` failures hard to trigger, so
+// tests force them deterministically through these thread-local flags.
+// Each flag makes one hardening step return the same `SessionError::Io`
+// it would return for a real OS failure, proving callers propagate instead
+// of silently continuing. Production builds contain no hook: every item
+// here is `#[cfg(test)]` and the checks below compile out otherwise.
+// Thread-local (not process-global) so parallel tests cannot interfere.
+// (Plain `//` comments: `thread_local!` is a macro invocation, which
+// rustdoc denies `///` docs on.)
+#[cfg(test)]
+thread_local! {
+    static INJECT_SECURE_DIR_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static INJECT_SECURE_FILE_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static INJECT_SYNC_PARENT_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether directory permission repair should fail. Test-only.
+#[cfg(test)]
+fn injected_secure_dir_failure() -> bool {
+    INJECT_SECURE_DIR_FAILURE.with(|flag| flag.get())
+}
+
+/// Whether file permission repair should fail. Test-only.
+#[cfg(test)]
+fn injected_secure_file_failure() -> bool {
+    INJECT_SECURE_FILE_FAILURE.with(|flag| flag.get())
+}
+
+/// Whether parent-directory sync should fail. Test-only.
+#[cfg(test)]
+fn injected_sync_parent_failure() -> bool {
+    INJECT_SYNC_PARENT_FAILURE.with(|flag| flag.get())
+}
+
+/// Hold hardening-failure flags for a fail-closed test and clear them on
+/// drop (including on panic) so no later test on this thread observes a
+/// stale injection.
+#[cfg(test)]
+struct HardeningFaultGuard;
+
+#[cfg(test)]
+impl HardeningFaultGuard {
+    fn new(secure_dir: bool, secure_file: bool, sync_parent: bool) -> Self {
+        INJECT_SECURE_DIR_FAILURE.with(|flag| flag.set(secure_dir));
+        INJECT_SECURE_FILE_FAILURE.with(|flag| flag.set(secure_file));
+        INJECT_SYNC_PARENT_FAILURE.with(|flag| flag.set(sync_parent));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for HardeningFaultGuard {
+    fn drop(&mut self) {
+        INJECT_SECURE_DIR_FAILURE.with(|flag| flag.set(false));
+        INJECT_SECURE_FILE_FAILURE.with(|flag| flag.set(false));
+        INJECT_SYNC_PARENT_FAILURE.with(|flag| flag.set(false));
+    }
+}
+
 /// Options used when creating a new durable session.
 #[derive(Clone, Debug, Default)]
 pub struct SessionCreateOptions {
@@ -1121,6 +1185,17 @@ fn workspace_key(path: &Path, salt: u64) -> String {
 /// failures are returned instead of silently continuing with permissive
 /// files or unsynced parents.
 fn ensure_private_directory(path: &Path) -> Result<()> {
+    // Fail-closed test hook: simulate an OS permission failure before any
+    // repair so tests prove `create` propagates instead of continuing with
+    // a permissive directory. Only active under `#[cfg(test)]` injection.
+    #[cfg(test)]
+    if injected_secure_dir_failure() {
+        return Err(io_error(
+            "secure directory permissions",
+            path,
+            std::io::Error::other("injected directory permission failure"),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1139,6 +1214,17 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 
 /// Fail-closed permission repair for files.
 fn ensure_private_file(path: &Path) -> Result<()> {
+    // Fail-closed test hook: simulate an OS permission failure before any
+    // repair so tests prove append/create propagates instead of continuing
+    // with a permissive file. Only active under `#[cfg(test)]` injection.
+    #[cfg(test)]
+    if injected_secure_file_failure() {
+        return Err(io_error(
+            "secure file permissions",
+            path,
+            std::io::Error::other("injected file permission failure"),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1217,6 +1303,17 @@ fn private_file(path: &Path) -> Result<File> {
 /// new entry survives power loss; failures fail closed.  On platforms
 /// without directory fsync support this is a no-op success.
 fn sync_parent(path: &Path) -> Result<()> {
+    // Fail-closed test hook: simulate a parent-fsync failure so tests prove
+    // durable creates propagate instead of leaving an undiscoverable entry.
+    // Only active under `#[cfg(test)]` injection.
+    #[cfg(test)]
+    if injected_sync_parent_failure() {
+        return Err(io_error(
+            "sync parent directory",
+            path,
+            std::io::Error::other("injected parent sync failure"),
+        ));
+    }
     #[cfg(unix)]
     {
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -1781,6 +1878,97 @@ mod tests {
         unsafe { libc::umask(old) };
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    /// SESSION-4: a directory-repair failure must fail the whole create
+    /// instead of continuing with a permissive workspace directory. The
+    /// injected error mirrors a real `chmod` failure, so `create` has no
+    /// session file to fall back to and nothing durable is left behind.
+    ///
+    /// The flag is armed only around `create`: store construction also
+    /// hardens the brand-new root (salt persistence), so arming earlier
+    /// would fail `new` by design. The point is that hardening inside the
+    /// write path propagates instead of being silently ignored.
+    #[test]
+    fn directory_permission_failure_fails_session_create() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let error = {
+            let _guard = HardeningFaultGuard::new(true, false, false);
+            store
+                .create(SessionCreateOptions::default())
+                .expect_err("create must fail closed on directory repair failure")
+        };
+        assert!(
+            matches!(error, SessionError::Io { operation, .. } if operation == "secure directory permissions"),
+            "unexpected error: {error:?}"
+        );
+        // `private_dir_all` created the workspace dir before the injected
+        // repair failed; no session header may have been written into it.
+        assert_eq!(fs::read_dir(store.workspace_dir()).unwrap().count(), 0);
+    }
+
+    /// SESSION-4: a file-repair failure inside lock acquisition must fail
+    /// the append instead of writing through a permissively-mode sidecar.
+    /// The store must surface the injected error and append nothing.
+    ///
+    /// Note the fault flag stays armed through the file-size assertion but
+    /// is dropped before reopening: plain reads also repair permissions,
+    /// so reading with the flag armed would fail by design. The point is
+    /// that the failed append left prior records intact and readable.
+    #[test]
+    fn file_permission_failure_fails_session_append() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        let bytes_before = fs::metadata(session.path().unwrap()).unwrap().len();
+        let error = {
+            let _guard = HardeningFaultGuard::new(false, true, false);
+            store
+                .append_event(
+                    &mut session,
+                    SessionEvent::UserMessage {
+                        message: StoredMessage::from_llm(&Message::user("blocked")),
+                    },
+                )
+                .expect_err("append must fail closed on lock-sidecar repair failure")
+        };
+        assert!(
+            matches!(error, SessionError::Io { operation, .. } if operation == "secure file permissions"),
+            "unexpected error: {error:?}"
+        );
+        assert!(session.events.is_empty());
+        assert_eq!(
+            fs::metadata(session.path().unwrap()).unwrap().len(),
+            bytes_before,
+            "failed append must not grow the session file"
+        );
+        assert!(store.open(&session.id()).unwrap().events.is_empty());
+    }
+
+    /// SESSION-4: a parent-sync failure must fail the whole create instead
+    /// of leaving a session header whose directory entry may not survive a
+    /// crash. The injected error mirrors a real directory-`fsync` failure.
+    ///
+    /// As above, the flag is armed only around `create`: construction
+    /// syncs the brand-new root, so arming earlier would fail `new` first.
+    #[test]
+    fn parent_sync_failure_fails_session_create() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let error = {
+            let _guard = HardeningFaultGuard::new(false, false, true);
+            store
+                .create(SessionCreateOptions::default())
+                .expect_err("create must fail closed on parent sync failure")
+        };
+        assert!(
+            matches!(error, SessionError::Io { operation, .. } if operation == "sync parent directory"),
+            "unexpected error: {error:?}"
+        );
     }
 
     #[test]

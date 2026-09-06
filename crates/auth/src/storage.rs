@@ -23,6 +23,70 @@ pub const OPENAI_CODEX_PROVIDER_KEY: &str = "openai-codex";
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
 
+// Test-only fault injection for fail-closed hardening (SESSION-4).
+//
+// Running as root makes real `chmod`/`fsync` failures hard to trigger, so
+// tests force them deterministically through these thread-local flags.
+// Each flag makes one hardening step return the same `AuthError::Io`
+// it would return for a real OS failure, proving callers propagate instead
+// of silently continuing. Production builds contain no hook: every item
+// here is `#[cfg(test)]` and the checks below compile out otherwise.
+// Thread-local (not process-global) so parallel tests cannot interfere.
+// (Plain `//` comments: `thread_local!` is a macro invocation, which
+// rustdoc denies `///` docs on.)
+#[cfg(test)]
+thread_local! {
+    static INJECT_SECURE_DIR_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static INJECT_SECURE_FILE_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static INJECT_SYNC_PARENT_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether directory permission repair should fail. Test-only.
+#[cfg(test)]
+fn injected_secure_dir_failure() -> bool {
+    INJECT_SECURE_DIR_FAILURE.with(|flag| flag.get())
+}
+
+/// Whether file permission repair should fail. Test-only.
+#[cfg(test)]
+fn injected_secure_file_failure() -> bool {
+    INJECT_SECURE_FILE_FAILURE.with(|flag| flag.get())
+}
+
+/// Whether parent-directory sync should fail. Test-only.
+#[cfg(test)]
+fn injected_sync_parent_failure() -> bool {
+    INJECT_SYNC_PARENT_FAILURE.with(|flag| flag.get())
+}
+
+/// Hold hardening-failure flags for a fail-closed test and clear them on
+/// drop (including on panic) so no later test on this thread observes a
+/// stale injection.
+#[cfg(test)]
+struct HardeningFaultGuard;
+
+#[cfg(test)]
+impl HardeningFaultGuard {
+    fn new(secure_dir: bool, secure_file: bool, sync_parent: bool) -> Self {
+        INJECT_SECURE_DIR_FAILURE.with(|flag| flag.set(secure_dir));
+        INJECT_SECURE_FILE_FAILURE.with(|flag| flag.set(secure_file));
+        INJECT_SYNC_PARENT_FAILURE.with(|flag| flag.set(sync_parent));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for HardeningFaultGuard {
+    fn drop(&mut self) {
+        INJECT_SECURE_DIR_FAILURE.with(|flag| flag.set(false));
+        INJECT_SECURE_FILE_FAILURE.with(|flag| flag.set(false));
+        INJECT_SYNC_PARENT_FAILURE.with(|flag| flag.set(false));
+    }
+}
+
 /// Credentials persisted by the GitHub Copilot OAuth flow.
 ///
 /// `access` is the short-lived Copilot token and `refresh` is the GitHub OAuth
@@ -490,6 +554,17 @@ fn private_dir_all(path: &Path) -> Result<()> {
 }
 
 fn ensure_private_directory(path: &Path) -> Result<()> {
+    // Fail-closed test hook: simulate an OS permission failure before any
+    // repair so tests prove saves propagate instead of continuing with a
+    // permissive directory. Only active under `#[cfg(test)]` injection.
+    #[cfg(test)]
+    if injected_secure_dir_failure() {
+        return Err(io_error(
+            "secure auth directory",
+            path,
+            std::io::Error::other("injected directory permission failure"),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -526,6 +601,17 @@ fn private_file(path: &Path) -> Result<fs::File> {
 }
 
 fn ensure_private_file(path: &Path) -> Result<()> {
+    // Fail-closed test hook: simulate an OS permission failure before any
+    // repair so tests prove lock acquisition/saves propagate instead of
+    // continuing with a permissive file. Only active under `#[cfg(test)]`.
+    #[cfg(test)]
+    if injected_secure_file_failure() {
+        return Err(io_error(
+            "secure auth file",
+            path,
+            std::io::Error::other("injected file permission failure"),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -544,6 +630,17 @@ fn ensure_private_file(path: &Path) -> Result<()> {
 /// failures fail closed.  No-op success where directory fsync is
 /// unsupported.
 fn sync_parent(path: &Path) -> Result<()> {
+    // Fail-closed test hook: simulate a parent-fsync failure so tests prove
+    // durable saves propagate instead of leaving an undiscoverable entry.
+    // Only active under `#[cfg(test)]` injection.
+    #[cfg(test)]
+    if injected_sync_parent_failure() {
+        return Err(io_error(
+            "sync parent directory",
+            path,
+            std::io::Error::other("injected parent sync failure"),
+        ));
+    }
     #[cfg(unix)]
     {
         // `path` here is the durable file or directory whose parent entry
@@ -767,5 +864,79 @@ mod tests {
         unsafe { libc::umask(old) };
         assert_eq!(dir_mode, 0o700);
         assert_eq!(file_mode, 0o600);
+    }
+
+    /// SESSION-4: a directory-repair failure must fail the whole save
+    /// instead of continuing with a permissive auth directory. The injected
+    /// error mirrors a real `chmod` failure; the lock is never taken and no
+    /// credential bytes are written.
+    #[test]
+    fn directory_permission_failure_fails_auth_save() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("nested").join("auth.json"));
+        let _guard = HardeningFaultGuard::new(true, false, false);
+        let error = store
+            .save_copilot(&credential())
+            .expect_err("save must fail closed on directory repair failure");
+        assert!(
+            matches!(error, AuthError::Io { operation, .. } if operation == "secure auth directory"),
+            "unexpected error: {error:?}"
+        );
+        assert!(
+            !store.path().exists(),
+            "failed save must not create the credential file"
+        );
+    }
+
+    /// SESSION-4: a file-repair failure inside lock acquisition must fail
+    /// the save instead of writing through a permissively-mode sidecar or
+    /// credential file. The persisted credential set is left untouched.
+    ///
+    /// Note the fault flag stays armed through the post-write assertions:
+    /// plain reads also repair permissions, so reading without clearing the
+    /// flag would hit the same fail-closed path. Dropping the guard before
+    /// verifying durability is the point — a failed save must leave the
+    /// previous credentials intact and readable.
+    #[test]
+    fn file_permission_failure_fails_auth_save() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        store.save_copilot(&credential()).unwrap();
+        let bytes_before = fs::metadata(store.path()).unwrap().len();
+        let mut rotated = credential();
+        rotated.access = "rotated-access".into();
+        let error = {
+            let _guard = HardeningFaultGuard::new(false, true, false);
+            store
+                .save_copilot(&rotated)
+                .expect_err("save must fail closed on lock-sidecar repair failure")
+        };
+        assert!(
+            matches!(error, AuthError::Io { operation, .. } if operation == "secure auth file"),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(
+            fs::metadata(store.path()).unwrap().len(),
+            bytes_before,
+            "failed save must not rewrite the credential file"
+        );
+        assert_eq!(store.copilot().unwrap().unwrap(), credential());
+    }
+
+    /// SESSION-4: a parent-sync failure must fail the whole save instead of
+    /// leaving credentials whose directory entry may not survive a crash.
+    /// The injected error mirrors a real directory-`fsync` failure.
+    #[test]
+    fn parent_sync_failure_fails_auth_save() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("nested").join("auth.json"));
+        let _guard = HardeningFaultGuard::new(false, false, true);
+        let error = store
+            .save_copilot(&credential())
+            .expect_err("save must fail closed on parent sync failure");
+        assert!(
+            matches!(error, AuthError::Io { operation, .. } if operation == "sync parent directory"),
+            "unexpected error: {error:?}"
+        );
     }
 }
