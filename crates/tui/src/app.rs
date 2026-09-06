@@ -163,6 +163,10 @@ struct StreamMarkdownCache {
     theme: Theme,
     source_offset: usize,
     lines: Vec<Line<'static>>,
+    /// Number of completed source chunks parsed into the cache. Besides being
+    /// useful when profiling, this guards the incremental-rendering invariant
+    /// in colocated tests.
+    rendered_blocks: usize,
 }
 
 /// One active tool call in the keyed running-tool state.
@@ -1700,6 +1704,7 @@ impl CrossTerm {
                 theme,
                 source_offset: 0,
                 lines: Vec::new(),
+                rendered_blocks: 0,
             });
         }
         let source_offset = self
@@ -1714,6 +1719,7 @@ impl CrossTerm {
         if let Some(cache) = self.stream_markdown_cache.as_mut() {
             cache.lines.extend(rendered);
             cache.source_offset = stable_offset;
+            cache.rendered_blocks = cache.rendered_blocks.saturating_add(1);
         }
     }
 
@@ -2582,7 +2588,7 @@ fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'stat
 /// because the input empties again). `ghost` is the fish-style dim suffix
 /// preview painted after the cursor (only at end-of-input, clamped to the row
 /// width), and `completion_hint` is one dim candidate row below the input.
-#[allow(dead_code)]
+#[cfg(test)]
 fn input_layout(
     input: &str,
     cursor: usize,
@@ -3795,10 +3801,12 @@ mod tests {
         ui.apply_event(UiEvent::TextDelta("first\n\nsecond".into()));
         let first_cache = ui.stream_markdown_cache.as_ref().unwrap();
         assert_eq!(first_cache.source_offset, "first\n\n".len());
+        assert_eq!(first_cache.rendered_blocks, 1);
         let first_lines = first_cache.lines.clone();
         ui.apply_event(UiEvent::TextDelta(" more".into()));
         let cache = ui.stream_markdown_cache.as_ref().unwrap();
         assert_eq!(cache.source_offset, "first\n\n".len());
+        assert_eq!(cache.rendered_blocks, 1);
         assert_eq!(cache.lines, first_lines);
         let rendered = ui.stream_tail_lines(render::content_width(ui.width));
         assert!(row_text(rendered.last().unwrap()).contains("second"));
