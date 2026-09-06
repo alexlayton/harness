@@ -1794,6 +1794,7 @@ impl CrossTerm {
     /// Rows of the live region: [streaming tail] · [tool lines] · [activity]
     /// · [input]. Every section except the input is optional; the tail and
     /// the input are each clipped so the whole region fits the screen.
+    #[cfg(test)]
     fn build_region(&self, input: &InputLayout) -> RegionBuild {
         self.build_region_with_running(input, self.running_region())
     }
@@ -1958,6 +1959,7 @@ impl CrossTerm {
     /// it outgrows the tail budget, so long responses flow into scrollback
     /// incrementally instead of appearing all at once at finalize.
     /// Reasoning-only streams stay fully live; the display clip handles them.
+    #[cfg(test)]
     fn commit_stream_prefix(&mut self, input_rows: usize) {
         let running_rows = self.running_region().rows;
         self.commit_stream_prefix_with_running(input_rows, running_rows);

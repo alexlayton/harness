@@ -329,6 +329,7 @@ impl FileConfig {
 /// The advisory lock covers the complete write, including the rename. The
 /// settings-specific helpers below use the same lock while editing the raw
 /// document, so concurrent read-modify-write operations cannot lose a field.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
     let _lock = lock_config(path)?;
     config.validate()?;
@@ -353,6 +354,7 @@ fn lock_config(path: &Path) -> Result<std::fs::File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(&lock_path)
         .with_context(|| format!("open config lock {}", lock_path.display()))?;
     lock.lock_exclusive()
