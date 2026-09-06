@@ -861,23 +861,6 @@ impl CopilotAuth {
         })
     }
 
-    /// Test seam: same construction with an injected HTTP client and
-    /// endpoints so refresh tests hit a local fixture through the real
-    /// `ensure_valid` path instead of reimplementing the guard inline.
-    /// Superseded by `with_client_for_test`, which preserves the seeded
-    /// cache; kept until the rewritten single-flight test lands.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn with_client(store: AuthStore, client: GithubCopilotClient) -> Result<Self> {
-        let credential = store.copilot()?;
-        Ok(Self {
-            store,
-            client,
-            credential: Arc::new(Mutex::new(credential)),
-            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
-        })
-    }
-
     pub fn from_default() -> Result<Self> {
         Self::new(AuthStore::default())
     }
@@ -886,6 +869,9 @@ impl CopilotAuth {
     /// (which already holds the seeded store + cache) so refresh tests hit
     /// a local fixture through the real `ensure_valid` path. Takes `&self`
     /// because `CopilotAuth` is shared by clone across waiter tasks.
+    /// (`with_client`, the by-value variant, was removed once this
+    /// landed: rebuilding from the store reseeds the cache from disk
+    /// and drops in-memory state the test had seeded.)
     #[cfg(test)]
     #[allow(dead_code)] // consumed by the rewritten single-flight test
     pub(crate) fn with_client_for_test(&self, client: GithubCopilotClient) -> Self {
