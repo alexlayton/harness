@@ -212,7 +212,7 @@ impl Agent {
             );
             return Ok(());
         }
-        self.compact_and_reload(events, cancel, CompactionReason::Manual)
+        self.compact_and_reload(events, cancel, CompactionReason::Manual, 0)
             .await
             .map(|_| ())
     }
@@ -255,7 +255,9 @@ impl Agent {
         };
         self.input_open = input_open;
         self.queued.extend(buffered);
-        self.flush_deferred_sync();
+        if self.flush_deferred_sync(events).is_err() {
+            return TurnControl::Quarantine;
+        }
         if interrupted && !application.is_cancelled() {
             // `handle_compact_session` has already observed the cancelled
             // operation and deliberately persisted no summary.
@@ -280,7 +282,9 @@ impl Agent {
         // Resolve without mutating live state; `handle_set_model` persists
         // first and only commits after persistence succeeds.
         let outcome = self.handle_set_model(provider, model, events).await;
-        self.flush_deferred_sync();
+        if self.flush_deferred_sync(events).is_err() {
+            return TurnControl::Quarantine;
+        }
         match outcome {
             Ok(()) => TurnControl::Continue,
             Err(TurnError::Shutdown) => TurnControl::Shutdown,

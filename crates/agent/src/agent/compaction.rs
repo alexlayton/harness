@@ -100,6 +100,7 @@ impl Agent {
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         reason: CompactionReason,
+        extra_bytes: usize,
     ) -> Result<bool, TurnError> {
         let Some(state) = self.session.as_ref() else {
             send(
@@ -110,7 +111,10 @@ impl Agent {
         };
         let session = state.session.clone();
 
-        let estimated = self.context_tokens_estimate(0);
+        // Keep the pending user input in the same estimate that triggered
+        // pre-turn compaction; otherwise planning can incorrectly conclude
+        // that the history fits and send the oversized request anyway.
+        let estimated = self.context_tokens_estimate(extra_bytes);
         let Some(plan) = plan_compaction(&session, &self.compaction, estimated) else {
             send(events, AgentEvent::Notice("nothing to compact yet".into()));
             return Ok(false);
@@ -197,12 +201,18 @@ impl Agent {
         cancel: &CancellationToken,
         attempts: &mut usize,
     ) -> Result<bool, TurnError> {
-        if !is_context_overflow(error) || *attempts >= MAX_OVERFLOW_RECOVERIES {
+        if self.session.is_none()
+            || !is_context_overflow(error)
+            || *attempts >= MAX_OVERFLOW_RECOVERIES
+        {
+            // Overflow compaction is a durable operation. With no session,
+            // disable this recovery path quietly instead of emitting the same
+            // unavailable notice on every rejected turn.
             return Ok(false);
         }
         *attempts += 1;
         if self
-            .compact_and_reload(events, cancel, CompactionReason::Overflow)
+            .compact_and_reload(events, cancel, CompactionReason::Overflow, 0)
             .await?
         {
             send(

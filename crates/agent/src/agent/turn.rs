@@ -34,8 +34,11 @@ impl Agent {
             .run_turn_body(user_text, events, input, &turn_cancel)
             .await;
         // Deferred-sync boundary: one durable flush per operation, for both
-        // normal and skill-invoked turns.
-        self.flush_deferred_sync();
+        // normal and skill-invoked turns. A failed fsync quarantines even if
+        // the turn body otherwise completed successfully.
+        if self.flush_deferred_sync(events).is_err() {
+            return TurnControl::Quarantine;
+        }
         match outcome {
             Ok(()) => TurnControl::Continue,
             Err(TurnError::Shutdown) => TurnControl::Shutdown,
@@ -80,7 +83,12 @@ impl Agent {
             let mut interrupted = false;
             let compacted = {
                 let mut application_open = true;
-                let compaction = self.compact_and_reload(events, cancel, CompactionReason::Auto);
+                let compaction = self.compact_and_reload(
+                    events,
+                    cancel,
+                    CompactionReason::Auto,
+                    user_text.len(),
+                );
                 tokio::pin!(compaction);
                 loop {
                     tokio::select! {

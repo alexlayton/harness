@@ -58,19 +58,25 @@ impl Agent {
         }
     }
 
-    /// Durable flush for deferred-sync stores (no-op otherwise). Called at
-    /// turn boundaries; failures are logged, not surfaced — the data is in
-    /// the OS page cache and the next boundary retries.
-    pub(crate) fn flush_deferred_sync(&self) {
+    /// Durable flush for deferred-sync stores (no-op otherwise). A sync
+    /// failure is a persistence failure, not telemetry: quarantine before any
+    /// queued operation can observe divergent durable history.
+    pub(crate) fn flush_deferred_sync(
+        &self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(), TurnError> {
         let Some(state) = self.session.as_ref() else {
-            return;
+            return Ok(());
         };
         if !state.store.deferred_sync() {
-            return;
+            return Ok(());
         }
         if let Err(error) = state.store.sync_session(&state.session) {
-            tracing::warn!(error = %error, "deferred session sync failed");
+            let message = format!("session persistence failed during sync: {error}");
+            send(events, AgentEvent::Error(message.clone()));
+            return Err(TurnError::Persist(message));
         }
+        Ok(())
     }
 
     pub(crate) fn persist_user_message(

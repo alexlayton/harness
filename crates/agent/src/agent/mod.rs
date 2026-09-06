@@ -324,9 +324,7 @@ impl Agent {
                         .handle_compact_session_boundary(&events, &mut input)
                         .await
                     {
-                        TurnControl::Shutdown | TurnControl::Quarantine => {
-                            send(&events, AgentEvent::TurnFinished);
-                        }
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
                         TurnControl::Continue => {}
                     }
                     continue;
@@ -339,9 +337,7 @@ impl Agent {
                         .handle_set_model_boundary(provider, model, &events)
                         .await
                     {
-                        TurnControl::Shutdown | TurnControl::Quarantine => {
-                            send(&events, AgentEvent::TurnFinished);
-                        }
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
                         TurnControl::Continue => {}
                     }
                     continue;
