@@ -819,16 +819,15 @@ pub(crate) fn output_tail(output: &str) -> Vec<String> {
     while tail_lines < DEFAULT_TAIL_LINES && cursor > 0 {
         match output[..cursor].rfind('\n') {
             Some(index) => {
-                tail_lines += 1;
-                if tail_lines == DEFAULT_TAIL_LINES {
+                if tail_lines + 1 == DEFAULT_TAIL_LINES {
                     tail_start = index + 1;
                     break;
                 }
+                tail_lines += 1;
                 cursor = index;
             }
             None => {
                 tail_start = 0;
-                tail_lines += 1;
                 break;
             }
         }
