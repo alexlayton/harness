@@ -6,7 +6,6 @@ use crate::{
     CompletionRequest, Content, EventStream, LlmError, Message, ReasoningPolicy, Role, StreamEvent,
     ToolCall, ToolDefinition, Usage,
 };
-use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_json::{Map, Value, json};
 
@@ -386,25 +385,22 @@ fn parse_usage(value: &Value) -> Result<Usage, LlmError> {
     })
 }
 
-fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
-    let stream = async_stream::try_stream! {
-        let mut parser = ResponsesParser::new();
-        while let Some(event) = sse.next().await {
-            let event = event?;
-            for item in parser.parse_event(&event)? {
-                yield item;
-            }
-            if parser.is_done() {
-                break;
-            }
-        }
-        if !parser.is_done() {
-            for item in parser.finish()? {
-                yield item;
-            }
-        }
-    };
-    Box::pin(stream)
+impl super::StreamParser for ResponsesParser {
+    fn parse_event(&mut self, event: &SseEvent) -> Result<Vec<StreamEvent>, LlmError> {
+        Self::parse_event(self, event)
+    }
+
+    fn is_done(&self) -> bool {
+        Self::is_done(self)
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
+        Self::finish(self)
+    }
+}
+
+fn event_stream(sse: crate::sse::SseStream) -> EventStream {
+    super::drive_parser_stream(sse, ResponsesParser::new())
 }
 
 #[cfg(test)]

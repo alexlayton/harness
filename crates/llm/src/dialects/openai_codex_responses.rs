@@ -10,7 +10,6 @@ use crate::dialects::openai_responses::{
 use crate::http::HttpClient;
 use crate::sse::stream_response;
 use crate::{CompletionRequest, EventStream, LlmError, ReasoningPolicy};
-use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_json::{Value, json};
 
@@ -129,24 +128,55 @@ pub fn convert_input(messages: &[crate::Message]) -> Vec<Value> {
     }
     input
 }
-fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
-    Box::pin(async_stream::try_stream! {
-        let mut parser = ResponsesParser::new();
-        while let Some(event) = sse.next().await {
-            let event = event?;
-            // Codex sends encrypted reasoning on completed output items. Keep
-            // the complete item opaque so a later tool follow-up can replay it.
-            if let Ok(value) = serde_json::from_str::<Value>(&event.data)
-                && value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
-                && value.get("item").and_then(|item| item.get("encrypted_content")).is_some()
-            {
-                yield crate::StreamEvent::OpaqueState { provider: "openai-codex".into(), data: value["item"].clone() };
-            }
-            for value in parser.parse_event(&event)? { yield value; }
-            if parser.is_done() { break; }
+
+/// Codex shares the Responses terminal contract but keeps encrypted
+/// reasoning items as opaque replay state. The side channel rides on top of
+/// the shared [`ResponsesParser`]: `parse_event` yields the opaque item
+/// first (when present), then the shared parser's events.
+struct CodexParser {
+    inner: ResponsesParser,
+}
+
+impl super::StreamParser for CodexParser {
+    fn parse_event(
+        &mut self,
+        event: &crate::sse::SseEvent,
+    ) -> Result<Vec<crate::StreamEvent>, crate::LlmError> {
+        let mut output = Vec::new();
+        // Codex sends encrypted reasoning on completed output items. Keep
+        // the complete item opaque so a later tool follow-up can replay it.
+        if let Ok(value) = serde_json::from_str::<Value>(&event.data)
+            && value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+            && value
+                .get("item")
+                .and_then(|item| item.get("encrypted_content"))
+                .is_some()
+        {
+            output.push(crate::StreamEvent::OpaqueState {
+                provider: "openai-codex".into(),
+                data: value["item"].clone(),
+            });
         }
-        if !parser.is_done() { for value in parser.finish()? { yield value; } }
-    })
+        output.extend(self.inner.parse_event(event)?);
+        Ok(output)
+    }
+
+    fn is_done(&self) -> bool {
+        self.inner.is_done()
+    }
+
+    fn finish(&mut self) -> Result<Vec<crate::StreamEvent>, crate::LlmError> {
+        self.inner.finish()
+    }
+}
+
+fn event_stream(sse: crate::sse::SseStream) -> EventStream {
+    super::drive_parser_stream(
+        sse,
+        CodexParser {
+            inner: ResponsesParser::new(),
+        },
+    )
 }
 
 #[cfg(test)]

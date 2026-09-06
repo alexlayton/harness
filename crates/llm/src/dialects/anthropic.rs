@@ -4,7 +4,6 @@ use crate::{
     CompletionRequest, Content, EventStream, LlmError, Message, Role, StreamEvent, ToolCall,
     ToolDefinition, Usage,
 };
-use futures_util::StreamExt;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value, json};
@@ -521,25 +520,22 @@ fn value_message(value: &Value) -> Option<&str> {
         .or_else(|| value.get("message").and_then(Value::as_str))
 }
 
-fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
-    let stream = async_stream::try_stream! {
-        let mut parser = AnthropicParser::new();
-        while let Some(event) = sse.next().await {
-            let event = event?;
-            for item in parser.parse_event(&event)? {
-                yield item;
-            }
-            if parser.is_done() {
-                break;
-            }
-        }
-        if !parser.is_done() {
-            for item in parser.finish()? {
-                yield item;
-            }
-        }
-    };
-    Box::pin(stream)
+impl super::StreamParser for AnthropicParser {
+    fn parse_event(&mut self, event: &SseEvent) -> Result<Vec<StreamEvent>, LlmError> {
+        Self::parse_event(self, event)
+    }
+
+    fn is_done(&self) -> bool {
+        Self::is_done(self)
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
+        Self::finish(self)
+    }
+}
+
+fn event_stream(sse: crate::sse::SseStream) -> EventStream {
+    super::drive_parser_stream(sse, AnthropicParser::new())
 }
 
 #[cfg(test)]
