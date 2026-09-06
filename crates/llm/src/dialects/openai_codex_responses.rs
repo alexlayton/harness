@@ -250,4 +250,17 @@ mod tests {
             "order violated: {rendered:?}"
         );
     }
+
+    #[test]
+    fn codex_rejects_malformed_tool_calls_through_shared_parser() {
+        // Codex delegates parsing to `ResponsesParser`: a missing call ID
+        // fails with `LlmError::Parse` before any `ToolCallComplete` can
+        // escape, so the agent's malformed-tool recovery handles it.
+        use crate::LlmError;
+        let mut parser = crate::dialects::openai_responses::ResponsesParser::new();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"read","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
 }
