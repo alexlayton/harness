@@ -8,6 +8,7 @@
 //! stdout carries only the answer.
 
 use crate::config::{Config, PromptArgs, provider_factory};
+#[cfg(test)]
 use crate::context::project_context_for;
 use agent::assembly::AgentBuilder;
 use agent::{AgentEvent, InputMessage};
@@ -304,8 +305,8 @@ async fn drive_headless_events_into(
 /// no durable state at all — no header, no events, nothing to resume. The
 /// agent, its channels, and the cancellation token are the same objects the
 /// interactive path uses.
-#[allow(dead_code)]
-pub async fn run_headless(
+#[cfg(test)]
+async fn run_headless(
     config: &Config,
     args: &PromptArgs,
     no_context_files: bool,
@@ -356,7 +357,7 @@ pub(crate) async fn run_headless_with_prompt(
 /// [`run_headless`] with an optional externally supplied cancellation token so
 /// tests can interrupt a turn at a deterministic point. Production always
 /// passes `None`, which installs the real SIGINT handler.
-#[allow(dead_code)]
+#[cfg(test)]
 async fn run_headless_with_cancel(
     config: &Config,
     args: &PromptArgs,
