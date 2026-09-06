@@ -7,7 +7,59 @@ fn main() {
     for turns in [1_000usize, 10_000] {
         let elapsed = benchmark_alternating_appends(turns);
         println!("alternating {turns} turns: {:.3}s", elapsed.as_secs_f64());
+        let listing = benchmark_listing(turns);
+        println!("listing {turns} turns: {:.3}s", listing.as_secs_f64());
     }
+}
+
+fn benchmark_listing(turns: usize) -> std::time::Duration {
+    let root = tempdir().expect("session root");
+    let workspace = tempdir().expect("workspace root");
+    let store = SessionStore::new(root.path(), workspace.path())
+        .expect("create session store")
+        .with_deferred_sync(true);
+    let mut session = store
+        .create(SessionCreateOptions::default())
+        .expect("create session");
+    let tool_output = "x".repeat(4_096);
+    for turn in 0..turns {
+        let call_id = format!("listing-{turn}");
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&llm::Message::user("inspect")),
+                },
+            )
+            .expect("append user message");
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolCall {
+                    call: StoredToolCall {
+                        id: call_id.clone(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "large.txt"}),
+                    },
+                },
+            )
+            .expect("append tool call");
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolResult {
+                    tool_call_id: call_id,
+                    content: tool_output.clone(),
+                    is_error: false,
+                    tool_name: Some("read".into()),
+                },
+            )
+            .expect("append tool result");
+    }
+    store.sync_session(&session).expect("sync listing session");
+    let started = Instant::now();
+    black_box(store.list().expect("list sessions"));
+    started.elapsed()
 }
 
 fn benchmark_alternating_appends(turns: usize) -> std::time::Duration {
