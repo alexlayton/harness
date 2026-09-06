@@ -137,15 +137,6 @@ fn event_tokens(record: &SessionEventRecord) -> u64 {
     estimate_provider_context_tokens(None, &[], &messages).saturating_add(4)
 }
 
-/// Sum of estimated tokens for `live[from..]`.
-fn live_tokens(live: &[&SessionEventRecord], from: usize) -> u64 {
-    let mut total = 0u64;
-    for record in live.iter().skip(from) {
-        total = total.saturating_add(event_tokens(record));
-    }
-    total
-}
-
 /// Choose the cut index within `live` under the policy, or `None` when there
 /// is no pressure (fewer than `keep_recent_turns` complete turns and the whole
 /// region is within the token cap).
@@ -230,19 +221,6 @@ fn snap_cut_point(
     } else {
         Some(tool_index)
     }
-}
-
-/// Estimated tokens currently occupied by the live conversation region
-/// (events after the latest compaction), used by the agent for exactness
-/// fallback when no request has provided usage yet.
-pub fn estimate_live_tokens(session: &Session) -> u64 {
-    let active = events_after_latest_compaction(&session.events);
-    let live: Vec<&SessionEventRecord> = active
-        .iter()
-        .copied()
-        .filter(|record| !is_compaction(record))
-        .collect();
-    live_tokens(&live, 0)
 }
 
 #[cfg(test)]
@@ -453,20 +431,5 @@ mod tests {
         });
         // No new events: a repeated plan must be a no-op.
         assert!(plan_compaction(&session, &policy, 40_000).is_none());
-    }
-
-    #[test]
-    fn estimate_live_tokens_covers_all_active_events() {
-        let mut session = grow_session(6, 4_000);
-        let estimated = estimate_live_tokens(&session);
-        assert!(estimated > 0);
-        // After a compaction, live region shrinks dramatically.
-        let plan = plan_compaction(&session, &default_policy(), estimated).unwrap();
-        session.append(SessionEvent::CompactionSummary {
-            summary: "s".into(),
-            compacted_through: plan.boundary,
-        });
-        let after = estimate_live_tokens(&session);
-        assert!(after < estimated);
     }
 }

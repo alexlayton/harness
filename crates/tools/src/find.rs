@@ -64,9 +64,6 @@ impl Default for FindConfig {
 pub struct FileSearchIndex {
     root: PathBuf,
     picker: OnceCell<SharedFilePicker>,
-    // Keeping this handle alive documents that the picker was initialized with
-    // a no-op frecency backend and leaves room for a persistent backend later.
-    _frecency: SharedFrecency,
     config: FindConfig,
     search_slots: Arc<Semaphore>,
     shutdown: AtomicBool,
@@ -90,7 +87,6 @@ impl FileSearchIndex {
         Ok(Self {
             root,
             picker: OnceCell::new(),
-            _frecency: SharedFrecency::noop(),
             search_slots: Arc::new(Semaphore::new(config.max_concurrent_searches.max(1))),
             config,
             shutdown: AtomicBool::new(false),
@@ -402,14 +398,11 @@ struct SearchOutput {
     total_matched: usize,
 }
 
-fn search_sync(
+fn wait_for_scan(
     shared_picker: &SharedFilePicker,
-    query: &str,
-    scope: Option<&str>,
-    requested_limit: usize,
     scan_timeout: Duration,
     cancel: &CancellationToken,
-) -> Result<SearchOutput, String> {
+) -> Result<(), String> {
     let scan_start = Instant::now();
     loop {
         if cancel.is_cancelled() {
@@ -424,12 +417,20 @@ fn search_sync(
         }
         let remaining = scan_timeout.saturating_sub(elapsed);
         if shared_picker.wait_for_scan(remaining.min(SCAN_WAIT_POLL)) {
-            break;
+            return Ok(());
         }
     }
-    if cancel.is_cancelled() {
-        return Err("cancelled".into());
-    }
+}
+
+fn search_sync(
+    shared_picker: &SharedFilePicker,
+    query: &str,
+    scope: Option<&str>,
+    requested_limit: usize,
+    scan_timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<SearchOutput, String> {
+    wait_for_scan(shared_picker, scan_timeout, cancel)?;
 
     let guard = shared_picker
         .read()
@@ -537,26 +538,7 @@ fn grep_sync(
     scan_timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<GrepRawOutput, String> {
-    let scan_start = Instant::now();
-    loop {
-        if cancel.is_cancelled() {
-            return Err("cancelled".into());
-        }
-        let elapsed = scan_start.elapsed();
-        if elapsed >= scan_timeout {
-            return Err(format!(
-                "initial file scan did not finish within {} seconds",
-                scan_timeout.as_secs()
-            ));
-        }
-        let remaining = scan_timeout.saturating_sub(elapsed);
-        if shared_picker.wait_for_scan(remaining.min(SCAN_WAIT_POLL)) {
-            break;
-        }
-    }
-    if cancel.is_cancelled() {
-        return Err("cancelled".into());
-    }
+    wait_for_scan(shared_picker, scan_timeout, cancel)?;
 
     let guard = shared_picker
         .read()
@@ -586,22 +568,7 @@ fn multi_grep_sync(
     scan_timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<GrepRawOutput, String> {
-    let scan_start = Instant::now();
-    while !shared_picker.wait_for_scan(
-        scan_timeout
-            .saturating_sub(scan_start.elapsed())
-            .min(SCAN_WAIT_POLL),
-    ) {
-        if cancel.is_cancelled() {
-            return Err("cancelled".into());
-        }
-        if scan_start.elapsed() >= scan_timeout {
-            return Err(format!(
-                "initial file scan did not finish within {} seconds",
-                scan_timeout.as_secs()
-            ));
-        }
-    }
+    wait_for_scan(shared_picker, scan_timeout, cancel)?;
     let guard = shared_picker
         .read()
         .map_err(|error| format!("cannot access find index: {error}"))?;

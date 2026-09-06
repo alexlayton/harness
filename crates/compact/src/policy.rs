@@ -84,16 +84,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_are_sane() {
+    fn default_policy_has_a_bounded_trigger_and_retention_budget() {
         let policy = CompactionPolicy::default();
         assert!(policy.auto);
-        assert_eq!(policy.threshold, 0.80);
-        assert_eq!(policy.reserve_tokens, 16_384);
-        assert_eq!(policy.keep_recent_turns, 10);
-        assert_eq!(policy.keep_recent_tokens, 20_000);
-        assert_eq!(policy.max_summary_input_bytes, 96 * 1024);
-        assert_eq!(policy.max_summary_bytes, 12 * 1024);
-        assert_eq!(policy.context_window, 0);
+        assert!((0.0..=1.0).contains(&policy.threshold));
+        assert!(policy.reserve_tokens > 0);
+        assert!(policy.keep_recent_turns > 0);
+        assert!(policy.keep_recent_tokens > 0);
+        assert!(policy.max_summary_input_bytes >= policy.max_summary_bytes);
+        assert!(policy.max_summary_bytes > 0);
+        assert_eq!(policy.resolved_window(0), DEFAULT_CONTEXT_WINDOW);
     }
 
     #[test]

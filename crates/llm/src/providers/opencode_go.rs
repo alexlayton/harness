@@ -34,20 +34,6 @@ pub const MESSAGES_MODELS: &[&str] = &[
     "qwen3.7-plus",
     "qwen3.6-plus",
 ];
-pub const CHAT_MODELS: &[&str] = &[
-    "grok-4.5",
-    "glm-5.2",
-    "glm-5.1",
-    "kimi-k3",
-    "kimi-k2.7-code",
-    "kimi-k2.6",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "mimo-v2.5",
-    "mimo-v2.5-pro",
-    "hy3",
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Responses,
@@ -241,9 +227,9 @@ mod tests {
         for model in MESSAGES_MODELS {
             assert_eq!(dialect_for_model(model), Dialect::Messages);
         }
-        for model in CHAT_MODELS {
-            assert_eq!(dialect_for_model(model), Dialect::Chat);
-        }
+        // Models without an explicit wire-format entry use the safe Chat
+        // fallback, including formerly documented Chat-only catalogue items.
+        assert_eq!(dialect_for_model("grok-4.5"), Dialect::Chat);
         assert_eq!(dialect_for_model("new-model"), Dialect::Chat);
     }
 

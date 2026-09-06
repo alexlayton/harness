@@ -488,7 +488,7 @@ mod tests {
         }
     }
 
-    fn run_agent(provider: MockProvider) -> (Vec<AgentEvent>, Vec<Message>) {
+    fn run_agent(provider: MockProvider) -> Vec<AgentEvent> {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let cancel = CancellationToken::new();
@@ -499,13 +499,12 @@ mod tests {
                 .unwrap();
             drop(input_tx);
             let agent = Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel);
-            let history = agent.history.clone();
             agent.run(input_rx, event_tx).await;
             let mut events = Vec::new();
             while let Ok(event) = event_rx.try_recv() {
                 events.push(event);
             }
-            (events, history)
+            events
         })
     }
 
@@ -1356,7 +1355,7 @@ mod tests {
 
     #[test]
     fn simple_text_turn_forwards_deltas() {
-        let (events, _) = run_agent(MockProvider {
+        let events = run_agent(MockProvider {
             calls: AtomicUsize::new(0),
             scripts: vec![script(vec![
                 StreamEvent::TextDelta("hello".into()),

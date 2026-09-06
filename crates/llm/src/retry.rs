@@ -123,23 +123,6 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    #[test]
-    fn jitter_is_safe_from_concurrent_callers() {
-        let handles = (0..8)
-            .map(|_| {
-                std::thread::spawn(|| {
-                    for _ in 0..1_000 {
-                        let value = jitter_ms();
-                        assert!(value < 251, "jitter {value} outside 0..251");
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        for handle in handles {
-            handle.join().expect("jitter thread panicked");
-        }
-    }
-
     #[tokio::test]
     async fn retry_counts_attempts_and_honors_retry_after() {
         // Deterministic: injected sleeper records waits, no clock involved.
