@@ -230,10 +230,11 @@ pub fn default_registry_with_index(
 }
 
 /// Construct the read-only subregistry used by `read_only` subagents:
-/// `read`, `find`, and `grep` plus the same skill discovery/read allowlists
-/// and one shared file index. Deliberately no `edit`/`write`/`bash`: the
-/// scheduler class is not a sandbox, so exclusion of mutating tools is the
-/// actual enforcement, not prompt wording.
+/// `read`, `find`, `grep`, and `multigrep`, plus the same skill
+/// discovery/read allowlists and one shared file index. Deliberately no
+/// `edit`/`write`/`bash`: the scheduler class is not a sandbox, so
+/// exclusion of mutating tools is the actual enforcement, not prompt
+/// wording.
 pub fn read_only_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitError> {
     let workspace_root = resolve_registry_workspace(&config.cwd)?;
     let index = Arc::new(
