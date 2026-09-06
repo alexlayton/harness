@@ -16,4 +16,3 @@ tracing = "0.1"
 
 [dev-dependencies]
 async-trait = "0.1"
-tempfile = "3"
