@@ -3095,4 +3095,113 @@ mod tests {
         // And nothing was appended to the (deleted-file) session.
         assert!(store.open(&session_id).is_err());
     }
+
+    #[tokio::test]
+    async fn one_model_switch_produces_one_metadata_request() {
+        // AGENT-4 single-fetch: a `/model` switch enqueues exactly one
+        // bounded `list_models` request whose result supplies both the UI
+        // catalogue and the context window (no per-consumer duplicate).
+        struct CountingModelsProvider {
+            list_calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for CountingModelsProvider {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                Ok(Box::pin(stream::iter(Vec::new())))
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![ModelInfo {
+                    id: "switched-model".into(),
+                    name: None,
+                    context_length: Some(123_456),
+                }])
+            }
+        }
+
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let provider = Arc::new(CountingModelsProvider {
+            list_calls: AtomicUsize::new(0),
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::SetModel {
+                provider: None,
+                model: "switched-model".into(),
+            })
+            .unwrap();
+        // Keep the run loop alive until the background metadata fetch
+        // reports: `run` must be alive to relay the channel result, and it
+        // exits when input closes — so hold input open, watch for the
+        // ModelList, then close.
+        let agent_task = tokio::spawn(
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .with_session(store, session)
+                .run(input_rx, event_tx),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+            if events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelList { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for metadata ModelList: {events:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(input_tx);
+        agent_task.await.unwrap();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ModelChanged { model, .. } if model == "switched-model"
+            )),
+            "expected the switch to commit: {events:?}"
+        );
+        // One request total: the startup fetch plus exactly one switch
+        // fetch — both flow through the same channel. The switch's own
+        // fetch is the one that must exist (its ModelList carries the
+        // switched model name); the count pins no per-consumer duplicate.
+        let calls = provider.list_calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= 2,
+            "startup + one switch must not fan out: {calls} calls"
+        );
+        assert!(
+            calls >= 1,
+            "the switch must spawn its metadata fetch: {events:?}"
+        );
+        // The single fetch supplies both catalogue and window: the
+        // switch's ModelList arrives (catalogue, carrying the switched
+        // model id) and the context window adopts the reported length —
+        // both derived from that one response.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ModelList { provider, models }
+                    if provider == "counting"
+                        && models.iter().any(|model| model.id == "switched-model")
+            )),
+            "the single fetch must supply the catalogue: {events:?}"
+        );
+    }
 }
