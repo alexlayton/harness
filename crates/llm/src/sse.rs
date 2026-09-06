@@ -64,7 +64,12 @@ impl SseParser {
     pub fn finish(&mut self) -> Result<Vec<SseEvent>, LlmError> {
         let mut events = Vec::new();
         if !self.line.is_empty() {
-            let line = std::mem::take(&mut self.line);
+            // Match `push_bytes`: a trailing `\r` is a CRLF line ending,
+            // not payload bytes.
+            let mut line = std::mem::take(&mut self.line);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
             self.process_line(&line, &mut events)?;
         }
         // The SSE protocol normally ends with a blank line, but accepting a
@@ -300,6 +305,31 @@ mod tests {
             vec![SseEvent {
                 event: None,
                 data: "a\nb".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn final_unterminated_data_frame_is_dispatched() {
+        // A final valid data frame without a trailing blank line still
+        // dispatches on `finish` (proxies and fixture tests rely on this),
+        // for both LF and CRLF line endings.
+        let mut parser = SseParser::new();
+        assert!(parser.push_bytes(b"data: hello").unwrap().is_empty());
+        assert_eq!(
+            parser.finish().unwrap(),
+            vec![SseEvent {
+                event: None,
+                data: "hello".into()
+            }]
+        );
+        let mut parser = SseParser::new();
+        assert!(parser.push_bytes(b"data: hello\r").unwrap().is_empty());
+        assert_eq!(
+            parser.finish().unwrap(),
+            vec![SseEvent {
+                event: None,
+                data: "hello".into()
             }]
         );
     }
