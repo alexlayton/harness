@@ -762,14 +762,18 @@ pub(crate) fn duration_text(duration_ms: u64) -> String {
 /// Bound a tool's raw output to the collapsed tail rows: the newest
 /// `DEFAULT_TAIL_LINES` lines, preceded by one `… N lines above` row when
 /// more were produced. Used by the expanded tool rendering.
+///
+/// Count lines without cloning the complete output. Tool output can be many
+/// megabytes, while the expanded view only needs this small immutable tail.
 pub(crate) fn output_tail(output: &str) -> Vec<String> {
-    let lines = output.lines().map(str::to_owned).collect::<Vec<_>>();
-    if lines.len() <= DEFAULT_TAIL_LINES {
-        return lines;
-    }
-    let omitted = lines.len() - DEFAULT_TAIL_LINES;
-    let mut result = vec![format!("… {omitted} lines above")];
-    result.extend(lines.into_iter().skip(omitted));
+    let total = output.lines().count();
+    let omitted = total.saturating_sub(DEFAULT_TAIL_LINES);
+    let mut result = if omitted > 0 {
+        vec![format!("… {omitted} lines above")]
+    } else {
+        Vec::new()
+    };
+    result.extend(output.lines().skip(omitted).map(str::to_owned));
     result
 }
 
@@ -777,6 +781,23 @@ pub(crate) fn output_tail(output: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn output_tail_keeps_only_the_bounded_suffix() {
+        assert_eq!(output_tail("one\ntwo"), vec!["one", "two"]);
+        assert_eq!(
+            output_tail("one\ntwo\nthree\nfour\nfive"),
+            vec!["… 1 lines above", "two", "three", "four", "five"]
+        );
+        let huge = (0..100_000)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = output_tail(&huge);
+        assert_eq!(tail.len(), DEFAULT_TAIL_LINES + 1);
+        assert_eq!(tail[1], "line 99996");
+        assert_eq!(tail[4], "line 99999");
+    }
 
     #[test]
     fn sanitizer_removes_terminal_controls_and_expands_tabs() {

@@ -155,6 +155,16 @@ struct StreamState {
     markdown: String,
 }
 
+/// Cached rendering for completed markdown blocks in the live stream. The
+/// current trailing block remains reparsed, while completed blocks are copied
+/// into this cache once when a blank-line boundary arrives.
+struct StreamMarkdownCache {
+    width: usize,
+    theme: Theme,
+    source_offset: usize,
+    lines: Vec<Line<'static>>,
+}
+
 /// One active tool call in the keyed running-tool state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RunningTool {
@@ -277,6 +287,7 @@ pub struct CrossTerm {
     pending: Vec<Entry>,
 
     stream: Option<StreamState>,
+    stream_markdown_cache: Option<StreamMarkdownCache>,
     /// Currently running tool calls, keyed by harness call id and kept in
     /// launch order. Concurrent fan-out (e.g. several `subagent` calls in one
     /// response) means more than one record can be live at once; a finish
@@ -372,6 +383,7 @@ impl CrossTerm {
             transcript: Vec::new(),
             pending: Vec::new(),
             stream: None,
+            stream_markdown_cache: None,
             running_tools: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -1402,6 +1414,7 @@ impl CrossTerm {
                 self.busy = true;
                 self.activity = Activity::Working;
                 self.stream().markdown.push_str(&delta);
+                self.refresh_stream_markdown_cache();
             }
             UiEvent::ReasoningDelta(delta) => {
                 if delta.is_empty() {
@@ -1668,11 +1681,49 @@ impl CrossTerm {
         self.stream.get_or_insert_with(StreamState::default)
     }
 
+    /// Parse newly completed markdown blocks once as deltas arrive. The
+    /// unfinished suffix is intentionally left out of the cache because its
+    /// Markdown meaning can still change with the next delta.
+    fn refresh_stream_markdown_cache(&mut self) {
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
+        let stable_offset = stable_block_split_offset(&stream.markdown).unwrap_or(0);
+        let width = render::content_width(self.width);
+        let theme = self.theme;
+        let reusable = self.stream_markdown_cache.as_ref().is_some_and(|cache| {
+            cache.width == width && cache.theme == theme && cache.source_offset <= stable_offset
+        });
+        if !reusable {
+            self.stream_markdown_cache = Some(StreamMarkdownCache {
+                width,
+                theme,
+                source_offset: 0,
+                lines: Vec::new(),
+            });
+        }
+        let source_offset = self
+            .stream_markdown_cache
+            .as_ref()
+            .map_or(0, |cache| cache.source_offset);
+        if stable_offset <= source_offset {
+            return;
+        }
+        let chunk = stream.markdown[source_offset..stable_offset].to_owned();
+        let rendered = render::markdown_lines(&chunk, theme, width);
+        if let Some(cache) = self.stream_markdown_cache.as_mut() {
+            cache.lines.extend(rendered);
+            cache.source_offset = stable_offset;
+        }
+    }
+
     /// Commit the in-flight assistant message as a final entry.
     fn finalize_stream(&mut self) {
         let Some(stream) = self.stream.take() else {
+            self.stream_markdown_cache = None;
             return;
         };
+        self.stream_markdown_cache = None;
         if stream.reasoning.is_empty() && stream.markdown.is_empty() {
             return;
         }
@@ -1744,9 +1795,16 @@ impl CrossTerm {
     /// · [input]. Every section except the input is optional; the tail and
     /// the input are each clipped so the whole region fits the screen.
     fn build_region(&self, input: &InputLayout) -> RegionBuild {
+        self.build_region_with_running(input, self.running_region())
+    }
+
+    fn build_region_with_running(
+        &self,
+        input: &InputLayout,
+        running: RunningRegion,
+    ) -> RegionBuild {
         let theme = self.theme;
         let content = render::content_width(self.width);
-        let running = self.running_region();
         let (input_rows, input_cursor_row) =
             clip_input(input, self.height as usize, self.busy, running.rows);
 
@@ -1756,7 +1814,7 @@ impl CrossTerm {
         let mut activity_row_index: Option<usize> = None;
         // out of the budget are printed in full when the message finalizes.
         let tail = self.stream_tail_lines(content);
-        let budget = self.tail_budget(input_rows.len());
+        let budget = self.tail_budget(input_rows.len(), running.rows);
         let start = tail.len().saturating_sub(budget);
         rows.extend(tail[start..].iter().cloned());
 
@@ -1865,7 +1923,24 @@ impl CrossTerm {
             if !lines.is_empty() {
                 render::push_blank(&mut lines, render::BLOCK_GAP);
             }
-            lines.extend(render::markdown_lines(&stream.markdown, self.theme, width));
+            let markdown = if let Some(cache) = &self.stream_markdown_cache
+                && cache.width == width
+                && cache.theme == self.theme
+                && cache.source_offset <= stream.markdown.len()
+            {
+                let mut rendered = cache.lines.clone();
+                if cache.source_offset < stream.markdown.len() {
+                    rendered.extend(render::markdown_lines(
+                        &stream.markdown[cache.source_offset..],
+                        self.theme,
+                        width,
+                    ));
+                }
+                rendered
+            } else {
+                render::markdown_lines(&stream.markdown, self.theme, width)
+            };
+            lines.extend(markdown);
         }
         lines
     }
@@ -1873,9 +1948,9 @@ impl CrossTerm {
     /// Row budget for the streaming tail: whatever is left of the screen once
     /// the input, the active-tool rows, the activity row, separators, and a
     /// safety row are reserved.
-    fn tail_budget(&self, input_rows: usize) -> usize {
+    fn tail_budget(&self, input_rows: usize, running_rows: usize) -> usize {
         (self.height as usize)
-            .saturating_sub(input_rows + self.running_region().rows + usize::from(self.busy) + 3)
+            .saturating_sub(input_rows + running_rows + usize::from(self.busy) + 3)
             .max(1)
     }
 
@@ -1884,9 +1959,14 @@ impl CrossTerm {
     /// incrementally instead of appearing all at once at finalize.
     /// Reasoning-only streams stay fully live; the display clip handles them.
     fn commit_stream_prefix(&mut self, input_rows: usize) {
+        let running_rows = self.running_region().rows;
+        self.commit_stream_prefix_with_running(input_rows, running_rows);
+    }
+
+    fn commit_stream_prefix_with_running(&mut self, input_rows: usize, running_rows: usize) {
         // Snapshot the immutable state first so `self.stream` can be borrowed
         // mutably for the rest of the function.
-        let budget = self.tail_budget(input_rows);
+        let budget = self.tail_budget(input_rows, running_rows);
         let width = render::content_width(self.width);
         let theme = self.theme;
         let Some(stream) = self.stream.as_mut() else {
@@ -1912,6 +1992,8 @@ impl CrossTerm {
         self.pending.push(prefix);
         stream.reasoning.clear();
         stream.markdown.drain(..offset);
+        // The source origin moved; cached offsets are no longer meaningful.
+        self.stream_markdown_cache = None;
     }
 
     // ------------------------------------------------------------------
@@ -1924,8 +2006,9 @@ impl CrossTerm {
             return Ok(());
         }
         let input = self.input_layout();
-        self.commit_stream_prefix(input.rows.len());
-        let build = self.build_region(&input);
+        let running = self.running_region();
+        self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
+        let build = self.build_region_with_running(&input, running);
         self.write_frame(build, false)
     }
 
@@ -1940,8 +2023,9 @@ impl CrossTerm {
         }
         self.transcript.append(&mut self.pending);
         let input = self.input_layout();
-        self.commit_stream_prefix(input.rows.len());
-        let build = self.build_region(&input);
+        let running = self.running_region();
+        self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
+        let build = self.build_region_with_running(&input, running);
         self.write_frame(build, true)
     }
 
@@ -1957,29 +2041,8 @@ impl CrossTerm {
 
         let mut above: Vec<Line<'static>> = Vec::new();
         if clear_all {
-            for (index, entry) in self.transcript.iter().enumerate() {
-                if index > 0 {
-                    render::push_blank(&mut above, render::SECTION_GAP);
-                }
-                above.extend(entry_lines(entry, content, theme, self.tools_expanded));
-            }
-            // Keep as much history as fits above the region, plus one
-            // ellipsis row when older rows fall outside the window.
             let keep = (self.height as usize).saturating_sub(build.rows.len());
-            if keep == 0 {
-                above.clear();
-            } else if above.len() > keep {
-                let hidden = above.len() - (keep - 1);
-                let mut window = Vec::with_capacity(keep);
-                window.push(Line::from(Span::styled(
-                    format!("… {hidden} rows above"),
-                    Style::default()
-                        .fg(theme.dim_text)
-                        .add_modifier(Modifier::DIM),
-                )));
-                window.extend(above.split_off(hidden));
-                above = window;
-            }
+            above = history_window(&self.transcript, keep, content, theme, self.tools_expanded);
         } else {
             for (index, entry) in self.pending.iter().enumerate() {
                 if index > 0 {
@@ -2179,6 +2242,72 @@ fn install_panic_hook(modes: Arc<Mutex<TerminalModes>>) {
 /// `tools_expanded` is the global Ctrl+O state; committed entries render
 /// collapsed unless the toggle is on, and the progress snapshot used the
 /// same global for its in-flight tool line so both agree after a repaint.
+/// Render only the newest history rows that can fit above the live region.
+///
+/// A resize used to render every transcript entry and discard almost all of
+/// it afterward. Walking backward lets a large session stop as soon as the
+/// viewport is full. The marker intentionally does not claim an exact hidden
+/// row count: discovering that count would require the full-history pass this
+/// helper is designed to avoid.
+fn history_window(
+    entries: &[Entry],
+    budget: usize,
+    width: usize,
+    theme: Theme,
+    tools_expanded: bool,
+) -> Vec<Line<'static>> {
+    if budget == 0 || entries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut newest_first = Vec::<Vec<Line<'static>>>::new();
+    let mut used = 0usize;
+    let mut hidden = false;
+    for (index, entry) in entries.iter().enumerate().rev() {
+        let lines = entry_lines(entry, width, theme, tools_expanded);
+        let gap = usize::from(!newest_first.is_empty()) * render::SECTION_GAP;
+        if used.saturating_add(gap).saturating_add(lines.len()) <= budget {
+            used = used.saturating_add(gap).saturating_add(lines.len());
+            newest_first.push(lines);
+            continue;
+        }
+
+        // A single entry can be taller than the viewport. Keep its newest
+        // rows rather than rendering older entries that cannot be visible.
+        let available = budget.saturating_sub(used.saturating_add(gap));
+        let entry_had_lines = !lines.is_empty();
+        if available > 0 {
+            let start = lines.len().saturating_sub(available);
+            let mut suffix = Vec::with_capacity(available.min(lines.len()));
+            suffix.extend(lines.into_iter().skip(start));
+            newest_first.push(suffix);
+        }
+        hidden = index > 0 || entry_had_lines;
+        break;
+    }
+
+    let mut result = Vec::new();
+    for (index, lines) in newest_first.iter().rev().enumerate() {
+        if index > 0 {
+            render::push_blank(&mut result, render::SECTION_GAP);
+        }
+        result.extend(lines.iter().cloned());
+    }
+    if hidden {
+        let marker = Line::from(Span::styled(
+            "… older rows above",
+            Style::default()
+                .fg(theme.dim_text)
+                .add_modifier(Modifier::DIM),
+        ));
+        if result.len() >= budget {
+            result.drain(..result.len() - budget.saturating_sub(1));
+        }
+        result.insert(0, marker);
+    }
+    result
+}
+
 fn entry_lines(
     entry: &Entry,
     width: usize,
@@ -3656,6 +3785,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ui.cursor, ui.input.len());
+    }
+
+    #[test]
+    fn stream_caches_completed_markdown_blocks() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::TextDelta("first\n\nsecond".into()));
+        let first_cache = ui.stream_markdown_cache.as_ref().unwrap();
+        assert_eq!(first_cache.source_offset, "first\n\n".len());
+        let first_lines = first_cache.lines.clone();
+        ui.apply_event(UiEvent::TextDelta(" more".into()));
+        let cache = ui.stream_markdown_cache.as_ref().unwrap();
+        assert_eq!(cache.source_offset, "first\n\n".len());
+        assert_eq!(cache.lines, first_lines);
+        let rendered = ui.stream_tail_lines(render::content_width(ui.width));
+        assert!(row_text(rendered.last().unwrap()).contains("second"));
+    }
+
+    #[test]
+    fn history_window_visits_newest_entries_and_marks_hidden_rows() {
+        let entries = vec![
+            Entry::User { text: "old".into() },
+            Entry::User {
+                text: "middle".into(),
+            },
+            Entry::User { text: "new".into() },
+        ];
+        let rows = history_window(&entries, 3, 80, Theme::default(), false);
+        assert_eq!(rows.len(), 3);
+        assert!(row_text(&rows[0]).contains("older rows"));
+        assert!(row_text(&rows[2]).contains("new"));
     }
 
     #[test]
