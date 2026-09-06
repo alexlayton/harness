@@ -4,12 +4,38 @@ use std::time::Instant;
 use tempfile::tempdir;
 
 fn main() {
+    // Near-linear scaling guard (PERF-5): 10× the turns must cost well
+    // under 10× the time. Incremental append validation reconciles only
+    // the new suffix, so growth is ~linear; a full-replay-per-append
+    // regression would blow past this bar immediately.
+    //
+    // Recent runs (Linux, debug):
+    //   alternating 1000 turns: ~0.11s, 10000 turns: ~1.1s (~10×)
+    //   listing 1000 turns: ~0.003s, 10000 turns: ~0.035s (~11×)
+    // Debug timing is noisy (machine + parallelism dependent), so the bar
+    // is a generous 40× rather than a tight bound.
+    const LINEARITY_BAR: f64 = 40.0;
+    let mut append_times = Vec::new();
+    let mut listing_times = Vec::new();
     for turns in [1_000usize, 10_000] {
         let elapsed = benchmark_alternating_appends(turns);
         println!("alternating {turns} turns: {:.3}s", elapsed.as_secs_f64());
+        append_times.push(elapsed.as_secs_f64());
         let listing = benchmark_listing(turns);
         println!("listing {turns} turns: {:.3}s", listing.as_secs_f64());
+        listing_times.push(listing.as_secs_f64());
     }
+    let append_ratio = append_times[1] / append_times[0].max(f64::EPSILON);
+    let listing_ratio = listing_times[1] / listing_times[0].max(f64::EPSILON);
+    assert!(
+        append_ratio < LINEARITY_BAR,
+        "appends went super-linear: 10k/1k = {append_ratio:.1}× (bar {LINEARITY_BAR}×)"
+    );
+    assert!(
+        listing_ratio < LINEARITY_BAR,
+        "listing went super-linear: 10k/1k = {listing_ratio:.1}× (bar {LINEARITY_BAR}×)"
+    );
+    println!("near-linear scaling holds: append {append_ratio:.1}×, listing {listing_ratio:.1}×");
 }
 
 fn benchmark_listing(turns: usize) -> std::time::Duration {
