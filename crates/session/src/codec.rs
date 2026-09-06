@@ -255,6 +255,11 @@ fn decode_session_lines(
                 metadata,
                 events: Vec::new(),
                 path: None,
+                validated_bytes: 0,
+                file_identity: None,
+                event_ids: std::collections::HashSet::new(),
+                tracker: crate::model::ToolCallTracker::default(),
+                compaction_boundary: None,
             });
             consumed_bytes = consumed_after;
             continue;

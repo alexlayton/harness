@@ -531,6 +531,16 @@ pub struct Session {
     /// export/load from double-counting usage or metadata changes.
     pub(crate) header_metadata: SessionMetadata,
     pub(crate) path: Option<PathBuf>,
+    /// Byte offset through the last validated on-disk record. Zero denotes an
+    /// in-memory session or a session whose backing file has not been cached.
+    pub(crate) validated_bytes: usize,
+    /// File identity used to reject a replacement with the same length before
+    /// taking the constant-time append path.
+    pub(crate) file_identity: Option<(u64, u64)>,
+    /// Incremental event-validation state for the cached file prefix.
+    pub(crate) event_ids: HashSet<EventId>,
+    pub(crate) tracker: ToolCallTracker,
+    pub(crate) compaction_boundary: Option<u64>,
 }
 
 impl Session {
@@ -540,6 +550,11 @@ impl Session {
             metadata,
             events: Vec::new(),
             path: None,
+            validated_bytes: 0,
+            file_identity: None,
+            event_ids: HashSet::new(),
+            tracker: ToolCallTracker::default(),
+            compaction_boundary: None,
         }
     }
 
@@ -580,6 +595,14 @@ impl Session {
 
     fn apply_record(&mut self, record: SessionEventRecord) {
         self.metadata.updated_at = record.timestamp.clone();
+        self.event_ids.insert(record.id);
+        if let SessionEvent::CompactionSummary {
+            compacted_through, ..
+        } = &record.event
+        {
+            self.compaction_boundary = Some(*compacted_through);
+        }
+        self.tracker.record(&record.event);
         match &record.event {
             SessionEvent::UserMessage { message } if self.metadata.title.is_none() => {
                 if let Some(title) = first_message_text(message) {
@@ -639,7 +662,7 @@ impl Session {
 /// been used (pending or completed), it is never reused.  `TurnCancelled`
 /// marks the tail explicitly cancelled and clears the pending queue; `Error`
 /// marks it cancelled without clearing so a crash tail stays recoverable.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ToolCallTracker {
     /// Call IDs awaiting a result, in emission order.
     pending: Vec<String>,
@@ -879,153 +902,191 @@ pub fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&Ses
 /// reused ID is rejected even after completion or cancellation, because the
 /// durable log has no call-instance identity beyond the ID.
 pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
-    let mut expected_sequence = 1u64;
     let mut ids = HashSet::new();
     let mut tracker = ToolCallTracker::default();
-    let mut compaction_boundary: Option<u64> = None;
-
-    for record in events {
-        if record.sequence != expected_sequence {
-            return Err(SessionError::InvalidEvent(format!(
-                "expected event sequence {expected_sequence}, found {}",
-                record.sequence
-            )));
-        }
-        expected_sequence = expected_sequence.saturating_add(1);
-        if !ids.insert(record.id) {
-            return Err(SessionError::InvalidEvent(format!(
-                "duplicate event ID {}",
-                record.id
-            )));
-        }
-        if record.timestamp.trim().is_empty() {
-            return Err(SessionError::InvalidEvent(format!(
-                "event {} has an empty timestamp",
-                record.id
-            )));
-        }
-
-        match &record.event {
-            SessionEvent::UserMessage { message } => {
-                if !tracker.pending().is_empty() && !tracker.is_cancelled() {
-                    return Err(SessionError::InvalidEvent(
-                        "user message follows an unresolved tool call".into(),
-                    ));
-                }
-                if message.role != StoredRole::User {
-                    return Err(SessionError::InvalidEvent(
-                        "user_message does not contain a user message".into(),
-                    ));
-                }
-                if message.content.iter().any(|content| {
-                    matches!(
-                        content,
-                        StoredContent::ToolCall { .. } | StoredContent::ToolResult { .. }
-                    )
-                }) {
-                    return Err(SessionError::InvalidEvent(
-                        "user_message contains tool content".into(),
-                    ));
-                }
-            }
-            SessionEvent::AssistantMessage { message } => {
-                if message.role != StoredRole::Assistant {
-                    return Err(SessionError::InvalidEvent(
-                        "assistant_message does not contain an assistant message".into(),
-                    ));
-                }
-                if message
-                    .content
-                    .iter()
-                    .any(|content| matches!(content, StoredContent::ToolResult { .. }))
-                {
-                    return Err(SessionError::InvalidEvent(
-                        "assistant_message contains a tool result".into(),
-                    ));
-                }
-                for content in &message.content {
-                    if let StoredContent::ToolCall { id, name, .. } = content {
-                        if id.trim().is_empty() || name.trim().is_empty() {
-                            return Err(SessionError::InvalidEvent(
-                                "assistant tool call requires a non-empty ID and name".into(),
-                            ));
-                        }
-                        if tracker.is_pending(id) {
-                            return Err(SessionError::InvalidEvent(format!(
-                                "duplicate pending tool call {id}"
-                            )));
-                        }
-                        if tracker.is_seen(id) {
-                            return Err(SessionError::InvalidEvent(format!(
-                                "reused tool call ID {id}"
-                            )));
-                        }
-                    }
-                }
-            }
-            SessionEvent::ToolCall { call } => {
-                if call.id.trim().is_empty() || call.name.trim().is_empty() {
-                    return Err(SessionError::InvalidEvent(
-                        "tool call requires a non-empty ID and name".into(),
-                    ));
-                }
-                if tracker.is_pending(&call.id) {
-                    return Err(SessionError::InvalidEvent(format!(
-                        "duplicate pending tool call {}",
-                        call.id
-                    )));
-                }
-                if tracker.is_seen(&call.id) {
-                    return Err(SessionError::InvalidEvent(format!(
-                        "reused tool call ID {}",
-                        call.id
-                    )));
-                }
-            }
-            SessionEvent::ToolResult { tool_call_id, .. } => {
-                if tool_call_id.trim().is_empty() {
-                    return Err(SessionError::InvalidEvent(
-                        "tool result requires a non-empty tool_call_id".into(),
-                    ));
-                }
-                if !tracker.is_pending(tool_call_id) {
-                    return Err(SessionError::InvalidEvent(format!(
-                        "tool result {tool_call_id} has no preceding tool call"
-                    )));
-                }
-                let Some(first) = tracker.pending().first() else {
-                    return Err(SessionError::InvalidEvent(format!(
-                        "tool result {tool_call_id} has no preceding tool call"
-                    )));
-                };
-                if first != tool_call_id {
-                    return Err(SessionError::InvalidEvent(format!(
-                        "tool result {tool_call_id} is out of order; expected {first}"
-                    )));
-                }
-            }
-            SessionEvent::TurnCancelled { .. } | SessionEvent::Error { .. } => {}
-            SessionEvent::CompactionSummary {
-                compacted_through, ..
-            } => {
-                if *compacted_through >= record.sequence {
-                    return Err(SessionError::InvalidEvent(format!(
-                        "compaction boundary {compacted_through} must precede its summary event {}",
-                        record.sequence
-                    )));
-                }
-                if let Some(previous) = compaction_boundary
-                    && *compacted_through <= previous
-                {
-                    return Err(SessionError::InvalidEvent(format!(
-                        "compaction boundary {compacted_through} does not advance past {previous}"
-                    )));
-                }
-                compaction_boundary = Some(*compacted_through);
-            }
-            _ => {}
+    let mut compaction_boundary = None;
+    for (index, record) in events.iter().enumerate() {
+        validate_record(
+            record,
+            index as u64 + 1,
+            &ids,
+            &tracker,
+            compaction_boundary,
+        )?;
+        ids.insert(record.id);
+        if let SessionEvent::CompactionSummary {
+            compacted_through, ..
+        } = &record.event
+        {
+            compaction_boundary = Some(*compacted_through);
         }
         tracker.record(&record.event);
+    }
+    Ok(())
+}
+
+/// Validate one append against the already validated in-memory prefix. This
+/// keeps the common append path constant-time with respect to session length;
+/// callers fall back to full replay when their cached prefix is stale.
+pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord) -> Result<()> {
+    let expected = session
+        .events
+        .last()
+        .map_or(1, |entry| entry.sequence.saturating_add(1));
+    validate_record(
+        record,
+        expected,
+        &session.event_ids,
+        &session.tracker,
+        session.compaction_boundary,
+    )
+}
+
+fn validate_record(
+    record: &SessionEventRecord,
+    expected_sequence: u64,
+    ids: &HashSet<EventId>,
+    tracker: &ToolCallTracker,
+    compaction_boundary: Option<u64>,
+) -> Result<()> {
+    if record.sequence != expected_sequence {
+        return Err(SessionError::InvalidEvent(format!(
+            "expected event sequence {expected_sequence}, found {}",
+            record.sequence
+        )));
+    }
+    if ids.contains(&record.id) {
+        return Err(SessionError::InvalidEvent(format!(
+            "duplicate event ID {}",
+            record.id
+        )));
+    }
+    if record.timestamp.trim().is_empty() {
+        return Err(SessionError::InvalidEvent(format!(
+            "event {} has an empty timestamp",
+            record.id
+        )));
+    }
+
+    match &record.event {
+        SessionEvent::UserMessage { message } => {
+            if !tracker.pending().is_empty() && !tracker.is_cancelled() {
+                return Err(SessionError::InvalidEvent(
+                    "user message follows an unresolved tool call".into(),
+                ));
+            }
+            if message.role != StoredRole::User {
+                return Err(SessionError::InvalidEvent(
+                    "user_message does not contain a user message".into(),
+                ));
+            }
+            if message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    StoredContent::ToolCall { .. } | StoredContent::ToolResult { .. }
+                )
+            }) {
+                return Err(SessionError::InvalidEvent(
+                    "user_message contains tool content".into(),
+                ));
+            }
+        }
+        SessionEvent::AssistantMessage { message } => {
+            if message.role != StoredRole::Assistant {
+                return Err(SessionError::InvalidEvent(
+                    "assistant_message does not contain an assistant message".into(),
+                ));
+            }
+            if message
+                .content
+                .iter()
+                .any(|content| matches!(content, StoredContent::ToolResult { .. }))
+            {
+                return Err(SessionError::InvalidEvent(
+                    "assistant_message contains a tool result".into(),
+                ));
+            }
+            let mut record_ids = HashSet::new();
+            for content in &message.content {
+                if let StoredContent::ToolCall { id, name, .. } = content {
+                    validate_tool_call_id(id, name, tracker, &record_ids)?;
+                    record_ids.insert(id.clone());
+                }
+            }
+        }
+        SessionEvent::ToolCall { call } => {
+            validate_tool_call_id(&call.id, &call.name, tracker, &HashSet::new())?;
+        }
+        SessionEvent::ToolResult { tool_call_id, .. } => {
+            if tool_call_id.trim().is_empty() {
+                return Err(SessionError::InvalidEvent(
+                    "tool result requires a non-empty tool_call_id".into(),
+                ));
+            }
+            if !tracker.is_pending(tool_call_id) {
+                return Err(SessionError::InvalidEvent(format!(
+                    "tool result {tool_call_id} has no preceding tool call"
+                )));
+            }
+            let Some(first) = tracker.pending().first() else {
+                return Err(SessionError::InvalidEvent(format!(
+                    "tool result {tool_call_id} has no preceding tool call"
+                )));
+            };
+            if first != tool_call_id {
+                return Err(SessionError::InvalidEvent(format!(
+                    "tool result {tool_call_id} is out of order; expected {first}"
+                )));
+            }
+        }
+        SessionEvent::CompactionSummary {
+            compacted_through, ..
+        } => {
+            if *compacted_through >= record.sequence {
+                return Err(SessionError::InvalidEvent(format!(
+                    "compaction boundary {compacted_through} must precede its summary event {}",
+                    record.sequence
+                )));
+            }
+            if let Some(previous) = compaction_boundary
+                && *compacted_through <= previous
+            {
+                return Err(SessionError::InvalidEvent(format!(
+                    "compaction boundary {compacted_through} does not advance past {previous}"
+                )));
+            }
+        }
+        SessionEvent::TurnCancelled { .. }
+        | SessionEvent::Error { .. }
+        | SessionEvent::ModelChange { .. }
+        | SessionEvent::Usage { .. }
+        | SessionEvent::MetadataChange { .. }
+        | SessionEvent::Reasoning { .. }
+        | SessionEvent::Unknown { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_tool_call_id(
+    id: &str,
+    name: &str,
+    tracker: &ToolCallTracker,
+    record_ids: &HashSet<String>,
+) -> Result<()> {
+    if id.trim().is_empty() || name.trim().is_empty() {
+        return Err(SessionError::InvalidEvent(
+            "tool call requires a non-empty ID and name".into(),
+        ));
+    }
+    if record_ids.contains(id) || tracker.is_pending(id) {
+        return Err(SessionError::InvalidEvent(format!(
+            "duplicate pending tool call {id}"
+        )));
+    }
+    if tracker.is_seen(id) {
+        return Err(SessionError::InvalidEvent(format!(
+            "reused tool call ID {id}"
+        )));
     }
     Ok(())
 }

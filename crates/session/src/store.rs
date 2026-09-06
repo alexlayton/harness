@@ -2,7 +2,7 @@ use crate::codec::{TailRecovery, decode_session_file, encode_header, encode_reco
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{
     EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, StoredContent,
-    StoredToolCall, Timestamp, now_timestamp,
+    StoredToolCall, Timestamp, now_timestamp, validate_next_event,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -196,11 +196,17 @@ impl SessionStore {
         drop(file);
         ensure_private_file(&path)?;
         sync_parent(&path)?;
+        let identity = file_identity(&path)?;
         Ok(Session {
             header_metadata: metadata.clone(),
             metadata,
             events: Vec::new(),
             path: Some(path),
+            validated_bytes: header.len().saturating_add(1),
+            file_identity: Some(identity),
+            event_ids: std::collections::HashSet::new(),
+            tracker: crate::model::ToolCallTracker::default(),
+            compaction_boundary: None,
         })
     }
 
@@ -231,7 +237,52 @@ impl SessionStore {
         };
         self.ensure_path_in_root(&path)?;
         let lock = SessionLock::acquire(&path)?;
-        // Re-read under the lock.  Two processes may each hold an older
+        let file_size = fs::metadata(&path)
+            .map_err(|source| io_error("stat session for append", &path, source))?
+            .len();
+        let current_identity = file_identity(&path)?;
+        if session.validated_bytes > 0
+            && session.file_identity == Some(current_identity)
+            && usize::try_from(file_size).ok() == Some(session.validated_bytes)
+        {
+            // The open Session still covers the complete file prefix and its
+            // identity is unchanged. Validate only the new state transition;
+            // stale copies fall through to the full locked replay below.
+            let record = SessionEventRecord {
+                id: EventId::new(),
+                sequence: session
+                    .events
+                    .last()
+                    .map_or(1, |entry| entry.sequence.saturating_add(1)),
+                timestamp: now_timestamp(),
+                event,
+            };
+            validate_next_event(session, &record)?;
+            let line = encode_record(session.id(), &record)?;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .map_err(|source| io_error("open session for append", &path, source))?;
+            let write_result = file
+                .write_all(line.as_bytes())
+                .and_then(|_| file.write_all(b"\n"))
+                .and_then(|_| file.flush());
+            let write_result = if write_result.is_err() || !self.deferred_sync() {
+                write_result.and_then(|_| file.sync_all())
+            } else {
+                write_result
+            };
+            write_result.map_err(|source| io_error("append session event", &path, source))?;
+            drop(file);
+            session.append_record(record.clone());
+            session.validated_bytes = usize::try_from(file_size)
+                .unwrap_or(usize::MAX)
+                .saturating_add(line.len())
+                .saturating_add(1);
+            drop(lock);
+            return Ok(record);
+        }
+        // Re-read under the lock. Two processes may each hold an older
         // in-memory Session; deriving the sequence from disk prevents
         // duplicate sequence numbers and keeps append-only ordering valid.
         let (mut disk_session, recovery) = load_session_file_for_append(&path)?;
@@ -276,6 +327,10 @@ impl SessionStore {
         write_result.map_err(|source| io_error("append session event", &path, source))?;
         drop(file);
         disk_session.append_record(record.clone());
+        disk_session.validated_bytes = recovery
+            .valid_bytes
+            .saturating_add(line.len())
+            .saturating_add(1);
         *session = disk_session;
         drop(lock);
         Ok(record)
@@ -470,8 +525,10 @@ impl SessionStore {
 
 fn load_session_file(path: &Path) -> Result<Session> {
     let contents = read_file(path)?;
-    let (mut session, _) = decode_session_file(&contents, path)?;
+    let (mut session, recovery) = decode_session_file(&contents, path)?;
     session.path = Some(path.to_path_buf());
+    session.validated_bytes = recovery.valid_bytes;
+    session.file_identity = Some(file_identity(path)?);
     Ok(session)
 }
 
@@ -483,6 +540,8 @@ fn load_session_file_for_append(path: &Path) -> Result<(Session, TailRecovery)> 
     let contents = read_file(path)?;
     let (mut session, recovery) = decode_session_file(&contents, path)?;
     session.path = Some(path.to_path_buf());
+    session.validated_bytes = recovery.valid_bytes;
+    session.file_identity = Some(file_identity(path)?);
     Ok((session, recovery))
 }
 
@@ -506,6 +565,24 @@ fn read_file(path: &Path) -> Result<String> {
     file.read_to_string(&mut contents)
         .map_err(|source| io_error("read session", path, source))?;
     Ok(contents)
+}
+
+fn file_identity(path: &Path) -> Result<(u64, u64)> {
+    let metadata = fs::metadata(path).map_err(|source| io_error("stat session", path, source))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_nanos() as u64);
+        Ok((metadata.len(), modified))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1174,6 +1251,39 @@ mod tests {
                 .has_conversation
         );
         assert_eq!(store.load("latest").unwrap().id(), session.id());
+    }
+
+    #[test]
+    fn stale_store_appends_reconcile_external_tail() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let id = session.id();
+        let mut first = store.open(&id).unwrap();
+        let mut second = store.open(&id).unwrap();
+
+        store
+            .append_event(
+                &mut first,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("first")),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut second,
+                SessionEvent::AssistantMessage {
+                    message: StoredMessage::from_llm(&Message::assistant(vec![
+                        llm::Content::Text("second".into()),
+                    ])),
+                },
+            )
+            .unwrap();
+        let loaded = store.open(&id).unwrap();
+        assert_eq!(loaded.events.len(), 2);
+        assert_eq!(loaded.events[1].sequence, 2);
     }
 
     #[test]
