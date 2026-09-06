@@ -593,7 +593,10 @@ fn parse_callback_target(request: &str, expected_state: &str) -> Option<String> 
 }
 
 /// True when the callback is a valid-state OAuth denial rather than a code:
-/// `?error=access_denied&state=<expected>`.
+/// `?error=access_denied&state=<expected>`. Only `access_denied` with the
+/// exact expected state counts: other errors, missing states, and
+/// mismatched states fall through to the failure reply below, so an
+/// attacker's cross-site request cannot terminate another login attempt.
 fn is_callback_denial(request: &str, expected_state: &str) -> bool {
     let Some(target) = request
         .lines()
@@ -1010,6 +1013,74 @@ mod tests {
         assert!(parse_callback_target(denial, "s1").is_none());
         assert!(is_callback_denial(denial, "s1"));
         assert!(!is_callback_denial(denial, "other"));
+        // Near-miss denials must not terminate: wrong error value, missing
+        // state, or a state belonging to a different login attempt.
+        let wrong_error = "GET /auth/callback?error=server_error&state=s1 HTTP/1.1\r\n\r\n";
+        assert!(!is_callback_denial(wrong_error, "s1"));
+        let missing_state = "GET /auth/callback?error=access_denied HTTP/1.1\r\n\r\n";
+        assert!(!is_callback_denial(missing_state, "s1"));
+        let wrong_path = "GET /other?error=access_denied&state=s1 HTTP/1.1\r\n\r\n";
+        assert!(!is_callback_denial(wrong_path, "s1"));
+        assert!(parse_callback_target(wrong_path, "s1").is_none());
+    }
+
+    /// AUTH-3: a live valid-state denial terminates promptly over the
+    /// socket — sanitized error, failure reply — without waiting for the
+    /// idle timeout or a later valid callback.
+    #[tokio::test]
+    async fn live_denial_terminates_promptly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            wait_for_callback_with_idle(
+                listener,
+                "s1",
+                &CancellationToken::new(),
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        let mut denied = tokio::net::TcpStream::connect(addr).await.unwrap();
+        denied
+            .write_all(
+                b"GET /auth/callback?error=access_denied&state=s1 HTTP/1.1\r\nHost: x\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let size =
+                tokio::time::timeout(std::time::Duration::from_secs(15), denied.read(&mut chunk))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if size == 0 {
+                break;
+            }
+            reply.extend_from_slice(&chunk[..size]);
+            if reply.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.contains("Login failed"), "unexpected reply: {reply}");
+        // Prompt termination: the denial resolves the wait, not a timeout.
+        let error = tokio::time::timeout(std::time::Duration::from_secs(15), server)
+            .await
+            .expect("denial must terminate without waiting for the idle timeout")
+            .unwrap()
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("denied"),
+            "denial must be sanitized, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("access_denied") || rendered.contains("authorization was denied"),
+            "raw OAuth error value leaked: {rendered}"
+        );
     }
 
     #[tokio::test]
