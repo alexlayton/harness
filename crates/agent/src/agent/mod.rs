@@ -3204,4 +3204,67 @@ mod tests {
             "the single fetch must supply the catalogue: {events:?}"
         );
     }
+
+    #[tokio::test]
+    async fn hanging_metadata_fetch_never_blocks_command_processing() {
+        // AGENT-4 non-blocking: a `list_models` that hangs past the 5s
+        // bound must not freeze the command loop — queued turns still run
+        // to completion while the fetch is in flight.
+        struct HangingModelsProvider;
+        #[async_trait]
+        impl Provider for HangingModelsProvider {
+            fn name(&self) -> &str {
+                "hanging"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("turn done".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                std::future::pending::<()>().await;
+                unreachable!("the 5s timeout must win first")
+            }
+        }
+
+        let provider = Arc::new(HangingModelsProvider);
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("hello".into()))
+            .unwrap();
+        drop(input_tx);
+        let started = std::time::Instant::now();
+        Agent::new(provider, ToolRegistry::empty(), "demo", cancel)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // The turn completed promptly — long before the 5s metadata bound
+        // could have elapsed — so the hanging fetch never blocked it.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::TextDelta(text) if text.contains("turn done")
+            )),
+            "turn must complete despite hanging metadata: {events:?}"
+        );
+        assert!(
+            events.contains(&AgentEvent::TurnFinished),
+            "events: {events:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "command processing blocked on metadata: {:?}",
+            started.elapsed()
+        );
+    }
 }
