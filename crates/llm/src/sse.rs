@@ -114,8 +114,10 @@ impl SseParser {
     fn dispatch(&mut self, events: &mut Vec<SseEvent>) {
         // Event-only frames carry no data and dispatch nothing; clear the
         // stored event name so it cannot leak into the next data frame.
-        if !self.has_data {
+        if !self.has_data || self.data.is_empty() {
             self.event = None;
+            self.data.clear();
+            self.has_data = false;
             return;
         }
         events.push(SseEvent {
@@ -235,6 +237,11 @@ mod tests {
                 data: "[DONE]".into()
             }]
         );
+    }
+
+    #[test]
+    fn empty_data_frames_are_ignored() {
+        assert!(parse_events("data:\n\nevent: ping\n\n").is_empty());
     }
 
     #[test]
