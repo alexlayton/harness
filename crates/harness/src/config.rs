@@ -170,10 +170,10 @@ impl CompactConfig {
                 "[compaction].max_summary_bytes must be between 1 and {MAX_SUMMARY_BYTES}"
             ));
         }
-        if let (Some(reserve), Some(window)) = (self.reserve_tokens, self.context_window)
-            && window > 0
-            && reserve >= window
-        {
+        let defaults = CompactionPolicy::default();
+        let reserve = self.reserve_tokens.unwrap_or(defaults.reserve_tokens);
+        let window = self.context_window.unwrap_or(defaults.context_window);
+        if window > 0 && reserve >= window {
             return Err(anyhow!(
                 "[compaction].reserve_tokens must be less than [compaction].context_window"
             ));
@@ -1303,6 +1303,21 @@ future_server_key = "keep"
             .to_string();
             assert!(error.contains(key), "{error}");
         }
+    }
+
+    #[test]
+    fn default_reserve_is_checked_against_explicit_window() {
+        let error = FileConfig {
+            compaction: Some(CompactConfig {
+                context_window: Some(8_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("reserve_tokens"), "{error}");
     }
 
     #[test]

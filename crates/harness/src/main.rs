@@ -49,6 +49,9 @@ async fn main_inner() -> Result<ExitCode> {
     // then always restore the launch directory and attempt safe cleanup after
     // application startup or shutdown.
     if let Some(Command::Worktree(args)) = cli.command.clone() {
+        // Resolve every process-level path override before prepare changes the
+        // cwd. This includes config/auth, logging, and both session roots.
+        absolutize_process_path_overrides()?;
         // Relative state/session overrides must retain launch-directory
         // semantics after prepare changes the process cwd.
         let session_root = std::path::absolute(session::default_session_dir())
@@ -99,6 +102,29 @@ async fn main_inner() -> Result<ExitCode> {
     }
 
     run_application(cli, None).await
+}
+
+fn absolutize_process_path_overrides() -> Result<()> {
+    let current = std::env::current_dir().context("resolve launch directory")?;
+    for variable in [
+        "HARNESS_CONFIG_DIR",
+        "HARNESS_LOG",
+        "HARNESS_SESSION_DIR",
+        "HARNESS_STATE_DIR",
+    ] {
+        let Some(value) = std::env::var_os(variable) else {
+            continue;
+        };
+        let path = std::path::PathBuf::from(value);
+        if path.is_absolute() {
+            continue;
+        }
+        let absolute = current.join(path);
+        // Environment overrides are process-local and are intentionally
+        // normalized before any worktree task can change cwd.
+        unsafe { std::env::set_var(variable, absolute) };
+    }
+    Ok(())
 }
 
 async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> Result<ExitCode> {
