@@ -169,19 +169,17 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - CLEANUP-3 shared implementations: parent/subagent dispatch + turn-boundary/persistence (AGENT-1/2); SSE transport loop now shared via `dialects::StreamParser`+`drive_parser_stream` (all four adapters; Codex side channel as `CodexParser` wrapper; payload parsing stays per-dialect); model catalogue fetch now shared via `fetch_model_catalogue` (`spawn_model_metadata` + `spawn_model_list`, sinks differ); find/grep/multigrep admission now shared via `FileSearchIndex::run_search` (shutdown/scope/cancel/semaphore/join once; `wait_for_scan` + `collect_grep_result` already shared); MCP bounded writing already shared (`OutputWriter`/`flatten`/`cap_display`).
 - CLEANUP-4 test replacements: compaction literal-defaults deleted (boundary/validation tests cover); retry jitter-range already deterministic; OpenCode catalogue already routing tests; ACP load already full new/load round-trip; synthetic-EOF already strict-terminal. Headless `HARNESS_SESSION_DIR` env-process test deliberately not added (process-env mutation races parallel tests; `blank_prompt_creates_no_session_on_disk` pins the same no-mutation contract in-process). Strong suites retained (scheduling, path safety, parser fixtures, stalled-body, edit property, TUI wrap).
 
-## Phase 9 — Config/CI/docs
+## Phase 9 — Config/CI/docs — DONE
 
-### CONFIG-1 — DONE in code, test-matrix gap
+### CONFIG-1 — DONE
 - `harness/config.rs:~153-180 CompactConfig::validate` finite `0.0-1.0`, `1..16MiB/1MiB`, `reserve<window` exact-key errors (`[compaction].threshold…`); `FileConfig{flatten extra}` + `update_config_document (toml_edit::DocumentMut` targeted edit + re-validate) + `save_settings/save_reasoning` preserve unknowns; `lock_config (fs2::lock_exclusive` write+rename) + `0600` temp+rename+`sync` + `TEMP_ENTROPY/splitmix64`; `default_reserve_is_checked…` test.
-- GAP: nested `extra` at every level (`[compaction]/[subagents]/[tui]/[mcp]/servers`) + two-mutator preservation tests not confirmed. Note: `completed.md` still lists CONFIG-1 outstanding — reconcile with above.
+- Nested unknowns preserved at the document level: `targeted_settings_saves_preserve_unknown_nested_document_fields` seeds all five levels (`[compaction]`, `[compaction.future]`, `[subagents]`, `[tui]`, `[mcp]` + `[[mcp.servers]]`) through both save paths; `concurrent_config_mutators_do_not_lose_each_other` pins the advisory lock; `invalid_compaction_values_name_their_toml_keys` (+zero-keep, default-reserve, round-trip) covers the validation matrix. `save_file_config` stays test-only by design (canonical writes go through `update_config_document`); `docs/configuration.md` reserve/window wording now matches the effective-window check.
 
-### CI-1 — PARTIAL
-- DONE: locked Cargo checks, all-target Clippy (`cargo clippy --workspace --all-targets --locked -- -D warnings`), native arm64 smoke (per `completed.md`).
-- OUTSTANDING: verify `.github/workflows/ci.yml/release.yml` `--locked` everywhere + Clippy exact flags; Linux/glibc baseline (pinned env or musl) + merge/cache speedup.
+### CI-1 — DONE
+- Locked Cargo checks everywhere + all-target Clippy (`cargo clippy --workspace --all-targets --locked -- -D warnings`) in `ci.yml:45` and `release.yml:49`; `--locked` on every test/build/metadata check; Linux test+build jobs pinned to `ubuntu-22.04` (`ci.yml`) matching the GNU artifact baseline (glibc 2.35, `release.yml:61-64` pin comment + `README.md:102-106`); native arm64 smoke (`macos-14`, `release.yml:68-72`) with every artifact executed before upload (`:93-101` smoke before `:102+` package). Merge/cache speedup deliberately not taken (isolated per-job caches stay correct and fast enough).
 
-### DOCS-1 — MISSING
-- `completed.md` admits outstanding. Need: model-assisted compaction + deterministic fallback (remove "absent" claim), read-only subagents `multigrep` scope, exact no-session compaction, shell exclusivity + tree-kill, MCP catalogue/output/time limits, Linux baseline, headless-stdout + ACP-purity. Files: `ARCHITECTURE.md`, `crates/session/README.md`, `docs/configuration.md`, `README.md`.
+### DOCS-1 — DONE
+- Model-assisted compaction + deterministic fallback: `ARCHITECTURE.md:171-173`, `session/README.md:69,86-88`, `docs/configuration.md:101-102`, `README.md` highlights. Read-only subagent scope resolved to `read/find/grep/multigrep` (`ARCHITECTURE.md:129`, `tools/src/lib.rs` doc, `docs/configuration.md` subagents, pinned by `read_only_registry_exposes_no_mutating_tools`). No-session compaction: disabled auto + unavailable `/compact` + no overflow recovery (`docs/configuration.md:186-190`, `ARCHITECTURE.md` subagents). Shell exclusivity + tree-kill (500 ms grace, shared 1s drain): `ARCHITECTURE.md:112-118`, `docs/configuration.md` shell section. MCP catalogue/output/time limits: `docs/configuration.md:152-157`, `ARCHITECTURE.md:121-123`. Linux baseline (glibc 2.35, Ubuntu 22.04): `README.md:102-106`, `release.yml:61-64`, `ci.yml` pin comments. Headless-stdout + ACP-purity: `ARCHITECTURE.md:69-72,185`, `README.md:61-63`, `docs/configuration.md` CLI table + logging section.
 
-## Remaining TODO (ordered)
-1. Phases 2–8 DONE. Next: CI-1 workflow verify + Linux baseline; DOCS-1 contracts.
-2. Re-run before handoff: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo build --workspace --locked`, `cargo tree --workspace --duplicates`, `git diff --check`.
+## Remaining TODO
+- All phases 2–9 DONE. Final handoff verification below.
