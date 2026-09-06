@@ -55,6 +55,11 @@ pub const CODEX_MODELS: &[CodexModel] = &[
         name: "GPT-5.6 Terra",
         context_length: 1_050_000,
     },
+    CodexModel {
+        id: "gpt-6-astra",
+        name: "GPT-6 Astra",
+        context_length: 1_050_000,
+    },
 ];
 #[derive(Clone)]
 pub struct OpenAiCodexProvider {
