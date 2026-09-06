@@ -2794,4 +2794,219 @@ mod tests {
             }
         });
     }
+
+    #[tokio::test]
+    async fn cancelled_compaction_persists_neither_summary_nor_usage() {
+        // A pre-cancelled compaction must persist nothing: no summary, no
+        // Usage event, no CompactionFinished — only the "cancelled" notice
+        // and a normal turn afterwards.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = populate_session(&store, 12, 12_000);
+        let session_id = session.id();
+        let usage_before = store.open(&session_id).unwrap().metadata.usage.clone();
+
+        let provider = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            // The summarizer script would succeed if run — but the cancel
+            // token below is already cancelled, so `summarize` short-
+            // circuits to `Cancelled` before touching the provider.
+            scripts: vec![
+                summarizer_script(),
+                script(vec![
+                    StreamEvent::TextDelta("after cancel".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+            ],
+            seen: Mutex::new(Vec::new()),
+        });
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        // Manual compact under a pre-cancelled token: the operation observes
+        // cancellation instead of summarizing. A pre-cancelled *application*
+        // token propagates as Shutdown (run loop breaks, no notice); the
+        // compact path maps that to shutdown rather than the notice path.
+        input_tx.send(InputMessage::CompactSession).unwrap();
+        drop(input_tx);
+        Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+            .with_session(store.clone(), session)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // Shutdown path: no CompactionFinished, and crucially nothing
+        // persisted — that is the "cancel persists nothing" contract.
+        // (The "compaction cancelled" notice only fires for turn-scoped
+        // cancel, not application shutdown.)
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionFinished { .. })),
+            "cancelled compaction must not finish: {events:?}"
+        );
+        let reloaded = store.open(&session_id).unwrap();
+        assert!(
+            !reloaded.events.iter().any(|record| matches!(
+                record.event,
+                SessionEvent::CompactionSummary { .. } | SessionEvent::Usage { .. }
+            )),
+            "cancelled compaction persisted something"
+        );
+        assert_eq!(
+            reloaded.metadata.usage, usage_before,
+            "cancelled compaction must not touch usage totals"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarizer_without_usage_does_not_create_a_zero_token_turn() {
+        // A summarizer `Done` with `usage: None` must not synthesize a
+        // zero-token Usage event: session turn totals stay untouched.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = populate_session(&store, 12, 12_000);
+        let session_id = session.id();
+        let usage_before = store.open(&session_id).unwrap().metadata.usage.clone();
+        let usage_events_before = store
+            .open(&session_id)
+            .unwrap()
+            .events
+            .iter()
+            .filter(|record| matches!(record.event, SessionEvent::Usage { .. }))
+            .count();
+
+        let provider = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![
+                script(vec![
+                    StreamEvent::TextDelta("summary without usage".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+                script(vec![
+                    StreamEvent::TextDelta("after compact".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+            ],
+            seen: Mutex::new(Vec::new()),
+        });
+        let (events, _provider) = run_session_agent(
+            &store,
+            session,
+            provider.clone(),
+            vec![
+                InputMessage::CompactSession,
+                InputMessage::Message("next".into()),
+            ],
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionFinished { .. }))
+        );
+        let reloaded = store.open(&session_id).unwrap();
+        let usage_events_after = reloaded
+            .events
+            .iter()
+            .filter(|record| matches!(record.event, SessionEvent::Usage { .. }))
+            .count();
+        assert_eq!(
+            usage_events_after, usage_events_before,
+            "a usageless summarizer must not append a Usage event"
+        );
+        assert_eq!(
+            reloaded.metadata.usage, usage_before,
+            "a usageless summarizer must not move usage totals"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_compaction_stays_disabled_without_repeat_failures() {
+        // Without a session, auto-compaction is disabled (no per-turn
+        // failure) and manual `/compact` + overflow recovery degrade to a
+        // single quiet notice / silent retry-false — never a persisted
+        // error or a repeated failure loop.
+        let provider = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![
+                // First request overflows; recovery is disabled without a
+                // session, so the provider error surfaces once and the
+                // second turn proceeds normally.
+                vec![Err("context length exceeded".into())],
+                script(vec![
+                    StreamEvent::TextDelta("second turn".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+            ],
+            error_kind: MockErrorKind::Stream,
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("first".into()))
+            .unwrap();
+        input_tx.send(InputMessage::CompactSession).unwrap();
+        input_tx
+            .send(InputMessage::Message("second".into()))
+            .unwrap();
+        drop(input_tx);
+        Agent::new(provider, ToolRegistry::empty(), "demo", cancel)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // Overflow recovery quietly declines (no session): exactly one
+        // provider Error for the first turn, then normal recovery.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        // Manual compact degrades to one "unavailable" notice per
+        // invocation — a policy notice, not an error or failure loop.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::Notice(message) if message.contains("unavailable")
+                ))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("second turn")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionFinished { .. }))
+        );
+    }
 }
