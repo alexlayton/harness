@@ -513,18 +513,6 @@ fn sync_parent(path: &Path) -> Result<()> {
     }
 }
 
-/// Sync a directory path itself after renames inside it.  `sync_parent`
-/// fsyncs the parent of its argument, so pass a child entry (or join a
-/// sentinel) rather than the directory itself.
-#[allow(dead_code)]
-fn sync_directory(path: &Path) {
-    // Best-effort wrapper for read paths where failures must not break
-    // listing; write paths call `sync_parent` directly and fail closed.
-    if let Err(error) = sync_parent(&path.join(".")) {
-        let _ = error;
-    }
-}
-
 struct AuthFileLock {
     path: PathBuf,
     /// Unguessable owner nonce: stealing removes only the exact stale

@@ -643,10 +643,6 @@ pub struct Config {
     pub provider: ProviderArg,
     pub model: String,
     pub reasoning: ReasoningPolicy,
-    /// Resolved key retained for config diagnostics and boundary tests;
-    /// provider construction reads the environment directly.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub api_key: String,
     pub rtk: bool,
     pub compaction: CompactionPolicy,
     /// Resolved subagent bounds (file `[subagents]` over defaults).
@@ -779,7 +775,6 @@ impl Config {
                 .reasoning_effort
                 .or(file.reasoning_effort)
                 .unwrap_or_default(),
-            api_key,
             rtk: file.rtk,
             compaction: file
                 .compaction
@@ -999,7 +994,6 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider, ProviderArg::GithubCopilot);
         assert_eq!(config.model, "gpt-5.4");
-        assert!(config.api_key.is_empty());
     }
 
     #[test]
@@ -1086,7 +1080,7 @@ mod tests {
         };
         let config =
             Config::resolve_with_key_values(&cli, None, Some("legacy-secret"), None).unwrap();
-        assert_eq!(config.api_key, "legacy-secret");
+        assert_eq!(config.provider, ProviderArg::OpencodeGo);
     }
 
     #[test]

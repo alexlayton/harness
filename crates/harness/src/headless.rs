@@ -74,17 +74,6 @@ fn cancel_on_sigint(cancel: CancellationToken) {
     });
 }
 
-/// Drive the headless event stream until the agent task closes the channel.
-/// Writes the answer to real stdout and maps the event stream to stderr per
-/// the stdout/stderr contract.  Returns the process exit code.
-#[allow(dead_code)]
-pub async fn drive_headless_events(
-    event_rx: mpsc::UnboundedReceiver<AgentEvent>,
-    verbose: bool,
-) -> ExitCode {
-    drive_headless_events_with_cancel(event_rx, verbose, None).await
-}
-
 /// Headless event driver variant that knows the application cancellation
 /// token, allowing it to discard a cancelled round's buffered prose.
 async fn drive_headless_events_with_cancel(
@@ -112,7 +101,7 @@ async fn drive_headless_events_with_cancel(
     result.unwrap_or(ExitCode::from(1))
 }
 
-/// Writer-injectable core of [`drive_headless_events`] so tests can assert the
+/// Writer-injectable core of the headless event driver so tests can assert the
 /// stdout/stderr split without touching the process streams.
 async fn drive_headless_events_into(
     mut event_rx: mpsc::UnboundedReceiver<AgentEvent>,
