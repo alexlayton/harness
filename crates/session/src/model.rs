@@ -209,15 +209,6 @@ impl SessionMetadata {
             usage: UsageSummary::default(),
         }
     }
-
-    pub fn with_id(mut self, id: SessionId) -> Self {
-        self.id = id;
-        self
-    }
-
-    pub fn short_id(&self) -> String {
-        self.id.short()
-    }
 }
 
 /// The role representation used by the stable session DTO.

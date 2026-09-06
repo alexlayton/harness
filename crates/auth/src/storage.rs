@@ -212,11 +212,6 @@ impl AuthStore {
         &self.path
     }
 
-    /// Read every provider entry.  A missing auth file is an empty store.
-    pub fn load(&self) -> Result<AuthEntries> {
-        self.load_unlocked()
-    }
-
     pub fn openai_codex(&self) -> Result<Option<OpenAiCodexCredential>> {
         let entries = self.load_unlocked()?;
         let Some(value) = entries.get(OPENAI_CODEX_PROVIDER_KEY) else {
@@ -301,19 +296,6 @@ impl AuthStore {
             source,
         })?;
         self.save_provider_value(COPILOT_PROVIDER_KEY, value)
-    }
-
-    pub fn remove_provider(&self, provider: &str) -> Result<bool> {
-        if !self.path.exists() {
-            return Ok(false);
-        }
-        let _lock = AuthFileLock::acquire(&self.path)?;
-        let mut entries = self.load_unlocked()?;
-        let removed = entries.remove(provider).is_some();
-        if removed {
-            self.write_unlocked(&entries)?;
-        }
-        Ok(removed)
     }
 
     fn parent_dir(&self) -> PathBuf {
@@ -693,7 +675,7 @@ mod tests {
             .save_provider_value("other", serde_json::json!({"token":"keep"}))
             .unwrap();
         store.save_copilot(&credential()).unwrap();
-        let entries = store.load().unwrap();
+        let entries = store.load_unlocked().unwrap();
         assert_eq!(entries["other"]["token"], "keep");
         assert!(entries.contains_key(COPILOT_PROVIDER_KEY));
     }

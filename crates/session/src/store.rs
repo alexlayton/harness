@@ -402,17 +402,6 @@ impl SessionStore {
         Ok(session)
     }
 
-    /// Load without applying this store's workspace filter.  This is used by
-    /// export/import tooling and is intentionally read-only.
-    pub fn load_any_path(path: &Path) -> Result<Session> {
-        let resolved = path
-            .canonicalize()
-            .map_err(|source| io_error("resolve session path", path, source))?;
-        let mut session = load_session_file(&resolved)?;
-        session.path = Some(resolved);
-        Ok(session)
-    }
-
     pub fn list(&self) -> Result<Vec<SessionIndexEntry>> {
         list_directory(&self.workspace_dir, Some(&self.workspace_root))
     }
