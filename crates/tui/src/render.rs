@@ -950,6 +950,40 @@ mod tests {
     }
 
     #[test]
+    fn combining_zwj_and_zero_width_text_never_exceeds_its_budget() {
+        // TUI-2 combining/ZWJ/zero-width contract: combining marks and ZWJ
+        // sequences cost their `UnicodeWidthChar` width (0 for combining
+        // and ZWJ, wide for the base) and must never push a row over
+        // budget — at any width, including 1–3.
+        let samples = [
+            // `e` + combining acute: renders as one cell.
+            "cafe\u{301} au lait",
+            // ZWJ family emoji: several codepoints, wide render width.
+            "👨‍👩‍👧‍👦 together",
+            // Zero-width joiner/space alone contribute no columns.
+            "a\u{200d}b\u{200b}c",
+            // Mixed: combining + wide + ZWJ + tabs + long indent.
+            "                    e\u{301} 你好\t👨‍👩‍👧‍👦",
+        ];
+        for width in [1usize, 2, 3, 5, 10, 40, 80] {
+            for sample in samples {
+                for lines in [
+                    wrap_text(&Text::from(Line::from(sample)), width, Style::default()),
+                    user_lines(sample, Theme::default(), width),
+                    markdown_lines(sample, Theme::default(), width),
+                    notice_lines(sample, Theme::default(), width),
+                    error_lines(sample, Theme::default(), width),
+                ] {
+                    assert!(
+                        lines.iter().all(|line| line_width(line) <= width),
+                        "width {width} sample {sample:?}: {lines:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fit_line_preserves_styles_while_dropping_wide_overflow() {
         let style = Style::default().fg(Theme::default().accent);
         let line = fit_line_to_width(&Line::from(Span::styled("a你b", style)), 2);
