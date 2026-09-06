@@ -3206,6 +3206,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_arriving_mid_turn_applies_before_the_queued_turn() {
+        // AGENT-4 anti-starvation: the run loop drains ready metadata
+        // before each queued operation (plus `select!` on metadata while
+        // idle), so a catalogue that lands while turn one runs is relayed
+        // before queued turn two completes — queued turns can never starve
+        // it indefinitely. Pinned at the `ModelList` relay level: the
+        // stale-guard window assertion lives in the switch test.
+        struct SlowMetadataProvider {
+            release: tokio::sync::Notify,
+            released: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for SlowMetadataProvider {
+            fn name(&self) -> &str {
+                "slow-meta"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                // Turn one parks until the test observes its request, so
+                // the release provably lands mid-turn.
+                if self.released.load(Ordering::SeqCst) == 0 {
+                    self.release.notified().await;
+                }
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("turn".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(vec![ModelInfo {
+                    id: "demo".into(),
+                    name: None,
+                    context_length: Some(777_777),
+                }])
+            }
+        }
+
+        let provider = Arc::new(SlowMetadataProvider {
+            release: tokio::sync::Notify::new(),
+            released: AtomicUsize::new(0),
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("first".into()))
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("second".into()))
+            .unwrap();
+        let agent_task = tokio::spawn(
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .run(input_rx, event_tx),
+        );
+        // Turn one's stream parks until released, so the release lands
+        // provably mid-turn one. The startup `list_models` resolves
+        // immediately, so its ModelList is already channel-queued; the run
+        // loop's `select!` relays it while turn one is parked — before
+        // queued turn two completes. Give turn one a beat to park, then
+        // release it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        provider.released.store(1, Ordering::SeqCst);
+        provider.release.notify_one();
+        drop(input_tx);
+        agent_task.await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // Both turns ran; the metadata relayed (ModelList) no later than
+        // before the second turn's completion — the drain-before-operation
+        // order means queued turns can never starve it. (The window-value
+        // assertion lives in `one_model_switch_produces_one_metadata_request`.)
+        let finished = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnFinished))
+            .count();
+        assert_eq!(finished, 2, "both queued turns must run: {events:?}");
+        let list_at = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ModelList { .. }));
+        let second_finish_at = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, AgentEvent::TurnFinished))
+            .map(|(index, _)| index)
+            .nth(1);
+        match (list_at, second_finish_at) {
+            (Some(list), Some(second)) => assert!(
+                list < second,
+                "metadata must relay before the queued turn completes"
+            ),
+            _ => panic!("missing ModelList relay or second finish: {events:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn hanging_metadata_fetch_never_blocks_command_processing() {
         // AGENT-4 non-blocking: a `list_models` that hangs past the 5s
         // bound must not freeze the command loop — queued turns still run
