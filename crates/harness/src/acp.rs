@@ -1556,6 +1556,11 @@ mod tests {
                     "a text-only turn must not emit tool calls: {seen:?}"
                 );
 
+                // HARNESS-1 is covered by a dedicated test below
+                // (`mid_stream_provider_error_fails_the_prompt`); the load
+                // round-trip needs the connection here, so keep this test
+                // to the happy path + persistence.
+
                 // The turn was persisted under our session id. The first
                 // connection owns the live agent, so use a fresh connection
                 // to exercise the real `session/load` path.
@@ -1599,6 +1604,91 @@ mod tests {
                     },
                 )
                 .await;
+            })
+            .await;
+    }
+
+    /// A mid-stream provider error must surface as a failed prompt — with
+    /// the error diagnostic visible — never as a successful blank EndTurn.
+    /// The scripted turn emits text, then a stream error, then the agent
+    /// closes the turn with its own Error event + TurnFinished.
+    #[tokio::test(flavor = "current_thread")]
+    async fn mid_stream_provider_error_fails_the_prompt() {
+        use tokio::task::LocalSet;
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let workspace = tempdir().unwrap();
+                let DuplexPair {
+                    server_reader,
+                    server_writer,
+                    client_reader,
+                    client_writer,
+                } = duplex_pair();
+
+                let provider = Arc::new(ScriptProvider {
+                    calls: AtomicUsize::new(0),
+                    scripts: vec![vec![
+                        Ok(StreamEvent::TextDelta("partial".into())),
+                        Err("provider exploded".into()),
+                    ]],
+                });
+                let session_root = workspace.path().join("sessions");
+                tokio::task::spawn_local({
+                    let provider: Arc<dyn Provider> = provider.clone();
+                    async move {
+                        let _ = serve(
+                            provider,
+                            acp_config(),
+                            None,
+                            true,
+                            session_root,
+                            ByteStreams::new(server_writer, server_reader),
+                        )
+                        .await
+                        .inspect_err(|error| eprintln!("server error: {error:#}"));
+                    }
+                });
+                let (response, mut updates) = run_client_side(
+                    ByteStreams::new(client_writer, client_reader),
+                    async |cx: ConnectionTo<agent_client_protocol::Agent>,
+                           updates: mpsc::UnboundedReceiver<SessionUpdate>| {
+                        cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                            .block_task()
+                            .await
+                            .expect("initialize");
+                        let new_session = cx
+                            .send_request(NewSessionRequest::new(workspace.path()))
+                            .block_task()
+                            .await
+                            .expect("session/new");
+                        let prompt_result = cx
+                            .send_request(PromptRequest::new(
+                                new_session.session_id.clone(),
+                                vec![text_block("fail please")],
+                            ))
+                            .block_task()
+                            .await;
+                        Ok((prompt_result, updates))
+                    },
+                )
+                .await;
+                assert!(
+                    response.is_err(),
+                    "a failed turn must not resolve as successful blank output"
+                );
+                let mut seen = Vec::new();
+                while let Ok(update) = updates.try_recv() {
+                    seen.push(update);
+                }
+                assert!(
+                    seen.iter().any(|update| matches!(
+                        update,
+                        SessionUpdate::AgentMessageChunk(chunk)
+                            if matches!(&chunk.content, ContentBlock::Text(t) if t.text.contains("provider exploded"))
+                    )),
+                    "the error diagnostic must be visible: {seen:?}"
+                );
             })
             .await;
     }
