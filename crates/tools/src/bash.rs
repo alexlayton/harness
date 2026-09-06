@@ -853,4 +853,60 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
         assert!(!marker.exists(), "descendant wrote after cancel");
     }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn held_stdout_and_stderr_share_one_drain_deadline() {
+        // A survivor detached into a new session (`setsid`) inherits both
+        // pipes but escapes the invocation's process group, so group
+        // teardown cannot reap it and both drain readers stay parked. Both
+        // streams must resolve under one shared `DRAIN_TIMEOUT` (~1s): two
+        // sequential per-stream waits would take ~2s instead.
+        //
+        // The survivor is backgrounded so the outer shell can exit; the
+        // trailing `sleep 1` keeps the shell alive long enough for the
+        // survivor to detach before group teardown signals the old group.
+        // True timeline is ~1s (outer sleep) + ~1s (shared drain) ~= 2s:
+        // an early EOF would finish at ~1s, sequential drains at ~3s.
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("drain-survivor.pid");
+        let started = std::time::Instant::now();
+        let output = BashTool::with_workspace_root(directory.path())
+            .execute(
+                json!({
+                    "command": format!(
+                        "setsid sleep 15 & echo $! > {}; sleep 1",
+                        pid_file.display()
+                    ),
+                    "timeout": 30,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        // Reap the detached survivor before asserting so a failure cannot
+        // leak a pipe-holding `sleep` into later tests.
+        if let Ok(text) = std::fs::read_to_string(&pid_file)
+            && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+        {
+            // SAFETY: the pid came from the survivor spawned above; SIGKILL
+            // targets that process only.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(!output.is_error, "{}", output.content);
+        // The lower bound proves both pipes were actually held through the
+        // drain (an early EOF would finish at ~1s); the upper bound proves
+        // both streams shared one deadline instead of two sequential waits
+        // (~3s).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_500),
+            "pipes were not actually held open: finished in {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_900),
+            "stdout+stderr did not share one drain deadline: took {elapsed:?}"
+        );
+    }
 }
