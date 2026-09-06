@@ -8,7 +8,7 @@ use crate::model::{
 };
 use fs2::FileExt;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -692,8 +692,51 @@ struct IndexEnvelope {
     event_id: Option<String>,
     sequence: Option<u64>,
     timestamp: Option<String>,
+    data: Option<Box<RawValue>>,
+}
+
+#[derive(Deserialize)]
+struct IndexedContent {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    text: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexedMessage {
     #[serde(default)]
-    data: Value,
+    content: Vec<IndexedContent>,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexedModelChange {
+    provider: Option<String>,
+    model: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexedMetadataChange {
+    title: Option<String>,
+}
+
+fn indexed_data(data: Option<&RawValue>) -> &str {
+    data.map_or("{}", |data| data.get())
+}
+
+fn index_title(value: &str) -> String {
+    let first_line = value
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(value)
+        .trim();
+    if first_line.len() <= 80 {
+        return first_line.to_owned();
+    }
+    let mut end = 79;
+    while end > 0 && !first_line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &first_line[..end])
 }
 
 /// Read only the metadata needed by the session picker. This deliberately
@@ -724,7 +767,7 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
             .session_id
             .as_deref()
             .and_then(|value| SessionId::parse(value).ok()),
-        serde_json::from_value::<SessionMetadata>(header.data),
+        serde_json::from_str::<SessionMetadata>(indexed_data(header.data.as_deref())),
     ) {
         (Some(id), Ok(metadata)) if id == metadata.id => (id, metadata),
         _ => return Ok(None),
@@ -783,30 +826,42 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
         expected_sequence = expected_sequence.saturating_add(1);
         match kind {
             "user_message" | "assistant_message" => {
-                has_conversation |= raw
-                    .data
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .is_some_and(|content| !content.is_empty());
+                let message =
+                    serde_json::from_str::<IndexedMessage>(indexed_data(raw.data.as_deref()))
+                        .unwrap_or_default();
+                if !message.content.is_empty() {
+                    has_conversation = true;
+                    if title.is_none() && kind == "user_message" {
+                        title = message
+                            .content
+                            .iter()
+                            .filter_map(|content| {
+                                (content.kind.as_deref() == Some("text"))
+                                    .then_some(content.text.as_deref())
+                                    .flatten()
+                            })
+                            .find(|text| !text.trim().is_empty())
+                            .map(index_title);
+                    }
+                }
             }
             "reasoning" | "tool_call" | "tool_result" | "compaction" => {
                 has_conversation = true;
             }
             "model_change" => {
-                if let (Some(next_provider), Some(next_model)) = (
-                    raw.data.get("provider").and_then(Value::as_str),
-                    raw.data.get("model").and_then(Value::as_str),
-                ) {
-                    provider = Some(next_provider.to_owned());
-                    model = Some(next_model.to_owned());
+                if let Ok(change) =
+                    serde_json::from_str::<IndexedModelChange>(indexed_data(raw.data.as_deref()))
+                {
+                    provider = change.provider;
+                    model = change.model;
                 }
             }
             "metadata_change" => {
-                title = raw
-                    .data
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                title = serde_json::from_str::<IndexedMetadataChange>(indexed_data(
+                    raw.data.as_deref(),
+                ))
+                .ok()
+                .and_then(|change| change.title);
             }
             _ => {}
         }
@@ -832,6 +887,36 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
     }))
 }
 
+fn index_from_session(session: &Session, path: &Path) -> SessionIndexEntry {
+    let has_conversation = session.events.iter().any(|record| match &record.event {
+        SessionEvent::UserMessage { message } | SessionEvent::AssistantMessage { message } => {
+            !message.content.is_empty()
+        }
+        SessionEvent::Reasoning { text } => !text.trim().is_empty(),
+        SessionEvent::ToolCall { .. }
+        | SessionEvent::ToolResult { .. }
+        | SessionEvent::CompactionSummary { .. } => true,
+        _ => false,
+    });
+    SessionIndexEntry {
+        id: session.id(),
+        short_id: session.id().short(),
+        title: session.title().map(str::to_owned),
+        workspace_root: session.metadata.workspace_root.clone(),
+        created_at: session.metadata.created_at.clone(),
+        updated_at: session.metadata.updated_at.clone(),
+        provider: session.metadata.provider.clone(),
+        model: session.metadata.model.clone(),
+        parent_session: session.metadata.parent_session,
+        event_count: session.events.len(),
+        has_conversation,
+        path: path.to_path_buf(),
+        bytes: fs::metadata(path)
+            .map(|metadata| metadata.len())
+            .unwrap_or_default(),
+    }
+}
+
 fn list_directory(directory: &Path, workspace: Option<&Path>) -> Result<Vec<SessionIndexEntry>> {
     if !directory.exists() {
         return Ok(Vec::new());
@@ -845,8 +930,23 @@ fn list_directory(directory: &Path, workspace: Option<&Path>) -> Result<Vec<Sess
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Some(entry) = index_file(&path, workspace)? {
-            result.push(entry);
+        match index_file(&path, workspace)? {
+            Some(entry) => result.push(entry),
+            None => {
+                // A torn final JSONL line is recoverable for reads even
+                // though the metadata-only scanner cannot parse that line.
+                // Fall back to the recovery-aware loader; terminated or
+                // middle-file corruption still remains excluded.
+                if let Ok(session) = load_session_file(&path)
+                    && workspace.is_none_or(|workspace| {
+                        normalize_workspace(session.metadata.workspace_root.clone())
+                            .ok()
+                            .is_some_and(|root| root == workspace)
+                    })
+                {
+                    result.push(index_from_session(&session, &path));
+                }
+            }
         }
     }
     result.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
@@ -1250,6 +1350,13 @@ mod tests {
                 .unwrap()
                 .has_conversation
         );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == session.id())
+                .and_then(|entry| entry.title.as_deref()),
+            Some("hello")
+        );
         assert!(
             !entries
                 .iter()
@@ -1519,7 +1626,10 @@ mod tests {
             .unwrap()
             .write_all(b"{\"version\":1,\"type\":\"user_message\"")
             .unwrap();
-        // Loading alone does not mutate the file.
+        // Listing and loading alone do not mutate the file; listing falls
+        // back to the recovery-aware loader for the torn final line.
+        let entries = store.list().unwrap();
+        assert!(entries.iter().any(|entry| entry.id == session.id()));
         let loaded = store.open(&session.id()).unwrap();
         assert_eq!(loaded.events, valid_events);
         let raw = fs::read_to_string(&path).unwrap();
