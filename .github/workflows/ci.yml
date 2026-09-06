@@ -46,7 +46,10 @@ jobs:
 
   test:
     name: Test (Linux)
-    runs-on: ubuntu-latest
+    # Pinned to the release baseline (Ubuntu 22.04 / glibc 2.35) so CI
+    # validates the same runtime the GNU artifact ships on. Do not move
+    # this to ubuntu-latest without intentionally changing that baseline.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Select stable Rust
@@ -65,7 +68,8 @@ jobs:
 
   build:
     name: Build (Linux)
-    runs-on: ubuntu-latest
+    # Same pinned baseline as Test (Linux) above; see that comment.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Select stable Rust
