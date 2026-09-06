@@ -93,8 +93,10 @@ context_window = 0
 
 `threshold` must be finite and between `0.0` and `1.0`. Summary byte limits
 must be nonzero and no larger than 16 MiB for input or 1 MiB for output.
-When both are set, `reserve_tokens` must be smaller than a nonzero
-`context_window`. Zero `keep_recent_turns` and `keep_recent_tokens` are
+`reserve_tokens` must be smaller than the effective context window: an
+explicit nonzero `context_window` is checked directly, and an explicit
+window also bounds the default reserve (so `context_window = 8000` alone
+is rejected). Zero `keep_recent_turns` and `keep_recent_tokens` are
 allowed: they request the smallest valid retained provider-history tail.
 Invalid values identify their exact `[compaction]` key and prevent startup.
 
