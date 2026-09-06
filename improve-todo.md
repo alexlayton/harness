@@ -146,7 +146,7 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - `tui/commands.rs:parse_command_with_skills` alias only if `rest.is_empty()` + non-colliding else `parse_command` error (never silently drops); `paths.rs:extract_at_prefix token_end` stops at `whitespace/) ] } , ;` (preserves punctuation); `app.rs:1093-1200 request/apply_path_completion` debounced `200ms`+`spawn_blocking`+`generation/cancel`, merges static `candidates_at_cursor` + `find_path_candidates` via `merge_candidates` (`/load ./…` + session IDs); `~3992 direct_provider_prefix_requests_its_model_catalogue`; `tool_lines` expanded `output_tail` + `error.lines().skip(1).take(TAIL)` + `running…`, collapsed first-line only.
 - Fixes: skill-alias trailing text now errors `usage: /<skill> (takes no arguments)` instead of misleading `unknown command`; `request_backend` also fires on partially typed `provider:model` (not just bare `provider:`); `load_completion_combines_session_and_filesystem_context` now asserts real filesystem candidates + session-ID retention through `merge_candidates`.
 
-## Phase 7 — Token/memory/startup
+## Phase 7 — Token/memory/startup — DONE
 
 ### PERF-3 MCP bounds — DONE
 - `mcp/config.rs`: `Debug` redacts `args/env` counts, `redact_url`, `MAX_SERVERS 64/1MiB`, name/control checks; `runtime.rs`: `MCP_INITIALIZE/LIST/SHUTDOWN_TIMEOUT`, `JoinSet` concurrent connect + sorted order, `join_all+timeout` single global shutdown, `spawn_stderr_reader` bounded `MCP_STDERR_CHUNK_BYTES` byte-count only (`debug bytes`); `list_tools_bounded timeout_at` + `MAX_REMOTE_TOOLS 256` + `validate_remote_tool` byte accounting; `tool.rs`: `MAX_NAME/DESC/SCHEMA_DEPTH 32/NODES 10k/STRING 64k/BYTES 256k`; `output.rs`: `OutputWriter MAX 20k+notice`, `utf8_prefix_len`, compact `to_writer`, `structured_duplicates_text`, `cap_display` same budget.
@@ -154,13 +154,14 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 ### PERF-4 Startup context once — DONE
 - `main.rs:context::load_context_bundle(workspace,cwd,no_files,interactive?)` once, `rendered/display_paths` reused; `headless_with_prompt` takes `prompt+project_context` (no second discovery; `project_context_for` only in `#[cfg(test)]`); ACP returns before registry/store/context; `resolved_prompt` before store/registry (blank→no mutation); sync `join!` replaced (comment "only ceremony"); worktree env-normalize `set_var` before `chdir`.
 
-### PERF-5 Session append/listing — PARTIAL
-- DONE per `completed.md:9` + `session/benches/store.rs`: streamed indexing + incremental append validation (`reconcile only appended tails`, `validate current appends incrementally`, `stream index metadata`, `avoid cloning validation history`, `listing recovery-aware metadata-only`).
-- OUTSTANDING: 1k/10k near-linear benchmarks + deeper external-file reconciliation (two-stores-stale, replacement/truncation safe-full-validation, no full-history clone for metadata booleans).
+### PERF-5 Session append/listing — DONE
+- DONE: streamed indexing + incremental append validation (`reconcile only appended tails`, `validate current appends incrementally`, `stream index metadata`, `avoid cloning validation history`, `listing recovery-aware metadata-only`).
+- Tests: `two_stores_append_alternately_without_duplicate_sequences` (two `SessionStore` handles, one root/workspace, alternate 20 appends → sequences 1..=20, no dup; idle cursor converges on next append); `corrupt_replacement_is_rejected_by_full_validation` (garbage replacement bytes → append `Err`, file untouched, stale view gains nothing); `listing_reports_conversation_without_materializing_payloads` (4MB tool result lists with `has_conversation`, event_count 2, <1s — metadata-only scanner never builds messages).
+- Benches (`session/benches/store.rs`): 1k/10k alternating appends + listing with 4KiB tool outputs, now asserting near-linear scaling (10× turns < 40× time; measured ~10×/~11× debug). Run via `cargo bench -p session` (custom harness, not part of `cargo test`).
 
-### PERF-6 Subagent + TUI rendering — PARTIAL
-- Subagent DONE per `completed.md:10` (`perf(agent): bound subagent context growth`, reserve for final synthesis, truncate old evidence).
-- TUI PARTIAL: `StreamMarkdownCache/refresh_stream_markdown_cache`, `history_window` newest→oldest budget-stop + `…older rows above`, `output_tail` bounded tail present; but `output_tail: lines().count()` full walk, no quadratic-guard benchmarks/instrumentation.
+### PERF-6 Subagent + TUI rendering — DONE
+- Subagent DONE (`perf(agent): bound subagent context growth`, reserve for final synthesis, truncate old evidence).
+- TUI DONE: `StreamMarkdownCache/refresh_stream_markdown_cache`, `history_window` newest→oldest budget-stop + `…older rows above`; `output_tail` rewritten from-the-end (rfind-located tail + `memchr` head count, no per-line allocation; ~2.5× faster release, ~7× debug on 100k lines) with parity test (`output_tail_matches_front_anchored_semantics` over 10 edge inputs) + quadratic guard (`output_tail_scales_with_the_tail_not_the_output`: 100k vs 25k lines < 10×). `memchr` added to `tui` deps (already in tree via `ignore`/`regex`, no new transitive weight).
 
 ## Phase 8 — Cleanup — PARTIAL
 - DONE: several dep removals (`eventsource-stream/nom`, `tracing` in `tui`, `tempfile` in `compact`, `ring`/`tokio-util/compat`/`base64` — verify via `cargo tree --duplicates`), redundant compact token surfaces (`estimate_text_tokens`, `estimated_tokens_freed`), shared dispatch/lifecycle/scan-waits refactors (`refactor: remove dead runtime surfaces and share scan waits`, `chore: remove unused session and auth APIs`).
@@ -180,7 +181,6 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - `completed.md` admits outstanding. Need: model-assisted compaction + deterministic fallback (remove "absent" claim), read-only subagents `multigrep` scope, exact no-session compaction, shell exclusivity + tree-kill, MCP catalogue/output/time limits, Linux baseline, headless-stdout + ACP-purity. Files: `ARCHITECTURE.md`, `crates/session/README.md`, `docs/configuration.md`, `README.md`.
 
 ## Remaining TODO (ordered)
-1. Phases 2–6 DONE. Next: PERF-5 benches (1k/10k) + external/replacement reconciliation; PERF-6 TUI quadratic guard.
-2. CONFIG-1 nested-extra matrix + concurrent-mutator tests; CLEANUP-1 `cargo tree --duplicates` verify + remaining removals; CLEANUP-2/3/4 sweeps.
-3. CI-1 workflow verify + Linux baseline; DOCS-1 contracts.
-4. Re-run before handoff: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo build --workspace --locked`, `cargo tree --workspace --duplicates`, `git diff --check`.
+1. Phases 2–7 DONE. Next: CONFIG-1 nested-extra matrix + concurrent-mutator tests; CLEANUP-1 `cargo tree --duplicates` verify + remaining removals; CLEANUP-2/3/4 sweeps.
+2. CI-1 workflow verify + Linux baseline; DOCS-1 contracts.
+3. Re-run before handoff: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo build --workspace --locked`, `cargo tree --workspace --duplicates`, `git diff --check`.
