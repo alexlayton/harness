@@ -120,8 +120,11 @@ prevent overlapping writes.
 
 `mcp` starts configured stdio servers during assembly, discovers their tools,
 namespaces them, and registers adapters in the same registry. MCP calls are
-exclusive. Tool-list changes require a new connection, and MCP tools are not
-passed to subagents.
+exclusive. Limits: 15-second initialize/catalogue deadlines, 60-second call
+deadline, four-second global shutdown; at most 256 tools and 512 KiB of
+aggregate definitions per server; schemas bounded by depth, node count, and
+string/total size; output compacted and capped at 20 KiB. Tool-list changes
+require a new connection, and MCP tools are not passed to subagents.
 
 The subagent schema lives in `tools`, while its runner lives in `agent` to
 preserve dependency direction. Important invariants are:
@@ -132,6 +135,9 @@ preserve dependency direction. Important invariants are:
 - Children cannot create subagents.
 - Each child gets fresh model context and bounded turns/context; older tool
   evidence is compacted or truncated before the final synthesis request.
+  A cancelled compaction persists neither a summary nor usage; without a
+  session, automatic compaction is disabled and `/compact` reports that it
+  is unavailable.
 - Tool call IDs remain stable through scheduling, UI events, and persistence.
 - Child sessions link to their parent, but child usage is not added to parent
   totals.
