@@ -119,6 +119,19 @@ impl OpenAiCodexAuth {
         self.endpoints = endpoints;
         self
     }
+    /// Test seam: same client against a local fixture so refresh tests
+    /// exercise the real `ensure_valid` path with one network exchange.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_http_and_endpoints(
+        mut self,
+        http: Client,
+        endpoints: OpenAiCodexEndpoints,
+    ) -> Self {
+        self.http = http;
+        self.endpoints = endpoints;
+        self
+    }
     pub fn credential(&self) -> Result<Option<OpenAiCodexCredential>> {
         if let Some(value) = self
             .credential

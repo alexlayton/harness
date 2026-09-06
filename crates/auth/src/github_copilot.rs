@@ -155,6 +155,24 @@ impl GithubCopilotClient {
         Self::from_endpoints(CopilotEndpoints::for_domain(None)?)
     }
 
+    /// Test seam: build a client whose token exchange and model discovery
+    /// hit injectable endpoints (local fixture), keeping production
+    /// endpoint construction untouched. `CopilotAuth` uses this in tests so
+    /// concurrent `ensure_valid` exercises the real `refresh` path.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_client_and_endpoints(
+        http: Client,
+        endpoints: CopilotEndpoints,
+    ) -> Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Ok(Self {
+            http,
+            endpoints,
+            api_base_url: None,
+        })
+    }
+
     pub fn with_endpoints(endpoints: CopilotEndpoints) -> Result<Self> {
         Self::from_endpoints(endpoints)
     }
@@ -826,6 +844,21 @@ impl CopilotAuth {
         Ok(Self {
             store,
             client: GithubCopilotClient::new()?,
+            credential: Arc::new(Mutex::new(credential)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    /// Test seam: same construction with an injected HTTP client and
+    /// endpoints so refresh tests hit a local fixture through the real
+    /// `ensure_valid` path instead of reimplementing the guard inline.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_client(store: AuthStore, client: GithubCopilotClient) -> Result<Self> {
+        let credential = store.copilot()?;
+        Ok(Self {
+            store,
+            client,
             credential: Arc::new(Mutex::new(credential)),
             refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
