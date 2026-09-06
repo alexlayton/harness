@@ -73,9 +73,10 @@ impl Agent {
         // Pre-turn auto-compaction trigger: run *before* the request is built
         // (never mid-stream), so provider-history validity is trivial. Exact
         // context from the last request when available, plus the new message
-        // this turn is about to add.
-        if self.should_auto_compact(&user_text) {
-            let context = self.context_tokens_estimate(user_text.len());
+        // this turn is about to add. The estimate is computed once and
+        // threaded through the percent notice and `compact_and_reload` so
+        // one pre-turn scans the live range a single time (PERF-1).
+        if let Some(context) = self.should_auto_compact(&user_text) {
             let percent = if self.context_window > 0 {
                 ((context as f64 / self.context_window as f64) * 100.0) as u32
             } else {
@@ -92,6 +93,7 @@ impl Agent {
                     cancel,
                     CompactionReason::Auto,
                     user_text.len(),
+                    Some(context),
                 );
                 tokio::pin!(compaction);
                 loop {

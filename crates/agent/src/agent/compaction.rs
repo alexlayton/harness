@@ -75,18 +75,21 @@ impl Agent {
     }
 
     /// Whether the pre-turn auto-compaction trigger fires for a turn adding
-    /// `user_text`.
-    pub(crate) fn should_auto_compact(&self, user_text: &str) -> bool {
+    /// `user_text`. Returns the estimate alongside the decision so callers
+    /// that fire can reuse it (percent notice, `compact_and_reload`) instead
+    /// of re-scanning the same live range (PERF-1 single-scan pre-turn).
+    pub(crate) fn should_auto_compact(&self, user_text: &str) -> Option<u64> {
         if !self.compaction.auto || self.session.is_none() {
             // Automatic compaction is a durable-history operation. With
             // --no-session there is no event boundary to persist, so leave
             // the in-memory conversation alone rather than emitting the same
             // failure on every subsequent turn.
-            return false;
+            return None;
         }
         let context = self.context_tokens_estimate(user_text.len());
         self.compaction
             .should_auto_compact(context, self.context_window)
+            .then_some(context)
     }
 
     /// Shared compaction routine used by the pre-turn trigger, manual
@@ -94,13 +97,17 @@ impl Agent {
     /// deterministic fallback), persists the summary + the summarizer's usage,
     /// and rebuilds `self.history` from the new boundary. Returns `false`
     /// (with a `Notice`) when there is nothing to compact or persistence
-    /// failed.
+    /// failed. Callers that already hold a fresh [`Self::should_auto_compact`]
+    /// estimate pass it via `estimated_context` to avoid re-scanning the
+    /// same live range (PERF-1 single-scan pre-turn); other callers pass
+    /// `None` and pay for one estimate here.
     pub(crate) async fn compact_and_reload(
         &mut self,
         events: &mpsc::UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         reason: CompactionReason,
         extra_bytes: usize,
+        estimated_context: Option<u64>,
     ) -> Result<bool, TurnError> {
         let Some(state) = self.session.as_ref() else {
             send(
@@ -114,7 +121,10 @@ impl Agent {
         // Keep the pending user input in the same estimate that triggered
         // pre-turn compaction; otherwise planning can incorrectly conclude
         // that the history fits and send the oversized request anyway.
-        let estimated = self.context_tokens_estimate(extra_bytes);
+        // Reuse the trigger's estimate when the caller already computed it
+        // so one pre-turn scans the live range once (PERF-1).
+        let estimated =
+            estimated_context.unwrap_or_else(|| self.context_tokens_estimate(extra_bytes));
         let Some(plan) = plan_compaction(&session, &self.compaction, estimated) else {
             send(events, AgentEvent::Notice("nothing to compact yet".into()));
             return Ok(false);
@@ -212,7 +222,7 @@ impl Agent {
         }
         *attempts += 1;
         if self
-            .compact_and_reload(events, cancel, CompactionReason::Overflow, 0)
+            .compact_and_reload(events, cancel, CompactionReason::Overflow, 0, None)
             .await?
         {
             send(

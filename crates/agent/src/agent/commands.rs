@@ -212,7 +212,7 @@ impl Agent {
             );
             return Ok(());
         }
-        self.compact_and_reload(events, cancel, CompactionReason::Manual, 0)
+        self.compact_and_reload(events, cancel, CompactionReason::Manual, 0, None)
             .await
             .map(|_| ())
     }
