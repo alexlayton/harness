@@ -429,16 +429,12 @@ fn apply_edits_exact(content: &str, edits: &[Edit], path: &str) -> Result<Applie
 
     let mut matched_edits = Vec::with_capacity(edits.len());
     for (index, edit) in edits.iter().enumerate() {
-        let first = content
-            .find(&edit.old_text)
-            .ok_or_else(|| not_found_error(path, index, edits.len()))?;
-        if content[first + edit.old_text.len()..].contains(&edit.old_text) {
-            return Err(duplicate_error(
-                path,
-                index,
-                edits.len(),
-                count_occurrences(content, &edit.old_text),
-            ));
+        let occurrences = match_positions(content, &edit.old_text);
+        let Some(&first) = occurrences.first() else {
+            return Err(not_found_error(path, index, edits.len()));
+        };
+        if occurrences.len() > 1 {
+            return Err(duplicate_error(path, index, edits.len(), occurrences.len()));
         }
         matched_edits.push(MatchedEdit {
             edit_index: index,
@@ -482,17 +478,14 @@ fn apply_replacements(content: &str, replacements: &[MatchedEdit]) -> String {
     result
 }
 
-fn count_occurrences(content: &str, old_text: &str) -> usize {
+fn match_positions(content: &str, old_text: &str) -> Vec<usize> {
     if old_text.is_empty() {
-        return 0;
+        return Vec::new();
     }
-    let mut count = 0;
-    let mut offset = 0;
-    while let Some(index) = content[offset..].find(old_text) {
-        count += 1;
-        offset += index + old_text.len();
-    }
-    count
+    content
+        .char_indices()
+        .filter_map(|(index, _)| content[index..].starts_with(old_text).then_some(index))
+        .collect()
 }
 
 fn strip_bom(content: &str) -> (&str, &str) {
@@ -739,7 +732,7 @@ mod tests {
     async fn rejects_missing_duplicate_overlap_and_empty_matches() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("file.txt");
-        fs::write(&path, "same\nsame\nabcdef\n").unwrap();
+        fs::write(&path, "same\nsame\nabcdef\naaa\n").unwrap();
 
         let cases = [
             (
@@ -748,6 +741,10 @@ mod tests {
             ),
             (
                 json!([{"oldText":"same", "newText":"x"}]),
+                "Found 2 occurrences",
+            ),
+            (
+                json!([{"oldText":"aa", "newText":"x"}]),
                 "Found 2 occurrences",
             ),
             (
@@ -770,7 +767,10 @@ mod tests {
             assert!(output.is_error, "unexpected success: {}", output.content);
             assert!(output.content.contains(expected), "{}", output.content);
         }
-        assert_eq!(fs::read_to_string(path).unwrap(), "same\nsame\nabcdef\n");
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "same\nsame\nabcdef\naaa\n"
+        );
     }
 
     #[cfg(unix)]
