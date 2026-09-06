@@ -224,6 +224,17 @@ impl SubagentRunnerImpl {
         state.model = model.into();
     }
 
+    /// Current child-target model (test seam for AGENT-4 atomicity: proves
+    /// a failed parent persist leaves future children on the old model).
+    #[cfg(test)]
+    pub fn model_for_test(&self) -> String {
+        self.model_state
+            .read()
+            .expect("subagent model state lock poisoned")
+            .model
+            .clone()
+    }
+
     /// Retarget future child runs after `/reasoning` changes.
     pub fn update_reasoning(&self, reasoning: ReasoningPolicy) {
         self.model_state

@@ -3009,4 +3009,90 @@ mod tests {
                 .any(|event| matches!(event, AgentEvent::CompactionFinished { .. }))
         );
     }
+
+    #[tokio::test]
+    async fn failed_model_change_persist_leaves_parent_and_subagent_unchanged() {
+        // AGENT-4 atomicity: `handle_set_model` resolves without mutating,
+        // persists `ModelChange` first, and only commits after persistence
+        // succeeds. A failed persist (deleted session file) leaves parent
+        // provider/model AND the subagent runner on the old selection.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_id = session.id();
+        let old_provider: Arc<dyn llm::Provider> = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let new_provider: Arc<dyn llm::Provider> = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let factory: crate::agent::ProviderFactory = Arc::new(move |name: &str| {
+            assert_eq!(name, "other");
+            Ok(new_provider.clone())
+        });
+        let runner = Arc::new(crate::subagent::SubagentRunnerImpl::new(
+            old_provider.clone(),
+            "old-model",
+            std::fs::canonicalize(workspace.path()).unwrap(),
+            false,
+            "",
+            crate::assembly::SubagentPolicy::default(),
+            None,
+            None,
+        ));
+        let runner_model = || runner.model_for_test();
+        // Delete the session file so the `ModelChange` persist fails.
+        let path = session.file_path().unwrap().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::SetModel {
+                provider: Some("other".into()),
+                model: "new-model".into(),
+            })
+            .unwrap();
+        drop(input_tx);
+        let mut agent = Agent::new(old_provider.clone(), ToolRegistry::empty(), "demo", cancel)
+            .with_provider_factory(factory)
+            .with_subagent_runner(runner.clone())
+            .with_session(store.clone(), session);
+        // Drive one step manually: the boundary quarantines on the failed
+        // persist instead of committing.
+        agent
+            .handle_set_model_boundary(Some("other".into()), "new-model".into(), &event_tx)
+            .await;
+        let _ = input_rx;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(message) if message.contains("session persistence failed")
+            )),
+            "expected a persistence error: {events:?}"
+        );
+        assert_eq!(agent.model, "demo", "parent model must not move");
+        assert!(
+            Arc::ptr_eq(&agent.provider, &old_provider),
+            "parent provider must not move"
+        );
+        assert_eq!(runner_model(), "old-model", "subagent runner must not move");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelChanged { .. })),
+            "no commit event on failed persist: {events:?}"
+        );
+        // And nothing was appended to the (deleted-file) session.
+        assert!(store.open(&session_id).is_err());
+    }
 }
