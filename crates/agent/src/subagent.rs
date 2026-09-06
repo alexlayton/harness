@@ -33,6 +33,7 @@ use crate::agent::{
 use crate::assembly::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
 use async_trait::async_trait;
+use compact::estimate_provider_context_tokens;
 use futures_util::stream::StreamExt;
 use llm::{
     CompletionRequest, Content, Message, Provider, ReasoningPolicy, RetryCallback, Role,
@@ -54,6 +55,57 @@ use tools::{
 /// large enough for a thorough audit, small enough not to blow the parent's
 /// context when several reports land in one turn.
 const REPORT_MAX_BYTES: usize = 20_000;
+/// Child requests are bounded independently of the parent's context window so
+/// repeated large reads cannot consume the entire parent turn.
+const CHILD_CONTEXT_MAX_TOKENS: u64 = 100_000;
+/// Reserve room for the final report request while exploration tools are used.
+const CHILD_FINAL_REPORT_RESERVE_TOKENS: u64 = 8_000;
+const CHILD_TOOL_EVIDENCE_MAX_BYTES: usize = 8_000;
+
+/// Bound a child's live provider history without rewriting its durable
+/// transcript. Tool evidence is truncated first; then complete old exchanges
+/// are removed while preserving the original user request and the newest
+/// evidence for synthesis.
+fn bound_child_history(
+    history: &mut Vec<Message>,
+    system: &str,
+    registry: &ToolRegistry,
+    max_tokens: u64,
+) {
+    let definitions = registry.definitions();
+    let estimate =
+        |history: &[Message]| estimate_provider_context_tokens(Some(system), &definitions, history);
+    for message in history.iter_mut() {
+        for content in &mut message.content {
+            if let Content::ToolResult { content, .. } = content
+                && content.len() > CHILD_TOOL_EVIDENCE_MAX_BYTES
+            {
+                *content = truncate_utf8(content, CHILD_TOOL_EVIDENCE_MAX_BYTES);
+            }
+        }
+    }
+
+    while estimate(history) > max_tokens && history.len() > 1 {
+        let mut end = 2.min(history.len());
+        while end < history.len() && history[end].role == Role::Tool {
+            end += 1;
+        }
+        history.drain(1..end);
+    }
+
+    // A very large initial prompt can exceed the bound by itself. Preserve its
+    // role and trim only its text as a final fallback rather than producing an
+    // empty provider request.
+    if estimate(history) > max_tokens
+        && let Some(message) = history.first_mut()
+    {
+        for content in &mut message.content {
+            if let Content::Text(text) = content {
+                *text = truncate_utf8(text, CHILD_TOOL_EVIDENCE_MAX_BYTES);
+            }
+        }
+    }
+}
 
 /// One delegated subagent run.
 pub(crate) struct SubagentRun {
@@ -389,6 +441,12 @@ impl SubagentRunnerImpl {
             // The note is request-local (not durable child history), and an
             // empty tool list makes the expected terminal action unambiguous.
             let final_report_turn = turns == self.config.max_turns;
+            let context_budget = if final_report_turn {
+                CHILD_CONTEXT_MAX_TOKENS
+            } else {
+                CHILD_CONTEXT_MAX_TOKENS.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS)
+            };
+            bound_child_history(history, system, registry, context_budget);
             let mut request_messages = history.clone();
             if final_report_turn {
                 push_request_note(
@@ -871,6 +929,28 @@ mod tests {
                 .unwrap()
                 .contains("Complete the task with the available tools")
         );
+    }
+
+    #[test]
+    fn child_history_budget_discards_old_tool_evidence() {
+        let registry = ToolRegistry::empty();
+        let mut history = vec![Message::user("original task")];
+        for index in 0..6 {
+            history.push(Message::assistant(vec![Content::Text(format!(
+                "analysis {index}"
+            ))]));
+            history.push(Message::tool_result(
+                format!("call-{index}"),
+                "x".repeat(20_000),
+                false,
+            ));
+        }
+        bound_child_history(&mut history, "system", &registry, 100);
+        let estimate =
+            estimate_provider_context_tokens(Some("system"), &registry.definitions(), &history);
+        assert!(estimate <= 100 || history.len() == 1);
+        assert_eq!(history[0].content.len(), 1);
+        assert!(history.len() < 13);
     }
 
     #[test]
