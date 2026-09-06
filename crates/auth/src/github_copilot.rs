@@ -28,6 +28,9 @@ pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.107.0";
 pub const COPILOT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
 pub const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 pub const COPILOT_API_VERSION: &str = "2026-06-01";
+/// Bound optional model discovery so a successful token exchange is never
+/// held hostage by an unavailable enrichment endpoint.
+const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The known model IDs used for best-effort policy enablement after login.
 /// Routing metadata lives in the LLM crate, but policy enablement belongs to
@@ -535,10 +538,29 @@ impl GithubCopilotClient {
         &self,
         enterprise_domain: Option<&str>,
         cancel: &CancellationToken,
-        mut emit: F,
+        emit: F,
     ) -> Result<CopilotCredential>
     where
         F: FnMut(AuthEvent) + Send,
+    {
+        self.login_with_events_and_persist(enterprise_domain, cancel, emit, |_| Ok(()))
+            .await
+    }
+
+    /// Complete device login while durably saving the exchanged credential
+    /// before optional model discovery. The persistence hook lets the auth
+    /// wrapper make the initial token usable even when enrichment hangs or
+    /// fails.
+    pub async fn login_with_events_and_persist<F, P>(
+        &self,
+        enterprise_domain: Option<&str>,
+        cancel: &CancellationToken,
+        mut emit: F,
+        mut persist: P,
+    ) -> Result<CopilotCredential>
+    where
+        F: FnMut(AuthEvent) + Send,
+        P: FnMut(&CopilotCredential) -> Result<()> + Send,
     {
         emit(AuthEvent::Started);
         let domain = normalize_domain(enterprise_domain)?;
@@ -561,16 +583,24 @@ impl GithubCopilotClient {
             });
             // Persist the exchanged credential before optional model
             // discovery: a models/policy failure must still leave a usable
-            // login.  Discovery and enrichment stay best effort.
+            // login. Discovery and enrichment stay best effort.
             let credential = client
                 .exchange_copilot_token(&github_token, domain.as_deref(), cancel)
                 .await?;
+            persist(&credential)?;
             let mut enriched = credential.clone();
-            if let Ok(ids) = client
-                .fetch_available_model_ids(&credential.access, domain.as_deref(), cancel)
-                .await
-            {
-                enriched.available_model_ids = ids;
+            let discovery = tokio::time::timeout(
+                MODEL_DISCOVERY_TIMEOUT,
+                client.fetch_available_model_ids(&credential.access, domain.as_deref(), cancel),
+            )
+            .await;
+            match discovery {
+                Ok(Ok(ids)) => enriched.available_model_ids = ids,
+                Ok(Err(AuthError::Cancelled)) => return Err(AuthError::Cancelled),
+                Ok(Err(_)) | Err(_) => {}
+            }
+            if enriched.available_model_ids != credential.available_model_ids {
+                persist(&enriched)?;
             }
             Ok::<_, AuthError>(enriched)
         }
@@ -876,8 +906,6 @@ impl CopilotAuth {
             }
         }
         let old = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
-        let old_access = old.access.clone();
-        let old_refresh = old.refresh.clone();
         let cancel = CancellationToken::new();
         let mut refreshed = self.client.refresh_copilot_token(&old, &cancel).await?;
         // Token refresh must remain useful if the optional model-policy
@@ -896,32 +924,26 @@ impl CopilotAuth {
         } else {
             refreshed.available_model_ids = old.available_model_ids.clone();
         }
-        // Prevent an older refresh completion from overwriting newer
-        // rotating credentials persisted while this exchange was in flight:
-        // only persist when the store still holds the refresh we exchanged.
-        let still_current = match self.store.copilot() {
-            Ok(Some(current)) => current.refresh == old_refresh && current.access == old_access,
-            Ok(None) => false,
-            Err(_) => true,
-        };
-        if still_current {
-            self.store.save_copilot(&refreshed)?;
-        } else if let Ok(Some(current)) = self.store.copilot() {
+        // Compare and save under the auth-file lock. A separate process may
+        // have rotated the credential while this exchange and enrichment were
+        // in flight, so a stale completion must never overwrite it.
+        if self.store.save_copilot_if_current(&old, &refreshed)? {
             *self
                 .credential
                 .lock()
                 .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-                Some(current.clone());
-            return Ok(current);
-        } else {
-            self.store.save_copilot(&refreshed)?;
+                Some(refreshed.clone());
+            return Ok(refreshed);
         }
+        let current = self.store.copilot()?.ok_or_else(|| {
+            AuthError::InvalidCredential("credential changed during refresh".into())
+        })?;
         *self
             .credential
             .lock()
             .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-            Some(refreshed.clone());
-        Ok(refreshed)
+            Some(current.clone());
+        Ok(current)
     }
 
     /// Fetch current model policy data and persist the refreshed list without
@@ -966,21 +988,18 @@ impl CopilotAuth {
     where
         F: FnMut(AuthEvent) + Send,
     {
-        // `GithubCopilotClient::login_with_events` (no store) already
-        // persists nothing; this wrapper persists exactly once, after the
-        // client returns the exchanged (and optionally enriched)
-        // credential.  Model discovery failures are swallowed inside the
-        // client so they can never lose the login.
         let domain = normalize_domain(enterprise_domain)?;
         let client = if domain.is_some() {
             self.client.for_domain(domain.as_deref())?
         } else {
             self.client.clone()
         };
+        let store = self.store.clone();
         let credential = client
-            .login_with_events(domain.as_deref(), cancel, emit)
+            .login_with_events_and_persist(domain.as_deref(), cancel, emit, move |credential| {
+                store.save_copilot(credential)
+            })
             .await?;
-        self.store.save_copilot(&credential)?;
         *self
             .credential
             .lock()

@@ -216,22 +216,27 @@ impl OpenAiCodexAuth {
             )
             .await?;
         let credential = credential_from_token(&value, Some(&old_refresh))?;
-        // Prevent an older refresh completion from overwriting newer
-        // rotating credentials persisted while this exchange was in flight.
-        if let Ok(Some(current)) = self.store.openai_codex()
-            && current.refresh != old_refresh
-            && current.refresh == credential.refresh
-            && current.access != credential.access
-        {
+        // Compare and save under the auth-file lock. A separate process may
+        // have rotated the credential while this exchange was in flight; in
+        // that case never overwrite its newer generation.
+        if self.store.save_openai_codex_if_current(&old, &credential)? {
             *self
                 .credential
                 .lock()
                 .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
-                Some(current.clone());
-            return Ok(current);
+                Some(credential.clone());
+            return Ok(credential);
         }
-        self.persist(credential.clone())?;
-        Ok(credential)
+        let current = self
+            .store
+            .openai_codex()?
+            .ok_or_else(|| AuthError::OpenAiCodex("credential changed during refresh".into()))?;
+        *self
+            .credential
+            .lock()
+            .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+            Some(current.clone());
+        Ok(current)
     }
     fn persist(&self, credential: OpenAiCodexCredential) -> Result<()> {
         self.store.save_openai_codex(&credential)?;
@@ -307,7 +312,15 @@ impl OpenAiCodexAuth {
             if cancel.is_cancelled() {
                 return Err(AuthError::Cancelled);
             }
-            let value = self.token(json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code", "device_code":device.device_code, "client_id":OPENAI_CODEX_CLIENT_ID}), cancel).await?;
+            let value = self
+                .request_token_until(
+                    self.http
+                        .post(&self.endpoints.token_url)
+                        .form(&json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code", "device_code":device.device_code, "client_id":OPENAI_CODEX_CLIENT_ID})),
+                    cancel,
+                    Some(deadline),
+                )
+                .await?;
             if let Some(error) = value.get("error").and_then(Value::as_str) {
                 match error {
                     "authorization_pending" => continue,
@@ -346,27 +359,54 @@ impl OpenAiCodexAuth {
         serde_json::from_slice(&body)
             .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))
     }
-    async fn token(&self, body: Value, cancel: &CancellationToken) -> Result<Value> {
-        self.request_token(
-            self.http.post(&self.endpoints.token_url).form(&body),
-            cancel,
-        )
-        .await
-    }
     /// Token endpoint with RFC 8628 device-polling semantics: read a bounded
     /// response body regardless of HTTP status, then map recognized `error`
     /// values (`authorization_pending`, `slow_down`, `expired_token`,
     /// `access_denied`) before treating other non-success statuses as
     /// errors.  Cancellation and expiry are checked around both sleeps and
     /// requests; token bodies never enter errors or logs.
+    #[cfg(test)]
     async fn request_token(
         &self,
         request: reqwest::RequestBuilder,
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        let response = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), result = request.send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))? };
+        self.request_token_until(request, cancel, None).await
+    }
+
+    async fn request_token_until(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancel: &CancellationToken,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Value> {
+        let response = if let Some(deadline) = deadline {
+            let deadline = tokio::time::Instant::from_std(deadline);
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(AuthError::DeviceCodeExpired),
+                result = request.send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))?,
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                result = request.send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))?,
+            }
+        };
         let status = response.status();
-        let body = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), body = read_bounded_body(response) => body? };
+        let body = if let Some(deadline) = deadline {
+            let deadline = tokio::time::Instant::from_std(deadline);
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(AuthError::DeviceCodeExpired),
+                body = read_bounded_body(response) => body?,
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                body = read_bounded_body(response) => body?,
+            }
+        };
         let value: Value = serde_json::from_slice(&body)
             .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))?;
         if status.is_success() && value.get("error").is_none() {

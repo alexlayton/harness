@@ -246,6 +246,35 @@ impl AuthStore {
         self.save_provider_value(OPENAI_CODEX_PROVIDER_KEY, value)
     }
 
+    /// Replace a Codex credential only if the persisted token generation is
+    /// still the one used for the exchange. This compare-and-save runs under
+    /// the same auth-file lock as ordinary updates, preventing a delayed
+    /// refresh in another process from overwriting a newer rotating token.
+    pub fn save_openai_codex_if_current(
+        &self,
+        expected: &OpenAiCodexCredential,
+        credential: &OpenAiCodexCredential,
+    ) -> Result<bool> {
+        if !credential.is_complete() {
+            return Err(AuthError::InvalidCredential(
+                "OpenAI Codex credential is missing OAuth fields".into(),
+            ));
+        }
+        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.save_provider_value_if_current(OPENAI_CODEX_PROVIDER_KEY, value, |current| {
+            current
+                .and_then(|value| {
+                    serde_json::from_value::<OpenAiCodexCredential>(value.clone()).ok()
+                })
+                .is_some_and(|current| {
+                    current.access == expected.access && current.refresh == expected.refresh
+                })
+        })
+    }
+
     pub fn copilot(&self) -> Result<Option<CopilotCredential>> {
         let entries = self.load_unlocked()?;
         let Some(value) = entries.get(COPILOT_PROVIDER_KEY) else {
@@ -297,6 +326,50 @@ impl AuthStore {
             source,
         })?;
         self.save_provider_value(COPILOT_PROVIDER_KEY, value)
+    }
+
+    /// Compare-and-save the result of a Copilot refresh under the auth-file
+    /// lock, so separate processes cannot overwrite a newer token generation.
+    pub fn save_copilot_if_current(
+        &self,
+        expected: &CopilotCredential,
+        credential: &CopilotCredential,
+    ) -> Result<bool> {
+        if !credential.is_complete() {
+            return Err(AuthError::InvalidCredential(
+                "credential is missing its OAuth token fields".into(),
+            ));
+        }
+        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.save_provider_value_if_current(COPILOT_PROVIDER_KEY, value, |current| {
+            current
+                .and_then(|value| serde_json::from_value::<CopilotCredential>(value.clone()).ok())
+                .is_some_and(|current| {
+                    current.access == expected.access && current.refresh == expected.refresh
+                })
+        })
+    }
+
+    fn save_provider_value_if_current(
+        &self,
+        provider: &str,
+        value: serde_json::Value,
+        matches: impl FnOnce(Option<&serde_json::Value>) -> bool,
+    ) -> Result<bool> {
+        let parent = self.parent_dir();
+        private_dir_all(&parent)?;
+        ensure_private_directory(&parent)?;
+        let _lock = AuthFileLock::acquire(&self.path)?;
+        let mut entries = self.load_unlocked()?;
+        if !matches(entries.get(provider)) {
+            return Ok(false);
+        }
+        entries.insert(provider.to_owned(), value);
+        self.write_unlocked(&entries)?;
+        Ok(true)
     }
 
     fn parent_dir(&self) -> PathBuf {
@@ -577,6 +650,24 @@ mod tests {
         let contents = fs::read_to_string(store.path()).unwrap();
         assert!(contents.contains("access-secret"));
         assert!(contents.contains("availableModelIds"));
+    }
+
+    #[test]
+    fn compare_and_save_rejects_stale_refresh_generations() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let old = credential();
+        let mut current = old.clone();
+        current.access = "current-access".into();
+        current.refresh = "current-refresh".into();
+        let mut stale_result = old.clone();
+        stale_result.access = "stale-access".into();
+        stale_result.refresh = "stale-refresh".into();
+
+        store.save_copilot(&old).unwrap();
+        assert!(store.save_copilot_if_current(&old, &current).unwrap());
+        assert!(!store.save_copilot_if_current(&old, &stale_result).unwrap());
+        assert_eq!(store.copilot().unwrap().unwrap(), current);
     }
 
     #[test]
