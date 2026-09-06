@@ -48,7 +48,11 @@ impl OpenAiResponsesClient {
             // discarded.
             Err(error)
                 if req.reasoning == ReasoningPolicy::Auto
-                    && matches!(&error, LlmError::Http { status: 400, body } if body.to_ascii_lowercase().contains("reasoning")) =>
+                    && matches!(&error, LlmError::Http {
+                        status: 400,
+                        body,
+                        ..
+                    } if body.to_ascii_lowercase().contains("reasoning")) =>
             {
                 tracing::debug!("Responses endpoint rejected reasoning; retrying without it");
                 self.http

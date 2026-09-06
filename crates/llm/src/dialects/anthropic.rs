@@ -71,7 +71,7 @@ impl AnthropicMessagesClient {
             .send()
             .await
             .map_err(LlmError::Network)?;
-        let response = crate::http::check_status(response).await?;
+        let response = crate::http::check_status_with_secret(response, &self.api_key).await?;
         Ok(event_stream(stream_response(response)))
     }
 

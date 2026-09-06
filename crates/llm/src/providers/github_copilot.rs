@@ -389,6 +389,7 @@ fn plan_gate_error(
     if let LlmError::Http {
         status: 400,
         ref body,
+        ..
     } = error
         && body.contains("model_not_supported")
     {
@@ -671,6 +672,7 @@ mod tests {
             LlmError::Http {
                 status: 400,
                 body: "{\"error\":{\"code\":\"model_not_supported\"}}".into(),
+                retry_after_secs: None,
             },
             "claude-haiku-4.5",
             &available,
@@ -687,6 +689,7 @@ mod tests {
         let other = || LlmError::Http {
             status: 400,
             body: "bad json".into(),
+            retry_after_secs: None,
         };
         assert!(matches!(
             plan_gate_error(other(), "m", &available, None),
@@ -695,6 +698,7 @@ mod tests {
         let not_found = LlmError::Http {
             status: 404,
             body: "model_not_supported".into(),
+            retry_after_secs: None,
         };
         assert!(matches!(
             plan_gate_error(not_found, "m", &available, None),
@@ -708,6 +712,7 @@ mod tests {
             LlmError::Http {
                 status: 401,
                 body: "token=access-secret".into(),
+                retry_after_secs: None,
             },
             "access-secret",
         );

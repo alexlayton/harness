@@ -3,7 +3,11 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum LlmError {
     #[error("http {status}: {body}")]
-    Http { status: u16, body: String },
+    Http {
+        status: u16,
+        body: String,
+        retry_after_secs: Option<u64>,
+    },
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
     #[error("stream: {0}")]
@@ -40,7 +44,11 @@ impl LlmError {
     /// malicious header cannot park the retry loop.
     pub fn retry_after_secs(&self) -> Option<u64> {
         match self {
-            Self::Http { status: 429, body } => parse_retry_after(body),
+            Self::Http {
+                status: 429,
+                retry_after_secs,
+                ..
+            } => *retry_after_secs,
             _ => None,
         }
     }
@@ -49,6 +57,7 @@ impl LlmError {
         Self::Http {
             status,
             body: truncate_body(&body.into(), 2048),
+            retry_after_secs: None,
         }
     }
 
@@ -57,13 +66,28 @@ impl LlmError {
     /// redaction point for provider errors; per-provider `redact_*` helpers
     /// must delegate here rather than reimplementing substitution.
     pub fn http_redacted(status: u16, body: impl Into<String>, secret: &str) -> Self {
+        Self::http_redacted_with_retry_after(status, body, secret, None)
+    }
+
+    /// Construct a bounded HTTP error while preserving the parsed retry hint
+    /// separately from attacker-controlled response text.
+    pub fn http_redacted_with_retry_after(
+        status: u16,
+        body: impl Into<String>,
+        secret: &str,
+        retry_after_secs: Option<u64>,
+    ) -> Self {
         let body = body.into();
         let body = if secret.is_empty() {
             body
         } else {
             body.replace(secret, "[redacted]")
         };
-        Self::http(status, body)
+        Self::Http {
+            status,
+            body: truncate_body(&body, 2048),
+            retry_after_secs,
+        }
     }
 
     /// Redact a secret from any error variant (stream/parse/auth bodies can
@@ -74,9 +98,14 @@ impl LlmError {
             return self;
         }
         match self {
-            Self::Http { status, body } => Self::Http {
+            Self::Http {
+                status,
+                body,
+                retry_after_secs,
+            } => Self::Http {
                 status,
                 body: body.replace(secret, "[redacted]"),
+                retry_after_secs,
             },
             Self::Stream(message) => Self::Stream(message.replace(secret, "[redacted]")),
             Self::Parse(message) => Self::Parse(message.replace(secret, "[redacted]")),
@@ -110,26 +139,22 @@ pub fn truncate_body(body: &str, max_bytes: usize) -> String {
 /// to backoff so a malicious header cannot park the loop.
 const MAX_RETRY_AFTER_SECS: u64 = 300;
 
-/// Extract a bounded `Retry-After` delay (seconds) from a rendered 429
-/// error body.  `check_status` appends the header as `retry-after: <value>`
-/// (see `http.rs`), so both delta-seconds (`120`) and HTTP-date forms
-/// parse here.  Returns `None` when absent, unparseable, or over the cap.
-fn parse_retry_after(body: &str) -> Option<u64> {
-    let value = body.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        if name.trim().eq_ignore_ascii_case("retry-after") {
-            Some(value.trim().to_owned())
-        } else {
-            None
-        }
-    })?;
+/// Parse a bounded `Retry-After` header value as seconds. Both delta-seconds
+/// and HTTP-date forms are accepted; unparseable or over-cap values return
+/// `None`.
+#[allow(dead_code)]
+pub(crate) fn parse_retry_after_value(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
     if let Ok(secs) = value.parse::<u64>()
         && secs <= MAX_RETRY_AFTER_SECS
     {
         return Some(secs);
     }
     // HTTP-date form: delay until that instant, bounded and non-negative.
-    if let Ok(date) = httpdate::parse_http_date(&value) {
+    if let Ok(date) = httpdate::parse_http_date(value) {
         let now = std::time::SystemTime::now();
         let delay = date.duration_since(now).unwrap_or_default().as_secs();
         if delay <= MAX_RETRY_AFTER_SECS {
@@ -182,7 +207,7 @@ mod tests {
     #[test]
     fn retry_after_parses_seconds_dates_and_caps() {
         assert_eq!(
-            LlmError::http(429, "busy\nretry-after: 5").retry_after_secs(),
+            LlmError::http_redacted_with_retry_after(429, "busy", "", Some(5)).retry_after_secs(),
             Some(5)
         );
         assert_eq!(LlmError::http(429, "busy").retry_after_secs(), None);
@@ -195,13 +220,9 @@ mod tests {
         let soon = httpdate::fmt_http_date(
             std::time::SystemTime::now() + std::time::Duration::from_secs(30),
         );
-        let body = format!("busy\nretry-after: {soon}");
-        let delay = LlmError::http(429, body).retry_after_secs().unwrap();
+        let delay = parse_retry_after_value(&soon).unwrap();
         assert!(delay <= 30 + 1, "delay {delay} should be ~30s");
         // Non-429 errors carry no hint.
-        assert_eq!(
-            LlmError::http(500, "x\nretry-after: 5").retry_after_secs(),
-            None
-        );
+        assert_eq!(LlmError::http(500, "x").retry_after_secs(), None);
     }
 }

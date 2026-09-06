@@ -175,7 +175,12 @@ mod tests {
                     let mut calls = calls_task.lock().unwrap();
                     *calls += 1;
                     if *calls == 1 {
-                        Err::<u32, _>(LlmError::http(429, "busy\nretry-after: 5"))
+                        Err::<u32, _>(LlmError::http_redacted_with_retry_after(
+                            429,
+                            "busy",
+                            "",
+                            Some(5),
+                        ))
                     } else {
                         Ok(*calls)
                     }

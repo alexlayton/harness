@@ -115,7 +115,7 @@ impl HttpClient {
             .send()
             .await
             .map_err(LlmError::Network)?;
-        check_status(response).await
+        check_status_with_secret(response, &self.api_key).await
     }
 
     /// GET `path` with the standard headers.
@@ -127,7 +127,7 @@ impl HttpClient {
             .send()
             .await
             .map_err(LlmError::Network)?;
-        check_status(response).await
+        check_status_with_secret(response, &self.api_key).await
     }
 }
 
@@ -138,16 +138,7 @@ impl HttpClient {
 /// an unbounded `response.text()` — and the final error stays within the
 /// byte cap as valid UTF-8.  A 429 `Retry-After` hint is preserved (bounded)
 /// so `retry.rs` can honor `max(backoff+jitter, retry_after)`.
-pub(crate) async fn check_status(
-    response: reqwest::Response,
-) -> Result<reqwest::Response, LlmError> {
-    if response.status().is_success() {
-        return Ok(response);
-    }
-    check_status_with_secret(response, "").await
-}
-
-/// Like [`check_status`], but redacts the active API key/token before the
+/// Map an error while redacting the active API key/token before the
 /// error becomes visible.  Providers holding a secret must use this so
 /// echoed bodies can never leak credentials.
 pub(crate) async fn check_status_with_secret(
@@ -162,16 +153,14 @@ pub(crate) async fn check_status_with_secret(
         .headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .and_then(crate::error::parse_retry_after_value);
     let body = bounded_error_body(response).await;
-    let mut rendered = body;
-    if let Some(hint) = retry_after {
-        // Bounded: header values are capped by reqwest; truncate defensively.
-        let hint: String = hint.chars().take(64).collect();
-        rendered.push_str("\nretry-after: ");
-        rendered.push_str(hint.trim());
-    }
-    Err(LlmError::http_redacted(status, rendered, secret))
+    Err(LlmError::http_redacted_with_retry_after(
+        status,
+        body,
+        secret,
+        retry_after,
+    ))
 }
 
 /// Maximum bytes read from a non-success response body.  Multi-megabyte or
@@ -211,6 +200,38 @@ mod tests {
     /// reqwest client had no timeouts.  With `read_timeout` set, the stalled
     /// body read must surface as an error so the agent loop can recover
     /// instead of waiting for a user interrupt.
+    #[tokio::test]
+    async fn shared_http_errors_redact_keys_and_preserve_retry_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().unwrap();
+        let secret = "sk-shared-http-secret";
+        let body = format!("provider echoed {secret}");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\nretry-after: 7\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = HttpClient::with_client(
+            format!("http://{addr}"),
+            secret,
+            HeaderMap::new(),
+            Client::builder().build().unwrap(),
+        );
+        let error = client.get("/models").await.unwrap_err();
+        assert!(!error.to_string().contains(secret));
+        assert_eq!(error.retry_after_secs(), Some(7));
+    }
+
     #[tokio::test]
     async fn stalled_response_body_times_out_instead_of_hanging() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
