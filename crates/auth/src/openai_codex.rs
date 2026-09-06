@@ -668,11 +668,6 @@ pub fn account_id_from_tokens(
     ))
 }
 
-/// Extract an account from a single JWT for callers that only have an access token.
-pub fn account_id_from_jwt(token: &str) -> Result<String> {
-    account_id_from_tokens(None, Some(token))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,7 +692,7 @@ mod tests {
             URL_SAFE_NO_PAD
                 .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct"}}"#)
         );
-        assert_eq!(account_id_from_jwt(&token).unwrap(), "acct");
+        assert_eq!(account_id_from_tokens(None, Some(&token)).unwrap(), "acct");
     }
 
     /// Minimal HTTP fixture: scripted `(status, body)` replies in order.
@@ -947,7 +942,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.is_cancelled());
+        assert!(matches!(error, AuthError::Cancelled));
         assert!(fix.seen.lock().unwrap().is_empty());
     }
 

@@ -72,12 +72,6 @@ pub enum AuthError {
 
 pub type Result<T> = std::result::Result<T, AuthError>;
 
-impl AuthError {
-    pub fn is_cancelled(&self) -> bool {
-        matches!(self, Self::Cancelled)
-    }
-}
-
 pub(crate) fn io_error(
     operation: &'static str,
     path: impl Into<PathBuf>,

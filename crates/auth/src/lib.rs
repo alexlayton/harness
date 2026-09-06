@@ -16,12 +16,12 @@ pub use github_copilot::{
     COPILOT_API_VERSION, COPILOT_EDITOR_PLUGIN_VERSION, COPILOT_EDITOR_VERSION,
     COPILOT_INTEGRATION_ID, COPILOT_USER_AGENT, CopilotAuth, CopilotEndpoints,
     GITHUB_DEVICE_CLIENT_ID, GithubCopilotClient, KNOWN_MODEL_IDS, base_url_from_proxy_token,
-    copilot_base_url, normalize_domain, parse_available_model_ids, parse_available_model_ids_value,
-    parse_copilot_token, sku_from_proxy_token,
+    copilot_base_url, normalize_domain, parse_available_model_ids_value, parse_copilot_token,
+    sku_from_proxy_token,
 };
 pub use openai_codex::{
     CALLBACK_PATH, CALLBACK_PORT, OPENAI_CODEX_CLIENT_ID, OpenAiCodexAuth, OpenAiCodexEndpoints,
-    Pkce, account_id_from_jwt, account_id_from_tokens, pkce,
+    Pkce, account_id_from_tokens, pkce,
 };
 pub use storage::{
     AuthEntries, AuthStore, COPILOT_PROVIDER_KEY, CopilotCredential, OPENAI_CODEX_PROVIDER_KEY,

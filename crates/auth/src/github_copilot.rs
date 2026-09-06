@@ -756,12 +756,6 @@ pub fn parse_available_model_ids_value(
     }
 }
 
-pub fn parse_available_model_ids(body: &str, allow_policy_fallback: bool) -> Result<Vec<String>> {
-    let value = serde_json::from_str(body)
-        .map_err(|_| AuthError::InvalidCredential("invalid Copilot models JSON".into()))?;
-    parse_available_model_ids_value(&value, allow_policy_fallback)
-}
-
 fn push_unique(values: &mut Vec<String>, value: &str) {
     if !values.iter().any(|existing| existing == value) {
         values.push(value.to_owned());
@@ -809,10 +803,6 @@ impl CopilotAuth {
 
     pub fn from_default() -> Result<Self> {
         Self::new(AuthStore::default())
-    }
-
-    pub fn store(&self) -> &AuthStore {
-        &self.store
     }
 
     pub fn credential(&self) -> Result<Option<CopilotCredential>> {
