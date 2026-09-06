@@ -22,6 +22,7 @@ session.workspace = true
 tools.workspace = true
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
+toml_edit = "0.25"
 dirs = "6"
 fs2 = "0.4"
 tokio.workspace = true

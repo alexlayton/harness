@@ -4,6 +4,7 @@ use auth::OpenAiCodexAuth;
 use auth::{CopilotAuth, sku_from_proxy_token};
 use clap::{Parser, ValueEnum};
 use compact::policy::CompactionPolicy;
+use fs2::FileExt;
 use llm::providers::github_copilot::default_model_for;
 use llm::providers::{
     GithubCopilotProvider, OpenAiCodexProvider, OpenCodeGoProvider, OpenRouterProvider,
@@ -95,9 +96,14 @@ impl fmt::Display for ProviderArg {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct CompactConfig {
     pub auto: Option<bool>,
+    /// Trigger fraction in the inclusive range `0.0..=1.0`.
     pub threshold: Option<f64>,
     pub reserve_tokens: Option<u64>,
+    /// Zero is valid and means that no minimum number of recent turns is
+    /// retained by policy; the token backstop still applies.
     pub keep_recent_turns: Option<usize>,
+    /// Zero is valid and means that the token backstop retains the smallest
+    /// valid provider-history tail.
     pub keep_recent_tokens: Option<u64>,
     pub max_summary_input_bytes: Option<usize>,
     pub max_summary_bytes: Option<usize>,
@@ -132,6 +138,47 @@ fn resolve_subagents(config: &SubagentConfig) -> SubagentPolicy {
             .max_concurrent
             .unwrap_or(defaults.max_concurrent)
             .max(1),
+    }
+}
+
+const MAX_SUMMARY_INPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SUMMARY_BYTES: usize = 1024 * 1024;
+
+impl CompactConfig {
+    /// Validate user-provided compaction values before they reach the planner.
+    /// The key names in these errors intentionally match `config.toml` so a
+    /// malformed setting can be fixed without guessing which field failed.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(threshold) = self.threshold
+            && (!threshold.is_finite() || !(0.0..=1.0).contains(&threshold))
+        {
+            return Err(anyhow!(
+                "[compaction].threshold must be finite and between 0.0 and 1.0"
+            ));
+        }
+        if let Some(limit) = self.max_summary_input_bytes
+            && (limit == 0 || limit > MAX_SUMMARY_INPUT_BYTES)
+        {
+            return Err(anyhow!(
+                "[compaction].max_summary_input_bytes must be between 1 and {MAX_SUMMARY_INPUT_BYTES}"
+            ));
+        }
+        if let Some(limit) = self.max_summary_bytes
+            && (limit == 0 || limit > MAX_SUMMARY_BYTES)
+        {
+            return Err(anyhow!(
+                "[compaction].max_summary_bytes must be between 1 and {MAX_SUMMARY_BYTES}"
+            ));
+        }
+        if let (Some(reserve), Some(window)) = (self.reserve_tokens, self.context_window)
+            && window > 0
+            && reserve >= window
+        {
+            return Err(anyhow!(
+                "[compaction].reserve_tokens must be less than [compaction].context_window"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -253,25 +300,80 @@ pub fn load_file_config(path: &Path) -> Result<FileConfig> {
             return Err(error).with_context(|| format!("read config file {}", path.display()));
         }
     };
-    toml::from_str(&contents).with_context(|| format!("parse config file {}", path.display()))
+    parse_file_config(&contents, path)
+}
+
+fn parse_file_config(contents: &str, path: &Path) -> Result<FileConfig> {
+    let config: FileConfig = toml::from_str(contents)
+        .with_context(|| format!("parse config file {}", path.display()))?;
+    config.validate()?;
+    Ok(config)
+}
+
+impl FileConfig {
+    /// Validate nested settings before they are used or persisted.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(compaction) = &self.compaction {
+            compaction.validate()?;
+        }
+        if let Some(mcp) = &self.mcp {
+            mcp.validate().map_err(|error| anyhow!(error))?;
+        }
+        Ok(())
+    }
 }
 
 /// Save a TOML configuration using a temporary file in the target directory,
 /// followed by rename, so a partially-written config is never observed.
+///
+/// The advisory lock covers the complete write, including the rename. The
+/// settings-specific helpers below use the same lock while editing the raw
+/// document, so concurrent read-modify-write operations cannot lose a field.
 pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
+    let _lock = lock_config(path)?;
+    config.validate()?;
+    let contents = toml::to_string_pretty(config).context("serialize config")?;
+    write_config_contents(path, &contents)
+}
+
+fn lock_config(path: &Path) -> Result<std::fs::File> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .with_context(|| format!("create config directory {}", parent.display()))?;
+    let lock_path = path.with_file_name(format!(
+        ".{}.lock",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml")
+    ));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .with_context(|| format!("open config lock {}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("lock config {}", path.display()))?;
+    Ok(lock)
+}
 
-    let contents = toml::to_string_pretty(config).context("serialize config")?;
+fn write_config_contents(path: &Path, contents: &str) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create config directory {}", parent.display()))?;
     let temp_path = temporary_path(path);
     let write_result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options
             .open(&temp_path)
             .with_context(|| format!("create temporary config {}", temp_path.display()))?;
         file.write_all(contents.as_bytes())
@@ -281,12 +383,47 @@ pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
         drop(file);
         fs::rename(&temp_path, path)
             .with_context(|| format!("replace config file {}", path.display()))?;
+        sync_config_parent(parent)?;
         Ok(())
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     write_result
+}
+
+#[cfg(unix)]
+fn sync_config_parent(parent: &Path) -> Result<()> {
+    std::fs::File::open(parent)
+        .with_context(|| format!("open config directory {} for syncing", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("sync config directory {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_config_parent(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn update_config_document(
+    path: &Path,
+    update: impl FnOnce(&mut toml_edit::DocumentMut),
+) -> Result<()> {
+    let _lock = lock_config(path)?;
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read config file {}", path.display()));
+        }
+    };
+    let mut document: toml_edit::DocumentMut = contents
+        .parse()
+        .with_context(|| format!("parse config file {}", path.display()))?;
+    update(&mut document);
+    let rendered = document.to_string();
+    parse_file_config(&rendered, path)?;
+    write_config_contents(path, &rendered)
 }
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -343,10 +480,10 @@ pub fn save_settings(provider: &str, model: &str) -> Result<()> {
 /// Path-injectable form used by callers that already resolved a config path
 /// and by tests.
 pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> {
-    let mut config = load_file_config(path)?;
-    config.provider = Some(provider.to_owned());
-    config.model = Some(model.to_owned());
-    save_file_config(path, &config)
+    update_config_document(path, |document| {
+        document["provider"] = toml_edit::value(provider);
+        document["model"] = toml_edit::value(model);
+    })
 }
 
 /// Persist a reasoning policy while retaining provider, model, and unknown
@@ -357,9 +494,9 @@ pub fn save_reasoning(reasoning: ReasoningPolicy) -> Result<()> {
 
 /// Path-injectable reasoning save used by tests.
 pub fn save_reasoning_at(path: &Path, reasoning: ReasoningPolicy) -> Result<()> {
-    let mut config = load_file_config(path)?;
-    config.reasoning_effort = Some(reasoning);
-    save_file_config(path, &config)
+    update_config_document(path, |document| {
+        document["reasoning_effort"] = toml_edit::value(reasoning.as_str());
+    })
 }
 
 /// Select an OAuth provider after login when the user has not already made a
@@ -369,13 +506,14 @@ pub fn select_provider_after_login(provider: ProviderArg) -> Result<bool> {
 }
 
 fn select_provider_after_login_at(path: &Path, provider: ProviderArg) -> Result<bool> {
-    let mut config = load_file_config(path)?;
-    if config.provider.is_some() {
-        return Ok(false);
-    }
-    config.provider = Some(provider.to_string());
-    save_file_config(path, &config)?;
-    Ok(true)
+    let selected = std::cell::Cell::new(false);
+    update_config_document(path, |document| {
+        if document.get("provider").is_none() {
+            document["provider"] = toml_edit::value(provider.to_string());
+            selected.set(true);
+        }
+    })?;
+    Ok(selected.get())
 }
 
 #[derive(Clone, Debug, Default, Parser)]
@@ -587,6 +725,7 @@ impl Config {
     where
         F: FnMut(ProviderArg) -> Option<String>,
     {
+        file.validate()?;
         // Validate the persisted name even when a CLI override is present;
         // otherwise a typo could remain hidden until a later launch.
         let file_provider = match file.provider.as_deref() {
@@ -1031,6 +1170,153 @@ mod tests {
 
         fs::write(&path, "rtk = true\n").unwrap();
         assert!(load_file_config(&path).unwrap().rtk);
+    }
+
+    #[test]
+    fn targeted_settings_saves_preserve_unknown_nested_document_fields() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"provider = "opencode-go"
+model = "old"
+
+[compaction]
+threshold = 0.8
+future_switch = "keep"
+
+[compaction.future]
+list = ["one", "two"]
+
+[subagents]
+max_turns = 4
+future_limit = 17
+
+[tui]
+minimal = true
+future_theme = "keep"
+
+[mcp]
+future_setting = true
+
+[[mcp.servers]]
+name = "demo"
+transport = "stdio"
+command = "/bin/echo"
+future_server_key = "keep"
+"#,
+        )
+        .unwrap();
+
+        save_settings_at(&path, "openrouter", "new/model").unwrap();
+        save_reasoning_at(&path, ReasoningPolicy::Effort(llm::ReasoningEffort::High)).unwrap();
+        let saved = fs::read_to_string(&path).unwrap();
+        for fragment in [
+            "future_switch = \"keep\"",
+            "list = [\"one\", \"two\"]",
+            "future_limit = 17",
+            "future_theme = \"keep\"",
+            "future_setting = true",
+            "future_server_key = \"keep\"",
+        ] {
+            assert!(saved.contains(fragment), "missing {fragment} in {saved}");
+        }
+        let config = load_file_config(&path).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.model.as_deref(), Some("new/model"));
+        assert_eq!(
+            config.reasoning_effort,
+            Some(ReasoningPolicy::Effort(llm::ReasoningEffort::High))
+        );
+    }
+
+    #[test]
+    fn concurrent_config_mutators_do_not_lose_each_other() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        save_file_config(&path, &FileConfig::default()).unwrap();
+        let settings_path = path.clone();
+        let reasoning_path = path.clone();
+        let settings = std::thread::spawn(move || {
+            save_settings_at(&settings_path, "openrouter", "router/model")
+        });
+        let reasoning =
+            std::thread::spawn(move || save_reasoning_at(&reasoning_path, ReasoningPolicy::Off));
+        settings.join().unwrap().unwrap();
+        reasoning.join().unwrap().unwrap();
+        let saved = load_file_config(&path).unwrap();
+        assert_eq!(saved.provider.as_deref(), Some("openrouter"));
+        assert_eq!(saved.model.as_deref(), Some("router/model"));
+        assert_eq!(saved.reasoning_effort, Some(ReasoningPolicy::Off));
+    }
+
+    #[test]
+    fn invalid_compaction_values_name_their_toml_keys() {
+        let cases = [
+            (
+                CompactConfig {
+                    threshold: Some(-0.1),
+                    ..Default::default()
+                },
+                "threshold",
+            ),
+            (
+                CompactConfig {
+                    threshold: Some(f64::NAN),
+                    ..Default::default()
+                },
+                "threshold",
+            ),
+            (
+                CompactConfig {
+                    threshold: Some(1.1),
+                    ..Default::default()
+                },
+                "threshold",
+            ),
+            (
+                CompactConfig {
+                    max_summary_input_bytes: Some(0),
+                    ..Default::default()
+                },
+                "max_summary_input_bytes",
+            ),
+            (
+                CompactConfig {
+                    max_summary_bytes: Some(0),
+                    ..Default::default()
+                },
+                "max_summary_bytes",
+            ),
+            (
+                CompactConfig {
+                    reserve_tokens: Some(10),
+                    context_window: Some(10),
+                    ..Default::default()
+                },
+                "reserve_tokens",
+            ),
+        ];
+        for (compaction, key) in cases {
+            let error = FileConfig {
+                compaction: Some(compaction),
+                ..Default::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(key), "{error}");
+        }
+    }
+
+    #[test]
+    fn zero_keep_values_are_valid_and_have_documented_policy_meaning() {
+        let config = CompactConfig {
+            keep_recent_turns: Some(0),
+            keep_recent_tokens: Some(0),
+            ..Default::default()
+        };
+        config.validate().unwrap();
     }
 
     #[test]
