@@ -10,7 +10,8 @@ use crate::plan::CompactionPlan;
 use crate::policy::CompactionPolicy;
 use crate::policy::DEFAULT_TOOL_RESULT_CHARS;
 use crate::serialize::{
-    extract_file_operations, format_file_operations, serialize_events, truncate_bytes,
+    OMISSION_MARKER, extract_file_operations, format_file_operations, serialize_events,
+    truncate_bytes,
 };
 use futures_util::StreamExt;
 use llm::{CompletionRequest, Message, Provider, ReasoningPolicy, StreamEvent, Usage};
@@ -135,8 +136,9 @@ async fn model_summarize(
     } else {
         &serialized.text
     });
-    if serialized.truncated {
-        prompt.push_str("\n[... older transcript material omitted ...]");
+    if serialized.truncated && policy.max_summary_input_bytes > OMISSION_MARKER.len() {
+        prompt.push('\n');
+        prompt.push_str(OMISSION_MARKER);
     }
     prompt.push_str("\n</conversation>\n\n");
     if let Some(previous) = &plan.previous_summary {
@@ -237,8 +239,9 @@ fn deterministic_summary(plan: &CompactionPlan, policy: &CompactionPolicy) -> St
     } else {
         text.push_str(&serialized.text);
     }
-    if serialized.truncated {
-        text.push_str("\n[... older transcript material omitted ...]");
+    if serialized.truncated && policy.max_summary_input_bytes > OMISSION_MARKER.len() {
+        text.push('\n');
+        text.push_str(OMISSION_MARKER);
     }
     append_file_lists(text, plan, policy.max_summary_bytes)
 }

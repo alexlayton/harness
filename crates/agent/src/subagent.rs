@@ -441,11 +441,8 @@ impl SubagentRunnerImpl {
             // The note is request-local (not durable child history), and an
             // empty tool list makes the expected terminal action unambiguous.
             let final_report_turn = turns == self.config.max_turns;
-            let context_budget = if final_report_turn {
-                CHILD_CONTEXT_MAX_TOKENS
-            } else {
-                CHILD_CONTEXT_MAX_TOKENS.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS)
-            };
+            let context_budget =
+                CHILD_CONTEXT_MAX_TOKENS.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS);
             bound_child_history(history, system, registry, context_budget);
             let mut request_messages = history.clone();
             if final_report_turn {

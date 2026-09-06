@@ -17,6 +17,11 @@ pub struct SerializedTranscript {
     pub truncated: bool,
 }
 
+/// Marker appended by the summarizer when older transcript material was
+/// omitted. Serialization reserves space for this marker so the configured
+/// transcript byte budget remains a hard limit.
+pub const OMISSION_MARKER: &str = "[... older transcript material omitted ...]";
+
 /// Serialize `events` into a flat transcript for the summarizer.
 ///
 /// Events are emitted oldest → newest. The newest material is always kept:
@@ -52,10 +57,19 @@ pub fn serialize_events(
         kept.push(line);
     }
     kept.reverse();
-    SerializedTranscript {
-        text: kept.join("\n"),
-        truncated,
+    let mut text = kept.join("\n");
+    if truncated {
+        // `summarize` adds a newline before the marker. Reserve both pieces
+        // now instead of allowing the marker to exceed max_input_bytes later.
+        let marker_reserve = if max_input_bytes > OMISSION_MARKER.len() {
+            OMISSION_MARKER.len() + 1
+        } else {
+            0
+        };
+        let transcript_budget = max_input_bytes.saturating_sub(marker_reserve);
+        text = truncate_bytes(&text, transcript_budget).to_owned();
     }
+    SerializedTranscript { text, truncated }
 }
 
 /// Return the longest UTF-8 prefix that fits within `max_bytes`.
@@ -424,6 +438,12 @@ mod tests {
                 transcript.text.len()
             );
             assert!(std::str::from_utf8(transcript.text.as_bytes()).is_ok());
+            if transcript.truncated && budget > OMISSION_MARKER.len() {
+                assert!(
+                    transcript.text.len() + 1 + OMISSION_MARKER.len() <= budget,
+                    "omission marker exceeded budget {budget}"
+                );
+            }
         }
     }
 
