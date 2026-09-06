@@ -234,13 +234,15 @@ async fn execute_edit_validated(
             ));
         }
         check_cancelled(cancel)?;
+        let existing_permissions = super::vfs::unix::open_file_metadata(&fs, components)
+            .map(|metadata| metadata.permissions());
         let (parent_fd, name) = super::vfs::unix::open_parent_relative(&fs, components)
             .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
         super::file_mutation::atomic_write_at(
             &parent_fd,
             &name,
             final_content.as_bytes(),
-            None,
+            existing_permissions,
             cancel,
         )
         .await
@@ -727,6 +729,35 @@ mod tests {
             assert!(output.content.contains(expected), "{}", output.content);
         }
         assert_eq!(fs::read_to_string(path).unwrap(), "same\nsame\nabcdef\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("script.sh");
+        fs::write(&path, "echo old\n").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+
+        let output = EditTool::with_workspace_root(directory.path())
+            .execute(
+                json!({
+                    "path": "script.sh",
+                    "edits": [{"oldText":"old", "newText":"new"}]
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
     }
 
     #[tokio::test]
