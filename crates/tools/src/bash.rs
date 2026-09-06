@@ -238,7 +238,7 @@ impl Tool for BashTool {
         let group_id = child.id();
         #[cfg(not(unix))]
         let group_id = None;
-        let _ = group_id;
+        let mut process_guard = ProcessGroupGuard::new(group_id);
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
@@ -256,12 +256,12 @@ impl Tool for BashTool {
                 Err(_) => End::Cancelled,
             },
             _ = tokio::time::sleep_until(deadline) => {
-                terminate_tree(&child, group_id, &cancel).await;
+                terminate_tree(&mut child, group_id, &cancel).await;
                 let _ = child.wait().await;
                 End::TimedOut
             },
             _ = cancel.cancelled() => {
-                terminate_tree(&child, group_id, &cancel).await;
+                terminate_tree(&mut child, group_id, &cancel).await;
                 let _ = child.wait().await;
                 End::Cancelled
             },
@@ -270,7 +270,7 @@ impl Tool for BashTool {
         // pipes and the group). Reap the whole tree the same way so a
         // backgrounded `sleep 300 &` cannot write a marker after return.
         if matches!(end, End::Exited(_)) {
-            terminate_tree(&child, group_id, &cancel).await;
+            terminate_tree(&mut child, group_id, &cancel).await;
         }
 
         // Drain stdout and stderr concurrently under one shared deadline
@@ -337,6 +337,7 @@ impl Tool for BashTool {
             output.push_str(&suffix);
         }
 
+        process_guard.disarm();
         ToolOutput {
             content: output,
             is_error,
@@ -457,17 +458,64 @@ fn first_line(value: &str) -> &str {
 /// platforms group semantics are unavailable and this degrades to killing
 /// the shell handle directly.
 ///
+/// Owns a shell process group until the tool has drained all of its pipes.
+/// This synchronous drop guard is the last line of defense when the async
+/// execution future is aborted before it reaches its normal cleanup path.
+struct ProcessGroupGuard {
+    group_id: Option<u32>,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(group_id: Option<u32>) -> Self {
+        Self {
+            group_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.armed
+            && let Some(pgid) = self.group_id
+        {
+            // SAFETY: the group ID came from the shell created by this tool;
+            // a negative PID targets only that process group.
+            unsafe {
+                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only probes the process group selected by our child ID.
+    let result = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// `child` is used to reap the directly manageable shell handle when the
 /// group signal path is unavailable; on Unix the group signals do the
 /// work and the caller waits on the shell separately.
 async fn terminate_tree(
-    child: &tokio::process::Child,
+    child: &mut tokio::process::Child,
     group_id: Option<u32>,
     cancel: &CancellationToken,
 ) {
     #[cfg(unix)]
     {
-        let _ = (child, cancel);
+        let _ = child;
+        let _ = cancel;
         if let Some(pgid) = group_id {
             // SAFETY: `killpg`-equivalent via libc with the group's own
             // pgid; a negative pid targets the group, signals are
@@ -476,21 +524,31 @@ async fn terminate_tree(
             unsafe {
                 libc::kill(-(pgid as libc::pid_t), libc::SIGTERM);
             }
-            // Grace period, still responsive to cancellation.
-            let _ = tokio::time::timeout(KILL_GRACE, cancel.cancelled()).await;
-            unsafe {
-                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            // If the shell already exited, its group normally disappears
+            // immediately. Only wait for the grace period when a descendant
+            // is still holding the group, avoiding a fixed delay on ordinary
+            // successful commands.
+            if process_group_alive(pgid) {
+                tokio::select! {
+                    _ = tokio::time::sleep(KILL_GRACE) => {}
+                    _ = cancel.cancelled() => {}
+                }
+            }
+            if process_group_alive(pgid) {
+                unsafe {
+                    libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+                }
             }
         }
     }
     #[cfg(not(unix))]
     {
-        // Fallback: kill the shell handle. Note this cannot reach
-        // already-detached grandchildren; that limitation is platform
-        // specific and documented here, not claimed away.
+        // Fallback: kill the shell handle. This cannot reach already-detached
+        // grandchildren, but the direct child must still be killed before the
+        // timeout/cancellation branch waits for it.
         let _ = group_id;
         let _ = cancel;
-        let _ = child;
+        let _ = child.start_kill();
     }
 }
 
@@ -729,6 +787,27 @@ mod tests {
             !marker.exists(),
             "background descendant survived the tool call"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn aborting_execution_kills_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("abort-marker");
+        let command = format!("(sleep 1; touch {}) & wait", marker.display());
+        let tool = BashTool::with_workspace_root(directory.path());
+        let task = tokio::spawn(async move {
+            tool.execute(
+                json!({"command": command, "timeout": 60}),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+        assert!(!marker.exists(), "descendant survived an aborted tool task");
     }
 
     #[cfg(unix)]
