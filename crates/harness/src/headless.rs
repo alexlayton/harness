@@ -624,6 +624,76 @@ mod tests {
     }
 
     #[test]
+    fn multiple_tool_rounds_emit_only_the_last_text_only_round() {
+        // Two full tool rounds: prose → tools → prose → tools → final.
+        // Only the last text-only round reaches stdout; everything
+        // intermediate is discarded (or verbose-only).
+        let (stdout, stderr, code) = route(
+            vec![
+                AgentEvent::TextDelta("first thought".into()),
+                AgentEvent::ToolCallStarted {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    summary: "read a".into(),
+                },
+                AgentEvent::ToolCallFinished {
+                    call_id: "c1".into(),
+                    name: "read".into(),
+                    summary: "read a".into(),
+                    ok: true,
+                    duration_ms: 1,
+                    output: "a-contents".into(),
+                    error: None,
+                },
+                AgentEvent::TextDelta("second thought".into()),
+                AgentEvent::ToolCallStarted {
+                    call_id: "c2".into(),
+                    name: "bash".into(),
+                    summary: "run b".into(),
+                },
+                AgentEvent::ToolCallFinished {
+                    call_id: "c2".into(),
+                    name: "bash".into(),
+                    summary: "run b".into(),
+                    ok: true,
+                    duration_ms: 2,
+                    output: "b-output".into(),
+                    error: None,
+                },
+                AgentEvent::TextDelta("final answer".into()),
+                AgentEvent::TurnFinished,
+            ],
+            false,
+        );
+        assert_eq!(stdout, b"final answer\n");
+        assert!(stderr.is_empty());
+        assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn error_followed_by_usage_update_still_fails_the_run() {
+        // Only a `TextDelta` (genuine recovery) clears the failure state:
+        // usage/telemetry metadata arriving after an error must not.
+        let (stdout, _, code) = route(
+            vec![
+                AgentEvent::TextDelta("partial".into()),
+                AgentEvent::Error("provider failed".into()),
+                AgentEvent::UsageUpdated {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    cached_tokens: 0,
+                    reasoning_tokens: 0,
+                    cost: "0".into(),
+                },
+                AgentEvent::TurnFinished,
+            ],
+            false,
+        );
+        assert!(stdout.is_empty());
+        assert_eq!(code, ExitCode::from(1));
+    }
+
+    #[test]
     fn intermediate_round_text_is_not_written_to_stdout() {
         let (stdout, stderr, code) = route(
             vec![
