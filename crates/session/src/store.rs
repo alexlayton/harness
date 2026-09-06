@@ -1694,6 +1694,47 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_replacement_is_rejected_by_full_validation() {
+        // A replacement whose bytes no longer decode must fail the append
+        // loudly (full validation), never silently reconcile or truncate.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("before")),
+                },
+            )
+            .unwrap();
+        let mut stale = store.open(&session.id()).unwrap();
+        let path = session.path().unwrap().clone();
+        let raw = fs::read(&path).unwrap();
+        let header_end = raw.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        let mut corrupt = raw[..header_end].to_vec();
+        corrupt.extend_from_slice(b"{not valid json\n");
+        fs::write(&path, &corrupt).unwrap();
+        let error = store
+            .append_event(
+                &mut stale,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("after")),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            !matches!(error, SessionError::NotFound(_)),
+            "corruption must fail validation, got {error:?}"
+        );
+        // The corrupt file is untouched by the failed append; the stale
+        // view gained nothing.
+        assert_eq!(fs::read(&path).unwrap(), corrupt);
+        assert_eq!(stale.events.len(), 1);
+    }
+
+    #[test]
     fn replacement_with_same_length_is_reconciled_before_append() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
