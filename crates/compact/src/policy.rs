@@ -83,19 +83,10 @@ pub const DEFAULT_TOOL_RESULT_CHARS: usize = 2_000;
 mod tests {
     use super::*;
 
-    #[test]
-    fn default_policy_has_a_bounded_trigger_and_retention_budget() {
-        let policy = CompactionPolicy::default();
-        assert!(policy.auto);
-        assert!((0.0..=1.0).contains(&policy.threshold));
-        assert!(policy.reserve_tokens > 0);
-        assert!(policy.keep_recent_turns > 0);
-        assert!(policy.keep_recent_tokens > 0);
-        assert!(policy.max_summary_input_bytes >= policy.max_summary_bytes);
-        assert!(policy.max_summary_bytes > 0);
-        assert_eq!(policy.resolved_window(0), DEFAULT_CONTEXT_WINDOW);
-    }
-
+    // CLEANUP-4: the literal default-value assertions below were replaced
+    // by the boundary/validation tests that follow (`trigger_fires_past…`,
+    // `window_resolution_priority…`, plus the `config.rs` TOML-key
+    // validation matrix) — the defaults themselves are covered there.
     #[test]
     fn trigger_fires_past_threshold_minus_reserve() {
         let policy = CompactionPolicy::default();
