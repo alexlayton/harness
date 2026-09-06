@@ -130,15 +130,12 @@ fn load_context_files_impl(
         let Some(path) = first_candidate(&dir) else {
             continue;
         };
-        let Some((canonical, display)) = contained_candidate(&dir, &path) else {
+        let Some((canonical, display, raw)) = read_contained_candidate(&dir, &path) else {
             continue;
         };
-        if !seen.insert(canonical.clone()) {
+        if !seen.insert(canonical) {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&canonical) else {
-            continue;
-        };
         found.push((display, raw));
     }
 
@@ -219,19 +216,31 @@ fn first_candidate(dir: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-/// Containment gate for one discovery directory: canonicalize both the
-/// directory and its candidate, then require the canonical candidate to
-/// stay beneath the canonical directory. Returns the canonical file path
-/// plus a safe display path (the original candidate) for UI text.
-/// Contained symlinks pass (their targets stay inside); external symlinks
-/// return `None` and are silently skipped by the caller.
-fn contained_candidate(dir: &Path, candidate: &Path) -> Option<(PathBuf, PathBuf)> {
-    let canonical_dir = fs::canonicalize(dir).ok()?;
+/// Validate and read one context candidate through a retained discovery-root
+/// capability. Canonicalization is used only for the containment decision;
+/// the final read is handle-relative and rejects a symlink swapped in after
+/// that decision.
+fn read_contained_candidate(dir: &Path, candidate: &Path) -> Option<(PathBuf, PathBuf, String)> {
+    let workspace = super::vfs::WorkspaceFs::open_root(dir).ok()?;
+    let canonical_dir = workspace.root().to_path_buf();
     let canonical = fs::canonicalize(candidate).ok()?;
     if !canonical.starts_with(&canonical_dir) {
         return None;
     }
-    Some((canonical, candidate.to_path_buf()))
+    let relative = canonical.strip_prefix(&canonical_dir).ok()?;
+    let components = super::vfs::split_relative(&relative.to_string_lossy()).ok()?;
+    #[cfg(unix)]
+    let raw = {
+        use std::io::Read;
+        let fd = super::vfs::unix::open_file_relative(&workspace, &components).ok()?;
+        let mut file = std::fs::File::from(fd);
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).ok()?;
+        raw
+    };
+    #[cfg(not(unix))]
+    let raw = fs::read_to_string(&canonical).ok()?;
+    Some((canonical, candidate.to_path_buf(), raw))
 }
 
 /// Render loaded context files as a `<project_context>` block. Returns an

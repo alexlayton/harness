@@ -6,34 +6,89 @@ use super::{
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 pub struct ReadTool {
     workspace_root: Option<PathBuf>,
-    /// Absolute paths (files AND dirs) `read` may access for agent skills
-    /// (every discovered `SKILL.md` file_path plus skill base_dirs). A path
-    /// is readable when it is under the workspace root or under one of these.
-    /// Populated from `SkillCatalog::read_paths`; `None` means no allowlist
-    /// (arbitrary absolute paths are rejected unless under the workspace).
-    allowed_paths: Option<Vec<PathBuf>>,
+    /// The canonical workspace capability retained during registry assembly.
+    /// Workspace files are opened relative to this handle, never by reopening
+    /// the root pathname after validation.
+    workspace_fs: Option<Arc<WorkspaceFs>>,
+    /// Validated capabilities for discovered skill roots/files. Each entry
+    /// retains the directory handle used for the final read, so an allowlisted
+    /// pathname cannot be redirected after discovery.
+    allowed_paths: Option<Vec<AllowedPath>>,
+}
+
+#[derive(Clone)]
+struct AllowedPath {
+    base: PathBuf,
+    root: Arc<WorkspaceFs>,
+    prefix: Vec<String>,
+    directory: bool,
 }
 
 impl ReadTool {
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
+        let root = normalize_workspace_root(root);
         Self {
-            workspace_root: Some(normalize_workspace_root(root)),
+            workspace_fs: WorkspaceFs::open_root(&root).ok().map(Arc::new),
+            workspace_root: Some(root),
             allowed_paths: None,
         }
     }
 
-    /// Add a set of allowed absolute paths (from the skills catalog). These
-    /// are canonicalized at call time; a path is readable when it is under
-    /// the workspace root or under one of these.
+    /// Construct a workspace-aware reader using a capability retained by the
+    /// registry. The handle must have been opened against `root`.
+    pub fn with_workspace_fs(_root: impl Into<PathBuf>, workspace_fs: Arc<WorkspaceFs>) -> Self {
+        Self {
+            workspace_root: Some(workspace_fs.root().to_path_buf()),
+            workspace_fs: Some(workspace_fs),
+            allowed_paths: None,
+        }
+    }
+
+    /// Add a set of allowed absolute paths (from the skills catalog). The
+    /// paths are canonicalized and opened once here; subsequent reads use the
+    /// retained capability instead of canonicalizing and reopening by name.
     pub fn with_allowed_paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        self.allowed_paths = Some(paths.into_iter().collect());
+        let mut allowed = Vec::new();
+        for path in paths {
+            let Ok(base) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&base) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                let Ok(root) = WorkspaceFs::open_root(&base) else {
+                    continue;
+                };
+                allowed.push(AllowedPath {
+                    base,
+                    root: Arc::new(root),
+                    prefix: Vec::new(),
+                    directory: true,
+                });
+            } else if let Some(parent) = base.parent()
+                && let Some(name) = base
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                && let Ok(root) = WorkspaceFs::open_root(parent)
+            {
+                allowed.push(AllowedPath {
+                    base,
+                    root: Arc::new(root),
+                    prefix: vec![name],
+                    directory: false,
+                });
+            }
+        }
+        self.allowed_paths = Some(allowed);
         self
     }
 }
@@ -53,11 +108,8 @@ impl ReadTool {
             // through to the skill allowlist.
             let candidate = PathBuf::from(path);
             let as_relative = if candidate.is_absolute() {
-                let canonical_root = std::fs::canonicalize(root)
-                    .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
-                let canonical = std::fs::canonicalize(&candidate).map_err(|_| String::new())?;
-                canonical
-                    .strip_prefix(&canonical_root)
+                candidate
+                    .strip_prefix(root)
                     .ok()
                     .map(|rel| rel.to_string_lossy().into_owned())
             } else {
@@ -91,17 +143,23 @@ impl ReadTool {
         if !candidate.is_absolute() {
             return Err(format!("cannot read {path}: outside workspace"));
         }
-        // Canonicalize both the candidate and each allowed base so symlink
-        // roots (e.g. /tmp -> /private/tmp on macOS) compare equal.
-        let canonical = fs::canonicalize(&candidate)
-            .await
-            .map_err(|e| format!("cannot resolve path {path}: {e}"))?;
         if let Some(allowed) = self.allowed_paths.as_deref() {
-            for base in allowed {
-                if let Ok(base) = fs::canonicalize(base).await
-                    && canonical.starts_with(&base)
-                {
-                    return Ok(ReadTarget::Skill(canonical));
+            for capability in allowed {
+                if capability.directory {
+                    if let Ok(relative) = candidate.strip_prefix(&capability.base)
+                        && let Ok(mut components) = split_relative(&relative.to_string_lossy())
+                    {
+                        components.splice(0..0, capability.prefix.iter().cloned());
+                        return Ok(ReadTarget::Skill {
+                            capability: capability.clone(),
+                            components,
+                        });
+                    }
+                } else if candidate == capability.base {
+                    return Ok(ReadTarget::Skill {
+                        capability: capability.clone(),
+                        components: capability.prefix.clone(),
+                    });
                 }
             }
         }
@@ -113,7 +171,10 @@ impl ReadTool {
 /// validated handle, or an allowlisted skill file opened directly.
 enum ReadTarget {
     Workspace(Vec<String>),
-    Skill(PathBuf),
+    Skill {
+        capability: AllowedPath,
+        components: Vec<String>,
+    },
 }
 
 /// Open a resolved target, preserving workspace-relative error messages
@@ -122,21 +183,47 @@ enum ReadTarget {
 /// existing canonicalize-and-compare allowlist check.
 async fn open_target(
     target: &ReadTarget,
-    root: Option<&std::path::Path>,
+    root: Option<&Path>,
+    workspace_fs: Option<&WorkspaceFs>,
 ) -> Result<fs::File, String> {
     match target {
-        ReadTarget::Skill(path) => fs::File::open(path)
-            .await
-            .map_err(|error| format!("cannot read file: {error}")),
+        ReadTarget::Skill {
+            capability,
+            components,
+        } => {
+            #[cfg(unix)]
+            {
+                let fd = super::vfs::unix::open_file_relative(&capability.root, components)
+                    .map_err(|error| format!("cannot read file: {error}"))?;
+                Ok(fd_into_tokio_file(fd))
+            }
+            #[cfg(not(unix))]
+            {
+                let path = components
+                    .iter()
+                    .fold(capability.root.root().to_path_buf(), |base, part| {
+                        base.join(part)
+                    });
+                fs::File::open(path)
+                    .await
+                    .map_err(|error| format!("cannot read file: {error}"))
+            }
+        }
         ReadTarget::Workspace(components) => {
             let Some(root) = root else {
                 return Err("cannot read file: no workspace root".into());
             };
             #[cfg(unix)]
             {
-                let fs = WorkspaceFs::open_root(root)
-                    .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
-                let fd = super::vfs::unix::open_file_relative(&fs, components)
+                let owned_fs;
+                let fs = if let Some(workspace_fs) = workspace_fs {
+                    workspace_fs
+                } else {
+                    owned_fs = WorkspaceFs::open_root(root)
+                        .map_err(|error| format!("cannot resolve workspace root: {error}"))?;
+                    &owned_fs
+                };
+                let fd = super::vfs::unix::open_file_relative(fs, components)
                     .map_err(|error| format!("cannot read file: {error}"))?;
                 Ok(fd_into_tokio_file(fd))
             }
@@ -223,7 +310,13 @@ impl Tool for ReadTool {
                 );
             }
         };
-        let file = match open_target(&target, self.workspace_root.as_deref()).await {
+        let file = match open_target(
+            &target,
+            self.workspace_root.as_deref(),
+            self.workspace_fs.as_deref(),
+        )
+        .await
+        {
             Ok(file) => file,
             Err(message) => {
                 return error(&format!("read {path}"), &message);

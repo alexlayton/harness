@@ -226,24 +226,15 @@ fn validate_name(name: &str, diagnostics: &mut Vec<SkillDiagnostic>, path: &Path
 /// Load a single skill file (a `SKILL.md` or a root-level `.md` in a
 /// harness-mode root).  The caller has already validated containment:
 /// `file_path` is the validated canonical path and `display_path` is the
-/// safe path kept for UI text.  Returns `None` when the description is
+/// safe path kept for UI text. The caller supplies contents read through the
+/// validated discovery capability. Returns `None` when the description is
 /// missing (skill is dropped); rejections never include file contents.
-fn load_skill_from_file(
+fn load_skill_from_content(
     file_path: &Path,
     display_path: &Path,
+    raw: String,
     diagnostics: &mut Vec<SkillDiagnostic>,
 ) -> Option<Skill> {
-    let raw = match fs::read_to_string(file_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            diagnostics.push(SkillDiagnostic {
-                severity: SkillSeverity::Warning,
-                message: format!("failed to read skill file: {error}"),
-                path: Some(display_path.to_path_buf()),
-            });
-            return None;
-        }
-    };
     let (frontmatter, _body) = parse_frontmatter(&raw);
     let Some(fm) = frontmatter else {
         // No frontmatter at all → not a valid skill.
@@ -309,11 +300,16 @@ fn load_skill_from_file(
 /// to stay beneath the canonical root before reading or registering, so an
 /// external `SKILL.md` symlink (or symlinked skill base directory) is never
 /// catalogued nor added to read paths.  Contained symlinks pass.
+// The recursive walk keeps the immutable discovery capability and mutable
+// catalogue/diagnostics explicit; bundling them would obscure which state is
+// shared across recursive calls.
+#[allow(clippy::too_many_arguments)]
 fn discover_dir(
     dir: &Path,
     mode: SkillMode,
     root: &Path,
     canonical_root: &Path,
+    workspace: &super::vfs::WorkspaceFs,
     ig: &ignore::gitignore::Gitignore,
     skills: &mut Vec<Skill>,
     diagnostics: &mut Vec<SkillDiagnostic>,
@@ -328,7 +324,8 @@ fn discover_dir(
     if skill_md.is_file() {
         let rel = skill_md.strip_prefix(root).unwrap_or(&skill_md);
         if !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_contained_skill(&skill_md, canonical_root, diagnostics)
+            && let Some(skill) =
+                load_contained_skill(&skill_md, canonical_root, workspace, diagnostics)
         {
             skills.push(skill);
         }
@@ -356,7 +353,16 @@ fn discover_dir(
             if !is_contained(canonical_root, &path) {
                 continue;
             }
-            discover_dir(&path, mode, root, canonical_root, ig, skills, diagnostics);
+            discover_dir(
+                &path,
+                mode,
+                root,
+                canonical_root,
+                workspace,
+                ig,
+                skills,
+                diagnostics,
+            );
             continue;
         }
         let is_file = entry.file_type().map(|t| t.is_file()).unwrap_or(false);
@@ -371,7 +377,7 @@ fn discover_dir(
             && matches!(mode, SkillMode::Harness)
             && path.parent() == Some(root)
             && !ig.matched(rel, false).is_ignore()
-            && let Some(skill) = load_contained_skill(&path, canonical_root, diagnostics)
+            && let Some(skill) = load_contained_skill(&path, canonical_root, workspace, diagnostics)
         {
             skills.push(skill);
         }
@@ -400,15 +406,30 @@ fn is_contained(canonical_root: &Path, candidate: &Path) -> bool {
 fn load_contained_skill(
     candidate: &Path,
     canonical_root: &Path,
+    workspace: &super::vfs::WorkspaceFs,
     diagnostics: &mut Vec<SkillDiagnostic>,
 ) -> Option<Skill> {
     // `candidate` is already lexically under the discovery root by
-    // construction; canonicalize to catch symlink escapes.
+    // construction; canonicalize only for the containment decision. The
+    // actual read is relative to the retained root handle.
     let canonical = fs::canonicalize(candidate).ok()?;
     if !canonical.starts_with(canonical_root) {
         return None;
     }
-    load_skill_from_file(&canonical, candidate, diagnostics)
+    let relative = canonical.strip_prefix(canonical_root).ok()?;
+    let components = super::vfs::split_relative(&relative.to_string_lossy()).ok()?;
+    #[cfg(unix)]
+    let raw = {
+        use std::io::Read;
+        let fd = super::vfs::unix::open_file_relative(workspace, &components).ok()?;
+        let mut file = std::fs::File::from(fd);
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).ok()?;
+        raw
+    };
+    #[cfg(not(unix))]
+    let raw = fs::read_to_string(&canonical).ok()?;
+    load_skill_from_content(&canonical, candidate, raw, diagnostics)
 }
 
 /// Build a gitignore-style matcher from `.gitignore` / `.ignore` /
@@ -442,14 +463,22 @@ pub fn load_skills_from_dir(root: &Path, mode: SkillMode) -> SkillCatalog {
     let mut skills = Vec::new();
     let mut diagnostics = Vec::new();
     let ig = build_ignore(root);
-    // Canonicalize the root once so containment compares like-for-like;
-    // symlinked roots (e.g. /tmp on macOS) still gate correctly.
-    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // Hold the discovery root open for the entire walk. Canonical paths are
+    // used only for containment; final skill reads use this capability.
+    let Ok(workspace) = super::vfs::WorkspaceFs::open_root(root) else {
+        return SkillCatalog {
+            skills,
+            diagnostics,
+            read_paths: Vec::new(),
+        };
+    };
+    let canonical_root = workspace.root().to_path_buf();
     discover_dir(
         root,
         mode,
         root,
         &canonical_root,
+        &workspace,
         &ig,
         &mut skills,
         &mut diagnostics,

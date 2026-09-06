@@ -8,6 +8,7 @@ use llm::ToolDefinition;
 use llm::util::truncate_utf8;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
@@ -46,12 +47,24 @@ struct DiffSummary {
 
 pub struct EditTool {
     workspace_root: Option<PathBuf>,
+    workspace_fs: Option<Arc<WorkspaceFs>>,
 }
 
 impl EditTool {
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
+        let root = normalize_workspace_root(root);
         Self {
-            workspace_root: Some(normalize_workspace_root(root)),
+            workspace_fs: WorkspaceFs::open_root(&root).ok().map(Arc::new),
+            workspace_root: Some(root),
+        }
+    }
+
+    /// Construct an editor using a workspace capability retained by registry
+    /// assembly rather than reopening the root pathname for every edit.
+    pub fn with_workspace_fs(_root: impl Into<PathBuf>, workspace_fs: Arc<WorkspaceFs>) -> Self {
+        Self {
+            workspace_root: Some(workspace_fs.root().to_path_buf()),
+            workspace_fs: Some(workspace_fs),
         }
     }
 }
@@ -120,15 +133,36 @@ impl Tool for EditTool {
         // same handle.
         let components =
             match resolve_workspace_path(&path, self.workspace_root.as_deref(), true).await {
-                Ok(_) => match split_relative(&path) {
-                    Ok(components) => components,
-                    Err(io_error) => {
-                        return error(&summary, &format!("cannot edit {path}: {io_error}"));
+                Ok(_) => {
+                    let Some(root) = self.workspace_root.as_deref() else {
+                        return error(&summary, "cannot edit without a workspace root");
+                    };
+                    let value = path.strip_prefix('@').unwrap_or(&path);
+                    let value_path = Path::new(value);
+                    let relative = if value_path.is_absolute() {
+                        match value_path.strip_prefix(root) {
+                            Ok(relative) => relative.to_string_lossy().into_owned(),
+                            Err(_) => {
+                                return error(
+                                    &summary,
+                                    &format!("cannot edit {path}: path is outside workspace"),
+                                );
+                            }
+                        }
+                    } else {
+                        value.to_owned()
+                    };
+                    match split_relative(&relative) {
+                        Ok(components) => components,
+                        Err(io_error) => {
+                            return error(&summary, &format!("cannot edit {path}: {io_error}"));
+                        }
                     }
-                },
+                }
                 Err(message) => return error(&summary, &format!("cannot edit {path}: {message}")),
             };
         let root = self.workspace_root.clone();
+        let workspace_fs = self.workspace_fs.clone();
         let edit_path_display = path.clone();
         let edit_cancel = cancel.clone();
         let edit_result = with_file_mutation_lock(
@@ -141,6 +175,7 @@ impl Tool for EditTool {
                 execute_edit_validated(
                     &edit_path_display,
                     root.as_deref(),
+                    workspace_fs.as_deref(),
                     &components,
                     &edits,
                     &edit_cancel,
@@ -189,6 +224,7 @@ struct EditResult {
 async fn execute_edit_validated(
     path: &str,
     root: Option<&Path>,
+    workspace_fs: Option<&WorkspaceFs>,
     components: &[String],
     edits: &[Edit],
     cancel: &CancellationToken,
@@ -197,9 +233,15 @@ async fn execute_edit_validated(
     #[cfg(unix)]
     if let Some(root) = root {
         use std::io::Read;
-        let fs = WorkspaceFs::open_root(root)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        let fd = super::vfs::unix::open_file_relative(&fs, components)
+        let owned_fs;
+        let fs = if let Some(workspace_fs) = workspace_fs {
+            workspace_fs
+        } else {
+            owned_fs = WorkspaceFs::open_root(root)
+                .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+            &owned_fs
+        };
+        let fd = super::vfs::unix::open_file_relative(fs, components)
             .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
         let mut original_bytes = Vec::new();
         let mut file = std::fs::File::from(fd);
@@ -221,7 +263,7 @@ async fn execute_edit_validated(
         final_content.push_str(bom);
         final_content.push_str(&applied.new_content);
         // Re-read from the same handle before committing.
-        let fd = super::vfs::unix::open_file_relative(&fs, components)
+        let fd = super::vfs::unix::open_file_relative(fs, components)
             .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
         let mut current_bytes = Vec::new();
         let mut current = std::fs::File::from(fd);
@@ -234,9 +276,9 @@ async fn execute_edit_validated(
             ));
         }
         check_cancelled(cancel)?;
-        let existing_permissions = super::vfs::unix::open_file_metadata(&fs, components)
+        let existing_permissions = super::vfs::unix::open_file_metadata(fs, components)
             .map(|metadata| metadata.permissions());
-        let (parent_fd, name) = super::vfs::unix::open_parent_relative(&fs, components)
+        let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)
             .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
         super::file_mutation::atomic_write_at(
             &parent_fd,

@@ -31,6 +31,7 @@ pub use skills::{
 pub use subagent::{SUBAGENT_TOOL_NAME, SubagentMode, SubagentRunner, SubagentTool};
 pub use write::WriteTool;
 
+use crate::vfs::WorkspaceFs;
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::Value;
@@ -192,14 +193,26 @@ pub fn default_registry_with_index(
     }
     let skills = discover_skills_for_config(&workspace_root);
     let read_paths = skills.read_paths.clone();
+    let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
+        ToolInitError::Workspace {
+            path: workspace_root.clone(),
+            source,
+        }
+    })?);
     let mut registry = ToolRegistry::try_new_with_workspace(
         vec![
             Box::new(
-                ReadTool::with_workspace_root(&workspace_root)
+                ReadTool::with_workspace_fs(&workspace_root, workspace_fs.clone())
                     .with_allowed_paths(read_paths.clone()),
             ),
-            Box::new(EditTool::with_workspace_root(&workspace_root)),
-            Box::new(WriteTool::with_workspace_root(&workspace_root)),
+            Box::new(EditTool::with_workspace_fs(
+                &workspace_root,
+                workspace_fs.clone(),
+            )),
+            Box::new(WriteTool::with_workspace_fs(
+                &workspace_root,
+                workspace_fs.clone(),
+            )),
             Box::new(BashTool::with_rtk_and_workspace_root(
                 config.rtk,
                 &workspace_root,
@@ -243,9 +256,18 @@ pub fn read_only_registry_with_index(
     }
     let skills = discover_skills_for_config(&workspace_root);
     let read_paths = skills.read_paths.clone();
+    let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
+        ToolInitError::Workspace {
+            path: workspace_root.clone(),
+            source,
+        }
+    })?);
     let mut registry = ToolRegistry::try_new_with_workspace(
         vec![
-            Box::new(ReadTool::with_workspace_root(&workspace_root).with_allowed_paths(read_paths)),
+            Box::new(
+                ReadTool::with_workspace_fs(&workspace_root, workspace_fs)
+                    .with_allowed_paths(read_paths),
+            ),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
             Box::new(MultiGrepTool::new(index.clone())),

@@ -7,17 +7,30 @@ use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 pub struct WriteTool {
     workspace_root: Option<PathBuf>,
+    workspace_fs: Option<Arc<WorkspaceFs>>,
 }
 
 impl WriteTool {
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
+        let root = normalize_workspace_root(root);
         Self {
-            workspace_root: Some(normalize_workspace_root(root)),
+            workspace_fs: WorkspaceFs::open_root(&root).ok().map(Arc::new),
+            workspace_root: Some(root),
+        }
+    }
+
+    /// Construct a writer using a workspace capability retained by registry
+    /// assembly rather than reopening the root pathname for every write.
+    pub fn with_workspace_fs(_root: impl Into<PathBuf>, workspace_fs: Arc<WorkspaceFs>) -> Self {
+        Self {
+            workspace_root: Some(workspace_fs.root().to_path_buf()),
+            workspace_fs: Some(workspace_fs),
         }
     }
 }
@@ -85,6 +98,7 @@ impl Tool for WriteTool {
             };
         let summary = format!("write {path}");
         let root = self.workspace_root.clone();
+        let workspace_fs = self.workspace_fs.clone();
         let Some(result) = with_file_mutation_lock(
             &root
                 .as_deref()
@@ -92,9 +106,15 @@ impl Tool for WriteTool {
                 .join(components.join("/")),
             &cancel,
             || async {
-                write_validated(&root, &components, content, &cancel)
-                    .await
-                    .map_err(|io_error| format!("cannot write {path}: {io_error}"))
+                write_validated(
+                    &root,
+                    workspace_fs.as_deref(),
+                    &components,
+                    content,
+                    &cancel,
+                )
+                .await
+                .map_err(|io_error| format!("cannot write {path}: {io_error}"))
             },
         )
         .await
@@ -127,6 +147,7 @@ fn error(summary: &str, content: &str) -> ToolOutput {
 /// is configured (compatibility mode).
 async fn write_validated(
     root: &Option<PathBuf>,
+    workspace_fs: Option<&WorkspaceFs>,
     components: &[String],
     content: &str,
     cancel: &CancellationToken,
@@ -139,10 +160,16 @@ async fn write_validated(
     }
     #[cfg(unix)]
     if let Some(root) = root.as_deref() {
-        let fs = WorkspaceFs::open_root(root).map_err(|error| {
-            std::io::Error::other(format!("cannot resolve workspace root: {error}"))
-        })?;
-        let (parent_fd, name) = super::vfs::unix::open_parent_relative(&fs, components)?;
+        let owned_fs;
+        let fs = if let Some(workspace_fs) = workspace_fs {
+            workspace_fs
+        } else {
+            owned_fs = WorkspaceFs::open_root(root).map_err(|error| {
+                std::io::Error::other(format!("cannot resolve workspace root: {error}"))
+            })?;
+            &owned_fs
+        };
+        let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)?;
         // Preserve existing permissions without re-walking names from `/`:
         // stat the destination through the validated parent handle, then
         // read its mode via the opened fd. A symlink final component
@@ -153,7 +180,7 @@ async fn write_validated(
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
         )
         .ok()
-        .and_then(|_| super::vfs::unix::open_file_metadata(&fs, components))
+        .and_then(|_| super::vfs::unix::open_file_metadata(fs, components))
         .map(|metadata| metadata.permissions());
         super::file_mutation::atomic_write_at(
             &parent_fd,
@@ -220,6 +247,38 @@ mod tests {
     /// End-to-end TOCTOU barrier for `write`: resolve, swap an ancestor
     /// for an external symlink, then execute. The handle-relative commit
     /// must refuse and leave both trees unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retained_workspace_capability_survives_root_path_replacement() {
+        let workspace = tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let moved = root.with_extension("moved");
+        let outside = tempdir().unwrap();
+        std::fs::write(root.join("file.txt"), "workspace").unwrap();
+        std::fs::write(outside.path().join("file.txt"), "external").unwrap();
+        let tool = WriteTool::with_workspace_root(&root);
+
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+        let output = tool
+            .execute(
+                json!({"path": "file.txt", "content": "updated"}),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            std::fs::read_to_string(moved.join("file.txt")).unwrap(),
+            "updated"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("file.txt")).unwrap(),
+            "external"
+        );
+        std::fs::remove_dir_all(moved).unwrap();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn write_cannot_create_through_swapped_ancestor() {
