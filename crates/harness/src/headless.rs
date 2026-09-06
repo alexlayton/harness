@@ -1130,6 +1130,55 @@ mod tests {
         });
     }
 
+    #[test]
+    fn blank_prompt_creates_no_session_on_disk() {
+        // `run_headless` resolves (and rejects) the prompt before the
+        // store/session/agent are touched: a blank prompt leaves the
+        // session directory empty.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let before: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
+            let provider = Arc::new(RecordingProvider::default());
+            let args = PromptArgs {
+                prompt: vec!["   ".into()],
+                ..PromptArgs::default()
+            };
+            let config = headless_config();
+            let error = run_headless(
+                &config,
+                &args,
+                false,
+                provider,
+                ToolRegistry::empty(),
+                Some(store),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("blank"));
+            let after: Vec<_> = std::fs::read_dir(root.path()).unwrap().collect();
+            assert_eq!(
+                before.len(),
+                after.len(),
+                "a blank prompt must not create any session file"
+            );
+        });
+    }
+
+    #[test]
+    fn agent_task_panic_surfaces_instead_of_blank_success() {
+        // `agent_task.await` uses `.context(...)`: a panicked agent task
+        // propagates as an error, never a blank successful turn.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let task: tokio::task::JoinHandle<()> = tokio::spawn(async { panic!("boom") });
+            let result = task.await.context("headless agent task failed");
+            assert!(result.is_err());
+        });
+    }
+
     // ------------------------------------------------------------ cancellation
 
     /// A provider whose stream never yields, so the turn stays in flight until
