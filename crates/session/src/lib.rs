@@ -32,4 +32,5 @@ pub use model::{
     UsageSummary, context_messages, events_after_latest_compaction, latest_compaction_boundary,
     snapshot_entries, usage_summary,
 };
+pub use store::SyncSessionFaultGuard;
 pub use store::{SessionCreateOptions, SessionIndexEntry, SessionStore, default_session_dir};

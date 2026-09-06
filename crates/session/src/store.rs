@@ -71,11 +71,53 @@ fn injected_sync_parent_failure() -> bool {
     INJECT_SYNC_PARENT_FAILURE.with(|flag| flag.get())
 }
 
+// Whether the deferred-sync durable flush should fail. Test-only: forces
+// [`SessionStore::sync_session`] to return the same `SessionError::Io` it
+// would return for a real `fsync` failure, so agent turn-boundary tests
+// can prove a failed flush quarantines (AGENT-1) without touching the OS.
+//
+// The flag itself is test-only, but the guard type is always compiled: the
+// agent crate's `#[cfg(test)]` boundary tests need to name it, and
+// `#[cfg(test)]` on an imported type does not propagate across crates.
+// The `arm` body is test-only (production builds get a no-op guard).
+// (Plain `//` comments: `thread_local!` is a macro invocation, which
+// rustdoc denies `///` docs on.)
+thread_local! {
+    static INJECT_SYNC_SESSION_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether the deferred-sync flush should fail. Test-only.
+#[cfg(test)]
+pub fn injected_sync_session_failure() -> bool {
+    INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.get())
+}
+
 /// Hold hardening-failure flags for a fail-closed test and clear them on
 /// drop (including on panic) so no later test on this thread observes a
 /// stale injection.
 #[cfg(test)]
 struct HardeningFaultGuard;
+
+/// Hold the deferred-sync flush failure flag for an agent boundary test and
+/// clear it on drop (including on panic). The agent crate cannot touch the
+/// private thread-local directly, so this constructor is the seam.
+pub struct SyncSessionFaultGuard;
+
+impl SyncSessionFaultGuard {
+    pub fn arm() -> Self {
+        #[cfg(test)]
+        INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+impl Drop for SyncSessionFaultGuard {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(false));
+    }
+}
 
 #[cfg(test)]
 impl HardeningFaultGuard {
@@ -178,6 +220,17 @@ impl SessionStore {
     /// every record appended so far survives power loss. Cheap to call
     /// repeatedly; a no-op when the session has no file (memory-only).
     pub fn sync_session(&self, session: &Session) -> Result<()> {
+        #[cfg(test)]
+        if injected_sync_session_failure() {
+            return Err(io_error(
+                "sync session",
+                session
+                    .path()
+                    .map(|path| path.to_path_buf())
+                    .unwrap_or_default(),
+                std::io::Error::other("injected sync failure"),
+            ));
+        }
         let Some(path) = session.path() else {
             return Ok(());
         };
