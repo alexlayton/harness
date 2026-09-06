@@ -117,6 +117,9 @@ parallel read-only delegations and is clamped to at least one. Workspace-mode
 subagents are exclusive and run in sequence.
 
 Subagents do not receive external MCP tools and cannot create more subagents.
+Read-only children receive exactly `read`, `find`, `grep`, and `multigrep`;
+workspace children receive the normal built-ins. Exclusion from the registry
+is the enforcement, not prompt wording.
 
 ## MCP servers
 
@@ -147,15 +150,18 @@ tool-list changes. Calls are serialized as exclusive operations and run
 without a confirmation step. Subagents do not receive MCP tools.
 
 Only stdio transport is enabled. Streamable HTTP and legacy SSE transports are
-not enabled.
+not enabled. ACP clients may declare HTTP/SSE servers, but those entries are
+rejected before any connection is attempted.
 
 MCP has fixed safety limits rather than per-server TOML overrides: initialize
 and catalogue requests have 15-second deadlines, calls have a 60-second
 deadline, and shutdown has a four-second global deadline. A server may expose
 at most 256 tools with at most 512 KiB of aggregate definitions. Schemas are
 limited to depth 32, 10,000 nodes, 64 KiB strings, and 256 KiB total size.
-Structured/text/error output is compacted and capped at 20 KiB. Stderr is
-bounded and discarded by default.
+Structured/text/error output is compacted (never pretty-printed) and capped
+at 20 KiB with a truncation notice; when structured and text carry the same
+payload only one representation is kept. Stderr is read in bounded 4 KiB
+chunks, counted but discarded by default, and never logged with secrets.
 
 ## Sessions
 
@@ -193,10 +199,12 @@ the ephemeral history.
 
 The shell starts in the workspace but is not a sandbox. Bash calls are
 exclusive, use a 120-second default timeout (maximum 86,400 seconds), and cap
-output at 2,000 lines or 50 KiB. On Unix each command has its own process group;
-timeout, cancellation, and shell exit terminate surviving descendants and
-escalate after a short grace period. Other platforms only guarantee direct
-child termination.
+output at 2,000 lines or 50 KiB. On Unix each command has its own process
+group; timeout, cancellation, future drop, and shell exit with surviving
+descendants terminate that group (SIGTERM, escalating to SIGKILL after a
+500 ms grace period) and reap the shell. Standard output and error drain
+concurrently under one shared one-second deadline. Other platforms only
+guarantee direct child termination.
 
 ## Project context and skills
 
@@ -237,7 +245,7 @@ harness acp --provider openai-codex
 | Command or option | Purpose |
 |---|---|
 | `prompt [PROMPT]` | Run one prompt and print only the final answer to stdout. Reads piped stdin when the prompt is omitted. |
-| `acp` | Serve ACP over stdio. |
+| `acp` | Serve ACP over stdio (stdout carries JSON-RPC protocol traffic only). |
 | `login <provider>` | Authenticate with an OAuth provider. |
 | `--provider <provider>` | Override the configured provider. |
 | `--model <model>` | Override the configured model. |
