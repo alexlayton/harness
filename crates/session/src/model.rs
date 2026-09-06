@@ -910,6 +910,7 @@ pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
         } = &record.event
         {
             compaction_boundary = Some(*compacted_through);
+            validate_compaction_boundary(events, *compacted_through, record.sequence)?;
         }
         tracker.record(&record.event);
     }
@@ -930,7 +931,16 @@ pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord
         &session.event_ids,
         &session.tracker,
         session.compaction_boundary,
-    )
+    )?;
+    if let SessionEvent::CompactionSummary {
+        compacted_through, ..
+    } = &record.event
+    {
+        let mut events = session.events.clone();
+        events.push(record.clone());
+        validate_compaction_boundary(&events, *compacted_through, record.sequence)?;
+    }
+    Ok(())
 }
 
 /// Validate an on-disk suffix against cached state without cloning the full
@@ -962,6 +972,9 @@ pub(crate) fn validate_event_suffix(
         } = &record.event
         {
             boundary = Some(*compacted_through);
+            let mut events = session.events.clone();
+            events.extend(records.iter().cloned());
+            validate_compaction_boundary(&events, *compacted_through, record.sequence)?;
         }
         tracker.record(&record.event);
         expected = expected.saturating_add(1);
@@ -1153,6 +1166,46 @@ fn validate_record<T: ToolValidationState>(
         | SessionEvent::MetadataChange { .. }
         | SessionEvent::Reasoning { .. }
         | SessionEvent::Unknown { .. } => {}
+    }
+    Ok(())
+}
+
+/// Validate that a compaction boundary ends after a complete tool-call
+/// batch. A summary may preserve a live tail after the boundary, but it must
+/// never summarize a call while retaining its result (or vice versa).
+fn validate_compaction_boundary(
+    events: &[SessionEventRecord],
+    boundary: u64,
+    summary_sequence: u64,
+) -> Result<()> {
+    if boundary > 0 && !events.iter().any(|record| record.sequence == boundary) {
+        return Err(SessionError::InvalidEvent(format!(
+            "compaction boundary {boundary} does not identify an existing event"
+        )));
+    }
+
+    let mut tracker = ToolCallTracker::default();
+    for record in events {
+        if record.sequence > boundary {
+            break;
+        }
+        // A previous summary replaces the tool-call state before its live
+        // tail; calls represented by that summary are no longer replayed.
+        if matches!(record.event, SessionEvent::CompactionSummary { .. }) {
+            tracker = ToolCallTracker::default();
+        } else {
+            tracker.record(&record.event);
+        }
+    }
+    if let Some(call_id) = tracker.pending().first() {
+        return Err(SessionError::InvalidEvent(format!(
+            "compaction boundary {boundary} splits unresolved tool call {call_id}"
+        )));
+    }
+    if boundary >= summary_sequence {
+        return Err(SessionError::InvalidEvent(format!(
+            "compaction boundary {boundary} must precede its summary event {summary_sequence}"
+        )));
     }
     Ok(())
 }
@@ -1665,6 +1718,18 @@ mod tests {
         }
         assert_eq!(results, vec!["call-1".to_owned()]);
         assert!(calls.contains("call-1"));
+    }
+
+    #[test]
+    fn compaction_rejects_a_boundary_inside_a_parallel_batch() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "read both");
+        push_tool_call(&mut session, "call-a", "read");
+        push_tool_call(&mut session, "call-b", "read");
+        push_tool_result(&mut session, "call-a");
+        push_tool_result(&mut session, "call-b");
+        push_summary(&mut session, "bad", 2);
+        assert!(validate_events(&session.events).is_err());
     }
 
     // --- SESSION-5: tool-call replay validation ---------------------------

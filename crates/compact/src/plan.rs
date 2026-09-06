@@ -11,7 +11,7 @@
 
 use crate::estimate::estimate_provider_context_tokens;
 use crate::policy::CompactionPolicy;
-use session::model::{Session, SessionEvent, SessionEventRecord};
+use session::model::{Session, SessionEvent, SessionEventRecord, StoredContent};
 use session::model::{events_after_latest_compaction, latest_compaction_boundary};
 
 /// A completed compaction plan: what to summarize and where the new
@@ -111,11 +111,11 @@ fn is_compaction(record: &SessionEventRecord) -> bool {
     matches!(record.event, SessionEvent::CompactionSummary { .. })
 }
 
-/// Event kinds that are valid cut points. Cutting before a `UserMessage` is a
-/// normal turn boundary; before an `AssistantMessage` is a split turn. A
-/// standalone `ToolCall` is also a safe cut because its result follows and is
-/// kept. We never cut before a `ToolResult` — that would orphan a tool call
-/// from its result and produce invalid provider history.
+/// Event kinds that can begin the retained tail. Cutting before a
+/// `UserMessage` is a normal turn boundary; before an `AssistantMessage` is a
+/// split turn. A standalone `ToolCall` may begin the tail only when there are
+/// no earlier unresolved calls in the retained region. We never cut before a
+/// `ToolResult` — that would orphan a tool call from its result.
 fn is_cut_point(record: &SessionEventRecord) -> bool {
     matches!(
         record.event,
@@ -123,6 +123,46 @@ fn is_cut_point(record: &SessionEventRecord) -> bool {
             | SessionEvent::AssistantMessage { .. }
             | SessionEvent::ToolCall { .. }
     )
+}
+
+/// Return cut points whose prefix leaves no unresolved tool calls. This is
+/// deliberately separate from the event-kind check above: a parallel batch
+/// can contain several standalone calls, and cutting before the second one
+/// would leave the first call in the summarized prefix while retaining its
+/// result in the live tail.
+fn valid_cut_points(live: &[&SessionEventRecord]) -> Vec<usize> {
+    let mut pending = Vec::<String>::new();
+    let mut cut_points = Vec::new();
+    for (index, record) in live.iter().enumerate() {
+        if is_cut_point(record) && pending.is_empty() {
+            cut_points.push(index);
+        }
+        match &record.event {
+            SessionEvent::AssistantMessage { message } => {
+                for content in &message.content {
+                    if let StoredContent::ToolCall { id, .. } = content {
+                        pending.push(id.clone());
+                    }
+                }
+            }
+            SessionEvent::ToolCall { call } => pending.push(call.id.clone()),
+            SessionEvent::ToolResult { tool_call_id, .. } => {
+                if let Some(position) = pending.iter().position(|id| id == tool_call_id) {
+                    pending.remove(position);
+                }
+            }
+            SessionEvent::TurnCancelled { .. } => pending.clear(),
+            SessionEvent::UserMessage { .. }
+            | SessionEvent::Reasoning { .. }
+            | SessionEvent::Error { .. }
+            | SessionEvent::ModelChange { .. }
+            | SessionEvent::Usage { .. }
+            | SessionEvent::MetadataChange { .. }
+            | SessionEvent::CompactionSummary { .. }
+            | SessionEvent::Unknown { .. } => {}
+        }
+    }
+    cut_points
 }
 
 /// Estimated provider-context tokens represented by a live event.
@@ -149,7 +189,7 @@ fn choose_cut(live: &[&SessionEventRecord], policy: &CompactionPolicy) -> Option
     for i in (0..live.len()).rev() {
         suffix[i] = suffix[i + 1].saturating_add(event_tokens(live[i]));
     }
-    let cut_points: Vec<usize> = (0..live.len()).filter(|&i| is_cut_point(live[i])).collect();
+    let cut_points = valid_cut_points(live);
 
     // --- Phase 1: turn-count primary -------------------------------------
     // Walk backward from the newest event until we have keep_recent_turns
@@ -265,6 +305,31 @@ mod tests {
             is_error: false,
             tool_name: None,
         });
+    }
+
+    #[test]
+    fn parallel_standalone_calls_are_one_compaction_unit() {
+        let mut session = new_session();
+        push_user(&mut session, "run these calls");
+        push_tool_call(&mut session, "call-a", "read");
+        push_tool_call(&mut session, "call-b", "read");
+        push_tool_result(&mut session, "call-a", "result a");
+        push_tool_result(&mut session, "call-b", "result b");
+        let live = session.events.iter().collect::<Vec<_>>();
+        let cut_points = valid_cut_points(&live);
+        let call_a = live
+            .iter()
+            .position(|record| matches!(record.event, SessionEvent::ToolCall { ref call } if call.id == "call-a"))
+            .unwrap();
+        let call_b = live
+            .iter()
+            .position(|record| matches!(record.event, SessionEvent::ToolCall { ref call } if call.id == "call-b"))
+            .unwrap();
+        assert!(cut_points.contains(&call_a));
+        assert!(
+            !cut_points.contains(&call_b),
+            "a compaction cut must not split a parallel call batch"
+        );
     }
 
     fn default_policy() -> CompactionPolicy {
