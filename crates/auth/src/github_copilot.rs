@@ -176,12 +176,13 @@ impl GithubCopilotClient {
     /// Test seam: redirect the model-catalogue base URL at a local
     /// fixture. Production callers leave this unset so the Copilot token's
     /// `proxy-ep` (or the pinned host) chooses the host; tests set it so a
-    /// failing `/models` endpoint proves login still persists.
+    /// failing `/models` endpoint proves login still persists. Prefer this
+    /// over `with_api_base_url` in tests: the `_for_test` name marks the
+    /// redirect as fixture-only at the call site.
     #[cfg(test)]
     #[allow(dead_code)] // consumed by the model-list-failure login test
-    pub(crate) fn with_api_base_url_for_test(mut self, base_url: impl Into<String>) -> Self {
-        self.api_base_url = Some(base_url.into().trim_end_matches('/').to_owned());
-        self
+    pub(crate) fn with_api_base_url_for_test(self, base_url: impl Into<String>) -> Self {
+        self.with_api_base_url(base_url)
     }
 
     pub fn with_endpoints(endpoints: CopilotEndpoints) -> Result<Self> {
@@ -1237,25 +1238,58 @@ mod tests {
     #[tokio::test]
     async fn concurrent_refresh_single_flights_on_one_network_call() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // A fake refresh client counting network exchanges: all concurrent
-        // `ensure_valid` waiters must share one exchange.
-        struct CountingClient {
-            calls: AtomicUsize,
-        }
-        impl CountingClient {
-            async fn exchange(&self, old: &CopilotCredential) -> CopilotCredential {
-                self.calls.fetch_add(1, Ordering::SeqCst);
-                // Hold the exchange open so waiters pile onto the guard.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                CopilotCredential::new(
-                    format!("access-new-{}", self.calls.load(Ordering::SeqCst)),
-                    old.refresh.clone(),
-                    u64::MAX,
-                    None,
-                    vec!["gpt-5.4".into()],
-                )
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Local fixture emulating a single-use rotating refresh token:
+        // the FIRST `/copilot_internal/v2/token` exchange succeeds and
+        // rotates the token; any SECOND exchange fails, so every waiter
+        // must share the first waiter's result through the real
+        // `ensure_valid` single-flight guard — not a reimplemented copy.
+        let exchanges = std::sync::Arc::new(AtomicUsize::new(0));
+        let exchanges_task = exchanges.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                let (status, body) = if request.contains("/copilot_internal/v2/token") {
+                    let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // First exchange rotates to a fresh single-use pair.
+                        // `expires_at` is far-future seconds; the 5-minute
+                        // skew still leaves the credential unexpired.
+                        (
+                            200,
+                            r#"{"token":"access-rotated","expires_at":9999999999}"#.to_owned(),
+                        )
+                    } else {
+                        // A second exchange means single-flight failed:
+                        // the rotated refresh token is already spent.
+                        (401, r#"{"error":"rotated token already used"}"#.to_owned())
+                    }
+                } else if request.contains("GET /models ") {
+                    // Model enrichment succeeds so the persisted result is
+                    // the fully-enriched credential every waiter saw.
+                    (
+                        200,
+                        r#"{"data":[{"id":"gpt-5.4","model_picker_enabled":true}]}"#.to_owned(),
+                    )
+                } else {
+                    (404, r#"{"error":"unexpected"}"#.to_owned())
+                };
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
             }
-        }
+        });
         let directory = tempfile::tempdir().unwrap();
         let store = AuthStore::new(directory.path().join("auth.json"));
         // Expired credential so every waiter wants a refresh.
@@ -1268,30 +1302,29 @@ mod tests {
                 Vec::new(),
             ))
             .unwrap();
-        let auth = CopilotAuth::new(store).unwrap();
-        let client = std::sync::Arc::new(CountingClient {
-            calls: AtomicUsize::new(0),
-        });
-        // Drive N concurrent `refresh`-guarded exchanges through the real
-        // single-flight guard by cloning the auth handle.
+        let auth = CopilotAuth::new(store).unwrap().with_client_for_test(
+            GithubCopilotClient::with_client_and_endpoints(
+                reqwest::Client::new(),
+                CopilotEndpoints {
+                    device_code_url: format!("http://{addr}/login/device/code"),
+                    access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                    copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+                },
+            )
+            .unwrap()
+            .with_api_base_url_for_test(format!("http://{addr}")),
+        );
+        // N concurrent `ensure_valid` calls through the REAL refresh path.
+        // A barrier releases them together so they pile onto the guard
+        // while the first exchange is in flight.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
         let waiters = (0..8)
             .map(|_| {
                 let auth = auth.clone();
-                let client = client.clone();
+                let barrier = barrier.clone();
                 tokio::spawn(async move {
-                    let _guard = auth.refresh_lock.lock().await;
-                    // Recheck pattern mirrors `refresh`: only the first
-                    // waiter exchanges; the rest reuse the fresh cache.
-                    if let Some(cached) = auth.credential().unwrap()
-                        && !cached.is_expired()
-                    {
-                        return cached;
-                    }
-                    let old = auth.credential().unwrap().unwrap();
-                    let refreshed = client.exchange(&old).await;
-                    auth.store.save_copilot(&refreshed).unwrap();
-                    *auth.credential.lock().unwrap() = Some(refreshed.clone());
-                    refreshed
+                    barrier.wait().await;
+                    auth.ensure_valid().await.unwrap()
                 })
             })
             .collect::<Vec<_>>();
@@ -1299,13 +1332,140 @@ mod tests {
         for waiter in waiters {
             results.push(waiter.await.unwrap());
         }
-        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        // One network exchange despite 8 concurrent waiters…
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        // …every waiter shares the rotated credential…
         for credential in &results {
-            assert_eq!(credential.access, results[0].access);
+            assert_eq!(credential.access, "access-rotated");
+            assert_eq!(credential.refresh, "refresh-single-use");
         }
-        // Persisted credentials equal the newest returned credentials.
+        // …and the persisted credential equals what the waiters saw.
         let persisted = auth.store.copilot().unwrap().unwrap();
-        assert_eq!(persisted.access, results[0].access);
+        assert_eq!(persisted.access, "access-rotated");
         assert_eq!(persisted.refresh, "refresh-single-use");
+        assert_eq!(persisted.available_model_ids, vec!["gpt-5.4"]);
+    }
+
+    /// AUTH-2: two handles on one store (two processes, two agent
+    /// instances) racing `ensure_valid` still produce one exchange: the
+    /// loser adopts the winner's persisted rotation via the reload-
+    /// recheck guard instead of exchanging a second time. (True
+    /// simultaneity could still double-exchange — separate guards, one
+    /// file — but compare-and-save then keeps the loser's stale
+    /// completion from overwriting the winner; the single-use fixture
+    /// would reject it with 401. What this test pins is the
+    /// reload-recheck path: a handle whose guard acquisition lands after
+    /// the winner's persist never hits the network.)
+    #[tokio::test]
+    async fn two_handles_racing_refresh_share_one_exchange() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let exchanges = std::sync::Arc::new(AtomicUsize::new(0));
+        let exchanges_task = exchanges.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                let (status, body) = if request.contains("/copilot_internal/v2/token") {
+                    let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // Hold the first exchange open so the second handle
+                        // starts its own exchange concurrently.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        (
+                            200,
+                            r#"{"token":"access-winner","expires_at":9999999999}"#.to_owned(),
+                        )
+                    } else {
+                        (401, r#"{"error":"rotated token already used"}"#.to_owned())
+                    }
+                } else if request.contains("GET /models ") {
+                    (
+                        200,
+                        r#"{"data":[{"id":"gpt-5.4","model_picker_enabled":true}]}"#.to_owned(),
+                    )
+                } else {
+                    (404, r#"{"error":"unexpected"}"#.to_owned())
+                };
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        AuthStore::new(path.clone())
+            .save_copilot(&CopilotCredential::new(
+                "access-old",
+                "refresh-single-use",
+                1,
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+        let client = || {
+            GithubCopilotClient::with_client_and_endpoints(
+                reqwest::Client::new(),
+                CopilotEndpoints {
+                    device_code_url: format!("http://{addr}/login/device/code"),
+                    access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                    copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+                },
+            )
+            .unwrap()
+            .with_api_base_url_for_test(format!("http://{addr}"))
+        };
+        // Two independent handles, one shared file — the closest a unit
+        // test gets to two processes. Separate caches, separate guards.
+        let first = CopilotAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_client_for_test(client());
+        let second = CopilotAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_client_for_test(client());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let first_task = tokio::spawn({
+            let first = first.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                first.ensure_valid().await
+            }
+        });
+        let second_task = tokio::spawn({
+            let second = second.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                // Let the winner's persist land first so the loser's
+                // reload-recheck path is deterministic: it must adopt
+                // the winner's unexpired rotation with no new exchange.
+                // (The exchange itself cannot be delayed past the
+                // winner's persist — both handles race it — but the
+                // loser's guard acquisition can.)
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                second.ensure_valid().await
+            }
+        });
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        let first_result = first_result.unwrap().unwrap();
+        assert_eq!(first_result.access, "access-winner");
+        // The loser adopted the winner's persisted rotation instead of
+        // exchanging a second time: one network exchange total.
+        let second_result = second_result.unwrap().unwrap();
+        assert_eq!(second_result.access, "access-winner");
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        let persisted = AuthStore::new(path).copilot().unwrap().unwrap();
+        assert_eq!(persisted.access, "access-winner");
     }
 }
