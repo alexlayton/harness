@@ -478,6 +478,43 @@ mod tests {
     }
 
     #[test]
+    fn held_partial_tool_call_emits_nothing_at_eof() {
+        // A completed `function_call` item is held (no `ToolCallComplete`
+        // escapes before the terminal event). Clean EOF first must surface
+        // `Stream` (never `Done`); `finish` never drains held calls.
+        let mut parser = ResponsesParser::new();
+        let held = parser.parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"held-1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).unwrap();
+        assert!(
+            !held
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallComplete(_))),
+            "held call escaped before terminal: {held:?}"
+        );
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(parser.is_done());
+        // A second finish after the error is a no-op, still no `Done`.
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_error_after_partial_output_remains_an_error() {
+        // Partial text followed by a provider failure payload stays an
+        // error: `response.failed` surfaces `LlmError::Stream` (agent
+        // recovery path) instead of ever reaching a terminal `Done`.
+        let mut parser = ResponsesParser::new();
+        let events = parser
+            .parse_payload(r#"{"type":"response.output_text.delta","delta":"hi"}"#)
+            .unwrap();
+        assert_eq!(events, vec![StreamEvent::TextDelta("hi".into())]);
+        let error = parser
+            .parse_payload(r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"boom"}}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(!parser.is_done());
+    }
+
+    #[test]
     fn incomplete_terminal_event_succeeds_with_reason_and_usage() {
         let mut parser = ResponsesParser::new();
         let done = parser.parse_payload(r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}}"#).unwrap();
