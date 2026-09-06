@@ -122,26 +122,29 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - `compact/serialize.rs:29 serialize_events` newest→oldest, separator accounting, oversized-newest `truncate_bytes` prefix, `truncated` flag, `marker_reserve` then `truncate_bytes(text,budget)` UTF-8 loop; `summarize.rs:195 append_with_limit`, `:212 append_file_lists truncate_bytes(combined,max_summary_bytes)`, `:223` deterministic, `:125,134` input cap + `OMISSION_MARKER` (`truncated` used).
 - Tests: `serialize.rs:428 transcript_budget_includes_separators_and_oversized_newest (0..=128 len<=budget, é×200)`, `:451` zero-budget + per-item; `summarize.rs:384 len<=max (128)`. GAP: no explicit 1000s-paths test (cap holds via combined truncate).
 
-## Phase 6 — Frontend (`crates/harness`, `crates/tui`)
+## Phase 6 — Frontend (`crates/harness`, `crates/tui`) — DONE
 
 ### HARNESS-1 ACP errors/usage — DONE
 - `harness/acp.rs:120-180 PromptTracker{in_flight:{error,cancelled}}` + `mark_error/clear_error` only on `TextDelta` (metadata doesn't clear); `~463,518-522 UsageUpdated→None`, `ContextUsageUpdated→UsageUpdate`; `~1030-1090 forward_events`: `cumulative_cost→UsageUpdate` only, `TurnFinished→EndTurn/Cancelled`, `Error→mark_error`, unconditional `resolve(id,None)` on stream-end; `_context_window` unused (first-model heuristic removed); tests `~1049,1532 EndTurn`, `~1059,1064,1266,1273` billing-vs-context.
+- New: `mid_stream_provider_error_fails_the_prompt` (scripted text + stream error → prompt `Err`, error diagnostic visible as `AgentMessageChunk`, never blank `EndTurn`); `prompt_tracker_error_lifecycle_resolves_failure_and_recovery` (unknown-session mark/clear/cancel are panic-free no-ops).
 
 ### HARNESS-2 ACP lifecycle — DONE
 - `acp.rs:89-180 SessionHandle{input_tx,cancel,agent_task,forwarder_task}`; `:189-360 serve` owns `AcpState{sessions,prompts}`, disconnect drains + `shutdown_session` each; `:611,645-720 load_session_inner` trim+`SessionId::parse`+canonical `to_string`+`already loaded` reject; `:720-753 delete_session` reject if `in_flight`, `shutdown_session` under `SESSION_TASK_TIMEOUT=2s` (aborts both after one deadline); `:778 delete_session_everywhere` workspace scan, `NotFound→Ok`; `:887-1020 build_session_stack` via `spawn_blocking`+`timeout`, `acp_mcp_servers` rejects HTTP/SSE, `spawn_agent builder.build()+timeout`, duplicate-after-assembly abort (`~1009` race comment); `new/load_session tokio::spawn` off dispatch.
 
 ### HARNESS-3 Headless — DONE
 - `harness/headless.rs:120-290 pending_text/active_tools/error_pending/saw_turn_finished`; `TextDelta→push`, `ToolCallStarted→verbose+clear`, `ToolCallFinished+active==0→clear`, `TurnFinished+active==0+!empty→stdout+newline else flush`, `Error→clear+stderr+error_pending=true`, `UsageUpdated/Notice/etc` don't clear (`error_pending=false` only in `TextDelta`); `write!/writeln!+?` propagates; `reasoning_open` delimiter only on `ToolCallStarted/TurnFinished`; `!saw_turn_finished→Err`; `run_headless_resolved agent_task.await.context`; `:130` SIGINT; `main.rs:~130-170 resolved_prompt=resolve_prompt()` before registry/store/bundle, `needs_session_store`, ACP early-return, `run_headless_with_prompt(...,prompt,rendered)` no reload.
+- New: `multiple_tool_rounds_emit_only_the_last_text_only_round` (prose→tools→prose→tools→final ⇒ `final answer\n` only); `error_followed_by_usage_update_still_fails_the_run` (`Error→UsageUpdated→TurnFinished` stays exit 1 — only `TextDelta` clears); `blank_prompt_creates_no_session_on_disk` (blank `run_headless` errors before store touch, session dir unchanged); `agent_task_panic_surfaces_instead_of_blank_success` (`.context` on the join propagates).
 
 ### TUI-1 Sanitize — DONE
 - `tui/render.rs:561-660 sanitize_terminal_text`: `\n` keep, `\t→4sp`, `ESC/CSI/OSC/string/C0/C1/DEL` via `skip_escape_sequence/skip_csi_sequence/skip_string_sequence`, `is_control/0x7f` drop; used in `plain_text/owned_markdown/fit_line_to_width/wrap_text` + `app.rs:639,725,2497,2524-2547,3103`; `Paste→sanitize`; tests `sanitizer_removes_terminal_controls_and_expands_tabs`, `consumes_unterminated`, `line_to_ansi_sanitizes OSC/CSI`.
 
-### TUI-2 Row-width/restoration — PARTIAL
-- DONE: `render.rs:358 fit_line_to_width` + `wrap_text` + `line_width` + `<=width` tests `~926-956`; `prefix_message_lines fit_text_to_width(prefix)` + width-1 invariant; `app.rs:700-713` separate `Home/End` vs `Ctrl+A/E`, `PageUp/Down→{}`; `activity_region_row:Option` from `build.activity_row (:583,2130,3753)`; `TerminalModes{raw,bracketed,keyboard,newline}` + best-effort `restore()` first-error + `Drop` + panic-hook.
-- GAP: `metadata_lines(~2520)` builds `cwd(branch)`/`provider·model` without explicit `fit`; combining/ZWJ/zero-width only via `UnicodeWidth` (no explicit ZWJ test); width 1–3 property, height 1–2 spinner-clamp correctness tests not found.
+### TUI-2 Row-width/restoration — DONE
+- DONE: `render.rs:358 fit_line_to_width` + `wrap_text` + `line_width` + `<=width` tests `~926-956`; `prefix_message_lines fit_text_to_width(prefix)` + width-1 invariant; `app.rs:700-713` separate `Home/End` vs `Ctrl+A/E`, `PageUp/Down→{}`; `activity_region_row:Option` from `build.activity_row (:583,2130,3753)`; `TerminalModes{raw,bracketed,keyboard,newline}` + best-effort `restore()` first-error + `Drop` + panic-hook; width 1–3 tests (`render.rs:921`, `app.rs:3724`) and height 1–2 clamp test (`app.rs:3745`) exist.
+- New: `combining_zwj_and_zero_width_text_never_exceeds_its_budget` (combining acute, ZWJ family, ZWJ/ZWSP, mixed indent+CJK+tab × widths 1–80 × all five line renderers); `long_metadata_rows_fit_narrow_widths` (pathological cwd/branch/provider·model/context/skills through the `entry_lines→fit_line_to_width` path at widths 1–80). Known non-blocking remainder: injectable terminal backend for setup/cleanup failure injection (CrossTerm calls crossterm directly; no failure tests) — documented, not a correctness gap.
 
 ### TUI-3 Commands/completion — DONE
 - `tui/commands.rs:parse_command_with_skills` alias only if `rest.is_empty()` + non-colliding else `parse_command` error (never silently drops); `paths.rs:extract_at_prefix token_end` stops at `whitespace/) ] } , ;` (preserves punctuation); `app.rs:1093-1200 request/apply_path_completion` debounced `200ms`+`spawn_blocking`+`generation/cancel`, merges static `candidates_at_cursor` + `find_path_candidates` via `merge_candidates` (`/load ./…` + session IDs); `~3992 direct_provider_prefix_requests_its_model_catalogue`; `tool_lines` expanded `output_tail` + `error.lines().skip(1).take(TAIL)` + `running…`, collapsed first-line only.
+- Fixes: skill-alias trailing text now errors `usage: /<skill> (takes no arguments)` instead of misleading `unknown command`; `request_backend` also fires on partially typed `provider:model` (not just bare `provider:`); `load_completion_combines_session_and_filesystem_context` now asserts real filesystem candidates + session-ID retention through `merge_candidates`.
 
 ## Phase 7 — Token/memory/startup
 
@@ -177,8 +180,7 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - `completed.md` admits outstanding. Need: model-assisted compaction + deterministic fallback (remove "absent" claim), read-only subagents `multigrep` scope, exact no-session compaction, shell exclusivity + tree-kill, MCP catalogue/output/time limits, Linux baseline, headless-stdout + ACP-purity. Files: `ARCHITECTURE.md`, `crates/session/README.md`, `docs/configuration.md`, `README.md`.
 
 ## Remaining TODO (ordered)
-1. Phases 2–5 DONE. Next: TUI-2 metadata fit + width/combining/ZWJ property + height-clamp tests.
-2. PERF-5 benches (1k/10k) + external/replacement reconciliation; PERF-6 TUI quadratic guard (fix `lines().count()` walk, add bench).
-3. CONFIG-1 nested-extra matrix + concurrent-mutator tests; CLEANUP-1 `cargo tree --duplicates` verify + remaining removals; CLEANUP-2/3/4 sweeps.
-4. CI-1 workflow verify + Linux baseline; DOCS-1 contracts.
-5. Re-run before handoff: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo build --workspace --locked`, `cargo tree --workspace --duplicates`, `git diff --check`.
+1. Phases 2–6 DONE. Next: PERF-5 benches (1k/10k) + external/replacement reconciliation; PERF-6 TUI quadratic guard.
+2. CONFIG-1 nested-extra matrix + concurrent-mutator tests; CLEANUP-1 `cargo tree --duplicates` verify + remaining removals; CLEANUP-2/3/4 sweeps.
+3. CI-1 workflow verify + Linux baseline; DOCS-1 contracts.
+4. Re-run before handoff: `cargo fmt --all`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo build --workspace --locked`, `cargo tree --workspace --duplicates`, `git diff --check`.
