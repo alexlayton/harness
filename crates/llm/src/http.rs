@@ -233,6 +233,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_error_body_is_bounded_to_a_prefix() {
+        // A multi-megabyte (chunked) non-success body must stay bounded:
+        // only a 16KiB prefix is read, and the final error stays within
+        // the byte cap as valid UTF-8.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().unwrap();
+        // 256KiB of chunked body: 64 chunks of 4KiB each.
+        let chunk = "x".repeat(4 * 1024);
+        let chunks = chunk.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let mut response =
+                b"HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\n\r\n"
+                    .to_vec();
+            for _ in 0..64 {
+                response.extend_from_slice(format!("{:x}\r\n", chunks.len()).as_bytes());
+                response.extend_from_slice(chunks.as_bytes());
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            socket.write_all(&response).await.unwrap();
+        });
+        let client = HttpClient::with_client(
+            format!("http://{addr}"),
+            "test-key",
+            HeaderMap::new(),
+            // Plain-HTTP fixture, but reqwest still requires a crypto
+            // provider at build time: reuse the shared client factory used
+            // in production.
+            crate::http::streaming_client(),
+        );
+        let error = client.get("/models").await.unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.len() <= 2048 + 64,
+            "oversized body leaked: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.is_char_boundary(rendered.len()));
+    }
+
+    #[tokio::test]
     async fn stalled_response_body_times_out_instead_of_hanging() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
