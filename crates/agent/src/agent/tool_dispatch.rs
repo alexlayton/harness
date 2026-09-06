@@ -637,6 +637,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_executor_retains_ready_result_racing_cancellation() {
+        // A call that completed before cancellation was observed keeps its
+        // real result: the ready-drain after cancellation harvests it
+        // instead of relabelling it as unknown cancellation. This is the
+        // shared-executor path both parent and child (subagent) dispatch
+        // flow through, so it pins the behavior for both.
+        let finished_first = Arc::new(Notify::new());
+        let release_second = Arc::new(Notify::new());
+        struct GatedTool {
+            finished_first: Arc<Notify>,
+            release_second: Arc<Notify>,
+        }
+        #[async_trait]
+        impl Tool for GatedTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    definition: llm::ToolDefinition {
+                        name: "gated".into(),
+                        description: "gated tool".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    prompt: tools::ToolPrompt::default(),
+                }
+            }
+            fn concurrency(&self, _args: &Value) -> Concurrency {
+                Concurrency::Parallel
+            }
+            async fn execute(&self, args: Value, _cancel: CancellationToken) -> ToolOutput {
+                if args["label"] == "first" {
+                    self.finished_first.notify_one();
+                    // Stay in-flight (but already completed-from-the-test's
+                    // view) until the test releases us — then report the
+                    // real result while cancellation is already pending.
+                    self.release_second.notified().await;
+                    ToolOutput {
+                        content: "first".into(),
+                        is_error: false,
+                        summary: "gated".into(),
+                    }
+                } else {
+                    // Park until the batch token is cancelled; the drop
+                    // ends this future without a result (unresolved).
+                    std::future::pending::<()>().await;
+                    unreachable!("cancelled futures are dropped before returning")
+                }
+            }
+        }
+        let registry = ToolRegistry::try_new(vec![Box::new(GatedTool {
+            finished_first: finished_first.clone(),
+            release_second: release_second.clone(),
+        })])
+        .unwrap();
+        let batch = ToolBatch {
+            calls: vec![
+                ToolCall {
+                    id: "first".into(),
+                    name: "gated".into(),
+                    arguments: json!({"label": "first"}),
+                },
+                ToolCall {
+                    id: "second".into(),
+                    name: "gated".into(),
+                    arguments: json!({"label": "second"}),
+                },
+            ],
+            class: Concurrency::Parallel,
+        };
+        let cancel = CancellationToken::new();
+        let mut control = CancellationControl::new(&cancel, DispatchCancellation::Explicit);
+        let mut hooks = NoopToolDispatchHooks;
+        let mut execution = Box::pin(execute_tool_batch(
+            &registry,
+            &batch,
+            2,
+            &mut control,
+            &mut hooks,
+        ));
+        // Both calls are in flight. Cancel while the first is parked just
+        // before reporting: the `select!` observes cancellation, then the
+        // ready-drain must still harvest the first call's real result once
+        // the test releases it.
+        tokio::select! {
+            _ = finished_first.notified() => cancel.cancel(),
+            _ = &mut execution => panic!("batch completed before cancellation"),
+        }
+        release_second.notify_one();
+        let outcome = execution.await;
+
+        assert_eq!(outcome.cancellation, Some(DispatchCancellation::Explicit));
+        assert_eq!(outcome.outcomes[0].output.content, "first");
+        assert!(!outcome.outcomes[0].output.is_error);
+        assert_eq!(
+            outcome.outcomes[1].output.content,
+            "cancelled; execution status unknown"
+        );
+    }
+
+    #[tokio::test]
     async fn shared_executor_distinguishes_launched_and_queued_cancellation() {
         let started = Arc::new(Notify::new());
         let registry = ToolRegistry::try_new(vec![Box::new(TestTool {
