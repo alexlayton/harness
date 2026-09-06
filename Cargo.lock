@@ -317,6 +317,7 @@ version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
+ "fs2",
  "futures-util",
  "libc",
  "reqwest",
@@ -3133,6 +3134,7 @@ dependencies = [
 name = "session"
 version = "0.3.0"
 dependencies = [
+ "fs2",
  "libc",
  "llm",
  "serde",

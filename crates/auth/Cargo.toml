@@ -6,6 +6,7 @@ publish.workspace = true
 description = "GitHub Copilot authentication and private credential storage for Harness"
 
 [dependencies]
+fs2 = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form", "stream"] }
 # The `ring` crypto provider must be installed before any reqwest client is
 # built (see crates/llm — the same provider install covers this crate). Kept

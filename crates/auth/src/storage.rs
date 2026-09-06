@@ -6,6 +6,7 @@
 //! different provider.
 
 use crate::error::{AuthError, Result, io_error};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -311,7 +312,7 @@ impl AuthStore {
             Ok(file) => {
                 // Reading an auth file is also an opportunity to repair a
                 // permissive mode left by an older Harness version.
-                set_private_file(&self.path);
+                ensure_private_file(&self.path)?;
                 file
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -466,10 +467,6 @@ fn ensure_private_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn set_private_file(path: &Path) {
-    let _ = ensure_private_file(path);
-}
-
 /// Sync the parent directory after durable create/rename operations;
 /// failures fail closed.  No-op success where directory fsync is
 /// unsupported.
@@ -496,11 +493,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 }
 
 struct AuthFileLock {
-    path: PathBuf,
-    /// Unguessable owner nonce: stealing removes only the exact stale
-    /// instance observed, and release removes only the owner's own lock —
-    /// the same reviewed scheme as the session store.
-    nonce: String,
+    file: fs::File,
 }
 
 impl AuthFileLock {
@@ -508,78 +501,40 @@ impl AuthFileLock {
         auth_path.with_extension("json.lock")
     }
 
-    fn read_nonce(path: &Path) -> Option<String> {
-        let contents = fs::read_to_string(path).ok()?;
-        contents.lines().find_map(|line| {
-            let value = line.strip_prefix("nonce=")?.trim();
-            (!value.is_empty()).then(|| value.to_owned())
-        })
-    }
-
-    fn is_same_lock(path: &Path, nonce: &str) -> bool {
-        Self::read_nonce(path).is_some_and(|current| current == nonce)
-    }
-
-    /// A lock is stale when its recorded owner is provably dead.  A live
-    /// owner is never stolen merely for being old; locks without readable
-    /// identity fall back to the conservative age timeout.
-    fn is_stale(path: &Path) -> bool {
-        if let Some(pid) = lock_owner_pid(path) {
-            return !pid_is_alive(pid);
-        }
-        fs::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .is_some_and(|age| age > Duration::from_secs(5 * 60))
-    }
-
-    /// Legacy locks without a nonce carry no instance identity: stale only
-    /// via the age heuristic (or a provably dead PID), never merely because
-    /// a PID line is present.
-    fn stale_without_identity(path: &Path) -> bool {
-        if Self::read_nonce(path).is_some() {
-            return false;
-        }
-        match lock_owner_pid(path) {
-            Some(pid) => !pid_is_alive(pid),
-            None => Self::is_stale(path),
-        }
-    }
-
     fn acquire(auth_path: &Path) -> Result<Self> {
         let path = Self::lock_path(auth_path);
+        let file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(&path)
+            }
+            #[cfg(not(unix))]
+            {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+            }
+        }
+        .map_err(|source| io_error("open auth lock", &path, source))?;
+        ensure_private_file(&path)?;
+
         for _ in 0..LOCK_ATTEMPTS {
-            let nonce = uuid_nonce();
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "pid={}", std::process::id());
-                    let _ = writeln!(file, "nonce={nonce}");
-                    let _ = file.sync_all();
-                    ensure_private_file(&path)?;
-                    return Ok(Self { path, nonce });
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(LOCK_WAIT);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if Self::is_stale(&path) {
-                        // Steal only the exact stale instance observed so two
-                        // racing stealers cannot both enter: a contender that
-                        // lost the race to a live replacement sees a changed
-                        // nonce and backs off.
-                        let observed = Self::read_nonce(&path);
-                        let same_instance = Self::read_nonce(&path) == observed;
-                        if Self::is_stale(&path)
-                            && same_instance
-                            && (observed.is_some() || Self::stale_without_identity(&path))
-                        {
-                            let _ = fs::remove_file(&path);
-                        } else {
-                            thread::sleep(LOCK_WAIT);
-                        }
-                    } else {
-                        thread::sleep(LOCK_WAIT);
-                    }
-                }
-                Err(source) => return Err(io_error("create auth lock", &path, source)),
+                Err(source) => return Err(io_error("lock auth file", &path, source)),
             }
         }
         Err(AuthError::LockUnavailable(path))
@@ -588,52 +543,9 @@ impl AuthFileLock {
 
 impl Drop for AuthFileLock {
     fn drop(&mut self) {
-        // Release only our own instance: a successor's nonce differs and
-        // its lock file is left alone.
-        if Self::is_same_lock(&self.path, &self.nonce) {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-/// Unguessable owner nonce without a new dependency: process id plus
-/// nanos plus a process-local sequence.
-fn uuid_nonce() -> String {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    format!("{}-{nanos}-{sequence}", std::process::id())
-}
-
-fn lock_owner_pid(path: &Path) -> Option<u32> {
-    let value = fs::read_to_string(path).ok()?;
-    value
-        .lines()
-        .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
-}
-
-/// True when the process with `pid` is alive (Unix `kill(pid, 0)` probe;
-/// `EPERM` counts as alive).  On other platforms a live PID line is never
-/// treated as stale by age alone — see `is_stale`.
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: signal 0 sends nothing; the PID comes from our own lock file.
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        // Without a probe, only the age fallback in `is_stale` applies; a
-        // readable PID is conservatively treated as live.
-        let _ = pid;
-        true
+        // Retain the sidecar inode so a waiter cannot switch to a replacement
+        // pathname between unlock and its next acquisition.
+        let _ = self.file.unlock();
     }
 }
 
@@ -699,60 +611,55 @@ mod tests {
     }
 
     #[test]
-    fn stale_auth_lock_steal_is_limited_to_the_observed_instance() {
-        // Same reviewed scheme as the session store: stealing removes only
-        // the exact stale instance observed, and release removes only the
-        // owner's own nonce, so two racing stealers cannot both enter.
+    fn advisory_auth_lock_serializes_contenders_and_retains_sidecar_inode() {
         let directory = tempdir().unwrap();
         let victim = directory.path().join("auth.json");
         fs::write(&victim, "{}").unwrap();
         let lock_path = AuthFileLock::lock_path(&victim);
-        fs::write(&lock_path, "pid=4000000\nnonce=stale-a\n").unwrap();
 
-        assert!(AuthFileLock::is_stale(&lock_path));
-        let observed_by_a = AuthFileLock::read_nonce(&lock_path);
-        assert_eq!(observed_by_a.as_deref(), Some("stale-a"));
-        // A racing contender replaces the stale lock with a live one.
-        fs::write(
-            &lock_path,
-            format!("pid={}\nnonce=fresh-b\n", std::process::id()),
-        )
-        .unwrap();
-        assert!(!AuthFileLock::is_stale(&lock_path));
-        assert_ne!(AuthFileLock::read_nonce(&lock_path), observed_by_a);
-
-        let old_owner = AuthFileLock {
-            path: lock_path.clone(),
-            nonce: "stale-a".into(),
-        };
-        drop(old_owner);
-        assert!(
-            lock_path.exists(),
-            "a stale owner must not remove the replacement lock"
+        let owner = AuthFileLock::acquire(&victim).unwrap();
+        assert!(lock_path.exists());
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert_eq!(
+            contender.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
         );
-        let owner = AuthFileLock {
-            path: lock_path.clone(),
-            nonce: "fresh-b".into(),
-        };
         drop(owner);
-        assert!(!lock_path.exists());
+
+        let next = AuthFileLock::acquire(&victim).unwrap();
+        assert!(lock_path.exists());
+        drop(next);
+        assert!(lock_path.exists());
     }
 
     #[test]
-    fn old_auth_lock_with_live_owner_is_never_stolen() {
+    fn concurrent_auth_lock_contenders_never_overlap() {
         let directory = tempdir().unwrap();
         let victim = directory.path().join("auth.json");
         fs::write(&victim, "{}").unwrap();
-        let lock_path = AuthFileLock::lock_path(&victim);
-        fs::write(
-            &lock_path,
-            format!("pid={}\nnonce=live-owner\n", std::process::id()),
-        )
-        .unwrap();
-        // A live owner is never stale, even past the age timeout; only a
-        // provably dead PID (or an unreadable identity past the timeout) is.
-        assert!(!AuthFileLock::is_stale(&lock_path));
-        assert!(!AuthFileLock::stale_without_identity(&lock_path));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let victim = victim.clone();
+            let barrier = barrier.clone();
+            let active = active.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let lock = AuthFileLock::acquire(&victim).unwrap();
+                assert_eq!(active.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                std::thread::sleep(Duration::from_millis(10));
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                drop(lock);
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 
     #[cfg(unix)]

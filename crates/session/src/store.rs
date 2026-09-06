@@ -6,6 +6,7 @@ use crate::model::{
     EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, StoredContent,
     StoredToolCall, Timestamp, now_timestamp, validate_event_suffix, validate_next_event,
 };
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -14,7 +15,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use uuid::Uuid;
 
 /// Shared deferred-sync flag so the store stays [`Clone`] (session handlers
@@ -30,8 +31,6 @@ impl Clone for DeferredSync {
 
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
-/// Locks older than this are stolen even when the owning PID cannot be read.
-const LOCK_STALE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// Options used when creating a new durable session.
 #[derive(Clone, Debug, Default)]
@@ -214,8 +213,9 @@ impl SessionStore {
 
     /// Append one event and make it durable before returning (or defer the
     /// `sync_all` when deferred sync is enabled — see the store field docs).
-    /// A sidecar create-new lock prevents two Harness processes from
-    /// interleaving JSON records.  Every record is followed by a newline.
+    /// An advisory sidecar lock prevents two Harness processes from
+    /// interleaving JSON records. The sidecar inode is retained so contenders
+    /// always lock the same object. Every record is followed by a newline.
     ///
     /// When the file ends with an incomplete crash tail (an unterminated
     /// malformed final line), the tail is truncated to the last valid record
@@ -671,7 +671,7 @@ fn file_identity(path: &Path) -> Result<(u64, u64)> {
         let modified = metadata
             .modified()
             .ok()
-            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_nanos() as u64);
         Ok((metadata.len(), modified))
     }
@@ -1132,11 +1132,7 @@ fn sync_parent(path: &Path) -> Result<()> {
 }
 
 struct SessionLock {
-    path: PathBuf,
-    /// Unguessable owner nonce written into the lock file.  Release and
-    /// stealing compare against this exact instance so one owner can never
-    /// remove another owner's replacement lock.
-    nonce: String,
+    file: File,
 }
 
 impl SessionLock {
@@ -1144,143 +1140,56 @@ impl SessionLock {
         session_path.with_extension("jsonl.lock")
     }
 
-    fn read_nonce(path: &Path) -> Option<String> {
-        let contents = fs::read_to_string(path).ok()?;
-        contents.lines().find_map(|line| {
-            let value = line.strip_prefix("nonce=")?.trim();
-            (!value.is_empty()).then(|| value.to_owned())
-        })
-    }
-
-    fn is_same_lock(path: &Path, nonce: &str) -> bool {
-        Self::read_nonce(path).is_some_and(|current| current == nonce)
-    }
-
     fn acquire(session_path: &Path) -> Result<Self> {
         let path = Self::lock_path(session_path);
+        let file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(&path)
+            }
+            #[cfg(not(unix))]
+            {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+            }
+        }
+        .map_err(|source| io_error("open session lock", &path, source))?;
+        // Existing sidecars from older versions are secured before any lock
+        // metadata or session bytes are written. Failure is fail-closed.
+        ensure_private_file(&path)?;
+
         for _ in 0..LOCK_ATTEMPTS {
-            // A fresh nonce per attempt keeps every contender's claim unique:
-            // stealing removes only the exact stale instance observed, and
-            // release removes only the owner's own instance.
-            let nonce = Uuid::new_v4().to_string();
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "pid={}", std::process::id());
-                    let _ = writeln!(file, "nonce={nonce}");
-                    let _ = file.sync_all();
-                    return Ok(Self { path, nonce });
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(LOCK_WAIT);
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if lock_is_stale(&path) {
-                        // Steal only the exact stale instance observed: if the
-                        // contender's `create_new` lost the race to a live
-                        // replacement owner, the nonce no longer matches and
-                        // the replacement lock is left alone.  Legacy locks
-                        // without a nonce carry no instance identity; they are
-                        // stolen by age so dead owners (like the
-                        // `pid=4000000` fixture) can still be recovered.
-                        let observed = Self::read_nonce(&path);
-                        let same_instance = Self::read_nonce(&path) == observed;
-                        if lock_is_stale(&path)
-                            && same_instance
-                            && (observed.is_some() || stale_without_identity(&path))
-                        {
-                            let _ = fs::remove_file(&path);
-                        } else {
-                            thread::sleep(LOCK_WAIT);
-                        }
-                    } else {
-                        thread::sleep(LOCK_WAIT);
-                    }
-                }
-                Err(source) => return Err(io_error("create session lock", &path, source)),
+                Err(source) => return Err(io_error("lock session", &path, source)),
             }
         }
         Err(SessionError::LockUnavailable(path))
     }
 }
 
-/// A lock is stale when its recorded owner is no longer alive (checked via
-/// `kill(pid, 0)` on Unix and `OpenProcess` on Windows), or — for lock files
-/// whose PID cannot be read (legacy files, unreadable, malformed) — when it is
-/// older than the conservative timeout.
-fn lock_is_stale(path: &Path) -> bool {
-    // A live owner means the lock is never stale, even past the timeout:
-    // a long append must not be interrupted by another process.
-    if let Some(pid) = lock_owner_pid(path) {
-        return !pid_is_alive(pid);
-    }
-    fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-        .is_some_and(|age| age > LOCK_STALE_TIMEOUT)
-}
-
-fn lock_owner_pid(path: &Path) -> Option<u32> {
-    let value = fs::read_to_string(path).ok()?;
-    value
-        .lines()
-        .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
-}
-
-/// Legacy locks without a nonce carry no instance identity: they are stale
-/// only via the conservative age heuristic (or a provably dead PID), never
-/// merely because a PID line is present.  A lock with a live owner is never
-/// stolen, even past the timeout.
-fn stale_without_identity(path: &Path) -> bool {
-    if SessionLock::read_nonce(path).is_some() {
-        return false;
-    }
-    match lock_owner_pid(path) {
-        Some(pid) => !pid_is_alive(pid),
-        None => lock_is_stale(path),
-    }
-}
-
-/// Returns true when the process with `pid` is alive.  On platforms without a
-/// process-existence probe this reports false so the age heuristic applies.
-fn pid_is_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        // kill(pid, 0) delivers no signal; it only probes existence.  EPERM
-        // means the process exists but is owned by another user.
-        // SAFETY: the signal number is 0, so no signal is sent; the PID comes
-        // from this store's own lock file.
-        let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-        use windows_sys::Win32::System::Threading::{
-            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        // SAFETY: OpenProcess only queries; the returned handle is closed
-        // immediately without touching any process state.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-            return false;
-        }
-        unsafe { CloseHandle(handle) };
-        true
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        false
-    }
-}
-
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        // Release only our own instance: if a successor already replaced
-        // this lock, its nonce differs and the file is left alone.
-        if Self::is_same_lock(&self.path, &self.nonce) {
-            let _ = fs::remove_file(&self.path);
-        }
+        // The sidecar inode is intentionally retained. Removing it after
+        // unlocking would let a waiting process create and lock a different
+        // inode, bypassing contenders that still hold the old one. Advisory
+        // locks are released by the OS when this file handle is dropped,
+        // including after an unexpected process exit.
+        let _ = self.file.unlock();
     }
 }
 
@@ -1639,118 +1548,57 @@ mod tests {
     }
 
     #[test]
-    fn lock_file_owned_by_dead_pid_is_stale_immediately() {
-        let directory = tempdir().unwrap();
-        let lock = directory.path().join("session.jsonl.lock");
-        fs::write(&lock, "pid=4000000\n").unwrap();
-        assert!(lock_is_stale(&lock));
-    }
-
-    #[test]
-    fn lock_file_owned_by_live_pid_is_not_stale() {
-        let directory = tempdir().unwrap();
-        let lock = directory.path().join("session.jsonl.lock");
-        fs::write(&lock, format!("pid={}\n", std::process::id())).unwrap();
-        assert!(!lock_is_stale(&lock));
-    }
-
-    #[test]
-    fn lock_file_without_pid_uses_age_heuristic() {
-        let directory = tempdir().unwrap();
-        let lock = directory.path().join("session.jsonl.lock");
-        // A legacy lock (no PID line) is fresh, so it must not be stolen yet.
-        fs::write(&lock, "legacy lock without pid\n").unwrap();
-        assert!(!lock_is_stale(&lock));
-    }
-
-    #[test]
-    fn acquire_steals_lock_left_by_dead_process() {
-        let root = tempdir().unwrap();
-        let workspace = tempdir().unwrap();
-        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
-        let mut session = store.create(SessionCreateOptions::default()).unwrap();
-        let lock_path = session.path().unwrap().with_extension("jsonl.lock");
-        // Simulate a harness process killed by SIGKILL mid-append: the lock
-        // file persists with its owner's PID.
-        fs::write(&lock_path, "pid=4000000\n").unwrap();
-        store
-            .append_event(
-                &mut session,
-                SessionEvent::UserMessage {
-                    message: StoredMessage::from_llm(&Message::user("hello")),
-                },
-            )
-            .unwrap();
-        assert!(
-            !lock_path.exists(),
-            "stale lock must be stolen and released"
-        );
-    }
-
-    #[test]
-    fn stale_lock_steal_is_limited_to_the_observed_instance() {
-        // Two contenders racing to steal the same stale lock must not both
-        // enter: stealing removes only the exact stale instance observed,
-        // and release removes only the owner's own nonce.
+    fn advisory_lock_serializes_contenders_and_retains_sidecar_inode() {
         let directory = tempdir().unwrap();
         let victim = directory.path().join("victim.jsonl");
         fs::write(&victim, "").unwrap();
         let lock_path = SessionLock::lock_path(&victim);
-        fs::write(&lock_path, "pid=4000000\nnonce=stale-a\n").unwrap();
 
-        // Contender B observes the stale instance and replaces it first.
-        assert!(lock_is_stale(&lock_path));
-        let observed_by_a = SessionLock::read_nonce(&lock_path);
-        assert_eq!(observed_by_a.as_deref(), Some("stale-a"));
-        fs::write(
-            &lock_path,
-            format!("pid={}\nnonce=fresh-b\n", std::process::id()),
-        )
-        .unwrap();
-        // Contender A re-checks before stealing: the instance changed, so
-        // the fresh owner's lock is left alone.
-        assert!(!lock_is_stale(&lock_path));
-        assert_ne!(SessionLock::read_nonce(&lock_path), observed_by_a);
-
-        // An old owner cannot remove a replacement owner's lock on release.
-        let old_owner = SessionLock {
-            path: lock_path.clone(),
-            nonce: "stale-a".into(),
-        };
-        drop(old_owner);
-        assert!(
-            lock_path.exists(),
-            "a stale owner must not remove the replacement lock"
-        );
-        let owner = SessionLock {
-            path: lock_path.clone(),
-            nonce: "fresh-b".into(),
-        };
-        drop(owner);
-        assert!(!lock_path.exists());
-    }
-
-    #[test]
-    fn old_lock_with_live_owner_is_never_stolen() {
-        let directory = tempdir().unwrap();
-        let victim = directory.path().join("victim.jsonl");
-        fs::write(&victim, "").unwrap();
-        let lock_path = SessionLock::lock_path(&victim);
-        fs::write(
-            &lock_path,
-            format!("pid={}\nnonce=live-owner\n", std::process::id()),
-        )
-        .unwrap();
-        // Even an ancient lock with a live owner is not stale.
-        let aged = SystemTime::now() - Duration::from_secs(3600 * 24);
-        OpenOptions::new()
+        let owner = SessionLock::acquire(&victim).unwrap();
+        assert!(lock_path.exists());
+        let contender = OpenOptions::new()
+            .read(true)
             .write(true)
             .open(&lock_path)
-            .unwrap()
-            .set_modified(aged)
             .unwrap();
-        assert!(!lock_is_stale(&lock_path));
-        assert!(!stale_without_identity(&lock_path));
+        assert_eq!(
+            contender.try_lock_exclusive().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(owner);
+
+        // The same inode is reused after release; a waiter cannot switch to a
+        // replacement pathname between unlock and its next acquisition.
+        let next = SessionLock::acquire(&victim).unwrap();
+        assert!(lock_path.exists());
+        drop(next);
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn concurrent_advisory_lock_contenders_never_overlap() {
+        let directory = tempdir().unwrap();
+        let victim = directory.path().join("victim.jsonl");
+        fs::write(&victim, "").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let victim = victim.clone();
+            let barrier = barrier.clone();
+            let active = active.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                let lock = SessionLock::acquire(&victim).unwrap();
+                assert_eq!(active.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                std::thread::sleep(Duration::from_millis(10));
+                active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                drop(lock);
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 
     #[cfg(unix)]
