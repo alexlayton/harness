@@ -194,6 +194,33 @@ impl OpenAiCodexCredential {
     pub fn is_expired(&self) -> bool {
         self.expires == 0 || self.expires <= unix_millis().saturating_add(60_000)
     }
+
+    /// Returns whether two credentials describe the same persisted Codex
+    /// generation. Token values, expiry, and account identity all belong to
+    /// the generation; the credential type is validated separately.
+    pub fn has_same_generation(&self, other: &Self) -> bool {
+        self.access == other.access
+            && self.refresh == other.refresh
+            && self.expires == other.expires
+            && self.account_id == other.account_id
+    }
+
+    /// Whether this is a valid generation newer than `previous`.
+    ///
+    /// There is no sequence number in the on-disk format, so a token or
+    /// account change is treated as a new generation. For an otherwise
+    /// identical credential, only an extended expiry is newer; retaining a
+    /// locally cached credential with a later expiry avoids adopting an older
+    /// disk write. Callers still require the persisted value to be complete
+    /// before using this comparison.
+    pub fn is_newer_generation_than(&self, previous: &Self) -> bool {
+        self.is_complete()
+            && !self.is_expired()
+            && (self.access != previous.access
+                || self.refresh != previous.refresh
+                || self.account_id != previous.account_id
+                || self.expires > previous.expires)
+    }
 }
 
 impl fmt::Debug for OpenAiCodexCredential {
@@ -310,10 +337,10 @@ impl AuthStore {
         self.save_provider_value(OPENAI_CODEX_PROVIDER_KEY, value)
     }
 
-    /// Replace a Codex credential only if the persisted token generation is
-    /// still the one used for the exchange. This compare-and-save runs under
-    /// the same auth-file lock as ordinary updates, preventing a delayed
-    /// refresh in another process from overwriting a newer rotating token.
+    /// Replace a Codex credential only if the persisted generation is still
+    /// the one used for the exchange. This compare-and-save runs under the
+    /// same auth-file lock as ordinary updates, preventing a delayed refresh
+    /// in another process from overwriting a newer token or expiry generation.
     pub fn save_openai_codex_if_current(
         &self,
         expected: &OpenAiCodexCredential,
@@ -334,7 +361,7 @@ impl AuthStore {
                     serde_json::from_value::<OpenAiCodexCredential>(value.clone()).ok()
                 })
                 .is_some_and(|current| {
-                    current.access == expected.access && current.refresh == expected.refresh
+                    current.is_complete() && current.has_same_generation(expected)
                 })
         })
     }
@@ -765,6 +792,22 @@ mod tests {
         assert!(store.save_copilot_if_current(&old, &current).unwrap());
         assert!(!store.save_copilot_if_current(&old, &stale_result).unwrap());
         assert_eq!(store.copilot().unwrap().unwrap(), current);
+    }
+
+    #[test]
+    fn compare_and_save_rejects_stale_codex_expiry_generation() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let old = OpenAiCodexCredential::new("access", "refresh", 1, "acct");
+        let mut newer = old.clone();
+        newer.expires = u64::MAX;
+
+        store.save_openai_codex(&old).unwrap();
+        assert!(store.save_openai_codex_if_current(&old, &newer).unwrap());
+        // The token pair is unchanged, but the old completion must not be
+        // allowed to erase the newer expiry generation.
+        assert!(!store.save_openai_codex_if_current(&old, &old).unwrap());
+        assert_eq!(store.openai_codex().unwrap().unwrap(), newer);
     }
 
     #[test]

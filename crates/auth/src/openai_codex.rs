@@ -172,10 +172,40 @@ impl OpenAiCodexAuth {
             .credential()?
             .ok_or(AuthError::OpenAiCodexNotAuthenticated)?;
         if !credential.is_expired() {
+            // A separate Harness process may have refreshed the same file
+            // while this handle's cached token was still unexpired. Check
+            // for a newer valid generation before returning the cache so a
+            // handle does not keep using an obsolete access token until its
+            // old expiry.
+            if let Some(current) = self.adopt_newer_on_disk(&credential)? {
+                return Ok(current);
+            }
             return Ok(credential);
         }
         self.refresh().await
     }
+
+    /// Best-effort adoption of a newer persisted generation. Read failures
+    /// intentionally leave a usable cached credential in place, matching the
+    /// refresh recheck's existing behavior; a refresh or later call can retry.
+    fn adopt_newer_on_disk(
+        &self,
+        cached: &OpenAiCodexCredential,
+    ) -> Result<Option<OpenAiCodexCredential>> {
+        let Ok(Some(current)) = self.store.openai_codex() else {
+            return Ok(None);
+        };
+        if current.is_newer_generation_than(cached) {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                Some(current.clone());
+            return Ok(Some(current));
+        }
+        Ok(None)
+    }
+
     pub async fn refresh(&self) -> Result<OpenAiCodexCredential> {
         // Single-flight: concurrent refreshers queue here, then recheck the
         // credential before refreshing so only the first waiter hits the
@@ -189,22 +219,23 @@ impl OpenAiCodexAuth {
                 .lock()
                 .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))?
                 .clone();
-            // Prefer the newest of cache vs. disk; disk wins ties only when
-            // it is unexpired (a fresh rotation another process persisted).
+            // Prefer a newer valid disk generation over the cache. A
+            // generation can change one field at a time: rotating only the
+            // refresh token, replacing only the access token, extending its
+            // expiry, or updating its account identity must all be adopted.
+            // The comparison also prevents an older cached expiry from
+            // forcing an unnecessary exchange.
             if let Some(cached) = cached {
-                if !cached.is_expired() {
-                    return Ok(cached);
-                }
-                if !current.is_expired()
-                    && current.refresh != cached.refresh
-                    && current.access != cached.access
-                {
+                if current.is_newer_generation_than(&cached) {
                     *self
                         .credential
                         .lock()
                         .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
                         Some(current.clone());
                     return Ok(current);
+                }
+                if !cached.is_expired() {
+                    return Ok(cached);
                 }
             } else if !current.is_expired() {
                 *self
@@ -846,6 +877,14 @@ mod tests {
         .to_string()
     }
 
+    fn cached_codex_credential() -> OpenAiCodexCredential {
+        OpenAiCodexCredential::new("access-cached", "refresh-cached", u64::MAX - 1, "acct")
+    }
+
+    fn expired_codex_credential() -> OpenAiCodexCredential {
+        OpenAiCodexCredential::new("access-cached", "refresh-cached", 1, "acct")
+    }
+
     async fn auth_with_fixture(
         store_dir: &tempfile::TempDir,
         fixture: &Fixture,
@@ -854,6 +893,247 @@ mod tests {
         OpenAiCodexAuth::new(store)
             .unwrap()
             .with_endpoints(token_endpoints(&fixture.addr))
+    }
+
+    #[tokio::test]
+    async fn recheck_adopts_access_only_codex_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = expired_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.access = "access-new".into();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+
+        assert_eq!(auth.refresh().await.unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn recheck_adopts_refresh_only_codex_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = expired_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.refresh = "refresh-new".into();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+
+        assert_eq!(auth.refresh().await.unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn recheck_adopts_codex_expiry_only_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = expired_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+
+        assert_eq!(auth.refresh().await.unwrap(), newer);
+    }
+
+    /// Separate handles have separate in-process locks, like two Harness
+    /// processes. Both must adopt a generation written by the other process
+    /// rather than using their independently cached credential.
+    #[tokio::test]
+    async fn independent_codex_handles_adopt_a_newer_disk_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = cached_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let first = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let second = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.refresh = "refresh-process-2".into();
+        store.save_openai_codex(&newer).unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_task = tokio::spawn({
+            let first = first.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                first.ensure_valid().await
+            }
+        });
+        let second_task = tokio::spawn({
+            let second = second.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                second.ensure_valid().await
+            }
+        });
+        let first = first_task.await.unwrap().unwrap();
+        let second = second_task.await.unwrap().unwrap();
+        assert_eq!(first, newer);
+        assert_eq!(second, newer);
+    }
+
+    /// Separate handles can reach the token endpoint concurrently because
+    /// their async single-flight locks are process-local. Both completions
+    /// are allowed to succeed here, but the compare-and-save winner must be
+    /// the credential returned by both handles and persisted to disk.
+    #[tokio::test]
+    async fn independent_codex_refresh_race_adopts_one_persisted_generation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(tokio::sync::Barrier::new(2));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let exchanges_task = exchanges.clone();
+        let responses_task = responses.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                let responses = responses_task.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 8192];
+                    let _ = socket.read(&mut scratch).await;
+                    responses.wait().await;
+                    let payload = URL_SAFE_NO_PAD
+                        .encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+                    let access = format!("head-{n}.{payload}.sig");
+                    let body = serde_json::json!({
+                        "access_token": access,
+                        "refresh_token": format!("refresh-response-{n}"),
+                        "expires_in": 3600,
+                        "id_token": access,
+                    })
+                    .to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        store
+            .save_openai_codex(&expired_codex_credential())
+            .unwrap();
+        let endpoints = token_endpoints(&addr);
+        let first = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_endpoints(endpoints.clone());
+        let second = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_endpoints(endpoints);
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let first_task = tokio::spawn({
+            let first = first.clone();
+            let start = start.clone();
+            async move {
+                start.wait().await;
+                first.ensure_valid().await
+            }
+        });
+        let second_task = tokio::spawn({
+            let second = second.clone();
+            let start = start.clone();
+            async move {
+                start.wait().await;
+                second.ensure_valid().await
+            }
+        });
+        let first = first_task.await.unwrap().unwrap();
+        let second = second_task.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+        assert_eq!(first, second);
+        assert_eq!(AuthStore::new(path).openai_codex().unwrap().unwrap(), first);
+    }
+
+    /// A refresh completion based on an old generation must not overwrite an
+    /// expiry-only update made while its network request was in flight.
+    #[tokio::test]
+    async fn stale_codex_refresh_completion_cannot_overwrite_disk_generation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 8192];
+            let _ = socket.read(&mut scratch).await;
+            let _ = request_tx.send(());
+            let _ = release_rx.await;
+            let payload =
+                URL_SAFE_NO_PAD.encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+            let access = format!("head.{payload}.sig");
+            let body = serde_json::json!({
+                "access_token": access,
+                "refresh_token": "refresh-exchange",
+                "expires_in": 3600,
+                "id_token": access,
+            })
+            .to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = OpenAiCodexCredential::new("access-old", "refresh-old", 1, "acct");
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_http_and_endpoints(
+                reqwest::Client::new(),
+                OpenAiCodexEndpoints {
+                    authorize_url: format!("http://{addr}/authorize"),
+                    token_url: format!("http://{addr}/token"),
+                    device_code_url: format!("http://{addr}/device"),
+                },
+            );
+        let refresh_task = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.refresh().await }
+        });
+        request_rx.await.unwrap();
+
+        let mut newer = old.clone();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+        release_tx.send(()).unwrap();
+
+        let result = refresh_task.await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(result, newer);
+        assert_eq!(store.openai_codex().unwrap().unwrap(), newer);
     }
 
     #[tokio::test]
