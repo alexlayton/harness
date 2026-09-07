@@ -129,12 +129,81 @@ pub fn convert_input(messages: &[crate::Message]) -> Vec<Value> {
     input
 }
 
+/// An output item that must remain in wire order until the shared Responses
+/// parser releases function calls at the terminal event.
+#[derive(Debug)]
+enum CodexOutputItem {
+    Opaque(Value),
+    ToolCall,
+}
+
 /// Codex shares the Responses terminal contract but keeps encrypted
-/// reasoning items as opaque replay state. The side channel rides on top of
-/// the shared [`ResponsesParser`]: `parse_event` yields the opaque item
-/// first (when present), then the shared parser's events.
+/// reasoning items as opaque replay state. Function calls are deliberately
+/// held by [`ResponsesParser`] until the terminal event, so Codex keeps an
+/// ordered marker for every output item and releases both kinds together.
 struct CodexParser {
     inner: ResponsesParser,
+    pending_items: Vec<CodexOutputItem>,
+}
+
+impl CodexParser {
+    fn new() -> Self {
+        Self {
+            inner: ResponsesParser::new(),
+            pending_items: Vec::new(),
+        }
+    }
+
+    fn flush_terminal(
+        &mut self,
+        events: Vec<crate::StreamEvent>,
+    ) -> Result<Vec<crate::StreamEvent>, crate::LlmError> {
+        let mut calls = Vec::new();
+        let mut other = Vec::new();
+        let mut terminal = Vec::new();
+        for event in events {
+            match event {
+                crate::StreamEvent::ToolCallComplete(call) => calls.push(call),
+                done @ crate::StreamEvent::Done { .. } => terminal.push(done),
+                event => other.push(event),
+            }
+        }
+
+        let expected_calls = self
+            .pending_items
+            .iter()
+            .filter(|item| matches!(item, CodexOutputItem::ToolCall))
+            .count();
+        if calls.len() != expected_calls {
+            return Err(crate::LlmError::Stream(
+                "Codex output items and parsed tool calls diverged".into(),
+            ));
+        }
+
+        let mut calls = calls.into_iter();
+        let mut output =
+            Vec::with_capacity(self.pending_items.len() + other.len() + terminal.len());
+        for item in std::mem::take(&mut self.pending_items) {
+            match item {
+                CodexOutputItem::Opaque(data) => output.push(crate::StreamEvent::OpaqueState {
+                    provider: "openai-codex".into(),
+                    data,
+                }),
+                CodexOutputItem::ToolCall => {
+                    let call = calls.next().ok_or_else(|| {
+                        crate::LlmError::Stream(
+                            "Codex output items and parsed tool calls diverged".into(),
+                        )
+                    })?;
+                    output.push(crate::StreamEvent::ToolCallComplete(call));
+                }
+            }
+        }
+        debug_assert!(calls.next().is_none());
+        output.extend(other);
+        output.extend(terminal);
+        Ok(output)
+    }
 }
 
 impl super::StreamParser for CodexParser {
@@ -142,23 +211,33 @@ impl super::StreamParser for CodexParser {
         &mut self,
         event: &crate::sse::SseEvent,
     ) -> Result<Vec<crate::StreamEvent>, crate::LlmError> {
-        let mut output = Vec::new();
-        // Codex sends encrypted reasoning on completed output items. Keep
-        // the complete item opaque so a later tool follow-up can replay it.
-        if let Ok(value) = serde_json::from_str::<Value>(&event.data)
-            && value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
-            && value
-                .get("item")
-                .and_then(|item| item.get("encrypted_content"))
-                .is_some()
-        {
-            output.push(crate::StreamEvent::OpaqueState {
-                provider: "openai-codex".into(),
-                data: value["item"].clone(),
+        // Classify before delegating, but append the marker only after the
+        // shared parser accepts the item. Function calls take precedence over
+        // encrypted content so malformed calls cannot bypass validation.
+        let item = serde_json::from_str::<Value>(&event.data)
+            .ok()
+            .filter(|value| {
+                value.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+            })
+            .and_then(|value| {
+                let item = value.get("item")?;
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    Some(CodexOutputItem::ToolCall)
+                } else if item.get("encrypted_content").is_some() {
+                    Some(CodexOutputItem::Opaque(item.clone()))
+                } else {
+                    None
+                }
             });
+
+        let events = self.inner.parse_event(event)?;
+        if self.inner.is_done() {
+            return self.flush_terminal(events);
         }
-        output.extend(self.inner.parse_event(event)?);
-        Ok(output)
+        if let Some(item) = item {
+            self.pending_items.push(item);
+        }
+        Ok(events)
     }
 
     fn is_done(&self) -> bool {
@@ -166,17 +245,15 @@ impl super::StreamParser for CodexParser {
     }
 
     fn finish(&mut self) -> Result<Vec<crate::StreamEvent>, crate::LlmError> {
+        // Do not release pending opaque state on EOF: the shared parser has
+        // not observed a valid terminal event, so replaying it would create a
+        // durable partial turn.
         self.inner.finish()
     }
 }
 
 fn event_stream(sse: crate::sse::SseStream) -> EventStream {
-    super::drive_parser_stream(
-        sse,
-        CodexParser {
-            inner: ResponsesParser::new(),
-        },
-    )
+    super::drive_parser_stream(sse, CodexParser::new())
 }
 
 #[cfg(test)]
@@ -216,14 +293,116 @@ mod tests {
     fn incomplete_terminal_event_succeeds_with_reason_and_usage() {
         // Codex shares the Responses terminal contract: `response.incomplete`
         // is a handled terminal event preserving reason, status, and usage.
-        let mut parser = crate::dialects::openai_responses::ResponsesParser::new();
-        let done = parser.parse_payload(r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":7,"output_tokens":3}}}"#).unwrap();
+        use crate::dialects::StreamParser;
+        let mut parser = CodexParser::new();
+        let done = StreamParser::parse_event(
+            &mut parser,
+            &crate::sse::SseEvent {
+                event: None,
+                data: r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"usage":{"input_tokens":7,"output_tokens":3}}}"#.into(),
+            },
+        )
+        .unwrap();
         assert!(
             matches!(&done[0], StreamEvent::Done { stop_reason: Some(reason), usage: Some(usage) }
                 if reason.contains("content_filter") && usage.input_tokens == 7 && usage.output_tokens == 3),
             "got {done:?}"
         );
         assert!(parser.is_done());
+    }
+
+    #[test]
+    fn codex_stream_parser_preserves_interleaved_output_item_order() {
+        // The SSE parser and Codex wrapper are exercised together here. Calls
+        // are held by the shared Responses parser, but opaque items use the
+        // same ordered queue so terminal output still matches provider order.
+        use crate::dialects::StreamParser;
+        let opaque = |id: &str, encrypted: &str| {
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "reasoning",
+                    "id": id,
+                    "encrypted_content": encrypted,
+                },
+            })
+            .to_string()
+        };
+        let call = |id: &str, name: &str, path: &str| {
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": id,
+                    "name": name,
+                    "arguments": serde_json::json!({"path": path}).to_string(),
+                },
+            })
+            .to_string()
+        };
+        let wire = [
+            opaque("rs_1", "enc1"),
+            call("c1", "read", "one"),
+            opaque("rs_2", "enc2"),
+            call("c2", "read", "two"),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {"status": "completed"},
+            })
+            .to_string(),
+        ]
+        .into_iter()
+        .map(|payload| format!("data: {payload}\n\n"))
+        .collect::<String>();
+        let events = crate::sse::parse_events(&wire);
+        let mut parser = CodexParser::new();
+        let mut output = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            let parsed = StreamParser::parse_event(&mut parser, event).unwrap();
+            if index < 4 {
+                assert!(
+                    parsed.is_empty(),
+                    "item escaped before terminal: {parsed:?}"
+                );
+            }
+            output.extend(parsed);
+        }
+
+        assert_eq!(
+            output,
+            vec![
+                StreamEvent::OpaqueState {
+                    provider: "openai-codex".into(),
+                    data: serde_json::json!({
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "enc1",
+                    }),
+                },
+                StreamEvent::ToolCallComplete(crate::ToolCall {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "one"}),
+                }),
+                StreamEvent::OpaqueState {
+                    provider: "openai-codex".into(),
+                    data: serde_json::json!({
+                        "type": "reasoning",
+                        "id": "rs_2",
+                        "encrypted_content": "enc2",
+                    }),
+                },
+                StreamEvent::ToolCallComplete(crate::ToolCall {
+                    id: "c2".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "two"}),
+                }),
+                StreamEvent::Done {
+                    stop_reason: Some("completed".into()),
+                    usage: None,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -283,14 +462,41 @@ mod tests {
 
     #[test]
     fn codex_rejects_malformed_tool_calls_through_shared_parser() {
-        // Codex delegates parsing to `ResponsesParser`: a missing call ID
-        // fails with `LlmError::Parse` before any `ToolCallComplete` can
-        // escape, so the agent's malformed-tool recovery handles it.
+        // Codex delegates validation to `ResponsesParser`: a missing call ID
+        // fails with `LlmError::Parse` before any queued opaque state or
+        // `ToolCallComplete` can escape, so malformed-tool recovery remains
+        // atomic for the whole response.
         use crate::LlmError;
-        let mut parser = crate::dialects::openai_responses::ResponsesParser::new();
-        let error = parser
-            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"read","arguments":"{}"}}"#)
-            .unwrap_err();
+        use crate::dialects::StreamParser;
+        let mut parser = CodexParser::new();
+        let opaque = StreamParser::parse_event(
+            &mut parser,
+            &crate::sse::SseEvent {
+                event: None,
+                data: serde_json::json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_1",
+                        "encrypted_content": "enc1",
+                    },
+                })
+                .to_string(),
+            },
+        )
+        .unwrap();
+        assert!(
+            opaque.is_empty(),
+            "opaque state escaped before terminal: {opaque:?}"
+        );
+        let error = StreamParser::parse_event(
+            &mut parser,
+            &crate::sse::SseEvent {
+                event: None,
+                data: r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"read","arguments":"{}"}}"#.into(),
+            },
+        )
+        .unwrap_err();
         assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
     }
 }
