@@ -866,6 +866,17 @@ pub fn events_after_latest_compaction(events: &[SessionEventRecord]) -> Vec<&Ses
         return events.iter().collect();
     };
 
+    events_after_compaction(events, summary_sequence, compacted_through)
+}
+
+/// Reconstruct the provider-context order for one compaction summary.  The
+/// summary is emitted first even though it was appended after the preserved
+/// live tail; older summaries are not part of that tail.
+fn events_after_compaction(
+    events: &[SessionEventRecord],
+    summary_sequence: u64,
+    compacted_through: u64,
+) -> Vec<&SessionEventRecord> {
     let summary = events
         .iter()
         .find(|record| record.sequence == summary_sequence);
@@ -1189,11 +1200,12 @@ fn validate_compaction_boundary(
         if record.sequence > boundary {
             break;
         }
-        // A previous summary replaces the tool-call state before its live
-        // tail; calls represented by that summary are no longer replayed.
-        if matches!(record.event, SessionEvent::CompactionSummary { .. }) {
-            tracker = ToolCallTracker::default();
-        } else {
+        // A summary is appended after the live tail it preserves. It does
+        // not end that tail, so resetting here could forget a call before an
+        // older summary and accept a later boundary that retains only its
+        // result. This is the same summary/live-tail model used by
+        // `events_after_latest_compaction` and `context_messages`.
+        if !matches!(record.event, SessionEvent::CompactionSummary { .. }) {
             tracker.record(&record.event);
         }
     }
@@ -1202,6 +1214,36 @@ fn validate_compaction_boundary(
             "compaction boundary {boundary} splits unresolved tool call {call_id}"
         )));
     }
+
+    // Validate the retained side in provider-context order as well. A result
+    // whose call was summarized is not visible to the provider and would be
+    // an orphan in `context_messages`.
+    let mut retained_calls = HashSet::new();
+    for record in events_after_compaction(events, summary_sequence, boundary) {
+        match &record.event {
+            SessionEvent::AssistantMessage { message } => {
+                retained_calls.extend(message.content.iter().filter_map(|content| {
+                    if let StoredContent::ToolCall { id, .. } = content {
+                        Some(id.clone())
+                    } else {
+                        None
+                    }
+                }));
+            }
+            SessionEvent::ToolCall { call } => {
+                retained_calls.insert(call.id.clone());
+            }
+            SessionEvent::ToolResult { tool_call_id, .. }
+                if !retained_calls.contains(tool_call_id) =>
+            {
+                return Err(SessionError::InvalidEvent(format!(
+                    "compaction boundary {boundary} retains tool result {tool_call_id} without its tool call"
+                )));
+            }
+            _ => {}
+        }
+    }
+
     if boundary >= summary_sequence {
         return Err(SessionError::InvalidEvent(format!(
             "compaction boundary {boundary} must precede its summary event {summary_sequence}"
@@ -1718,6 +1760,55 @@ mod tests {
         }
         assert_eq!(results, vec!["call-1".to_owned()]);
         assert!(calls.contains("call-1"));
+    }
+
+    #[test]
+    fn repeated_compaction_preserves_tool_call_pairs_across_summary_tail() {
+        // The first summary is through the event before call `c`. A later
+        // boundary through that summary must be rejected: it would retain the
+        // result while dropping the call from the live provider tail.
+        let mut invalid = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut invalid, "before");
+        push_assistant(&mut invalid, "context");
+        push_user(&mut invalid, "read this");
+        push_tool_call(&mut invalid, "c", "read");
+        push_summary(&mut invalid, "first", 2);
+        push_tool_result(&mut invalid, "c");
+        push_summary(&mut invalid, "second", 5);
+        assert!(validate_events(&invalid.events).is_err());
+
+        // A repeated summary may advance within the preserved tail as long as
+        // it leaves the complete call/result pair live.
+        let mut valid = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut valid, "before");
+        push_assistant(&mut valid, "context");
+        push_user(&mut valid, "read this");
+        push_tool_call(&mut valid, "c", "read");
+        push_summary(&mut valid, "first", 2);
+        push_tool_result(&mut valid, "c");
+        push_summary(&mut valid, "second", 3);
+
+        validate_events(&valid.events).unwrap();
+        assert_eq!(retained_sequences(&valid), vec![7, 4, 6]);
+        let messages = valid.context_messages();
+        let calls: HashSet<_> = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                Content::ToolCall(call) => Some(call.id.clone()),
+                _ => None,
+            })
+            .collect();
+        let results: Vec<_> = messages
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                Content::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls, HashSet::from([String::from("c")]));
+        assert_eq!(results, vec![String::from("c")]);
     }
 
     #[test]
