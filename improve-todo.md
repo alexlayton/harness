@@ -183,53 +183,57 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 
 
 
-## Remaining TODO — PR-readiness review
+## PR-readiness follow-up — completed
+
+Each post-implementation review action item below was implemented in a separate
+conventional-commit change and covered by focused regression tests. The findings
+remain as an audit trail of the work completed.
 
 ### Blocking correctness, security, and lifecycle items
 
-#### REVIEW-SESSION-1: Preserve tool-call pairs across repeated compaction — OPEN (Critical)
+#### REVIEW-SESSION-1: Preserve tool-call pairs across repeated compaction — DONE (Critical)
 - `crates/session/src/model.rs:1192-1197` resets tool-call state at an older `CompactionSummary`. A later boundary can therefore retain a `ToolResult` while dropping its pre-summary live-tail `ToolCall`.
 - Reproduce with `ToolCall(c), summary(through before c), ToolResult(c), summary(through first summary)` and assert that validation rejects any boundary that would orphan the result.
 - Make boundary validation use the same summary-first/live-tail semantics as `events_after_latest_compaction` and `context_messages`.
 
-#### REVIEW-LLM-1: Preserve Codex opaque/tool-call parser order — OPEN (High)
+#### REVIEW-LLM-1: Preserve Codex opaque/tool-call parser order — DONE (High)
 - `CodexParser` emits opaque state immediately (`openai_codex_responses.rs:145-159`), while `ResponsesParser` holds calls until the terminal event (`openai_responses.rs:274,314-318`). This reorders `opaque1, call1, opaque2, call2` into `opaque1, opaque2, call1, call2` before persistence.
 - Buffer Codex opaque items and function calls in one ordered response-item sequence.
 - Add an end-to-end stream-parser test, not only a `convert_input` test, that verifies exact parser output and replay order around multiple calls.
 
-#### REVIEW-LLM-2: Validate pending Chat calls on `[DONE]` — OPEN (High)
+#### REVIEW-LLM-2: Validate pending Chat calls on `[DONE]` — DONE (High)
 - `openai_chat.rs:279-283` marks the stream done without calling `flush_calls`; malformed, missing-ID/name, or partial-JSON calls can disappear and the stream succeeds without a `Done` event.
 - Validate/flush all pending calls before accepting `[DONE]`, reject unfinished calls with `LlmError::Parse`, and emit one coherent terminal event.
 - Add tests for missing ID, missing name, partial arguments, and a valid call followed directly by `[DONE]`.
 
-#### REVIEW-LLM-3: Redact errors yielded after stream construction — OPEN (High)
+#### REVIEW-LLM-3: Redact errors yielded after stream construction — DONE (High)
 - Provider wrappers currently redact only `.stream(...).await` construction errors (`providers/openai_codex.rs:103-110`, `github_copilot.rs:524`, `opencode_go.rs:78-87`). Later `EventStream` items can contain raw provider-supplied SSE error text.
 - Apply active-credential redaction to every error yielded by the returned stream, including OpenRouter and all OAuth-backed providers.
 - Add a fixture whose SSE error echoes the active token and assert that the token is absent from the yielded error, persisted error, UI diagnostic, and logs where testable.
 
-#### REVIEW-AGENT-1: Make terminal events exactly once and propagate cancellation persistence failures — OPEN (High)
+#### REVIEW-AGENT-1: Make terminal events exactly once and propagate cancellation persistence failures — DONE (High)
 - `agent/turn.rs:25-29` explicitly documents a second `TurnFinished` when a completed body is followed by deferred-sync failure; the run loop emits that second event at `agent/mod.rs:296-298`.
 - `agent/persistence.rs:154-169` swallows a failed `TurnCancelled` append, allowing cancellation paths to return without quarantining divergent durable state.
 - Move terminal-event ownership to one boundary and make `persist_cancelled` return control flow that causes quarantine on persistence failure.
 - Test successful body + failed deferred sync, interrupt + failed cancellation append, shutdown + failed cancellation append, and skill equivalents; each operation must emit one terminal event and queued work must not run.
 
-#### REVIEW-AGENT-2: Keep `/model` atomic through deferred sync — OPEN (High)
+#### REVIEW-AGENT-2: Keep `/model` atomic through deferred sync — DONE (High)
 - `commands.rs:319-357` mutates provider/model/subagent state and emits `ModelChanged` before `handle_set_model_boundary` performs deferred sync at `commands.rs:285`.
 - If append buffering succeeds but sync fails, the failed operation is externally visible and live state has already changed.
 - Commit live state only after the durability boundary succeeds, or roll it back completely on sync failure.
 - Extend the model-change failure test to inject deferred-sync failure and assert parent, subagent, context window, metadata task, and frontend events remain unchanged.
 
-#### REVIEW-ACP-1: Make duplicate registration atomic — OPEN (High)
+#### REVIEW-ACP-1: Make duplicate registration atomic — DONE (High)
 - The final duplicate check (`harness/acp.rs:1004-1007`) and insertion (`:1017-1025`) use separate lock acquisitions. Two concurrent loads can both pass and one can replace the other live `SessionHandle`.
 - Reserve an `assembling` entry before expensive setup or perform one atomic occupied/vacant insertion without replacing the original.
 - Add a barrier-controlled concurrent-load test proving only one agent is started/registered and the original remains usable.
 
-#### REVIEW-ACP-2: Own in-progress session assembly tasks — OPEN (High)
+#### REVIEW-ACP-2: Own in-progress session assembly tasks — DONE (High)
 - `new_session` and `load_session` spawn untracked tasks (`harness/acp.rs:566-570,624-628`), while disconnect cleanup only stops already registered sessions (`:341-357`).
 - Track, cancel, and await pending assembly tasks on disconnect and on request failure; prevent late registration or filesystem/MCP work after transport shutdown.
 - Add disconnect-during-build and disconnect-during-MCP-initialize tests.
 
-#### REVIEW-TOOLS-1: Reject special files without blocking — OPEN (High)
+#### REVIEW-TOOLS-1: Reject special files without blocking — DONE (High)
 - Unix `open_child_file` opens the target before checking type (`tools/src/vfs.rs:255-275`) and rejects only directories. A FIFO with no writer can block a Tokio worker before cancellation is observed.
 - Open nonblocking through the retained directory handle, inspect with `fstat`, and accept only regular files for read/edit/existing-file write metadata paths.
 - Add FIFO, socket, and device/special-file tests where supported; cancellation and timeout must remain responsive.
@@ -250,27 +254,27 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 
 ### Additional required follow-ups
 
-#### REVIEW-AUTH-1: Adopt any newer valid on-disk Codex credential — OPEN (Medium)
+#### REVIEW-AUTH-1: Adopt any newer valid on-disk Codex credential — DONE (Medium)
 - `auth/openai_codex.rs:202-206` adopts disk state only when both access and refresh tokens differ. A refresh-token-only rotation, access-token-only change, or extended expiry can leave a stale handle using an obsolete token.
 - Compare credential generation robustly and adopt a valid newer disk credential when any generation-relevant field changes.
 - Add tests for access-only, refresh-only, and expiry-only updates, plus independent-handle refresh races.
 
-#### REVIEW-TOOLS-3: Resolve non-Unix path TOCTOU behavior — OPEN (Medium-High)
+#### REVIEW-TOOLS-3: Resolve non-Unix path TOCTOU behavior — DONE (Medium-High)
 - `tools/src/vfs.rs:23-27` acknowledges that non-Unix paths still use canonicalize-then-open. A Windows junction/symlink swap can redirect read/write/edit after validation.
 - Implement handle-relative containment on Windows or explicitly disable unsafe operations where the invariant cannot be enforced.
 - Add deterministic Windows ancestor-swap tests for read, write, and edit.
 
-#### REVIEW-MCP-2: Validate resolved MCP configuration sizes — OPEN (Medium)
+#### REVIEW-MCP-2: Validate resolved MCP configuration sizes — DONE (Medium)
 - `McpConfig::resolve_with` (`mcp/config.rs:115-151`) clones and expands configuration without first applying the global validation or a post-expansion size cap. Small placeholders can expand into very large argument/header/environment values.
 - Validate before cloning where possible, cap each expansion, and revalidate aggregate resolved bytes/server count afterward.
 - Add excessive-server and oversized-environment-expansion tests.
 
-#### REVIEW-ACP-3: Align ACP build timeout with MCP deadlines — OPEN (Medium)
+#### REVIEW-ACP-3: Align ACP build timeout with MCP deadlines — DONE (Medium)
 - ACP applies the two-second `SESSION_TASK_TIMEOUT` to `builder.build()` (`harness/acp.rs:718,992-995`), while MCP initialization/catalogue deadlines are documented as 15 seconds.
 - Separate shutdown timeout from assembly timeout and retain responsive JSON-RPC dispatch without rejecting otherwise valid 2–15 second MCP startup.
 - Add a delayed-but-valid MCP setup test.
 
-#### REVIEW-TUI-1: Complete terminal setup/cleanup fault coverage — OPEN (Medium)
+#### REVIEW-TUI-1: Complete terminal setup/cleanup fault coverage — DONE (Medium)
 - The TUI-2 plan required an injectable terminal backend and tests for every setup/cleanup failure. The earlier audit explicitly notes that Crossterm is still called directly and those tests are absent while marking TUI-2 `DONE`.
 - Add mode-by-mode setup and cleanup fault injection, verify all cleanup attempts run best-effort, and report only the first error after restoration attempts.
 
@@ -281,11 +285,12 @@ Passed locally on Linux:
 ```text
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked        # 522 passed, 17 suites
+cargo test --workspace --locked        # 568 passed, 17 suites
 cargo build --workspace --locked
 cargo tree --workspace --duplicates
 ```
 
-Passing the current suite is not sufficient for merge because the scenarios
-above are not covered. Re-run all required checks after the fixes, including
-the macOS suite, and then perform another PR-readiness review.
+All listed scenarios now have focused coverage. The complete locked workspace
+verification passed on Linux. The macOS suite still needs to run in its native
+CI environment because this Linux host cannot cross-compile the Apple-specific
+`ring` dependency.
