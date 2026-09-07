@@ -49,6 +49,7 @@ use std::collections::{HashMap, hash_map::Entry};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -914,14 +915,22 @@ fn list_sessions(request: &ListSessionsRequest, state: &AcpState) -> ListSession
     )
 }
 
-const SESSION_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// Bound for complete ACP session assembly. MCP gives initialize and each
+/// catalogue request 15 seconds, and those operations are sequential for one
+/// server, so the outer bound must cover both rather than imposing the old
+/// two-second cleanup bound on a valid startup.
+const SESSION_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(35);
+/// Short bound for releasing an ACP session or an abandoned assembly. The
+/// agent/MCP owners are cancelled first; abort remains the final fallback so a
+/// broken provider cannot hold delete or disconnect forever.
+const SESSION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Stop an in-progress request while retaining ownership until its task has
 /// actually terminated. Aborting is only the final fallback: cooperative
 /// cancellation lets MCP and blocking setup run their normal cleanup first.
 async fn shutdown_assembly(mut assembly: PendingAssembly) {
     assembly.cancel.cancel();
-    let stopped = tokio::time::timeout(SESSION_TASK_TIMEOUT, &mut assembly.task)
+    let stopped = tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, &mut assembly.task)
         .await
         .is_ok();
     if !stopped {
@@ -973,7 +982,7 @@ async fn shutdown_session(handle: SessionHandle) {
     } = handle;
     cancel.cancel();
     drop(input_tx);
-    let stopped = tokio::time::timeout(SESSION_TASK_TIMEOUT, async {
+    let stopped = tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, async {
         let _ = (&mut agent_task).await;
         let _ = (&mut forwarder_task).await;
     })
@@ -1133,7 +1142,8 @@ async fn build_session_stack(
             let _ = task.await;
             anyhow::bail!("ACP session stack build cancelled");
         }
-        _ = tokio::time::sleep(SESSION_TASK_TIMEOUT) => {
+        _ = tokio::time::sleep(SESSION_ASSEMBLY_TIMEOUT) => {
+            cancel.cancel();
             task.abort();
             let _ = task.await;
             anyhow::bail!("build ACP session stack timed out");
@@ -1141,6 +1151,36 @@ async fn build_session_stack(
     }?;
     assembly_cancelled(cancel)?;
     Ok(joined)
+}
+
+/// Run agent assembly under the longer startup bound while preserving
+/// cancellation cleanup. A timed-out build gets the same cancellation token
+/// as MCP and is given the short shutdown window to release any connected
+/// servers before the future is finally dropped.
+async fn build_agent_with_timeout(
+    builder: AgentBuilder,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<agent::assembly::AssembledAgent> {
+    let mut build = Box::pin(builder.build());
+    tokio::select! {
+        result = &mut build => result.context("build ACP agent"),
+        _ = cancel.cancelled() => {
+            let cleanup = tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, &mut build).await;
+            if let Ok(Ok(agent)) = cleanup {
+                agent.shutdown().await;
+            }
+            anyhow::bail!("build ACP agent cancelled");
+        }
+        _ = tokio::time::sleep(timeout) => {
+            cancel.cancel();
+            let cleanup = tokio::time::timeout(SESSION_SHUTDOWN_TIMEOUT, &mut build).await;
+            if let Ok(Ok(agent)) = cleanup {
+                agent.shutdown().await;
+            }
+            anyhow::bail!("build ACP agent timed out");
+        }
+    }
 }
 
 /// Convert ACP's session-local stdio declarations without retaining ACP wire
@@ -1284,9 +1324,7 @@ async fn spawn_agent(
         state.copilot_auth.clone(),
         state.config.codex_auth.clone(),
     ));
-    let agent = tokio::time::timeout(SESSION_TASK_TIMEOUT, builder.build())
-        .await
-        .context("build ACP agent timed out")??;
+    let agent = build_agent_with_timeout(builder, &cancel, SESSION_ASSEMBLY_TIMEOUT).await?;
     if cancel.is_cancelled() {
         agent.shutdown().await;
         anyhow::bail!("ACP agent assembly cancelled");
@@ -1392,6 +1430,8 @@ mod tests {
     use async_trait::async_trait;
     use futures_util::stream;
     use llm::{CompletionRequest, EventStream, LlmError, ModelInfo, StreamEvent, Usage};
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
@@ -1730,6 +1770,96 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
+    fn test_mcp_server(
+        pid_path: &std::path::Path,
+        mode: &str,
+        initialize_delay: &str,
+    ) -> mcp::McpServerConfig {
+        // The delayed mode answers valid MCP frames after a three-second
+        // initialize delay, which is long enough to regress the old ACP
+        // two-second build bound. Hang mode replaces the shell with a silent
+        // child so the ACP assembly timeout, not a graceful protocol reply,
+        // must end the build.
+        let script = r#"
+set -eu
+echo $$ > "$MCP_PID"
+if [ "$MCP_MODE" = "hang" ]; then
+    exec sleep 60
+fi
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    [ -n "$id" ] || continue
+    case "$line" in
+        *'"method":"initialize"'*)
+            sleep "$MCP_INITIALIZE_DELAY"
+            printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"fixture\",\"version\":\"1\"}}}"
+            ;;
+        *'"method":"tools/list"'*)
+            printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"fixture\",\"description\":\"delayed fixture\",\"inputSchema\":{\"type\":\"object\"}}]}}"
+            ;;
+    esac
+done
+"#;
+        mcp::McpServerConfig {
+            name: "delayed".into(),
+            transport: mcp::McpTransportConfig::Stdio {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                env: BTreeMap::from([
+                    ("MCP_PID".into(), pid_path.display().to_string()),
+                    ("MCP_MODE".into(), mode.into()),
+                    ("MCP_INITIALIZE_DELAY".into(), initialize_delay.into()),
+                ]),
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    fn mcp_test_builder(
+        workspace: &std::path::Path,
+        server: mcp::McpServerConfig,
+        cancel: CancellationToken,
+    ) -> AgentBuilder {
+        let tools = default_registry(ToolConfig::new(workspace, false)).expect("test registry");
+        AgentBuilder::new(Arc::new(HangingProvider), "test-model", tools, cancel)
+            .with_mcp_servers(vec![server])
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid(path: &std::path::Path) -> u32 {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(path)
+                    && let Ok(pid) = pid.trim().parse()
+                {
+                    return pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("MCP fixture should start")
+    }
+
+    #[cfg(unix)]
+    async fn assert_process_stopped(pid: u32) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let alive = std::process::Command::new("/bin/kill")
+                    .args(["-0", &pid.to_string()])
+                    .status()
+                    .is_ok_and(|status| status.success());
+                if !alive {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("MCP fixture child must be cleaned up");
+    }
+
     async fn register_test_assembly(
         state: Arc<AcpState>,
         session_id: String,
@@ -1747,6 +1877,82 @@ mod tests {
                 anyhow::bail!("session `{session_id}` is already loaded");
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delayed_mcp_setup_is_allowed_by_session_assembly_timeout() {
+        let workspace = tempdir().unwrap();
+        let pid_path = workspace.path().join("delayed-mcp.pid");
+        let cancel = CancellationToken::new();
+        let builder = mcp_test_builder(
+            workspace.path(),
+            test_mcp_server(&pid_path, "delayed", "3"),
+            cancel.clone(),
+        );
+
+        // MCP initialize may legitimately take longer than the old two-second
+        // ACP cleanup bound. The response is valid, so assembly must complete
+        // rather than treating a slow server as a hung build.
+        let agent = tokio::time::timeout(
+            Duration::from_secs(8),
+            build_agent_with_timeout(builder, &cancel, SESSION_ASSEMBLY_TIMEOUT),
+        )
+        .await
+        .expect("valid delayed MCP setup must finish")
+        .expect("valid delayed MCP setup must assemble");
+        let pid = wait_for_pid(&pid_path).await;
+        agent.shutdown().await;
+        assert_process_stopped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_mcp_build_cancels_and_cleans_up_child() {
+        let workspace = tempdir().unwrap();
+        let pid_path = workspace.path().join("hung-mcp.pid");
+        let cancel = CancellationToken::new();
+        let builder = mcp_test_builder(
+            workspace.path(),
+            test_mcp_server(&pid_path, "hang", "0"),
+            cancel.clone(),
+        );
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            build_agent_with_timeout(builder, &task_cancel, Duration::from_millis(100)).await
+        });
+        let pid = wait_for_pid(&pid_path).await;
+        let result = task.await.expect("assembly task must not panic");
+        let error = result.err().expect("a genuinely hung build must time out");
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        assert!(cancel.is_cancelled(), "timeout must cancel MCP assembly");
+        assert_process_stopped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_mcp_build_stops_before_session_registration() {
+        let workspace = tempdir().unwrap();
+        let pid_path = workspace.path().join("cancelled-mcp.pid");
+        let cancel = CancellationToken::new();
+        let builder = mcp_test_builder(
+            workspace.path(),
+            test_mcp_server(&pid_path, "hang", "0"),
+            cancel.clone(),
+        );
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            build_agent_with_timeout(builder, &task_cancel, SESSION_ASSEMBLY_TIMEOUT).await
+        });
+        let pid = wait_for_pid(&pid_path).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled assembly must resolve")
+            .expect("assembly task must not panic");
+        let error = result.err().expect("cancelled build must fail");
+        assert!(error.to_string().contains("cancelled"), "{error:#}");
+        assert_process_stopped(pid).await;
     }
 
     /// Disconnecting while assembly is waiting must await the owned task and

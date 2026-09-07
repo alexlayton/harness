@@ -157,7 +157,10 @@ rejected before any connection is attempted.
 
 MCP has fixed safety limits rather than per-server TOML overrides: initialize
 and catalogue requests have 15-second deadlines, calls have a 60-second
-deadline, and shutdown has a four-second global deadline. A server may expose
+deadline, and shutdown has a four-second global deadline. ACP session assembly
+uses its own 35-second bound so sequential initialize and catalogue requests
+can both use their full MCP deadlines; this is separate from the short ACP
+session shutdown/delete cleanup bound. A server may expose
 at most 256 tools with at most 512 KiB of aggregate definitions. Schemas are
 limited to depth 32, 10,000 nodes, 64 KiB strings, and 256 KiB total size.
 Structured/text/error output is compacted (never pretty-printed) and capped
