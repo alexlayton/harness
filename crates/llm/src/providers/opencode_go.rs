@@ -6,6 +6,7 @@ use crate::{
     CompletionRequest, EventStream, LlmError, ModelInfo, Provider, ReasoningPolicy,
     SubscriptionUsage, SubscriptionUsageWindow,
 };
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Deserialize;
 
 pub const BASE_URL: &str = "https://opencode.ai/zen/go/v1";
@@ -69,11 +70,26 @@ pub struct OpenCodeGoProvider {
 impl OpenCodeGoProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         let api_key = api_key.into();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-opencode-session",
+            HeaderValue::from_static(concat!("harness/", env!("CARGO_PKG_VERSION"))),
+        );
+
         Self {
-            chat: OpenAiChatClient::new(BASE_URL, api_key.clone()),
-            responses: OpenAiResponsesClient::new(BASE_URL, api_key.clone()),
-            messages: AnthropicMessagesClient::new(BASE_URL, api_key.clone()),
-            usage: HttpClient::new(BASE_URL, api_key),
+            chat: OpenAiChatClient::with_headers(BASE_URL, api_key.clone(), headers.clone()),
+            responses: OpenAiResponsesClient::with_headers(
+                BASE_URL,
+                api_key.clone(),
+                headers.clone(),
+            ),
+            messages: AnthropicMessagesClient::with_headers(
+                BASE_URL,
+                api_key.clone(),
+                headers.clone(),
+            ),
+            usage: HttpClient::with_headers(BASE_URL, api_key, headers),
         }
     }
 }
