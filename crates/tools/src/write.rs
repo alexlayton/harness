@@ -170,18 +170,16 @@ async fn write_validated(
             &owned_fs
         };
         let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)?;
-        // Preserve existing permissions without re-walking names from `/`:
-        // stat the destination through the validated parent handle, then
-        // read its mode via the opened fd. A symlink final component
-        // fails here (SYMLINK_NOFOLLOW) instead of being followed.
-        let existing = rustix::fs::statat(
+        // Preserve existing permissions without re-walking names from `/`.
+        // This handle-relative metadata check rejects an existing FIFO,
+        // socket, device, or directory before any operation can block or the
+        // atomic rename could silently replace a special file. It uses
+        // fstatat rather than opening the contents, so write-only regular
+        // files remain writable.
+        let existing = super::vfs::unix::existing_file_permissions(
             std::os::fd::AsFd::as_fd(&parent_fd),
             name.as_str(),
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .ok()
-        .and_then(|_| super::vfs::unix::open_file_metadata(fs, components))
-        .map(|metadata| metadata.permissions());
+        )?;
         super::file_mutation::atomic_write_at(
             &parent_fd,
             &name,
@@ -210,6 +208,20 @@ async fn write_validated(
             "cancelled",
         ));
     }
+    // Without Unix directory handles this is only a preflight: it rejects
+    // known special files but cannot close a rename race or promise
+    // cancellation-safe named-pipe behavior during the later path open.
+    match fs::metadata(&full_path).await {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     atomic_write(&full_path, content.as_bytes(), cancel).await
 }
 
@@ -217,6 +229,22 @@ async fn write_validated(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn create_fifo(path: &std::path::Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string remains valid for this libc call.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
 
     #[tokio::test]
     async fn creates_parents_and_overwrites() {
@@ -241,6 +269,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a/b/file.txt")).unwrap(),
             "second"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn existing_fifo_rejection_is_responsive_to_a_timeout() {
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        create_fifo(&dir.path().join("output.fifo"));
+        let tool = WriteTool::with_workspace_root(dir.path());
+        let task = tokio::spawn(async move {
+            tool.execute(
+                json!({"path": "output.fifo", "content": "would block"}),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        let output = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("inspecting a FIFO must not block the Tokio worker")
+            .expect("write task panicked");
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not a regular file"),
+            "{}",
+            output.content
         );
     }
 

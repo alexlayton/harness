@@ -204,9 +204,7 @@ async fn open_target(
                     .fold(capability.root.root().to_path_buf(), |base, part| {
                         base.join(part)
                     });
-                fs::File::open(path)
-                    .await
-                    .map_err(|error| format!("cannot read file: {error}"))
+                open_regular_path(path).await
             }
         }
         ReadTarget::Workspace(components) => {
@@ -232,12 +230,28 @@ async fn open_target(
                 let candidate = components
                     .iter()
                     .fold(root.to_path_buf(), |base, part| base.join(part));
-                fs::File::open(&candidate)
-                    .await
-                    .map_err(|error| format!("cannot read file: {error}"))
+                open_regular_path(candidate).await
             }
         }
     }
+}
+
+#[cfg(not(unix))]
+/// The non-Unix fallback has no directory-handle-relative, no-follow open.
+/// Preflight the entry so known directories and special files are rejected
+/// before `File::open`; unlike the Unix path this cannot close a rename race,
+/// and platform-specific named-pipe behavior is not promised to be
+/// cancellation-safe.
+async fn open_regular_path(path: PathBuf) -> Result<fs::File, String> {
+    let metadata = fs::metadata(&path)
+        .await
+        .map_err(|error| format!("cannot read file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("cannot read file: not a regular file".to_owned());
+    }
+    fs::File::open(path)
+        .await
+        .map_err(|error| format!("cannot read file: {error}"))
 }
 
 #[cfg(unix)]
@@ -458,6 +472,22 @@ mod tests {
     use std::io::Write;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn create_fifo(path: &std::path::Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string remains valid for this libc call.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     #[tokio::test]
     async fn reads_ranges_and_reports_truncation() {
         let dir = tempdir().unwrap();
@@ -484,6 +514,30 @@ mod tests {
             .await;
         assert!(output.is_error);
         assert!(output.content.contains("binary"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fifo_rejection_is_responsive_to_a_timeout() {
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        create_fifo(&dir.path().join("input.fifo"));
+        let tool = ReadTool::with_workspace_root(dir.path());
+        let task = tokio::spawn(async move {
+            tool.execute(json!({"path": "input.fifo"}), CancellationToken::new())
+                .await
+        });
+        let output = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("opening a FIFO must not block the Tokio worker")
+            .expect("read task panicked");
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not a regular file"),
+            "{}",
+            output.content
+        );
     }
 
     #[tokio::test]

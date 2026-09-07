@@ -166,13 +166,22 @@ pub async fn atomic_write_at(
 
         // Check and commit through the already validated parent handle. The
         // destination may be replaced atomically, but no ancestor is looked up
-        // again by pathname.
-        let existed = rustix::fs::statat(
+        // again by pathname. Recheck the type immediately before rename so a
+        // special file racing with the metadata preflight is never silently
+        // accepted as an existing write target.
+        let existed = match rustix::fs::statat(
             parent_fd.as_fd(),
             name,
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )
-        .is_ok();
+        ) {
+            Ok(stat) => {
+                let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+                super::vfs::unix::ensure_regular_file(name, file_type)?;
+                true
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => false,
+            Err(error) => return Err(io::Error::from(error)),
+        };
         check_cancelled(cancel)?;
         rustix::fs::renameat(parent_fd.as_fd(), &temporary_name, parent_fd.as_fd(), name)
             .map_err(io::Error::from)?;

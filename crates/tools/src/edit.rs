@@ -276,8 +276,11 @@ async fn execute_edit_validated(
             ));
         }
         check_cancelled(cancel)?;
-        let existing_permissions = super::vfs::unix::open_file_metadata(fs, components)
-            .map(|metadata| metadata.permissions());
+        let existing_permissions = Some(
+            super::vfs::unix::open_file_metadata(fs, components)
+                .map(|metadata| metadata.permissions())
+                .map_err(|error| format!("Could not edit file: {path}. {error}"))?,
+        );
         let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)
             .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
         super::file_mutation::atomic_write_at(
@@ -314,8 +317,13 @@ async fn execute_edit(
     let metadata = fs::metadata(target_path)
         .await
         .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-    if metadata.is_dir() {
-        return Err(format!("Could not edit file: {path}. It is a directory."));
+    if !metadata.is_file() {
+        let message = if metadata.is_dir() {
+            "It is a directory."
+        } else {
+            "It is not a regular file."
+        };
+        return Err(format!("Could not edit file: {path}. {message}"));
     }
 
     let original_bytes = fs::read(target_path)
@@ -668,6 +676,22 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn create_fifo(path: &std::path::Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string remains valid for this libc call.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
     #[tokio::test]
     async fn replaces_one_block_and_returns_a_bounded_diff() {
         let directory = tempdir().unwrap();
@@ -702,6 +726,36 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "fn main() {\n    println!(\"new\");\n}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fifo_rejection_is_responsive_to_a_timeout() {
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        create_fifo(&dir.path().join("input.fifo"));
+        let tool = EditTool::with_workspace_root(dir.path());
+        let task = tokio::spawn(async move {
+            tool.execute(
+                json!({
+                    "path": "input.fifo",
+                    "edits": [{"oldText": "old", "newText": "new"}]
+                }),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        let output = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("opening a FIFO must not block the Tokio worker")
+            .expect("edit task panicked");
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("not a regular file"),
+            "{}",
+            output.content
         );
     }
 

@@ -12,7 +12,7 @@ ignore = "0.4"
 llm.workspace = true
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }

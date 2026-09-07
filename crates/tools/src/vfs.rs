@@ -244,14 +244,70 @@ pub mod unix {
         }
     }
 
+    /// Require an opened or statted path to be a regular file. Keeping this
+    /// check in the handle-relative layer means every caller gets the same
+    /// safe treatment for directories, FIFOs, sockets, and device nodes.
+    pub fn ensure_regular_file(name: &str, file_type: rustix::fs::FileType) -> io::Result<()> {
+        if file_type.is_file() {
+            return Ok(());
+        }
+        if file_type.is_symlink() {
+            return Err(io::Error::other(format!("symlink file rejected: {name}")));
+        }
+        if file_type.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                format!("is a directory: {name}"),
+            ));
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a regular file: {name}"),
+        ))
+    }
+
+    /// Return permissions for an existing regular file in `parent` without
+    /// opening its contents. Missing entries are reported as `None`; any
+    /// existing non-regular entry is rejected. This lets `write` preserve
+    /// modes on write-only regular files without ever opening a FIFO or
+    /// device just to read metadata.
+    pub fn existing_file_permissions(
+        parent: BorrowedFd<'_>,
+        name: &str,
+    ) -> io::Result<Option<std::fs::Permissions>> {
+        use rustix::fs::AtFlags;
+        use std::os::unix::fs::PermissionsExt;
+
+        match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+                ensure_regular_file(name, file_type)?;
+                Ok(Some(std::fs::Permissions::from_mode(stat.st_mode & 0o7777)))
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
+            Err(error) => Err(io::Error::from(error)),
+        }
+    }
+
     fn open_child_file(parent: BorrowedFd<'_>, name: &str) -> io::Result<OwnedFd> {
-        use rustix::fs::{Mode, OFlags};
-        // Read-only open of the validated file. `NOFOLLOW` rejects a final
-        // symlink; directories are rejected by checking the opened fd.
+        use rustix::fs::{AtFlags, Mode, OFlags};
+
+        // Inspect the directory entry first so sockets and device nodes are
+        // rejected with a useful error without asking the kernel to open
+        // them. This is only a preflight: the final fstat below still closes
+        // the type-check race if the entry changes between these operations.
+        let entry_type = rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map(|stat| rustix::fs::FileType::from_raw_mode(stat.st_mode))
+            .map_err(io::Error::from)?;
+        ensure_regular_file(name, entry_type)?;
+
+        // O_NONBLOCK is essential even though regular files are the only
+        // accepted result. A FIFO or other special file swapped in after the
+        // preflight must not make this synchronous open wait on a peer.
         let fd = rustix::fs::openat(
             parent,
             name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::empty(),
         )
         .map_err(|error| {
@@ -264,29 +320,24 @@ pub mod unix {
         let file_type = rustix::fs::FileType::from_raw_mode(
             rustix::fs::fstat(&fd).map_err(io::Error::from)?.st_mode,
         );
-        if file_type.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::IsADirectory,
-                format!("is a directory: {name}"),
-            ));
-        }
+        ensure_regular_file(name, file_type)?;
         Ok(fd)
     }
 
     /// Metadata of the regular file `rel`, opened through the validated
     /// parent handle. Used to preserve existing permissions on replace
     /// without re-walking names from `/`.
-    pub fn open_file_metadata(fs: &WorkspaceFs, rel: &[String]) -> Option<std::fs::Metadata> {
-        let fd = open_file_relative(fs, rel).ok()?;
+    pub fn open_file_metadata(fs: &WorkspaceFs, rel: &[String]) -> io::Result<std::fs::Metadata> {
+        let fd = open_file_relative(fs, rel)?;
         // Duplicate into a `std::fs::File` and read metadata from the open
         // description: identity comes from the handle, not a name lookup.
-        let duplicated =
-            rustix::io::retry_on_intr(|| rustix::io::fcntl_dupfd_cloexec(&fd, 0)).ok()?;
+        let duplicated = rustix::io::retry_on_intr(|| rustix::io::fcntl_dupfd_cloexec(&fd, 0))
+            .map_err(io::Error::from)?;
         use std::os::fd::{FromRawFd, IntoRawFd};
         let raw = duplicated.into_raw_fd();
         // SAFETY: `raw` is freshly duplicated and now solely owned.
         let file = unsafe { std::fs::File::from_raw_fd(raw) };
-        file.metadata().ok()
+        file.metadata()
     }
 
     /// Confirm `dir_fd` is contained in the workspace root by walking up
@@ -350,6 +401,43 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         assert!(WorkspaceFs::open_root(&file).is_err());
         assert!(WorkspaceFs::open_root(&dir.path().join("missing")).is_err());
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &std::path::Path) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the C string is NUL-terminated and points to the intended
+        // temporary-directory path for the duration of the call.
+        let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+        assert_eq!(
+            result,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_fifo_and_socket_without_opening_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let fifo = root.join("input.fifo");
+        create_fifo(&fifo);
+        let socket_path = root.join("listener.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let fs = WorkspaceFs::open_root(&root).unwrap();
+
+        for (name, expected) in [("input.fifo", "FIFO"), ("listener.sock", "socket")] {
+            let error = unix::open_file_relative(&fs, &[name.to_owned()]).unwrap_err();
+            assert!(
+                error.to_string().contains("not a regular file"),
+                "{expected} was not rejected clearly: {error:?}"
+            );
+        }
     }
 
     #[cfg(unix)]
