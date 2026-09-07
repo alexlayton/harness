@@ -1153,12 +1153,41 @@ mod tests {
     }
 
     #[cfg(all(unix, not(target_os = "linux")))]
+    struct DetachedChildCleanup {
+        pid_file: std::path::PathBuf,
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    impl DetachedChildCleanup {
+        fn kill(&self) {
+            if let Ok(text) = std::fs::read_to_string(&self.pid_file)
+                && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+            {
+                // SAFETY: the helper called setsid, so its pid is also its
+                // process-group id. Kill both the group and direct pid; the
+                // direct signal also covers a race with session setup.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    impl Drop for DetachedChildCleanup {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[tokio::test]
     async fn held_stdout_and_stderr_share_one_drain_deadline_without_cgroup() {
         // On Unix platforms without the Linux cgroup containment path, a
         // survivor detached into a new session can inherit both pipes. The
         // shared deadline still bounds Harness waiting (~1s): two sequential
-        // per-stream waits would take ~2s instead. The cleanup below is
+        // per-stream waits would take ~2s instead. The cleanup guard is
         // required because this is an explicitly documented best-effort path.
         //
         // The survivor is backgrounded so the outer shell can exit; the
@@ -1168,6 +1197,9 @@ mod tests {
         // an early EOF would finish at ~1s, sequential drains at ~3s.
         let directory = tempfile::tempdir().unwrap();
         let pid_file = directory.path().join("drain-survivor.pid");
+        let cleanup = DetachedChildCleanup {
+            pid_file: pid_file.clone(),
+        };
         let ready = directory.path().join("drain-ready");
         let marker = directory.path().join("drain-marker");
         let helper = shell_quote(&std::env::current_exe().unwrap().display().to_string());
@@ -1176,7 +1208,7 @@ mod tests {
             .execute(
                 json!({
                     "command": format!(
-                        "HARNESS_BASH_HELPER_READY={} HARNESS_BASH_HELPER_MARKER={} HARNESS_BASH_HELPER_PID={} HARNESS_BASH_HELPER_DELAY=15 {} --exact bash::tests::detached_marker_helper --nocapture & while [ ! -f {} ]; do sleep 0.01; done; exit 0",
+                        "HARNESS_BASH_HELPER_READY={} HARNESS_BASH_HELPER_MARKER={} HARNESS_BASH_HELPER_PID={} HARNESS_BASH_HELPER_DELAY=15 {} --exact bash::tests::detached_marker_helper --nocapture & while [ ! -f {} ]; do sleep 0.01; done; sleep 1; exit 0",
                         shell_quote(&ready.display().to_string()),
                         shell_quote(&marker.display().to_string()),
                         shell_quote(&pid_file.display().to_string()),
@@ -1189,19 +1221,10 @@ mod tests {
             )
             .await;
         let elapsed = started.elapsed();
-        // Reap the detached survivor before asserting so a failure cannot
-        // leak a pipe-holding `sleep` into later tests.
-        if let Ok(text) = std::fs::read_to_string(&pid_file)
-            && let Ok(pid) = text.trim().parse::<libc::pid_t>()
-        {
-            // SAFETY: the helper called setsid, so its pid is also its
-            // process-group id. Kill both the group and direct pid as a
-            // best-effort fallback before any assertions can panic.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
+        // Kill the detached survivor before asserting. The guard also repeats
+        // this cleanup during unwinding so a failed test cannot leak a
+        // pipe-holding child into later tests.
+        cleanup.kill();
         assert!(!output.is_error, "{}", output.content);
         // The lower bound proves both pipes were actually held through the
         // drain (an early EOF would finish at ~1s); the upper bound proves
