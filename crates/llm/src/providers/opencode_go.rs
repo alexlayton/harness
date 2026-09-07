@@ -11,6 +11,14 @@ use serde::Deserialize;
 
 pub const BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 
+/// Name for the static client-identity header sent on every OpenCode Go
+/// request. This identifies the harness build (User-Agent semantics); the
+/// per-conversation `x-opencode-session` id is request-scoped instead.
+pub const USER_AGENT: &str = concat!("harness/", env!("CARGO_PKG_VERSION"));
+
+/// Per-conversation session header expected by the OpenCode Go backend.
+const SESSION_HEADER: &str = "x-opencode-session";
+
 pub const RESPONSES_MODELS: &[&str] = &[
     "gpt-5.6-luna",
     "grok-4.6",
@@ -62,8 +70,6 @@ pub fn dialect_for_model(model: &str) -> Dialect {
 #[derive(Clone)]
 pub struct OpenCodeGoProvider {
     pub chat: OpenAiChatClient,
-    pub responses: OpenAiResponsesClient,
-    pub messages: AnthropicMessagesClient,
     usage: HttpClient,
 }
 
@@ -71,27 +77,39 @@ impl OpenCodeGoProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         let api_key = api_key.into();
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-opencode-session",
-            HeaderValue::from_static(concat!("harness/", env!("CARGO_PKG_VERSION"))),
-        );
-
+        // Static client identity only (User-Agent semantics): the same for
+        // every conversation. The per-conversation id goes on each request
+        // via `session_headers` instead, so one provider can serve parent
+        // and subagent conversations concurrently without shared state.
         Self {
-            chat: OpenAiChatClient::with_headers(BASE_URL, api_key.clone(), headers.clone()),
-            responses: OpenAiResponsesClient::with_headers(
-                BASE_URL,
-                api_key.clone(),
-                headers.clone(),
-            ),
-            messages: AnthropicMessagesClient::with_headers(
-                BASE_URL,
-                api_key.clone(),
-                headers.clone(),
-            ),
-            usage: HttpClient::with_headers(BASE_URL, api_key, headers),
+            chat: OpenAiChatClient::with_headers(BASE_URL, api_key.clone(), base_headers()),
+            usage: HttpClient::with_headers(BASE_URL, api_key, base_headers()),
         }
     }
+}
+
+/// Static client-identity headers sent on every OpenCode Go request.
+fn base_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        HeaderValue::from_static(USER_AGENT),
+    );
+    headers
+}
+
+/// Extra headers for one request: the static client identity plus the
+/// stable per-conversation id when the caller knows it. `None` (ephemeral
+/// runs) sends no session header rather than a placeholder.
+fn session_headers(session_id: Option<&str>) -> HeaderMap {
+    let mut headers = base_headers();
+    if let Some(session_id) = session_id
+        && !session_id.is_empty()
+        && let Ok(value) = HeaderValue::from_str(session_id)
+    {
+        headers.insert(SESSION_HEADER, value);
+    }
+    headers
 }
 
 #[async_trait::async_trait]
@@ -108,10 +126,28 @@ impl Provider for OpenCodeGoProvider {
                 req.model, dialect
             )));
         }
+        // Per-request clients carrying the conversation id as a header, so
+        // parallel turns from different sessions never share an id. Cheap:
+        // the underlying reqwest client is Arc-backed; only the small
+        // header map is rebuilt.
+        let headers = session_headers(req.session_id.as_deref());
+        let api_key = self.usage.api_key.clone();
         match dialect {
-            Dialect::Responses => self.responses.stream(req).await,
-            Dialect::Messages => self.messages.stream(req).await,
-            Dialect::Chat => self.chat.stream(req).await,
+            Dialect::Responses => {
+                OpenAiResponsesClient::with_headers(BASE_URL, api_key.clone(), headers.clone())
+                    .stream(req)
+                    .await
+            }
+            Dialect::Messages => {
+                AnthropicMessagesClient::with_headers(BASE_URL, api_key.clone(), headers.clone())
+                    .stream(req)
+                    .await
+            }
+            Dialect::Chat => {
+                OpenAiChatClient::with_headers(BASE_URL, api_key, headers)
+                    .stream(req)
+                    .await
+            }
         }
     }
 
@@ -176,6 +212,22 @@ fn parse_usage_body(body: &str) -> Result<SubscriptionUsage, LlmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_header_scopes_requests_to_the_conversation() {
+        // The static identity rides every request; the conversation id only
+        // when the caller knows it (ephemeral runs send no placeholder).
+        let scoped = session_headers(Some("01933f2e-uuid"));
+        assert_eq!(scoped.get(SESSION_HEADER).unwrap(), "01933f2e-uuid");
+        assert_eq!(scoped.get(reqwest::header::USER_AGENT).unwrap(), USER_AGENT);
+
+        let ephemeral = session_headers(None);
+        assert!(ephemeral.get(SESSION_HEADER).is_none());
+        assert_eq!(
+            ephemeral.get(reqwest::header::USER_AGENT).unwrap(),
+            USER_AGENT
+        );
+    }
 
     #[test]
     fn routes_every_documented_model_and_falls_back() {

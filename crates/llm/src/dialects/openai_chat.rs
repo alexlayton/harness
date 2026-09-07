@@ -461,6 +461,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning: ReasoningPolicy::Auto,
+            session_id: None,
         }
     }
 

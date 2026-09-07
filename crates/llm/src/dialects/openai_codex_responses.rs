@@ -124,6 +124,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning,
+            session_id: None,
         }
     }
 

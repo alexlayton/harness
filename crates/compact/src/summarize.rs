@@ -76,14 +76,18 @@ pub enum SummaryOutcome {
 /// Generate a summary for `plan` using the conversation's provider/model with
 /// a deterministic fallback on any failure. `cancel` aborts the summarizer
 /// request (the caller then persists nothing, so no half-written state).
+/// `session_id` scopes the request to the conversation being summarized so
+/// providers with per-conversation accounting bill it to the right place;
+/// `None` leaves the request unscoped.
 pub async fn summarize(
     provider: &dyn Provider,
     model: &str,
     plan: &CompactionPlan,
     policy: &CompactionPolicy,
+    session_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> SummaryOutcome {
-    match model_summarize(provider, model, plan, policy, cancel).await {
+    match model_summarize(provider, model, plan, policy, session_id, cancel).await {
         Ok((text, usage)) => SummaryOutcome::Model {
             text: append_file_lists(text, plan),
             usage,
@@ -104,6 +108,7 @@ async fn model_summarize(
     model: &str,
     plan: &CompactionPlan,
     policy: &CompactionPolicy,
+    session_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> Result<(String, Usage), llm::LlmError> {
     let serialized = serialize_events(
@@ -133,6 +138,7 @@ async fn model_summarize(
         max_tokens: Some(summary_max_tokens(policy)),
         temperature: None,
         reasoning: ReasoningPolicy::Off,
+        session_id: session_id.map(str::to_owned),
     };
 
     let mut stream = provider.stream(&request).await?;
@@ -308,6 +314,7 @@ mod tests {
             "demo",
             &plan,
             &CompactionPolicy::default(),
+            None,
             &cancel,
         ));
         match outcome {
@@ -335,6 +342,7 @@ mod tests {
             "demo",
             &plan,
             &CompactionPolicy::default(),
+            None,
             &cancel,
         ));
         match outcome {
@@ -362,6 +370,7 @@ mod tests {
             "demo",
             &plan,
             &CompactionPolicy::default(),
+            None,
             &cancel,
         ));
         assert!(matches!(outcome, SummaryOutcome::Deterministic { .. }));

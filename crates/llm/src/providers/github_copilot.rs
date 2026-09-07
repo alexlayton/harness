@@ -738,6 +738,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning: ReasoningPolicy::Auto,
+            session_id: None,
         };
         let error = match provider.stream(&request).await {
             Ok(_) => panic!("missing auth unexpectedly produced a stream"),

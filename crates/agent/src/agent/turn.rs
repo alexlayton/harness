@@ -71,6 +71,7 @@ impl Agent {
                 max_tokens: None,
                 temperature: None,
                 reasoning: self.reasoning,
+                session_id: self.session_id(),
             };
 
             let retry_events = events.clone();
