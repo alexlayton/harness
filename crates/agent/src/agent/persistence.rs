@@ -58,6 +58,52 @@ impl Agent {
         }
     }
 
+    /// Stage a model-change append without changing the live session. The
+    /// returned clone is committed by the command handler only after a
+    /// deferred sync succeeds, so an append followed by a failed sync cannot
+    /// make the in-memory session look newer than the successful model
+    /// selection.
+    pub(crate) fn stage_model_change(
+        &self,
+        provider: String,
+        model: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<Option<Session>, TurnError> {
+        let Some(state) = self.session.as_ref() else {
+            return Ok(None);
+        };
+        let mut staged = state.session.clone();
+        state
+            .store
+            .append_event(&mut staged, SessionEvent::ModelChange { provider, model })
+            .map(|_| Some(staged))
+            .map_err(|error| {
+                let message = format!("session persistence failed: {error}");
+                send(events, AgentEvent::Error(message.clone()));
+                TurnError::Persist(message)
+            })
+    }
+
+    /// Flush one session clone at the deferred-sync boundary. Model changes
+    /// use this with their staged session before replacing the live session;
+    /// ordinary turns use [`Self::flush_deferred_sync`] with the live one.
+    pub(crate) fn flush_deferred_sync_session(
+        &self,
+        store: &SessionStore,
+        session: &Session,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(), TurnError> {
+        if !store.deferred_sync() {
+            return Ok(());
+        }
+        if let Err(error) = store.sync_session(session) {
+            let message = format!("session persistence failed during sync: {error}");
+            send(events, AgentEvent::Error(message.clone()));
+            return Err(TurnError::Persist(message));
+        }
+        Ok(())
+    }
+
     /// Durable flush for deferred-sync stores (no-op otherwise). A sync
     /// failure is a persistence failure, not telemetry: quarantine before any
     /// queued operation can observe divergent durable history.
@@ -68,15 +114,7 @@ impl Agent {
         let Some(state) = self.session.as_ref() else {
             return Ok(());
         };
-        if !state.store.deferred_sync() {
-            return Ok(());
-        }
-        if let Err(error) = state.store.sync_session(&state.session) {
-            let message = format!("session persistence failed during sync: {error}");
-            send(events, AgentEvent::Error(message.clone()));
-            return Err(TurnError::Persist(message));
-        }
-        Ok(())
+        self.flush_deferred_sync_session(&state.store, &state.session, events)
     }
 
     pub(crate) fn persist_user_message(

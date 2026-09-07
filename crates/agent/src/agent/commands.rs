@@ -4,13 +4,20 @@ use super::{
     TurnControl, TurnError, send,
 };
 use llm::Provider;
-use session::{ExportOptions, SessionCreateOptions, SessionEvent, export_jsonl, snapshot_entries};
+use session::{ExportOptions, Session, SessionCreateOptions, export_jsonl, snapshot_entries};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tools::SkillEntry;
+
+struct PendingModelChange {
+    provider: Arc<dyn Provider>,
+    canonical: String,
+    model: String,
+    staged_session: Option<Session>,
+}
 
 impl Agent {
     pub(crate) fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
@@ -270,39 +277,67 @@ impl Agent {
         }
     }
 
-    /// Boundary wrapper for model changes: persist-first atomic commit
-    /// (see `handle_set_model`), deferred-sync flush, and quarantine on
-    /// persistence failure — the same boundary policy as turns. Model command
-    /// events remain separate from prompt `TurnFinished`.
+    /// Boundary wrapper for model changes. The append is staged on a cloned
+    /// session, and deferred sync runs against that clone before any live
+    /// provider/model, subagent, context, metadata, or frontend state moves.
+    /// Model command events remain separate from prompt `TurnFinished`.
     pub(crate) async fn handle_set_model_boundary(
         &mut self,
         provider: Option<String>,
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> TurnControl {
-        // Resolve without mutating live state; `handle_set_model` persists
-        // first and only commits after persistence succeeds.
         let outcome = self.handle_set_model(provider, model, events).await;
-        if self.flush_deferred_sync(events).is_err() {
-            return TurnControl::Quarantine;
+        let pending = match outcome {
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                return if self.flush_deferred_sync(events).is_err() {
+                    TurnControl::Quarantine
+                } else {
+                    TurnControl::Continue
+                };
+            }
+            Err(error) => {
+                // Preserve the boundary flush for an append/provider error;
+                // no model-change state has been committed in this branch.
+                if self.flush_deferred_sync(events).is_err() {
+                    return TurnControl::Quarantine;
+                }
+                return match error {
+                    TurnError::Shutdown => TurnControl::Shutdown,
+                    TurnError::Persist(_) => TurnControl::Quarantine,
+                };
+            }
+        };
+
+        // The append has already reached the OS, but the session clone is not
+        // installed until its deferred durability boundary succeeds. A
+        // failed fsync therefore cannot leak a model switch into live state.
+        if let Some(staged) = pending.staged_session.as_ref() {
+            let Some(state) = self.session.as_ref() else {
+                return TurnControl::Quarantine;
+            };
+            if self
+                .flush_deferred_sync_session(&state.store, staged, events)
+                .is_err()
+            {
+                return TurnControl::Quarantine;
+            }
         }
-        match outcome {
-            Ok(()) => TurnControl::Continue,
-            Err(TurnError::Shutdown) => TurnControl::Shutdown,
-            Err(TurnError::Persist(_)) => TurnControl::Quarantine,
-        }
+
+        self.commit_model_change(pending, events);
+        TurnControl::Continue
     }
 
-    pub(crate) async fn handle_set_model(
+    async fn handle_set_model(
         &mut self,
         provider: Option<String>,
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> Result<(), TurnError> {
+    ) -> Result<Option<PendingModelChange>, TurnError> {
         // Resolve the candidate provider and canonical model name without
-        // mutating live state; commit only after persistence succeeds, so
-        // a failed `ModelChange` persist leaves parent and subagent
-        // selection unchanged (AGENT-4 atomicity).
+        // mutating live state. The session append is also staged so a
+        // deferred-sync failure leaves every live model-related field alone.
         let requested = provider.unwrap_or_else(|| self.provider.name().to_owned());
         let current = self.provider.name().to_owned();
         let next_provider = if requested.eq_ignore_ascii_case(&current) {
@@ -313,36 +348,50 @@ impl Agent {
                     events,
                     AgentEvent::Error("provider switching is unavailable".into()),
                 );
-                return Ok(());
+                return Ok(None);
             };
             match factory(&requested) {
                 Ok(provider) => Some(provider),
                 Err(error) => {
                     send(events, AgentEvent::Error(error.to_string()));
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         };
-        let canonical = next_provider
-            .as_ref()
-            .map(|provider| provider.name().to_owned())
-            .unwrap_or_else(|| current.clone());
-        // Persist first: only after this succeeds do live parent/provider
-        // state and the subagent runner move.
-        self.persist_event(
-            SessionEvent::ModelChange {
-                provider: canonical.clone(),
-                model: model.clone(),
-            },
-            events,
-        )?;
-        if let Some(provider) = next_provider {
-            self.provider = provider;
+        let candidate = next_provider.unwrap_or_else(|| self.provider.clone());
+        let canonical = candidate.name().to_owned();
+        let staged_session = self.stage_model_change(canonical.clone(), model.clone(), events)?;
+        Ok(Some(PendingModelChange {
+            provider: candidate,
+            canonical,
+            model,
+            staged_session,
+        }))
+    }
+
+    fn commit_model_change(
+        &mut self,
+        pending: PendingModelChange,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let PendingModelChange {
+            provider,
+            canonical,
+            model,
+            staged_session,
+        } = pending;
+        if let Some(staged) = staged_session {
+            // The staged session was synced before this replacement. No live
+            // session mutation is observable if that boundary failed.
+            self.session
+                .as_mut()
+                .expect("staged model change requires a session")
+                .session = staged;
         }
+        self.provider = provider;
         self.model = model.clone();
-        // Future subagents must follow the parent's active selection; a
-        // failed switch already returned above, so children never see a
-        // half-applied state. Running children keep their own snapshot.
+        // Future subagents must follow the parent's active selection; running
+        // children keep the provider/model snapshot they started with.
         if let Some(runner) = &self.subagent_runner {
             runner.update_model(self.provider.clone(), self.model.clone());
         }
@@ -372,7 +421,6 @@ impl Agent {
                 self.cancel.clone(),
             );
         }
-        Ok(())
     }
 
     pub(crate) fn handle_set_reasoning(

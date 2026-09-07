@@ -1890,7 +1890,8 @@ mod tests {
                 );
             }
 
-            // --- `/model`: persist-first commit, then boundary flush. ---
+            // --- `/model`: append succeeds, deferred sync fails before
+            // the live model commit. ---
             {
                 let root = tempdir().unwrap();
                 let workspace = tempdir().unwrap();
@@ -1927,10 +1928,10 @@ mod tests {
                 .await;
                 drop(_guard);
                 let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-                // The `ModelChange` persist succeeded and committed before
-                // the boundary flush failed: selection moved, then the
-                // failed flush quarantined (queued work never runs) with a
-                // loud sync-failure error.
+                // The `ModelChange` append succeeded, but the staged
+                // session was not installed because its deferred sync failed.
+                // The operation quarantines (queued work never runs) with a
+                // loud sync-failure error and no frontend model commit.
                 assert_eq!(
                     events
                         .iter()
@@ -1940,11 +1941,10 @@ mod tests {
                     "command operations must not masquerade as prompt turns: {events:?}"
                 );
                 assert!(
-                    events.iter().any(|event| matches!(
-                        event,
-                        AgentEvent::ModelChanged { model, .. } if model == "switched-model"
-                    )),
-                    "model change should commit before the flush: {events:?}"
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, AgentEvent::ModelChanged { .. })),
+                    "model change must not commit before the flush: {events:?}"
                 );
                 assert!(
                     events.iter().any(|event| matches!(
@@ -3353,6 +3353,136 @@ mod tests {
         );
         // And nothing was appended to the (deleted-file) session.
         assert!(store.open(&session_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn deferred_sync_failure_after_model_append_is_not_a_live_commit() {
+        // The deferred store accepts the append before the boundary sync.
+        // Sync failure must leave every live model-related field untouched,
+        // including the session clone, subagent target, context bookkeeping,
+        // metadata task, and frontend event stream.
+        struct CountingProvider {
+            list_calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for CountingProvider {
+            fn name(&self) -> &str {
+                "other"
+            }
+
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                Ok(Box::pin(stream::iter(Vec::new())))
+            }
+
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+
+        use session::SyncSessionFaultGuard;
+
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path())
+            .unwrap()
+            .with_deferred_sync(true);
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_id = session.id();
+        let old_provider: Arc<dyn llm::Provider> = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let new_provider = Arc::new(CountingProvider {
+            list_calls: AtomicUsize::new(0),
+        });
+        let factory_provider = new_provider.clone();
+        let factory: crate::agent::ProviderFactory = Arc::new(move |name: &str| {
+            assert_eq!(name, "other");
+            Ok(factory_provider.clone() as Arc<dyn llm::Provider>)
+        });
+        let runner = Arc::new(crate::subagent::SubagentRunnerImpl::new(
+            old_provider.clone(),
+            "old-model",
+            std::fs::canonicalize(workspace.path()).unwrap(),
+            false,
+            "",
+            crate::assembly::SubagentPolicy::default(),
+            None,
+            None,
+        ));
+        let (metadata_tx, mut metadata_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            old_provider.clone(),
+            ToolRegistry::empty(),
+            "old-model",
+            CancellationToken::new(),
+        )
+        .with_provider_factory(factory)
+        .with_subagent_runner(runner.clone())
+        .with_session(store.clone(), session);
+        agent.context_window = 77_777;
+        agent.last_context_tokens = Some(123);
+        agent.model_metadata_tx = Some(metadata_tx);
+        let before_session = agent.session.as_ref().unwrap().session.clone();
+
+        let _guard = SyncSessionFaultGuard::arm();
+        let control = agent
+            .handle_set_model_boundary(Some("other".into()), "new-model".into(), &event_tx)
+            .await;
+        drop(_guard);
+
+        assert_eq!(control, TurnControl::Quarantine);
+        assert!(Arc::ptr_eq(&agent.provider, &old_provider));
+        assert_eq!(agent.model, "old-model");
+        assert_eq!(runner.model_for_test(), "old-model");
+        assert_eq!(agent.context_window, 77_777);
+        assert_eq!(agent.last_context_tokens, Some(123));
+        assert_eq!(
+            agent.session.as_ref().unwrap().session,
+            before_session,
+            "failed deferred sync must not install the staged session"
+        );
+
+        // The append did succeed, so the append-only file contains the record;
+        // only the live commit is withheld when its durability boundary fails.
+        let reloaded = store.open(&session_id).unwrap();
+        assert!(
+            reloaded
+                .events
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::ModelChange { .. }))
+        );
+
+        tokio::task::yield_now().await;
+        assert_eq!(new_provider.list_calls.load(Ordering::SeqCst), 0);
+        assert!(metadata_rx.try_recv().is_err());
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(message) if message.contains("during sync")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelChanged { .. }))
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(message) if message.contains("Using other")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelList { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ContextUsageUpdated { .. }))
+        );
     }
 
     #[tokio::test]
