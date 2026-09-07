@@ -1,11 +1,24 @@
 use crate::retry::with_retry;
 use crate::{CompletionRequest, LlmError, ModelInfo, StreamEvent, SubscriptionUsage};
 use futures_core::Stream;
+use futures_util::StreamExt;
 use std::pin::Pin;
 use std::sync::Arc;
 
 pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, LlmError>> + Send>>;
 pub type RetryCallback = Arc<dyn for<'a> Fn(u32, &'a LlmError) + Send + Sync>;
+
+/// Attach the active provider credential to an event stream's error boundary.
+///
+/// SSE parsing happens after a dialect's request method has returned, so
+/// redacting only the `Result<EventStream, LlmError>` from that method leaves
+/// provider-supplied error payloads exposed.  Every dialect driver uses this
+/// adapter before returning its stream; it preserves the original error
+/// variants and therefore does not affect retry classification.
+pub(crate) fn redact_stream(stream: EventStream, secret: &str) -> EventStream {
+    let secret = secret.to_owned();
+    Box::pin(stream.map(move |item| item.map_err(|error| error.redacted(&secret))))
+}
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
@@ -46,5 +59,24 @@ pub trait Provider: Send + Sync {
             },
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::stream;
+
+    #[tokio::test]
+    async fn late_stream_errors_are_redacted_without_changing_the_variant() {
+        let secret = "late-stream-sentinel-token";
+        let raw: EventStream = Box::pin(stream::iter([Err(LlmError::Stream(format!(
+            "provider echoed {secret}",
+        )))]));
+        let mut stream = redact_stream(raw, secret);
+        let error = stream.next().await.unwrap().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)));
+        assert!(!error.to_string().contains(secret));
+        assert!(error.to_string().contains("[redacted]"));
     }
 }

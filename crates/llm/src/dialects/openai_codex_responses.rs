@@ -32,7 +32,7 @@ impl OpenAiCodexResponsesClient {
             .http
             .post_json("/responses", &build_request_body(request))
             .await?;
-        Ok(event_stream(stream_response(response)))
+        Ok(event_stream(stream_response(response), &self.http.api_key))
     }
 }
 /// Convert neutral harness history to the subset accepted by Codex.
@@ -252,8 +252,8 @@ impl super::StreamParser for CodexParser {
     }
 }
 
-fn event_stream(sse: crate::sse::SseStream) -> EventStream {
-    super::drive_parser_stream(sse, CodexParser::new())
+fn event_stream(sse: crate::sse::SseStream, secret: &str) -> EventStream {
+    super::drive_parser_stream(sse, CodexParser::new(), secret)
 }
 
 #[cfg(test)]

@@ -26,13 +26,16 @@ pub(crate) trait StreamParser {
 
 /// Drive any [`StreamParser`] over a shared [`SseStream`], yielding parsed
 /// events until the parser reports its protocol terminal (or EOF without
-/// one, which the parser surfaces as `LlmError::Stream`).
+/// one, which the parser surfaces as `LlmError::Stream`).  The returned
+/// boundary redacts the active credential from both transport and parser
+/// errors, which are produced after the async request has already returned.
 pub(crate) fn drive_parser_stream(
     mut sse: crate::sse::SseStream,
     mut parser: impl StreamParser + Send + 'static,
+    secret: &str,
 ) -> crate::EventStream {
     use futures_util::StreamExt;
-    Box::pin(async_stream::try_stream! {
+    let stream: crate::EventStream = Box::pin(async_stream::try_stream! {
         while let Some(event) = sse.next().await {
             let event = event?;
             for item in parser.parse_event(&event)? {
@@ -47,7 +50,8 @@ pub(crate) fn drive_parser_stream(
                 yield item;
             }
         }
-    })
+    });
+    crate::provider::redact_stream(stream, secret)
 }
 
 /// OpenAI-compatible wire spelling for a portable explicit effort.

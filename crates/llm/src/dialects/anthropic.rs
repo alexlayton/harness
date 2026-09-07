@@ -71,7 +71,7 @@ impl AnthropicMessagesClient {
             .await
             .map_err(LlmError::Network)?;
         let response = crate::http::check_status_with_secret(response, &self.api_key).await?;
-        Ok(event_stream(stream_response(response)))
+        Ok(event_stream(stream_response(response), &self.api_key))
     }
 
     fn headers(&self) -> HeaderMap {
@@ -534,8 +534,8 @@ impl super::StreamParser for AnthropicParser {
     }
 }
 
-fn event_stream(sse: crate::sse::SseStream) -> EventStream {
-    super::drive_parser_stream(sse, AnthropicParser::new())
+fn event_stream(sse: crate::sse::SseStream, secret: &str) -> EventStream {
+    super::drive_parser_stream(sse, AnthropicParser::new(), secret)
 }
 
 #[cfg(test)]

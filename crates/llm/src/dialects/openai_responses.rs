@@ -60,7 +60,7 @@ impl OpenAiResponsesClient {
             }
             Err(error) => return Err(error),
         };
-        Ok(event_stream(stream_response(response)))
+        Ok(event_stream(stream_response(response), &self.http.api_key))
     }
 }
 
@@ -399,8 +399,8 @@ impl super::StreamParser for ResponsesParser {
     }
 }
 
-fn event_stream(sse: crate::sse::SseStream) -> EventStream {
-    super::drive_parser_stream(sse, ResponsesParser::new())
+fn event_stream(sse: crate::sse::SseStream, secret: &str) -> EventStream {
+    super::drive_parser_stream(sse, ResponsesParser::new(), secret)
 }
 
 #[cfg(test)]

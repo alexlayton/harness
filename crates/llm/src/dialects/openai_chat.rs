@@ -61,13 +61,17 @@ impl OpenAiChatClient {
                 &build_request_body_with_reasoning(req, self.reasoning_format),
             )
             .await?;
-        Ok(event_stream(stream_response(response)))
+        Ok(event_stream(stream_response(response), &self.http.api_key))
+    }
+
+    pub(crate) fn api_key(&self) -> &str {
+        &self.http.api_key
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         let response = self.http.get("/models").await?;
         let body = response.text().await.map_err(LlmError::Network)?;
-        parse_models_body(&body)
+        parse_models_body(&body).map_err(|error| error.redacted(self.api_key()))
     }
 }
 
@@ -487,8 +491,8 @@ impl super::StreamParser for ChatStreamParser {
     }
 }
 
-fn event_stream(sse: crate::sse::SseStream) -> EventStream {
-    super::drive_parser_stream(sse, ChatStreamParser::new())
+fn event_stream(sse: crate::sse::SseStream, secret: &str) -> EventStream {
+    super::drive_parser_stream(sse, ChatStreamParser::new(), secret)
 }
 
 #[cfg(test)]
@@ -795,5 +799,22 @@ mod tests {
             .parse_payload(r#"{"error":{"message":"boom","type":"server_error"}}"#)
             .unwrap_err();
         assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn parser_errors_are_redacted_only_at_the_stream_boundary() {
+        let secret = "parser-stream-sentinel";
+        let mut parser = ChatStreamParser::new();
+        let error = parser
+            .parse_payload(&format!(
+                r#"{{"error":{{"message":"upstream echoed {secret}"}}}}"#
+            ))
+            .unwrap_err();
+        // The wire parser retains the provider's diagnostic; the shared
+        // stream adapter is the security boundary for returned EventStreams.
+        assert!(error.to_string().contains(secret));
+        let rendered = error.redacted(secret).to_string();
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("[redacted]"));
     }
 }
