@@ -84,26 +84,13 @@ impl fmt::Debug for McpTransportConfig {
 
 const MAX_MCP_SERVERS: usize = 64;
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_MCP_FIELD_BYTES: usize = 64 * 1024;
 const MAX_SERVER_NAME_BYTES: usize = 256;
 
 impl McpConfig {
     /// Validate configuration without expanding environment placeholders.
     pub fn validate(&self) -> Result<(), McpError> {
-        if self.servers.len() > MAX_MCP_SERVERS {
-            return Err(McpError::Config {
-                server: "<mcp>".into(),
-                message: format!("too many servers; maximum is {MAX_MCP_SERVERS}"),
-            });
-        }
-        if serde_json::to_vec(self)
-            .map(|bytes| bytes.len() > MAX_MCP_CONFIG_BYTES)
-            .unwrap_or(true)
-        {
-            return Err(McpError::Config {
-                server: "<mcp>".into(),
-                message: format!("configuration exceeds {MAX_MCP_CONFIG_BYTES} bytes"),
-            });
-        }
+        validate_global_limits(self)?;
         let mut names = BTreeSet::new();
         for server in &self.servers {
             validate_server(server, &mut names)?;
@@ -116,44 +103,45 @@ impl McpConfig {
         &self,
         mut lookup: impl FnMut(&str) -> Option<String>,
     ) -> Result<Vec<McpServerConfig>, McpError> {
-        let mut names = BTreeSet::new();
+        // Check the caller-owned configuration before cloning it. In
+        // particular, a large raw configuration must not be duplicated just
+        // to discover that it is already over one of the global limits.
+        self.validate()?;
+
+        let mut expansion_budget = MAX_MCP_CONFIG_BYTES;
         let mut servers = self.servers.clone();
         servers.sort_by(|left, right| left.name.cmp(&right.name));
         for server in &mut servers {
-            validate_server(server, &mut names)?;
             match &mut server.transport {
                 McpTransportConfig::Stdio { args, env, .. } => {
                     for arg in args {
-                        *arg = expand_environment(arg, &mut lookup).map_err(|message| {
-                            McpError::Config {
+                        *arg = expand_with_budget(arg, &mut lookup, &mut expansion_budget)
+                            .map_err(|message| McpError::Config {
                                 server: server.name.clone(),
                                 message,
-                            }
-                        })?;
+                            })?;
                     }
                     for value in env.values_mut() {
-                        *value = expand_environment(value, &mut lookup).map_err(|message| {
-                            McpError::Config {
+                        *value = expand_with_budget(value, &mut lookup, &mut expansion_budget)
+                            .map_err(|message| McpError::Config {
                                 server: server.name.clone(),
                                 message,
-                            }
-                        })?;
+                            })?;
                     }
                 }
                 McpTransportConfig::Http { url, headers } => {
-                    *url = expand_environment(url, &mut lookup).map_err(|message| {
-                        McpError::Config {
+                    *url = expand_with_budget(url, &mut lookup, &mut expansion_budget).map_err(
+                        |message| McpError::Config {
                             server: server.name.clone(),
                             message,
-                        }
-                    })?;
+                        },
+                    )?;
                     for value in headers.values_mut() {
-                        *value = expand_environment(value, &mut lookup).map_err(|message| {
-                            McpError::Config {
+                        *value = expand_with_budget(value, &mut lookup, &mut expansion_budget)
+                            .map_err(|message| McpError::Config {
                                 server: server.name.clone(),
                                 message,
-                            }
-                        })?;
+                            })?;
                     }
                     if url::Url::parse(url).is_err() {
                         return Err(McpError::Config {
@@ -164,8 +152,34 @@ impl McpConfig {
                 }
             }
         }
-        Ok(servers)
+
+        // Expansion can introduce NULs, invalid URLs, duplicate-sensitive
+        // sizes, and enough serialized data to cross the aggregate limit, so
+        // validate the complete resolved form rather than relying on the raw
+        // configuration checks above.
+        let resolved = McpConfig { servers };
+        resolved.validate()?;
+        Ok(resolved.servers)
     }
+}
+
+fn validate_global_limits(config: &McpConfig) -> Result<(), McpError> {
+    if config.servers.len() > MAX_MCP_SERVERS {
+        return Err(McpError::Config {
+            server: "<mcp>".into(),
+            message: format!("too many servers; maximum is {MAX_MCP_SERVERS}"),
+        });
+    }
+    if serde_json::to_vec(config)
+        .map(|bytes| bytes.len() > MAX_MCP_CONFIG_BYTES)
+        .unwrap_or(true)
+    {
+        return Err(McpError::Config {
+            server: "<mcp>".into(),
+            message: format!("configuration exceeds {MAX_MCP_CONFIG_BYTES} bytes"),
+        });
+    }
+    Ok(())
 }
 
 fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Result<(), McpError> {
@@ -190,6 +204,14 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
             if command.as_os_str().is_empty() || command.to_string_lossy().contains('\0') {
                 return Err(invalid("command must be non-empty and contain no NUL"));
             }
+            if args.iter().any(|arg| arg.len() > MAX_MCP_FIELD_BYTES) {
+                return Err(field_too_large(server, "argument"));
+            }
+            if env.iter().any(|(key, value)| {
+                key.len() > MAX_MCP_FIELD_BYTES || value.len() > MAX_MCP_FIELD_BYTES
+            }) {
+                return Err(field_too_large(server, "environment entry"));
+            }
             if args.iter().any(|arg| arg.contains('\0'))
                 || env.iter().any(|(key, value)| {
                     key.is_empty() || key.contains('\0') || value.contains('\0')
@@ -201,6 +223,9 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
             }
         }
         McpTransportConfig::Http { url, headers } => {
+            if url.len() > MAX_MCP_FIELD_BYTES {
+                return Err(field_too_large(server, "HTTP URL"));
+            }
             if !(url.starts_with("https://") || url.starts_with("http://")) {
                 return Err(invalid("HTTP URL must start with http:// or https://"));
             }
@@ -209,15 +234,32 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
             }
             if headers.keys().any(|key| {
                 key.is_empty()
+                    || key.len() > MAX_MCP_FIELD_BYTES
                     || !key.bytes().all(|byte| {
                         byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
                     })
             }) {
                 return Err(invalid("HTTP header name is invalid"));
             }
+            if headers
+                .values()
+                .any(|value| value.len() > MAX_MCP_FIELD_BYTES)
+            {
+                return Err(field_too_large(server, "HTTP header value"));
+            }
+            if headers.values().any(|value| value.contains('\0')) {
+                return Err(invalid("HTTP header values must contain no NUL"));
+            }
         }
     }
     Ok(())
+}
+
+fn field_too_large(server: &McpServerConfig, field: &str) -> McpError {
+    McpError::Config {
+        server: server.name.clone(),
+        message: format!("{field} exceeds {MAX_MCP_FIELD_BYTES} bytes"),
+    }
 }
 
 fn redact_url(value: &str) -> String {
@@ -234,12 +276,31 @@ fn redact_url(value: &str) -> String {
 }
 
 pub(crate) fn expand_environment(
+    value: &str,
+    lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<String, String> {
+    expand_environment_bounded(value, lookup, MAX_MCP_FIELD_BYTES)
+}
+
+fn expand_with_budget(
+    value: &str,
+    lookup: impl FnMut(&str) -> Option<String>,
+    budget: &mut usize,
+) -> Result<String, String> {
+    let limit = (*budget).min(MAX_MCP_FIELD_BYTES);
+    let expanded = expand_environment_bounded(value, lookup, limit)?;
+    *budget = (*budget).saturating_sub(expanded.len());
+    Ok(expanded)
+}
+
+fn expand_environment_bounded(
     mut value: &str,
     mut lookup: impl FnMut(&str) -> Option<String>,
+    limit: usize,
 ) -> Result<String, String> {
-    let mut output = String::new();
+    let mut output = String::with_capacity(value.len().min(limit));
     while let Some(start) = value.find("${") {
-        output.push_str(&value[..start]);
+        append_bounded(&mut output, &value[..start], limit)?;
         let rest = &value[start + 2..];
         let Some(end) = rest.find('}') else {
             return Err("unterminated ${ENV_VAR} placeholder".into());
@@ -256,11 +317,19 @@ pub(crate) fn expand_environment(
         }
         let replacement =
             lookup(name).ok_or_else(|| format!("environment variable `{name}` is required"))?;
-        output.push_str(&replacement);
+        append_bounded(&mut output, &replacement, limit)?;
         value = &rest[end + 1..];
     }
-    output.push_str(value);
+    append_bounded(&mut output, value, limit)?;
     Ok(output)
+}
+
+fn append_bounded(output: &mut String, value: &str, limit: usize) -> Result<(), String> {
+    if value.len() > limit.saturating_sub(output.len()) {
+        return Err(format!("expanded value exceeds {limit} bytes"));
+    }
+    output.push_str(value);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -292,6 +361,178 @@ mod tests {
         let debug = format!("{:?}", resolved[0]);
         assert!(debug.contains("redacted"));
         assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn resolves_all_value_surfaces_and_sorts_without_mutating_input() {
+        let config = McpConfig {
+            servers: vec![
+                McpServerConfig {
+                    name: "remote".into(),
+                    transport: McpTransportConfig::Http {
+                        url: "https://${HOST}/mcp?token=${TOKEN}".into(),
+                        headers: [("Authorization".into(), "Bearer ${TOKEN}".into())]
+                            .into_iter()
+                            .collect(),
+                    },
+                },
+                McpServerConfig {
+                    name: "local".into(),
+                    transport: McpTransportConfig::Stdio {
+                        command: "server".into(),
+                        args: vec!["--token=${TOKEN}".into()],
+                        env: [("AUTH".into(), "${TOKEN}".into())].into_iter().collect(),
+                    },
+                },
+            ],
+        };
+        let resolved = config
+            .resolve_with(|name| match name {
+                "HOST" => Some("example.test".into()),
+                "TOKEN" => Some("resolved-secret".into()),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(resolved[0].name, "local");
+        assert_eq!(resolved[1].name, "remote");
+        let McpTransportConfig::Http { url, headers } = &resolved[1].transport else {
+            panic!("expected HTTP transport")
+        };
+        assert_eq!(url, "https://example.test/mcp?token=resolved-secret");
+        assert_eq!(headers["Authorization"], "Bearer resolved-secret");
+        assert_eq!(config.servers[0].name, "remote");
+        let debug = format!("{:?}", resolved[1]);
+        assert!(!debug.contains("resolved-secret"));
+    }
+
+    #[test]
+    fn rejects_oversized_expansions_in_every_value_surface() {
+        let oversized =
+            "oversized-secret".repeat(MAX_MCP_FIELD_BYTES / "oversized-secret".len() + 1);
+        let configs = [
+            McpConfig {
+                servers: vec![McpServerConfig {
+                    name: "args".into(),
+                    transport: McpTransportConfig::Stdio {
+                        command: "server".into(),
+                        args: vec!["${TOKEN}".into()],
+                        env: BTreeMap::new(),
+                    },
+                }],
+            },
+            McpConfig {
+                servers: vec![McpServerConfig {
+                    name: "env".into(),
+                    transport: McpTransportConfig::Stdio {
+                        command: "server".into(),
+                        args: Vec::new(),
+                        env: [("TOKEN_VALUE".into(), "${TOKEN}".into())]
+                            .into_iter()
+                            .collect(),
+                    },
+                }],
+            },
+            McpConfig {
+                servers: vec![McpServerConfig {
+                    name: "headers".into(),
+                    transport: McpTransportConfig::Http {
+                        url: "https://example.test/mcp".into(),
+                        headers: [("Authorization".into(), "${TOKEN}".into())]
+                            .into_iter()
+                            .collect(),
+                    },
+                }],
+            },
+            McpConfig {
+                servers: vec![McpServerConfig {
+                    name: "url".into(),
+                    transport: McpTransportConfig::Http {
+                        url: "https://${TOKEN}/mcp".into(),
+                        headers: BTreeMap::new(),
+                    },
+                }],
+            },
+        ];
+
+        for config in configs {
+            let error = config
+                .resolve_with(|_| Some(oversized.clone()))
+                .expect_err("oversized expansion must be rejected");
+            let rendered = error.to_string();
+            assert!(rendered.contains("expanded value exceeds"), "{rendered}");
+            assert!(!rendered.contains("oversized-secret"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_pre_resolved_configuration_before_cloning() {
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "server".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "server".into(),
+                    args: (0..16).map(|_| "x".repeat(MAX_MCP_FIELD_BYTES)).collect(),
+                    env: BTreeMap::new(),
+                },
+            }],
+        };
+
+        let error = config
+            .resolve_with(|_| None)
+            .expect_err("oversized raw config must be rejected");
+        assert!(matches!(
+            error,
+            McpError::Config { server, message }
+                if server == "<mcp>" && message.contains("configuration exceeds")
+        ));
+    }
+
+    #[test]
+    fn rejects_aggregate_size_after_expansion() {
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "server".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "server".into(),
+                    args: (0..16).map(|_| "${TOKEN}".into()).collect(),
+                    env: BTreeMap::new(),
+                },
+            }],
+        };
+        assert!(config.validate().is_ok());
+        let expansion = "x".repeat(MAX_MCP_FIELD_BYTES);
+
+        let error = config
+            .resolve_with(|_| Some(expansion.clone()))
+            .expect_err("resolved aggregate must be revalidated");
+        assert!(matches!(
+            error,
+            McpError::Config { server, message }
+                if server == "<mcp>" && message.contains("configuration exceeds")
+        ));
+
+        let debug = format!("{:?}", config);
+        assert!(!debug.contains(&expansion));
+    }
+
+    #[test]
+    fn rejects_nul_introduced_by_expansion_during_final_validation() {
+        let config = McpConfig {
+            servers: vec![McpServerConfig {
+                name: "server".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "server".into(),
+                    args: vec!["${TOKEN}".into()],
+                    env: BTreeMap::new(),
+                },
+            }],
+        };
+
+        let error = config
+            .resolve_with(|_| Some("bad\0value".into()))
+            .expect_err("expanded NUL must be rejected");
+        assert!(error.to_string().contains("NUL"));
     }
 
     #[test]
@@ -356,7 +597,16 @@ mod tests {
                 },
             })
             .collect();
-        assert!(McpConfig { servers }.validate().is_err());
+        let config = McpConfig { servers };
+        assert!(config.validate().is_err());
+        let error = config
+            .resolve_with(|_| None)
+            .expect_err("the resolver must enforce the server count limit");
+        assert!(matches!(
+            error,
+            McpError::Config { server, message }
+                if server == "<mcp>" && message.contains("too many servers")
+        ));
 
         let invalid = McpConfig {
             servers: vec![McpServerConfig {

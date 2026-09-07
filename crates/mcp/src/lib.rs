@@ -73,6 +73,7 @@ impl McpError {
 
 /// Expand `${NAME}` placeholders without reading or logging environment values.
 /// Missing variables are reported by name so configuration mistakes are actionable.
+/// The resulting value is bounded by the MCP configuration field limit.
 pub fn expand_environment(
     value: &str,
     lookup: impl FnMut(&str) -> Option<String>,
