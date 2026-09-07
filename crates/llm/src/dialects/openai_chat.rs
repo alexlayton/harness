@@ -276,11 +276,18 @@ impl ChatStreamParser {
     }
 
     pub fn parse_payload(&mut self, payload: &str) -> Result<Vec<StreamEvent>, LlmError> {
-        if payload.trim() == "[DONE]" {
-            // The documented Chat terminator: even without a finish_reason
-            // or usage chunk, the endpoint explicitly closed the turn.
-            self.done = true;
+        // A terminal payload is sometimes followed by a transport-level
+        // duplicate (or is passed to the parser directly after a usage
+        // terminal).  Do not allow either case to produce another terminal
+        // event or process data after the turn has ended.
+        if self.done {
             return Ok(Vec::new());
+        }
+        if payload.trim() == "[DONE]" {
+            // The documented Chat terminator has no usage of its own.  It is
+            // nevertheless a complete protocol terminal: validate and emit
+            // every pending call before recording one usage-less Done event.
+            return self.complete(None);
         }
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| LlmError::Parse(format!("chat SSE payload: {error}")))?;
@@ -338,12 +345,7 @@ impl ChatStreamParser {
         if let Some(usage_value) = value.get("usage")
             && !usage_value.is_null()
         {
-            output.extend(self.flush_calls()?);
-            output.push(StreamEvent::Done {
-                stop_reason: self.stop_reason.clone(),
-                usage: Some(parse_usage(usage_value)?),
-            });
-            self.done = true;
+            output.extend(self.complete(Some(parse_usage(usage_value)?))?);
         }
         Ok(output)
     }
@@ -362,6 +364,16 @@ impl ChatStreamParser {
             "chat stream ended without a terminal event (expected [DONE], a finish_reason, or a usage chunk)"
                 .into(),
         ))
+    }
+
+    fn complete(&mut self, usage: Option<Usage>) -> Result<Vec<StreamEvent>, LlmError> {
+        let mut output = self.flush_calls()?;
+        output.push(StreamEvent::Done {
+            stop_reason: self.stop_reason.clone(),
+            usage,
+        });
+        self.done = true;
+        Ok(output)
     }
 
     fn accumulate_tool_call(&mut self, item: &Value, fallback_index: u64) {
@@ -392,23 +404,25 @@ impl ChatStreamParser {
     }
 
     fn flush_calls(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
-        if self.calls_flushed {
+        if self.calls_flushed && self.calls.is_empty() {
             return Ok(Vec::new());
         }
-        self.calls_flushed = true;
         // Validate every call before emitting any: a malformed call fails
         // the response with `LlmError::Parse` (handled by the agent's
         // malformed-tool recovery) and no `ToolCallComplete` is emitted.
-        let pending = std::mem::take(&mut self.calls);
-        let mut validated = Vec::with_capacity(pending.len());
-        for call in pending.values() {
+        // Keep the pending map intact until validation succeeds so a failed
+        // terminal cannot turn the malformed call into an apparent success
+        // if the parser is inspected again.
+        let mut validated = Vec::with_capacity(self.calls.len());
+        for call in self.calls.values() {
             let id = call.id.trim();
             if id.is_empty() {
                 return Err(LlmError::Parse(
                     "chat tool call is missing a call ID".into(),
                 ));
             }
-            if call.name.trim().is_empty() {
+            let name = call.name.trim();
+            if name.is_empty() {
                 return Err(LlmError::Parse(format!(
                     "chat tool call {id} is missing a name"
                 )));
@@ -420,18 +434,20 @@ impl ChatStreamParser {
                 json!({})
             } else {
                 serde_json::from_str(&call.arguments).map_err(|error| {
-                    LlmError::Parse(format!("invalid tool arguments for {}: {error}", call.name))
+                    LlmError::Parse(format!("invalid tool arguments for {name}: {error}"))
                 })?
             };
             validated.push((
                 id.to_owned(),
                 ToolCall {
                     id: id.to_owned(),
-                    name: call.name.clone(),
+                    name: name.to_owned(),
                     arguments,
                 },
             ));
         }
+        self.calls_flushed = true;
+        self.calls.clear();
         let mut result = Vec::with_capacity(validated.len());
         for (id, call) in validated {
             self.seen_ids.insert(id);
@@ -588,18 +604,27 @@ mod tests {
         let done = parser.parse_event(&events[0]).unwrap();
         assert!(matches!(&done[0], StreamEvent::Done { .. }), "got {done:?}");
         assert!(parser.done);
+        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
     }
 
     #[test]
-    fn valid_done_terminator_succeeds() {
-        // The documented `[DONE]` terminator closes the turn without a
-        // `Done` event of its own; the stream simply ends successfully.
+    fn valid_text_only_done_terminator_emits_one_terminal_event() {
         let mut parser = ChatStreamParser::new();
-        parser
+        let mut events = parser
             .parse_payload(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
             .unwrap();
-        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
-        assert!(parser.done);
+        events.extend(parser.parse_payload("[DONE]").unwrap());
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::TextDelta("hi".into()),
+                StreamEvent::Done {
+                    stop_reason: None,
+                    usage: None,
+                },
+            ]
+        );
+        assert!(parser.finish().unwrap().is_empty());
     }
 
     #[test]
@@ -635,11 +660,10 @@ mod tests {
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{}"}}]}}]}"#,
             )
             .unwrap();
-        let error = parser
-            .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
-            .unwrap_err();
+        let error = parser.parse_payload("[DONE]").unwrap_err();
         assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
-        assert!(!parser.calls_flushed || parser.seen_ids.is_empty());
+        assert!(!parser.done);
+        assert!(parser.seen_ids.is_empty());
     }
 
     #[test]
@@ -650,10 +674,70 @@ mod tests {
                 r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"arguments":"{}"}}]}}]}"#,
             )
             .unwrap();
-        let error = parser
-            .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
-            .unwrap_err();
+        let error = parser.parse_payload("[DONE]").unwrap_err();
         assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+        assert!(!parser.done);
+    }
+
+    #[test]
+    fn rejects_partial_json_arguments_on_done() {
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+            )
+            .unwrap();
+        let error = parser.parse_payload("[DONE]").unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+        assert!(!parser.done);
+        assert!(parser.seen_ids.is_empty());
+    }
+
+    #[test]
+    fn valid_tool_call_followed_directly_by_done_flushes_once() {
+        let mut parser = ChatStreamParser::new();
+        parser
+            .parse_payload(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read","arguments":"{\"path\":\"x\"}"}}]}}]}"#,
+            )
+            .unwrap();
+        let events = parser.parse_payload("[DONE]").unwrap();
+        assert_eq!(
+            events,
+            vec![
+                StreamEvent::ToolCallComplete(ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: json!({"path": "x"}),
+                }),
+                StreamEvent::Done {
+                    stop_reason: None,
+                    usage: None,
+                },
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StreamEvent::Done { .. }))
+                .count(),
+            1
+        );
+        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_blank_tool_call_id_and_name_on_done() {
+        for (id, name) in [("  ", "read"), ("call-1", "   ")] {
+            let mut parser = ChatStreamParser::new();
+            let payload = format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":[{{"index":0,"id":"{id}","function":{{"name":"{name}","arguments":"{{}}"}}}}]}}}}]}}"#
+            );
+            parser.parse_payload(&payload).unwrap();
+            let error = parser.parse_payload("[DONE]").unwrap_err();
+            assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+        }
     }
 
     #[test]
