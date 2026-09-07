@@ -161,23 +161,23 @@ impl Agent {
         )
     }
 
-    /// Try to record cancellation without obscuring the original interrupt.
+    /// Record cancellation before the turn is allowed to finish.
+    ///
+    /// A missing cancellation marker leaves durable history ambiguous: the
+    /// live agent may have stopped while the session still looks like it can
+    /// continue.  Treat that append like every other history-bearing event so
+    /// the turn boundary can quarantine instead of running queued work.
     pub(crate) fn persist_cancelled(
         &mut self,
         reason: impl Into<String>,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) {
-        if self
-            .persist_event(
-                SessionEvent::TurnCancelled {
-                    reason: reason.into(),
-                },
-                events,
-            )
-            .is_err()
-        {
-            tracing::warn!("could not persist cancellation marker");
-        }
+    ) -> Result<(), TurnError> {
+        self.persist_event(
+            SessionEvent::TurnCancelled {
+                reason: reason.into(),
+            },
+            events,
+        )
     }
 }
 

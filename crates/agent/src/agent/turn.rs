@@ -21,12 +21,13 @@ impl Agent {
     /// - quarantines/stops after persistence failure
     ///   (`TurnControl::Quarantine`, mirroring the run-loop quarantine);
     /// - flushes deferred session writes exactly once at the boundary;
-    /// - emits terminal events exactly once on early-exit paths (shutdown
-    ///   before any body ran, persistence failure inside the body). A body
-    ///   that already emitted `TurnFinished` and then fails its boundary
-    ///   flush yields a second `TurnFinished` from the run-loop quarantine;
-    ///   the quarantine (loop break, queued work never runs) is what the
-    ///   boundary guarantees, not a literal single event in that corner.
+    /// - emits the one terminal event for the operation, after both the body
+    ///   and its durability boundary have finished.
+    ///
+    /// Keeping `TurnFinished` here is important: a body can complete and emit
+    /// all of its durable records before the deferred sync fails. The failure
+    /// still quarantines the agent, but it must not create a second terminal
+    /// event in the run loop.
     pub(crate) async fn execute_turn(
         &mut self,
         user_text: String,
@@ -40,19 +41,21 @@ impl Agent {
         // Deferred-sync boundary: one durable flush per operation, for both
         // normal and skill-invoked turns. A failed fsync quarantines even if
         // the turn body otherwise completed successfully.
-        if self.flush_deferred_sync(events).is_err() {
-            return TurnControl::Quarantine;
-        }
-        match outcome {
-            Ok(()) => TurnControl::Continue,
-            Err(TurnError::Shutdown) => TurnControl::Shutdown,
-            Err(TurnError::Persist(_)) => {
-                // Mirror the run-loop quarantine: the terminal event was
-                // already emitted at the failure source; stop here so no
-                // queued work runs on divergent history.
-                TurnControl::Quarantine
+        let flush_failed = self.flush_deferred_sync(events).is_err();
+        let control = if flush_failed {
+            TurnControl::Quarantine
+        } else {
+            match outcome {
+                Ok(()) => TurnControl::Continue,
+                Err(TurnError::Shutdown) => TurnControl::Shutdown,
+                Err(TurnError::Persist(_)) => TurnControl::Quarantine,
             }
-        }
+        };
+        // This is the sole owner of the normal/skill turn terminal event.
+        // Command operations such as `/compact` and `/model` have their own
+        // frontend events and intentionally do not use TurnFinished.
+        send(events, AgentEvent::TurnFinished);
+        control
     }
 
     /// Turn body: everything `run_turn` historically did, minus token
@@ -120,15 +123,13 @@ impl Agent {
             let compacted = match compacted {
                 Ok(compacted) => compacted,
                 Err(TurnError::Shutdown) => {
-                    self.persist_cancelled("application shutdown", events);
-                    send(events, AgentEvent::TurnFinished);
+                    self.persist_cancelled("application shutdown", events)?;
                     return Err(TurnError::Shutdown);
                 }
                 Err(error) => return Err(error),
             };
             if interrupted || cancel.is_cancelled() {
-                self.persist_cancelled("turn interrupted during compaction", events);
-                send(events, AgentEvent::TurnFinished);
+                self.persist_cancelled("turn interrupted during compaction", events)?;
                 if application.is_cancelled() {
                     return Err(TurnError::Shutdown);
                 }
@@ -185,8 +186,7 @@ impl Agent {
                     // failed request can enter its retry path after Esc.
                     biased;
                     _ = self.cancel.cancelled() => {
-                        self.persist_cancelled("application shutdown", events);
-                        send(events, AgentEvent::TurnFinished);
+                        self.persist_cancelled("application shutdown", events)?;
                         return Err(TurnError::Shutdown);
                     }
                     _ = cancel.cancelled() => break None,
@@ -202,8 +202,7 @@ impl Agent {
                 }
             };
             let Some(stream_result) = stream_result else {
-                self.persist_cancelled("turn interrupted before response", events);
-                send(events, AgentEvent::TurnFinished);
+                self.persist_cancelled("turn interrupted before response", events)?;
                 return Ok(());
             };
             let mut stream = match stream_result {
@@ -227,7 +226,6 @@ impl Agent {
                         events,
                     )?;
                     send(events, AgentEvent::Error(message));
-                    send(events, AgentEvent::TurnFinished);
                     return Ok(());
                 }
             };
@@ -336,8 +334,7 @@ impl Agent {
                         true,
                     ));
                 }
-                self.persist_cancelled("turn interrupted", events);
-                send(events, AgentEvent::TurnFinished);
+                self.persist_cancelled("turn interrupted", events)?;
                 if self.cancel.is_cancelled() {
                     return Err(TurnError::Shutdown);
                 }
@@ -420,7 +417,6 @@ impl Agent {
                 if retried {
                     continue;
                 }
-                send(events, AgentEvent::TurnFinished);
                 return Ok(());
             }
 
@@ -438,15 +434,14 @@ impl Agent {
                     );
                     continue;
                 }
-                send(events, AgentEvent::TurnFinished);
                 return Ok(());
             }
 
             self.dispatch_tool_batches(tool_calls, events, input, cancel)
                 .await?;
-            // The dispatcher emits the terminal event and marks the
-            // turn-scoped token when tool execution is interrupted. Do not
-            // issue another provider request (or a second TurnFinished).
+            // The dispatcher marks the turn-scoped token when tool
+            // execution is interrupted. Do not issue another provider
+            // request; the shared turn boundary owns TurnFinished.
             if cancel.is_cancelled() {
                 return Ok(());
             }
@@ -464,13 +459,12 @@ impl Agent {
 /// how the run loop must proceed, and the loop acts on it in one place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TurnControl {
-    /// Operation completed (or reported its own terminal event); keep
-    /// draining queued input.
+    /// Operation completed; keep draining queued input.
     Continue,
     /// Application shutdown fired: stop the run loop immediately.
     Shutdown,
-    /// Persistence failed mid-operation: stop like the run-loop
-    /// quarantine so no queued work runs on divergent history.
+    /// Persistence failed mid-operation: stop like the run-loop quarantine
+    /// so no queued work runs on divergent history.
     Quarantine,
 }
 

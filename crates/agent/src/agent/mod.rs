@@ -287,16 +287,13 @@ impl Agent {
                     // skill-invoked turns alike.
                     match self.execute_turn(text, &events, &mut input).await {
                         TurnControl::Shutdown => break,
-                        // Persistence errors are emitted at their source; the
-                        // executor already flushed and owns the single
-                        // terminal event. Live state may include an executed
-                        // side effect whose durable result could not be
-                        // appended: quarantine rather than sending divergent
-                        // history on a later queued turn.
-                        TurnControl::Quarantine => {
-                            send(&events, AgentEvent::TurnFinished);
-                            break;
-                        }
+                        // Persistence errors are emitted at their source and
+                        // the executor owns the single terminal event. Live
+                        // state may include an executed side effect whose
+                        // durable result could not be appended: quarantine
+                        // rather than sending divergent history on a later
+                        // queued turn.
+                        TurnControl::Quarantine => break,
                         TurnControl::Continue => {}
                     }
                 }
@@ -365,10 +362,7 @@ impl Agent {
                     // operation boundary.
                     match self.handle_invoke_skill(name, &events, &mut input).await {
                         TurnControl::Shutdown => break,
-                        TurnControl::Quarantine => {
-                            send(&events, AgentEvent::TurnFinished);
-                            break;
-                        }
+                        TurnControl::Quarantine => break,
                         TurnControl::Continue => {}
                     }
                     continue;
@@ -1472,6 +1466,196 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn interrupt_with_failed_cancellation_append_quarantines_queued_work() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let stream_polled = Arc::new(Notify::new());
+        let release_error = Arc::new(Notify::new());
+        let provider = Arc::new(InterruptRaceProvider {
+            calls: AtomicUsize::new(0),
+            stream_polled: stream_polled.clone(),
+            release_error,
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("interrupt me".into()))
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("queued must never run".into()))
+            .unwrap();
+        let agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel)
+            .with_session(store, session);
+        let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
+            .await
+            .expect("provider stream was not polled");
+        // The user message has already been appended. Removing the file now
+        // makes the cancellation marker append fail rather than masking the
+        // original turn setup failure.
+        std::fs::remove_file(session_path).unwrap();
+        input_tx.send(InputMessage::Interrupt).unwrap();
+        drop(input_tx);
+        agent_task.await.unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("queued must never run")
+        )));
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_failed_cancellation_append_quarantines_queued_work() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let stream_polled = Arc::new(Notify::new());
+        let release_error = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let provider = Arc::new(InterruptRaceProvider {
+            calls: AtomicUsize::new(0),
+            stream_polled: stream_polled.clone(),
+            release_error,
+        });
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("shut down".into()))
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("queued must never run".into()))
+            .unwrap();
+        let agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel.clone())
+            .with_session(store, session);
+        let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
+            .await
+            .expect("provider stream was not polled");
+        std::fs::remove_file(session_path).unwrap();
+        cancel.cancel();
+        drop(input_tx);
+        agent_task.await.unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("queued must never run")
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_skill_with_failed_cancellation_append_has_one_terminal_event() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let skill_root = tempdir().unwrap();
+        let skill_dir = skill_root.path().join("cancel-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: cancel-skill\ndescription: Cancel\n---\nDo it.\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+        let registry =
+            tools::default_registry(tools::ToolConfig::new(workspace.path(), false)).unwrap();
+        unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+
+        let stream_polled = Arc::new(Notify::new());
+        let provider = Arc::new(InterruptRaceProvider {
+            calls: AtomicUsize::new(0),
+            stream_polled: stream_polled.clone(),
+            release_error: Arc::new(Notify::new()),
+        });
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::InvokeSkill {
+                name: "cancel-skill".into(),
+            })
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("queued must never run".into()))
+            .unwrap();
+        let agent = Agent::new(provider, registry, "demo", CancellationToken::new())
+            .with_session(store, session);
+        let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
+            .await
+            .expect("skill provider stream was not polled");
+        std::fs::remove_file(session_path).unwrap();
+        input_tx.send(InputMessage::Interrupt).unwrap();
+        drop(input_tx);
+        agent_task.await.unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("queued must never run")
+        )));
+    }
+
     #[test]
     fn deferred_sync_flush_failure_quarantines_skill_manual_compact_and_model_change() {
         // Every operation sharing the turn boundary (skill turns,
@@ -1483,6 +1667,68 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
+            // --- Normal turn: body succeeds, flush fails → quarantine. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = store.create(SessionCreateOptions::default()).unwrap();
+                let provider = Arc::new(MockProvider {
+                    calls: AtomicUsize::new(0),
+                    scripts: vec![script(vec![
+                        StreamEvent::TextDelta("normal answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ])],
+                    error_kind: MockErrorKind::Stream,
+                });
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::Message("normal".into()))
+                    .unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(
+                    provider,
+                    ToolRegistry::empty(),
+                    "demo",
+                    CancellationToken::new(),
+                )
+                .with_session(store, session)
+                .run(input_rx, event_tx)
+                .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text == "normal answer"
+                )));
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::Error(message) if message.contains("during sync")
+                )));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    1,
+                    "events: {events:?}"
+                );
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                )));
+            }
+
             // --- Skill turn: body succeeds, flush fails → quarantine. ---
             {
                 let root = tempdir().unwrap();
@@ -1551,17 +1797,14 @@ mod tests {
                     )),
                     "expected a sync-failure error: {events:?}"
                 );
-                // The body already emitted its own `TurnFinished` before
-                // the boundary flush failed; the run loop quarantines with
-                // a second one. What matters: exactly one sync-failure
-                // error, quarantine (loop breaks), and the queued message
-                // never runs — never a successful second turn.
+                // The shared executor owns the terminal event, so a failed
+                // deferred sync cannot add a second one while quarantining.
                 assert_eq!(
                     events
                         .iter()
                         .filter(|event| matches!(event, AgentEvent::TurnFinished))
                         .count(),
-                    2,
+                    1,
                     "events: {events:?}"
                 );
                 assert!(
@@ -1615,6 +1858,14 @@ mod tests {
                         AgentEvent::Error(message) if message.contains("during sync")
                     )),
                     "expected a sync-failure error: {events:?}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    0,
+                    "command operations must not masquerade as prompt turns: {events:?}"
                 );
                 assert!(
                     !events.iter().any(|event| matches!(
@@ -1680,6 +1931,14 @@ mod tests {
                 // the boundary flush failed: selection moved, then the
                 // failed flush quarantined (queued work never runs) with a
                 // loud sync-failure error.
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    0,
+                    "command operations must not masquerade as prompt turns: {events:?}"
+                );
                 assert!(
                     events.iter().any(|event| matches!(
                         event,

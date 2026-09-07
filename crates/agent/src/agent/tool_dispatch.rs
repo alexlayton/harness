@@ -511,8 +511,7 @@ impl Agent {
                         DispatchCancellation::Shutdown => "application shutdown",
                     },
                     events,
-                );
-                send(events, AgentEvent::TurnFinished);
+                )?;
                 if reason == DispatchCancellation::Shutdown {
                     return Err(TurnError::Shutdown);
                 }

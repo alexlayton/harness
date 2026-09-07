@@ -217,9 +217,9 @@ impl Agent {
             .map(|_| ())
     }
 
-    /// Boundary wrapper for manual compaction: same deferred-sync flush and
-    /// quarantine policy as turns, with exactly one terminal event owned by
-    /// the run loop.
+    /// Boundary wrapper for manual compaction: the same deferred-sync flush
+    /// and quarantine policy as turns. `CompactionFinished` remains the
+    /// operation event; prompt `TurnFinished` is owned only by `execute_turn`.
     pub(crate) async fn handle_compact_session_boundary(
         &mut self,
         events: &mpsc::UnboundedSender<AgentEvent>,
@@ -272,7 +272,8 @@ impl Agent {
 
     /// Boundary wrapper for model changes: persist-first atomic commit
     /// (see `handle_set_model`), deferred-sync flush, and quarantine on
-    /// persistence failure — the same boundary policy as turns.
+    /// persistence failure — the same boundary policy as turns. Model command
+    /// events remain separate from prompt `TurnFinished`.
     pub(crate) async fn handle_set_model_boundary(
         &mut self,
         provider: Option<String>,
