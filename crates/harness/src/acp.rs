@@ -47,6 +47,7 @@ use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
 use std::collections::{HashMap, hash_map::Entry};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -60,6 +61,9 @@ const MODE_ID: &str = "work";
 
 /// Everything needed to drive one live session.
 struct SessionHandle {
+    /// Unique owner token used to avoid tearing down a replacement session
+    /// when an old request loses its response race.
+    owner: uuid::Uuid,
     /// Commands for the agent's run loop.
     input_tx: mpsc::UnboundedSender<InputMessage>,
     /// Cancellation owned by this ACP session, rather than shared across all
@@ -151,7 +155,20 @@ impl PromptTracker {
     }
 }
 
-/// Shared adapter state for the lifetime of one stdio connection.
+/// One in-progress session/new or session/load request owned by the
+/// connection lifecycle.
+struct PendingAssembly {
+    /// Cancellation shared with the stack and agent builder. Cancelling this
+    /// token is cooperative; the join handle is still awaited by the owner.
+    cancel: CancellationToken,
+    /// The request task owns its responder and every temporary assembly value.
+    task: JoinHandle<()>,
+}
+
+/// Shared adapter state for the lifetime of one stdio connection. Everything
+/// that is still being assembled stays in this map until the connection
+/// closes, even after completion, so there is no gap between task completion
+/// and lifecycle ownership during disconnect.
 struct AcpState {
     /// Directory holding the session store's workspace groups. Resolved once
     /// at startup (from `HARNESS_SESSION_DIR`/`HARNESS_STATE_DIR` env or the
@@ -165,9 +182,44 @@ struct AcpState {
     no_context_files: bool,
     sessions: Mutex<HashMap<String, SessionHandle>>,
     prompts: Arc<PromptTracker>,
+    pending_assemblies: Mutex<HashMap<uuid::Uuid, PendingAssembly>>,
+    transport_closed: AtomicBool,
 }
 
 impl AcpState {
+    /// Claim an assembly task for this connection. The closed check is made
+    /// both before and after taking the map lock so disconnect cannot race a
+    /// task into an unowned gap.
+    fn track_assembly(
+        &self,
+        id: uuid::Uuid,
+        pending: PendingAssembly,
+    ) -> std::result::Result<(), PendingAssembly> {
+        if self.transport_closed.load(Ordering::Acquire) {
+            return Err(pending);
+        }
+        let mut assemblies = self.pending_assemblies.lock().unwrap();
+        if self.transport_closed.load(Ordering::Acquire) {
+            Err(pending)
+        } else {
+            assemblies.insert(id, pending);
+            Ok(())
+        }
+    }
+
+    /// Close the lifecycle exactly once and take every owner without awaiting
+    /// while holding a synchronous mutex.
+    fn close(&self) -> (Vec<PendingAssembly>, Vec<SessionHandle>) {
+        self.transport_closed.store(true, Ordering::Release);
+        let pending = std::mem::take(&mut *self.pending_assemblies.lock().unwrap())
+            .into_values()
+            .collect();
+        let sessions = std::mem::take(&mut *self.sessions.lock().unwrap())
+            .into_values()
+            .collect();
+        (pending, sessions)
+    }
+
     fn cancel_session(&self, session_id: &str) {
         // Keep the same sessions → prompts lock order as prompt submission and
         // deletion, preventing a cancel/delete race from deadlocking.
@@ -240,6 +292,8 @@ where
         prompts: Arc::new(PromptTracker {
             in_flight: Mutex::new(HashMap::new()),
         }),
+        pending_assemblies: Mutex::new(HashMap::new()),
+        transport_closed: AtomicBool::new(false),
     });
 
     // Handlers run inside the SDK dispatch loop and block message processing,
@@ -347,12 +401,10 @@ where
     // detach agents and leave providers/MCP servers able to append after the
     // ACP transport is gone. Cancel and await every owned session before the
     // frontend returns.
-    let handles = {
-        let mut sessions = state.sessions.lock().unwrap();
-        std::mem::take(&mut *sessions)
-            .into_values()
-            .collect::<Vec<_>>()
-    };
+    let (assemblies, handles) = state.close();
+    for assembly in assemblies {
+        shutdown_assembly(assembly).await;
+    }
     for handle in handles {
         shutdown_session(handle).await;
     }
@@ -563,11 +615,72 @@ async fn new_session(
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
-    tokio::spawn(async move {
-        if let Err(error) = new_session_inner(request, responder, connection, state).await {
+    let cancel = CancellationToken::new();
+    let request_cancellation = responder.cancellation();
+    let assembly_id = uuid::Uuid::new_v4();
+    let task_state = state.clone();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        let inner = new_session_inner(
+            request,
+            responder,
+            connection,
+            task_state.clone(),
+            task_cancel.clone(),
+        );
+        tokio::pin!(inner);
+        let result = tokio::select! {
+            result = &mut inner => result,
+            _ = request_cancellation.cancelled() => {
+                task_cancel.cancel();
+                inner.await
+            }
+        };
+        if let Err(error) = result {
             tracing::error!(error = %error, "ACP new-session task failed");
         }
     });
+    let pending = PendingAssembly { cancel, task };
+    if let Err(pending) = state.track_assembly(assembly_id, pending) {
+        pending.cancel.cancel();
+        pending.task.abort();
+        let _ = pending.task.await;
+    }
+    Ok(())
+}
+
+struct CreatedSessionFile {
+    path: std::path::PathBuf,
+    armed: bool,
+}
+
+impl CreatedSessionFile {
+    fn new(session: &session::Session) -> Option<Self> {
+        session
+            .path()
+            .cloned()
+            .map(|path| Self { path, armed: true })
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreatedSessionFile {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(self.path.with_extension("jsonl.lock"));
+    }
+}
+
+fn assembly_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        anyhow::bail!("ACP session assembly cancelled");
+    }
     Ok(())
 }
 
@@ -576,15 +689,26 @@ async fn new_session_inner(
     responder: Responder<NewSessionResponse>,
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
+    cancel: CancellationToken,
 ) -> AcResult<()> {
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
     let mcp_servers = match acp_mcp_servers(&request.mcp_servers) {
         Ok(servers) => servers,
         Err(error) => return respond_invalid_params(responder, error),
     };
-    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root).await {
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
+    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root, &cancel).await
+    {
         Ok(stack) => stack,
         Err(error) => return respond_anyhow(responder, error),
     };
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
     let session = match store.create(SessionCreateOptions {
         provider: Some(state.provider.name().to_owned()),
         model: Some(state.config.model.clone()),
@@ -593,22 +717,42 @@ async fn new_session_inner(
         Ok(session) => session,
         Err(error) => return respond_anyhow(responder, error.into()),
     };
+    let mut created_file = CreatedSessionFile::new(&session);
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
     let id = session.id().to_string();
     match spawn_agent(
         &state,
-        store,
-        tools,
-        session,
+        SessionStack {
+            store,
+            tools,
+            session,
+        },
         connection,
         id.clone(),
         mcp_servers,
+        cancel.clone(),
     )
     .await
     {
-        Ok(()) => {
+        Ok(owner) => {
+            if cancel.is_cancelled() {
+                shutdown_registered_session(&state, &id, owner).await;
+                return respond_anyhow(
+                    responder,
+                    anyhow::anyhow!("ACP session assembly cancelled"),
+                );
+            }
             tracing::info!(session = %id, cwd = %request.cwd.display(), "ACP session created");
-            let _ = responder
-                .respond(NewSessionResponse::new(SessionId::from(id)).modes(static_mode_state()));
+            if let Err(error) = responder.respond(
+                NewSessionResponse::new(SessionId::from(id.clone())).modes(static_mode_state()),
+            ) {
+                tracing::debug!(session = %id, error = %error, "ACP new-session response was not delivered");
+                shutdown_registered_session(&state, &id, owner).await;
+            } else if let Some(file) = created_file.as_mut() {
+                file.disarm();
+            }
             Ok(())
         }
         Err(error) => respond_anyhow(responder, error),
@@ -621,11 +765,37 @@ async fn load_session(
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
-    tokio::spawn(async move {
-        if let Err(error) = load_session_inner(request, responder, connection, state).await {
+    let cancel = CancellationToken::new();
+    let request_cancellation = responder.cancellation();
+    let assembly_id = uuid::Uuid::new_v4();
+    let task_state = state.clone();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        let inner = load_session_inner(
+            request,
+            responder,
+            connection,
+            task_state,
+            task_cancel.clone(),
+        );
+        tokio::pin!(inner);
+        let result = tokio::select! {
+            result = &mut inner => result,
+            _ = request_cancellation.cancelled() => {
+                task_cancel.cancel();
+                inner.await
+            }
+        };
+        if let Err(error) = result {
             tracing::error!(error = %error, "ACP load-session task failed");
         }
     });
+    let pending = PendingAssembly { cancel, task };
+    if let Err(pending) = state.track_assembly(assembly_id, pending) {
+        pending.cancel.cancel();
+        pending.task.abort();
+        let _ = pending.task.await;
+    }
     Ok(())
 }
 
@@ -634,7 +804,11 @@ async fn load_session_inner(
     responder: Responder<LoadSessionResponse>,
     connection: ConnectionTo<agent_client_protocol::Client>,
     state: Arc<AcpState>,
+    cancel: CancellationToken,
 ) -> AcResult<()> {
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
     let raw_id = request.session_id.0.to_string();
     if raw_id.trim() != raw_id {
         return respond_invalid_params(
@@ -653,14 +827,24 @@ async fn load_session_inner(
             anyhow::anyhow!("session `{id}` is already loaded"),
         );
     }
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
     let mcp_servers = match acp_mcp_servers(&request.mcp_servers) {
         Ok(servers) => servers,
         Err(error) => return respond_invalid_params(responder, error),
     };
-    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root).await {
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
+    let (store, tools) = match build_session_stack(&request.cwd, &state.session_root, &cancel).await
+    {
         Ok(stack) => stack,
         Err(error) => return respond_anyhow(responder, error),
     };
+    if let Err(error) = assembly_cancelled(&cancel) {
+        return respond_anyhow(responder, error);
+    }
     let session = match store.open(&parsed_id) {
         Ok(session) => session,
         Err(error) => {
@@ -672,21 +856,36 @@ async fn load_session_inner(
     };
     match spawn_agent(
         &state,
-        store,
-        tools,
-        session,
+        SessionStack {
+            store,
+            tools,
+            session,
+        },
         connection,
         id.clone(),
         mcp_servers,
+        cancel.clone(),
     )
     .await
     {
-        Ok(()) => {
+        Ok(owner) => {
+            if cancel.is_cancelled() {
+                shutdown_registered_session(&state, &id, owner).await;
+                return respond_anyhow(
+                    responder,
+                    anyhow::anyhow!("ACP session assembly cancelled"),
+                );
+            }
             tracing::info!(session = %id, cwd = %request.cwd.display(), "ACP session loaded");
             // Documented limitation: no transcript replay notifications. The
             // editor renders an empty transcript until the next turn; the
             // full history is intact on disk and in the agent's context.
-            let _ = responder.respond(LoadSessionResponse::default().modes(static_mode_state()));
+            if let Err(error) =
+                responder.respond(LoadSessionResponse::default().modes(static_mode_state()))
+            {
+                tracing::debug!(session = %id, error = %error, "ACP load-session response was not delivered");
+                shutdown_registered_session(&state, &id, owner).await;
+            }
             Ok(())
         }
         Err(error) => respond_anyhow(responder, error),
@@ -716,6 +915,20 @@ fn list_sessions(request: &ListSessionsRequest, state: &AcpState) -> ListSession
 }
 
 const SESSION_TASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Stop an in-progress request while retaining ownership until its task has
+/// actually terminated. Aborting is only the final fallback: cooperative
+/// cancellation lets MCP and blocking setup run their normal cleanup first.
+async fn shutdown_assembly(mut assembly: PendingAssembly) {
+    assembly.cancel.cancel();
+    let stopped = tokio::time::timeout(SESSION_TASK_TIMEOUT, &mut assembly.task)
+        .await
+        .is_ok();
+    if !stopped {
+        assembly.task.abort();
+        let _ = assembly.task.await;
+    }
+}
 
 async fn delete_session(
     request: DeleteSessionRequest,
@@ -756,6 +969,7 @@ async fn shutdown_session(handle: SessionHandle) {
         cancel,
         mut agent_task,
         mut forwarder_task,
+        ..
     } = handle;
     cancel.cancel();
     drop(input_tx);
@@ -895,22 +1109,38 @@ async fn prompt(
 async fn build_session_stack(
     cwd: &std::path::Path,
     session_root: &std::path::Path,
+    cancel: &CancellationToken,
 ) -> Result<(SessionStore, ToolRegistry)> {
+    assembly_cancelled(cancel)?;
     let cwd = cwd.to_path_buf();
     let session_root = session_root.to_path_buf();
-    let joined = tokio::time::timeout(
-        SESSION_TASK_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            let workspace_root = std::fs::canonicalize(&cwd)
-                .with_context(|| format!("resolve session cwd `{}`", cwd.display()))?;
-            let store = SessionStore::new(&session_root, &workspace_root)?;
-            let tools = default_registry(ToolConfig::new(&workspace_root, false))?;
-            Ok::<_, anyhow::Error>((store, tools))
-        }),
-    )
-    .await
-    .context("build ACP session stack timed out")?;
-    joined.context("build ACP session stack task failed")?
+    let blocking_cancel = cancel.clone();
+    let mut task = tokio::task::spawn_blocking(move || {
+        assembly_cancelled(&blocking_cancel)?;
+        let workspace_root = std::fs::canonicalize(&cwd)
+            .with_context(|| format!("resolve session cwd `{}`", cwd.display()))?;
+        assembly_cancelled(&blocking_cancel)?;
+        let store = SessionStore::new(&session_root, &workspace_root)?;
+        assembly_cancelled(&blocking_cancel)?;
+        let tools = default_registry(ToolConfig::new(&workspace_root, false))?;
+        assembly_cancelled(&blocking_cancel)?;
+        Ok::<_, anyhow::Error>((store, tools))
+    });
+    let joined = tokio::select! {
+        result = &mut task => result.context("build ACP session stack task failed")?,
+        _ = cancel.cancelled() => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("ACP session stack build cancelled");
+        }
+        _ = tokio::time::sleep(SESSION_TASK_TIMEOUT) => {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("build ACP session stack timed out");
+        }
+    }?;
+    assembly_cancelled(cancel)?;
+    Ok(joined)
 }
 
 /// Convert ACP's session-local stdio declarations without retaining ACP wire
@@ -962,12 +1192,26 @@ fn try_register_session(
     handle: SessionHandle,
 ) -> std::result::Result<(), SessionHandle> {
     let mut sessions = state.sessions.lock().unwrap();
+    if state.transport_closed.load(Ordering::Acquire) {
+        return Err(handle);
+    }
     match sessions.entry(acp_session_id) {
         Entry::Vacant(entry) => {
             entry.insert(handle);
             Ok(())
         }
         Entry::Occupied(_) => Err(handle),
+    }
+}
+
+async fn shutdown_registered_session(state: &AcpState, id: &str, owner: uuid::Uuid) {
+    let handle = {
+        let mut sessions = state.sessions.lock().unwrap();
+        let owned = sessions.get(id).is_some_and(|handle| handle.owner == owner);
+        owned.then(|| sessions.remove(id)).flatten()
+    };
+    if let Some(handle) = handle {
+        shutdown_session(handle).await;
     }
 }
 
@@ -981,6 +1225,7 @@ async fn discard_session(handle: SessionHandle) {
         cancel,
         agent_task,
         forwarder_task,
+        ..
     } = handle;
     cancel.cancel();
     drop(input_tx);
@@ -990,6 +1235,15 @@ async fn discard_session(handle: SessionHandle) {
     let _ = agent_task.await;
 }
 
+/// The durable/session-specific values passed from assembly into the agent
+/// builder. Keeping them together also makes it harder to accidentally build
+/// an agent with a store and session from different workspaces.
+struct SessionStack {
+    store: SessionStore,
+    tools: ToolRegistry,
+    session: session::Session,
+}
+
 /// Spawn the agent task plus its event forwarder and register the session's
 /// input channel under `acp_session_id`. The forwarder owns everything
 /// event-shaped: notification translation and prompt-turn resolution. The
@@ -997,18 +1251,22 @@ async fn discard_session(handle: SessionHandle) {
 /// operations can stop both owners before touching session files.
 async fn spawn_agent(
     state: &AcpState,
-    store: SessionStore,
-    tools: ToolRegistry,
-    session: session::Session,
+    stack: SessionStack,
     connection: ConnectionTo<agent_client_protocol::Client>,
     acp_session_id: String,
     mcp_servers: Vec<mcp::McpServerConfig>,
-) -> Result<()> {
+    cancel: CancellationToken,
+) -> Result<uuid::Uuid> {
+    let SessionStack {
+        store,
+        tools,
+        session,
+    } = stack;
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let cancel = CancellationToken::new();
-
+    assembly_cancelled(&cancel)?;
     let project_context = project_context_for(tools.workspace_root(), state.no_context_files);
+    assembly_cancelled(&cancel)?;
 
     let builder = AgentBuilder::new(
         state.provider.clone(),
@@ -1029,6 +1287,10 @@ async fn spawn_agent(
     let agent = tokio::time::timeout(SESSION_TASK_TIMEOUT, builder.build())
         .await
         .context("build ACP agent timed out")??;
+    if cancel.is_cancelled() {
+        agent.shutdown().await;
+        anyhow::bail!("ACP agent assembly cancelled");
+    }
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     let forwarder_task = tokio::spawn(forward_events(
@@ -1038,14 +1300,16 @@ async fn spawn_agent(
         acp_session_id.clone(),
     ));
 
+    let owner = uuid::Uuid::new_v4();
     let handle = SessionHandle {
+        owner,
         input_tx,
         cancel,
         agent_task,
         forwarder_task,
     };
     match try_register_session(state, acp_session_id.clone(), handle) {
-        Ok(()) => Ok(()),
+        Ok(()) => Ok(owner),
         Err(handle) => {
             // A duplicate load can race another request during assembly. Keep
             // the original live session and stop the newly assembled pair.
@@ -1131,6 +1395,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     // ------------------------------------------------------------------
     // Pure translation
@@ -1441,6 +1706,7 @@ mod tests {
         });
 
         SessionHandle {
+            owner: uuid::Uuid::new_v4(),
             input_tx,
             cancel,
             agent_task,
@@ -1459,6 +1725,8 @@ mod tests {
             prompts: Arc::new(PromptTracker {
                 in_flight: Mutex::new(HashMap::new()),
             }),
+            pending_assemblies: Mutex::new(HashMap::new()),
+            transport_closed: AtomicBool::new(false),
         })
     }
 
@@ -1479,6 +1747,111 @@ mod tests {
                 anyhow::bail!("session `{session_id}` is already loaded");
             }
         }
+    }
+
+    /// Disconnecting while assembly is waiting must await the owned task and
+    /// reject its eventual registration point.
+    #[tokio::test]
+    async fn disconnect_during_assembly_cancels_task_before_late_registration() {
+        let state = test_acp_state();
+        let started = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task_state = state.clone();
+        let session_id = "late-session".to_owned();
+        let flags = test_assembly_flags();
+        let task_flags = flags.clone();
+        let task_started = started.clone();
+        let task = tokio::spawn(async move {
+            task_started.notify_one();
+            task_cancel.cancelled().await;
+            // This is the registration point that a detached assembly could
+            // reach after disconnect. It must be rejected and fully cleaned.
+            let handle = test_session_handle(&task_flags);
+            if let Err(handle) = try_register_session(&task_state, session_id, handle) {
+                discard_session(handle).await;
+            }
+        });
+        let assembly = PendingAssembly { cancel, task };
+        let assembly_id = uuid::Uuid::new_v4();
+        assert!(state.track_assembly(assembly_id, assembly).is_ok());
+        started.notified().await;
+
+        let (assemblies, sessions) = state.close();
+        assert!(sessions.is_empty());
+        for assembly in assemblies {
+            shutdown_assembly(assembly).await;
+        }
+        assert!(state.sessions.lock().unwrap().is_empty());
+        assert_eq!(flags.agent_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(flags.forwarder_dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disconnect_during_mcp_initialization_awaits_and_cleans_assembly() {
+        let state = test_acp_state();
+        let workspace = tempdir().unwrap();
+        let pid_path = workspace.path().join("mcp.pid");
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let workspace_root = workspace.path().to_path_buf();
+        let server_script = format!("echo $$ > {}; exec sleep 60", pid_path.display());
+        let task = tokio::spawn(async move {
+            let server = mcp::McpServerConfig {
+                name: "initializing".into(),
+                transport: mcp::McpTransportConfig::Stdio {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), server_script],
+                    env: Default::default(),
+                },
+            };
+            let result = mcp::McpRuntime::connect(&[server], &workspace_root, task_cancel).await;
+            assert!(result.is_err(), "disconnect must cancel MCP initialization");
+        });
+        assert!(
+            state
+                .track_assembly(uuid::Uuid::new_v4(), PendingAssembly { cancel, task })
+                .is_ok()
+        );
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = pid.trim().parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("MCP child should start before disconnect");
+
+        let (assemblies, sessions) = state.close();
+        assert!(sessions.is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for assembly in assemblies {
+                shutdown_assembly(assembly).await;
+            }
+        })
+        .await
+        .expect("MCP initialization must be cancellable");
+        for _ in 0..100 {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "MCP child {pid} survived assembly cancellation");
+        assert!(state.sessions.lock().unwrap().is_empty());
     }
 
     /// Two completed assemblies racing to register one id must leave exactly

@@ -23,6 +23,19 @@ pub struct McpRuntime {
     servers: Vec<ConnectedServer>,
 }
 
+impl Drop for McpRuntime {
+    fn drop(&mut self) {
+        // Async shutdown is preferred, but assembly cancellation can drop a
+        // partially built runtime. Abort diagnostic readers here and rely on
+        // TokioChildProcess's kill-on-drop contract for the child itself.
+        for server in &mut self.servers {
+            if let Some(task) = server.stderr_task.take() {
+                task.abort();
+            }
+        }
+    }
+}
+
 struct ConnectedServer {
     name: String,
     client: RunningService<RoleClient, HarnessClient>,
@@ -66,26 +79,37 @@ impl McpRuntime {
             servers: Vec::with_capacity(tasks.len()),
         };
         let mut failure = None;
-        while let Some(result) = tasks.join_next().await {
-            match result {
-                Ok(Ok((_, server))) => connected.servers.push(server),
-                Ok(Err(error)) => {
-                    failure = Some(error);
-                    startup_cancel.cancel();
+        loop {
+            tokio::select! {
+                _ = startup_cancel.cancelled() => {
+                    failure = Some(McpError::operation("<mcp>", "initialize", "cancelled"));
                     tasks.abort_all();
                     while tasks.join_next().await.is_some() {}
                     break;
                 }
-                Err(error) => {
-                    failure = Some(McpError::operation(
-                        "<mcp>",
-                        "initialize",
-                        format!("connection task failed: {error}"),
-                    ));
-                    startup_cancel.cancel();
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
-                    break;
+                result = tasks.join_next() => {
+                    let Some(result) = result else { break };
+                    match result {
+                        Ok(Ok((_, server))) => connected.servers.push(server),
+                        Ok(Err(error)) => {
+                            failure = Some(error);
+                            startup_cancel.cancel();
+                            tasks.abort_all();
+                            while tasks.join_next().await.is_some() {}
+                            break;
+                        }
+                        Err(error) => {
+                            failure = Some(McpError::operation(
+                                "<mcp>",
+                                "initialize",
+                                format!("connection task failed: {error}"),
+                            ));
+                            startup_cancel.cancel();
+                            tasks.abort_all();
+                            while tasks.join_next().await.is_some() {}
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -163,9 +187,15 @@ async fn connect_server(
         .spawn()
         .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
     let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
-    let handler = HarnessClient::new(workspace_root)?;
+    let handler = match HarnessClient::new(workspace_root) {
+        Ok(handler) => handler,
+        Err(error) => {
+            abort_stderr_task(stderr_task).await;
+            return Err(error);
+        }
+    };
     let server_cancel = cancel.child_token();
-    let mut client = match tokio::time::timeout(
+    let initialize = tokio::time::timeout(
         MCP_INITIALIZE_TIMEOUT,
         serve_client_with_lifecycle_and_ct(
             handler,
@@ -173,29 +203,38 @@ async fn connect_server(
             ClientLifecycleMode::Initialize,
             server_cancel.clone(),
         ),
-    )
-    .await
-    {
-        Ok(Ok(client)) => client,
-        Ok(Err(error)) => {
-            abort_stderr_task(stderr_task).await;
-            return Err(McpError::operation(&server.name, "initialize", error));
-        }
-        Err(_) => {
+    );
+    tokio::pin!(initialize);
+    let mut client = tokio::select! {
+        _ = server_cancel.cancelled() => {
             server_cancel.cancel();
             abort_stderr_task(stderr_task).await;
-            return Err(McpError::operation(
-                &server.name,
-                "initialize",
-                "request timed out",
-            ));
+            return Err(McpError::operation(&server.name, "initialize", "cancelled"));
+        }
+        result = &mut initialize => match result {
+            Ok(Ok(client)) => client,
+            Ok(Err(error)) => {
+                abort_stderr_task(stderr_task).await;
+                return Err(McpError::operation(&server.name, "initialize", error));
+            }
+            Err(_) => {
+                server_cancel.cancel();
+                abort_stderr_task(stderr_task).await;
+                return Err(McpError::operation(
+                    &server.name,
+                    "initialize",
+                    "request timed out",
+                ));
+            }
         }
     };
-    let tools = match list_tools_bounded(&client, &server.name).await {
+    let tools = match list_tools_bounded(&client, &server.name, &server_cancel).await {
         Ok(tools) => tools,
         Err(error) => {
             server_cancel.cancel();
-            let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
+            if !cancel.is_cancelled() {
+                let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
+            }
             abort_stderr_task(stderr_task).await;
             return Err(error);
         }
@@ -228,6 +267,7 @@ fn spawn_stderr_reader(name: String, mut stderr: tokio::process::ChildStderr) ->
 async fn list_tools_bounded(
     client: &RunningService<RoleClient, HarnessClient>,
     server: &str,
+    cancel: &CancellationToken,
 ) -> Result<Vec<RemoteTool>, McpError> {
     let deadline = tokio::time::Instant::now()
         .checked_add(MCP_LIST_TIMEOUT)
@@ -236,15 +276,19 @@ async fn list_tools_bounded(
     let mut total_bytes = 0usize;
     let mut cursor = None;
     loop {
-        let page = tokio::time::timeout_at(
-            deadline,
-            client
-                .peer()
-                .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor))),
-        )
-        .await
-        .map_err(|_| McpError::operation(server, "tools/list", "request timed out"))?
-        .map_err(|error| McpError::operation(server, "tools/list", error))?;
+        let page = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(McpError::operation(server, "tools/list", "cancelled"));
+            }
+            result = tokio::time::timeout_at(
+                deadline,
+                client
+                    .peer()
+                    .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor))),
+            ) => result
+                .map_err(|_| McpError::operation(server, "tools/list", "request timed out"))?
+                .map_err(|error| McpError::operation(server, "tools/list", error))?,
+        };
         for tool in page.tools {
             if tools.len() >= MAX_REMOTE_TOOLS {
                 return Err(McpError::Operation {
