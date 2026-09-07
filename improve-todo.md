@@ -66,8 +66,8 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - Tests (resolve→`remove_dir_all`+`symlink(outside)`→execute): `read.rs:547-579`, `write.rs:284-310` + `write.rs:248-283 retained_workspace_capability_survives_root_path_replacement`, `edit.rs:953-993`, `lib.rs:730-767`.
 
 ### TOOLS-3 Bash exclusive + tree kill — DONE
-- DONE: `bash.rs:50-62 command_concurrency→Exclusive`, `:129-133 concurrency()`; word-level classifier removed. `MAX_TIMEOUT_SECS=86400 :37-48,72-81,137-160`, `checked_add` → tool error. `process_group(0) :203-210`. `ProcessGroupGuard:461-546 (SIGKILL on drop)` + `terminate_tree (SIGTERM→alive?→KILL_GRACE 500ms→SIGKILL)` on timeout/cancel/drop + after `Exited` for backgrounders; `child.wait()` reaps. `read_bounded_tail :245-305,373-410` + `timeout_at(drain_deadline) join!` one `DRAIN_TIMEOUT=1s`.
-- Tests DONE: `bash.rs:707-734 every_bash_invocation_is_exclusive`, `:741 oversized`, `:749 max_rejects_u64_max`, `:767 background_descendant_killed_after_return`, `:815 timeout_kills_descendants`, `:838 cancellation_kills`, `:794 aborting_execution_kills`, `:583 timeout_kills_command`; `held_stdout_and_stderr_share_one_drain_deadline` (setsid-detached survivor holds both pipes past shell exit; ~1s outer sleep + ~1s shared drain asserts 1.5s ≤ elapsed < 2.9s, proving one shared `DRAIN_TIMEOUT` instead of two sequential waits; survivor reaped via pid file).
+- DONE: `bash.rs:50-62 command_concurrency→Exclusive`, `:129-133 concurrency()`; word-level classifier removed. `MAX_TIMEOUT_SECS=86400 :37-48,72-81,137-160`, `checked_add` → tool error. `process_group(0) :203-210`; Linux adds a writable cgroup-v2 scope and `cgroup.kill`, with process-group fallback elsewhere. `ProcessGroupGuard` kills containment on timeout/cancel/drop and after `Exited`; `child.wait()` reaps. `read_bounded_tail :245-305,373-410` + `timeout_at(drain_deadline) join!` one `DRAIN_TIMEOUT=1s`.
+- Tests DONE: exclusivity, timeout bounds, output tails, and four Linux detached-marker cases (`detached_marker_is_killed_after_normal_shell_exit`, `_on_timeout`, `_on_explicit_cancellation`, `_when_execution_future_is_dropped`). Unix fallback coverage keeps `held_stdout_and_stderr_share_one_drain_deadline_without_cgroup` (shared `DRAIN_TIMEOUT`, with unconditional helper cleanup).
 
 ### TOOLS-4 Exact byte-preserving edit — DONE
 - `edit.rs:415-490 apply_edits_exact` via `match_positions (char_indices+starts_with)` exact bytes; `strip_bom:491-495` split+reattach; spans vs original, overlap rejected, apply `rev`; BOM/mixed CRLF/LF preserved; pre-commit re-read (`:266-280` handle, `:343-351` fallback); `unicode-normalization` removed from `Cargo.toml`.
@@ -234,20 +234,19 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - Open nonblocking through the retained directory handle, inspect with `fstat`, and accept only regular files for read/edit/existing-file write metadata paths.
 - Add FIFO, socket, and device/special-file tests where supported; cancellation and timeout must remain responsive.
 
-#### REVIEW-TOOLS-2: Close or accurately scope process-tree containment — OPEN (High)
-- Bash cleanup signals only the shell's process group (`tools/src/bash.rs:461-545`). A descendant can call `setsid` and escape; the drain test itself documents this at `bash.rs:860-878`.
-- Either implement containment that reaches escaped descendants on supported platforms, or explicitly narrow the security/documentation contract and ensure detached processes cannot retain tool pipes or mutate the workspace after return.
-- Add timeout, explicit cancellation, future-drop, and normal-shell-exit tests using a detached marker-writing descendant.
+#### REVIEW-TOOLS-2: Close or accurately scope process-tree containment — DONE
+- Linux uses a private writable cgroup-v2 scope when available, attaches the shell before exec, and kills the scope plus process group on timeout, cancellation, future drop, and normal shell exit. This reaches descendants that call `setsid`, so they cannot retain tool pipes or mutate the workspace after cleanup. Hosts without cgroup-v2 delegation fall back to process-group best effort; macOS has the same documented limitation, and other platforms guarantee only direct-child termination.
+- Tests use an in-process Rust `setsid(2)` helper and a ready-synchronized detached marker writer for normal exit, timeout, explicit cancellation, and future drop. The fallback drain test is portable to macOS and always kills its helper before assertions.
+- The documented fallback keeps the shared one-second output drain and makes no post-return containment claim for a descendant that calls `setsid`.
 
 #### REVIEW-MCP-1: Enforce protocol/frame limits before deserialization — OPEN (High)
 - Catalogue and tool-output limits run only after `rmcp` has materialized complete responses (`mcp/runtime.rs:219-242`, `mcp/tool.rs:266-281`). A malicious server can allocate an arbitrarily large JSON frame/result before Harness applies its 20 KiB/definition caps.
 - Add transport/frame-level byte limits or a bounded parser for MCP messages and bound protocol/service error payloads before allocation/rendering.
 - Test oversized single frames, chunked frames, text, structured data, binary/image payloads, catalogues, and error responses.
 
-#### REVIEW-CI-1: Make the drain-deadline test portable to macOS — OPEN (High)
-- `tools/src/bash.rs:858-898` is `#[cfg(unix)]` but invokes the external util-linux `setsid` command. macOS CI runs all workspace tests and normally has no `setsid` executable, causing the elapsed-time assertion to fail.
-- Use a test helper that calls `setsid(2)`, or gate the external-command test to Linux and add an appropriate macOS test.
-- Confirm the complete locked suite on both Linux and macOS.
+#### REVIEW-CI-1: Make the drain-deadline test portable to macOS — DONE
+- The Unix drain test launches an in-process Rust helper that calls `setsid(2)` directly instead of depending on the external util-linux `setsid` command. It kills the helper process group before any assertion, so a failure cannot leak a pipe holder.
+- Linux detached-marker tests skip only when the host cannot delegate cgroup v2; the macOS test continues to pin the shared drain deadline and its documented best-effort limitation.
 
 ### Additional required follow-ups
 

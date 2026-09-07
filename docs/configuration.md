@@ -201,12 +201,17 @@ the ephemeral history.
 
 The shell starts in the workspace but is not a sandbox. Bash calls are
 exclusive, use a 120-second default timeout (maximum 86,400 seconds), and cap
-output at 2,000 lines or 50 KiB. On Unix each command has its own process
-group; timeout, cancellation, future drop, and shell exit with surviving
-descendants terminate that group (SIGTERM, escalating to SIGKILL after a
-500 ms grace period) and reap the shell. Standard output and error drain
-concurrently under one shared one-second deadline. Other platforms only
-guarantee direct child termination.
+output at 2,000 lines or 50 KiB. On Linux, when a writable cgroup-v2 hierarchy
+is available, each command gets a private cgroup before the shell is executed.
+Timeout, cancellation, future drop, and shell exit use `cgroup.kill` plus the
+process group (SIGTERM, escalating to SIGKILL after a 500 ms grace period), so
+even a `setsid` descendant is terminated before output draining and cannot
+mutate the workspace after tool return. Hosts without cgroup-v2 delegation
+fall back to process-group cleanup; that path cannot contain a descendant that
+calls `setsid`. macOS has the same process-group limitation, and other
+platforms only guarantee direct child termination. Standard output and error
+drain concurrently under one shared one-second deadline, which bounds Harness
+waiting even on those best-effort paths.
 
 ## Project context and skills
 

@@ -5,6 +5,12 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::{CStr, CString},
+    os::unix::ffi::OsStrExt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -216,13 +222,24 @@ impl Tool for BashTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // Own process group/session: on timeout, cancellation, future drop,
-        // or shell exit with surviving descendants, the whole group is
-        // terminated (TERM, escalated to KILL) and reaped — a backgrounded
-        // descendant can never outlive the tool call and touch the
-        // workspace afterwards.
+        // Own a process group on Unix. Linux additionally uses a private
+        // cgroup when the host exposes a writable cgroup v2 hierarchy. A
+        // process group is deliberately only a fallback: a command can call
+        // setsid(2), while cgroup membership survives that escape.
         #[cfg(unix)]
         command_builder.process_group(0);
+        #[cfg(target_os = "linux")]
+        let mut cgroup = CgroupGuard::new();
+        #[cfg(target_os = "linux")]
+        if let Some(scope) = cgroup.as_ref() {
+            let cgroup_procs = scope.procs_cstring();
+            // SAFETY: the closure only performs the async-signal-safe open,
+            // write, and close operations needed between fork and exec. It
+            // runs before the shell can fork any user descendants.
+            unsafe {
+                command_builder.pre_exec(move || attach_pid_to_cgroup(&cgroup_procs));
+            }
+        }
         let mut child = match command_builder.spawn() {
             Ok(child) => child,
             Err(io_error) => {
@@ -238,12 +255,18 @@ impl Tool for BashTool {
         let group_id = child.id();
         #[cfg(not(unix))]
         let group_id = None;
-        let mut process_guard = ProcessGroupGuard::new(group_id);
+        let mut process_guard = ProcessGroupGuard::new(
+            group_id,
+            #[cfg(target_os = "linux")]
+            cgroup.take(),
+        );
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
-        let mut stdout_task = tokio::spawn(read_bounded_tail(stdout));
-        let mut stderr_task = tokio::spawn(read_bounded_tail(stderr));
+        let mut readers = ReaderTasks {
+            stdout: tokio::spawn(read_bounded_tail(stdout)),
+            stderr: tokio::spawn(read_bounded_tail(stderr)),
+        };
 
         enum End {
             Exited(std::process::ExitStatus),
@@ -256,22 +279,35 @@ impl Tool for BashTool {
                 Err(_) => End::Cancelled,
             },
             _ = tokio::time::sleep_until(deadline) => {
-                terminate_tree(&mut child, group_id, &cancel).await;
+                terminate_tree(
+                    &mut child,
+                    group_id,
+                    process_guard.containment(),
+                    &cancel,
+                )
+                .await;
                 let _ = child.wait().await;
                 End::TimedOut
             },
             _ = cancel.cancelled() => {
-                terminate_tree(&mut child, group_id, &cancel).await;
+                terminate_tree(
+                    &mut child,
+                    group_id,
+                    process_guard.containment(),
+                    &cancel,
+                )
+                .await;
                 let _ = child.wait().await;
                 End::Cancelled
             },
         };
-        // The shell exited but descendants may survive (they inherit the
-        // pipes and the group). Reap the whole tree the same way so a
-        // backgrounded `sleep 300 &` cannot write a marker after return.
-        if matches!(end, End::Exited(_)) {
-            terminate_tree(&mut child, group_id, &cancel).await;
-        }
+        // The shell may have exited, or `wait` may have failed. Repeat the
+        // idempotent cleanup for every branch before draining: the Linux
+        // cgroup (when available) and the Unix process group terminate
+        // detached descendants before they can keep these pipes open or
+        // mutate the workspace after this tool returns. Other Unix platforms
+        // retain only the process-group best effort documented below.
+        terminate_tree(&mut child, group_id, process_guard.containment(), &cancel).await;
 
         // Drain stdout and stderr concurrently under one shared deadline
         // (not two sequential one-second waits): held pipes on both
@@ -281,19 +317,19 @@ impl Tool for BashTool {
             .unwrap_or_else(tokio::time::Instant::now);
         let (stdout, stderr) = tokio::join!(
             async {
-                match tokio::time::timeout_at(drain_deadline, &mut stdout_task).await {
+                match tokio::time::timeout_at(drain_deadline, &mut readers.stdout).await {
                     Ok(Ok(capture)) => capture,
                     _ => {
-                        stdout_task.abort();
+                        readers.stdout.abort();
                         TailCapture::default()
                     }
                 }
             },
             async {
-                match tokio::time::timeout_at(drain_deadline, &mut stderr_task).await {
+                match tokio::time::timeout_at(drain_deadline, &mut readers.stderr).await {
                     Ok(Ok(capture)) => capture,
                     _ => {
-                        stderr_task.abort();
+                        readers.stderr.abort();
                         TailCapture::default()
                     }
                 }
@@ -346,6 +382,21 @@ impl Tool for BashTool {
                 None => format!("bash: {}", first_line(&run_command)),
             },
         }
+    }
+}
+
+/// Owns the asynchronous pipe readers. Tokio detaches a task when its
+/// `JoinHandle` is merely dropped, so the explicit abort-on-drop behavior is
+/// required when the bash execution future itself is cancelled or aborted.
+struct ReaderTasks {
+    stdout: tokio::task::JoinHandle<TailCapture>,
+    stderr: tokio::task::JoinHandle<TailCapture>,
+}
+
+impl Drop for ReaderTasks {
+    fn drop(&mut self) {
+        self.stdout.abort();
+        self.stderr.abort();
     }
 }
 
@@ -450,28 +501,171 @@ fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value)
 }
 
-/// Terminate the whole process tree of a shell invocation: signal the
-/// process group (TERM), escalate to KILL after a short grace period, and
-/// reap directly manageable handles. The shell runs as its own group
-/// leader (`process_group(0)`), so `killpg`-equivalent signals hit exactly
-/// this invocation's descendants — never the harness itself. On non-Unix
-/// platforms group semantics are unavailable and this degrades to killing
-/// the shell handle directly.
-///
-/// Owns a shell process group until the tool has drained all of its pipes.
-/// This synchronous drop guard is the last line of defense when the async
-/// execution future is aborted before it reaches its normal cleanup path.
+/// Linux cgroup-v2 scope for one shell invocation. A process group is not a
+/// tree boundary: `setsid(2)` lets a descendant leave it. Cgroup membership
+/// survives that operation, so `cgroup.kill` is the strong containment path
+/// when the host grants this process a writable cgroup hierarchy.
+#[cfg(target_os = "linux")]
+struct CgroupGuard {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+static CGROUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+impl CgroupGuard {
+    fn new() -> Option<Self> {
+        let root = Path::new("/sys/fs/cgroup");
+        if !root.join("cgroup.controllers").is_file() {
+            return None;
+        }
+        for _ in 0..8 {
+            let number = CGROUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = root.join(format!("harness-bash-{}-{number}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) if path.join("cgroup.kill").is_file() => {
+                    return Some(Self { path });
+                }
+                Ok(()) => {
+                    let _ = std::fs::remove_dir(&path);
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    fn procs_cstring(&self) -> CString {
+        CString::new(self.path.join("cgroup.procs").as_os_str().as_bytes())
+            .expect("cgroup path cannot contain NUL")
+    }
+
+    fn kill(&self) {
+        // cgroup.kill is atomic with respect to membership: unlike a /proc
+        // descendant walk, a concurrent fork cannot escape this operation.
+        let _ = std::fs::write(self.path.join("cgroup.kill"), b"1\n");
+    }
+
+    fn cleanup(&self) {
+        // A normal path has waited for the shell and cgroup.kill has finished
+        // the descendants. Kernel task exit is asynchronous, so retry the
+        // removal briefly; this also prevents future-drop cleanup from
+        // accumulating empty invocation cgroups.
+        for _ in 0..200 {
+            match std::fs::remove_dir(&self.path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+        self.cleanup();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_pid_to_cgroup(path: &CStr) -> std::io::Result<()> {
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut digits = [0u8; 20];
+    let mut end = digits.len();
+    let mut pid = unsafe { libc::getpid() as u64 };
+    loop {
+        end -= 1;
+        digits[end] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+    let bytes = &digits[end..];
+    let mut written = 0;
+    while written < bytes.len() {
+        let result =
+            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        if result == 0 {
+            let _ = unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "could not attach shell to cgroup",
+            ));
+        }
+        written += result as usize;
+    }
+    let close_result = unsafe { libc::close(fd) };
+    if close_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Process containment kept for the lifetime of one shell invocation. Linux
+/// owns a cgroup when available; Unix process groups remain the portable
+/// best-effort fallback, and non-Unix platforms only kill the direct child.
+/// The synchronous drop path is the last line of defense when the async
+/// execution future is aborted before normal cleanup runs.
+struct Containment {
+    #[cfg(target_os = "linux")]
+    cgroup: Option<CgroupGuard>,
+}
+
+impl Containment {
+    #[cfg(target_os = "linux")]
+    fn new(cgroup: Option<CgroupGuard>) -> Self {
+        Self { cgroup }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn kill(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = &self.cgroup {
+            cgroup.kill();
+        }
+    }
+}
+
+/// Owns the shell's process group and, on Linux, its cgroup until all output
+/// has drained. The cgroup is killed before the output drain, so a detached
+/// descendant cannot retain the tool's pipes on the strong Linux path.
 struct ProcessGroupGuard {
     group_id: Option<u32>,
+    containment: Containment,
     armed: bool,
 }
 
 impl ProcessGroupGuard {
-    fn new(group_id: Option<u32>) -> Self {
+    fn new(group_id: Option<u32>, #[cfg(target_os = "linux")] cgroup: Option<CgroupGuard>) -> Self {
         Self {
             group_id,
+            containment: Containment::new(
+                #[cfg(target_os = "linux")]
+                cgroup,
+            ),
             armed: true,
         }
+    }
+
+    fn containment(&self) -> &Containment {
+        &self.containment
     }
 
     fn disarm(&mut self) {
@@ -481,10 +675,12 @@ impl ProcessGroupGuard {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.containment.kill();
         #[cfg(unix)]
-        if self.armed
-            && let Some(pgid) = self.group_id
-        {
+        if let Some(pgid) = self.group_id {
             // SAFETY: the group ID came from the shell created by this tool;
             // a negative PID targets only that process group.
             unsafe {
@@ -510,8 +706,10 @@ fn process_group_alive(pgid: u32) -> bool {
 async fn terminate_tree(
     child: &mut tokio::process::Child,
     group_id: Option<u32>,
+    containment: &Containment,
     cancel: &CancellationToken,
 ) {
+    containment.kill();
     #[cfg(unix)]
     {
         let _ = child;
@@ -563,6 +761,37 @@ fn error(summary: &str, content: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_marker_helper() {
+        let Some(ready) = std::env::var_os("HARNESS_BASH_HELPER_READY") else {
+            return;
+        };
+        let Some(marker) = std::env::var_os("HARNESS_BASH_HELPER_MARKER") else {
+            return;
+        };
+        let Some(pid_path) = std::env::var_os("HARNESS_BASH_HELPER_PID") else {
+            return;
+        };
+        let delay = std::env::var("HARNESS_BASH_HELPER_DELAY")
+            .expect("helper delay")
+            .parse::<u64>()
+            .expect("helper delay is an integer");
+        // This test executable is launched as an ordinary child of the shell;
+        // setsid makes it the leader of a new session/process group without
+        // relying on the non-portable external `setsid` utility.
+        assert_eq!(unsafe { libc::setsid() }, unsafe { libc::getpid() });
+        std::fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(ready, b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(delay));
+        std::fs::write(marker, b"detached").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+    }
 
     #[tokio::test]
     async fn captures_stderr_and_exit_code() {
@@ -762,40 +991,113 @@ mod tests {
         assert!(output.content.contains("timeout"), "{}", output.content);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn background_descendant_is_killed_after_return() {
-        // A backgrounded descendant that tries to write a marker after the
-        // shell returns must be killed with the process group.
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("marker");
-        let output = BashTool::with_workspace_root(directory.path())
+    #[cfg(target_os = "linux")]
+    struct DetachedMarker {
+        directory: tempfile::TempDir,
+        ready: std::path::PathBuf,
+        marker: std::path::PathBuf,
+        pid: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DetachedMarker {
+        fn new() -> Option<Self> {
+            // The production fallback is intentionally usable on hosts that
+            // do not delegate cgroup v2. These tests specifically exercise
+            // the stronger detached-descendant guarantee, so skip rather than
+            // turn a host capability limitation into a flaky process leak.
+            let cgroup = CgroupGuard::new()?;
+            drop(cgroup);
+            let directory = tempfile::tempdir().unwrap();
+            Some(Self {
+                ready: directory.path().join("ready"),
+                marker: directory.path().join("marker"),
+                pid: directory.path().join("pid"),
+                directory,
+            })
+        }
+
+        fn command(&self, delay: u64, tail: &str) -> String {
+            let helper = shell_quote(&std::env::current_exe().unwrap().display().to_string());
+            format!(
+                "HARNESS_BASH_HELPER_READY={} HARNESS_BASH_HELPER_MARKER={} HARNESS_BASH_HELPER_PID={} HARNESS_BASH_HELPER_DELAY={} {} --exact bash::tests::detached_marker_helper --nocapture & while [ ! -f {} ]; do sleep 0.01; done; {}",
+                shell_quote(&self.ready.display().to_string()),
+                shell_quote(&self.marker.display().to_string()),
+                shell_quote(&self.pid.display().to_string()),
+                delay,
+                helper,
+                shell_quote(&self.ready.display().to_string()),
+                tail,
+            )
+        }
+
+        async fn wait_until_ready(&self) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while !self.ready.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "detached marker child did not become ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn assert_marker_absent(&self) {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+            while tokio::time::Instant::now() < deadline {
+                assert!(
+                    !self.marker.exists(),
+                    "detached descendant wrote after tool cleanup"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DetachedMarker {
+        fn drop(&mut self) {
+            if let Ok(text) = std::fs::read_to_string(&self.pid)
+                && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+            {
+                // The helper calls setsid, making its PID its process-group
+                // ID. This is an unconditional test cleanup fallback for a
+                // failed assertion or a shell-startup error.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_after_normal_shell_exit() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
+        let output = BashTool::with_workspace_root(fixture.directory.path())
             .execute(
                 json!({
-                    "command": format!(
-                        "(sleep 30 && touch {} &) ; exit 0",
-                        marker.display()
-                    ),
+                    "command": fixture.command(2, "exit 0"),
                     "timeout": 10,
                 }),
                 CancellationToken::new(),
             )
             .await;
         assert!(!output.is_error, "{}", output.content);
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        assert!(
-            !marker.exists(),
-            "background descendant survived the tool call"
-        );
+        fixture.assert_marker_absent().await;
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn aborting_execution_kills_descendants() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("abort-marker");
-        let command = format!("(sleep 1; touch {}) & wait", marker.display());
-        let tool = BashTool::with_workspace_root(directory.path());
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_when_execution_future_is_dropped() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
+        let command = fixture.command(2, "sleep 30");
+        let tool = BashTool::with_workspace_root(fixture.directory.path());
         let task = tokio::spawn(async move {
             tool.execute(
                 json!({"command": command, "timeout": 60}),
@@ -803,25 +1105,22 @@ mod tests {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        fixture.wait_until_ready().await;
         task.abort();
         let _ = task.await;
-        tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-        assert!(!marker.exists(), "descendant survived an aborted tool task");
+        fixture.assert_marker_absent().await;
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn timeout_kills_descendants() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("timeout-marker");
-        let output = BashTool::with_workspace_root(directory.path())
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_on_timeout() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
+        let output = BashTool::with_workspace_root(fixture.directory.path())
             .execute(
                 json!({
-                    "command": format!(
-                        "sh -c 'sleep 30 & wait'; touch {}",
-                        marker.display()
-                    ),
+                    "command": fixture.command(2, "sleep 30"),
                     "timeout": 1,
                 }),
                 CancellationToken::new(),
@@ -829,39 +1128,38 @@ mod tests {
             .await;
         assert!(output.is_error, "expected timeout: {}", output.content);
         assert!(output.content.contains("timed out"), "{}", output.content);
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        assert!(!marker.exists(), "descendant wrote after timeout");
+        fixture.assert_marker_absent().await;
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancellation_kills_descendants() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("cancel-marker");
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_on_explicit_cancellation() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
         let cancel = CancellationToken::new();
-        let tool = BashTool::with_workspace_root(directory.path());
-        let command = format!("sleep 30; touch {}", marker.display());
+        let tool = BashTool::with_workspace_root(fixture.directory.path());
         let cancel_task = cancel.clone();
+        let command = fixture.command(2, "sleep 30");
         let task = tokio::spawn(async move {
             tool.execute(json!({"command": command, "timeout": 60}), cancel_task)
                 .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        fixture.wait_until_ready().await;
         cancel.cancel();
         let output = task.await.unwrap();
         assert!(output.content.contains("cancelled"), "{}", output.content);
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-        assert!(!marker.exists(), "descendant wrote after cancel");
+        fixture.assert_marker_absent().await;
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[tokio::test]
-    async fn held_stdout_and_stderr_share_one_drain_deadline() {
-        // A survivor detached into a new session (`setsid`) inherits both
-        // pipes but escapes the invocation's process group, so group
-        // teardown cannot reap it and both drain readers stay parked. Both
-        // streams must resolve under one shared `DRAIN_TIMEOUT` (~1s): two
-        // sequential per-stream waits would take ~2s instead.
+    async fn held_stdout_and_stderr_share_one_drain_deadline_without_cgroup() {
+        // On Unix platforms without the Linux cgroup containment path, a
+        // survivor detached into a new session can inherit both pipes. The
+        // shared deadline still bounds Harness waiting (~1s): two sequential
+        // per-stream waits would take ~2s instead. The cleanup below is
+        // required because this is an explicitly documented best-effort path.
         //
         // The survivor is backgrounded so the outer shell can exit; the
         // trailing `sleep 1` keeps the shell alive long enough for the
@@ -870,13 +1168,20 @@ mod tests {
         // an early EOF would finish at ~1s, sequential drains at ~3s.
         let directory = tempfile::tempdir().unwrap();
         let pid_file = directory.path().join("drain-survivor.pid");
+        let ready = directory.path().join("drain-ready");
+        let marker = directory.path().join("drain-marker");
+        let helper = shell_quote(&std::env::current_exe().unwrap().display().to_string());
         let started = std::time::Instant::now();
         let output = BashTool::with_workspace_root(directory.path())
             .execute(
                 json!({
                     "command": format!(
-                        "setsid sleep 15 & echo $! > {}; sleep 1",
-                        pid_file.display()
+                        "HARNESS_BASH_HELPER_READY={} HARNESS_BASH_HELPER_MARKER={} HARNESS_BASH_HELPER_PID={} HARNESS_BASH_HELPER_DELAY=15 {} --exact bash::tests::detached_marker_helper --nocapture & while [ ! -f {} ]; do sleep 0.01; done; exit 0",
+                        shell_quote(&ready.display().to_string()),
+                        shell_quote(&marker.display().to_string()),
+                        shell_quote(&pid_file.display().to_string()),
+                        helper,
+                        shell_quote(&ready.display().to_string()),
                     ),
                     "timeout": 30,
                 }),
@@ -889,9 +1194,11 @@ mod tests {
         if let Ok(text) = std::fs::read_to_string(&pid_file)
             && let Ok(pid) = text.trim().parse::<libc::pid_t>()
         {
-            // SAFETY: the pid came from the survivor spawned above; SIGKILL
-            // targets that process only.
+            // SAFETY: the helper called setsid, so its pid is also its
+            // process-group id. Kill both the group and direct pid as a
+            // best-effort fallback before any assertions can panic.
             unsafe {
+                libc::kill(-pid, libc::SIGKILL);
                 libc::kill(pid, libc::SIGKILL);
             }
         }
