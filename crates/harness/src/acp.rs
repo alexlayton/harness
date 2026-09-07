@@ -45,7 +45,7 @@ use anyhow::{Context as _, Result};
 use auth::CopilotAuth;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -950,6 +950,46 @@ fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
     Ok(servers)
 }
 
+/// Insert one assembled session without replacing an already-live handle.
+///
+/// Assembly deliberately happens outside the sessions mutex because it can
+/// initialize tools, MCP servers, and an agent. The final occupied/vacant
+/// decision must nevertheless be one locked operation: a duplicate receives
+/// its own assembled handle back so the caller can stop both of its tasks.
+fn try_register_session(
+    state: &AcpState,
+    acp_session_id: String,
+    handle: SessionHandle,
+) -> std::result::Result<(), SessionHandle> {
+    let mut sessions = state.sessions.lock().unwrap();
+    match sessions.entry(acp_session_id) {
+        Entry::Vacant(entry) => {
+            entry.insert(handle);
+            Ok(())
+        }
+        Entry::Occupied(_) => Err(handle),
+    }
+}
+
+/// Discard an assembled session that never became the registered owner.
+/// Abort the forwarder before the agent can close its event channel: a
+/// forwarder that exits normally calls `PromptTracker::resolve`, and its
+/// session id may belong to the original live agent that won registration.
+async fn discard_session(handle: SessionHandle) {
+    let SessionHandle {
+        input_tx,
+        cancel,
+        agent_task,
+        forwarder_task,
+    } = handle;
+    cancel.cancel();
+    drop(input_tx);
+    forwarder_task.abort();
+    agent_task.abort();
+    let _ = forwarder_task.await;
+    let _ = agent_task.await;
+}
+
 /// Spawn the agent task plus its event forwarder and register the session's
 /// input channel under `acp_session_id`. The forwarder owns everything
 /// event-shaped: notification translation and prompt-turn resolution. The
@@ -964,9 +1004,6 @@ async fn spawn_agent(
     acp_session_id: String,
     mcp_servers: Vec<mcp::McpServerConfig>,
 ) -> Result<()> {
-    if state.sessions.lock().unwrap().contains_key(&acp_session_id) {
-        anyhow::bail!("session `{acp_session_id}` is already loaded");
-    }
     let (input_tx, input_rx) = mpsc::unbounded_channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
@@ -1001,29 +1038,21 @@ async fn spawn_agent(
         acp_session_id.clone(),
     ));
 
-    let duplicate = {
-        let sessions = state.sessions.lock().unwrap();
-        sessions.contains_key(&acp_session_id)
+    let handle = SessionHandle {
+        input_tx,
+        cancel,
+        agent_task,
+        forwarder_task,
     };
-    if duplicate {
-        // A duplicate load can race another request during assembly. Keep the
-        // original live session and stop the newly assembled pair.
-        agent_task.abort();
-        forwarder_task.abort();
-        let _ = agent_task.await;
-        let _ = forwarder_task.await;
-        anyhow::bail!("session `{acp_session_id}` is already loaded");
+    match try_register_session(state, acp_session_id.clone(), handle) {
+        Ok(()) => Ok(()),
+        Err(handle) => {
+            // A duplicate load can race another request during assembly. Keep
+            // the original live session and stop the newly assembled pair.
+            discard_session(handle).await;
+            anyhow::bail!("session `{acp_session_id}` is already loaded");
+        }
     }
-    state.sessions.lock().unwrap().insert(
-        acp_session_id,
-        SessionHandle {
-            input_tx,
-            cancel,
-            agent_task,
-            forwarder_task,
-        },
-    );
-    Ok(())
 }
 
 /// Consume one session's agent events until the agent task exits: translate
@@ -1367,6 +1396,156 @@ mod tests {
     impl ScriptProvider {}
 
     struct HangingProvider;
+
+    struct TaskDropFlag(Arc<AtomicUsize>);
+
+    impl Drop for TaskDropFlag {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestAssemblyFlags {
+        agent_dropped: Arc<AtomicUsize>,
+        forwarder_dropped: Arc<AtomicUsize>,
+        used: Arc<AtomicUsize>,
+    }
+
+    fn test_assembly_flags() -> TestAssemblyFlags {
+        TestAssemblyFlags {
+            agent_dropped: Arc::new(AtomicUsize::new(0)),
+            forwarder_dropped: Arc::new(AtomicUsize::new(0)),
+            used: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Build task owners that behave like an assembled agent but expose their
+    /// lifetime to the registration race test.
+    fn test_session_handle(flags: &TestAssemblyFlags) -> SessionHandle {
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let agent_marker = TaskDropFlag(flags.agent_dropped.clone());
+        let used = flags.used.clone();
+        let agent_task = tokio::spawn(async move {
+            let _agent_marker = agent_marker;
+            if input_rx.recv().await.is_some() {
+                used.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let forwarder_marker = TaskDropFlag(flags.forwarder_dropped.clone());
+        let forwarder_task = tokio::spawn(async move {
+            let _forwarder_marker = forwarder_marker;
+            std::future::pending::<()>().await;
+        });
+
+        SessionHandle {
+            input_tx,
+            cancel,
+            agent_task,
+            forwarder_task,
+        }
+    }
+
+    fn test_acp_state() -> Arc<AcpState> {
+        Arc::new(AcpState {
+            session_root: PathBuf::new(),
+            provider: Arc::new(HangingProvider),
+            config: acp_config(),
+            copilot_auth: None,
+            no_context_files: true,
+            sessions: Mutex::new(HashMap::new()),
+            prompts: Arc::new(PromptTracker {
+                in_flight: Mutex::new(HashMap::new()),
+            }),
+        })
+    }
+
+    async fn register_test_assembly(
+        state: Arc<AcpState>,
+        session_id: String,
+        barrier: Arc<tokio::sync::Barrier>,
+        handle: SessionHandle,
+    ) -> anyhow::Result<()> {
+        // Both assembled agents reach the registration point together. The
+        // winner is intentionally scheduler-dependent; only the locked entry
+        // operation decides which one owns the session.
+        barrier.wait().await;
+        match try_register_session(&state, session_id.clone(), handle) {
+            Ok(()) => Ok(()),
+            Err(handle) => {
+                discard_session(handle).await;
+                anyhow::bail!("session `{session_id}` is already loaded");
+            }
+        }
+    }
+
+    /// Two completed assemblies racing to register one id must leave exactly
+    /// one owner in the map. The losing agent and forwarder are both aborted,
+    /// while the winner's input channel remains usable.
+    #[tokio::test]
+    async fn concurrent_session_registration_keeps_original_and_cleans_loser() {
+        let state = test_acp_state();
+        let session_id = "same-session".to_owned();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let left_flags = test_assembly_flags();
+        let right_flags = test_assembly_flags();
+
+        let left = tokio::spawn(register_test_assembly(
+            state.clone(),
+            session_id.clone(),
+            barrier.clone(),
+            test_session_handle(&left_flags),
+        ));
+        let right = tokio::spawn(register_test_assembly(
+            state.clone(),
+            session_id.clone(),
+            barrier,
+            test_session_handle(&right_flags),
+        ));
+        let left_result = left.await.unwrap();
+        let right_result = right.await.unwrap();
+
+        assert_eq!(
+            left_result.is_ok() as usize + right_result.is_ok() as usize,
+            1
+        );
+        assert_eq!(state.sessions.lock().unwrap().len(), 1);
+
+        let (winner, loser) = if left_result.is_ok() {
+            (&left_flags, &right_flags)
+        } else {
+            (&right_flags, &left_flags)
+        };
+        assert_eq!(loser.agent_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(loser.forwarder_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(winner.agent_dropped.load(Ordering::SeqCst), 0);
+        assert_eq!(winner.forwarder_dropped.load(Ordering::SeqCst), 0);
+
+        // The registered/original handle was not replaced by the duplicate.
+        let input_tx = state
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .expect("the winning session remains registered")
+            .input_tx
+            .clone();
+        input_tx.send(InputMessage::Interrupt).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while winner.used.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the original session input channel remains usable");
+
+        let handle = state.sessions.lock().unwrap().remove(&session_id).unwrap();
+        discard_session(handle).await;
+        assert_eq!(winner.agent_dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(winner.forwarder_dropped.load(Ordering::SeqCst), 1);
+    }
 
     #[async_trait]
     impl Provider for HangingProvider {
