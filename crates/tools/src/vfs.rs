@@ -1,37 +1,36 @@
 //! Handle-relative filesystem opens for workspace tools.
 //!
-//! Design (TOOLS-2 spike outcome): of the three options in the plan —
-//! capability-based APIs, `openat2`/directory-handle-relative traversal, a
-//! small cross-platform abstraction — directory-handle-relative traversal
-//! with no-follow semantics wins. It needs no new async runtime support
-//! (unlike capability handles, which would force every tool through a new
-//! I/O abstraction), it works on both Linux and macOS (unlike `openat2`,
-//! which is Linux-only), and the validated-handle construction below is
-//! already the small cross-platform abstraction the plan asks for:
-//! `WorkspaceFs` owns one validated directory fd for the workspace root,
-//! and every open is relative to it.
+//! Unix uses directory-handle-relative traversal with no-follow semantics.
+//! `WorkspaceFs` owns one validated directory fd for the workspace root, and
+//! every workspace file open and mutation is relative to that capability.
 //!
 //! Why this closes the TOCTOU race rather than narrowing it: the file that
 //! is read or written is never opened by re-walking the path from `/`.
 //! Components are traversed one at a time with `O_NOFOLLOW`, so a symlink
-//! swapped into any ancestor *after* validation either fails the open
-//! (`ELOOP`) or resolves to a directory fd that fails the final
-//! containment check (device/inode comparison against the validated root).
-//! "Canonicalize twice" only narrows the race because both checks still end
-//! in a name-based `open()`; here the open itself is handle-relative, so
-//! the path opened *is* the path that was validated.
+//! swapped into any ancestor *after* validation fails the open. The final
+//! containment check also compares the opened directory's device/inode with
+//! the validated root. "Canonicalize twice" only narrows the race because
+//! both checks still end in a name-based `open()`; here the open itself is
+//! handle-relative, so the path opened *is* the path that was validated.
 //!
-//! Non-Unix fallback: without directory fds, traversal degrades to the
-//! existing canonicalize-and-check plus a same-directory temporary-file +
-//! rename for writes. That narrows but does not close the race; the
-//! platform limitation is documented here rather than claimed away.
+//! Non-Unix platforms do not have this implementation. The old fallback
+//! canonicalized and then reopened by pathname, which is not safe against a
+//! Windows junction/reparse-point ancestor swap. Workspace read/write/edit
+//! tools therefore fail closed on non-Unix platforms instead of claiming
+//! containment they cannot enforce. `WorkspaceFs` still retains the
+//! canonical root for registry construction and diagnostics, but it is not a
+//! filesystem capability there.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-/// Validated handle to the workspace root. Construction canonicalizes the
-/// root once; every later open is relative to the held directory fd, so the
-/// root itself cannot be swapped out from under us.
+/// Validated workspace root capability.
+///
+/// On Unix, construction holds the root open as a directory fd and later
+/// operations use handle-relative, no-follow traversal. On non-Unix
+/// platforms this stores only the canonical root path; workspace file tools
+/// reject operations there because pathname I/O cannot enforce the same
+/// invariant.
 #[derive(Debug)]
 pub struct WorkspaceFs {
     root: PathBuf,
@@ -40,8 +39,11 @@ pub struct WorkspaceFs {
 }
 
 impl WorkspaceFs {
-    /// Canonicalize `root` and hold it open as a directory fd. Fails when
-    /// the root does not exist or is not a directory.
+    /// Canonicalize `root` and, on Unix, hold it open as a directory fd.
+    /// Fails when the root does not exist or is not a directory. On
+    /// non-Unix platforms the returned value is only a canonical-root
+    /// validator; workspace read/write/edit operations reject it rather than
+    /// fall back to unsafe pathname opens.
     pub fn open_root(root: &Path) -> io::Result<Self> {
         let canonical = std::fs::canonicalize(root)?;
         let metadata = std::fs::metadata(&canonical)?;
@@ -71,6 +73,21 @@ impl WorkspaceFs {
         }
     }
 
+    /// Return the explicit fail-closed error used when a platform cannot
+    /// provide handle-relative, no-follow workspace I/O.
+    #[cfg(not(unix))]
+    pub fn unsupported_operation(operation: &str) -> io::Error {
+        let platform = if cfg!(windows) {
+            "Windows reparse-point-safe handle-relative I/O is unavailable"
+        } else {
+            "handle-relative no-follow I/O is unavailable"
+        };
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("workspace {operation} is disabled: {platform}"),
+        )
+    }
+
     /// Canonical workspace root this handle was validated against.
     pub fn root(&self) -> &Path {
         &self.root
@@ -78,8 +95,8 @@ impl WorkspaceFs {
 }
 
 /// Lexically split `value` into workspace-relative components. Shared by the
-/// Unix handle walk and the non-Unix fallback so both enforce the same
-/// lexical confinement.
+/// Unix handle walk and fail-closed platform paths so all callers retain the
+/// same lexical confinement rules.
 pub fn split_relative(value: &str) -> io::Result<Vec<String>> {
     if value.is_empty() {
         return Err(io::Error::new(

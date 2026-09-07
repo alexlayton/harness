@@ -1,4 +1,6 @@
-use super::file_mutation::{atomic_write, with_file_mutation_lock};
+#[cfg(unix)]
+use super::file_mutation::atomic_write;
+use super::file_mutation::with_file_mutation_lock;
 use super::vfs::{WorkspaceFs, split_relative};
 use super::{
     Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
@@ -8,6 +10,7 @@ use llm::ToolDefinition;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +29,8 @@ impl WriteTool {
     }
 
     /// Construct a writer using a workspace capability retained by registry
-    /// assembly rather than reopening the root pathname for every write.
+    /// assembly rather than reopening the root pathname for every Unix write.
+    /// Non-Unix writes fail closed because pathname reopening is not safe.
     pub fn with_workspace_fs(_root: impl Into<PathBuf>, workspace_fs: Arc<WorkspaceFs>) -> Self {
         Self {
             workspace_root: Some(workspace_fs.root().to_path_buf()),
@@ -72,6 +76,16 @@ impl Tool for WriteTool {
         };
         if cancel.is_cancelled() {
             return error(&format!("write {path}"), "cancelled");
+        }
+        #[cfg(not(unix))]
+        {
+            return error(
+                &format!("write {path}"),
+                &format!(
+                    "cannot write {path}: {}",
+                    WorkspaceFs::unsupported_operation("write")
+                ),
+            );
         }
 
         // Resolve lexically first (for precise workspace-relative errors),
@@ -142,9 +156,9 @@ fn error(summary: &str, content: &str) -> ToolOutput {
 
 /// Write `content` through validated handles: open the workspace root,
 /// create missing parents handle-relatively, then commit the temp file
-/// with a handle-relative rename. Falls back to path-based
-/// [`atomic_write`] where handles are unavailable (non-Unix) or no root
-/// is configured (compatibility mode).
+/// with a handle-relative rename. On Unix, callers without a workspace
+/// capability retain the path-based [`atomic_write`] compatibility path;
+/// non-Unix workspace callers fail closed instead.
 async fn write_validated(
     root: &Option<PathBuf>,
     workspace_fs: Option<&WorkspaceFs>,
@@ -190,39 +204,46 @@ async fn write_validated(
         .await?;
         return Ok(());
     }
-    // Fallback: reconstruct the lexical path and use the path-based commit.
-    let base = root.clone().unwrap_or_else(|| PathBuf::from("."));
-    let full_path = components.iter().fold(base, |base, part| base.join(part));
-    if cancel.is_cancelled() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "cancelled",
-        ));
-    }
-    if let Some(parent) = full_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    if cancel.is_cancelled() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Interrupted,
-            "cancelled",
-        ));
-    }
-    // Without Unix directory handles this is only a preflight: it rejects
-    // known special files but cannot close a rename race or promise
-    // cancellation-safe named-pipe behavior during the later path open.
-    match fs::metadata(&full_path).await {
-        Ok(metadata) if !metadata.is_file() => {
+    // Unix retains the compatibility path for callers that do not provide a
+    // workspace root. Workspace tools always take the handle-relative branch
+    // above; non-Unix callers fail closed before reaching this function.
+    #[cfg(unix)]
+    {
+        let base = root.clone().unwrap_or_else(|| PathBuf::from("."));
+        let full_path = components.iter().fold(base, |base, part| base.join(part));
+        if cancel.is_cancelled() {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "not a regular file",
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
             ));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        if cancel.is_cancelled() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ));
+        }
+        match fs::metadata(&full_path).await {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        return atomic_write(&full_path, content.as_bytes(), cancel).await;
     }
-    atomic_write(&full_path, content.as_bytes(), cancel).await
+    #[cfg(not(unix))]
+    {
+        let _ = (root, workspace_fs, components, content, cancel);
+        Err(WorkspaceFs::unsupported_operation("write"))
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +267,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn creates_parents_and_overwrites() {
         let dir = tempdir().unwrap();
@@ -296,6 +318,39 @@ mod tests {
             output.content.contains("not a regular file"),
             "{}",
             output.content
+        );
+    }
+
+    /// Non-Unix intentionally performs no path lookup after an ancestor is
+    /// replaced. This deterministic test covers the fail-closed choice
+    /// without depending on Windows junction privileges.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn non_unix_write_is_disabled_before_an_ancestor_swap() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("sub")).unwrap();
+        std::fs::write(outside.path().join("keep.txt"), "EXTERNAL").unwrap();
+        let tool = WriteTool::with_workspace_root(workspace.path());
+        std::fs::rename(
+            workspace.path().join("sub"),
+            workspace.path().join("sub.old"),
+        )
+        .unwrap();
+        std::fs::create_dir(workspace.path().join("sub")).unwrap();
+
+        let output = tool
+            .execute(
+                json!({"path": "sub/evil.txt", "content": "evil"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("disabled"), "{}", output.content);
+        assert!(!outside.path().join("evil.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep.txt")).unwrap(),
+            "EXTERNAL"
         );
     }
 

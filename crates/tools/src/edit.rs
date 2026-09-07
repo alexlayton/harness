@@ -1,4 +1,6 @@
-use super::file_mutation::{atomic_write, with_file_mutation_lock};
+#[cfg(unix)]
+use super::file_mutation::atomic_write;
+use super::file_mutation::with_file_mutation_lock;
 use super::vfs::{WorkspaceFs, split_relative};
 use super::{
     Tool, ToolOutput, ToolPrompt, ToolSpec, normalize_workspace_root, resolve_workspace_path,
@@ -9,6 +11,7 @@ use llm::util::truncate_utf8;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
@@ -60,7 +63,8 @@ impl EditTool {
     }
 
     /// Construct an editor using a workspace capability retained by registry
-    /// assembly rather than reopening the root pathname for every edit.
+    /// assembly rather than reopening the root pathname for every Unix edit.
+    /// Non-Unix edits fail closed because pathname reopening is not safe.
     pub fn with_workspace_fs(_root: impl Into<PathBuf>, workspace_fs: Arc<WorkspaceFs>) -> Self {
         Self {
             workspace_root: Some(workspace_fs.root().to_path_buf()),
@@ -123,6 +127,16 @@ impl Tool for EditTool {
         let summary = format!("edit {path}");
         if cancel.is_cancelled() {
             return error(&summary, "cancelled");
+        }
+        #[cfg(not(unix))]
+        {
+            return error(
+                &summary,
+                &format!(
+                    "cannot edit {path}: {}",
+                    WorkspaceFs::unsupported_operation("edit")
+                ),
+            );
         }
 
         // Resolve lexically first (for precise workspace-relative errors),
@@ -298,14 +312,25 @@ async fn execute_edit_validated(
             replacement_count: edits.len(),
         });
     }
-    // Fallback (non-Unix or compatibility mode): path-based edit.
-    let base = root
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let target_path = components.iter().fold(base, |base, part| base.join(part));
-    execute_edit(path, &target_path, edits, cancel).await
+    // Unix retains the compatibility path for callers without a workspace
+    // capability. Workspace tools use the handle-relative branch above;
+    // non-Unix callers fail closed before reaching this function.
+    #[cfg(unix)]
+    {
+        let base = root
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let target_path = components.iter().fold(base, |base, part| base.join(part));
+        execute_edit(path, &target_path, edits, cancel).await
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, root, workspace_fs, components, edits, cancel);
+        Err(WorkspaceFs::unsupported_operation("edit").to_string())
+    }
 }
 
+#[cfg(unix)]
 async fn execute_edit(
     path: &str,
     target_path: &Path,
@@ -692,6 +717,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn replaces_one_block_and_returns_a_bounded_diff() {
         let directory = tempdir().unwrap();
@@ -759,6 +785,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn applies_multiple_disjoint_edits_against_the_original() {
         let directory = tempdir().unwrap();
@@ -782,6 +809,7 @@ mod tests {
         assert_eq!(fs::read_to_string(path).unwrap(), "one\nbeta\nthree\n");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn rejects_missing_duplicate_overlap_and_empty_matches() {
         let directory = tempdir().unwrap();
@@ -856,6 +884,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn preserves_bom_and_crlf_line_endings() {
         let directory = tempdir().unwrap();
@@ -1002,6 +1031,41 @@ mod tests {
         let diff = generate_diff(&old, &new);
         assert!(diff.text.contains("diff omitted"));
         assert!(diff.text.len() < 200);
+    }
+
+    /// Non-Unix intentionally performs no path lookup after an ancestor is
+    /// replaced. This deterministic test covers the fail-closed choice
+    /// without depending on Windows junction privileges.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn non_unix_edit_is_disabled_before_an_ancestor_swap() {
+        let workspace = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("sub")).unwrap();
+        std::fs::write(outside.path().join("file.txt"), "EXTERNAL").unwrap();
+        let tool = EditTool::with_workspace_root(workspace.path());
+        std::fs::rename(
+            workspace.path().join("sub"),
+            workspace.path().join("sub.old"),
+        )
+        .unwrap();
+        std::fs::create_dir(workspace.path().join("sub")).unwrap();
+
+        let output = tool
+            .execute(
+                json!({
+                    "path": "sub/file.txt",
+                    "edits": [{"oldText": "EXTERNAL", "newText": "evil"}]
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("disabled"), "{}", output.content);
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("file.txt")).unwrap(),
+            "EXTERNAL"
+        );
     }
 
     /// End-to-end TOCTOU barrier for `edit`: resolve, swap an ancestor for

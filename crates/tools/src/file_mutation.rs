@@ -81,15 +81,14 @@ fn sweep_unreferenced_file_locks() {
 
 /// Write a file through a same-directory temporary file and atomic rename.
 /// Keeping the temporary file beside the destination ensures the rename does
-/// not cross filesystems.  Existing permissions are copied to the temporary
+/// not cross filesystems. Existing permissions are copied to the temporary
 /// file before it replaces the destination.
 ///
-/// Handle-relative variant: when `parent_fd` is provided (Unix), the
-/// temporary file is created with an unpredictable `openat(CREATE|EXCL)`
-/// name relative to the validated parent handle. The final `renameat` is
-/// relative to that same handle, so the temporary file and commit cannot be
-/// redirected through a swapped ancestor. Callers fall back to
-/// [`atomic_write`] (path-based) on non-Unix platforms.
+/// This helper is pathname-based and therefore is not a workspace containment
+/// primitive: callers handling workspace paths must use `atomic_write_at`
+/// on Unix or fail closed on platforms without an equivalent directory-handle
+/// API. It remains available for the Unix compatibility path and for callers
+/// that deliberately provide their own path-safety boundary.
 pub async fn atomic_write(
     path: &Path,
     contents: &[u8],
