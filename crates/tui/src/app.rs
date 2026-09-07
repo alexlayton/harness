@@ -252,15 +252,86 @@ struct RunningRegion {
     rows: usize,
 }
 
+/// Operations needed to change terminal state. Keeping this small seam here
+/// makes setup and cleanup testable without making the rendering or input
+/// protocol depend on a different terminal implementation.
+trait TerminalBackend: Send {
+    fn size(&self) -> io::Result<(u16, u16)>;
+    fn enable_raw_mode(&mut self) -> io::Result<()>;
+    fn disable_raw_mode(&mut self) -> io::Result<()>;
+    fn enable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn disable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn push_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn pop_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn write_newline(&mut self, out: &mut Stdout) -> io::Result<()>;
+}
+
+/// The production terminal operation layer. Crossterm is deliberately kept
+/// behind [`TerminalBackend`], so mode bookkeeping can be tested independently
+/// of the process terminal and its platform-specific implementation.
+struct CrosstermBackend;
+
+impl TerminalBackend for CrosstermBackend {
+    fn size(&self) -> io::Result<(u16, u16)> {
+        terminal::size()
+    }
+
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        terminal::enable_raw_mode()
+    }
+
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        terminal::disable_raw_mode()
+    }
+
+    fn enable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(out, EnableBracketedPaste)
+    }
+
+    fn disable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(out, DisableBracketedPaste)
+    }
+
+    fn push_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+    }
+
+    fn pop_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(out, PopKeyboardEnhancementFlags)
+    }
+
+    fn write_newline(&mut self, out: &mut Stdout) -> io::Result<()> {
+        writeln!(out)
+    }
+}
+
 /// Terminal modes successfully enabled by one UI instance. Cleanup only
 /// reverses modes recorded here, so a partial setup cannot pop another
-/// component's keyboard state.
+/// component's keyboard state. Failed cleanup remains recorded until a later
+/// retry succeeds.
 #[derive(Default)]
 struct TerminalModes {
     raw_mode: bool,
     bracketed_paste: bool,
     keyboard_flags: bool,
     newline_written: bool,
+}
+
+struct TerminalState {
+    backend: Box<dyn TerminalBackend>,
+    modes: TerminalModes,
+}
+
+impl TerminalState {
+    fn is_restored(&self) -> bool {
+        !self.modes.raw_mode
+            && !self.modes.bracketed_paste
+            && !self.modes.keyboard_flags
+            && self.modes.newline_written
+    }
 }
 
 /// The direct-crossterm UI. See the module docs for the screen model; the
@@ -355,8 +426,7 @@ pub struct CrossTerm {
     /// that row instead of the whole region.
     activity_region_row: Option<usize>,
 
-    modes: Arc<Mutex<TerminalModes>>,
-    restored: bool,
+    terminal: Arc<Mutex<TerminalState>>,
 }
 
 impl CrossTerm {
@@ -418,9 +488,19 @@ impl CrossTerm {
             cursor_row: 0,
             cursor_col: 0,
             activity_region_row: None,
-            modes: Arc::new(Mutex::new(TerminalModes::default())),
-            restored: false,
+            terminal: Arc::new(Mutex::new(TerminalState {
+                backend: Box::new(CrosstermBackend),
+                modes: TerminalModes::default(),
+            })),
         }
+    }
+
+    fn with_backend(mut ui: Self, backend: Box<dyn TerminalBackend>) -> Self {
+        ui.terminal = Arc::new(Mutex::new(TerminalState {
+            backend,
+            modes: TerminalModes::default(),
+        }));
+        ui
     }
 
     /// `skills`, `context_files`, and the initial reasoning label come from
@@ -435,46 +515,83 @@ impl CrossTerm {
         reasoning: &str,
         minimal: bool,
     ) -> Result<Self> {
-        let (width, height) = terminal::size().unwrap_or((80, 24));
-        let mut ui = Self::base(
-            model,
-            provider,
-            providers,
-            skills,
-            context_files,
-            width,
-            height,
+        let backend = CrosstermBackend;
+        let (width, height) = backend.size().unwrap_or((80, 24));
+        let mut ui = Self::with_backend(
+            Self::base(
+                model,
+                provider,
+                providers,
+                skills,
+                context_files,
+                width,
+                height,
+            ),
+            Box::new(backend),
         );
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
-        install_panic_hook(ui.modes.clone());
-        terminal::enable_raw_mode().context("enable terminal raw mode")?;
-        ui.modes.lock().unwrap().raw_mode = true;
-        if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
-            let mut result = anyhow::Error::new(error).context("configure terminal input");
-            if let Some(restore_error) = ui.restore().err() {
-                result =
-                    result.context(format!("terminal restoration also failed: {restore_error}"));
-            }
-            return Err(result);
+        install_panic_hook(ui.terminal.clone());
+        ui.setup_terminal()?;
+        Ok(ui)
+    }
+
+    /// Enable terminal modes in dependency order. Only successful operations
+    /// are recorded; a setup failure restores the successful prefix before it
+    /// is returned to the caller. Keyboard enhancement is optional because
+    /// unsupported terminals report that operation as an error.
+    fn setup_terminal(&mut self) -> Result<()> {
+        let raw_result = {
+            let mut terminal = self.terminal.lock().unwrap();
+            terminal
+                .backend
+                .enable_raw_mode()
+                .context("enable terminal raw mode")
+        };
+        if let Err(error) = raw_result {
+            return self.setup_failed(error);
         }
-        ui.modes.lock().unwrap().bracketed_paste = true;
+        self.terminal.lock().unwrap().modes.raw_mode = true;
+
+        let bracketed_result = {
+            let mut terminal = self.terminal.lock().unwrap();
+            terminal
+                .backend
+                .enable_bracketed_paste(&mut self.out)
+                .context("configure terminal input")
+        };
+        if let Err(error) = bracketed_result {
+            return self.setup_failed(error);
+        }
+        self.terminal.lock().unwrap().modes.bracketed_paste = true;
+
         // The kitty keyboard protocol makes Shift+Enter report as `Enter` with
         // the SHIFT modifier, which the input handler already maps to a newline
         // (works on Ghostty; iTerm/Terminal.app do not support it). Only
         // `DISAMBIGUATE_ESCAPE_CODES` is pushed — `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
         // would swallow plain characters. Popped in `restore` and the panic hook.
-        if execute!(
-            ui.out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )
-        .is_ok()
+        if self
+            .terminal
+            .lock()
+            .unwrap()
+            .backend
+            .push_keyboard_flags(&mut self.out)
+            .is_ok()
         {
-            ui.modes.lock().unwrap().keyboard_flags = true;
+            self.terminal.lock().unwrap().modes.keyboard_flags = true;
         }
         // The cursor stays visible: it *is* the input caret, sitting right
         // after the `› ` prefix. No hide, no fake cell.
-        Ok(ui)
+        Ok(())
+    }
+
+    fn setup_failed(&mut self, error: anyhow::Error) -> Result<()> {
+        match self.restore() {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(error.context(format!(
+                "terminal restoration also failed: {restore_error:#}"
+            ))),
+        }
     }
 
     pub async fn run(
@@ -489,9 +606,9 @@ impl CrossTerm {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Err(error)) => Err(error),
-            (Err(error), Err(restore_error)) => {
-                Err(error.context(format!("terminal restoration also failed: {restore_error}")))
-            }
+            (Err(error), Err(restore_error)) => Err(error.context(format!(
+                "terminal restoration also failed: {restore_error:#}"
+            ))),
         }
     }
 
@@ -2137,52 +2254,65 @@ impl CrossTerm {
     }
 
     fn restore(&mut self) -> Result<()> {
-        if self.restored {
-            return Ok(());
+        let mut terminal = self.terminal.lock().unwrap();
+        restore_terminal(&mut terminal, &mut self.out)
+    }
+}
+
+/// Restore every state component that still needs work. An operation that
+/// fails remains recorded, allowing a later call from `run`, `Drop`, or a
+/// panic path to retry it. All operations are attempted before the first
+/// error is returned.
+fn restore_terminal(state: &mut TerminalState, out: &mut Stdout) -> Result<()> {
+    if state.is_restored() {
+        return Ok(());
+    }
+
+    let mut first_error = None;
+    if state.modes.raw_mode {
+        if let Err(error) = state
+            .backend
+            .disable_raw_mode()
+            .context("restore terminal raw mode")
+        {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.raw_mode = false;
         }
-        let mut first_error = None;
-        let mut modes = self.modes.lock().unwrap();
-        if modes.raw_mode {
-            if let Err(error) = terminal::disable_raw_mode().context("restore terminal raw mode") {
-                first_error.get_or_insert(error);
-            } else {
-                modes.raw_mode = false;
-            }
+    }
+    if state.modes.bracketed_paste {
+        if let Err(error) = state
+            .backend
+            .disable_bracketed_paste(out)
+            .context("restore bracketed paste")
+        {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.bracketed_paste = false;
         }
-        if modes.bracketed_paste {
-            if let Err(error) =
-                execute!(self.out, DisableBracketedPaste).context("restore bracketed paste")
-            {
-                first_error.get_or_insert(error);
-            } else {
-                modes.bracketed_paste = false;
-            }
+    }
+    if state.modes.keyboard_flags {
+        if let Err(error) = state
+            .backend
+            .pop_keyboard_flags(out)
+            .context("restore keyboard enhancement flags")
+        {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.keyboard_flags = false;
         }
-        if modes.keyboard_flags {
-            if let Err(error) = execute!(self.out, PopKeyboardEnhancementFlags)
-                .context("restore keyboard enhancement flags")
-            {
-                first_error.get_or_insert(error);
-            } else {
-                modes.keyboard_flags = false;
-            }
+    }
+    if !state.modes.newline_written {
+        if let Err(error) = state.backend.write_newline(out).context("leave terminal") {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.newline_written = true;
         }
-        if !modes.newline_written {
-            if let Err(error) = writeln!(self.out).context("leave terminal") {
-                first_error.get_or_insert(error);
-            } else {
-                modes.newline_written = true;
-            }
-        }
-        self.restored = !modes.raw_mode
-            && !modes.bracketed_paste
-            && !modes.keyboard_flags
-            && modes.newline_written;
-        drop(modes);
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -2224,23 +2354,14 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     });
 }
 
-fn install_panic_hook(modes: Arc<Mutex<TerminalModes>>) {
+fn install_panic_hook(terminal: Arc<Mutex<TerminalState>>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         let mut stdout = io::stdout();
-        let mut modes = modes.lock().unwrap();
-        if modes.raw_mode && terminal::disable_raw_mode().is_ok() {
-            modes.raw_mode = false;
-        }
-        if modes.bracketed_paste && execute!(stdout, DisableBracketedPaste).is_ok() {
-            modes.bracketed_paste = false;
-        }
-        if modes.keyboard_flags && execute!(stdout, PopKeyboardEnhancementFlags).is_ok() {
-            modes.keyboard_flags = false;
-        }
-        if !modes.newline_written && writeln!(stdout).is_ok() {
-            modes.newline_written = true;
-        }
+        // Panic hooks cannot report a cleanup error without obscuring the
+        // original panic, but they still use the same best-effort operation
+        // layer. A caught panic or a later Drop can retry anything that failed.
+        let _ = restore_terminal(&mut terminal.lock().unwrap(), &mut stdout);
         previous(panic);
     }));
 }
@@ -3199,6 +3320,8 @@ fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize, width: usize) 
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::OnceLock;
 
     fn ui(width: u16, height: u16) -> CrossTerm {
         CrossTerm::base(
@@ -3210,6 +3333,90 @@ mod tests {
             width,
             height,
         )
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum TerminalOperation {
+        EnableRaw,
+        DisableRaw,
+        EnableBracketed,
+        DisableBracketed,
+        PushKeyboard,
+        PopKeyboard,
+        Newline,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockTerminal {
+        calls: Arc<Mutex<Vec<TerminalOperation>>>,
+        failures: Arc<Mutex<HashMap<TerminalOperation, usize>>>,
+    }
+
+    impl MockTerminal {
+        fn fail_next(&self, operation: TerminalOperation) {
+            self.failures.lock().unwrap().insert(operation, 1);
+        }
+
+        fn calls(&self) -> Vec<TerminalOperation> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn run(&self, operation: TerminalOperation) -> io::Result<()> {
+            self.calls.lock().unwrap().push(operation);
+            let mut failures = self.failures.lock().unwrap();
+            let Some(remaining) = failures.get_mut(&operation) else {
+                return Ok(());
+            };
+            if *remaining == 0 {
+                return Ok(());
+            }
+            *remaining -= 1;
+            Err(io::Error::other(format!("mock {operation:?}")))
+        }
+    }
+
+    impl TerminalBackend for MockTerminal {
+        fn size(&self) -> io::Result<(u16, u16)> {
+            Ok((80, 24))
+        }
+
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.run(TerminalOperation::EnableRaw)
+        }
+
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.run(TerminalOperation::DisableRaw)
+        }
+
+        fn enable_bracketed_paste(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::EnableBracketed)
+        }
+
+        fn disable_bracketed_paste(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::DisableBracketed)
+        }
+
+        fn push_keyboard_flags(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::PushKeyboard)
+        }
+
+        fn pop_keyboard_flags(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::PopKeyboard)
+        }
+
+        fn write_newline(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::Newline)
+        }
+    }
+
+    fn terminal_ui(backend: MockTerminal) -> CrossTerm {
+        CrossTerm::with_backend(ui(80, 24), Box::new(backend))
+    }
+
+    fn successful_terminal_ui(backend: &MockTerminal) -> CrossTerm {
+        let mut ui = terminal_ui(backend.clone());
+        ui.setup_terminal().unwrap();
+        ui
     }
 
     fn row_text(line: &Line<'_>) -> String {
@@ -3263,6 +3470,188 @@ mod tests {
             .iter()
             .map(|running| running.record.summary.clone())
             .collect()
+    }
+
+    #[test]
+    fn terminal_setup_restores_each_partial_prefix_without_popping_unset_modes() {
+        let raw_failure = MockTerminal::default();
+        raw_failure.fail_next(TerminalOperation::EnableRaw);
+        let mut ui = terminal_ui(raw_failure.clone());
+        let error = ui.setup_terminal().unwrap_err();
+        assert!(format!("{error:#}").contains("mock EnableRaw"));
+        assert_eq!(
+            raw_failure.calls(),
+            vec![TerminalOperation::EnableRaw, TerminalOperation::Newline]
+        );
+
+        let bracketed_failure = MockTerminal::default();
+        bracketed_failure.fail_next(TerminalOperation::EnableBracketed);
+        let mut ui = terminal_ui(bracketed_failure.clone());
+        let error = ui.setup_terminal().unwrap_err();
+        assert!(format!("{error:#}").contains("mock EnableBracketed"));
+        assert_eq!(
+            bracketed_failure.calls(),
+            vec![
+                TerminalOperation::EnableRaw,
+                TerminalOperation::EnableBracketed,
+                TerminalOperation::DisableRaw,
+                TerminalOperation::Newline,
+            ]
+        );
+
+        // Kitty keyboard enhancement is optional. A failed push is not marked
+        // as enabled, so cleanup never pops a stack belonging to another UI.
+        let keyboard_failure = MockTerminal::default();
+        keyboard_failure.fail_next(TerminalOperation::PushKeyboard);
+        let mut ui = terminal_ui(keyboard_failure.clone());
+        ui.setup_terminal().unwrap();
+        {
+            let terminal = ui.terminal.lock().unwrap();
+            assert!(terminal.modes.raw_mode);
+            assert!(terminal.modes.bracketed_paste);
+            assert!(!terminal.modes.keyboard_flags);
+            assert!(!terminal.modes.newline_written);
+        }
+        ui.restore().unwrap();
+        assert_eq!(
+            keyboard_failure.calls(),
+            vec![
+                TerminalOperation::EnableRaw,
+                TerminalOperation::EnableBracketed,
+                TerminalOperation::PushKeyboard,
+                TerminalOperation::DisableRaw,
+                TerminalOperation::DisableBracketed,
+                TerminalOperation::Newline,
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_cleanup_attempts_every_operation_and_retries_failures() {
+        let cleanup_operations = [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ];
+
+        for failed_operation in cleanup_operations {
+            let backend = MockTerminal::default();
+            let mut ui = successful_terminal_ui(&backend);
+            backend.fail_next(failed_operation);
+
+            let error = ui.restore().unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!("mock {failed_operation:?}")),
+                "first cleanup error was not reported: {error:#}"
+            );
+            let calls = backend.calls();
+            for operation in cleanup_operations {
+                assert_eq!(
+                    calls.iter().filter(|called| **called == operation).count(),
+                    1,
+                    "cleanup did not attempt {operation:?} after {failed_operation:?} failed"
+                );
+            }
+
+            // The one-shot failure was consumed. Successful operations are no
+            // longer retried, while the failed operation remains tracked.
+            ui.restore().unwrap();
+            let calls = backend.calls();
+            assert_eq!(
+                calls.last(),
+                Some(&failed_operation),
+                "cleanup did not retry {failed_operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_reports_the_first_error_after_all_attempts() {
+        let backend = MockTerminal::default();
+        let mut ui = successful_terminal_ui(&backend);
+        backend.fail_next(TerminalOperation::DisableRaw);
+        backend.fail_next(TerminalOperation::DisableBracketed);
+
+        let error = ui.restore().unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("mock DisableRaw"));
+        assert!(!rendered.contains("mock DisableBracketed"));
+        let calls = backend.calls();
+        assert!(calls.contains(&TerminalOperation::DisableRaw));
+        assert!(calls.contains(&TerminalOperation::DisableBracketed));
+        assert!(calls.contains(&TerminalOperation::PopKeyboard));
+        assert!(calls.contains(&TerminalOperation::Newline));
+
+        // Both failed modes remain tracked and can be restored on a later
+        // attempt; the already restored modes are not touched again.
+        ui.restore().unwrap();
+        let calls = backend.calls();
+        assert_eq!(
+            &calls[calls.len() - 2..],
+            [
+                TerminalOperation::DisableRaw,
+                TerminalOperation::DisableBracketed
+            ]
+        );
+    }
+
+    #[test]
+    fn panic_cleanup_attempts_all_modes_and_drop_retries_unfinished_cleanup() {
+        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _hook_guard = PANIC_HOOK_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let backend = MockTerminal::default();
+        let ui = successful_terminal_ui(&backend);
+        for operation in [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ] {
+            backend.fail_next(operation);
+        }
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        install_panic_hook(ui.terminal.clone());
+        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            panic!("simulated terminal panic");
+        }));
+        std::panic::set_hook(previous);
+        assert!(panic_result.is_err());
+
+        let calls = backend.calls();
+        for operation in [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ] {
+            assert_eq!(
+                calls.iter().filter(|called| **called == operation).count(),
+                1
+            );
+        }
+
+        // Drop is a second cleanup boundary. The failed operations were not
+        // cleared by the panic hook, so this retry completes all restoration.
+        drop(ui);
+        let calls = backend.calls();
+        for operation in [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ] {
+            assert_eq!(
+                calls.iter().filter(|called| **called == operation).count(),
+                2
+            );
+        }
     }
 
     #[test]
