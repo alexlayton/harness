@@ -146,6 +146,11 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub reasoning: ReasoningPolicy,
+    /// Stable per-conversation identifier forwarded to providers that scope
+    /// usage by conversation (currently OpenCode Go's `x-opencode-session`
+    /// header). `None` for ephemeral runs or providers that ignore it. A
+    /// plain string keeps `llm` independent of the session crate.
+    pub session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

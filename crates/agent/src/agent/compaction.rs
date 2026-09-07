@@ -148,11 +148,13 @@ impl Agent {
             return Ok(false);
         };
 
+        let session_id = state.session.id().to_string();
         let outcome = compact_summarize(
             self.provider.as_ref(),
             &self.model,
             &plan,
             &self.compaction,
+            Some(&session_id),
             cancel,
         )
         .await;

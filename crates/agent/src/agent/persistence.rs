@@ -12,6 +12,16 @@ pub struct AgentSessionState {
 }
 
 impl Agent {
+    /// Stable id of the attached durable conversation, if any. Passed
+    /// through on each request so providers with per-conversation
+    /// accounting (OpenCode Go) can scope usage correctly. `None` leaves
+    /// requests unscoped (ephemeral `--no-session` runs).
+    pub(crate) fn session_id(&self) -> Option<String> {
+        self.session
+            .as_ref()
+            .map(|state| state.session.id().to_string())
+    }
+
     /// Append a history-bearing event, surfacing the failure to abort the turn.
     pub(crate) fn persist_event(
         &mut self,
