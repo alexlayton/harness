@@ -239,10 +239,10 @@ Legend: `DONE` / `PARTIAL` / `MISSING`.
 - Tests use an in-process Rust `setsid(2)` helper and a ready-synchronized detached marker writer for normal exit, timeout, explicit cancellation, and future drop. The fallback drain test is portable to macOS and always kills its helper before assertions.
 - The documented fallback keeps the shared one-second output drain and makes no post-return containment claim for a descendant that calls `setsid`.
 
-#### REVIEW-MCP-1: Enforce protocol/frame limits before deserialization — OPEN (High)
-- Catalogue and tool-output limits run only after `rmcp` has materialized complete responses (`mcp/runtime.rs:219-242`, `mcp/tool.rs:266-281`). A malicious server can allocate an arbitrarily large JSON frame/result before Harness applies its 20 KiB/definition caps.
-- Add transport/frame-level byte limits or a bounded parser for MCP messages and bound protocol/service error payloads before allocation/rendering.
-- Test oversized single frames, chunked frames, text, structured data, binary/image payloads, catalogues, and error responses.
+#### REVIEW-MCP-1: Enforce protocol/frame limits before deserialization — DONE
+- `mcp/runtime.rs` wraps child stdout with a fixed-chunk, newline-aware reader that rejects frames over `MCP_MAX_FRAME_BYTES` (1 MiB) before rmcp's buffered decoder and serde materialize them. The guard counts bytes across arbitrary chunks, resets per frame, preserves CRLF/pagination, and synthesizes a bounded correlated service error so initialize/list/call failures return promptly.
+- Manual child ownership retains kill-on-drop and bounded shutdown behavior; the existing catalogue validation and 20 KiB rendered output caps remain in place.
+- Runtime fake stdio tests cover oversized single/chunked initialize and catalogue frames, paginated discovery, and huge text/structured/binary/image/service-error call frames; reader unit tests cover exact boundaries, chunk splits, and frame reset ordering.
 
 #### REVIEW-CI-1: Make the drain-deadline test portable to macOS — DONE
 - The Unix drain test launches an in-process Rust helper that calls `setsid(2)` directly instead of depending on the external util-linux `setsid` command. It kills the helper process group before any assertion, so a failure cannot leak a pipe holder.

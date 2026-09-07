@@ -128,7 +128,8 @@ process-local locks to prevent overlapping writes.
 `mcp` starts configured stdio servers during assembly, discovers their tools,
 namespaces them, and registers adapters in the same registry. MCP calls are
 exclusive. Limits: 15-second initialize/catalogue deadlines, 60-second call
-deadline, four-second global shutdown; at most 256 tools and 512 KiB of
+deadline, four-second global shutdown; each newline-delimited stdio frame is
+capped at 1 MiB before rmcp deserialization; at most 256 tools and 512 KiB of
 aggregate definitions per server; schemas bounded by depth, node count, and
 string/total size; output compacted and capped at 20 KiB. Tool-list changes
 require a new connection, and MCP tools are not passed to subagents.

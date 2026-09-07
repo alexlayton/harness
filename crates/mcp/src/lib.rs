@@ -27,6 +27,9 @@ pub(crate) const MCP_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const MCP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 /// Fixed stderr read buffer; server diagnostics are discarded by default.
 pub(crate) const MCP_STDERR_CHUNK_BYTES: usize = 4096;
+/// Maximum JSON bytes in one newline-delimited MCP frame, excluding its final
+/// newline. This is enforced while reading stdio, before rmcp deserializes it.
+pub(crate) const MCP_MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A named MCP lifecycle error. Its display form deliberately excludes command
 /// environment values and HTTP headers.

@@ -162,8 +162,10 @@ at most 256 tools with at most 512 KiB of aggregate definitions. Schemas are
 limited to depth 32, 10,000 nodes, 64 KiB strings, and 256 KiB total size.
 Structured/text/error output is compacted (never pretty-printed) and capped
 at 20 KiB with a truncation notice; when structured and text carry the same
-payload only one representation is kept. Stderr is read in bounded 4 KiB
-chunks, counted but discarded by default, and never logged with secrets.
+payload only one representation is kept. Every newline-delimited stdio frame is
+also capped at 1 MiB before rmcp deserializes it, including initialize,
+pagination, calls, and protocol errors. Stderr is read in bounded 4 KiB chunks,
+counted but discarded by default, and never logged with secrets.
 
 ## Sessions
 
