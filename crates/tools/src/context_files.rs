@@ -239,7 +239,13 @@ fn read_contained_candidate(dir: &Path, candidate: &Path) -> Option<(PathBuf, Pa
         raw
     };
     #[cfg(not(unix))]
-    let raw = fs::read_to_string(&canonical).ok()?;
+    {
+        // Do not canonicalize and then reopen by pathname on platforms where
+        // an ancestor reparse point can be swapped between those operations.
+        let _ = components;
+        return None;
+    }
+    #[cfg(unix)]
     Some((canonical, candidate.to_path_buf(), raw))
 }
 

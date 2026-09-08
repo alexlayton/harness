@@ -50,6 +50,9 @@ pub struct Skill {
     pub file_path: PathBuf,
     /// Directory containing the skill file (for resolving relative paths).
     pub base_dir: PathBuf,
+    /// Instructions captured through the validated discovery handle. Runtime
+    /// invocation uses this snapshot instead of reopening a mutable pathname.
+    pub instructions: String,
     pub disable_model_invocation: bool,
 }
 
@@ -235,7 +238,7 @@ fn load_skill_from_content(
     raw: String,
     diagnostics: &mut Vec<SkillDiagnostic>,
 ) -> Option<Skill> {
-    let (frontmatter, _body) = parse_frontmatter(&raw);
+    let (frontmatter, body) = parse_frontmatter(&raw);
     let Some(fm) = frontmatter else {
         // No frontmatter at all → not a valid skill.
         diagnostics.push(SkillDiagnostic {
@@ -289,6 +292,7 @@ fn load_skill_from_content(
         description,
         file_path: file_path.to_path_buf(),
         base_dir,
+        instructions: body.trim().to_owned(),
         disable_model_invocation: fm.disable_model_invocation,
     })
 }
@@ -428,7 +432,14 @@ fn load_contained_skill(
         raw
     };
     #[cfg(not(unix))]
-    let raw = fs::read_to_string(&canonical).ok()?;
+    {
+        // Canonicalize-then-open is unsafe against Windows reparse-point
+        // swaps. Discovery fails closed until a handle-relative backend is
+        // available on this platform.
+        let _ = (workspace, components, diagnostics);
+        return None;
+    }
+    #[cfg(unix)]
     load_skill_from_content(&canonical, candidate, raw, diagnostics)
 }
 

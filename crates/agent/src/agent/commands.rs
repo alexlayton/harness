@@ -567,24 +567,15 @@ impl Agent {
                 .invocable()
                 .into_iter()
                 .find(|skill| skill.name.eq_ignore_ascii_case(&name))
-                .map(|skill| (skill.file_path.clone(), skill.name.clone()))
+                .map(|skill| (skill.instructions.clone(), skill.name.clone()))
         });
-        let Some((file_path, name)) = found else {
+        let Some((body, name)) = found else {
             send(events, AgentEvent::Error(format!("unknown skill: {name}")));
             return TurnControl::Continue;
         };
-        let raw = match std::fs::read_to_string(&file_path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                send(
-                    events,
-                    AgentEvent::Error(format!("could not read {name}: {error}")),
-                );
-                return TurnControl::Continue;
-            }
-        };
-        let (_, body) = tools::parse_frontmatter(&raw);
-        let body = body.trim();
+        // Discovery captured the body through a retained filesystem handle.
+        // Never reopen the catalogued pathname here: it may have been swapped
+        // to an external symlink since startup.
         if body.is_empty() {
             send(events, AgentEvent::Error(format!("skill {name} is empty")));
             return TurnControl::Continue;
