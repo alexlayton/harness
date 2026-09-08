@@ -79,6 +79,7 @@ mod tests {
             max_tokens: None,
             temperature: None,
             reasoning: ReasoningPolicy::Auto,
+            session_id: None,
         };
         let mut stream = provider
             .stream(&request)

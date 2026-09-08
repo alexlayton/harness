@@ -427,7 +427,7 @@ mod tests {
         let provider = HangingSummaryProvider;
         let policy = CompactionPolicy::default();
         let cancel = CancellationToken::new();
-        let mut summary = Box::pin(summarize(&provider, "demo", &plan, &policy, &cancel));
+        let mut summary = Box::pin(summarize(&provider, "demo", &plan, &policy, None, &cancel));
         let outcome = runtime.block_on(async {
             tokio::select! {
                 outcome = &mut summary => panic!("summary completed unexpectedly: {outcome:?}"),
@@ -450,6 +450,7 @@ mod tests {
             "demo",
             &plan,
             &CompactionPolicy::default(),
+            None,
             &cancel,
         ));
         assert_eq!(outcome, SummaryOutcome::Cancelled);
