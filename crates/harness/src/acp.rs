@@ -45,7 +45,7 @@ use anyhow::{Context as _, Result};
 use auth::CopilotAuth;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -182,12 +182,41 @@ struct AcpState {
     copilot_auth: Option<Arc<CopilotAuth>>,
     no_context_files: bool,
     sessions: Mutex<HashMap<String, SessionHandle>>,
+    /// Canonical IDs claimed before a load starts filesystem, MCP, or agent
+    /// assembly. This prevents duplicate requests from both starting agents.
+    loading_sessions: Mutex<HashSet<String>>,
     prompts: Arc<PromptTracker>,
     pending_assemblies: Mutex<HashMap<uuid::Uuid, PendingAssembly>>,
     transport_closed: AtomicBool,
 }
 
+/// RAII admission claim for a session being loaded. Every return path,
+/// including cancellation and panic unwinding, releases the claim.
+struct LoadReservation {
+    state: Arc<AcpState>,
+    id: String,
+}
+
+impl Drop for LoadReservation {
+    fn drop(&mut self) {
+        self.state.loading_sessions.lock().unwrap().remove(&self.id);
+    }
+}
+
 impl AcpState {
+    /// Claim a canonical session ID before expensive load assembly.
+    fn reserve_load(self: &Arc<Self>, id: &str) -> Result<LoadReservation> {
+        let sessions = self.sessions.lock().unwrap();
+        let mut loading = self.loading_sessions.lock().unwrap();
+        if sessions.contains_key(id) || !loading.insert(id.to_owned()) {
+            anyhow::bail!("session `{id}` is already loaded or loading");
+        }
+        Ok(LoadReservation {
+            state: self.clone(),
+            id: id.to_owned(),
+        })
+    }
+
     /// Claim an assembly task for this connection. The closed check is made
     /// both before and after taking the map lock so disconnect cannot race a
     /// task into an unowned gap.
@@ -290,6 +319,7 @@ where
         copilot_auth,
         no_context_files,
         sessions: Mutex::new(HashMap::new()),
+        loading_sessions: Mutex::new(HashSet::new()),
         prompts: Arc::new(PromptTracker {
             in_flight: Mutex::new(HashMap::new()),
         }),
@@ -822,12 +852,12 @@ async fn load_session_inner(
         Err(error) => return respond_invalid_params(responder, anyhow::Error::new(error)),
     };
     let id = parsed_id.to_string();
-    if state.sessions.lock().unwrap().contains_key(&id) {
-        return respond_invalid_params(
-            responder,
-            anyhow::anyhow!("session `{id}` is already loaded"),
-        );
-    }
+    // Reserve before filesystem/MCP/agent work. The guard releases admission
+    // on all failures; a successful registration then blocks later loads.
+    let _reservation = match state.reserve_load(&id) {
+        Ok(reservation) => reservation,
+        Err(error) => return respond_invalid_params(responder, error),
+    };
     if let Err(error) = assembly_cancelled(&cancel) {
         return respond_anyhow(responder, error);
     }
@@ -945,6 +975,13 @@ async fn delete_session(
     state: Arc<AcpState>,
 ) -> AcResult<()> {
     let id = request.session_id.0.to_string();
+    if state.loading_sessions.lock().unwrap().contains(&id) {
+        let _ = responder.respond_with_error(
+            AcError::invalid_request()
+                .data("cannot delete a session while it is loading".to_owned()),
+        );
+        return Ok(());
+    }
     // Reject deletion while a prompt is active. This keeps the protocol
     // response tied to a live session and avoids deleting a file whose agent
     // is still allowed to append a turn.
@@ -1762,6 +1799,7 @@ mod tests {
             copilot_auth: None,
             no_context_files: true,
             sessions: Mutex::new(HashMap::new()),
+            loading_sessions: Mutex::new(HashSet::new()),
             prompts: Arc::new(PromptTracker {
                 in_flight: Mutex::new(HashMap::new()),
             }),
@@ -2060,9 +2098,39 @@ done
         assert!(state.sessions.lock().unwrap().is_empty());
     }
 
-    /// Two completed assemblies racing to register one id must leave exactly
-    /// one owner in the map. The losing agent and forwarder are both aborted,
-    /// while the winner's input channel remains usable.
+    /// Duplicate load admission is claimed before assembly, so only one
+    /// request may start filesystem/MCP/agent work for a canonical ID.
+    #[tokio::test]
+    async fn concurrent_load_admission_starts_one_assembly() {
+        let state = test_acp_state();
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let attempted = Arc::new(tokio::sync::Barrier::new(2));
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let state = state.clone();
+            let start = start.clone();
+            let attempted = attempted.clone();
+            let admitted = admitted.clone();
+            tasks.push(tokio::spawn(async move {
+                start.wait().await;
+                let reservation = state.reserve_load("same-session").ok();
+                if reservation.is_some() {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+                attempted.wait().await;
+                reservation.is_some()
+            }));
+        }
+        let left = tasks.remove(0).await.unwrap();
+        let right = tasks.remove(0).await.unwrap();
+        assert_eq!(left as usize + right as usize, 1);
+        assert_eq!(admitted.load(Ordering::SeqCst), 1);
+        assert!(state.loading_sessions.lock().unwrap().is_empty());
+    }
+
+    /// The final insertion remains atomic as defense in depth: an assembled
+    /// loser cannot replace the original live owner.
     #[tokio::test]
     async fn concurrent_session_registration_keeps_original_and_cleans_loser() {
         let state = test_acp_state();
