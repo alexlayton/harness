@@ -803,15 +803,36 @@ fn file_identity(path: &Path) -> Result<(u64, u64)> {
 }
 
 #[derive(Deserialize)]
-struct IndexEnvelope {
+struct IndexHeaderEnvelope {
     version: Option<u32>,
     #[serde(rename = "type")]
+    kind: Option<String>,
+    session_id: Option<String>,
+    data: Option<Box<RawValue>>,
+}
+
+struct IndexEnvelope {
+    version: Option<u32>,
     kind: Option<String>,
     session_id: Option<String>,
     event_id: Option<String>,
     sequence: Option<u64>,
     timestamp: Option<String>,
-    data: Option<Box<RawValue>>,
+    data: IndexedData,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexedData {
+    provider: Option<String>,
+    model: Option<String>,
+    title: Option<String>,
+    message_nonempty: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexedMessage {
+    #[serde(default)]
+    content: Vec<IndexedContent>,
 }
 
 #[derive(Deserialize)]
@@ -821,21 +842,74 @@ struct IndexedContent {
     text: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
-struct IndexedMessage {
-    #[serde(default)]
-    content: Vec<IndexedContent>,
-}
+impl<'de> Deserialize<'de> for IndexEnvelope {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct EnvelopeVisitor;
+        impl<'de> serde::de::Visitor<'de> for EnvelopeVisitor {
+            type Value = IndexEnvelope;
 
-#[derive(Deserialize, Default)]
-struct IndexedModelChange {
-    provider: Option<String>,
-    model: Option<String>,
-}
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a session event envelope")
+            }
 
-#[derive(Deserialize, Default)]
-struct IndexedMetadataChange {
-    title: Option<String>,
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut envelope = IndexEnvelope {
+                    version: None,
+                    kind: None,
+                    session_id: None,
+                    event_id: None,
+                    sequence: None,
+                    timestamp: None,
+                    data: IndexedData::default(),
+                };
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" => envelope.version = map.next_value()?,
+                        "type" => envelope.kind = map.next_value()?,
+                        "session_id" => envelope.session_id = map.next_value()?,
+                        "event_id" => envelope.event_id = map.next_value()?,
+                        "sequence" => envelope.sequence = map.next_value()?,
+                        "timestamp" => envelope.timestamp = map.next_value()?,
+                        "data" => match envelope.kind.as_deref() {
+                            Some("model_change" | "metadata_change") => {
+                                envelope.data = map.next_value()?;
+                            }
+                            Some(kind @ ("user_message" | "assistant_message")) => {
+                                let message: IndexedMessage = map.next_value()?;
+                                envelope.data.message_nonempty = !message.content.is_empty();
+                                if kind == "user_message" {
+                                    envelope.data.title = message
+                                        .content
+                                        .iter()
+                                        .filter_map(|content| {
+                                            (content.kind.as_deref() == Some("text"))
+                                                .then_some(content.text.as_deref())
+                                                .flatten()
+                                        })
+                                        .find(|text| !text.trim().is_empty())
+                                        .map(index_title);
+                                }
+                            }
+                            _ => {
+                                let _: serde::de::IgnoredAny = map.next_value()?;
+                            }
+                        },
+                        _ => {
+                            let _: serde::de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(envelope)
+            }
+        }
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
 }
 
 fn indexed_data(data: Option<&RawValue>) -> &str {
@@ -871,7 +945,7 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
     {
         return Ok(None);
     }
-    let header: IndexEnvelope = match serde_json::from_str(&line) {
+    let header: IndexHeaderEnvelope = match serde_json::from_str(&line) {
         Ok(header) => header,
         Err(_) => return Ok(None),
     };
@@ -906,15 +980,12 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
     let mut has_conversation = false;
     let mut expected_sequence = 1u64;
     let mut event_ids = HashSet::new();
-    line.clear();
-    loop {
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|source| io_error("read session index", path, source))?;
-        if read == 0 {
-            break;
-        }
-        let raw: IndexEnvelope = match serde_json::from_str(&line) {
+    // Parse subsequent top-level JSON objects directly from the reader. Serde
+    // skips unknown `data` fields while reading, so a multi-megabyte tool
+    // result is never first accumulated into a line-sized String/RawValue.
+    let events = serde_json::Deserializer::from_reader(reader).into_iter::<IndexEnvelope>();
+    for raw in events {
+        let raw = match raw {
             Ok(raw) => raw,
             Err(_) => return Ok(None),
         };
@@ -944,47 +1015,26 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
         event_count = event_count.saturating_add(1);
         expected_sequence = expected_sequence.saturating_add(1);
         match kind {
-            "user_message" | "assistant_message" => {
-                let message =
-                    serde_json::from_str::<IndexedMessage>(indexed_data(raw.data.as_deref()))
-                        .unwrap_or_default();
-                if !message.content.is_empty() {
-                    has_conversation = true;
-                    if title.is_none() && kind == "user_message" {
-                        title = message
-                            .content
-                            .iter()
-                            .filter_map(|content| {
-                                (content.kind.as_deref() == Some("text"))
-                                    .then_some(content.text.as_deref())
-                                    .flatten()
-                            })
-                            .find(|text| !text.trim().is_empty())
-                            .map(index_title);
-                    }
+            // Only a user message's small title-bearing text is decoded.
+            // Assistant content and large tool-result payloads are skipped by
+            // `IgnoredAny` rather than accumulated in a line-sized buffer.
+            "user_message" => {
+                has_conversation |= raw.data.message_nonempty;
+                if title.is_none() {
+                    title = raw.data.title;
                 }
             }
+            "assistant_message" => has_conversation |= raw.data.message_nonempty,
             "reasoning" | "tool_call" | "tool_result" | "compaction" => {
                 has_conversation = true;
             }
             "model_change" => {
-                if let Ok(change) =
-                    serde_json::from_str::<IndexedModelChange>(indexed_data(raw.data.as_deref()))
-                {
-                    provider = change.provider;
-                    model = change.model;
-                }
+                provider = raw.data.provider;
+                model = raw.data.model;
             }
-            "metadata_change" => {
-                title = serde_json::from_str::<IndexedMetadataChange>(indexed_data(
-                    raw.data.as_deref(),
-                ))
-                .ok()
-                .and_then(|change| change.title);
-            }
+            "metadata_change" => title = raw.data.title,
             _ => {}
         }
-        line.clear();
     }
     let bytes = fs::metadata(path)
         .map(|metadata| metadata.len())
