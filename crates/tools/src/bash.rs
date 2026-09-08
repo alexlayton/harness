@@ -520,9 +520,24 @@ impl CgroupGuard {
         if !root.join("cgroup.controllers").is_file() {
             return None;
         }
+        // Delegation normally grants write access to this process's current
+        // subtree, not to the cgroup-v2 mount root. Resolve `0::<path>` from
+        // procfs and reject every non-normal component before joining it.
+        let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?;
+        let mut base = root.to_path_buf();
+        for component in Path::new(relative).components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::Normal(part) => base.push(part),
+                std::path::Component::ParentDir | std::path::Component::Prefix(_) => return None,
+            }
+        }
         for _ in 0..8 {
             let number = CGROUP_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = root.join(format!("harness-bash-{}-{number}", std::process::id()));
+            let path = base.join(format!("harness-bash-{}-{number}", std::process::id()));
             match std::fs::create_dir(&path) {
                 Ok(()) if path.join("cgroup.kill").is_file() => {
                     return Some(Self { path });
