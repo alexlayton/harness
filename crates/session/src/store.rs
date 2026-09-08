@@ -811,14 +811,27 @@ struct IndexHeaderEnvelope {
     data: Option<Box<RawValue>>,
 }
 
+#[derive(Deserialize)]
 struct IndexEnvelope {
     version: Option<u32>,
+    #[serde(rename = "type")]
     kind: Option<String>,
     session_id: Option<String>,
     event_id: Option<String>,
     sequence: Option<u64>,
     timestamp: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexedDataEnvelope {
+    #[serde(default)]
     data: IndexedData,
+}
+
+#[derive(Deserialize, Default)]
+struct IndexedMessageEnvelope {
+    #[serde(default)]
+    data: IndexedMessage,
 }
 
 #[derive(Deserialize, Default)]
@@ -826,7 +839,6 @@ struct IndexedData {
     provider: Option<String>,
     model: Option<String>,
     title: Option<String>,
-    message_nonempty: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -840,76 +852,6 @@ struct IndexedContent {
     #[serde(rename = "type")]
     kind: Option<String>,
     text: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for IndexEnvelope {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct EnvelopeVisitor;
-        impl<'de> serde::de::Visitor<'de> for EnvelopeVisitor {
-            type Value = IndexEnvelope;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a session event envelope")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut envelope = IndexEnvelope {
-                    version: None,
-                    kind: None,
-                    session_id: None,
-                    event_id: None,
-                    sequence: None,
-                    timestamp: None,
-                    data: IndexedData::default(),
-                };
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "version" => envelope.version = map.next_value()?,
-                        "type" => envelope.kind = map.next_value()?,
-                        "session_id" => envelope.session_id = map.next_value()?,
-                        "event_id" => envelope.event_id = map.next_value()?,
-                        "sequence" => envelope.sequence = map.next_value()?,
-                        "timestamp" => envelope.timestamp = map.next_value()?,
-                        "data" => match envelope.kind.as_deref() {
-                            Some("model_change" | "metadata_change") => {
-                                envelope.data = map.next_value()?;
-                            }
-                            Some(kind @ ("user_message" | "assistant_message")) => {
-                                let message: IndexedMessage = map.next_value()?;
-                                envelope.data.message_nonempty = !message.content.is_empty();
-                                if kind == "user_message" {
-                                    envelope.data.title = message
-                                        .content
-                                        .iter()
-                                        .filter_map(|content| {
-                                            (content.kind.as_deref() == Some("text"))
-                                                .then_some(content.text.as_deref())
-                                                .flatten()
-                                        })
-                                        .find(|text| !text.trim().is_empty())
-                                        .map(index_title);
-                                }
-                            }
-                            _ => {
-                                let _: serde::de::IgnoredAny = map.next_value()?;
-                            }
-                        },
-                        _ => {
-                            let _: serde::de::IgnoredAny = map.next_value()?;
-                        }
-                    }
-                }
-                Ok(envelope)
-            }
-        }
-        deserializer.deserialize_map(EnvelopeVisitor)
-    }
 }
 
 fn indexed_data(data: Option<&RawValue>) -> &str {
@@ -932,22 +874,91 @@ fn index_title(value: &str) -> String {
     format!("{}…", &first_line[..end])
 }
 
+#[derive(Clone, Copy)]
+struct IndexSpan {
+    start: u64,
+    bytes: u64,
+    end: u64,
+}
+
+enum IndexRecord<T> {
+    Eof,
+    Invalid,
+    Value(T, IndexSpan),
+}
+
+/// Deserialize one physical JSONL line without first collecting it in a
+/// line-sized buffer. Scanning uses `BufRead::fill_buf`; the reader is then
+/// rewound and serde receives an exact-length `Take`, so concatenated objects,
+/// blank lines, and trailing garbage remain invalid JSONL records.
+fn next_index_record<T: serde::de::DeserializeOwned>(
+    reader: &mut BufReader<File>,
+) -> std::io::Result<IndexRecord<T>> {
+    let start = reader.stream_position()?;
+    let mut line_bytes = 0u64;
+    let mut terminated = false;
+    let mut has_non_whitespace = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            break;
+        }
+        if let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+            has_non_whitespace |= buffer[..newline]
+                .iter()
+                .any(|byte| !byte.is_ascii_whitespace());
+            line_bytes = line_bytes.saturating_add(newline as u64);
+            reader.consume(newline + 1);
+            terminated = true;
+            break;
+        }
+        has_non_whitespace |= buffer.iter().any(|byte| !byte.is_ascii_whitespace());
+        line_bytes = line_bytes.saturating_add(buffer.len() as u64);
+        let consumed = buffer.len();
+        reader.consume(consumed);
+    }
+    let end = reader.stream_position()?;
+    if line_bytes == 0 && !terminated {
+        return Ok(IndexRecord::Eof);
+    }
+    if !has_non_whitespace {
+        return Ok(IndexRecord::Invalid);
+    }
+
+    reader.seek(SeekFrom::Start(start))?;
+    let parsed = serde_json::from_reader(reader.by_ref().take(line_bytes));
+    reader.seek(SeekFrom::Start(end))?;
+    let span = IndexSpan {
+        start,
+        bytes: line_bytes,
+        end,
+    };
+    Ok(match parsed {
+        Ok(value) => IndexRecord::Value(value, span),
+        Err(_) => IndexRecord::Invalid,
+    })
+}
+
+fn parse_index_span<T: serde::de::DeserializeOwned>(
+    reader: &mut BufReader<File>,
+    span: IndexSpan,
+) -> std::io::Result<Option<T>> {
+    reader.seek(SeekFrom::Start(span.start))?;
+    let parsed = serde_json::from_reader(reader.by_ref().take(span.bytes)).ok();
+    reader.seek(SeekFrom::Start(span.end))?;
+    Ok(parsed)
+}
+
 /// Read only the metadata needed by the session picker. This deliberately
 /// avoids rebuilding provider messages or cloning large tool results.
 fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionIndexEntry>> {
     let file = File::open(path).map_err(|source| io_error("open session index", path, source))?;
     let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    if reader
-        .read_line(&mut line)
+    let header: IndexHeaderEnvelope = match next_index_record(&mut reader)
         .map_err(|source| io_error("read session header", path, source))?
-        == 0
     {
-        return Ok(None);
-    }
-    let header: IndexHeaderEnvelope = match serde_json::from_str(&line) {
-        Ok(header) => header,
-        Err(_) => return Ok(None),
+        IndexRecord::Value(header, _) => header,
+        IndexRecord::Eof | IndexRecord::Invalid => return Ok(None),
     };
     if header.version.is_none()
         || header.version.unwrap_or_default() > crate::model::FORMAT_VERSION
@@ -980,15 +991,18 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
     let mut has_conversation = false;
     let mut expected_sequence = 1u64;
     let mut event_ids = HashSet::new();
-    // Parse subsequent top-level JSON objects directly from the reader. Serde
-    // skips unknown `data` fields while reading, so a multi-megabyte tool
-    // result is never first accumulated into a line-sized String/RawValue.
-    let events = serde_json::Deserializer::from_reader(reader).into_iter::<IndexEnvelope>();
-    for raw in events {
-        let raw = match raw {
-            Ok(raw) => raw,
-            Err(_) => return Ok(None),
+    // Parse one physical record at a time while serde skips irrelevant `data`
+    // fields. Multi-megabyte tool results are neither retained as RawValue nor
+    // accumulated into a line-sized String.
+    loop {
+        let raw = match next_index_record::<IndexEnvelope>(&mut reader)
+            .map_err(|source| io_error("read session index", path, source))?
+        {
+            IndexRecord::Value(raw, span) => (raw, span),
+            IndexRecord::Eof => break,
+            IndexRecord::Invalid => return Ok(None),
         };
+        let (raw, span) = raw;
         if raw.version.is_none()
             || raw.version.unwrap_or_default() > crate::model::FORMAT_VERSION
             || raw.kind.as_deref() == Some("session")
@@ -1015,24 +1029,51 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
         event_count = event_count.saturating_add(1);
         expected_sequence = expected_sequence.saturating_add(1);
         match kind {
-            // Only a user message's small title-bearing text is decoded.
-            // Assistant content and large tool-result payloads are skipped by
-            // `IgnoredAny` rather than accumulated in a line-sized buffer.
-            "user_message" => {
-                has_conversation |= raw.data.message_nonempty;
-                if title.is_none() {
-                    title = raw.data.title;
+            // Re-read only metadata-bearing records from the bounded physical
+            // span. This second pass is independent of JSON object key order;
+            // large tool-result payloads are never materialized.
+            "user_message" | "assistant_message" => {
+                let Some(message) =
+                    parse_index_span::<IndexedMessageEnvelope>(&mut reader, span)
+                        .map_err(|source| io_error("read session message index", path, source))?
+                else {
+                    return Ok(None);
+                };
+                has_conversation |= !message.data.content.is_empty();
+                if title.is_none() && kind == "user_message" {
+                    title = message
+                        .data
+                        .content
+                        .iter()
+                        .filter_map(|content| {
+                            (content.kind.as_deref() == Some("text"))
+                                .then_some(content.text.as_deref())
+                                .flatten()
+                        })
+                        .find(|text| !text.trim().is_empty())
+                        .map(index_title);
                 }
             }
-            "assistant_message" => has_conversation |= raw.data.message_nonempty,
             "reasoning" | "tool_call" | "tool_result" | "compaction" => {
                 has_conversation = true;
             }
             "model_change" => {
-                provider = raw.data.provider;
-                model = raw.data.model;
+                let Some(change) = parse_index_span::<IndexedDataEnvelope>(&mut reader, span)
+                    .map_err(|source| io_error("read session model index", path, source))?
+                else {
+                    return Ok(None);
+                };
+                provider = change.data.provider;
+                model = change.data.model;
             }
-            "metadata_change" => title = raw.data.title,
+            "metadata_change" => {
+                let Some(change) = parse_index_span::<IndexedDataEnvelope>(&mut reader, span)
+                    .map_err(|source| io_error("read session metadata index", path, source))?
+                else {
+                    return Ok(None);
+                };
+                title = change.data.title;
+            }
             _ => {}
         }
     }
@@ -1674,6 +1715,102 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "listing touched the payload: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn listing_rejects_concatenated_records_on_one_line() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        for text in ["one", "two"] {
+            store
+                .append_event(
+                    &mut session,
+                    SessionEvent::UserMessage {
+                        message: StoredMessage::from_llm(&Message::user(text)),
+                    },
+                )
+                .unwrap();
+        }
+        let path = session.file_path().unwrap();
+        let lines = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        fs::write(path, format!("{}\n{}{}\n", lines[0], lines[1], lines[2])).unwrap();
+        assert!(
+            index_file(path, Some(store.workspace_root()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn listing_rejects_blank_jsonl_records() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("hello")),
+                },
+            )
+            .unwrap();
+        let path = session.file_path().unwrap();
+        let contents = fs::read_to_string(path).unwrap();
+        fs::write(path, contents.replacen('\n', "\n\n", 1)).unwrap();
+        assert!(
+            index_file(path, Some(store.workspace_root()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn listing_accepts_data_before_type_and_preserves_user_metadata() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("hello reordered")),
+                },
+            )
+            .unwrap();
+        let path = session.file_path().unwrap();
+        let mut lines = fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let value: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        let object = value.as_object().unwrap();
+        let data = serde_json::to_string(&object["data"]).unwrap();
+        let kind = serde_json::to_string(&object["type"]).unwrap();
+        let mut reordered = format!("{{\"data\":{data},\"type\":{kind}");
+        for key in ["version", "session_id", "event_id", "sequence", "timestamp"] {
+            reordered.push(',');
+            reordered.push_str(&serde_json::to_string(key).unwrap());
+            reordered.push(':');
+            reordered.push_str(&serde_json::to_string(&object[key]).unwrap());
+        }
+        reordered.push('}');
+        lines[1] = reordered;
+        fs::write(path, format!("{}\n{}\n", lines[0], lines[1])).unwrap();
+
+        let entry = index_file(path, Some(store.workspace_root()))
+            .unwrap()
+            .unwrap();
+        assert!(entry.has_conversation);
+        assert_eq!(entry.title.as_deref(), Some("hello reordered"));
     }
 
     #[test]
