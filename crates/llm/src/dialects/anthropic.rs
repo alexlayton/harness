@@ -423,15 +423,23 @@ impl AnthropicParser {
                     .map(StreamEvent::ToolCallComplete)
                     .collect::<Vec<_>>();
                 self.done = true;
-                output.push(StreamEvent::Done {
-                    stop_reason: self.stop_reason.clone(),
-                    usage: Some(Usage {
+                let usage = if self.input_tokens.is_some()
+                    || self.output_tokens.is_some()
+                    || self.cached_tokens.is_some()
+                {
+                    Some(Usage {
                         input_tokens: self.input_tokens.unwrap_or(0),
                         output_tokens: self.output_tokens.unwrap_or(0),
                         cached_tokens: self.cached_tokens,
                         reasoning_tokens: None,
                         cost: None,
-                    }),
+                    })
+                } else {
+                    None
+                };
+                output.push(StreamEvent::Done {
+                    stop_reason: self.stop_reason.clone(),
+                    usage,
                 });
                 Ok(output)
             }
@@ -600,6 +608,16 @@ mod tests {
                 }),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn message_stop_without_usage_does_not_synthesize_zero_usage() {
+        let mut parser = AnthropicParser::new();
+        let done = parser.parse_payload(r#"{"type":"message_stop"}"#).unwrap();
+        assert!(matches!(
+            done.as_slice(),
+            [StreamEvent::Done { usage: None, .. }]
         ));
     }
 
