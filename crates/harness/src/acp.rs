@@ -43,6 +43,7 @@ use agent_client_protocol::{
 };
 use anyhow::{Context as _, Result};
 use auth::CopilotAuth;
+use fs2::FileExt;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
@@ -703,8 +704,9 @@ impl Drop for CreatedSessionFile {
         if !self.armed {
             return;
         }
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_file(self.path.with_extension("jsonl.lock"));
+        // Coordinate cleanup with any process that discovered the new file,
+        // and retain the sidecar inode for future contenders.
+        let _ = remove_session_file_locked(&self.path);
     }
 }
 
@@ -1060,17 +1062,7 @@ fn delete_session_everywhere(id: &str, session_root: &std::path::Path) -> Result
         let path = workspace_dir.join(&file_name);
         match std::fs::metadata(&path) {
             Ok(metadata) if metadata.is_file() => {
-                std::fs::remove_file(&path)
-                    .with_context(|| format!("delete `{}`", path.display()))?;
-                let lock_path = path.with_extension("jsonl.lock");
-                match std::fs::remove_file(&lock_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(anyhow::Error::new(error)
-                            .context(format!("delete `{}`", lock_path.display())));
-                    }
-                }
+                remove_session_file_locked(&path)?;
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1082,6 +1074,38 @@ fn delete_session_everywhere(id: &str, session_root: &std::path::Path) -> Result
         }
     }
     Ok(())
+}
+
+/// Remove one session while holding the same retained advisory sidecar used
+/// by appenders. The sidecar is never unlinked: waiters that opened it before
+/// deletion must continue coordinating on the same inode.
+fn remove_session_file_locked(path: &std::path::Path) -> Result<()> {
+    let lock_path = path.with_extension("jsonl.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| format!("open session lock `{}`", lock_path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("secure session lock `{}`", lock_path.display()))?;
+    }
+    lock.lock_exclusive()
+        .with_context(|| format!("lock session `{}`", path.display()))?;
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context(format!("delete `{}`", path.display())))
+        }
+    }
 }
 
 async fn prompt(
@@ -2098,6 +2122,35 @@ done
         assert!(state.sessions.lock().unwrap().is_empty());
     }
 
+    /// Deletion waits for current appenders and never removes the coordination
+    /// inode from beneath already-open or future contenders.
+    #[test]
+    fn deletion_coordinates_on_retained_sidecar_inode() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("session.jsonl");
+        std::fs::write(&path, "session").unwrap();
+        let lock_path = path.with_extension("jsonl.lock");
+        let owner = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        owner.lock_exclusive().unwrap();
+
+        let deleting = std::thread::spawn({
+            let path = path.clone();
+            move || remove_session_file_locked(&path)
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(path.exists(), "delete bypassed the held session lock");
+        owner.unlock().unwrap();
+        deleting.join().unwrap().unwrap();
+        assert!(!path.exists());
+        assert!(lock_path.exists(), "sidecar inode must be retained");
+    }
+
     /// Duplicate load admission is claimed before assembly, so only one
     /// request may start filesystem/MCP/agent work for a canonical ID.
     #[tokio::test]
@@ -2118,6 +2171,7 @@ done
                 if reservation.is_some() {
                     admitted.fetch_add(1, Ordering::SeqCst);
                 }
+                // Keep the winner's claim alive until the loser has tried.
                 attempted.wait().await;
                 reservation.is_some()
             }));
