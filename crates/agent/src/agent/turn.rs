@@ -4,25 +4,69 @@ use super::{Agent, AgentEvent, CompactionReason, MAX_TURN_RECOVERIES, TurnError,
 use crate::prompt::system_prompt_with_workspace_context;
 use futures_util::stream::StreamExt;
 use llm::{
-    CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent, ToolCall,
-    truncate_utf8,
+    CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent, truncate_utf8,
 };
 use session::{SessionEvent, usage_summary};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 impl Agent {
-    /// Run one user turn: persist the message, stream the provider response,
-    /// execute any tool calls, and persist every durable event.  Returns
-    /// [`TurnError::Shutdown`] only when the application cancellation token
-    /// fired mid-turn, so `run` can stop immediately.
+    /// The single shared turn executor used by normal user messages and
+    /// skill-invoked messages alike. It owns the whole operation boundary:
+    ///
+    /// - builds a turn-scoped child token of the application token;
+    /// - propagates shutdown (`TurnControl::Shutdown`);
+    /// - quarantines/stops after persistence failure
+    ///   (`TurnControl::Quarantine`, mirroring the run-loop quarantine);
+    /// - flushes deferred session writes exactly once at the boundary;
+    /// - emits the one terminal event for the operation, after both the body
+    ///   and its durability boundary have finished.
+    ///
+    /// Keeping `TurnFinished` here is important: a body can complete and emit
+    /// all of its durable records before the deferred sync fails. The failure
+    /// still quarantines the agent, but it must not create a second terminal
+    /// event in the run loop.
+    pub(crate) async fn execute_turn(
+        &mut self,
+        user_text: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+    ) -> TurnControl {
+        let turn_cancel = self.cancel.child_token();
+        let outcome = self
+            .run_turn_body(user_text, events, input, &turn_cancel)
+            .await;
+        // Deferred-sync boundary: one durable flush per operation, for both
+        // normal and skill-invoked turns. A failed fsync quarantines even if
+        // the turn body otherwise completed successfully.
+        let flush_failed = self.flush_deferred_sync(events).is_err();
+        let control = if flush_failed {
+            TurnControl::Quarantine
+        } else {
+            match outcome {
+                Ok(()) => TurnControl::Continue,
+                Err(TurnError::Shutdown) => TurnControl::Shutdown,
+                Err(TurnError::Persist(_)) => TurnControl::Quarantine,
+            }
+        };
+        // This is the sole owner of the normal/skill turn terminal event.
+        // Command operations such as `/compact` and `/model` have their own
+        // frontend events and intentionally do not use TurnFinished.
+        send(events, AgentEvent::TurnFinished);
+        control
+    }
+
+    /// Turn body: everything `run_turn` historically did, minus token
+    /// construction and the deferred-sync flush (both owned by
+    /// [`Self::execute_turn`]).
     #[tracing::instrument(
         name = "turn",
         skip(self, events, input, cancel),
         fields(user_text = %truncate_utf8(&user_text, 200))
     )]
-    pub(crate) async fn run_turn(
+    async fn run_turn_body(
         &mut self,
         user_text: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
@@ -32,18 +76,66 @@ impl Agent {
         // Pre-turn auto-compaction trigger: run *before* the request is built
         // (never mid-stream), so provider-history validity is trivial. Exact
         // context from the last request when available, plus the new message
-        // this turn is about to add.
-        if self.should_auto_compact(&user_text) {
-            let context = self.context_tokens_estimate(user_text.len());
+        // this turn is about to add. The estimate is computed once and
+        // threaded through the percent notice and `compact_and_reload` so
+        // one pre-turn scans the live range a single time (PERF-1).
+        if let Some(context) = self.should_auto_compact(&user_text) {
             let percent = if self.context_window > 0 {
                 ((context as f64 / self.context_window as f64) * 100.0) as u32
             } else {
                 0
             };
-            if self
-                .compact_and_reload(events, cancel, CompactionReason::Auto)
-                .await?
-            {
+            let application = self.cancel.clone();
+            let mut buffered = VecDeque::new();
+            let mut input_open = self.input_open;
+            let mut interrupted = false;
+            let compacted = {
+                let mut application_open = true;
+                let compaction = self.compact_and_reload(
+                    events,
+                    cancel,
+                    CompactionReason::Auto,
+                    user_text.len(),
+                    Some(context),
+                );
+                tokio::pin!(compaction);
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut compaction => break result,
+                        _ = application.cancelled(), if application_open => {
+                            application_open = false;
+                            cancel.cancel();
+                        }
+                        message = input.recv(), if input_open => match message {
+                            Some(InputMessage::Interrupt) => {
+                                interrupted = true;
+                                cancel.cancel();
+                            }
+                            Some(message) => buffered.push_back(message),
+                            None => input_open = false,
+                        },
+                    }
+                }
+            };
+            self.input_open = input_open;
+            self.queued.extend(buffered);
+            let compacted = match compacted {
+                Ok(compacted) => compacted,
+                Err(TurnError::Shutdown) => {
+                    self.persist_cancelled("application shutdown", events)?;
+                    return Err(TurnError::Shutdown);
+                }
+                Err(error) => return Err(error),
+            };
+            if interrupted || cancel.is_cancelled() {
+                self.persist_cancelled("turn interrupted during compaction", events)?;
+                if application.is_cancelled() {
+                    return Err(TurnError::Shutdown);
+                }
+                return Ok(());
+            }
+            if compacted {
                 send(
                     events,
                     AgentEvent::Notice(format!("auto-compacted: context at {percent}% of window")),
@@ -94,8 +186,7 @@ impl Agent {
                     // failed request can enter its retry path after Esc.
                     biased;
                     _ = self.cancel.cancelled() => {
-                        self.persist_cancelled("application shutdown", events);
-                        send(events, AgentEvent::TurnFinished);
+                        self.persist_cancelled("application shutdown", events)?;
                         return Err(TurnError::Shutdown);
                     }
                     _ = cancel.cancelled() => break None,
@@ -111,8 +202,7 @@ impl Agent {
                 }
             };
             let Some(stream_result) = stream_result else {
-                self.persist_cancelled("turn interrupted before response", events);
-                send(events, AgentEvent::TurnFinished);
+                self.persist_cancelled("turn interrupted before response", events)?;
                 return Ok(());
             };
             let mut stream = match stream_result {
@@ -136,15 +226,16 @@ impl Agent {
                         events,
                     )?;
                     send(events, AgentEvent::Error(message));
-                    send(events, AgentEvent::TurnFinished);
                     return Ok(());
                 }
             };
 
             let mut text = String::new();
             let mut reasoning = String::new();
-            let mut tool_calls = Vec::<ToolCall>::new();
-            let mut opaque = Vec::<(String, serde_json::Value)>::new();
+            // Preserve the wire order of opaque provider state and function
+            // calls. Codex requires encrypted reasoning to remain interleaved
+            // with calls when the next request is rebuilt.
+            let mut assistant_items = Vec::<Content>::new();
             let mut cancelled = false;
             let mut stream_error = None;
 
@@ -184,8 +275,8 @@ impl Agent {
                                 reasoning.push_str(&delta);
                                 send(events, AgentEvent::ReasoningDelta(delta));
                             }
-                            Ok(StreamEvent::OpaqueState { provider, data }) => opaque.push((provider, data)),
-                            Ok(StreamEvent::ToolCallComplete(call)) => tool_calls.push(call),
+                            Ok(StreamEvent::OpaqueState { provider, data }) => assistant_items.push(Content::Opaque { provider, data }),
+                            Ok(StreamEvent::ToolCallComplete(call)) => assistant_items.push(Content::ToolCall(call)),
                             Ok(StreamEvent::Done { usage: done_usage, .. }) => {
                                 if let Some(done_usage) = done_usage {
                                     // Exact context occupancy of the request
@@ -205,6 +296,13 @@ impl Agent {
                                         send(events, usage_event(&summary));
                                     }
                                     send(events, self.context_usage_event());
+                                } else {
+                                    // A provider may omit usage on a valid
+                                    // terminal event. Do not keep using an
+                                    // older exact count; fall back to the
+                                    // current full-request estimator.
+                                    self.last_context_tokens = None;
+                                    send(events, self.context_usage_event());
                                 }
                             }
                             Err(error) => {
@@ -216,15 +314,17 @@ impl Agent {
                 }
             }
 
+            let tool_calls = assistant_items
+                .iter()
+                .filter_map(|item| match item {
+                    Content::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
             if cancelled {
-                self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
-                append_assistant(
-                    &mut self.history,
-                    &reasoning,
-                    &text,
-                    &opaque,
-                    tool_calls.clone(),
-                );
+                self.persist_assistant(&reasoning, &text, &assistant_items, events)?;
+                append_assistant(&mut self.history, &reasoning, &text, &assistant_items);
                 for call in &tool_calls {
                     let cancelled_result = "cancelled before tool execution";
                     self.persist_tool_result(call, cancelled_result, true, events)?;
@@ -234,22 +334,21 @@ impl Agent {
                         true,
                     ));
                 }
-                self.persist_cancelled("turn interrupted", events);
-                send(events, AgentEvent::TurnFinished);
+                self.persist_cancelled("turn interrupted", events)?;
                 if self.cancel.is_cancelled() {
                     return Err(TurnError::Shutdown);
                 }
                 return Ok(());
             }
 
-            self.persist_assistant(&reasoning, &text, &opaque, &tool_calls, events)?;
-            append_assistant(
-                &mut self.history,
-                &reasoning,
-                &text,
-                &opaque,
-                tool_calls.clone(),
-            );
+            self.persist_assistant(&reasoning, &text, &assistant_items, events)?;
+            append_assistant(&mut self.history, &reasoning, &text, &assistant_items);
+            if stream_error.is_some() || !tool_calls.is_empty() {
+                // A stream may have emitted partial assistant content or tool
+                // calls before its next request. The old Done count no longer
+                // covers that newly appended history.
+                self.last_context_tokens = None;
+            }
 
             if let Some(error) = stream_error {
                 let message = error.to_string();
@@ -318,7 +417,6 @@ impl Agent {
                 if retried {
                     continue;
                 }
-                send(events, AgentEvent::TurnFinished);
                 return Ok(());
             }
 
@@ -336,14 +434,38 @@ impl Agent {
                     );
                     continue;
                 }
-                send(events, AgentEvent::TurnFinished);
                 return Ok(());
             }
 
             self.dispatch_tool_batches(tool_calls, events, input, cancel)
                 .await?;
+            // The dispatcher marks the turn-scoped token when tool
+            // execution is interrupted. Do not issue another provider
+            // request; the shared turn boundary owns TurnFinished.
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            // Tool results are appended after the provider's Done usage was
+            // observed. That exact snapshot no longer describes the next
+            // request, so use the complete-history estimator instead.
+            self.last_context_tokens = None;
         }
     }
+}
+
+/// Explicit control flow for command handlers and turn execution.
+/// Replaces the old pattern of swallowing `TurnError::Shutdown` and
+/// `TurnError::Persist` at skill-invocation sites: every handler returns
+/// how the run loop must proceed, and the loop acts on it in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnControl {
+    /// Operation completed; keep draining queued input.
+    Continue,
+    /// Application shutdown fired: stop the run loop immediately.
+    Shutdown,
+    /// Persistence failed mid-operation: stop like the run-loop quarantine
+    /// so no queued work runs on divergent history.
+    Quarantine,
 }
 
 /// Push a non-durable recovery note into history, preserving provider role
@@ -374,10 +496,9 @@ pub(crate) fn append_assistant(
     history: &mut Vec<Message>,
     reasoning: &str,
     text: &str,
-    opaque: &[(String, serde_json::Value)],
-    calls: Vec<ToolCall>,
+    items: &[Content],
 ) {
-    if reasoning.is_empty() && text.is_empty() && opaque.is_empty() && calls.is_empty() {
+    if reasoning.is_empty() && text.is_empty() && items.is_empty() {
         return;
     }
     let mut content = Vec::new();
@@ -387,11 +508,18 @@ pub(crate) fn append_assistant(
     if !text.is_empty() {
         content.push(Content::Text(text.to_owned()));
     }
-    content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-        provider: provider.clone(),
-        data: data.clone(),
-    }));
-    content.extend(calls.into_iter().map(Content::ToolCall));
+    let has_opaque = items
+        .iter()
+        .any(|item| matches!(item, Content::Opaque { .. }));
+    if has_opaque {
+        content.extend(items.iter().cloned());
+    } else {
+        content.extend(items.iter().filter_map(|item| match item {
+            Content::Opaque { .. } => None,
+            Content::ToolCall(call) => Some(Content::ToolCall(call.clone())),
+            _ => None,
+        }));
+    }
     history.push(Message {
         role: Role::Assistant,
         content,

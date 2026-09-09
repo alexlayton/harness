@@ -25,7 +25,11 @@ editor opens.
 ACP `session/new` and `session/load` can supply stdio MCP servers for that
 session. Session declarations replace the MCP servers in local configuration;
 they do not merge with them. Harness rejects HTTP, SSE, and MCP-over-ACP
-server declarations.
+server declarations. ACP gives session assembly a separate 35-second bound,
+which leaves room for both the 15-second MCP initialize and catalogue deadlines
+when they occur sequentially. Disconnect and session deletion retain a short
+cleanup bound and cancel the owned agent/MCP tasks before using it as a final
+fallback.
 
 > [!WARNING]
 > Tools run without a permission or confirmation step. An editor that sends a

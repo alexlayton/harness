@@ -6,7 +6,8 @@ publish.workspace = true
 description = "GitHub Copilot authentication and private credential storage for Harness"
 
 [dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form"] }
+fs2 = "0.4"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "form", "stream"] }
 # The `ring` crypto provider must be installed before any reqwest client is
 # built (see crates/llm — the same provider install covers this crate). Kept
 # as a direct dependency so the feature intent is explicit here too.
@@ -17,9 +18,16 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "time", "net", "io-util"] }
 tokio-util = "0.7"
+# Only for `StreamExt::next` on bounded OAuth body reads; tokio-util does not
+# re-export a stream polling adapter suitable here.
+bytes = "1"
+futures-util = "0.3"
 url = "2"
-base64 = "0.23"
+base64 = "0.22"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util", "time"] }

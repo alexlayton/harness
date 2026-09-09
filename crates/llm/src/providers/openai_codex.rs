@@ -103,21 +103,8 @@ impl Provider for OpenAiCodexProvider {
             .ensure_valid()
             .await
             .map_err(|error| LlmError::Auth(error.to_string()))?;
-        let mut headers = HeaderMap::new();
+        let mut headers = codex_headers(&credential.account_id)?;
         headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        headers.insert(
-            HeaderName::from_static("chatgpt-account-id"),
-            HeaderValue::from_str(&credential.account_id)
-                .map_err(|_| LlmError::Auth("invalid Codex account id".into()))?,
-        );
-        headers.insert(
-            HeaderName::from_static("originator"),
-            HeaderValue::from_static("harness"),
-        );
-        headers.insert(
-            HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("harness/0.1"),
-        );
         headers.insert(
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses=experimental"),
@@ -144,20 +131,7 @@ impl Provider for OpenAiCodexProvider {
             .ensure_valid()
             .await
             .map_err(|error| LlmError::Auth(error.to_string()))?;
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            HeaderName::from_static("chatgpt-account-id"),
-            HeaderValue::from_str(&credential.account_id)
-                .map_err(|_| LlmError::Auth("invalid Codex account id".into()))?,
-        );
-        headers.insert(
-            HeaderName::from_static("originator"),
-            HeaderValue::from_static("harness"),
-        );
-        headers.insert(
-            HeaderName::from_static("user-agent"),
-            HeaderValue::from_static("harness/0.1"),
-        );
+        let headers = codex_headers(&credential.account_id)?;
         let client = HttpClient::with_headers(&self.endpoint, credential.access.clone(), headers);
         let response = client
             .get("/usage")
@@ -268,17 +242,28 @@ fn count_label(count: u64, unit: &str) -> String {
     format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
 }
 
+fn codex_headers(account_id: &str) -> Result<HeaderMap, LlmError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("chatgpt-account-id"),
+        HeaderValue::from_str(account_id)
+            .map_err(|_| LlmError::Auth("invalid Codex account id".into()))?,
+    );
+    headers.insert(
+        HeaderName::from_static("originator"),
+        HeaderValue::from_static("harness"),
+    );
+    headers.insert(
+        HeaderName::from_static("user-agent"),
+        HeaderValue::from_static(concat!("harness/", env!("CARGO_PKG_VERSION"))),
+    );
+    Ok(headers)
+}
+
+/// Consolidated OAuth-provider redaction: delegate to the shared
+/// [`LlmError::redacted`] point so every variant is covered once.
 fn redact(error: LlmError, secret: &str) -> LlmError {
-    match error {
-        LlmError::Http { status, body } => LlmError::Http {
-            status,
-            body: body.replace(secret, "[redacted]"),
-        },
-        LlmError::Network(error) => LlmError::Network(error),
-        LlmError::Stream(message) => LlmError::Stream(message.replace(secret, "[redacted]")),
-        LlmError::Parse(message) => LlmError::Parse(message.replace(secret, "[redacted]")),
-        LlmError::Auth(message) => LlmError::Auth(message.replace(secret, "[redacted]")),
-    }
+    error.redacted(secret)
 }
 
 #[cfg(test)]

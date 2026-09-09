@@ -6,7 +6,6 @@ use crate::{
     CompletionRequest, Content, EventStream, LlmError, Message, ReasoningPolicy, Role, StreamEvent,
     ToolCall, ToolDefinition, Usage,
 };
-use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use serde_json::{Map, Value, json};
 
@@ -48,7 +47,11 @@ impl OpenAiResponsesClient {
             // discarded.
             Err(error)
                 if req.reasoning == ReasoningPolicy::Auto
-                    && matches!(&error, LlmError::Http { status: 400, body } if body.to_ascii_lowercase().contains("reasoning")) =>
+                    && matches!(&error, LlmError::Http {
+                        status: 400,
+                        body,
+                        ..
+                    } if body.to_ascii_lowercase().contains("reasoning")) =>
             {
                 tracing::debug!("Responses endpoint rejected reasoning; retrying without it");
                 self.http
@@ -57,7 +60,7 @@ impl OpenAiResponsesClient {
             }
             Err(error) => return Err(error),
         };
-        Ok(event_stream(stream_response(response)))
+        Ok(event_stream(stream_response(response), &self.http.api_key))
     }
 }
 
@@ -190,6 +193,12 @@ fn stringify_arguments(arguments: &Value) -> String {
 #[derive(Debug, Default)]
 pub struct ResponsesParser {
     done: bool,
+    /// Call IDs already observed in this response. IDs are unique per
+    /// assistant response; malformed calls are held until the terminal event
+    /// so an earlier valid call cannot escape before a later invalid one is
+    /// detected.
+    seen_ids: std::collections::HashSet<String>,
+    pending_calls: Vec<ToolCall>,
 }
 
 impl ResponsesParser {
@@ -234,32 +243,81 @@ impl ResponsesParser {
                         LlmError::Parse(format!("invalid Responses tool arguments: {error}"))
                     })?
                 };
+                // Missing or blank IDs/names cannot be replayed to the
+                // provider, so they fail with `LlmError::Parse` (handled by
+                // the agent's malformed-tool recovery) instead of becoming
+                // synthetic IDs.  No `ToolCallComplete` is emitted.
                 let id = item
                     .get("call_id")
-                    .or_else(|| item.get("id"))
                     .and_then(Value::as_str)
-                    .unwrap_or("response-call")
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        LlmError::Parse("Responses tool call is missing a call ID".into())
+                    })?
                     .to_owned();
                 let name = item
                     .get("name")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .ok_or_else(|| {
+                        LlmError::Parse(format!("Responses tool call {id} is missing a name"))
+                    })?
                     .to_owned();
-                Ok(vec![StreamEvent::ToolCallComplete(ToolCall {
+                if self.seen_ids.contains(&id) {
+                    return Err(LlmError::Parse(format!(
+                        "duplicate Responses tool call ID {id}"
+                    )));
+                }
+                self.seen_ids.insert(id.clone());
+                self.pending_calls.push(ToolCall {
                     id,
                     name,
                     arguments,
-                })])
+                });
+                Ok(Vec::new())
             }
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 self.done = true;
                 let response = value.get("response").unwrap_or(&Value::Null);
                 let usage = response.get("usage").map(parse_usage).transpose()?;
-                let stop_reason = response
+                // Preserve the terminal status verbatim: `completed` and
+                // each `incomplete` reason (e.g. `max_output_tokens`) are
+                // normal stop reasons the agent records, not errors (see
+                // the all-normal rationale below).  The
+                // `incomplete_details.reason` (when present) is surfaced by
+                // mapping it into the stop reason so it survives in
+                // `Done` even though no separate event carries it.
+                let mut stop_reason = response
                     .get("status")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                Ok(vec![StreamEvent::Done { stop_reason, usage }])
+                // Every `incomplete` reason is a normal stop: the provider
+                // delivered a complete terminal event (status + reason +
+                // usage), so the turn records it in `Done` rather than
+                // retrying. Only transport-level problems (`Stream`), HTTP
+                // failures, and auth errors are retryable — see
+                // `LlmError::is_retryable`.
+                if kind == "response.incomplete" {
+                    let detail = response
+                        .get("incomplete_details")
+                        .and_then(|details| details.get("reason"))
+                        .and_then(Value::as_str);
+                    stop_reason = Some(match (stop_reason, detail) {
+                        (Some(status), Some(reason)) => format!("{status}: {reason}"),
+                        (Some(status), None) => status,
+                        (None, Some(reason)) => format!("incomplete: {reason}"),
+                        (None, None) => "incomplete".to_owned(),
+                    });
+                }
+                let mut output = self
+                    .pending_calls
+                    .drain(..)
+                    .map(StreamEvent::ToolCallComplete)
+                    .collect::<Vec<_>>();
+                output.push(StreamEvent::Done { stop_reason, usage });
+                Ok(output)
             }
             "response.failed" => Err(LlmError::Stream(error_message(&value, "response failed"))),
             "error" => Err(LlmError::Stream(error_message(&value, "Responses error"))),
@@ -274,19 +332,19 @@ impl ResponsesParser {
         self.done
     }
 
-    /// Emit a fallback `Done` event when the SSE stream ended without a
-    /// `response.completed` (e.g. a proxy dropped the connection after the last
-    /// text delta).  Mirrors `ChatStreamParser::finish` so the agent loop always
-    /// receives `TurnFinished` rather than staying busy forever.
+    /// Clean transport EOF without `response.completed`/`response.incomplete`
+    /// is a truncated stream, not a successful turn: surface it as
+    /// `LlmError::Stream` so the agent's recovery path handles it.  Never
+    /// manufacture `Done` and never finalize unfinished tool calls here.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         if self.done {
             return Ok(Vec::new());
         }
         self.done = true;
-        Ok(vec![StreamEvent::Done {
-            stop_reason: None,
-            usage: None,
-        }])
+        Err(LlmError::Stream(
+            "Responses stream ended without a terminal event (expected response.completed or response.incomplete)"
+                .into(),
+        ))
     }
 }
 
@@ -327,22 +385,22 @@ fn parse_usage(value: &Value) -> Result<Usage, LlmError> {
     })
 }
 
-fn event_stream(mut sse: crate::sse::SseStream) -> EventStream {
-    let stream = async_stream::try_stream! {
-        let mut parser = ResponsesParser::new();
-        while let Some(event) = sse.next().await {
-            let event = event?;
-            for item in parser.parse_event(&event)? {
-                yield item;
-            }
-        }
-        if !parser.is_done() {
-            for item in parser.finish()? {
-                yield item;
-            }
-        }
-    };
-    Box::pin(stream)
+impl super::StreamParser for ResponsesParser {
+    fn parse_event(&mut self, event: &SseEvent) -> Result<Vec<StreamEvent>, LlmError> {
+        Self::parse_event(self, event)
+    }
+
+    fn is_done(&self) -> bool {
+        Self::is_done(self)
+    }
+
+    fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
+        Self::finish(self)
+    }
+}
+
+fn event_stream(sse: crate::sse::SseStream, secret: &str) -> EventStream {
+    super::drive_parser_stream(sse, ResponsesParser::new(), secret)
 }
 
 #[cfg(test)]
@@ -399,20 +457,83 @@ mod tests {
     }
 
     #[test]
-    fn finish_emits_fallback_done_only_once() {
+    fn finish_without_terminal_event_is_a_stream_error() {
+        // Clean EOF with no `response.completed`/`response.incomplete` is
+        // a truncated stream, not success: `finish` returns
+        // `LlmError::Stream` and emits no completed calls.
         let mut parser = ResponsesParser::new();
         assert!(!parser.is_done());
-        let events = parser.finish().unwrap();
-        assert!(matches!(
-            events.as_slice(),
-            [StreamEvent::Done {
-                stop_reason: None,
-                usage: None
-            }]
-        ));
-        // A second finish (or a later completed event) is a no-op.
-        assert!(parser.finish().unwrap().is_empty());
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
         assert!(parser.is_done());
+        // A second finish after the error is a no-op.
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn text_then_eof_fails_and_partial_tool_call_emits_nothing() {
+        let mut parser = ResponsesParser::new();
+        parser
+            .parse_payload(r#"{"type":"response.output_text.delta","delta":"hi"}"#)
+            .unwrap();
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn held_partial_tool_call_emits_nothing_at_eof() {
+        // A completed `function_call` item is held (no `ToolCallComplete`
+        // escapes before the terminal event). Clean EOF first must surface
+        // `Stream` (never `Done`); `finish` never drains held calls.
+        let mut parser = ResponsesParser::new();
+        let held = parser.parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"held-1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).unwrap();
+        assert!(
+            !held
+                .iter()
+                .any(|event| matches!(event, StreamEvent::ToolCallComplete(_))),
+            "held call escaped before terminal: {held:?}"
+        );
+        let error = parser.finish().unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(parser.is_done());
+        // A second finish after the error is a no-op, still no `Done`.
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stream_error_after_partial_output_remains_an_error() {
+        // Partial text followed by a provider failure payload stays an
+        // error: `response.failed` surfaces `LlmError::Stream` (agent
+        // recovery path) instead of ever reaching a terminal `Done`.
+        let mut parser = ResponsesParser::new();
+        let events = parser
+            .parse_payload(r#"{"type":"response.output_text.delta","delta":"hi"}"#)
+            .unwrap();
+        assert_eq!(events, vec![StreamEvent::TextDelta("hi".into())]);
+        let error = parser
+            .parse_payload(r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"boom"}}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(!parser.is_done());
+    }
+
+    #[test]
+    fn incomplete_terminal_event_succeeds_with_reason_and_usage() {
+        // All `incomplete` reasons are normal stops: the provider sent a
+        // complete terminal event, so the turn records `Done` (with reason
+        // and usage) instead of retrying. Only transport/HTTP/auth
+        // failures are retryable.
+        let mut parser = ResponsesParser::new();
+        let done = parser.parse_payload(r#"{"type":"response.incomplete","response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}}"#).unwrap();
+        assert!(matches!(
+            &done[0],
+            StreamEvent::Done {
+                stop_reason: Some(reason),
+                usage: Some(Usage { input_tokens: 10, output_tokens: 20, .. }),
+            } if reason.contains("max_output_tokens")
+        ));
+        assert!(parser.is_done());
+        assert!(parser.finish().unwrap().is_empty());
     }
 
     #[test]
@@ -423,6 +544,30 @@ mod tests {
             .unwrap();
         assert!(parser.is_done());
         assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_event_split_across_transport_chunks_succeeds() {
+        // The `response.completed` terminal split mid-object across two
+        // `push_bytes` calls still terminates: the decoder buffers the
+        // partial line and only `process_line`s on `\n`, so dialect
+        // parsing sees the reassembled payload.
+        use crate::sse::SseParser;
+        let mut sse = SseParser::new();
+        // Split *between* SSE lines (after the `data:` line's `\n`): the
+        // first chunk holds a complete data line, the second the blank
+        // dispatch line. Byte-halving one `push_bytes` call would split
+        // inside the JSON string instead (an interior `\n` is a line
+        // separator, and half a `\n\n` terminator dispatches nothing).
+        let first = r#"{"type":"response.completed","response":{"status":"completed"}}"#;
+        let payload = format!("data: {first}\n");
+        assert!(sse.push_bytes(payload.as_bytes()).unwrap().is_empty());
+        let events = sse.push_bytes(b"\n").unwrap();
+        assert_eq!(events.len(), 1, "reassembled terminal: {events:?}");
+        let mut parser = ResponsesParser::new();
+        let done = parser.parse_event(&events[0]).unwrap();
+        assert!(matches!(&done[0], StreamEvent::Done { .. }), "got {done:?}");
+        assert!(parser.is_done());
     }
     #[test]
     fn parses_response_events() {
@@ -442,10 +587,11 @@ mod tests {
             vec![StreamEvent::ReasoningDelta("think".into())]
         );
         let calls = parser.parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"read","arguments":"{\"path\":\"x\"}"}}"#).unwrap();
-        assert!(matches!(&calls[0], StreamEvent::ToolCallComplete(call) if call.name == "read"));
+        assert!(calls.is_empty(), "calls are held until the terminal event");
         let done = parser.parse_payload(r#"{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":3,"output_tokens":4,"output_tokens_details":{"reasoning_tokens":1}}}}"#).unwrap();
+        assert!(matches!(&done[0], StreamEvent::ToolCallComplete(call) if call.name == "read"));
         assert!(matches!(
-            &done[0],
+            &done[1],
             StreamEvent::Done {
                 usage: Some(Usage {
                     input_tokens: 3,
@@ -455,5 +601,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rejects_missing_id() {
+        let mut parser = ResponsesParser::new();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","name":"read","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn rejects_blank_id_and_missing_name() {
+        let mut parser = ResponsesParser::new();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"  ","name":"read","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+        let mut parser = ResponsesParser::new();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c1","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn rejects_duplicate_ids_in_parallel_calls() {
+        let mut parser = ResponsesParser::new();
+        parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"dup","name":"read","arguments":"{}"}}"#)
+            .unwrap();
+        let error = parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"dup","name":"bash","arguments":"{}"}}"#)
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
     }
 }

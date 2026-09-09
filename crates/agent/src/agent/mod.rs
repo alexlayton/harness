@@ -23,6 +23,7 @@ mod persistence;
 mod tool_dispatch;
 mod turn;
 
+use commands::spawn_model_metadata;
 pub use commands::{ProviderFactory, spawn_model_list};
 pub use events::{
     AgentEvent, CompactionReason, InputMessage, SessionListItem, SessionSnapshotEntry, TurnError,
@@ -30,7 +31,11 @@ pub use events::{
 pub use persistence::AgentSessionState;
 use persistence::{ui_snapshot_entries, usage_event};
 pub use tool_dispatch::SubagentLimits;
-pub(crate) use tool_dispatch::plan_tool_batches;
+pub(crate) use tool_dispatch::{
+    CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
+    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch, plan_tool_batches,
+};
+pub(crate) use turn::TurnControl;
 
 /// Maximum number of times a turn re-streams after a recoverable failure:
 /// malformed tool-call arguments, a retryable mid-stream error, or an empty
@@ -90,6 +95,10 @@ pub struct Agent {
     /// successful `/model` switch can retarget future child runs to the new
     /// provider/model (`SubagentRunnerImpl::update_model`).
     subagent_runner: Option<Arc<crate::subagent::SubagentRunnerImpl>>,
+    /// Channel used by background model metadata requests. Keeping the sender
+    /// on the agent lets model changes remain non-blocking while the run loop
+    /// applies ready results at every operation boundary.
+    model_metadata_tx: Option<mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>>,
 }
 
 impl Agent {
@@ -118,6 +127,7 @@ impl Agent {
             project_context: String::new(),
             subagent_limits: SubagentLimits::default(),
             subagent_runner: None,
+            model_metadata_tx: None,
         }
     }
 
@@ -219,35 +229,30 @@ impl Agent {
             self.context_window = self.compaction.resolved_window(0);
         }
         send(&events, self.context_usage_event());
-        // Begin model discovery without placing it on the first-turn critical
-        // path. The generous/configured window is already installed; a
-        // bounded late result only affects future turns.
-        let (context_tx, mut context_rx) = mpsc::channel(1);
-        let mut metadata_pending = self.compaction.context_window == 0;
-        if metadata_pending {
-            let provider = self.provider.clone();
-            let provider_name = provider.name().to_owned();
-            let model = self.model.clone();
-            let lookup_model = model.clone();
-            let shutdown = self.cancel.clone();
-            tokio::spawn(async move {
-                let discovered = tokio::select! {
-                    result = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        provider.list_models(),
-                    ) => result.ok().and_then(Result::ok).and_then(|models| {
-                        models.into_iter().find(|candidate| {
-                            candidate.id == lookup_model
-                                || candidate.name.as_deref() == Some(lookup_model.as_str())
-                        }).and_then(|candidate| candidate.context_length)
-                    }),
-                    _ = shutdown.cancelled() => None,
-                };
-                let _ = context_tx.send((provider_name, model, discovered)).await;
-            });
-        }
+        // Begin one model metadata request without placing it on the
+        // first-turn critical path. The same result supplies both the model
+        // catalogue and the selected model's context window; model switches
+        // enqueue through this channel instead of issuing a second request.
+        let (metadata_tx, mut metadata_rx) = mpsc::unbounded_channel();
+        self.model_metadata_tx = Some(metadata_tx.clone());
+        spawn_model_metadata(
+            metadata_tx,
+            self.provider.clone(),
+            self.provider.name().to_owned(),
+            self.model.clone(),
+            self.cancel.clone(),
+        );
 
         loop {
+            // Apply every result that is already ready before selecting the
+            // next queued operation. Otherwise a busy queued-turn stream can
+            // starve startup metadata indefinitely.
+            while let Ok((provider, model, models)) = metadata_rx.try_recv() {
+                self.apply_model_metadata(provider, model, models, &events);
+            }
+            if metadata_rx.is_closed() {
+                self.model_metadata_tx = None;
+            }
             let next_message = if let Some(message) = self.queued.pop_front() {
                 Some(message)
             } else if !self.input_open {
@@ -260,14 +265,11 @@ impl Agent {
                         }
                         message
                     }
-                    reported = context_rx.recv(), if metadata_pending => {
-                        metadata_pending = false;
-                        if let Some((provider, model, Some(window))) = reported
-                            && provider == self.provider.name()
-                            && model == self.model
-                        {
-                            self.context_window = self.compaction.resolved_window(window);
-                            send(&events, self.context_usage_event());
+                    metadata = metadata_rx.recv() => {
+                        if let Some((provider, model, models)) = metadata {
+                            self.apply_model_metadata(provider, model, models, &events);
+                        } else {
+                            self.model_metadata_tx = None;
                         }
                         continue;
                     }
@@ -279,28 +281,20 @@ impl Agent {
             };
             match message {
                 InputMessage::Message(text) if !text.trim().is_empty() => {
-                    // A turn is independently interruptible, but application shutdown must
-                    // propagate through the same token to tools and compaction work.
-                    let turn_cancel = self.cancel.child_token();
-                    let result = self.run_turn(text, &events, &mut input, &turn_cancel).await;
-                    // Turn-boundary durable flush: with deferred sync enabled
-                    // the events of this turn were written+flushed but not
-                    // fsynced; make them all durable once here instead of
-                    // paying an fsync per streamed event.
-                    self.flush_deferred_sync();
-                    match result {
-                        Err(TurnError::Shutdown) => break,
-                        // Persistence errors are emitted at their source; the
-                        // outer boundary owns the single terminal event.
-                        Err(TurnError::Persist(_)) => {
-                            send(&events, AgentEvent::TurnFinished);
-                            // Live state may include an executed side effect whose
-                            // durable result could not be appended. Quarantine this
-                            // agent instance rather than sending divergent history
-                            // on a later queued turn.
-                            break;
-                        }
-                        Ok(()) => {}
+                    // One shared executor owns the whole operation boundary
+                    // (shutdown propagation, quarantine, deferred flush,
+                    // exactly-once terminal events) for normal and
+                    // skill-invoked turns alike.
+                    match self.execute_turn(text, &events, &mut input).await {
+                        TurnControl::Shutdown => break,
+                        // Persistence errors are emitted at their source and
+                        // the executor owns the single terminal event. Live
+                        // state may include an executed side effect whose
+                        // durable result could not be appended: quarantine
+                        // rather than sending divergent history on a later
+                        // queued turn.
+                        TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
                     }
                 }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
@@ -321,16 +315,28 @@ impl Agent {
                     continue;
                 }
                 InputMessage::CompactSession => {
-                    let cancel = self.cancel.clone();
-                    if let Err(TurnError::Persist(_)) =
-                        self.handle_compact_session(&events, &cancel).await
+                    // Manual compaction shares the boundary policy: persist
+                    // failures quarantine with exactly one terminal event.
+                    match self
+                        .handle_compact_session_boundary(&events, &mut input)
+                        .await
                     {
-                        send(&events, AgentEvent::TurnFinished);
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
                     }
                     continue;
                 }
                 InputMessage::SetModel { provider, model } => {
-                    self.handle_set_model(provider, model, &events).await;
+                    // Model changes persist first and commit atomically;
+                    // failures leave parent and subagent selection unchanged
+                    // and surface one terminal event via quarantine.
+                    match self
+                        .handle_set_model_boundary(provider, model, &events)
+                        .await
+                    {
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
+                    }
                     continue;
                 }
                 InputMessage::SetReasoning { level } => {
@@ -350,7 +356,15 @@ impl Agent {
                     continue;
                 }
                 InputMessage::InvokeSkill { name } => {
-                    self.handle_invoke_skill(name, &events, &mut input).await;
+                    // Skill turns run through the same executor: shutdown
+                    // propagates and persistence failures quarantine instead
+                    // of being swallowed, with deferred sync flushed at the
+                    // operation boundary.
+                    match self.handle_invoke_skill(name, &events, &mut input).await {
+                        TurnControl::Shutdown => break,
+                        TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
+                    }
                     continue;
                 }
             };
@@ -420,6 +434,7 @@ mod tests {
                         MockErrorKind::Retryable => LlmError::Http {
                             status: 500,
                             body: message,
+                            retry_after_secs: None,
                         },
                     })
                 },
@@ -455,6 +470,7 @@ mod tests {
                 Err(LlmError::Http {
                     status: 500,
                     body: "connection dropped".into(),
+                    retry_after_secs: None,
                 })
             })))
         }
@@ -464,7 +480,7 @@ mod tests {
         }
     }
 
-    fn run_agent(provider: MockProvider) -> (Vec<AgentEvent>, Vec<Message>) {
+    fn run_agent(provider: MockProvider) -> Vec<AgentEvent> {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async move {
             let cancel = CancellationToken::new();
@@ -475,13 +491,12 @@ mod tests {
                 .unwrap();
             drop(input_tx);
             let agent = Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel);
-            let history = agent.history.clone();
             agent.run(input_rx, event_tx).await;
             let mut events = Vec::new();
             while let Ok(event) = event_rx.try_recv() {
                 events.push(event);
             }
-            (events, history)
+            events
         })
     }
 
@@ -1332,7 +1347,7 @@ mod tests {
 
     #[test]
     fn simple_text_turn_forwards_deltas() {
-        let (events, _) = run_agent(MockProvider {
+        let events = run_agent(MockProvider {
             calls: AtomicUsize::new(0),
             scripts: vec![script(vec![
                 StreamEvent::TextDelta("hello".into()),
@@ -1447,6 +1462,659 @@ mod tests {
                     .filter(|event| matches!(event, AgentEvent::TurnFinished))
                     .count(),
                 1
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn interrupt_with_failed_cancellation_append_quarantines_queued_work() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let stream_polled = Arc::new(Notify::new());
+        let release_error = Arc::new(Notify::new());
+        let provider = Arc::new(InterruptRaceProvider {
+            calls: AtomicUsize::new(0),
+            stream_polled: stream_polled.clone(),
+            release_error,
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("interrupt me".into()))
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("queued must never run".into()))
+            .unwrap();
+        let agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel)
+            .with_session(store, session);
+        let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
+            .await
+            .expect("provider stream was not polled");
+        // The user message has already been appended. Removing the file now
+        // makes the cancellation marker append fail rather than masking the
+        // original turn setup failure.
+        std::fs::remove_file(session_path).unwrap();
+        input_tx.send(InputMessage::Interrupt).unwrap();
+        drop(input_tx);
+        agent_task.await.unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("queued must never run")
+        )));
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_failed_cancellation_append_quarantines_queued_work() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let stream_polled = Arc::new(Notify::new());
+        let release_error = Arc::new(Notify::new());
+        let cancel = CancellationToken::new();
+        let provider = Arc::new(InterruptRaceProvider {
+            calls: AtomicUsize::new(0),
+            stream_polled: stream_polled.clone(),
+            release_error,
+        });
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("shut down".into()))
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("queued must never run".into()))
+            .unwrap();
+        let agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel.clone())
+            .with_session(store, session);
+        let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
+            .await
+            .expect("provider stream was not polled");
+        std::fs::remove_file(session_path).unwrap();
+        cancel.cancel();
+        drop(input_tx);
+        agent_task.await.unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("queued must never run")
+        )));
+    }
+
+    #[tokio::test]
+    async fn cancelled_skill_with_failed_cancellation_append_has_one_terminal_event() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let skill_root = tempdir().unwrap();
+        let skill_dir = skill_root.path().join("cancel-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: cancel-skill\ndescription: Cancel\n---\nDo it.\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+        let registry =
+            tools::default_registry(tools::ToolConfig::new(workspace.path(), false)).unwrap();
+        unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+
+        let stream_polled = Arc::new(Notify::new());
+        let provider = Arc::new(InterruptRaceProvider {
+            calls: AtomicUsize::new(0),
+            stream_polled: stream_polled.clone(),
+            release_error: Arc::new(Notify::new()),
+        });
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::InvokeSkill {
+                name: "cancel-skill".into(),
+            })
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("queued must never run".into()))
+            .unwrap();
+        let agent = Agent::new(provider, registry, "demo", CancellationToken::new())
+            .with_session(store, session);
+        let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
+
+        tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
+            .await
+            .expect("skill provider stream was not polled");
+        std::fs::remove_file(session_path).unwrap();
+        input_tx.send(InputMessage::Interrupt).unwrap();
+        drop(input_tx);
+        agent_task.await.unwrap();
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("queued must never run")
+        )));
+    }
+
+    #[test]
+    fn deferred_sync_flush_failure_quarantines_skill_manual_compact_and_model_change() {
+        // Every operation sharing the turn boundary (skill turns,
+        // manual `/compact`, `/model`) must flush deferred-sync writes
+        // and quarantine on a failed flush — even when the body itself
+        // succeeded. The injected `sync_session` failure is the same
+        // `SessionError::Io` a real `fsync` failure would produce.
+        use session::SyncSessionFaultGuard;
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // --- Normal turn: body succeeds, flush fails → quarantine. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = store.create(SessionCreateOptions::default()).unwrap();
+                let provider = Arc::new(MockProvider {
+                    calls: AtomicUsize::new(0),
+                    scripts: vec![script(vec![
+                        StreamEvent::TextDelta("normal answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ])],
+                    error_kind: MockErrorKind::Stream,
+                });
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::Message("normal".into()))
+                    .unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(
+                    provider,
+                    ToolRegistry::empty(),
+                    "demo",
+                    CancellationToken::new(),
+                )
+                .with_session(store, session)
+                .run(input_rx, event_tx)
+                .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text == "normal answer"
+                )));
+                assert!(events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::Error(message) if message.contains("during sync")
+                )));
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    1,
+                    "events: {events:?}"
+                );
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                )));
+            }
+
+            // --- Skill turn: body succeeds, flush fails → quarantine. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = store.create(SessionCreateOptions::default()).unwrap();
+                let skill_root = tempdir().unwrap();
+                let skill_dir = skill_root.path().join("flush-skill");
+                std::fs::create_dir_all(&skill_dir).unwrap();
+                std::fs::write(
+                    skill_dir.join("SKILL.md"),
+                    "---\nname: flush-skill\ndescription: Flush\n---\nDo it.\n",
+                )
+                .unwrap();
+                // SAFETY: single-threaded test runtime; scoped env mutation.
+                unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+                let registry =
+                    tools::default_registry(tools::ToolConfig::new(workspace.path(), false))
+                        .unwrap();
+                unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+                let provider = Arc::new(MockProvider {
+                    calls: AtomicUsize::new(0),
+                    scripts: vec![script(vec![
+                        StreamEvent::TextDelta("skill answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ])],
+                    error_kind: MockErrorKind::Stream,
+                });
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::InvokeSkill {
+                        name: "flush-skill".into(),
+                    })
+                    .unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(provider, registry, "demo", CancellationToken::new())
+                    .with_session(store, session)
+                    .run(input_rx, event_tx)
+                    .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                // The skill body ran (text arrived) but the failed flush
+                // quarantined: one sync-failure Error, one TurnFinished,
+                // and the queued message never ran.
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("skill answer")
+                    )),
+                    "skill body should have run before the flush: {events:?}"
+                );
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::Error(message) if message.contains("during sync")
+                    )),
+                    "expected a sync-failure error: {events:?}"
+                );
+                // The shared executor owns the terminal event, so a failed
+                // deferred sync cannot add a second one while quarantining.
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    1,
+                    "events: {events:?}"
+                );
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                    )),
+                    "queued work ran: {events:?}"
+                );
+            }
+
+            // --- Manual `/compact`: flush fails → quarantine, no summary. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = populate_session(&store, 12, 12_000);
+                let session_id = session.id();
+                let provider = Arc::new(RecordingProvider {
+                    calls: AtomicUsize::new(0),
+                    scripts: vec![summarizer_script()],
+                    seen: Mutex::new(Vec::new()),
+                });
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx.send(InputMessage::CompactSession).unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(
+                    provider,
+                    ToolRegistry::empty(),
+                    "demo",
+                    CancellationToken::new(),
+                )
+                .with_session(store.clone(), session)
+                .run(input_rx, event_tx)
+                .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                // The boundary flush runs even when compaction itself
+                // fails: one sync-failure error, quarantine (queued work
+                // never runs), and no summary persisted.
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::Error(message) if message.contains("during sync")
+                    )),
+                    "expected a sync-failure error: {events:?}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    0,
+                    "command operations must not masquerade as prompt turns: {events:?}"
+                );
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                    )),
+                    "queued work ran: {events:?}"
+                );
+                let reloaded = store.open(&session_id).unwrap();
+                // The compaction body itself succeeded and persisted its
+                // summary before the boundary flush failed — the flush is
+                // durability of already-written records, not a gate on the
+                // write. What the boundary guarantees is quarantine (queued
+                // work never runs) plus a loud sync-failure error, both
+                // asserted above.
+                assert!(
+                    reloaded.events.iter().any(|record| matches!(
+                        record.event,
+                        SessionEvent::CompactionSummary { .. }
+                    )),
+                    "body summary persists; the failed flush only loses fsync durability"
+                );
+            }
+
+            // --- `/model`: append succeeds, deferred sync fails before
+            // the live model commit. ---
+            {
+                let root = tempdir().unwrap();
+                let workspace = tempdir().unwrap();
+                let store = SessionStore::new(root.path(), workspace.path())
+                    .unwrap()
+                    .with_deferred_sync(true);
+                let session = store.create(SessionCreateOptions::default()).unwrap();
+                let session_id = session.id();
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::SetModel {
+                        provider: None,
+                        model: "switched-model".into(),
+                    })
+                    .unwrap();
+                input_tx
+                    .send(InputMessage::Message("queued must never run".into()))
+                    .unwrap();
+                drop(input_tx);
+                let _guard = SyncSessionFaultGuard::arm();
+                Agent::new(
+                    Arc::new(MockProvider {
+                        calls: AtomicUsize::new(0),
+                        scripts: vec![],
+                        error_kind: MockErrorKind::Stream,
+                    }),
+                    ToolRegistry::empty(),
+                    "demo",
+                    CancellationToken::new(),
+                )
+                .with_session(store.clone(), session)
+                .run(input_rx, event_tx)
+                .await;
+                drop(_guard);
+                let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+                // The `ModelChange` append succeeded, but the staged
+                // session was not installed because its deferred sync failed.
+                // The operation quarantines (queued work never runs) with a
+                // loud sync-failure error and no frontend model commit.
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                        .count(),
+                    0,
+                    "command operations must not masquerade as prompt turns: {events:?}"
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, AgentEvent::ModelChanged { .. })),
+                    "model change must not commit before the flush: {events:?}"
+                );
+                assert!(
+                    events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::Error(message) if message.contains("during sync")
+                    )),
+                    "expected a sync-failure error: {events:?}"
+                );
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                    )),
+                    "queued work ran: {events:?}"
+                );
+                let reloaded = store.open(&session_id).unwrap();
+                assert!(
+                    reloaded
+                        .events
+                        .iter()
+                        .any(|record| matches!(record.event, SessionEvent::ModelChange { .. })),
+                    "ModelChange persists; the failed flush only loses fsync durability"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn skill_turn_failure_quarantines_and_never_runs_queued_work() {
+        // Persistence failure during a skill turn (deleted session file)
+        // must quarantine through the shared executor: exactly one
+        // terminal event, provider never called again, queued message
+        // never runs.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let mut session = store.create(SessionCreateOptions::default()).unwrap();
+            // Seed a skill the catalog can find: write SKILL.md through the
+            // real discovery path (temp skill root + HARNESS_SKILLS_DIR).
+            let skill_root = tempdir().unwrap();
+            let skill_dir = skill_root.path().join("demo-skill");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: demo-skill\ndescription: Demo\n---\nDo the thing.\n",
+            )
+            .unwrap();
+            // SAFETY: tests run single-threaded here (current-thread
+            // runtime); the env mutation is scoped to this test body.
+            unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+            let registry =
+                tools::default_registry(tools::ToolConfig::new(workspace.path(), false)).unwrap();
+            unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+            assert!(
+                registry.skills().is_some_and(|catalog| catalog
+                    .invocable()
+                    .iter()
+                    .any(|skill| skill.name == "demo-skill")),
+                "skill discovery must find demo-skill"
+            );
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![],
+                error_kind: MockErrorKind::Stream,
+            });
+            // Delete the session file so the first persist fails.
+            let path = session.file_path().unwrap().to_path_buf();
+            std::fs::remove_file(&path).unwrap();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::InvokeSkill {
+                    name: "demo-skill".into(),
+                })
+                .unwrap();
+            input_tx
+                .send(InputMessage::Message("queued must never run".into()))
+                .unwrap();
+            drop(input_tx);
+            // Keep `session` (with its path) for the agent; the store still
+            // points at the deleted file.
+            let _ = &mut session;
+            Agent::new(provider.clone(), registry, "demo", CancellationToken::new())
+                .with_session(store, session)
+                .run(input_rx, event_tx)
+                .await;
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            // One terminal Error at the failure source; the run loop
+            // quarantines with exactly one TurnFinished — never a successful
+            // skill turn, never a second turn for the queued message.
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::Error(_)))
+                    .count(),
+                1,
+                "events: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::TurnFinished))
+                    .count(),
+                1,
+                "events: {events:?}"
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text.contains("queued must never run")
+                )),
+                "queued work ran: {events:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn shutdown_during_skill_turn_exits_the_agent() {
+        // Cancelling the application token mid-skill-turn must propagate
+        // Shutdown through the shared executor and stop the run loop.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![script(vec![
+                    StreamEvent::TextDelta("skill answer".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ])],
+                error_kind: MockErrorKind::Stream,
+            });
+            let skill_root = tempdir().unwrap();
+            let skill_dir = skill_root.path().join("stop-skill");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: stop-skill\ndescription: Stop\n---\nDo it.\n",
+            )
+            .unwrap();
+            unsafe { std::env::set_var("HARNESS_SKILLS_DIR", skill_root.path()) };
+            let workspace = tempdir().unwrap();
+            let registry =
+                tools::default_registry(tools::ToolConfig::new(workspace.path(), false)).unwrap();
+            unsafe { std::env::remove_var("HARNESS_SKILLS_DIR") };
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::InvokeSkill {
+                    name: "stop-skill".into(),
+                })
+                .unwrap();
+            drop(input_tx);
+            cancel.cancel();
+            Agent::new(provider, registry, "demo", cancel)
+                .run(input_rx, event_tx)
+                .await;
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            // Shutdown propagates: no successful skill turn completes.
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(text) if text.contains("skill answer")
+                )),
+                "turn completed despite shutdown: {events:?}"
             );
         });
     }
@@ -2384,5 +3052,708 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[tokio::test]
+    async fn cancelled_compaction_persists_neither_summary_nor_usage() {
+        // A pre-cancelled compaction must persist nothing: no summary, no
+        // Usage event, no CompactionFinished — only the "cancelled" notice
+        // and a normal turn afterwards.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = populate_session(&store, 12, 12_000);
+        let session_id = session.id();
+        let usage_before = store.open(&session_id).unwrap().metadata.usage.clone();
+
+        let provider = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            // The summarizer script would succeed if run — but the cancel
+            // token below is already cancelled, so `summarize` short-
+            // circuits to `Cancelled` before touching the provider.
+            scripts: vec![
+                summarizer_script(),
+                script(vec![
+                    StreamEvent::TextDelta("after cancel".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+            ],
+            seen: Mutex::new(Vec::new()),
+        });
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        // Manual compact under a pre-cancelled token: the operation observes
+        // cancellation instead of summarizing. A pre-cancelled *application*
+        // token propagates as Shutdown (run loop breaks, no notice); the
+        // compact path maps that to shutdown rather than the notice path.
+        input_tx.send(InputMessage::CompactSession).unwrap();
+        drop(input_tx);
+        Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+            .with_session(store.clone(), session)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // Shutdown path: no CompactionFinished, and crucially nothing
+        // persisted — that is the "cancel persists nothing" contract.
+        // (The "compaction cancelled" notice only fires for turn-scoped
+        // cancel, not application shutdown.)
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionFinished { .. })),
+            "cancelled compaction must not finish: {events:?}"
+        );
+        let reloaded = store.open(&session_id).unwrap();
+        assert!(
+            !reloaded.events.iter().any(|record| matches!(
+                record.event,
+                SessionEvent::CompactionSummary { .. } | SessionEvent::Usage { .. }
+            )),
+            "cancelled compaction persisted something"
+        );
+        assert_eq!(
+            reloaded.metadata.usage, usage_before,
+            "cancelled compaction must not touch usage totals"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarizer_without_usage_does_not_create_a_zero_token_turn() {
+        // A summarizer `Done` with `usage: None` must not synthesize a
+        // zero-token Usage event: session turn totals stay untouched.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = populate_session(&store, 12, 12_000);
+        let session_id = session.id();
+        let usage_before = store.open(&session_id).unwrap().metadata.usage.clone();
+        let usage_events_before = store
+            .open(&session_id)
+            .unwrap()
+            .events
+            .iter()
+            .filter(|record| matches!(record.event, SessionEvent::Usage { .. }))
+            .count();
+
+        let provider = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![
+                script(vec![
+                    StreamEvent::TextDelta("summary without usage".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+                script(vec![
+                    StreamEvent::TextDelta("after compact".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+            ],
+            seen: Mutex::new(Vec::new()),
+        });
+        let (events, _provider) = run_session_agent(
+            &store,
+            session,
+            provider.clone(),
+            vec![
+                InputMessage::CompactSession,
+                InputMessage::Message("next".into()),
+            ],
+        )
+        .await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionFinished { .. }))
+        );
+        let reloaded = store.open(&session_id).unwrap();
+        let usage_events_after = reloaded
+            .events
+            .iter()
+            .filter(|record| matches!(record.event, SessionEvent::Usage { .. }))
+            .count();
+        assert_eq!(
+            usage_events_after, usage_events_before,
+            "a usageless summarizer must not append a Usage event"
+        );
+        assert_eq!(
+            reloaded.metadata.usage, usage_before,
+            "a usageless summarizer must not move usage totals"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_compaction_stays_disabled_without_repeat_failures() {
+        // Without a session, auto-compaction is disabled (no per-turn
+        // failure) and manual `/compact` + overflow recovery degrade to a
+        // single quiet notice / silent retry-false — never a persisted
+        // error or a repeated failure loop.
+        let provider = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![
+                // First request overflows; recovery is disabled without a
+                // session, so the provider error surfaces once and the
+                // second turn proceeds normally.
+                vec![Err("context length exceeded".into())],
+                script(vec![
+                    StreamEvent::TextDelta("second turn".into()),
+                    StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    },
+                ]),
+            ],
+            error_kind: MockErrorKind::Stream,
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("first".into()))
+            .unwrap();
+        input_tx.send(InputMessage::CompactSession).unwrap();
+        input_tx
+            .send(InputMessage::Message("second".into()))
+            .unwrap();
+        drop(input_tx);
+        Agent::new(provider, ToolRegistry::empty(), "demo", cancel)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // Overflow recovery quietly declines (no session): exactly one
+        // provider Error for the first turn, then normal recovery.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Error(_)))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        // Manual compact degrades to one "unavailable" notice per
+        // invocation — a policy notice, not an error or failure loop.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::Notice(message) if message.contains("unavailable")
+                ))
+                .count(),
+            1,
+            "events: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TextDelta(text) if text.contains("second turn")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::CompactionFinished { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_model_change_persist_leaves_parent_and_subagent_unchanged() {
+        // AGENT-4 atomicity: `handle_set_model` resolves without mutating,
+        // persists `ModelChange` first, and only commits after persistence
+        // succeeds. A failed persist (deleted session file) leaves parent
+        // provider/model AND the subagent runner on the old selection.
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_id = session.id();
+        let old_provider: Arc<dyn llm::Provider> = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let new_provider: Arc<dyn llm::Provider> = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let factory: crate::agent::ProviderFactory = Arc::new(move |name: &str| {
+            assert_eq!(name, "other");
+            Ok(new_provider.clone())
+        });
+        let runner = Arc::new(crate::subagent::SubagentRunnerImpl::new(
+            old_provider.clone(),
+            "old-model",
+            std::fs::canonicalize(workspace.path()).unwrap(),
+            false,
+            "",
+            crate::assembly::SubagentPolicy::default(),
+            None,
+            None,
+        ));
+        let runner_model = || runner.model_for_test();
+        // Delete the session file so the `ModelChange` persist fails.
+        let path = session.file_path().unwrap().to_path_buf();
+        std::fs::remove_file(&path).unwrap();
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::SetModel {
+                provider: Some("other".into()),
+                model: "new-model".into(),
+            })
+            .unwrap();
+        drop(input_tx);
+        let mut agent = Agent::new(old_provider.clone(), ToolRegistry::empty(), "demo", cancel)
+            .with_provider_factory(factory)
+            .with_subagent_runner(runner.clone())
+            .with_session(store.clone(), session);
+        // Drive one step manually: the boundary quarantines on the failed
+        // persist instead of committing.
+        agent
+            .handle_set_model_boundary(Some("other".into()), "new-model".into(), &event_tx)
+            .await;
+        let _ = input_rx;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Error(message) if message.contains("session persistence failed")
+            )),
+            "expected a persistence error: {events:?}"
+        );
+        assert_eq!(agent.model, "demo", "parent model must not move");
+        assert!(
+            Arc::ptr_eq(&agent.provider, &old_provider),
+            "parent provider must not move"
+        );
+        assert_eq!(runner_model(), "old-model", "subagent runner must not move");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelChanged { .. })),
+            "no commit event on failed persist: {events:?}"
+        );
+        // And nothing was appended to the (deleted-file) session.
+        assert!(store.open(&session_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn deferred_sync_failure_after_model_append_is_not_a_live_commit() {
+        // The deferred store accepts the append before the boundary sync.
+        // Sync failure must leave every live model-related field untouched,
+        // including the session clone, subagent target, context bookkeeping,
+        // metadata task, and frontend event stream.
+        struct CountingProvider {
+            list_calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for CountingProvider {
+            fn name(&self) -> &str {
+                "other"
+            }
+
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                Ok(Box::pin(stream::iter(Vec::new())))
+            }
+
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Vec::new())
+            }
+        }
+
+        use session::SyncSessionFaultGuard;
+
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path())
+            .unwrap()
+            .with_deferred_sync(true);
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_id = session.id();
+        let old_provider: Arc<dyn llm::Provider> = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let new_provider = Arc::new(CountingProvider {
+            list_calls: AtomicUsize::new(0),
+        });
+        let factory_provider = new_provider.clone();
+        let factory: crate::agent::ProviderFactory = Arc::new(move |name: &str| {
+            assert_eq!(name, "other");
+            Ok(factory_provider.clone() as Arc<dyn llm::Provider>)
+        });
+        let runner = Arc::new(crate::subagent::SubagentRunnerImpl::new(
+            old_provider.clone(),
+            "old-model",
+            std::fs::canonicalize(workspace.path()).unwrap(),
+            false,
+            "",
+            crate::assembly::SubagentPolicy::default(),
+            None,
+            None,
+        ));
+        let (metadata_tx, mut metadata_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut agent = Agent::new(
+            old_provider.clone(),
+            ToolRegistry::empty(),
+            "old-model",
+            CancellationToken::new(),
+        )
+        .with_provider_factory(factory)
+        .with_subagent_runner(runner.clone())
+        .with_session(store.clone(), session);
+        agent.context_window = 77_777;
+        agent.last_context_tokens = Some(123);
+        agent.model_metadata_tx = Some(metadata_tx);
+        let before_session = agent.session.as_ref().unwrap().session.clone();
+
+        let _guard = SyncSessionFaultGuard::arm();
+        let control = agent
+            .handle_set_model_boundary(Some("other".into()), "new-model".into(), &event_tx)
+            .await;
+        drop(_guard);
+
+        assert_eq!(control, TurnControl::Quarantine);
+        assert!(Arc::ptr_eq(&agent.provider, &old_provider));
+        assert_eq!(agent.model, "old-model");
+        assert_eq!(runner.model_for_test(), "old-model");
+        assert_eq!(agent.context_window, 77_777);
+        assert_eq!(agent.last_context_tokens, Some(123));
+        assert_eq!(
+            agent.session.as_ref().unwrap().session,
+            before_session,
+            "failed deferred sync must not install the staged session"
+        );
+
+        // The append did succeed, so the append-only file contains the record;
+        // only the live commit is withheld when its durability boundary fails.
+        let reloaded = store.open(&session_id).unwrap();
+        assert!(
+            reloaded
+                .events
+                .iter()
+                .any(|record| matches!(record.event, SessionEvent::ModelChange { .. }))
+        );
+
+        tokio::task::yield_now().await;
+        assert_eq!(new_provider.list_calls.load(Ordering::SeqCst), 0);
+        assert!(metadata_rx.try_recv().is_err());
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(message) if message.contains("during sync")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelChanged { .. }))
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Notice(message) if message.contains("Using other")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelList { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ContextUsageUpdated { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn one_model_switch_produces_one_metadata_request() {
+        // AGENT-4 single-fetch: a `/model` switch enqueues exactly one
+        // bounded `list_models` request whose result supplies both the UI
+        // catalogue and the context window (no per-consumer duplicate).
+        struct CountingModelsProvider {
+            list_calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for CountingModelsProvider {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                Ok(Box::pin(stream::iter(Vec::new())))
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![ModelInfo {
+                    id: "switched-model".into(),
+                    name: None,
+                    context_length: Some(123_456),
+                }])
+            }
+        }
+
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let provider = Arc::new(CountingModelsProvider {
+            list_calls: AtomicUsize::new(0),
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::SetModel {
+                provider: None,
+                model: "switched-model".into(),
+            })
+            .unwrap();
+        // Keep the run loop alive until the background metadata fetch
+        // reports: `run` must be alive to relay the channel result, and it
+        // exits when input closes — so hold input open, watch for the
+        // ModelList, then close.
+        let agent_task = tokio::spawn(
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .with_session(store, session)
+                .run(input_rx, event_tx),
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut events = Vec::new();
+        loop {
+            while let Ok(event) = event_rx.try_recv() {
+                events.push(event);
+            }
+            if events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ModelList { .. }))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for metadata ModelList: {events:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(input_tx);
+        agent_task.await.unwrap();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ModelChanged { model, .. } if model == "switched-model"
+            )),
+            "expected the switch to commit: {events:?}"
+        );
+        // One request total: the startup fetch plus exactly one switch
+        // fetch — both flow through the same channel. The switch's own
+        // fetch is the one that must exist (its ModelList carries the
+        // switched model name); the count pins no per-consumer duplicate.
+        let calls = provider.list_calls.load(Ordering::SeqCst);
+        assert!(
+            calls <= 2,
+            "startup + one switch must not fan out: {calls} calls"
+        );
+        assert!(
+            calls >= 1,
+            "the switch must spawn its metadata fetch: {events:?}"
+        );
+        // The single fetch supplies both catalogue and window: the
+        // switch's ModelList arrives (catalogue, carrying the switched
+        // model id) and the context window adopts the reported length —
+        // both derived from that one response.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::ModelList { provider, models }
+                    if provider == "counting"
+                        && models.iter().any(|model| model.id == "switched-model")
+            )),
+            "the single fetch must supply the catalogue: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_arriving_mid_turn_applies_before_the_queued_turn() {
+        // AGENT-4 anti-starvation: the run loop drains ready metadata
+        // before each queued operation (plus `select!` on metadata while
+        // idle), so a catalogue that lands while turn one runs is relayed
+        // before queued turn two completes — queued turns can never starve
+        // it indefinitely. Pinned at the `ModelList` relay level: the
+        // stale-guard window assertion lives in the switch test.
+        struct SlowMetadataProvider {
+            release: tokio::sync::Notify,
+            released: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for SlowMetadataProvider {
+            fn name(&self) -> &str {
+                "slow-meta"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                // Turn one parks until the test observes its request, so
+                // the release provably lands mid-turn.
+                if self.released.load(Ordering::SeqCst) == 0 {
+                    self.release.notified().await;
+                }
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("turn".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(vec![ModelInfo {
+                    id: "demo".into(),
+                    name: None,
+                    context_length: Some(777_777),
+                }])
+            }
+        }
+
+        let provider = Arc::new(SlowMetadataProvider {
+            release: tokio::sync::Notify::new(),
+            released: AtomicUsize::new(0),
+        });
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("first".into()))
+            .unwrap();
+        input_tx
+            .send(InputMessage::Message("second".into()))
+            .unwrap();
+        let agent_task = tokio::spawn(
+            Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
+                .run(input_rx, event_tx),
+        );
+        // Turn one's stream parks until released, so the release lands
+        // provably mid-turn one. The startup `list_models` resolves
+        // immediately, so its ModelList is already channel-queued; the run
+        // loop's `select!` relays it while turn one is parked — before
+        // queued turn two completes. Give turn one a beat to park, then
+        // release it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        provider.released.store(1, Ordering::SeqCst);
+        provider.release.notify_one();
+        drop(input_tx);
+        agent_task.await.unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // Both turns ran; the metadata relayed (ModelList) no later than
+        // before the second turn's completion — the drain-before-operation
+        // order means queued turns can never starve it. (The window-value
+        // assertion lives in `one_model_switch_produces_one_metadata_request`.)
+        let finished = events
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::TurnFinished))
+            .count();
+        assert_eq!(finished, 2, "both queued turns must run: {events:?}");
+        let list_at = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::ModelList { .. }));
+        let second_finish_at = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, AgentEvent::TurnFinished))
+            .map(|(index, _)| index)
+            .nth(1);
+        match (list_at, second_finish_at) {
+            (Some(list), Some(second)) => assert!(
+                list < second,
+                "metadata must relay before the queued turn completes"
+            ),
+            _ => panic!("missing ModelList relay or second finish: {events:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hanging_metadata_fetch_never_blocks_command_processing() {
+        // AGENT-4 non-blocking: a `list_models` that hangs past the 5s
+        // bound must not freeze the command loop — queued turns still run
+        // to completion while the fetch is in flight.
+        struct HangingModelsProvider;
+        #[async_trait]
+        impl Provider for HangingModelsProvider {
+            fn name(&self) -> &str {
+                "hanging"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("turn done".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(events)))
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                std::future::pending::<()>().await;
+                unreachable!("the 5s timeout must win first")
+            }
+        }
+
+        let provider = Arc::new(HangingModelsProvider);
+        let cancel = CancellationToken::new();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("hello".into()))
+            .unwrap();
+        drop(input_tx);
+        let started = std::time::Instant::now();
+        Agent::new(provider, ToolRegistry::empty(), "demo", cancel)
+            .run(input_rx, event_tx)
+            .await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        // The turn completed promptly — long before the 5s metadata bound
+        // could have elapsed — so the hanging fetch never blocked it.
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::TextDelta(text) if text.contains("turn done")
+            )),
+            "turn must complete despite hanging metadata: {events:?}"
+        );
+        assert!(
+            events.contains(&AgentEvent::TurnFinished),
+            "events: {events:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "command processing blocked on metadata: {:?}",
+            started.elapsed()
+        );
     }
 }

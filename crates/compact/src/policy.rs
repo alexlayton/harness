@@ -83,19 +83,10 @@ pub const DEFAULT_TOOL_RESULT_CHARS: usize = 2_000;
 mod tests {
     use super::*;
 
-    #[test]
-    fn defaults_are_sane() {
-        let policy = CompactionPolicy::default();
-        assert!(policy.auto);
-        assert_eq!(policy.threshold, 0.80);
-        assert_eq!(policy.reserve_tokens, 16_384);
-        assert_eq!(policy.keep_recent_turns, 10);
-        assert_eq!(policy.keep_recent_tokens, 20_000);
-        assert_eq!(policy.max_summary_input_bytes, 96 * 1024);
-        assert_eq!(policy.max_summary_bytes, 12 * 1024);
-        assert_eq!(policy.context_window, 0);
-    }
-
+    // CLEANUP-4: the literal default-value assertions below were replaced
+    // by the boundary/validation tests that follow (`trigger_fires_past…`,
+    // `window_resolution_priority…`, plus the `config.rs` TOML-key
+    // validation matrix) — the defaults themselves are covered there.
     #[test]
     fn trigger_fires_past_threshold_minus_reserve() {
         let policy = CompactionPolicy::default();

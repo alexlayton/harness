@@ -34,20 +34,6 @@ pub const MESSAGES_MODELS: &[&str] = &[
     "qwen3.7-plus",
     "qwen3.6-plus",
 ];
-pub const CHAT_MODELS: &[&str] = &[
-    "grok-4.5",
-    "glm-5.2",
-    "glm-5.1",
-    "kimi-k3",
-    "kimi-k2.7-code",
-    "kimi-k2.6",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "mimo-v2.5",
-    "mimo-v2.5-pro",
-    "hy3",
-];
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Dialect {
     Responses,
@@ -131,7 +117,8 @@ impl Provider for OpenCodeGoProvider {
         // the underlying reqwest client is Arc-backed; only the small
         // header map is rebuilt.
         let headers = session_headers(req.session_id.as_deref());
-        let api_key = self.usage.api_key.clone();
+        let access = self.usage.api_key.clone();
+        let api_key = access.clone();
         match dialect {
             Dialect::Responses => {
                 OpenAiResponsesClient::with_headers(BASE_URL, api_key.clone(), headers.clone())
@@ -149,16 +136,26 @@ impl Provider for OpenCodeGoProvider {
                     .await
             }
         }
+        .map_err(|error| error.redacted(&access))
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        self.chat.list_models().await
+        self.chat
+            .list_models()
+            .await
+            .map_err(|error| error.redacted(&self.usage.api_key))
     }
 
     async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {
-        let response = self.usage.get("/usage").await?;
+        let response = self
+            .usage
+            .get("/usage")
+            .await
+            .map_err(|error| error.redacted(&self.usage.api_key))?;
         let body = response.text().await.map_err(LlmError::Network)?;
-        parse_usage_body(&body).map(Some)
+        parse_usage_body(&body)
+            .map(Some)
+            .map_err(|error| error.redacted(&self.usage.api_key))
     }
 }
 
@@ -241,9 +238,9 @@ mod tests {
         for model in MESSAGES_MODELS {
             assert_eq!(dialect_for_model(model), Dialect::Messages);
         }
-        for model in CHAT_MODELS {
-            assert_eq!(dialect_for_model(model), Dialect::Chat);
-        }
+        // Models without an explicit wire-format entry use the safe Chat
+        // fallback, including formerly documented Chat-only catalogue items.
+        assert_eq!(dialect_for_model("grok-4.5"), Dialect::Chat);
         assert_eq!(dialect_for_model("new-model"), Dialect::Chat);
     }
 
@@ -275,5 +272,19 @@ mod tests {
     fn rejects_incomplete_subscription_usage() {
         let error = parse_usage_body(r#"{"usage":{"rolling":{}}}"#).unwrap_err();
         assert!(error.to_string().contains("OpenCode Go usage response"));
+    }
+
+    #[test]
+    fn provider_errors_redact_api_keys() {
+        // Every fallible provider surface redacts the active key before
+        // the error becomes UI-/log-visible: stream, usage-parse, and HTTP
+        // errors alike.
+        let secret = "zen-go-secret-key";
+        let stream = LlmError::http(500, format!("boom {secret}")).redacted(secret);
+        assert!(!stream.to_string().contains(secret));
+        let parse = parse_usage_body(&format!("not json {secret}"))
+            .unwrap_err()
+            .redacted(secret);
+        assert!(!parse.to_string().contains(secret));
     }
 }

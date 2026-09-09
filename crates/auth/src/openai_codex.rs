@@ -19,10 +19,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpListener,
-};
+use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 /// Public OAuth client identity used by the Codex subscription login.
@@ -86,6 +83,10 @@ pub struct OpenAiCodexAuth {
     http: Client,
     endpoints: OpenAiCodexEndpoints,
     credential: Arc<Mutex<Option<OpenAiCodexCredential>>>,
+    /// Serializes rotating refresh-token exchanges so concurrent
+    /// `ensure_valid` calls produce one network refresh and never let an
+    /// older completion overwrite newer credentials.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 impl fmt::Debug for OpenAiCodexAuth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -108,12 +109,25 @@ impl OpenAiCodexAuth {
             http,
             endpoints: OpenAiCodexEndpoints::default(),
             credential: Arc::new(Mutex::new(credential)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
     pub fn from_default() -> Result<Self> {
         Self::new(AuthStore::default())
     }
     pub fn with_endpoints(mut self, endpoints: OpenAiCodexEndpoints) -> Self {
+        self.endpoints = endpoints;
+        self
+    }
+    /// Test seam: same client against a local fixture so refresh tests
+    /// exercise the real `ensure_valid` path with one network exchange.
+    #[cfg(test)]
+    pub(crate) fn with_http_and_endpoints(
+        mut self,
+        http: Client,
+        endpoints: OpenAiCodexEndpoints,
+    ) -> Self {
+        self.http = http;
         self.endpoints = endpoints;
         self
     }
@@ -158,23 +172,114 @@ impl OpenAiCodexAuth {
             .credential()?
             .ok_or(AuthError::OpenAiCodexNotAuthenticated)?;
         if !credential.is_expired() {
+            // A separate Harness process may have refreshed the same file
+            // while this handle's cached token was still unexpired. Check
+            // for a newer valid generation before returning the cache so a
+            // handle does not keep using an obsolete access token until its
+            // old expiry.
+            if let Some(current) = self.adopt_newer_on_disk(&credential)? {
+                return Ok(current);
+            }
             return Ok(credential);
         }
         self.refresh().await
     }
+
+    /// Best-effort adoption of a newer persisted generation. Read failures
+    /// intentionally leave a usable cached credential in place, matching the
+    /// refresh recheck's existing behavior; a refresh or later call can retry.
+    fn adopt_newer_on_disk(
+        &self,
+        cached: &OpenAiCodexCredential,
+    ) -> Result<Option<OpenAiCodexCredential>> {
+        let Ok(Some(current)) = self.store.openai_codex() else {
+            return Ok(None);
+        };
+        if current.is_newer_generation_than(cached) {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                Some(current.clone());
+            return Ok(Some(current));
+        }
+        Ok(None)
+    }
+
     pub async fn refresh(&self) -> Result<OpenAiCodexCredential> {
+        // Single-flight: concurrent refreshers queue here, then recheck the
+        // credential before refreshing so only the first waiter hits the
+        // network.  Never hold the blocking cache mutex across the network;
+        // the async guard is released before any `.await` on the mutex.
+        let _guard = self.refresh_lock.lock().await;
+        // Reload: another waiter (or process) may have already refreshed.
+        if let Ok(Some(current)) = self.store.openai_codex() {
+            let cached = self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))?
+                .clone();
+            // Prefer a newer valid disk generation over the cache. A
+            // generation can change one field at a time: rotating only the
+            // refresh token, replacing only the access token, extending its
+            // expiry, or updating its account identity must all be adopted.
+            // The comparison also prevents an older cached expiry from
+            // forcing an unnecessary exchange.
+            if let Some(cached) = cached {
+                if current.is_newer_generation_than(&cached) {
+                    *self
+                        .credential
+                        .lock()
+                        .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                        Some(current.clone());
+                    return Ok(current);
+                }
+                if !cached.is_expired() {
+                    return Ok(cached);
+                }
+            } else if !current.is_expired() {
+                *self
+                    .credential
+                    .lock()
+                    .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                    Some(current.clone());
+                return Ok(current);
+            }
+        }
         let old = self
             .credential()?
             .ok_or(AuthError::OpenAiCodexNotAuthenticated)?;
+        let old_refresh = old.refresh.clone();
+        // Refresh exchanges use strict status handling like the browser
+        // flow: only 2xx with a token payload succeeds.
         let value = self
-            .token(
+            .token_strict(
                 json!({"grant_type":"refresh_token", "refresh_token":old.refresh, "client_id": OPENAI_CODEX_CLIENT_ID} ),
                 &CancellationToken::new(),
             )
             .await?;
-        let credential = credential_from_token(&value, Some(&old.refresh))?;
-        self.persist(credential.clone())?;
-        Ok(credential)
+        let credential = credential_from_token(&value, Some(&old_refresh))?;
+        // Compare and save under the auth-file lock. A separate process may
+        // have rotated the credential while this exchange was in flight; in
+        // that case never overwrite its newer generation.
+        if self.store.save_openai_codex_if_current(&old, &credential)? {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+                Some(credential.clone());
+            return Ok(credential);
+        }
+        let current = self
+            .store
+            .openai_codex()?
+            .ok_or_else(|| AuthError::OpenAiCodex("credential changed during refresh".into()))?;
+        *self
+            .credential
+            .lock()
+            .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? =
+            Some(current.clone());
+        Ok(current)
     }
     fn persist(&self, credential: OpenAiCodexCredential) -> Result<()> {
         self.store.save_openai_codex(&credential)?;
@@ -203,7 +308,7 @@ impl OpenAiCodexAuth {
         emit(AuthEvent::Started);
         emit(AuthEvent::Prompt { message: url });
         let code = wait_for_callback(listener, &values.state, cancel).await?;
-        let value = self.token(json!({"grant_type":"authorization_code", "client_id":OPENAI_CODEX_CLIENT_ID, "code":code, "code_verifier":values.verifier, "redirect_uri":"http://localhost:1455/auth/callback"}), cancel).await?;
+        let value = self.token_strict(json!({"grant_type":"authorization_code", "client_id":OPENAI_CODEX_CLIENT_ID, "code":code, "code_verifier":values.verifier, "redirect_uri":"http://localhost:1455/auth/callback"}), cancel).await?;
         let credential = credential_from_token(&value, None)?;
         self.persist(credential.clone())?;
         emit(AuthEvent::Finished);
@@ -212,18 +317,40 @@ impl OpenAiCodexAuth {
     pub async fn login_device<F>(
         &self,
         cancel: &CancellationToken,
-        mut emit: F,
+        emit: F,
     ) -> Result<OpenAiCodexCredential>
     where
         F: FnMut(AuthEvent) + Send,
     {
+        self.login_device_with_sleep(cancel, emit, |seconds, token| async move {
+            cancellable_sleep(seconds, &token).await
+        })
+        .await
+    }
+
+    /// `login_device` with an injectable poll-interval sleep. Production
+    /// passes [`cancellable_sleep`]; tests record the requested waits to
+    /// prove `slow_down` backs off without sleeping the suite or fighting
+    /// Tokio's paused clock over real-socket I/O.
+    async fn login_device_with_sleep<F, S, Fut>(
+        &self,
+        cancel: &CancellationToken,
+        mut emit: F,
+        sleep: S,
+    ) -> Result<OpenAiCodexCredential>
+    where
+        F: FnMut(AuthEvent) + Send,
+        S: Fn(u64, CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = Result<()>> + Send,
+    {
+        let cancel = cancel.clone();
         emit(AuthEvent::Started);
         let value = self
             .request_json(
                 self.http
                     .post(&self.endpoints.device_code_url)
                     .json(&json!({"client_id":OPENAI_CODEX_CLIENT_ID})),
-                cancel,
+                &cancel,
             )
             .await?;
         let device = parse_device_code(&value)?;
@@ -233,14 +360,42 @@ impl OpenAiCodexAuth {
             expires_in: device.expires_in,
             interval: device.interval,
         });
-        let deadline = std::time::Instant::now() + Duration::from_secs(device.expires_in);
+        // Expiry deadline in the Tokio clock domain: `cancellable_sleep`
+        // and `request_token_until` both wait on Tokio time (which paused
+        // test clocks auto-advance past short expiries), so a `std`
+        // wall-clock deadline would never fire there. Conversely, expiry
+        // checks on the Tokio clock DO advance under paused time — the
+        // 900s grant below outlasts the test's ~5s of virtual sleep.
+        // `Duration::from_secs` cannot overflow for a `u64` grant on
+        // 64-bit; clamp anyway so a huge grant never wraps the deadline
+        // into the past.
+        let grant = Duration::from_secs(device.expires_in.min(3600));
+        let deadline = tokio::time::Instant::now() + grant;
         let mut interval = device.interval;
         loop {
-            if std::time::Instant::now() >= deadline {
+            // Check expiry before sleeping so an already-expired grant
+            // fails fast, and re-check after the sleep and around the
+            // request (inside `token`) so cancellation/expiry interrupt
+            // both waits and in-flight polls.
+            if tokio::time::Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
             }
-            cancellable_sleep(interval, cancel).await?;
-            let value = self.token(json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code", "device_code":device.device_code, "client_id":OPENAI_CODEX_CLIENT_ID}), cancel).await?;
+            sleep(interval, cancel.clone()).await?;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(AuthError::DeviceCodeExpired);
+            }
+            if cancel.is_cancelled() {
+                return Err(AuthError::Cancelled);
+            }
+            let value = self
+                .request_token_until(
+                    self.http
+                        .post(&self.endpoints.token_url)
+                        .form(&json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code", "device_code":device.device_code, "client_id":OPENAI_CODEX_CLIENT_ID})),
+                    &cancel,
+                    Some(deadline),
+                )
+                .await?;
             if let Some(error) = value.get("error").and_then(Value::as_str) {
                 match error {
                     "authorization_pending" => continue,
@@ -263,12 +418,83 @@ impl OpenAiCodexAuth {
             return Ok(credential);
         }
     }
-    async fn token(&self, body: Value, cancel: &CancellationToken) -> Result<Value> {
-        self.request_json(
-            self.http.post(&self.endpoints.token_url).form(&body),
-            cancel,
-        )
-        .await
+    /// Browser authorization exchange: strict status handling (no RFC 8628
+    /// polling semantics).  Only 2xx with a token payload succeeds; error
+    /// bodies are bounded and never echoed.
+    async fn token_strict(&self, body: Value, cancel: &CancellationToken) -> Result<Value> {
+        let response = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), result = self.http.post(&self.endpoints.token_url).form(&body).send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))? };
+        let status = response.status();
+        let body = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), body = read_bounded_body(response) => body? };
+        if !status.is_success() {
+            return Err(AuthError::Http {
+                status: status.as_u16(),
+                endpoint: "auth.openai.com".into(),
+            });
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))
+    }
+    /// Token endpoint with RFC 8628 device-polling semantics: read a bounded
+    /// response body regardless of HTTP status, then map recognized `error`
+    /// values (`authorization_pending`, `slow_down`, `expired_token`,
+    /// `access_denied`) before treating other non-success statuses as
+    /// errors.  Cancellation and expiry are checked around both sleeps and
+    /// requests; token bodies never enter errors or logs.
+    #[cfg(test)]
+    async fn request_token(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancel: &CancellationToken,
+    ) -> Result<Value> {
+        self.request_token_until(request, cancel, None).await
+    }
+
+    async fn request_token_until(
+        &self,
+        request: reqwest::RequestBuilder,
+        cancel: &CancellationToken,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Value> {
+        let response = if let Some(deadline) = deadline {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(AuthError::DeviceCodeExpired),
+                result = request.send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))?,
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                result = request.send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))?,
+            }
+        };
+        let status = response.status();
+        let body = if let Some(deadline) = deadline {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(AuthError::DeviceCodeExpired),
+                body = read_bounded_body(response) => body?,
+            }
+        } else {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+                body = read_bounded_body(response) => body?,
+            }
+        };
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))?;
+        if status.is_success() && value.get("error").is_none() {
+            return Ok(value);
+        }
+        match value.get("error").and_then(Value::as_str) {
+            Some("authorization_pending") => Ok(value),
+            Some("slow_down") => Ok(value),
+            Some("expired_token") => Ok(value),
+            Some("access_denied") => Ok(value),
+            _ => Err(AuthError::Http {
+                status: status.as_u16(),
+                endpoint: "auth.openai.com".into(),
+            }),
+        }
     }
     async fn request_json(
         &self,
@@ -286,44 +512,190 @@ impl OpenAiCodexAuth {
     }
 }
 
+/// Read at most `OAUTH_BODY_LIMIT` bytes of a token/authorize response.
+/// OAuth error payloads are small JSON objects; bounding the read keeps a
+/// malicious endpoint from filling memory before the RFC 8628 error mapping
+/// runs.  Bodies are parsed, never echoed into errors or logs.
+const OAUTH_BODY_LIMIT: usize = 64 * 1024;
+
+async fn read_bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk: bytes::Bytes =
+            chunk.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))?;
+        let remaining = OAUTH_BODY_LIMIT.saturating_sub(body.len());
+        if chunk.len() > remaining {
+            return Err(AuthError::OpenAiCodex("invalid OAuth response".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// Browser-flow listener timeouts: an idle connection cannot park login
+/// forever, and the whole flow is bounded so a hanging browser tab fails
+/// with actionable device-flow advice instead of blocking shutdown.
+/// `idle_timeout` is exposed for tests; production uses 10 seconds.
+const CALLBACK_OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Maximum callback request head: headers are read incrementally through
+/// the `\r\n\r\n` terminator under this cap so a slowloris-style sender
+/// cannot grow memory without bound.
+const CALLBACK_HEAD_LIMIT: usize = 16 * 1024;
+
 async fn wait_for_callback(
     listener: TcpListener,
     expected_state: &str,
     cancel: &CancellationToken,
 ) -> Result<String> {
+    wait_for_callback_with_idle(listener, expected_state, cancel, Duration::from_secs(10)).await
+}
+
+async fn wait_for_callback_with_idle(
+    listener: TcpListener,
+    expected_state: &str,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + CALLBACK_OVERALL_TIMEOUT;
     loop {
-        let (mut stream, _) = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), value = listener.accept() => value.map_err(|_| AuthError::OpenAiCodex("callback listener failed".into()))? };
-        let mut request = vec![0; 8192];
-        let size = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), value = stream.read(&mut request) => value.map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))? };
-        let target = std::str::from_utf8(&request[..size])
-            .ok()
-            .and_then(|s| s.lines().next())
-            .and_then(|line| line.split_whitespace().nth(1));
-        let outcome = target
-            .and_then(|target| Url::parse(&format!("http://localhost{target}")).ok())
-            .and_then(|url| (url.path() == CALLBACK_PATH).then_some(url))
-            .and_then(|url| {
-                let pairs: std::collections::HashMap<_, _> =
-                    url.query_pairs().into_owned().collect();
-                (pairs
-                    .get("state")
-                    .is_some_and(|state| state == expected_state))
-                .then(|| pairs.get("code").cloned())
-                .flatten()
-            });
-        let (body, code) = match outcome {
-            Some(code) => ("Login complete. You may close this window.", Some(code)),
-            None => ("Login failed. Return to Harness and try again.", None),
+        if std::time::Instant::now() >= deadline {
+            return Err(AuthError::OpenAiCodex(
+                "browser login timed out; use `harness login openai-codex --device-code`".into(),
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let accept = listener.accept();
+        let (mut stream, _) = tokio::select! {
+            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+            _ = tokio::time::sleep(remaining) => return Err(AuthError::OpenAiCodex("browser login timed out; use `harness login openai-codex --device-code`".into())),
+            value = accept => value.map_err(|_| AuthError::OpenAiCodex("callback listener failed".into()))?
         };
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n<html><body>{body}</body></html>",
-            body.len() + 26
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        if let Some(code) = code {
+        let request = match read_callback_head(&stream, cancel, idle_timeout).await {
+            Ok(request) => request,
+            // Idle/slow senders time out per-connection without blocking a
+            // later valid callback; malformed heads are answered as failure.
+            Err(_) => {
+                let _ = respond_callback(&mut stream, false).await;
+                continue;
+            }
+        };
+        let outcome = parse_callback_target(&request, expected_state);
+        // A valid-state OAuth denial (`error=access_denied`) terminates
+        // promptly as a sanitized denial, not a retried code exchange.
+        if is_callback_denial(&request, expected_state) {
+            let _ = respond_callback(&mut stream, false).await;
+            return Err(AuthError::OpenAiCodex(
+                "browser authorization was denied".into(),
+            ));
+        }
+        let success = outcome.is_some();
+        let _ = respond_callback(&mut stream, success).await;
+        if let Some(code) = outcome {
             return Ok(code);
         }
     }
+}
+
+/// Read one HTTP request head incrementally through the `\r\n\r\n`
+/// terminator under [`CALLBACK_HEAD_LIMIT`], timing out idle connections so
+/// one hanging sender cannot block later callbacks.
+async fn read_callback_head(
+    stream: &tokio::net::TcpStream,
+    cancel: &CancellationToken,
+    idle_timeout: Duration,
+) -> Result<String> {
+    let mut head: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 512];
+    loop {
+        if head.len() > CALLBACK_HEAD_LIMIT {
+            return Err(AuthError::OpenAiCodex("callback request too large".into()));
+        }
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+        let read = async {
+            stream
+                .readable()
+                .await
+                .and_then(|_| stream.try_read(&mut chunk))
+        };
+        let size = tokio::select! {
+            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
+            _ = tokio::time::sleep(idle_timeout) => return Err(AuthError::OpenAiCodex("callback read timed out".into())),
+            value = read => value.map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))?,
+        };
+        if size == 0 {
+            break;
+        }
+        head.extend_from_slice(&chunk[..size]);
+    }
+    String::from_utf8(head).map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))
+}
+
+/// Parse the request target from a callback head: the authorization `code`
+/// when the path and PKCE `state` match.
+fn parse_callback_target(request: &str, expected_state: &str) -> Option<String> {
+    let target = request.lines().next()?.split_whitespace().nth(1)?;
+    let url = Url::parse(&format!("http://localhost{target}")).ok()?;
+    if url.path() != CALLBACK_PATH {
+        return None;
+    }
+    let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    if pairs
+        .get("state")
+        .is_none_or(|state| state != expected_state)
+    {
+        return None;
+    }
+    pairs.get("code").cloned()
+}
+
+/// True when the callback is a valid-state OAuth denial rather than a code:
+/// `?error=access_denied&state=<expected>`. Only `access_denied` with the
+/// exact expected state counts: other errors, missing states, and
+/// mismatched states fall through to the failure reply below, so an
+/// attacker's cross-site request cannot terminate another login attempt.
+fn is_callback_denial(request: &str, expected_state: &str) -> bool {
+    let Some(target) = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+    else {
+        return false;
+    };
+    let Ok(url) = Url::parse(&format!("http://localhost{target}")) else {
+        return false;
+    };
+    if url.path() != CALLBACK_PATH {
+        return false;
+    }
+    let pairs: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    pairs
+        .get("state")
+        .is_some_and(|state| state == expected_state)
+        && pairs
+            .get("error")
+            .is_some_and(|error| error == "access_denied")
+}
+
+async fn respond_callback(stream: &mut tokio::net::TcpStream, success: bool) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let body = if success {
+        "Login complete. You may close this window."
+    } else {
+        "Login failed. Return to Harness and try again."
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n<html><body>{body}</body></html>",
+        body.len() + 26
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .map_err(|_| AuthError::OpenAiCodex("callback write failed".into()))?;
+    Ok(())
 }
 
 fn credential_from_token(
@@ -412,14 +784,13 @@ pub fn account_id_from_tokens(
     ))
 }
 
-/// Extract an account from a single JWT for callers that only have an access token.
-pub fn account_id_from_jwt(token: &str) -> Result<String> {
-    account_id_from_tokens(None, Some(token))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     #[test]
     fn pkce_is_url_safe_and_changes_each_time() {
         let a = pkce().unwrap();
@@ -437,6 +808,1019 @@ mod tests {
             URL_SAFE_NO_PAD
                 .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct"}}"#)
         );
-        assert_eq!(account_id_from_jwt(&token).unwrap(), "acct");
+        assert_eq!(account_id_from_tokens(None, Some(&token)).unwrap(), "acct");
+    }
+
+    /// Minimal HTTP fixture: scripted `(status, body)` replies in order.
+    struct Fixture {
+        addr: std::net::SocketAddr,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    async fn fixture(replies: Vec<(u16, String)>) -> Fixture {
+        let replies = Arc::new(Mutex::new(VecDeque::from(replies)));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let replies_task = replies.clone();
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let next = replies_task.lock().unwrap().pop_front();
+                let Some((status, body)) = next else {
+                    return;
+                };
+                // Drain the request head so the client can finish sending.
+                let mut scratch = [0u8; 4096];
+                let _ = socket.read(&mut scratch).await;
+                seen_task
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&scratch).into_owned());
+                let reason = match status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    _ => "Error",
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        Fixture { addr, seen }
+    }
+
+    fn token_endpoints(addr: &std::net::SocketAddr) -> OpenAiCodexEndpoints {
+        OpenAiCodexEndpoints {
+            authorize_url: format!("http://{addr}/authorize"),
+            token_url: format!("http://{addr}/token"),
+            device_code_url: format!("http://{addr}/device"),
+        }
+    }
+
+    fn success_token_body(refresh: &str) -> String {
+        // A JWT whose payload carries the account id and expiry.
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+        let access = format!("head.{payload}.sig");
+        serde_json::json!({
+            "access_token": access,
+            "refresh_token": refresh,
+            "expires_in": 3600,
+            "id_token": access,
+        })
+        .to_string()
+    }
+
+    fn cached_codex_credential() -> OpenAiCodexCredential {
+        OpenAiCodexCredential::new("access-cached", "refresh-cached", u64::MAX - 1, "acct")
+    }
+
+    fn expired_codex_credential() -> OpenAiCodexCredential {
+        OpenAiCodexCredential::new("access-cached", "refresh-cached", 1, "acct")
+    }
+
+    async fn auth_with_fixture(
+        store_dir: &tempfile::TempDir,
+        fixture: &Fixture,
+    ) -> OpenAiCodexAuth {
+        let store = AuthStore::new(store_dir.path().join("auth.json"));
+        OpenAiCodexAuth::new(store)
+            .unwrap()
+            .with_endpoints(token_endpoints(&fixture.addr))
+    }
+
+    #[tokio::test]
+    async fn recheck_adopts_access_only_codex_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = expired_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.access = "access-new".into();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+
+        assert_eq!(auth.refresh().await.unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn recheck_adopts_refresh_only_codex_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = expired_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.refresh = "refresh-new".into();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+
+        assert_eq!(auth.refresh().await.unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn recheck_adopts_codex_expiry_only_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = expired_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+
+        assert_eq!(auth.refresh().await.unwrap(), newer);
+    }
+
+    /// Separate handles have separate in-process locks, like two Harness
+    /// processes. Both must adopt a generation written by the other process
+    /// rather than using their independently cached credential.
+    #[tokio::test]
+    async fn independent_codex_handles_adopt_a_newer_disk_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = cached_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let first = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let second = OpenAiCodexAuth::new(AuthStore::new(path.clone())).unwrap();
+        let mut newer = old.clone();
+        newer.refresh = "refresh-process-2".into();
+        store.save_openai_codex(&newer).unwrap();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_task = tokio::spawn({
+            let first = first.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                first.ensure_valid().await
+            }
+        });
+        let second_task = tokio::spawn({
+            let second = second.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                second.ensure_valid().await
+            }
+        });
+        let first = first_task.await.unwrap().unwrap();
+        let second = second_task.await.unwrap().unwrap();
+        assert_eq!(first, newer);
+        assert_eq!(second, newer);
+    }
+
+    /// Separate handles can reach the token endpoint concurrently because
+    /// their async single-flight locks are process-local. Both completions
+    /// are allowed to succeed here, but the compare-and-save winner must be
+    /// the credential returned by both handles and persisted to disk.
+    #[tokio::test]
+    async fn independent_codex_refresh_race_adopts_one_persisted_generation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let exchanges = Arc::new(AtomicUsize::new(0));
+        let responses = Arc::new(tokio::sync::Barrier::new(2));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let exchanges_task = exchanges.clone();
+        let responses_task = responses.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                let responses = responses_task.clone();
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 8192];
+                    let _ = socket.read(&mut scratch).await;
+                    responses.wait().await;
+                    let payload = URL_SAFE_NO_PAD
+                        .encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+                    let access = format!("head-{n}.{payload}.sig");
+                    let body = serde_json::json!({
+                        "access_token": access,
+                        "refresh_token": format!("refresh-response-{n}"),
+                        "expires_in": 3600,
+                        "id_token": access,
+                    })
+                    .to_string();
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = socket.write_all(head.as_bytes()).await;
+                    let _ = socket.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        store
+            .save_openai_codex(&expired_codex_credential())
+            .unwrap();
+        let endpoints = token_endpoints(&addr);
+        let first = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_endpoints(endpoints.clone());
+        let second = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_endpoints(endpoints);
+        let start = Arc::new(tokio::sync::Barrier::new(2));
+        let first_task = tokio::spawn({
+            let first = first.clone();
+            let start = start.clone();
+            async move {
+                start.wait().await;
+                first.ensure_valid().await
+            }
+        });
+        let second_task = tokio::spawn({
+            let second = second.clone();
+            let start = start.clone();
+            async move {
+                start.wait().await;
+                second.ensure_valid().await
+            }
+        });
+        let first = first_task.await.unwrap().unwrap();
+        let second = second_task.await.unwrap().unwrap();
+        server.abort();
+        let _ = server.await;
+
+        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+        assert_eq!(first, second);
+        assert_eq!(AuthStore::new(path).openai_codex().unwrap().unwrap(), first);
+    }
+
+    /// A refresh completion based on an old generation must not overwrite an
+    /// expiry-only update made while its network request was in flight.
+    #[tokio::test]
+    async fn stale_codex_refresh_completion_cannot_overwrite_disk_generation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut scratch = [0u8; 8192];
+            let _ = socket.read(&mut scratch).await;
+            let _ = request_tx.send(());
+            let _ = release_rx.await;
+            let payload =
+                URL_SAFE_NO_PAD.encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+            let access = format!("head.{payload}.sig");
+            let body = serde_json::json!({
+                "access_token": access,
+                "refresh_token": "refresh-exchange",
+                "expires_in": 3600,
+                "id_token": access,
+            })
+            .to_string();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body.as_bytes()).await;
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let store = AuthStore::new(path.clone());
+        let old = OpenAiCodexCredential::new("access-old", "refresh-old", 1, "acct");
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_http_and_endpoints(
+                reqwest::Client::new(),
+                OpenAiCodexEndpoints {
+                    authorize_url: format!("http://{addr}/authorize"),
+                    token_url: format!("http://{addr}/token"),
+                    device_code_url: format!("http://{addr}/device"),
+                },
+            );
+        let refresh_task = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.refresh().await }
+        });
+        request_rx.await.unwrap();
+
+        let mut newer = old.clone();
+        newer.expires = u64::MAX;
+        store.save_openai_codex(&newer).unwrap();
+        release_tx.send(()).unwrap();
+
+        let result = refresh_task.await.unwrap().unwrap();
+        server.await.unwrap();
+        assert_eq!(result, newer);
+        assert_eq!(store.openai_codex().unwrap().unwrap(), newer);
+    }
+
+    #[tokio::test]
+    async fn device_poll_pending_then_success() {
+        // Superseded by `device_login_pending_then_success_persists`,
+        // which drives the same two replies through the full
+        // `login_device` loop. Kept as the helper-level contract: the
+        // polling helper surfaces `authorization_pending` instead of
+        // failing on the 400 status.
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![
+            (400, r#"{"error":"authorization_pending"}"#.into()),
+            (200, success_token_body("refresh-1")),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let cancel = CancellationToken::new();
+        let credential = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            credential.get("error").and_then(Value::as_str),
+            Some("authorization_pending")
+        );
+        let credential = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        let parsed = credential_from_token(&credential, None).unwrap();
+        assert_eq!(parsed.refresh, "refresh-1");
+        // Request bodies never carry tokens into errors: a bad reply maps to
+        // a status-only error with no body echo.
+        assert_eq!(fix.seen.lock().unwrap().len(), 2);
+    }
+
+    /// AUTH-1: `authorization_pending` through the full `login_device`
+    /// loop — device-code grant, one pending poll, then success — persists
+    /// the exchanged credential and finishes. The fixture's device grant
+    /// uses `interval: 0` so the loop polls immediately (no suite sleep).
+    #[tokio::test]
+    async fn device_login_pending_then_success_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (400, r#"{"error":"authorization_pending"}"#.into()),
+            (200, success_token_body("refresh-device-1")),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let mut events = Vec::new();
+        let credential = auth
+            .login_device(&CancellationToken::new(), |event| events.push(event))
+            .await
+            .unwrap();
+        assert_eq!(credential.refresh, "refresh-device-1");
+        // The exchanged credential is durable: a fresh handle built on the
+        // same store observes it without another network exchange.
+        let reopened = OpenAiCodexAuth::new(AuthStore::new(dir.path().join("auth.json")))
+            .unwrap()
+            .credential()
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened.refresh, "refresh-device-1");
+        assert!(events.contains(&AuthEvent::Started));
+        assert!(events.contains(&AuthEvent::Finished));
+        assert_eq!(fix.seen.lock().unwrap().len(), 3);
+    }
+
+    /// AUTH-1: `slow_down` through the full `login_device` loop.
+    /// `slow_down` raises the next poll interval by exactly 5s: the
+    /// device grant's `interval: 0` is normalized to the 5s RFC 8628
+    /// default, so the test records every requested poll wait through
+    /// the injectable sleep and asserts the sequence is `[5, 10]` —
+    /// default first poll, backed-off second poll. No clock is paused
+    /// (real-socket I/O and paused clocks starve each other); the
+    /// recording sleep returns immediately so the suite never waits.
+    #[tokio::test]
+    async fn device_login_slow_down_delays_the_next_poll() {
+        use std::sync::{Arc, Mutex};
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (400, r#"{"error":"slow_down"}"#.into()),
+            (200, success_token_body("refresh-slow-1")),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let waits: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let waits_task = waits.clone();
+        let cancel = CancellationToken::new();
+        let credential = auth
+            .login_device_with_sleep(
+                &cancel,
+                |_| {},
+                move |seconds, _token| {
+                    waits_task.lock().unwrap().push(seconds);
+                    async { Ok(()) }
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(credential.refresh, "refresh-slow-1");
+        assert_eq!(
+            *waits.lock().unwrap(),
+            vec![5, 10],
+            "slow_down must back the next poll off by exactly 5s"
+        );
+        assert_eq!(fix.seen.lock().unwrap().len(), 3);
+    }
+
+    /// AUTH-1: `expired_token` through the full `login_device` loop
+    /// surfaces expiry — not a generic failure — and persists nothing.
+    /// `login_device` itself emits no `Failed` event (only the Copilot
+    /// wrapper does); the terminal `DeviceCodeExpired` error is the
+    /// contract the caller matches on.
+    #[tokio::test]
+    async fn device_login_expired_token_fails_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (400, r#"{"error":"expired_token"}"#.into()),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let mut events = Vec::new();
+        let error = auth
+            .login_device(&CancellationToken::new(), |event| events.push(event))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, AuthError::DeviceCodeExpired),
+            "unexpected: {error:?}"
+        );
+        assert!(
+            !dir.path().join("auth.json").exists(),
+            "expired grant must persist nothing"
+        );
+        // The loop emits Started + DeviceCode, then returns the terminal
+        // error with no success event; `Failed` is a wrapper-level event.
+        assert!(events.contains(&AuthEvent::Started));
+        assert!(!events.contains(&AuthEvent::Finished));
+    }
+
+    /// AUTH-1: `access_denied` through the full `login_device` loop
+    /// surfaces the sanitized denial — never a body echo — and persists
+    /// nothing.
+    #[tokio::test]
+    async fn device_login_access_denied_is_sanitized_without_persisting() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let fix = fixture(vec![
+            (200, device_body),
+            (
+                400,
+                r#"{"error":"access_denied","secret":"shh-device-secret"}"#.into(),
+            ),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .login_device(&CancellationToken::new(), |_| {})
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("denied"), "unexpected: {rendered}");
+        assert!(
+            !rendered.contains("shh-device-secret"),
+            "token body leaked: {rendered}"
+        );
+        assert!(
+            !dir.path().join("auth.json").exists(),
+            "denied grant must persist nothing"
+        );
+    }
+
+    /// AUTH-1: strict-status paths stay strict. Browser/refresh exchanges
+    /// (`token_strict`) reject a `400 authorization_pending` that the
+    /// device-polling helper accepts, mapping it to a status-only error
+    /// with no body echo.
+    #[tokio::test]
+    async fn strict_token_exchange_rejects_polling_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"{"error":"authorization_pending","secret":"shh-strict-secret"}"#;
+        let fix = fixture(vec![(400, body.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .token_strict(
+                serde_json::json!({"grant_type": "refresh_token"}),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("400"), "unexpected: {rendered}");
+        assert!(
+            !rendered.contains("shh-strict-secret"),
+            "token body leaked: {rendered}"
+        );
+    }
+
+    /// AUTH-1: cancelling mid-poll aborts the in-flight request and the
+    /// `login_device` loop surfaces `Cancelled`. The fixture holds the
+    /// token reply until the cancel fires; what matters is the outcome,
+    /// not which `select!` branch won the race.
+    #[tokio::test]
+    async fn cancellation_during_device_poll_aborts_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let device_body = serde_json::json!({
+            "device_code": "device-1",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://example.com/device",
+            "expires_in": 900,
+            "interval": 0,
+        })
+        .to_string();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut gate_rx = gate_rx;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                if request.contains("POST /device ") {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        device_body.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, head.as_bytes()).await;
+                    let _ =
+                        tokio::io::AsyncWriteExt::write_all(&mut socket, device_body.as_bytes())
+                            .await;
+                } else {
+                    // Token poll: hold the reply until the test cancels.
+                    let _ = (&mut gate_rx).await;
+                    let body = r#"{"error":"authorization_pending"}"#;
+                    let head = format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, head.as_bytes()).await;
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, body.as_bytes()).await;
+                }
+            }
+        });
+        let auth = OpenAiCodexAuth::new(AuthStore::new(dir.path().join("auth.json")))
+            .unwrap()
+            .with_endpoints(OpenAiCodexEndpoints {
+                authorize_url: format!("http://{addr}/authorize"),
+                token_url: format!("http://{addr}/token"),
+                device_code_url: format!("http://{addr}/device"),
+            });
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            canceller.cancel();
+        });
+        let error = auth.login_device(&cancel, |_| {}).await.unwrap_err();
+        assert!(
+            matches!(error, AuthError::Cancelled),
+            "in-flight cancel must surface Cancelled, got: {error:?}"
+        );
+        assert!(
+            !dir.path().join("auth.json").exists(),
+            "cancelled login must persist nothing"
+        );
+        let _ = gate_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn device_poll_errors_map_before_status() {
+        let dir = tempfile::tempdir().unwrap();
+        // `expired_token` on a 400 surface as the parsed error value (the
+        // caller maps it to expiry), not as a generic HTTP failure.
+        let fix = fixture(vec![(400, r#"{"error":"expired_token"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let value = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            value.get("error").and_then(Value::as_str),
+            Some("expired_token")
+        );
+
+        // `access_denied` likewise parses so the caller can deny sanitely.
+        let fix = fixture(vec![(400, r#"{"error":"access_denied"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let value = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            value.get("error").and_then(Value::as_str),
+            Some("access_denied")
+        );
+
+        // Unrecognized errors on non-success stay generic HTTP failures with
+        // no body echo (never leak token response bodies).
+        let fix = fixture(vec![(400, r#"{"error":"weird","token":"abc"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(rendered.contains("400"), "unexpected: {rendered}");
+        assert!(!rendered.contains("abc"), "body leaked: {rendered}");
+    }
+
+    #[tokio::test]
+    async fn slow_down_increases_the_poll_interval() {
+        // Superseded by `device_login_slow_down_delays_the_next_poll`,
+        // which asserts the real `[5, 10]` wait sequence through the full
+        // loop. Kept as the unit contract for the `slow_down → +5s`
+        // mapping itself.
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![(400, r#"{"error":"slow_down"}"#.into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let value = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({"grant_type":"device_code"})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let interval = 5u64;
+        let next = match value.get("error").and_then(Value::as_str) {
+            Some("slow_down") => interval.saturating_add(5),
+            _ => interval,
+        };
+        assert_eq!(next, 10);
+    }
+
+    #[tokio::test]
+    async fn malformed_and_oversized_bodies_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![(200, "not json".into())]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid OAuth response"));
+
+        // Oversized bodies fail before unbounded allocation.
+        let big = "x".repeat(OAUTH_BODY_LIMIT + 1024);
+        let fix = fixture(vec![(200, big)]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({})),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("invalid OAuth response"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_aborts_sleep_and_request() {
+        // Cancelled sleep resolves promptly.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(cancellable_sleep(60, &cancel).await.is_err());
+
+        // Cancelled request never hits the network.
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![(200, success_token_body("r"))]).await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .request_token(
+                auth.http
+                    .post(auth.endpoints.token_url.clone())
+                    .form(&serde_json::json!({})),
+                &cancel,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AuthError::Cancelled));
+        assert!(fix.seen.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn callback_target_parsing_accepts_codes_and_denials() {
+        let request = "GET /auth/callback?code=abc&state=s1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        assert_eq!(parse_callback_target(request, "s1").as_deref(), Some("abc"));
+        assert!(parse_callback_target(request, "other").is_none());
+        assert!(!is_callback_denial(request, "s1"));
+        // Fragmented-style denial: valid state + access_denied terminates.
+        let denial = "GET /auth/callback?error=access_denied&state=s1 HTTP/1.1\r\n\r\n";
+        assert!(parse_callback_target(denial, "s1").is_none());
+        assert!(is_callback_denial(denial, "s1"));
+        assert!(!is_callback_denial(denial, "other"));
+        // Near-miss denials must not terminate: wrong error value, missing
+        // state, or a state belonging to a different login attempt.
+        let wrong_error = "GET /auth/callback?error=server_error&state=s1 HTTP/1.1\r\n\r\n";
+        assert!(!is_callback_denial(wrong_error, "s1"));
+        let missing_state = "GET /auth/callback?error=access_denied HTTP/1.1\r\n\r\n";
+        assert!(!is_callback_denial(missing_state, "s1"));
+        let wrong_path = "GET /other?error=access_denied&state=s1 HTTP/1.1\r\n\r\n";
+        assert!(!is_callback_denial(wrong_path, "s1"));
+        assert!(parse_callback_target(wrong_path, "s1").is_none());
+    }
+
+    /// AUTH-3: a live valid-state denial terminates promptly over the
+    /// socket — sanitized error, failure reply — without waiting for the
+    /// idle timeout or a later valid callback.
+    #[tokio::test]
+    async fn live_denial_terminates_promptly() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            wait_for_callback_with_idle(
+                listener,
+                "s1",
+                &CancellationToken::new(),
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        let mut denied = tokio::net::TcpStream::connect(addr).await.unwrap();
+        denied
+            .write_all(
+                b"GET /auth/callback?error=access_denied&state=s1 HTTP/1.1\r\nHost: x\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let size =
+                tokio::time::timeout(std::time::Duration::from_secs(15), denied.read(&mut chunk))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if size == 0 {
+                break;
+            }
+            reply.extend_from_slice(&chunk[..size]);
+            if reply.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.contains("Login failed"), "unexpected reply: {reply}");
+        // Prompt termination: the denial resolves the wait, not a timeout.
+        let error = tokio::time::timeout(std::time::Duration::from_secs(15), server)
+            .await
+            .expect("denial must terminate without waiting for the idle timeout")
+            .unwrap()
+            .unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("denied"),
+            "denial must be sanitized, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("access_denied") || rendered.contains("authorization was denied"),
+            "raw OAuth error value leaked: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_connection_does_not_block_a_later_valid_callback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            wait_for_callback_with_idle(
+                listener,
+                "s1",
+                &CancellationToken::new(),
+                Duration::from_millis(300),
+            )
+            .await
+        });
+        // First connection: idle, sends nothing (holds the socket open).
+        let idle = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Second connection: a fragmented valid callback.
+        let mut valid = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = b"GET /auth/callback?code=frag&state=s1 HTTP/1.1\r\nHost: x\r\n\r\n";
+        valid.write_all(&head[..20]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        valid.write_all(&head[20..]).await.unwrap();
+        let mut reply = Vec::new();
+        // Read until the response head terminator.
+        let mut chunk = [0u8; 512];
+        loop {
+            let size =
+                tokio::time::timeout(std::time::Duration::from_secs(15), valid.read(&mut chunk))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            if size == 0 {
+                break;
+            }
+            reply.extend_from_slice(&chunk[..size]);
+            if reply.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        assert!(String::from_utf8_lossy(&reply).contains("Login complete"));
+        let code = tokio::time::timeout(std::time::Duration::from_secs(15), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, "frag");
+        drop(idle);
+    }
+
+    /// AUTH-2 (Codex counterpart): concurrent `ensure_valid` calls
+    /// single-flight onto one network refresh through the real guard.
+    /// The fixture's token endpoint counts exchanges: the first
+    /// succeeds and rotates the token, a second would fail, so every
+    /// waiter must share the first waiter's result. A barrier releases
+    /// all waiters together so they pile onto the refresh lock while
+    /// the first exchange is in flight.
+    #[tokio::test]
+    async fn codex_concurrent_refresh_single_flights_on_one_network_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let exchanges = std::sync::Arc::new(AtomicUsize::new(0));
+        let exchanges_task = exchanges.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                // Hold the first exchange open so waiters pile onto the
+                // refresh guard; reject any second exchange outright.
+                if n == 0 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let body = if n == 0 {
+                    // Fresh pair: the response carries its own refresh
+                    // token plus a JWT account id and expiry, so the
+                    // parsed credential is complete and unexpired.
+                    let payload = URL_SAFE_NO_PAD
+                        .encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
+                    let access = format!("head.{payload}.sig");
+                    serde_json::json!({
+                        "access_token": access,
+                        "refresh_token": "refresh-rotated",
+                        "expires_in": 3600,
+                        "id_token": access,
+                    })
+                    .to_string()
+                } else {
+                    r#"{"error":"rotated token already used"}"#.to_owned()
+                };
+                let (status, reason) = if n == 0 { (200, "OK") } else { (401, "Error") };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        // Expired credential so every waiter wants a refresh (`expires:
+        // 1` is past, and the 60s Codex early-expiry skew keeps it so).
+        AuthStore::new(path.clone())
+            .save_openai_codex(&OpenAiCodexCredential::new(
+                "access-old",
+                "refresh-single-use",
+                1,
+                "acct",
+            ))
+            .unwrap();
+        let auth = OpenAiCodexAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_http_and_endpoints(
+                reqwest::Client::new(),
+                OpenAiCodexEndpoints {
+                    authorize_url: format!("http://{addr}/authorize"),
+                    token_url: format!("http://{addr}/token"),
+                    device_code_url: format!("http://{addr}/device"),
+                },
+            );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let waiters = (0..8)
+            .map(|_| {
+                let auth = auth.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    auth.ensure_valid().await.unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for waiter in waiters {
+            results.push(waiter.await.unwrap());
+        }
+        // One network exchange despite 8 concurrent waiters…
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        // …every waiter shares the rotated credential…
+        for credential in &results {
+            assert_eq!(credential.access, results[0].access);
+            assert_eq!(credential.refresh, "refresh-rotated");
+        }
+        // …and the persisted credential equals what the waiters saw.
+        // (Read without the auth handle's cache: the store is the
+        // source of truth a restarted process would observe.)
+        let persisted = AuthStore::new(path).openai_codex().unwrap().unwrap();
+        assert_eq!(persisted.access, results[0].access);
+        assert_eq!(persisted.refresh, "refresh-rotated");
     }
 }

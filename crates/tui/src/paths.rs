@@ -74,7 +74,9 @@ pub fn extract_at_prefix(line: &str, cursor_col: usize) -> Option<AtPrefix> {
 
     let token_end = line[cursor_byte..]
         .char_indices()
-        .find(|(_, character)| character.is_whitespace())
+        .find(|(_, character)| {
+            character.is_whitespace() || matches!(character, ')' | ']' | '}' | ',' | ';')
+        })
         .map(|(offset, _)| cursor_byte + offset)
         .unwrap_or(line.len());
 
@@ -442,6 +444,17 @@ mod tests {
         );
         assert!(extract_at_prefix("alex@example.com", 16).is_none());
         assert_eq!(extract_at_prefix("(@src/ma)", 8).unwrap().query, "src/ma");
+    }
+
+    #[test]
+    fn punctuation_ends_the_replacement_token_without_being_consumed() {
+        for punctuation in [')', ',', ';'] {
+            let line = format!("(@src/ma{punctuation}");
+            let cursor = line[..line.len() - punctuation.len_utf8()].chars().count();
+            let prefix = extract_at_prefix(&line, cursor).unwrap();
+            assert_eq!(prefix.query, "src/ma");
+            assert_eq!(&line[prefix.token_end..], &punctuation.to_string());
+        }
     }
 
     #[test]

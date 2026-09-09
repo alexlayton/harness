@@ -121,6 +121,14 @@ impl AgentBuilder {
     /// Connect optional MCP servers, register optional subagents, and produce
     /// a runtime that keeps external server processes alive for the agent.
     pub async fn build(mut self) -> Result<AssembledAgent> {
+        // Repair a loaded crash tail before starting MCP servers or exposing a
+        // live agent. Failing here is preferable to reporting a successful
+        // load that predictably quarantines on its first append.
+        if let Some((store, session)) = self.session.as_mut() {
+            store
+                .repair_incomplete_tool_calls(session)
+                .context("repair incomplete session tool calls")?;
+        }
         let mcp = if self.mcp_servers.is_empty() {
             None
         } else {
@@ -137,6 +145,12 @@ impl AgentBuilder {
             }
             Some(runtime)
         };
+        if self.cancel.is_cancelled() {
+            if let Some(mcp) = mcp {
+                mcp.shutdown().await;
+            }
+            anyhow::bail!("agent assembly cancelled");
+        }
         let parent_session = self.session.as_ref().map(|(_, session)| session.id());
         let search_index = self.tools.file_search_index().cloned();
         let runner = if self.subagents.max_turns > 0 {
@@ -155,14 +169,18 @@ impl AgentBuilder {
                 runner = runner.with_file_search_index(index);
             }
             let runner = Arc::new(runner);
-            self.tools
-                .register_subagent(runner.clone())
-                .context("register subagent tool")?;
+            if let Err(error) = self.tools.register_subagent(runner.clone()) {
+                if let Some(mcp) = mcp {
+                    mcp.shutdown().await;
+                }
+                return Err(error).context("register subagent tool");
+            }
             Some(runner)
         } else {
             None
         };
 
+        let assembly_cancel = self.cancel.clone();
         let mut agent = Agent::new(self.provider, self.tools, self.model, self.cancel)
             .with_reasoning(self.reasoning)
             .with_project_context(self.project_context)
@@ -178,6 +196,12 @@ impl AgentBuilder {
         }
         if let Some((store, session)) = self.session {
             agent = agent.with_session(store, session);
+        }
+        if assembly_cancel.is_cancelled() {
+            if let Some(mcp) = mcp {
+                mcp.shutdown().await;
+            }
+            anyhow::bail!("agent assembly cancelled");
         }
         Ok(AssembledAgent { agent, mcp })
     }
@@ -199,6 +223,14 @@ impl AssembledAgent {
         events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     ) {
         self.agent.run(input, events).await;
+        if let Some(mcp) = self.mcp {
+            mcp.shutdown().await;
+        }
+    }
+
+    /// Shut down MCP services when assembly completes but the frontend cannot
+    /// take ownership of the resulting agent.
+    pub async fn shutdown(self) {
         if let Some(mcp) = self.mcp {
             mcp.shutdown().await;
         }

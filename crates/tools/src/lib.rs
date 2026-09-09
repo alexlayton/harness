@@ -9,6 +9,7 @@ mod read;
 mod registry;
 pub mod skills;
 mod subagent;
+pub mod vfs;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
@@ -30,6 +31,7 @@ pub use skills::{
 pub use subagent::{SUBAGENT_TOOL_NAME, SubagentMode, SubagentRunner, SubagentTool};
 pub use write::WriteTool;
 
+use crate::vfs::WorkspaceFs;
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::Value;
@@ -191,14 +193,26 @@ pub fn default_registry_with_index(
     }
     let skills = discover_skills_for_config(&workspace_root);
     let read_paths = skills.read_paths.clone();
+    let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
+        ToolInitError::Workspace {
+            path: workspace_root.clone(),
+            source,
+        }
+    })?);
     let mut registry = ToolRegistry::try_new_with_workspace(
         vec![
             Box::new(
-                ReadTool::with_workspace_root(&workspace_root)
+                ReadTool::with_workspace_fs(&workspace_root, workspace_fs.clone())
                     .with_allowed_paths(read_paths.clone()),
             ),
-            Box::new(EditTool::with_workspace_root(&workspace_root)),
-            Box::new(WriteTool::with_workspace_root(&workspace_root)),
+            Box::new(EditTool::with_workspace_fs(
+                &workspace_root,
+                workspace_fs.clone(),
+            )),
+            Box::new(WriteTool::with_workspace_fs(
+                &workspace_root,
+                workspace_fs.clone(),
+            )),
             Box::new(BashTool::with_rtk_and_workspace_root(
                 config.rtk,
                 &workspace_root,
@@ -216,10 +230,11 @@ pub fn default_registry_with_index(
 }
 
 /// Construct the read-only subregistry used by `read_only` subagents:
-/// `read`, `find`, and `grep` plus the same skill discovery/read allowlists
-/// and one shared file index. Deliberately no `edit`/`write`/`bash`: the
-/// scheduler class is not a sandbox, so exclusion of mutating tools is the
-/// actual enforcement, not prompt wording.
+/// `read`, `find`, `grep`, and `multigrep`, plus the same skill
+/// discovery/read allowlists and one shared file index. Deliberately no
+/// `edit`/`write`/`bash`: the scheduler class is not a sandbox, so
+/// exclusion of mutating tools is the actual enforcement, not prompt
+/// wording.
 pub fn read_only_registry(config: ToolConfig) -> Result<ToolRegistry, ToolInitError> {
     let workspace_root = resolve_registry_workspace(&config.cwd)?;
     let index = Arc::new(
@@ -242,9 +257,18 @@ pub fn read_only_registry_with_index(
     }
     let skills = discover_skills_for_config(&workspace_root);
     let read_paths = skills.read_paths.clone();
+    let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
+        ToolInitError::Workspace {
+            path: workspace_root.clone(),
+            source,
+        }
+    })?);
     let mut registry = ToolRegistry::try_new_with_workspace(
         vec![
-            Box::new(ReadTool::with_workspace_root(&workspace_root).with_allowed_paths(read_paths)),
+            Box::new(
+                ReadTool::with_workspace_fs(&workspace_root, workspace_fs)
+                    .with_allowed_paths(read_paths),
+            ),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
             Box::new(MultiGrepTool::new(index.clone())),
@@ -695,5 +719,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
+    }
+
+    /// Swap an ancestor directory for an external symlink between the
+    /// production resolution step and the handle-relative open, and assert
+    /// the open still cannot escape. This is the deterministic TOCTOU
+    /// barrier the plan requires: resolution and I/O are separated by an
+    /// explicit filesystem mutation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ancestor_swap_between_resolve_and_open_cannot_escape() {
+        use crate::vfs::{WorkspaceFs, split_relative};
+        let workspace = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/file.txt"), "inside").unwrap();
+
+        // 1. Resolve while the tree is intact (production step).
+        let resolved = resolve_workspace_path("sub/file.txt", Some(&root), false)
+            .await
+            .unwrap();
+        assert_eq!(resolved, root.join("sub/file.txt"));
+        let components = split_relative("sub/file.txt").unwrap();
+
+        // 2. Barrier: swap the ancestor for an external symlink.
+        std::fs::remove_dir_all(root.join("sub")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("sub")).unwrap();
+
+        // 3. The handle-relative open must not follow the swapped ancestor.
+        let fs = WorkspaceFs::open_root(&root).unwrap();
+        let error = crate::vfs::unix::open_file_relative(&fs, &components).unwrap_err();
+        assert!(
+            error.to_string().contains("outside workspace")
+                || error.to_string().contains("symlink"),
+            "unexpected: {error:?}"
+        );
+        // And the workspace file is untouched, as is the outside file.
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
     }
 }

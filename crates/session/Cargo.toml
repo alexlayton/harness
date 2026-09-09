@@ -6,9 +6,10 @@ publish.workspace = true
 description = "Durable, append-only conversation sessions for Harness"
 
 [dependencies]
+fs2 = "0.4"
 llm.workspace = true
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 time = { version = "0.3", features = ["formatting"] }
@@ -22,3 +23,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bench]]
+name = "store"
+harness = false

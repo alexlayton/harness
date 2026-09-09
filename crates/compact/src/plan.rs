@@ -9,14 +9,13 @@
 //! `keep_recent_tokens`, the cut moves to an assistant message mid-turn — a
 //! "split turn".
 
-use crate::estimate::estimate_tokens;
+use crate::estimate::estimate_provider_context_tokens;
 use crate::policy::CompactionPolicy;
-use crate::serialize::serialize_record;
-use session::model::{Session, SessionEvent, SessionEventRecord};
+use session::model::{Session, SessionEvent, SessionEventRecord, StoredContent};
 use session::model::{events_after_latest_compaction, latest_compaction_boundary};
 
-/// A completed compaction plan: what to summarize, where the new boundary is,
-/// and how much context the summary is expected to free.
+/// A completed compaction plan: what to summarize and where the new
+/// boundary is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionPlan {
     /// Sequence boundary a new `CompactionSummary { compacted_through: … }`
@@ -30,9 +29,6 @@ pub struct CompactionPlan {
     /// The most recent previous summarizer output, if any, threaded into the
     /// summarizer so context survives across compactions.
     pub previous_summary: Option<String>,
-    /// Estimated context tokens freed by this compaction (whole live region
-    /// minus the kept tail). Informational; the trigger uses exact numbers.
-    pub estimated_tokens_freed: u64,
 }
 
 /// Plan a compaction for `session` under `policy`, or return `None` when
@@ -104,13 +100,10 @@ pub fn plan_compaction(
         return None;
     }
 
-    let estimated_tokens_freed = live_tokens(&live, 0).saturating_sub(live_tokens(&live, cut));
-
     Some(CompactionPlan {
         boundary,
         to_summarize,
         previous_summary,
-        estimated_tokens_freed,
     })
 }
 
@@ -118,11 +111,11 @@ fn is_compaction(record: &SessionEventRecord) -> bool {
     matches!(record.event, SessionEvent::CompactionSummary { .. })
 }
 
-/// Event kinds that are valid cut points. Cutting before a `UserMessage` is a
-/// normal turn boundary; before an `AssistantMessage` is a split turn. A
-/// standalone `ToolCall` is also a safe cut because its result follows and is
-/// kept. We never cut before a `ToolResult` — that would orphan a tool call
-/// from its result and produce invalid provider history.
+/// Event kinds that can begin the retained tail. Cutting before a
+/// `UserMessage` is a normal turn boundary; before an `AssistantMessage` is a
+/// split turn. A standalone `ToolCall` may begin the tail only when there are
+/// no earlier unresolved calls in the retained region. We never cut before a
+/// `ToolResult` — that would orphan a tool call from its result.
 fn is_cut_point(record: &SessionEventRecord) -> bool {
     matches!(
         record.event,
@@ -132,23 +125,56 @@ fn is_cut_point(record: &SessionEventRecord) -> bool {
     )
 }
 
-/// Estimated provider-context tokens represented by a live event.
-fn event_tokens(record: &SessionEventRecord, max_tool_result_chars: usize) -> u64 {
-    let text = serialize_record(&record.event, max_tool_result_chars);
-    if text.is_empty() {
-        return 0;
+/// Return cut points whose prefix leaves no unresolved tool calls. This is
+/// deliberately separate from the event-kind check above: a parallel batch
+/// can contain several standalone calls, and cutting before the second one
+/// would leave the first call in the summarized prefix while retaining its
+/// result in the live tail.
+fn valid_cut_points(live: &[&SessionEventRecord]) -> Vec<usize> {
+    let mut pending = Vec::<String>::new();
+    let mut cut_points = Vec::new();
+    for (index, record) in live.iter().enumerate() {
+        if is_cut_point(record) && pending.is_empty() {
+            cut_points.push(index);
+        }
+        match &record.event {
+            SessionEvent::AssistantMessage { message } => {
+                for content in &message.content {
+                    if let StoredContent::ToolCall { id, .. } = content {
+                        pending.push(id.clone());
+                    }
+                }
+            }
+            SessionEvent::ToolCall { call } => pending.push(call.id.clone()),
+            SessionEvent::ToolResult { tool_call_id, .. } => {
+                if let Some(position) = pending.iter().position(|id| id == tool_call_id) {
+                    pending.remove(position);
+                }
+            }
+            SessionEvent::TurnCancelled { .. } => pending.clear(),
+            SessionEvent::UserMessage { .. }
+            | SessionEvent::Reasoning { .. }
+            | SessionEvent::Error { .. }
+            | SessionEvent::ModelChange { .. }
+            | SessionEvent::Usage { .. }
+            | SessionEvent::MetadataChange { .. }
+            | SessionEvent::CompactionSummary { .. }
+            | SessionEvent::Unknown { .. } => {}
+        }
     }
-    estimate_tokens(text.len()).saturating_add(4)
+    cut_points
 }
 
-/// Sum of estimated tokens for `live[from..]`.
-fn live_tokens(live: &[&SessionEventRecord], from: usize) -> u64 {
-    let max_chars = crate::policy::DEFAULT_TOOL_RESULT_CHARS;
-    let mut total = 0u64;
-    for record in live.iter().skip(from) {
-        total = total.saturating_add(event_tokens(record, max_chars));
+/// Estimated provider-context tokens represented by a live event.
+fn event_tokens(record: &SessionEventRecord) -> u64 {
+    // Planning must budget the provider context, not the shorter summarizer
+    // transcript. In particular, retained tool results are sent in full and
+    // provider-owned opaque state may be required for replay.
+    let messages = record.event.to_messages();
+    if messages.is_empty() {
+        return 0;
     }
-    total
+    estimate_provider_context_tokens(None, &[], &messages).saturating_add(4)
 }
 
 /// Choose the cut index within `live` under the policy, or `None` when there
@@ -158,14 +184,12 @@ fn choose_cut(live: &[&SessionEventRecord], policy: &CompactionPolicy) -> Option
     if live.is_empty() {
         return None;
     }
-    let max_chars = crate::policy::DEFAULT_TOOL_RESULT_CHARS;
-
     // Prefix-sum of estimated tokens so suffix totals are O(1).
     let mut suffix = vec![0u64; live.len() + 1];
     for i in (0..live.len()).rev() {
-        suffix[i] = suffix[i + 1].saturating_add(event_tokens(live[i], max_chars));
+        suffix[i] = suffix[i + 1].saturating_add(event_tokens(live[i]));
     }
-    let cut_points: Vec<usize> = (0..live.len()).filter(|&i| is_cut_point(live[i])).collect();
+    let cut_points = valid_cut_points(live);
 
     // --- Phase 1: turn-count primary -------------------------------------
     // Walk backward from the newest event until we have keep_recent_turns
@@ -203,28 +227,40 @@ fn choose_cut(live: &[&SessionEventRecord], policy: &CompactionPolicy) -> Option
     for i in (0..live.len()).rev() {
         accumulated = accumulated.saturating_add(suffix[i].saturating_sub(suffix[i + 1]));
         if accumulated >= policy.keep_recent_tokens {
-            cut = cut_points
-                .iter()
-                .copied()
-                .find(|&candidate| candidate >= i)
-                .unwrap_or(cut);
+            cut = snap_cut_point(live, &cut_points, i).unwrap_or(cut);
             break;
         }
     }
     Some(cut)
 }
 
-/// Estimated tokens currently occupied by the live conversation region
-/// (events after the latest compaction), used by the agent for exactness
-/// fallback when no request has provided usage yet.
-pub fn estimate_live_tokens(session: &Session) -> u64 {
-    let active = events_after_latest_compaction(&session.events);
-    let live: Vec<&SessionEventRecord> = active
+/// Snap a token-driven cut to a valid boundary. Prefer splitting before an
+/// assistant response when a huge retained tool result would otherwise make
+/// the nearest boundary the standalone tool call; this preserves the whole
+/// call/result pair while keeping the cut semantically at a turn boundary.
+fn snap_cut_point(
+    live: &[&SessionEventRecord],
+    cut_points: &[usize],
+    index: usize,
+) -> Option<usize> {
+    let tool_index = cut_points
         .iter()
         .copied()
-        .filter(|record| !is_compaction(record))
-        .collect();
-    live_tokens(&live, 0)
+        .rev()
+        .find(|&candidate| candidate <= index)?;
+    if matches!(live[tool_index].event, SessionEvent::ToolCall { .. }) {
+        cut_points
+            .iter()
+            .copied()
+            .rev()
+            .find(|&prior| {
+                prior < tool_index
+                    && matches!(live[prior].event, SessionEvent::AssistantMessage { .. })
+            })
+            .or(Some(tool_index))
+    } else {
+        Some(tool_index)
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +305,31 @@ mod tests {
             is_error: false,
             tool_name: None,
         });
+    }
+
+    #[test]
+    fn parallel_standalone_calls_are_one_compaction_unit() {
+        let mut session = new_session();
+        push_user(&mut session, "run these calls");
+        push_tool_call(&mut session, "call-a", "read");
+        push_tool_call(&mut session, "call-b", "read");
+        push_tool_result(&mut session, "call-a", "result a");
+        push_tool_result(&mut session, "call-b", "result b");
+        let live = session.events.iter().collect::<Vec<_>>();
+        let cut_points = valid_cut_points(&live);
+        let call_a = live
+            .iter()
+            .position(|record| matches!(record.event, SessionEvent::ToolCall { ref call } if call.id == "call-a"))
+            .unwrap();
+        let call_b = live
+            .iter()
+            .position(|record| matches!(record.event, SessionEvent::ToolCall { ref call } if call.id == "call-b"))
+            .unwrap();
+        assert!(cut_points.contains(&call_a));
+        assert!(
+            !cut_points.contains(&call_b),
+            "a compaction cut must not split a parallel call batch"
+        );
     }
 
     fn default_policy() -> CompactionPolicy {
@@ -319,7 +380,6 @@ mod tests {
             .count();
         assert_eq!(kept_turns, 2);
         assert!(!plan.to_summarize.is_empty());
-        assert!(plan.estimated_tokens_freed > 0);
     }
 
     #[test]
@@ -436,20 +496,5 @@ mod tests {
         });
         // No new events: a repeated plan must be a no-op.
         assert!(plan_compaction(&session, &policy, 40_000).is_none());
-    }
-
-    #[test]
-    fn estimate_live_tokens_covers_all_active_events() {
-        let mut session = grow_session(6, 4_000);
-        let estimated = estimate_live_tokens(&session);
-        assert!(estimated > 0);
-        // After a compaction, live region shrinks dramatically.
-        let plan = plan_compaction(&session, &default_policy(), estimated).unwrap();
-        session.append(SessionEvent::CompactionSummary {
-            summary: "s".into(),
-            compacted_through: plan.boundary,
-        });
-        let after = estimate_live_tokens(&session);
-        assert!(after < estimated);
     }
 }

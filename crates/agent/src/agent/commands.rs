@@ -1,15 +1,23 @@
 use super::persistence::{ui_snapshot_entries, usage_event};
 use super::{
     Agent, AgentEvent, AgentSessionState, CompactionReason, InputMessage, SessionListItem,
-    TurnError, send,
+    TurnControl, TurnError, send,
 };
 use llm::Provider;
-use session::{ExportOptions, SessionCreateOptions, SessionEvent, export_jsonl, snapshot_entries};
+use session::{ExportOptions, Session, SessionCreateOptions, export_jsonl, snapshot_entries};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tools::SkillEntry;
+
+struct PendingModelChange {
+    provider: Arc<dyn Provider>,
+    canonical: String,
+    model: String,
+    staged_session: Option<Session>,
+}
 
 impl Agent {
     pub(crate) fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
@@ -205,20 +213,131 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
         if self.session.is_none() {
-            send(events, AgentEvent::Error("sessions are not enabled".into()));
+            send(
+                events,
+                AgentEvent::Notice("compaction is unavailable without a session".into()),
+            );
             return Ok(());
         }
-        self.compact_and_reload(events, cancel, CompactionReason::Manual)
+        self.compact_and_reload(events, cancel, CompactionReason::Manual, 0, None)
             .await
             .map(|_| ())
     }
 
-    pub(crate) async fn handle_set_model(
+    /// Boundary wrapper for manual compaction: the same deferred-sync flush
+    /// and quarantine policy as turns. `CompactionFinished` remains the
+    /// operation event; prompt `TurnFinished` is owned only by `execute_turn`.
+    pub(crate) async fn handle_compact_session_boundary(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+    ) -> TurnControl {
+        let cancel = self.cancel.child_token();
+        let application = self.cancel.clone();
+        let mut buffered = VecDeque::new();
+        let mut input_open = self.input_open;
+        let mut interrupted = false;
+        let outcome = {
+            let mut application_open = true;
+            let operation = self.handle_compact_session(events, &cancel);
+            tokio::pin!(operation);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut operation => break result,
+                    _ = application.cancelled(), if application_open => {
+                        application_open = false;
+                        cancel.cancel();
+                    }
+                    message = input.recv(), if input_open => match message {
+                        Some(InputMessage::Interrupt) => {
+                            interrupted = true;
+                            cancel.cancel();
+                        }
+                        Some(message) => buffered.push_back(message),
+                        None => input_open = false,
+                    },
+                }
+            }
+        };
+        self.input_open = input_open;
+        self.queued.extend(buffered);
+        if self.flush_deferred_sync(events).is_err() {
+            return TurnControl::Quarantine;
+        }
+        if interrupted && !application.is_cancelled() {
+            // `handle_compact_session` has already observed the cancelled
+            // operation and deliberately persisted no summary.
+            return TurnControl::Continue;
+        }
+        match outcome {
+            Ok(()) => TurnControl::Continue,
+            Err(TurnError::Shutdown) => TurnControl::Shutdown,
+            Err(TurnError::Persist(_)) => TurnControl::Quarantine,
+        }
+    }
+
+    /// Boundary wrapper for model changes. The append is staged on a cloned
+    /// session, and deferred sync runs against that clone before any live
+    /// provider/model, subagent, context, metadata, or frontend state moves.
+    /// Model command events remain separate from prompt `TurnFinished`.
+    pub(crate) async fn handle_set_model_boundary(
         &mut self,
         provider: Option<String>,
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) {
+    ) -> TurnControl {
+        let outcome = self.handle_set_model(provider, model, events).await;
+        let pending = match outcome {
+            Ok(Some(pending)) => pending,
+            Ok(None) => {
+                return if self.flush_deferred_sync(events).is_err() {
+                    TurnControl::Quarantine
+                } else {
+                    TurnControl::Continue
+                };
+            }
+            Err(error) => {
+                // Preserve the boundary flush for an append/provider error;
+                // no model-change state has been committed in this branch.
+                if self.flush_deferred_sync(events).is_err() {
+                    return TurnControl::Quarantine;
+                }
+                return match error {
+                    TurnError::Shutdown => TurnControl::Shutdown,
+                    TurnError::Persist(_) => TurnControl::Quarantine,
+                };
+            }
+        };
+
+        // The append has already reached the OS, but the session clone is not
+        // installed until its deferred durability boundary succeeds. A
+        // failed fsync therefore cannot leak a model switch into live state.
+        if let Some(staged) = pending.staged_session.as_ref() {
+            let Some(state) = self.session.as_ref() else {
+                return TurnControl::Quarantine;
+            };
+            if self
+                .flush_deferred_sync_session(&state.store, staged, events)
+                .is_err()
+            {
+                return TurnControl::Quarantine;
+            }
+        }
+
+        self.commit_model_change(pending, events);
+        TurnControl::Continue
+    }
+
+    async fn handle_set_model(
+        &mut self,
+        provider: Option<String>,
+        model: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<Option<PendingModelChange>, TurnError> {
+        // Resolve the candidate provider and canonical model name without
+        // mutating live state. The session append is also staged so a
+        // deferred-sync failure leaves every live model-related field alone.
         let requested = provider.unwrap_or_else(|| self.provider.name().to_owned());
         let current = self.provider.name().to_owned();
         let next_provider = if requested.eq_ignore_ascii_case(&current) {
@@ -229,38 +348,52 @@ impl Agent {
                     events,
                     AgentEvent::Error("provider switching is unavailable".into()),
                 );
-                return;
+                return Ok(None);
             };
             match factory(&requested) {
                 Ok(provider) => Some(provider),
                 Err(error) => {
                     send(events, AgentEvent::Error(error.to_string()));
-                    return;
+                    return Ok(None);
                 }
             }
         };
-        if let Some(provider) = next_provider {
-            self.provider = provider;
+        let candidate = next_provider.unwrap_or_else(|| self.provider.clone());
+        let canonical = candidate.name().to_owned();
+        let staged_session = self.stage_model_change(canonical.clone(), model.clone(), events)?;
+        Ok(Some(PendingModelChange {
+            provider: candidate,
+            canonical,
+            model,
+            staged_session,
+        }))
+    }
+
+    fn commit_model_change(
+        &mut self,
+        pending: PendingModelChange,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        let PendingModelChange {
+            provider,
+            canonical,
+            model,
+            staged_session,
+        } = pending;
+        if let Some(staged) = staged_session {
+            // The staged session was synced before this replacement. No live
+            // session mutation is observable if that boundary failed.
+            self.session
+                .as_mut()
+                .expect("staged model change requires a session")
+                .session = staged;
         }
-        let canonical = self.provider.name().to_owned();
+        self.provider = provider;
         self.model = model.clone();
-        // Future subagents must follow the parent's active selection; a
-        // failed switch already returned above, so children never see a
-        // half-applied state. Running children keep their own snapshot.
+        // Future subagents must follow the parent's active selection; running
+        // children keep the provider/model snapshot they started with.
         if let Some(runner) = &self.subagent_runner {
             runner.update_model(self.provider.clone(), self.model.clone());
-        }
-        if self
-            .persist_event(
-                SessionEvent::ModelChange {
-                    provider: canonical.clone(),
-                    model: model.clone(),
-                },
-                events,
-            )
-            .is_err()
-        {
-            return;
         }
         send(
             events,
@@ -273,11 +406,21 @@ impl Agent {
             events,
             AgentEvent::Notice(format!("Using {canonical} · {model}")),
         );
-        spawn_model_list(canonical, self.provider.clone(), events.clone());
         // A different model may have a different context window and stale
-        // token counts; reset both so the next trigger re-baselines.
+        // token counts; reset both so the next trigger re-baselines. Metadata
+        // is fetched in the background so a slow catalogue cannot block the
+        // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
-        self.refresh_context_window(events).await;
+        self.context_window = self.compaction.resolved_window(0);
+        if let Some(metadata_tx) = &self.model_metadata_tx {
+            spawn_model_metadata(
+                metadata_tx.clone(),
+                self.provider.clone(),
+                canonical,
+                self.model.clone(),
+                self.cancel.clone(),
+            );
+        }
     }
 
     pub(crate) fn handle_set_reasoning(
@@ -409,48 +552,36 @@ impl Agent {
 
     /// Start a turn from a skill's instructions: the `SKILL.md` body without
     /// frontmatter, prefixed with a line naming the skill so both the model
-    /// and the session transcript show what was invoked.
+    /// and the session transcript show what was invoked. Runs through the
+    /// single shared turn executor, so shutdown propagates, persistence
+    /// failures quarantine, deferred writes flush, and exactly one terminal
+    /// event is emitted — identical to a normal user message.
     pub(crate) async fn handle_invoke_skill(
         &mut self,
         name: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
         input: &mut mpsc::UnboundedReceiver<InputMessage>,
-    ) {
+    ) -> TurnControl {
         let found = self.tools.skills().and_then(|catalog| {
             catalog
                 .invocable()
                 .into_iter()
                 .find(|skill| skill.name.eq_ignore_ascii_case(&name))
-                .map(|skill| (skill.file_path.clone(), skill.name.clone()))
+                .map(|skill| (skill.instructions.clone(), skill.name.clone()))
         });
-        let Some((file_path, name)) = found else {
+        let Some((body, name)) = found else {
             send(events, AgentEvent::Error(format!("unknown skill: {name}")));
-            return;
+            return TurnControl::Continue;
         };
-        let raw = match std::fs::read_to_string(&file_path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                send(
-                    events,
-                    AgentEvent::Error(format!("could not read {name}: {error}")),
-                );
-                return;
-            }
-        };
-        let (_, body) = tools::parse_frontmatter(&raw);
-        let body = body.trim();
+        // Discovery captured the body through a retained filesystem handle.
+        // Never reopen the catalogued pathname here: it may have been swapped
+        // to an external symlink since startup.
         if body.is_empty() {
             send(events, AgentEvent::Error(format!("skill {name} is empty")));
-            return;
+            return TurnControl::Continue;
         }
-        let turn_cancel = CancellationToken::new();
-        let result = self
-            .run_turn(format!("/{name}\n\n{body}"), events, input, &turn_cancel)
-            .await;
-        match result {
-            Err(TurnError::Shutdown) => {}
-            Err(TurnError::Persist(_)) | Ok(()) => {}
-        }
+        self.execute_turn(format!("/{name}\n\n{body}"), events, input)
+            .await
     }
 }
 
@@ -458,26 +589,72 @@ impl Agent {
 pub type ProviderFactory =
     Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn Provider>> + Send + Sync + 'static>;
 
+/// Fetch model metadata for the active selection on a bounded background
+/// task. The run loop consumes the result and derives both context-window and
+/// model-list updates from this one request.
+/// Bound for one model-catalogue fetch. Both metadata fetchers share it so
+/// a slow provider blocks neither the run loop (metadata) nor the command
+/// loop (`/models`) for longer than this.
+const MODEL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Run one bounded, cancellable model-catalogue fetch. Shared by
+/// [`spawn_model_metadata`] (single request feeding both context window and
+/// UI catalogue) and [`spawn_model_list`] (explicit `/models`); only the
+/// result sink differs (CLEANUP-3). Returns `None` on timeout, cancel, or
+/// provider error.
+async fn fetch_model_catalogue(
+    provider: Arc<dyn Provider>,
+    cancel: &CancellationToken,
+) -> Option<Vec<llm::ModelInfo>> {
+    tokio::select! {
+        result = tokio::time::timeout(MODEL_FETCH_TIMEOUT, provider.list_models())
+            => result.ok().and_then(Result::ok),
+        _ = cancel.cancelled() => None,
+    }
+}
+
+pub(crate) fn spawn_model_metadata(
+    sender: mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>,
+    provider: Arc<dyn Provider>,
+    provider_name: String,
+    model: String,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        if let Some(models) = fetch_model_catalogue(provider, &cancel).await {
+            let _ = sender.send((provider_name, model, models));
+        }
+    });
+}
+
 /// Fetch a provider's model list on a background task, reporting
-/// `AgentEvent::ModelList` on success and a notice on failure.  Shared by the
-/// startup fetch in `main` and the `/model` and `/models` handlers.
+/// `AgentEvent::ModelList` on success and a notice on failure. Shared by the
+/// `/model` and `/models` handlers. The fetch itself is the shared
+/// [`fetch_model_catalogue`]; only this explicit-listing sink differs from
+/// the metadata path.
 pub fn spawn_model_list(
     provider_name: String,
     provider: Arc<dyn Provider>,
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
+    // No cancel token on this path today: the timeout still bounds it, and
+    // the task only sends events (never mutates agent state).
+    let never = CancellationToken::new();
     tokio::spawn(async move {
-        match provider.list_models().await {
-            Ok(models) => send(
+        match fetch_model_catalogue(provider, &never).await {
+            Some(models) => send(
                 &events,
                 AgentEvent::ModelList {
                     provider: provider_name,
                     models,
                 },
             ),
-            Err(error) => send(
+            // `fetch_model_catalogue` collapses provider errors to `None`
+            // along with timeout/cancel; the explicit-listing sink reports
+            // failure while the metadata path drops it silently.
+            None => send(
                 &events,
-                AgentEvent::Notice(format!("could not fetch model list: {error}")),
+                AgentEvent::Notice("could not fetch model list".into()),
             ),
         }
     });

@@ -26,26 +26,28 @@
 //! triggers, or slash commands, and sharing those would couple the child to
 //! UI concerns it must not have.
 
-use crate::agent::plan_tool_batches;
+use crate::agent::{
+    CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
+    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch, plan_tool_batches,
+};
 use crate::assembly::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
 use async_trait::async_trait;
-use futures_util::stream::{FuturesUnordered, StreamExt};
+use compact::estimate_provider_context_tokens;
+use futures_util::stream::StreamExt;
 use llm::{
     CompletionRequest, Content, Message, Provider, ReasoningPolicy, RetryCallback, Role,
     StreamEvent, truncate_utf8,
 };
 use session::{SessionCreateOptions, SessionStore, usage_summary};
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tools::{
-    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry, call_summary,
+    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry,
     default_registry_with_index, read_only_registry_with_index,
 };
 
@@ -53,15 +55,57 @@ use tools::{
 /// large enough for a thorough audit, small enough not to blow the parent's
 /// context when several reports land in one turn.
 const REPORT_MAX_BYTES: usize = 20_000;
+/// Child requests are bounded independently of the parent's context window so
+/// repeated large reads cannot consume the entire parent turn.
+const CHILD_CONTEXT_MAX_TOKENS: u64 = 100_000;
+/// Reserve room for the final report request while exploration tools are used.
+const CHILD_FINAL_REPORT_RESERVE_TOKENS: u64 = 8_000;
+const CHILD_TOOL_EVIDENCE_MAX_BYTES: usize = 8_000;
 
-/// Upper bound on read-only tool calls running at once inside one subagent.
-/// Mirrors the parent's cap; children never see `Parallel` tools, so this is
-/// the only in-flight limit they need.
-const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 8;
+/// Bound a child's live provider history without rewriting its durable
+/// transcript. Tool evidence is truncated first; then complete old exchanges
+/// are removed while preserving the original user request and the newest
+/// evidence for synthesis.
+fn bound_child_history(
+    history: &mut Vec<Message>,
+    system: &str,
+    registry: &ToolRegistry,
+    max_tokens: u64,
+) {
+    let definitions = registry.definitions();
+    let estimate =
+        |history: &[Message]| estimate_provider_context_tokens(Some(system), &definitions, history);
+    for message in history.iter_mut() {
+        for content in &mut message.content {
+            if let Content::ToolResult { content, .. } = content
+                && content.len() > CHILD_TOOL_EVIDENCE_MAX_BYTES
+            {
+                *content = truncate_utf8(content, CHILD_TOOL_EVIDENCE_MAX_BYTES);
+            }
+        }
+    }
 
-/// One in-flight child tool execution carrying its slot index so results
-/// land in original call order rather than completion order.
-type ChildToolRun<'a> = Pin<Box<dyn Future<Output = (usize, tools::ToolOutput)> + Send + 'a>>;
+    while estimate(history) > max_tokens && history.len() > 1 {
+        let mut end = 2.min(history.len());
+        while end < history.len() && history[end].role == Role::Tool {
+            end += 1;
+        }
+        history.drain(1..end);
+    }
+
+    // A very large initial prompt can exceed the bound by itself. Preserve its
+    // role and trim only its text as a final fallback rather than producing an
+    // empty provider request.
+    if estimate(history) > max_tokens
+        && let Some(message) = history.first_mut()
+    {
+        for content in &mut message.content {
+            if let Content::Text(text) = content {
+                *text = truncate_utf8(text, CHILD_TOOL_EVIDENCE_MAX_BYTES);
+            }
+        }
+    }
+}
 
 /// One delegated subagent run.
 pub(crate) struct SubagentRun {
@@ -178,6 +222,17 @@ impl SubagentRunnerImpl {
             .expect("subagent model state lock poisoned");
         state.provider = provider;
         state.model = model.into();
+    }
+
+    /// Current child-target model (test seam for AGENT-4 atomicity: proves
+    /// a failed parent persist leaves future children on the old model).
+    #[cfg(test)]
+    pub fn model_for_test(&self) -> String {
+        self.model_state
+            .read()
+            .expect("subagent model state lock poisoned")
+            .model
+            .clone()
     }
 
     /// Retarget future child runs after `/reasoning` changes.
@@ -397,6 +452,9 @@ impl SubagentRunnerImpl {
             // The note is request-local (not durable child history), and an
             // empty tool list makes the expected terminal action unambiguous.
             let final_report_turn = turns == self.config.max_turns;
+            let context_budget =
+                CHILD_CONTEXT_MAX_TOKENS.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS);
+            bound_child_history(history, system, registry, context_budget);
             let mut request_messages = history.clone();
             if final_report_turn {
                 push_request_note(
@@ -517,11 +575,11 @@ impl SubagentRunnerImpl {
         }
     }
 
-    /// Program-order dispatch mirroring the parent agent: maximal read-only
-    /// runs batch concurrently, adjacent same-tool `Parallel` calls would fan
-    /// out (the child has no such tool), everything else serializes. Results
-    /// land in original call order; cancellation synthesizes "cancelled"
-    /// results for unfilled slots before unwinding.
+    /// Program-order dispatch mirroring the parent agent through the shared
+    /// batch executor. Results are persisted in provider call order even when
+    /// independent tools complete in another order. A launched non-read-only
+    /// call that is interrupted is reported as having unknown execution
+    /// status, never as a confirmed ordinary cancellation.
     async fn dispatch_tool_batches(
         &self,
         registry: &ToolRegistry,
@@ -531,71 +589,29 @@ impl SubagentRunnerImpl {
         cancel: &CancellationToken,
     ) -> Result<(), String> {
         for batch in plan_tool_batches(tool_calls, registry) {
-            // The batch shares a child token so a cancel kills exactly this
-            // phase while leaving the outer token untouched for cleanup.
-            let batch_cancel = cancel.child_token();
-            let mut futures: FuturesUnordered<ChildToolRun<'_>> = FuturesUnordered::new();
             let launch_limit = if batch.concurrent() {
-                MAX_CONCURRENT_READ_ONLY_TOOLS
+                match batch.class {
+                    tools::Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
+                    tools::Concurrency::Parallel => MAX_CONCURRENT_PARALLEL_TOOLS,
+                    tools::Concurrency::Exclusive => 1,
+                }
             } else {
                 1
             };
-            let mut next_launch = 0usize;
-            while next_launch < batch.calls.len().min(launch_limit) {
-                futures.push(Self::launch(
-                    registry,
-                    &batch.calls[next_launch],
-                    next_launch,
-                    batch_cancel.clone(),
-                ));
-                next_launch += 1;
-            }
-            let mut slots: Vec<Option<tools::ToolOutput>> =
-                (0..batch.calls.len()).map(|_| None).collect();
-            let mut finished = 0usize;
-            loop {
-                tokio::select! {
-                    item = futures.next() => match item {
-                        Some((index, output)) => {
-                            slots[index] = Some(output);
-                            finished += 1;
-                            if finished == slots.len() {
-                                break;
-                            }
-                            if next_launch < batch.calls.len() {
-                                futures.push(Self::launch(registry, &batch.calls[next_launch], next_launch, batch_cancel.clone()));
-                                next_launch += 1;
-                            }
-                        }
-                        None => break,
-                    },
-                    _ = cancel.cancelled() => {
-                        batch_cancel.cancel();
-                        break;
-                    }
-                }
-            }
-            drop(futures);
+            let mut control = CancellationControl::new(cancel, DispatchCancellation::Explicit);
+            let mut hooks = NoopToolDispatchHooks;
+            let outcome =
+                execute_tool_batch(registry, &batch, launch_limit, &mut control, &mut hooks).await;
 
-            let mut cancelled = false;
-            for (call, slot) in batch.calls.iter().zip(&mut slots) {
-                let output = match slot.take() {
-                    Some(output) => output,
-                    None => {
-                        cancelled = true;
-                        tools::ToolOutput {
-                            content: "cancelled".to_owned(),
-                            is_error: true,
-                            summary: call_summary(&call.name, &call.arguments),
-                        }
-                    }
-                };
+            for (call, call_outcome) in batch.calls.iter().zip(outcome.outcomes) {
+                let content = call_outcome.output.content;
+                let is_error = call_outcome.output.is_error;
                 history.push(Message {
                     role: Role::Tool,
                     content: vec![Content::ToolResult {
                         tool_call_id: call.id.clone(),
-                        content: output.content.clone(),
-                        is_error: output.is_error,
+                        content: content.clone(),
+                        is_error,
                     }],
                 });
                 Self::persist(
@@ -603,32 +619,17 @@ impl SubagentRunnerImpl {
                     session,
                     session::SessionEvent::ToolResult {
                         tool_call_id: call.id.clone(),
-                        content: output.content.clone(),
-                        is_error: output.is_error,
+                        content,
+                        is_error,
                         tool_name: Some(call.name.clone()),
                     },
                 );
             }
-            if cancelled {
+            if outcome.cancellation.is_some() {
                 return Err("cancelled by user".into());
             }
         }
         Ok(())
-    }
-
-    /// Start one registry execution as a slot-carrying future.
-    fn launch<'a>(
-        registry: &'a ToolRegistry,
-        call: &'a llm::ToolCall,
-        index: usize,
-        cancel: CancellationToken,
-    ) -> ChildToolRun<'a> {
-        let name = call.name.clone();
-        let arguments = call.arguments.clone();
-        Box::pin(async move {
-            let output = registry.execute(&name, arguments, cancel).await;
-            (index, output)
-        })
     }
 }
 
@@ -936,6 +937,28 @@ mod tests {
                 .unwrap()
                 .contains("Complete the task with the available tools")
         );
+    }
+
+    #[test]
+    fn child_history_budget_discards_old_tool_evidence() {
+        let registry = ToolRegistry::empty();
+        let mut history = vec![Message::user("original task")];
+        for index in 0..6 {
+            history.push(Message::assistant(vec![Content::Text(format!(
+                "analysis {index}"
+            ))]));
+            history.push(Message::tool_result(
+                format!("call-{index}"),
+                "x".repeat(20_000),
+                false,
+            ));
+        }
+        bound_child_history(&mut history, "system", &registry, 100);
+        let estimate =
+            estimate_provider_context_tokens(Some("system"), &registry.definitions(), &history);
+        assert!(estimate <= 100 || history.len() == 1);
+        assert_eq!(history[0].content.len(), 1);
+        assert!(history.len() < 13);
     }
 
     #[test]
@@ -1264,6 +1287,7 @@ mod tests {
                         return Err(LlmError::Http {
                             status: 500,
                             body: message,
+                            retry_after_secs: None,
                         });
                     }
                 }

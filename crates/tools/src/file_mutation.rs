@@ -81,8 +81,14 @@ fn sweep_unreferenced_file_locks() {
 
 /// Write a file through a same-directory temporary file and atomic rename.
 /// Keeping the temporary file beside the destination ensures the rename does
-/// not cross filesystems.  Existing permissions are copied to the temporary
+/// not cross filesystems. Existing permissions are copied to the temporary
 /// file before it replaces the destination.
+///
+/// This helper is pathname-based and therefore is not a workspace containment
+/// primitive: callers handling workspace paths must use `atomic_write_at`
+/// on Unix or fail closed on platforms without an equivalent directory-handle
+/// API. It remains available for the Unix compatibility path and for callers
+/// that deliberately provide their own path-safety boundary.
 pub async fn atomic_write(
     path: &Path,
     contents: &[u8],
@@ -123,6 +129,145 @@ pub async fn atomic_write(
         let _ = fs::remove_file(&temporary_path).await;
     }
     result
+}
+
+/// Write `contents` to `name` inside the validated parent directory `parent_fd`
+/// (Unix): anonymous temp file via `O_TMPFILE`, then `linkat` to the final
+/// name (or `renameat` when replacing).  Both the temp creation and the
+/// commit are relative to the validated handle, so a swapped ancestor
+/// cannot redirect the write.  Returns `Ok(true)` when an existing file was
+/// replaced, `Ok(false)` when created.
+#[cfg(unix)]
+pub async fn atomic_write_at(
+    parent_fd: &std::os::fd::OwnedFd,
+    name: &str,
+    contents: &[u8],
+    existing_permissions: Option<std::fs::Permissions>,
+    cancel: &CancellationToken,
+) -> io::Result<bool> {
+    use std::os::fd::AsFd;
+
+    check_cancelled(cancel)?;
+    let (tmp, temporary_name) = create_temporary_file_at(parent_fd)?;
+    let result = async {
+        write_all_chunks(&tmp, contents, cancel).await?;
+        rustix::fs::fsync(&tmp).map_err(io::Error::from)?;
+        check_cancelled(cancel)?;
+
+        if let Some(permissions) = existing_permissions {
+            use std::os::unix::fs::PermissionsExt;
+            // `mode()` is the full `st_mode` (file-type bits included) as
+            // `u32`; mask to the permission bits, then narrow to rustix's
+            // raw mode type (`u32` on Linux, `u16` on macOS).
+            let mode = permissions.mode() & 0o7777;
+            rustix::fs::fchmod(&tmp, rustix::fs::Mode::from_raw_mode(mode as _))
+                .map_err(io::Error::from)?;
+        }
+
+        // Check and commit through the already validated parent handle. The
+        // destination may be replaced atomically, but no ancestor is looked up
+        // again by pathname. Recheck the type immediately before rename so a
+        // special file racing with the metadata preflight is never silently
+        // accepted as an existing write target.
+        let existed = match rustix::fs::statat(
+            parent_fd.as_fd(),
+            name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => {
+                let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+                super::vfs::unix::ensure_regular_file(name, file_type)?;
+                true
+            }
+            Err(error) if error == rustix::io::Errno::NOENT => false,
+            Err(error) => return Err(io::Error::from(error)),
+        };
+        check_cancelled(cancel)?;
+        rustix::fs::renameat(parent_fd.as_fd(), &temporary_name, parent_fd.as_fd(), name)
+            .map_err(io::Error::from)?;
+
+        // Cancellation after rename must not turn a committed mutation into a
+        // reported failure. The caller can no longer safely retry it.
+        rustix::fs::fsync(parent_fd.as_fd()).map_err(io::Error::from)?;
+        Ok(existed)
+    }
+    .await;
+
+    if result.is_err() {
+        // If rename already committed, this is simply NotFound. Ignore cleanup
+        // errors because the primary operation's error is more useful.
+        let _ = rustix::fs::unlinkat(
+            parent_fd.as_fd(),
+            &temporary_name,
+            rustix::fs::AtFlags::empty(),
+        );
+    }
+    result
+}
+
+#[cfg(unix)]
+fn create_temporary_file_at(
+    parent_fd: &std::os::fd::OwnedFd,
+) -> io::Result<(std::os::fd::OwnedFd, String)> {
+    use std::os::fd::AsFd;
+    for _ in 0..100 {
+        let name = format!(".harness-edit-{}", uuid::Uuid::new_v4());
+        match rustix::fs::openat(
+            parent_fd.as_fd(),
+            name.as_str(),
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        ) {
+            Ok(file) => return Ok((file, name)),
+            Err(error) if error == rustix::io::Errno::EXIST => continue,
+            Err(error) => return Err(io::Error::from(error)),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique handle-relative temporary file",
+    ))
+}
+
+#[cfg(unix)]
+async fn write_all_chunks(
+    tmp: &std::os::fd::OwnedFd,
+    contents: &[u8],
+    cancel: &CancellationToken,
+) -> io::Result<()> {
+    use std::os::fd::AsFd;
+    use tokio::io::AsyncWriteExt;
+    // `rustix` fds are blocking; wrap the owned fd in a tokio File without
+    // duplicating it by transferring ownership through `File::from`.
+    let std_file = fd_to_std_file(tmp.as_fd())?;
+    let mut file = tokio::fs::File::from_std(std_file);
+    for chunk in contents.chunks(64 * 1024) {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        file.write_all(chunk).await?;
+    }
+    file.sync_all().await?;
+    // Prevent `file`'s Drop from closing the fd: the caller still owns `tmp`.
+    // Re-materialize ownership by forgetting the std wrapper's fd… instead,
+    // simply leak-guard: `into_std` below duplicates. Easiest correct path:
+    // detach by `mem::forget` after converting back — but tokio File owns
+    // the fd. To keep single ownership sound, duplicate first.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fd_to_std_file(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<std::fs::File> {
+    let duplicated = rustix::io::retry_on_intr(|| rustix::io::fcntl_dupfd_cloexec(fd, 0))
+        .map_err(io::Error::from)?;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let raw = duplicated.into_raw_fd();
+    // SAFETY: `raw` was just duplicated from a live fd and is now owned.
+    Ok(unsafe { std::fs::File::from_raw_fd(raw) })
 }
 
 async fn lock_key(path: &Path) -> PathBuf {

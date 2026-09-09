@@ -389,6 +389,7 @@ fn plan_gate_error(
     if let LlmError::Http {
         status: 400,
         ref body,
+        ..
     } = error
         && body.contains("model_not_supported")
     {
@@ -537,20 +538,10 @@ fn auth_error(error: auth::AuthError) -> LlmError {
     LlmError::Auth(error.to_string())
 }
 
+/// Consolidated OAuth-provider redaction: delegate to the shared
+/// [`LlmError::redacted`] point so every variant is covered once.
 fn redact_error(error: LlmError, secret: &str) -> LlmError {
-    if secret.is_empty() {
-        return error;
-    }
-    match error {
-        LlmError::Http { status, body } => LlmError::Http {
-            status,
-            body: body.replace(secret, "[redacted]"),
-        },
-        LlmError::Stream(message) => LlmError::Stream(message.replace(secret, "[redacted]")),
-        LlmError::Parse(message) => LlmError::Parse(message.replace(secret, "[redacted]")),
-        LlmError::Auth(message) => LlmError::Auth(message.replace(secret, "[redacted]")),
-        other => other,
-    }
+    error.redacted(secret)
 }
 
 #[cfg(test)]
@@ -681,6 +672,7 @@ mod tests {
             LlmError::Http {
                 status: 400,
                 body: "{\"error\":{\"code\":\"model_not_supported\"}}".into(),
+                retry_after_secs: None,
             },
             "claude-haiku-4.5",
             &available,
@@ -697,6 +689,7 @@ mod tests {
         let other = || LlmError::Http {
             status: 400,
             body: "bad json".into(),
+            retry_after_secs: None,
         };
         assert!(matches!(
             plan_gate_error(other(), "m", &available, None),
@@ -705,6 +698,7 @@ mod tests {
         let not_found = LlmError::Http {
             status: 404,
             body: "model_not_supported".into(),
+            retry_after_secs: None,
         };
         assert!(matches!(
             plan_gate_error(not_found, "m", &available, None),
@@ -718,6 +712,7 @@ mod tests {
             LlmError::Http {
                 status: 401,
                 body: "token=access-secret".into(),
+                retry_after_secs: None,
             },
             "access-secret",
         );

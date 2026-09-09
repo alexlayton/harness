@@ -58,19 +58,63 @@ impl Agent {
         }
     }
 
-    /// Durable flush for deferred-sync stores (no-op otherwise). Called at
-    /// turn boundaries; failures are logged, not surfaced — the data is in
-    /// the OS page cache and the next boundary retries.
-    pub(crate) fn flush_deferred_sync(&self) {
+    /// Stage a model-change append without changing the live session. The
+    /// returned clone is committed by the command handler only after a
+    /// deferred sync succeeds, so an append followed by a failed sync cannot
+    /// make the in-memory session look newer than the successful model
+    /// selection.
+    pub(crate) fn stage_model_change(
+        &self,
+        provider: String,
+        model: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<Option<Session>, TurnError> {
         let Some(state) = self.session.as_ref() else {
-            return;
+            return Ok(None);
         };
-        if !state.store.deferred_sync() {
-            return;
+        let mut staged = state.session.clone();
+        state
+            .store
+            .append_event(&mut staged, SessionEvent::ModelChange { provider, model })
+            .map(|_| Some(staged))
+            .map_err(|error| {
+                let message = format!("session persistence failed: {error}");
+                send(events, AgentEvent::Error(message.clone()));
+                TurnError::Persist(message)
+            })
+    }
+
+    /// Flush one session clone at the deferred-sync boundary. Model changes
+    /// use this with their staged session before replacing the live session;
+    /// ordinary turns use [`Self::flush_deferred_sync`] with the live one.
+    pub(crate) fn flush_deferred_sync_session(
+        &self,
+        store: &SessionStore,
+        session: &Session,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(), TurnError> {
+        if !store.deferred_sync() {
+            return Ok(());
         }
-        if let Err(error) = state.store.sync_session(&state.session) {
-            tracing::warn!(error = %error, "deferred session sync failed");
+        if let Err(error) = store.sync_session(session) {
+            let message = format!("session persistence failed during sync: {error}");
+            send(events, AgentEvent::Error(message.clone()));
+            return Err(TurnError::Persist(message));
         }
+        Ok(())
+    }
+
+    /// Durable flush for deferred-sync stores (no-op otherwise). A sync
+    /// failure is a persistence failure, not telemetry: quarantine before any
+    /// queued operation can observe divergent durable history.
+    pub(crate) fn flush_deferred_sync(
+        &self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(), TurnError> {
+        let Some(state) = self.session.as_ref() else {
+            return Ok(());
+        };
+        self.flush_deferred_sync_session(&state.store, &state.session, events)
     }
 
     pub(crate) fn persist_user_message(
@@ -90,11 +134,10 @@ impl Agent {
         &mut self,
         reasoning: &str,
         text: &str,
-        opaque: &[(String, serde_json::Value)],
-        calls: &[ToolCall],
+        items: &[Content],
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), TurnError> {
-        if reasoning.is_empty() && text.is_empty() && opaque.is_empty() && calls.is_empty() {
+        if reasoning.is_empty() && text.is_empty() && items.is_empty() {
             return Ok(());
         }
         let mut content = Vec::new();
@@ -104,12 +147,15 @@ impl Agent {
         if !text.is_empty() {
             content.push(Content::Text(text.to_owned()));
         }
-        content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-            provider: provider.clone(),
-            data: data.clone(),
-        }));
-        // Tool calls have their own durable events. Keeping them out of this
-        // message avoids duplicates while retaining explicit call events.
+        let has_opaque = items
+            .iter()
+            .any(|item| matches!(item, Content::Opaque { .. }));
+        if has_opaque {
+            // Codex continuation state must remain interleaved with calls in
+            // one assistant message. Embedded calls are validated and replayed
+            // by session using the same state machine as standalone calls.
+            content.extend(items.iter().cloned());
+        }
         let message = Message::assistant(content);
         if !message.content.is_empty() {
             self.persist_event(
@@ -119,13 +165,18 @@ impl Agent {
                 events,
             )?;
         }
-        for call in calls {
-            self.persist_event(
-                SessionEvent::ToolCall {
-                    call: StoredToolCall::from(call),
-                },
-                events,
-            )?;
+        if !has_opaque {
+            for call in items.iter().filter_map(|item| match item {
+                Content::ToolCall(call) => Some(call),
+                _ => None,
+            }) {
+                self.persist_event(
+                    SessionEvent::ToolCall {
+                        call: StoredToolCall::from(call),
+                    },
+                    events,
+                )?;
+            }
         }
         Ok(())
     }
@@ -148,23 +199,23 @@ impl Agent {
         )
     }
 
-    /// Try to record cancellation without obscuring the original interrupt.
+    /// Record cancellation before the turn is allowed to finish.
+    ///
+    /// A missing cancellation marker leaves durable history ambiguous: the
+    /// live agent may have stopped while the session still looks like it can
+    /// continue.  Treat that append like every other history-bearing event so
+    /// the turn boundary can quarantine instead of running queued work.
     pub(crate) fn persist_cancelled(
         &mut self,
         reason: impl Into<String>,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) {
-        if self
-            .persist_event(
-                SessionEvent::TurnCancelled {
-                    reason: reason.into(),
-                },
-                events,
-            )
-            .is_err()
-        {
-            tracing::warn!("could not persist cancellation marker");
-        }
+    ) -> Result<(), TurnError> {
+        self.persist_event(
+            SessionEvent::TurnCancelled {
+                reason: reason.into(),
+            },
+            events,
+        )
     }
 }
 

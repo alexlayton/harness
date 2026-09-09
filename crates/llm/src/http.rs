@@ -115,7 +115,7 @@ impl HttpClient {
             .send()
             .await
             .map_err(LlmError::Network)?;
-        check_status(response).await
+        check_status_with_secret(response, &self.api_key).await
     }
 
     /// GET `path` with the standard headers.
@@ -127,26 +127,65 @@ impl HttpClient {
             .send()
             .await
             .map_err(LlmError::Network)?;
-        check_status(response).await
+        check_status_with_secret(response, &self.api_key).await
     }
 }
 
 /// Map a non-success HTTP status to `LlmError::Http` with a bounded body.
 /// `LlmError::http` is the single constructor that enforces the truncation
 /// invariant, so every status-mapped error (OpenAI dialects and Anthropic
-/// alike) is bounded here.
-pub(crate) async fn check_status(
+/// alike) is bounded here.  The body is streamed as a bounded prefix — never
+/// an unbounded `response.text()` — and the final error stays within the
+/// byte cap as valid UTF-8.  A 429 `Retry-After` hint is preserved (bounded)
+/// so `retry.rs` can honor `max(backoff+jitter, retry_after)`.
+/// Map an error while redacting the active API key/token before the
+/// error becomes visible.  Providers holding a secret must use this so
+/// echoed bodies can never leak credentials.
+pub(crate) async fn check_status_with_secret(
     response: reqwest::Response,
+    secret: &str,
 ) -> Result<reqwest::Response, LlmError> {
     if response.status().is_success() {
         return Ok(response);
     }
     let status = response.status().as_u16();
-    let body = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<unable to read response body>".into());
-    Err(LlmError::http(status, body))
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::error::parse_retry_after_value);
+    let body = bounded_error_body(response).await;
+    Err(LlmError::http_redacted_with_retry_after(
+        status,
+        body,
+        secret,
+        retry_after,
+    ))
+}
+
+/// Maximum bytes read from a non-success response body.  Multi-megabyte or
+/// chunked error bodies stay bounded in memory and output.
+const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
+
+async fn bounded_error_body(response: reqwest::Response) -> String {
+    use futures_util::StreamExt;
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        let take = remaining.min(chunk.len());
+        body.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break;
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 #[cfg(test)]
@@ -161,6 +200,86 @@ mod tests {
     /// reqwest client had no timeouts.  With `read_timeout` set, the stalled
     /// body read must surface as an error so the agent loop can recover
     /// instead of waiting for a user interrupt.
+    #[tokio::test]
+    async fn shared_http_errors_redact_keys_and_preserve_retry_headers() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().unwrap();
+        let secret = "sk-shared-http-secret";
+        let body = format!("provider echoed {secret}");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-length: {}\r\nretry-after: 7\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let client = HttpClient::with_client(
+            format!("http://{addr}"),
+            secret,
+            HeaderMap::new(),
+            Client::builder().build().unwrap(),
+        );
+        let error = client.get("/models").await.unwrap_err();
+        assert!(!error.to_string().contains(secret));
+        assert_eq!(error.retry_after_secs(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn oversized_error_body_is_bounded_to_a_prefix() {
+        // A multi-megabyte (chunked) non-success body must stay bounded:
+        // only a 16KiB prefix is read, and the final error stays within
+        // the byte cap as valid UTF-8.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().unwrap();
+        // 256KiB of chunked body: 64 chunks of 4KiB each.
+        let chunk = "x".repeat(4 * 1024);
+        let chunks = chunk.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let mut response =
+                b"HTTP/1.1 500 Internal Server Error\r\ntransfer-encoding: chunked\r\n\r\n"
+                    .to_vec();
+            for _ in 0..64 {
+                response.extend_from_slice(format!("{:x}\r\n", chunks.len()).as_bytes());
+                response.extend_from_slice(chunks.as_bytes());
+                response.extend_from_slice(b"\r\n");
+            }
+            response.extend_from_slice(b"0\r\n\r\n");
+            socket.write_all(&response).await.unwrap();
+        });
+        let client = HttpClient::with_client(
+            format!("http://{addr}"),
+            "test-key",
+            HeaderMap::new(),
+            // Plain-HTTP fixture, but reqwest still requires a crypto
+            // provider at build time: reuse the shared client factory used
+            // in production.
+            crate::http::streaming_client(),
+        );
+        let error = client.get("/models").await.unwrap_err();
+        let rendered = error.to_string();
+        assert!(
+            rendered.len() <= 2048 + 64,
+            "oversized body leaked: {} bytes",
+            rendered.len()
+        );
+        assert!(rendered.is_char_boundary(rendered.len()));
+    }
+
     #[tokio::test]
     async fn stalled_response_body_times_out_instead_of_hanging() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

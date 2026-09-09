@@ -91,8 +91,18 @@ context_window = 0
   provider metadata, then a generous 1M fallback if metadata is unavailable
   (some providers report no context lengths).
 
-Compaction appends a summary event. It does not rewrite or delete old session
-events.
+`threshold` must be finite and between `0.0` and `1.0`. Summary byte limits
+must be nonzero and no larger than 16 MiB for input or 1 MiB for output.
+`reserve_tokens` must be smaller than the effective context window: an
+explicit nonzero `context_window` is checked directly, and an explicit
+window also bounds the default reserve (so `context_window = 8000` alone
+is rejected). Zero `keep_recent_turns` and `keep_recent_tokens` are
+allowed: they request the smallest valid retained provider-history tail.
+Invalid values identify their exact `[compaction]` key and prevent startup.
+
+Compaction asks the active model for a bounded summary and uses a deterministic
+local fallback when that request fails. It appends a summary event; it does
+not rewrite or delete old session events.
 
 ## Subagents
 
@@ -109,6 +119,9 @@ parallel read-only delegations and is clamped to at least one. Workspace-mode
 subagents are exclusive and run in sequence.
 
 Subagents do not receive external MCP tools and cannot create more subagents.
+Read-only children receive exactly `read`, `find`, `grep`, and `multigrep`;
+workspace children receive the normal built-ins. Exclusion from the registry
+is the enforcement, not prompt wording.
 
 ## MCP servers
 
@@ -139,7 +152,23 @@ tool-list changes. Calls are serialized as exclusive operations and run
 without a confirmation step. Subagents do not receive MCP tools.
 
 Only stdio transport is enabled. Streamable HTTP and legacy SSE transports are
-not enabled.
+not enabled. ACP clients may declare HTTP/SSE servers, but those entries are
+rejected before any connection is attempted.
+
+MCP has fixed safety limits rather than per-server TOML overrides: initialize
+and catalogue requests have 15-second deadlines, calls have a 60-second
+deadline, and shutdown has a four-second global deadline. ACP session assembly
+uses its own 35-second bound so sequential initialize and catalogue requests
+can both use their full MCP deadlines; this is separate from the short ACP
+session shutdown/delete cleanup bound. A server may expose
+at most 256 tools with at most 512 KiB of aggregate definitions. Schemas are
+limited to depth 32, 10,000 nodes, 64 KiB strings, and 256 KiB total size.
+Structured/text/error output is compacted (never pretty-printed) and capped
+at 20 KiB with a truncation notice; when structured and text carry the same
+payload only one representation is kept. Every newline-delimited stdio frame is
+also capped at 1 MiB before rmcp deserializes it, including initialize,
+pagination, calls, and protocol errors. Stderr is read in bounded 4 KiB chunks,
+counted but discarded by default, and never logged with secrets.
 
 ## Sessions
 
@@ -166,6 +195,28 @@ harness prompt --no-session "prompt"
 `--defer-session-sync` syncs at turn boundaries instead of after each event.
 This is faster for tool-heavy turns, but a power failure can lose the current
 turn's tail.
+
+With `--no-session`, Harness does not create a session store, header, event
+file, or resumable history. Automatic compaction is disabled because there is
+no durable session to append a summary to; `/compact` reports that it is
+unavailable, and an over-window provider request cannot recover by compacting
+the ephemeral history.
+
+## Shell execution
+
+The shell starts in the workspace but is not a sandbox. Bash calls are
+exclusive, use a 120-second default timeout (maximum 86,400 seconds), and cap
+output at 2,000 lines or 50 KiB. On Linux, when a writable cgroup-v2 hierarchy
+is available, each command gets a private cgroup before the shell is executed.
+Timeout, cancellation, future drop, and shell exit use `cgroup.kill` plus the
+process group (SIGTERM, escalating to SIGKILL after a 500 ms grace period), so
+even a `setsid` descendant is terminated before output draining and cannot
+mutate the workspace after tool return. Hosts without cgroup-v2 delegation
+fall back to process-group cleanup; that path cannot contain a descendant that
+calls `setsid`. macOS has the same process-group limitation, and other
+platforms only guarantee direct child termination. Standard output and error
+drain concurrently under one shared one-second deadline, which bounds Harness
+waiting even on those best-effort paths.
 
 ## Project context and skills
 
@@ -206,7 +257,7 @@ harness acp --provider openai-codex
 | Command or option | Purpose |
 |---|---|
 | `prompt [PROMPT]` | Run one prompt and print only the final answer to stdout. Reads piped stdin when the prompt is omitted. |
-| `acp` | Serve ACP over stdio. |
+| `acp` | Serve ACP over stdio (stdout carries JSON-RPC protocol traffic only). |
 | `login <provider>` | Authenticate with an OAuth provider. |
 | `--provider <provider>` | Override the configured provider. |
 | `--model <model>` | Override the configured model. |

@@ -88,6 +88,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -152,6 +153,20 @@ enum Entry {
 struct StreamState {
     reasoning: String,
     markdown: String,
+}
+
+/// Cached rendering for completed markdown blocks in the live stream. The
+/// current trailing block remains reparsed, while completed blocks are copied
+/// into this cache once when a blank-line boundary arrives.
+struct StreamMarkdownCache {
+    width: usize,
+    theme: Theme,
+    source_offset: usize,
+    lines: Vec<Line<'static>>,
+    /// Number of completed source chunks parsed into the cache. Besides being
+    /// useful when profiling, this guards the incremental-rendering invariant
+    /// in colocated tests.
+    rendered_blocks: usize,
 }
 
 /// One active tool call in the keyed running-tool state.
@@ -237,6 +252,88 @@ struct RunningRegion {
     rows: usize,
 }
 
+/// Operations needed to change terminal state. Keeping this small seam here
+/// makes setup and cleanup testable without making the rendering or input
+/// protocol depend on a different terminal implementation.
+trait TerminalBackend: Send {
+    fn size(&self) -> io::Result<(u16, u16)>;
+    fn enable_raw_mode(&mut self) -> io::Result<()>;
+    fn disable_raw_mode(&mut self) -> io::Result<()>;
+    fn enable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn disable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn push_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn pop_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()>;
+    fn write_newline(&mut self, out: &mut Stdout) -> io::Result<()>;
+}
+
+/// The production terminal operation layer. Crossterm is deliberately kept
+/// behind [`TerminalBackend`], so mode bookkeeping can be tested independently
+/// of the process terminal and its platform-specific implementation.
+struct CrosstermBackend;
+
+impl TerminalBackend for CrosstermBackend {
+    fn size(&self) -> io::Result<(u16, u16)> {
+        terminal::size()
+    }
+
+    fn enable_raw_mode(&mut self) -> io::Result<()> {
+        terminal::enable_raw_mode()
+    }
+
+    fn disable_raw_mode(&mut self) -> io::Result<()> {
+        terminal::disable_raw_mode()
+    }
+
+    fn enable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(out, EnableBracketedPaste)
+    }
+
+    fn disable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(out, DisableBracketedPaste)
+    }
+
+    fn push_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+    }
+
+    fn pop_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()> {
+        execute!(out, PopKeyboardEnhancementFlags)
+    }
+
+    fn write_newline(&mut self, out: &mut Stdout) -> io::Result<()> {
+        writeln!(out)
+    }
+}
+
+/// Terminal modes successfully enabled by one UI instance. Cleanup only
+/// reverses modes recorded here, so a partial setup cannot pop another
+/// component's keyboard state. Failed cleanup remains recorded until a later
+/// retry succeeds.
+#[derive(Default)]
+struct TerminalModes {
+    raw_mode: bool,
+    bracketed_paste: bool,
+    keyboard_flags: bool,
+    newline_written: bool,
+}
+
+struct TerminalState {
+    backend: Box<dyn TerminalBackend>,
+    modes: TerminalModes,
+}
+
+impl TerminalState {
+    fn is_restored(&self) -> bool {
+        !self.modes.raw_mode
+            && !self.modes.bracketed_paste
+            && !self.modes.keyboard_flags
+            && self.modes.newline_written
+    }
+}
+
 /// The direct-crossterm UI. See the module docs for the screen model; the
 /// struct is consumed externally only through `CrossTerm::new` and
 /// `CrossTerm::run`.
@@ -265,6 +362,7 @@ pub struct CrossTerm {
     pending: Vec<Entry>,
 
     stream: Option<StreamState>,
+    stream_markdown_cache: Option<StreamMarkdownCache>,
     /// Currently running tool calls, keyed by harness call id and kept in
     /// launch order. Concurrent fan-out (e.g. several `subagent` calls in one
     /// response) means more than one record can be live at once; a finish
@@ -328,7 +426,7 @@ pub struct CrossTerm {
     /// that row instead of the whole region.
     activity_region_row: Option<usize>,
 
-    restored: bool,
+    terminal: Arc<Mutex<TerminalState>>,
 }
 
 impl CrossTerm {
@@ -359,6 +457,7 @@ impl CrossTerm {
             transcript: Vec::new(),
             pending: Vec::new(),
             stream: None,
+            stream_markdown_cache: None,
             running_tools: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -389,8 +488,19 @@ impl CrossTerm {
             cursor_row: 0,
             cursor_col: 0,
             activity_region_row: None,
-            restored: false,
+            terminal: Arc::new(Mutex::new(TerminalState {
+                backend: Box::new(CrosstermBackend),
+                modes: TerminalModes::default(),
+            })),
         }
+    }
+
+    fn with_backend(mut ui: Self, backend: Box<dyn TerminalBackend>) -> Self {
+        ui.terminal = Arc::new(Mutex::new(TerminalState {
+            backend,
+            modes: TerminalModes::default(),
+        }));
+        ui
     }
 
     /// `skills`, `context_files`, and the initial reasoning label come from
@@ -405,36 +515,83 @@ impl CrossTerm {
         reasoning: &str,
         minimal: bool,
     ) -> Result<Self> {
-        install_panic_hook();
-        let (width, height) = terminal::size().unwrap_or((80, 24));
-        let mut ui = Self::base(
-            model,
-            provider,
-            providers,
-            skills,
-            context_files,
-            width,
-            height,
+        let backend = CrosstermBackend;
+        let (width, height) = backend.size().unwrap_or((80, 24));
+        let mut ui = Self::with_backend(
+            Self::base(
+                model,
+                provider,
+                providers,
+                skills,
+                context_files,
+                width,
+                height,
+            ),
+            Box::new(backend),
         );
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
-        terminal::enable_raw_mode().context("enable terminal raw mode")?;
-        if let Err(error) = execute!(ui.out, EnableBracketedPaste) {
-            let _ = terminal::disable_raw_mode();
-            return Err(error).context("configure terminal input");
+        install_panic_hook(ui.terminal.clone());
+        ui.setup_terminal()?;
+        Ok(ui)
+    }
+
+    /// Enable terminal modes in dependency order. Only successful operations
+    /// are recorded; a setup failure restores the successful prefix before it
+    /// is returned to the caller. Keyboard enhancement is optional because
+    /// unsupported terminals report that operation as an error.
+    fn setup_terminal(&mut self) -> Result<()> {
+        let raw_result = {
+            let mut terminal = self.terminal.lock().unwrap();
+            terminal
+                .backend
+                .enable_raw_mode()
+                .context("enable terminal raw mode")
+        };
+        if let Err(error) = raw_result {
+            return self.setup_failed(error);
         }
+        self.terminal.lock().unwrap().modes.raw_mode = true;
+
+        let bracketed_result = {
+            let mut terminal = self.terminal.lock().unwrap();
+            terminal
+                .backend
+                .enable_bracketed_paste(&mut self.out)
+                .context("configure terminal input")
+        };
+        if let Err(error) = bracketed_result {
+            return self.setup_failed(error);
+        }
+        self.terminal.lock().unwrap().modes.bracketed_paste = true;
+
         // The kitty keyboard protocol makes Shift+Enter report as `Enter` with
         // the SHIFT modifier, which the input handler already maps to a newline
         // (works on Ghostty; iTerm/Terminal.app do not support it). Only
         // `DISAMBIGUATE_ESCAPE_CODES` is pushed — `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
         // would swallow plain characters. Popped in `restore` and the panic hook.
-        let _ = execute!(
-            ui.out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
+        if self
+            .terminal
+            .lock()
+            .unwrap()
+            .backend
+            .push_keyboard_flags(&mut self.out)
+            .is_ok()
+        {
+            self.terminal.lock().unwrap().modes.keyboard_flags = true;
+        }
         // The cursor stays visible: it *is* the input caret, sitting right
         // after the `› ` prefix. No hide, no fake cell.
-        Ok(ui)
+        Ok(())
+    }
+
+    fn setup_failed(&mut self, error: anyhow::Error) -> Result<()> {
+        match self.restore() {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(error.context(format!(
+                "terminal restoration also failed: {restore_error:#}"
+            ))),
+        }
     }
 
     pub async fn run(
@@ -445,7 +602,14 @@ impl CrossTerm {
     ) -> Result<()> {
         let result = self.run_inner(&mut events, input_tx, cancel).await;
         let restore = self.restore();
-        result.and(restore)
+        match (result, restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(error),
+            (Err(error), Err(restore_error)) => Err(error.context(format!(
+                "terminal restoration also failed: {restore_error:#}"
+            ))),
+        }
     }
 
     async fn run_inner(
@@ -536,6 +700,9 @@ impl CrossTerm {
         let Some(row) = self.activity_region_row else {
             return Ok(false);
         };
+        if row >= self.region.len() {
+            return Ok(false);
+        }
         let theme = self.theme;
         let gutter = render::horizontal_pad(self.width) as usize;
         let line = activity_line(self.activity, self.spinner, theme);
@@ -545,7 +712,7 @@ impl CrossTerm {
             let _ = write!(buffer, "{}", MoveUp(up as u16));
         }
         let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
-        write_row(&mut buffer, &line, gutter);
+        write_row(&mut buffer, &line, gutter, self.width as usize);
         if up > 0 {
             let _ = write!(buffer, "\r{}", MoveDown(up as u16));
         }
@@ -586,7 +753,8 @@ impl CrossTerm {
     ) -> Result<bool> {
         let Event::Key(key) = event else {
             if let Event::Paste(text) = event {
-                insert_text(&mut self.input, &mut self.cursor, text);
+                let text = render::sanitize_terminal_text(text);
+                insert_text(&mut self.input, &mut self.cursor, &text);
                 self.refresh_completion();
             }
             return Ok(false);
@@ -646,10 +814,16 @@ impl CrossTerm {
             KeyCode::Delete => delete_forward(&mut self.input, &mut self.cursor),
             KeyCode::Left => move_left(&self.input, &mut self.cursor),
             KeyCode::Right => move_right(&self.input, &mut self.cursor),
-            KeyCode::Home | KeyCode::Char('a') if control => {
+            KeyCode::Home => {
                 self.cursor = line_bounds(&self.input, self.cursor).0;
             }
-            KeyCode::End | KeyCode::Char('e') if control => {
+            KeyCode::End => {
+                self.cursor = line_bounds(&self.input, self.cursor).1;
+            }
+            KeyCode::Char('a') if control => {
+                self.cursor = line_bounds(&self.input, self.cursor).0;
+            }
+            KeyCode::Char('e') if control => {
                 self.cursor = line_bounds(&self.input, self.cursor).1;
             }
             // Up/Down move within a multi-line draft; at the top/bottom edge
@@ -680,6 +854,7 @@ impl CrossTerm {
         // Recompute completion after any input mutation; refreshing at the
         // end of every handled key keeps the draft's ghost/hint in sync.
         self.refresh_completion();
+        self.request_typed_backend(input_tx)?;
         Ok(false)
     }
 
@@ -788,7 +963,7 @@ impl CrossTerm {
         // Path arguments scan the filesystem on a debounced task.
         if matches!(
             result.context.target,
-            CompletionTarget::Argument(ArgumentKind::Path),
+            CompletionTarget::Argument(ArgumentKind::Path | ArgumentKind::Session),
         ) {
             self.request_path_completion(result.context, result.candidates, old_value, None);
             return;
@@ -810,7 +985,7 @@ impl CrossTerm {
         if result.candidates.is_empty() {
             // Keep a session list open (empty) so Tab can request it; close
             // everything else.
-            if kind == CompletionKind::Session {
+            if matches!(kind, CompletionKind::Session | CompletionKind::Model) {
                 self.completion = Some(Completion {
                     context: result.context,
                     candidates: Vec::new(),
@@ -884,6 +1059,40 @@ impl CrossTerm {
         self.cursor = byte_index_at_char(&self.input, new_cursor_col);
     }
 
+    /// Request backend data for a directly typed model provider prefix or a
+    /// session/path command. Candidate acceptance already calls
+    /// [`Self::request_backend`]; this covers the equivalent typed form.
+    fn request_typed_backend(
+        &mut self,
+        input_tx: &mpsc::UnboundedSender<InputMessage>,
+    ) -> Result<()> {
+        let Some(context) = self
+            .completion
+            .as_ref()
+            .map(|completion| completion.context.clone())
+        else {
+            return Ok(());
+        };
+        let CompletionTarget::Argument(kind) = context.target else {
+            return Ok(());
+        };
+        if !matches!(kind, ArgumentKind::Model | ArgumentKind::Session) {
+            return Ok(());
+        }
+        let start = context.token_start;
+        let end = context.token_end.min(self.input.len());
+        let value = self.input[start..end].to_owned();
+        self.request_backend(
+            input_tx,
+            &context,
+            &Candidate {
+                value,
+                description: String::new(),
+                kind: CandidateKind::Slash,
+            },
+        )
+    }
+
     /// Send anything the new draft now needs from the agent: a `ListSessions`
     /// for `/load` arguments or a `ListModels` when a `provider:` token was
     /// just completed and its model list is unknown. The dedupe sets keep
@@ -904,9 +1113,14 @@ impl CrossTerm {
                 .send(InputMessage::ListSessions)
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
         }
-        let provider = candidate
-            .value
+        // A bare `provider:` token requests the catalogue; so does a
+        // partially typed `provider:model` token whose provider part is
+        // known but uncached — the user is clearly addressing that
+        // provider's catalogue even before Tab-accepting the prefix.
+        let typed = candidate.value.as_str();
+        let provider = typed
             .strip_suffix(':')
+            .or_else(|| typed.split_once(':').map(|(provider, _)| provider))
             .filter(|name| {
                 self.providers
                     .iter()
@@ -1326,6 +1540,7 @@ impl CrossTerm {
                 self.busy = true;
                 self.activity = Activity::Working;
                 self.stream().markdown.push_str(&delta);
+                self.refresh_stream_markdown_cache();
             }
             UiEvent::ReasoningDelta(delta) => {
                 if delta.is_empty() {
@@ -1592,11 +1807,51 @@ impl CrossTerm {
         self.stream.get_or_insert_with(StreamState::default)
     }
 
+    /// Parse newly completed markdown blocks once as deltas arrive. The
+    /// unfinished suffix is intentionally left out of the cache because its
+    /// Markdown meaning can still change with the next delta.
+    fn refresh_stream_markdown_cache(&mut self) {
+        let Some(stream) = self.stream.as_ref() else {
+            return;
+        };
+        let stable_offset = stable_block_split_offset(&stream.markdown).unwrap_or(0);
+        let width = render::content_width(self.width);
+        let theme = self.theme;
+        let reusable = self.stream_markdown_cache.as_ref().is_some_and(|cache| {
+            cache.width == width && cache.theme == theme && cache.source_offset <= stable_offset
+        });
+        if !reusable {
+            self.stream_markdown_cache = Some(StreamMarkdownCache {
+                width,
+                theme,
+                source_offset: 0,
+                lines: Vec::new(),
+                rendered_blocks: 0,
+            });
+        }
+        let source_offset = self
+            .stream_markdown_cache
+            .as_ref()
+            .map_or(0, |cache| cache.source_offset);
+        if stable_offset <= source_offset {
+            return;
+        }
+        let chunk = stream.markdown[source_offset..stable_offset].to_owned();
+        let rendered = render::markdown_lines(&chunk, theme, width);
+        if let Some(cache) = self.stream_markdown_cache.as_mut() {
+            cache.lines.extend(rendered);
+            cache.source_offset = stable_offset;
+            cache.rendered_blocks = cache.rendered_blocks.saturating_add(1);
+        }
+    }
+
     /// Commit the in-flight assistant message as a final entry.
     fn finalize_stream(&mut self) {
         let Some(stream) = self.stream.take() else {
+            self.stream_markdown_cache = None;
             return;
         };
+        self.stream_markdown_cache = None;
         if stream.reasoning.is_empty() && stream.markdown.is_empty() {
             return;
         }
@@ -1652,10 +1907,11 @@ impl CrossTerm {
         let input_width = content.saturating_sub(INPUT_PREFIX_WIDTH).max(1);
         let ghost = self.ghost_text();
         let hint = self.completion_hint(input_width);
-        input_layout(
+        input_layout_with_row_width(
             &self.input,
             self.cursor,
             input_width,
+            content,
             self.theme,
             &usage_trailer,
             &ghost,
@@ -1666,10 +1922,18 @@ impl CrossTerm {
     /// Rows of the live region: [streaming tail] · [tool lines] · [activity]
     /// · [input]. Every section except the input is optional; the tail and
     /// the input are each clipped so the whole region fits the screen.
+    #[cfg(test)]
     fn build_region(&self, input: &InputLayout) -> RegionBuild {
+        self.build_region_with_running(input, self.running_region())
+    }
+
+    fn build_region_with_running(
+        &self,
+        input: &InputLayout,
+        running: RunningRegion,
+    ) -> RegionBuild {
         let theme = self.theme;
         let content = render::content_width(self.width);
-        let running = self.running_region();
         let (input_rows, input_cursor_row) =
             clip_input(input, self.height as usize, self.busy, running.rows);
 
@@ -1679,7 +1943,7 @@ impl CrossTerm {
         let mut activity_row_index: Option<usize> = None;
         // out of the budget are printed in full when the message finalizes.
         let tail = self.stream_tail_lines(content);
-        let budget = self.tail_budget(input_rows.len());
+        let budget = self.tail_budget(input_rows.len(), running.rows);
         let start = tail.len().saturating_sub(budget);
         rows.extend(tail[start..].iter().cloned());
 
@@ -1706,6 +1970,12 @@ impl CrossTerm {
         }
         let mut cursor_row = rows.len() + input_cursor_row;
         rows.extend(input_rows);
+        // Every producer has a local budget, but keep one final guard here so
+        // newly added metadata/tool rows cannot invalidate terminal geometry.
+        rows = rows
+            .into_iter()
+            .map(|line| render::fit_line_to_width(&line, content))
+            .collect();
 
         // Degenerate-terminal guard: the region must never exceed the screen
         // or cursor-relative moves would clamp at the top and corrupt the
@@ -1714,13 +1984,19 @@ impl CrossTerm {
             let dropped = rows.len() - self.height as usize;
             rows.drain(..dropped);
             cursor_row = cursor_row.saturating_sub(dropped).min(rows.len() - 1);
+            activity_row_index = activity_row_index.and_then(|row| row.checked_sub(dropped));
         }
 
         let gutter = render::horizontal_pad(self.width) as usize;
+        let prefix_width = INPUT_PREFIX_WIDTH.min(content);
+        let cursor_col = gutter
+            .saturating_add(prefix_width)
+            .saturating_add(input.cursor_col)
+            .min(self.width.saturating_sub(1) as usize);
         RegionBuild {
             rows,
             cursor_row,
-            cursor_col: gutter + INPUT_PREFIX_WIDTH + input.cursor_col,
+            cursor_col,
             activity_row: activity_row_index,
         }
     }
@@ -1776,7 +2052,24 @@ impl CrossTerm {
             if !lines.is_empty() {
                 render::push_blank(&mut lines, render::BLOCK_GAP);
             }
-            lines.extend(render::markdown_lines(&stream.markdown, self.theme, width));
+            let markdown = if let Some(cache) = &self.stream_markdown_cache
+                && cache.width == width
+                && cache.theme == self.theme
+                && cache.source_offset <= stream.markdown.len()
+            {
+                let mut rendered = cache.lines.clone();
+                if cache.source_offset < stream.markdown.len() {
+                    rendered.extend(render::markdown_lines(
+                        &stream.markdown[cache.source_offset..],
+                        self.theme,
+                        width,
+                    ));
+                }
+                rendered
+            } else {
+                render::markdown_lines(&stream.markdown, self.theme, width)
+            };
+            lines.extend(markdown);
         }
         lines
     }
@@ -1784,9 +2077,9 @@ impl CrossTerm {
     /// Row budget for the streaming tail: whatever is left of the screen once
     /// the input, the active-tool rows, the activity row, separators, and a
     /// safety row are reserved.
-    fn tail_budget(&self, input_rows: usize) -> usize {
+    fn tail_budget(&self, input_rows: usize, running_rows: usize) -> usize {
         (self.height as usize)
-            .saturating_sub(input_rows + self.running_region().rows + usize::from(self.busy) + 3)
+            .saturating_sub(input_rows + running_rows + usize::from(self.busy) + 3)
             .max(1)
     }
 
@@ -1794,10 +2087,16 @@ impl CrossTerm {
     /// it outgrows the tail budget, so long responses flow into scrollback
     /// incrementally instead of appearing all at once at finalize.
     /// Reasoning-only streams stay fully live; the display clip handles them.
+    #[cfg(test)]
     fn commit_stream_prefix(&mut self, input_rows: usize) {
+        let running_rows = self.running_region().rows;
+        self.commit_stream_prefix_with_running(input_rows, running_rows);
+    }
+
+    fn commit_stream_prefix_with_running(&mut self, input_rows: usize, running_rows: usize) {
         // Snapshot the immutable state first so `self.stream` can be borrowed
         // mutably for the rest of the function.
-        let budget = self.tail_budget(input_rows);
+        let budget = self.tail_budget(input_rows, running_rows);
         let width = render::content_width(self.width);
         let theme = self.theme;
         let Some(stream) = self.stream.as_mut() else {
@@ -1823,6 +2122,8 @@ impl CrossTerm {
         self.pending.push(prefix);
         stream.reasoning.clear();
         stream.markdown.drain(..offset);
+        // The source origin moved; cached offsets are no longer meaningful.
+        self.stream_markdown_cache = None;
     }
 
     // ------------------------------------------------------------------
@@ -1835,8 +2136,9 @@ impl CrossTerm {
             return Ok(());
         }
         let input = self.input_layout();
-        self.commit_stream_prefix(input.rows.len());
-        let build = self.build_region(&input);
+        let running = self.running_region();
+        self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
+        let build = self.build_region_with_running(&input, running);
         self.write_frame(build, false)
     }
 
@@ -1851,8 +2153,9 @@ impl CrossTerm {
         }
         self.transcript.append(&mut self.pending);
         let input = self.input_layout();
-        self.commit_stream_prefix(input.rows.len());
-        let build = self.build_region(&input);
+        let running = self.running_region();
+        self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
+        let build = self.build_region_with_running(&input, running);
         self.write_frame(build, true)
     }
 
@@ -1868,29 +2171,8 @@ impl CrossTerm {
 
         let mut above: Vec<Line<'static>> = Vec::new();
         if clear_all {
-            for (index, entry) in self.transcript.iter().enumerate() {
-                if index > 0 {
-                    render::push_blank(&mut above, render::SECTION_GAP);
-                }
-                above.extend(entry_lines(entry, content, theme, self.tools_expanded));
-            }
-            // Keep as much history as fits above the region, plus one
-            // ellipsis row when older rows fall outside the window.
             let keep = (self.height as usize).saturating_sub(build.rows.len());
-            if keep == 0 {
-                above.clear();
-            } else if above.len() > keep {
-                let hidden = above.len() - (keep - 1);
-                let mut window = Vec::with_capacity(keep);
-                window.push(Line::from(Span::styled(
-                    format!("… {hidden} rows above"),
-                    Style::default()
-                        .fg(theme.dim_text)
-                        .add_modifier(Modifier::DIM),
-                )));
-                window.extend(above.split_off(hidden));
-                above = window;
-            }
+            above = history_window(&self.transcript, keep, content, theme, self.tools_expanded);
         } else {
             for (index, entry) in self.pending.iter().enumerate() {
                 if index > 0 {
@@ -1923,7 +2205,7 @@ impl CrossTerm {
 
         for (index, line) in rows.iter().enumerate() {
             let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
-            write_row(&mut buffer, line, gutter);
+            write_row(&mut buffer, line, gutter, self.width as usize);
             if index + 1 < total {
                 buffer.push('\n');
             }
@@ -1972,16 +2254,65 @@ impl CrossTerm {
     }
 
     fn restore(&mut self) -> Result<()> {
-        if self.restored {
-            return Ok(());
+        let mut terminal = self.terminal.lock().unwrap();
+        restore_terminal(&mut terminal, &mut self.out)
+    }
+}
+
+/// Restore every state component that still needs work. An operation that
+/// fails remains recorded, allowing a later call from `run`, `Drop`, or a
+/// panic path to retry it. All operations are attempted before the first
+/// error is returned.
+fn restore_terminal(state: &mut TerminalState, out: &mut Stdout) -> Result<()> {
+    if state.is_restored() {
+        return Ok(());
+    }
+
+    let mut first_error = None;
+    if state.modes.raw_mode {
+        if let Err(error) = state
+            .backend
+            .disable_raw_mode()
+            .context("restore terminal raw mode")
+        {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.raw_mode = false;
         }
-        self.restored = true;
-        terminal::disable_raw_mode().context("restore terminal raw mode")?;
-        execute!(self.out, DisableBracketedPaste).context("restore terminal input")?;
-        let _ = execute!(self.out, PopKeyboardEnhancementFlags);
-        // Leave one blank line so the shell prompt lands below the UI.
-        writeln!(self.out).context("leave terminal")?;
-        Ok(())
+    }
+    if state.modes.bracketed_paste {
+        if let Err(error) = state
+            .backend
+            .disable_bracketed_paste(out)
+            .context("restore bracketed paste")
+        {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.bracketed_paste = false;
+        }
+    }
+    if state.modes.keyboard_flags {
+        if let Err(error) = state
+            .backend
+            .pop_keyboard_flags(out)
+            .context("restore keyboard enhancement flags")
+        {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.keyboard_flags = false;
+        }
+    }
+    if !state.modes.newline_written {
+        if let Err(error) = state.backend.write_newline(out).context("leave terminal") {
+            first_error.get_or_insert(error);
+        } else {
+            state.modes.newline_written = true;
+        }
+    }
+
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -2023,13 +2354,14 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     });
 }
 
-fn install_panic_hook() {
+fn install_panic_hook(terminal: Arc<Mutex<TerminalState>>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
-        let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste);
-        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        let _ = writeln!(io::stdout());
+        let mut stdout = io::stdout();
+        // Panic hooks cannot report a cleanup error without obscuring the
+        // original panic, but they still use the same best-effort operation
+        // layer. A caught panic or a later Drop can retry anything that failed.
+        let _ = restore_terminal(&mut terminal.lock().unwrap(), &mut stdout);
         previous(panic);
     }));
 }
@@ -2044,6 +2376,72 @@ fn install_panic_hook() {
 /// `tools_expanded` is the global Ctrl+O state; committed entries render
 /// collapsed unless the toggle is on, and the progress snapshot used the
 /// same global for its in-flight tool line so both agree after a repaint.
+/// Render only the newest history rows that can fit above the live region.
+///
+/// A resize used to render every transcript entry and discard almost all of
+/// it afterward. Walking backward lets a large session stop as soon as the
+/// viewport is full. The marker intentionally does not claim an exact hidden
+/// row count: discovering that count would require the full-history pass this
+/// helper is designed to avoid.
+fn history_window(
+    entries: &[Entry],
+    budget: usize,
+    width: usize,
+    theme: Theme,
+    tools_expanded: bool,
+) -> Vec<Line<'static>> {
+    if budget == 0 || entries.is_empty() {
+        return Vec::new();
+    }
+
+    let mut newest_first = Vec::<Vec<Line<'static>>>::new();
+    let mut used = 0usize;
+    let mut hidden = false;
+    for (index, entry) in entries.iter().enumerate().rev() {
+        let lines = entry_lines(entry, width, theme, tools_expanded);
+        let gap = usize::from(!newest_first.is_empty()) * render::SECTION_GAP;
+        if used.saturating_add(gap).saturating_add(lines.len()) <= budget {
+            used = used.saturating_add(gap).saturating_add(lines.len());
+            newest_first.push(lines);
+            continue;
+        }
+
+        // A single entry can be taller than the viewport. Keep its newest
+        // rows rather than rendering older entries that cannot be visible.
+        let available = budget.saturating_sub(used.saturating_add(gap));
+        let entry_had_lines = !lines.is_empty();
+        if available > 0 {
+            let start = lines.len().saturating_sub(available);
+            let mut suffix = Vec::with_capacity(available.min(lines.len()));
+            suffix.extend(lines.into_iter().skip(start));
+            newest_first.push(suffix);
+        }
+        hidden = index > 0 || entry_had_lines;
+        break;
+    }
+
+    let mut result = Vec::new();
+    for (index, lines) in newest_first.iter().rev().enumerate() {
+        if index > 0 {
+            render::push_blank(&mut result, render::SECTION_GAP);
+        }
+        result.extend(lines.iter().cloned());
+    }
+    if hidden {
+        let marker = Line::from(Span::styled(
+            "… older rows above",
+            Style::default()
+                .fg(theme.dim_text)
+                .add_modifier(Modifier::DIM),
+        ));
+        if result.len() >= budget {
+            result.drain(..result.len() - budget.saturating_sub(1));
+        }
+        result.insert(0, marker);
+    }
+    result
+}
+
 fn entry_lines(
     entry: &Entry,
     width: usize,
@@ -2068,7 +2466,10 @@ fn entry_lines(
             context_files,
             skills,
             theme,
-        ),
+        )
+        .into_iter()
+        .map(|line| render::fit_line_to_width(&line, width))
+        .collect(),
         Entry::User { text } => render::user_lines(text, theme, width),
         Entry::Assistant {
             markdown,
@@ -2096,7 +2497,7 @@ fn entry_lines(
 /// The simplified tool call: one line with the tool type and its primary
 /// parameter — `$ git status`, `read file.txt` — plus a duration on success
 /// or a `✗` error preview on failure. Collapsed this is the compact line;
-/// expanded it adds the bounded output tail, the first error line, and a
+/// expanded it adds the bounded output tail, later error lines, and a
 /// `running…` marker, each indented two spaces.
 fn tool_lines(
     record: &ToolRecord,
@@ -2168,8 +2569,8 @@ fn tool_lines(
         return summary_lines;
     }
 
-    // Expanded: the compact line, then the bounded output tail, the first
-    // error line, and a trailing `running…` marker, each indented two spaces
+    // Expanded: the compact line, then the bounded output tail, later error
+    // lines, and a trailing `running…` marker, each indented two spaces
     // and dimmed so they read as details under the summary.
     let dim_style = Style::default()
         .fg(theme.dim_text)
@@ -2180,10 +2581,10 @@ fn tool_lines(
             push_detail_line(&mut lines, &tail, dim_style, width);
         }
     }
-    if let Some(error) = record.error.as_deref()
-        && let Some(first) = error.lines().next()
-    {
-        push_detail_line(&mut lines, first, Style::default().fg(theme.error), width);
+    if let Some(error) = record.error.as_deref() {
+        for detail in error.lines().skip(1).take(render::DEFAULT_TAIL_LINES) {
+            push_detail_line(&mut lines, detail, Style::default().fg(theme.error), width);
+        }
     }
     if matches!(record.status, ToolStatus::Running) {
         push_detail_line(&mut lines, "running…", dim_style, width);
@@ -2217,7 +2618,11 @@ fn fold_entries(entries: &[String]) -> Option<String> {
         return None;
     }
     let shown = entries.len().min(METADATA_MAX_ENTRIES);
-    let mut text = entries[..shown].join(", ");
+    let mut text = entries[..shown]
+        .iter()
+        .map(|entry| render::sanitize_terminal_text(entry))
+        .collect::<Vec<_>>()
+        .join(", ");
     let hidden = entries.len() - shown;
     if hidden > 0 {
         let _ = write!(text, " · +{hidden} more");
@@ -2242,9 +2647,13 @@ fn metadata_lines(
     let style = Style::default()
         .fg(theme.dim_text)
         .add_modifier(Modifier::DIM);
+    let cwd = render::sanitize_terminal_text(cwd);
+    let branch = branch.map(render::sanitize_terminal_text);
+    let provider = render::sanitize_terminal_text(provider);
+    let model = render::sanitize_terminal_text(model);
     let left = match branch {
         Some(branch) => format!("{cwd}  ({branch})"),
-        None => cwd.to_owned(),
+        None => cwd,
     };
     let mut lines = vec![
         Line::from(Span::styled(left, style)),
@@ -2261,6 +2670,7 @@ fn metadata_lines(
 /// A left-oriented rule marking a session boundary. An empty label is the
 /// unlabelled initial boundary below the full startup header.
 fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'static> {
+    let label = render::sanitize_terminal_text(label);
     let text = if label.is_empty() {
         "─".repeat(width)
     } else {
@@ -2304,6 +2714,7 @@ fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'stat
 /// because the input empties again). `ghost` is the fish-style dim suffix
 /// preview painted after the cursor (only at end-of-input, clamped to the row
 /// width), and `completion_hint` is one dim candidate row below the input.
+#[cfg(test)]
 fn input_layout(
     input: &str,
     cursor: usize,
@@ -2313,7 +2724,31 @@ fn input_layout(
     ghost: &str,
     completion_hint: &str,
 ) -> InputLayout {
+    input_layout_with_row_width(
+        input,
+        cursor,
+        width,
+        width.saturating_add(INPUT_PREFIX_WIDTH),
+        theme,
+        usage_trailer,
+        ghost,
+        completion_hint,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn input_layout_with_row_width(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    row_width: usize,
+    theme: Theme,
+    usage_trailer: &str,
+    ghost: &str,
+    completion_hint: &str,
+) -> InputLayout {
     let width = width.max(1);
+    let row_width = row_width.max(1);
     let cursor = cursor.min(input.len());
     let prefix_style = Style::default()
         .fg(theme.accent)
@@ -2333,12 +2768,15 @@ fn input_layout(
         if !usage_trailer.is_empty() {
             spans.push(Span::styled(usage_trailer.to_owned(), dim_style));
         }
-        let mut rows = vec![Line::from(spans)];
+        let mut rows = vec![render::fit_line_to_width(&Line::from(spans), row_width)];
         if !completion_hint.is_empty() {
-            rows.push(Line::from(vec![
-                Span::raw(INPUT_CONTINUATION),
-                Span::styled(completion_hint.to_owned(), dim_style),
-            ]));
+            rows.push(render::fit_line_to_width(
+                &Line::from(vec![
+                    Span::raw(INPUT_CONTINUATION),
+                    Span::styled(completion_hint.to_owned(), dim_style),
+                ]),
+                row_width,
+            ));
         }
         return InputLayout {
             rows,
@@ -2357,7 +2795,7 @@ fn input_layout(
         let cursor_here = cursor >= byte_base && cursor <= line_end;
         let chars: Vec<(char, usize)> = logical
             .chars()
-            .map(|c| (c, UnicodeWidthChar::width(c).unwrap_or(1).max(1)))
+            .map(|c| (c, UnicodeWidthChar::width(c).unwrap_or(0)))
             .collect();
         let cursor_char = if cursor_here {
             Some(input[byte_base..cursor].chars().count())
@@ -2371,7 +2809,14 @@ fn input_layout(
         let mut current: Vec<(char, usize)> = Vec::new();
         let mut current_width = 0usize;
         for &(character, character_width) in &chars {
-            if current_width > 0 && current_width + character_width > width {
+            if character_width > width {
+                if !current.is_empty() {
+                    visual.push(std::mem::take(&mut current));
+                    current_width = 0;
+                }
+                continue;
+            }
+            if character_width > 0 && current_width + character_width > width {
                 visual.push(std::mem::take(&mut current));
                 current_width = 0;
             }
@@ -2415,7 +2860,10 @@ fn input_layout(
             } else {
                 Span::raw(INPUT_CONTINUATION)
             };
-            rows.push(Line::from(vec![lead, Span::styled(text, text_style)]));
+            rows.push(render::fit_line_to_width(
+                &Line::from(vec![lead, Span::styled(text, text_style)]),
+                row_width,
+            ));
         }
 
         byte_base = line_end + 1;
@@ -2428,10 +2876,13 @@ fn input_layout(
     // The list hint sits below the draft so opening completion never moves
     // the input or its real terminal cursor.
     if !completion_hint.is_empty() {
-        rows.push(Line::from(vec![
-            Span::raw(INPUT_CONTINUATION),
-            Span::styled(completion_hint.to_owned(), dim_style),
-        ]));
+        rows.push(render::fit_line_to_width(
+            &Line::from(vec![
+                Span::raw(INPUT_CONTINUATION),
+                Span::styled(completion_hint.to_owned(), dim_style),
+            ]),
+            row_width,
+        ));
     }
     // Ghost preview: append the dim suffix after the typed text on the
     // cursor's row. Only at end-of-input, clamped to the remaining width so
@@ -2445,7 +2896,7 @@ fn input_layout(
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum();
-        let available = width.saturating_sub(used);
+        let available = row_width.saturating_sub(used);
         let fits = ghost_to_width(ghost, available);
         if !fits.is_empty() {
             row.spans.push(Span::styled(fits, dim_style));
@@ -2775,7 +3226,8 @@ fn line_to_ansi(line: &Line<'_>) -> String {
     let mut previous = None;
     let mut styled = false;
     for span in &line.spans {
-        if span.content.is_empty() {
+        let content = render::sanitize_terminal_text(span.content.as_ref());
+        if content.is_empty() {
             continue;
         }
         let style = line.style.patch(span.style);
@@ -2788,7 +3240,7 @@ fn line_to_ansi(line: &Line<'_>) -> String {
             styled |= !prefix.is_empty();
             out.push_str(&prefix);
         }
-        out.push_str(span.content.as_ref());
+        out.push_str(&content);
         previous = Some(style);
     }
     if styled {
@@ -2855,17 +3307,21 @@ fn ansi_color(color: ratatui_core::style::Color) -> AnsiColor {
 
 /// Write one row: the shared left gutter plus the line's ANSI serialization.
 /// Blank rows become gutter-width space runs, which render identically.
-fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize) {
+fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize, width: usize) {
     if gutter > 0 {
-        buffer.push_str(&" ".repeat(gutter));
+        buffer.push_str(&" ".repeat(gutter.min(width)));
     }
-    buffer.push_str(&line_to_ansi(line));
+    let content_width = width.saturating_sub(gutter);
+    let line = render::fit_line_to_width(line, content_width);
+    buffer.push_str(&line_to_ansi(&line));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyEvent;
+    use std::panic::AssertUnwindSafe;
+    use std::sync::OnceLock;
 
     fn ui(width: u16, height: u16) -> CrossTerm {
         CrossTerm::base(
@@ -2879,11 +3335,102 @@ mod tests {
         )
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    enum TerminalOperation {
+        EnableRaw,
+        DisableRaw,
+        EnableBracketed,
+        DisableBracketed,
+        PushKeyboard,
+        PopKeyboard,
+        Newline,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockTerminal {
+        calls: Arc<Mutex<Vec<TerminalOperation>>>,
+        failures: Arc<Mutex<HashMap<TerminalOperation, usize>>>,
+    }
+
+    impl MockTerminal {
+        fn fail_next(&self, operation: TerminalOperation) {
+            self.failures.lock().unwrap().insert(operation, 1);
+        }
+
+        fn calls(&self) -> Vec<TerminalOperation> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn run(&self, operation: TerminalOperation) -> io::Result<()> {
+            self.calls.lock().unwrap().push(operation);
+            let mut failures = self.failures.lock().unwrap();
+            let Some(remaining) = failures.get_mut(&operation) else {
+                return Ok(());
+            };
+            if *remaining == 0 {
+                return Ok(());
+            }
+            *remaining -= 1;
+            Err(io::Error::other(format!("mock {operation:?}")))
+        }
+    }
+
+    impl TerminalBackend for MockTerminal {
+        fn size(&self) -> io::Result<(u16, u16)> {
+            Ok((80, 24))
+        }
+
+        fn enable_raw_mode(&mut self) -> io::Result<()> {
+            self.run(TerminalOperation::EnableRaw)
+        }
+
+        fn disable_raw_mode(&mut self) -> io::Result<()> {
+            self.run(TerminalOperation::DisableRaw)
+        }
+
+        fn enable_bracketed_paste(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::EnableBracketed)
+        }
+
+        fn disable_bracketed_paste(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::DisableBracketed)
+        }
+
+        fn push_keyboard_flags(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::PushKeyboard)
+        }
+
+        fn pop_keyboard_flags(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::PopKeyboard)
+        }
+
+        fn write_newline(&mut self, _out: &mut Stdout) -> io::Result<()> {
+            self.run(TerminalOperation::Newline)
+        }
+    }
+
+    fn terminal_ui(backend: MockTerminal) -> CrossTerm {
+        CrossTerm::with_backend(ui(80, 24), Box::new(backend))
+    }
+
+    fn successful_terminal_ui(backend: &MockTerminal) -> CrossTerm {
+        let mut ui = terminal_ui(backend.clone());
+        ui.setup_terminal().unwrap();
+        ui
+    }
+
     fn row_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>()
+    }
+
+    fn row_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
     }
 
     fn record(status: ToolStatus) -> ToolRecord {
@@ -2923,6 +3470,188 @@ mod tests {
             .iter()
             .map(|running| running.record.summary.clone())
             .collect()
+    }
+
+    #[test]
+    fn terminal_setup_restores_each_partial_prefix_without_popping_unset_modes() {
+        let raw_failure = MockTerminal::default();
+        raw_failure.fail_next(TerminalOperation::EnableRaw);
+        let mut ui = terminal_ui(raw_failure.clone());
+        let error = ui.setup_terminal().unwrap_err();
+        assert!(format!("{error:#}").contains("mock EnableRaw"));
+        assert_eq!(
+            raw_failure.calls(),
+            vec![TerminalOperation::EnableRaw, TerminalOperation::Newline]
+        );
+
+        let bracketed_failure = MockTerminal::default();
+        bracketed_failure.fail_next(TerminalOperation::EnableBracketed);
+        let mut ui = terminal_ui(bracketed_failure.clone());
+        let error = ui.setup_terminal().unwrap_err();
+        assert!(format!("{error:#}").contains("mock EnableBracketed"));
+        assert_eq!(
+            bracketed_failure.calls(),
+            vec![
+                TerminalOperation::EnableRaw,
+                TerminalOperation::EnableBracketed,
+                TerminalOperation::DisableRaw,
+                TerminalOperation::Newline,
+            ]
+        );
+
+        // Kitty keyboard enhancement is optional. A failed push is not marked
+        // as enabled, so cleanup never pops a stack belonging to another UI.
+        let keyboard_failure = MockTerminal::default();
+        keyboard_failure.fail_next(TerminalOperation::PushKeyboard);
+        let mut ui = terminal_ui(keyboard_failure.clone());
+        ui.setup_terminal().unwrap();
+        {
+            let terminal = ui.terminal.lock().unwrap();
+            assert!(terminal.modes.raw_mode);
+            assert!(terminal.modes.bracketed_paste);
+            assert!(!terminal.modes.keyboard_flags);
+            assert!(!terminal.modes.newline_written);
+        }
+        ui.restore().unwrap();
+        assert_eq!(
+            keyboard_failure.calls(),
+            vec![
+                TerminalOperation::EnableRaw,
+                TerminalOperation::EnableBracketed,
+                TerminalOperation::PushKeyboard,
+                TerminalOperation::DisableRaw,
+                TerminalOperation::DisableBracketed,
+                TerminalOperation::Newline,
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_cleanup_attempts_every_operation_and_retries_failures() {
+        let cleanup_operations = [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ];
+
+        for failed_operation in cleanup_operations {
+            let backend = MockTerminal::default();
+            let mut ui = successful_terminal_ui(&backend);
+            backend.fail_next(failed_operation);
+
+            let error = ui.restore().unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!("mock {failed_operation:?}")),
+                "first cleanup error was not reported: {error:#}"
+            );
+            let calls = backend.calls();
+            for operation in cleanup_operations {
+                assert_eq!(
+                    calls.iter().filter(|called| **called == operation).count(),
+                    1,
+                    "cleanup did not attempt {operation:?} after {failed_operation:?} failed"
+                );
+            }
+
+            // The one-shot failure was consumed. Successful operations are no
+            // longer retried, while the failed operation remains tracked.
+            ui.restore().unwrap();
+            let calls = backend.calls();
+            assert_eq!(
+                calls.last(),
+                Some(&failed_operation),
+                "cleanup did not retry {failed_operation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_cleanup_reports_the_first_error_after_all_attempts() {
+        let backend = MockTerminal::default();
+        let mut ui = successful_terminal_ui(&backend);
+        backend.fail_next(TerminalOperation::DisableRaw);
+        backend.fail_next(TerminalOperation::DisableBracketed);
+
+        let error = ui.restore().unwrap_err();
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("mock DisableRaw"));
+        assert!(!rendered.contains("mock DisableBracketed"));
+        let calls = backend.calls();
+        assert!(calls.contains(&TerminalOperation::DisableRaw));
+        assert!(calls.contains(&TerminalOperation::DisableBracketed));
+        assert!(calls.contains(&TerminalOperation::PopKeyboard));
+        assert!(calls.contains(&TerminalOperation::Newline));
+
+        // Both failed modes remain tracked and can be restored on a later
+        // attempt; the already restored modes are not touched again.
+        ui.restore().unwrap();
+        let calls = backend.calls();
+        assert_eq!(
+            &calls[calls.len() - 2..],
+            [
+                TerminalOperation::DisableRaw,
+                TerminalOperation::DisableBracketed
+            ]
+        );
+    }
+
+    #[test]
+    fn panic_cleanup_attempts_all_modes_and_drop_retries_unfinished_cleanup() {
+        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _hook_guard = PANIC_HOOK_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+
+        let backend = MockTerminal::default();
+        let ui = successful_terminal_ui(&backend);
+        for operation in [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ] {
+            backend.fail_next(operation);
+        }
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        install_panic_hook(ui.terminal.clone());
+        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            panic!("simulated terminal panic");
+        }));
+        std::panic::set_hook(previous);
+        assert!(panic_result.is_err());
+
+        let calls = backend.calls();
+        for operation in [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ] {
+            assert_eq!(
+                calls.iter().filter(|called| **called == operation).count(),
+                1
+            );
+        }
+
+        // Drop is a second cleanup boundary. The failed operations were not
+        // cleared by the panic hook, so this retry completes all restoration.
+        drop(ui);
+        let calls = backend.calls();
+        for operation in [
+            TerminalOperation::DisableRaw,
+            TerminalOperation::DisableBracketed,
+            TerminalOperation::PopKeyboard,
+            TerminalOperation::Newline,
+        ] {
+            assert_eq!(
+                calls.iter().filter(|called| **called == operation).count(),
+                2
+            );
+        }
     }
 
     #[test]
@@ -3187,7 +3916,7 @@ mod tests {
 
         // Empty input shows the placeholder with the cursor after `› `.
         let layout = input_layout("", 0, 10, Theme::default(), "", "", "");
-        assert_eq!(row_text(&layout.rows[0]), format!("› {PLACEHOLDER}"));
+        assert_eq!(row_text(&layout.rows[0]), "› Type your ");
         assert_eq!(layout.cursor_row, 0);
         assert_eq!(layout.cursor_col, 0);
     }
@@ -3241,7 +3970,8 @@ mod tests {
     #[test]
     fn tool_lines_expanded_show_output_tail_and_error() {
         // A finished tool with output and an error: expanded shows the
-        // bounded tail plus the first error line, indented.
+        // bounded tail plus later diagnostic lines, indented without repeating
+        // the first preview line.
         let mut failed = record(ToolStatus::Failure);
         failed.output = (0..10)
             .map(|i| format!("out line {i}"))
@@ -3253,7 +3983,7 @@ mod tests {
         assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
         assert_eq!(row_text(&lines[1]), "  … 6 lines above");
         assert_eq!(row_text(&lines[5]), "  out line 9");
-        assert_eq!(row_text(&lines[6]), "  boom");
+        assert_eq!(row_text(&lines[6]), "  trace");
 
         // Collapsed stays compact regardless of retained output.
         let collapsed = tool_lines(&failed, false, 60, Theme::default());
@@ -3303,6 +4033,59 @@ mod tests {
         // Nothing loaded: no extra rows.
         let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], Theme::default());
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn long_metadata_rows_fit_narrow_widths() {
+        // TUI-2: header metadata (cwd/branch/provider·model/context/skills)
+        // goes through `entry_lines` → `fit_line_to_width`, so even
+        // pathological inputs fit widths 1–3 as well as normal widths.
+        let long_cwd = "/very/long/working/directory/that/keeps/going/and/going";
+        let long_branch = "feature/extremely-long-branch-name-that-never-ends";
+        let long_model = "some-provider-model-with-an-absurdly-long-identifier-v99";
+        let many_context: Vec<String> = (0..10)
+            .map(|index| format!("/deep/path/to/AGENTS-{index}.md"))
+            .collect();
+        let many_skills: Vec<String> = (0..10)
+            .map(|index| format!("skill-number-{index}"))
+            .collect();
+        for width in [1usize, 2, 3, 10, 40, 80] {
+            let lines = metadata_lines(
+                long_cwd,
+                Some(long_branch),
+                "provider-with-a-long-name",
+                long_model,
+                &many_context,
+                &many_skills,
+                Theme::default(),
+            );
+            // Mirror the `entry_lines` Metadata path: fit every row.
+            let fitted: Vec<_> = lines
+                .iter()
+                .map(|line| crate::render::fit_line_to_width(line, width))
+                .collect();
+            assert!(
+                fitted.iter().all(|line| row_width(line) <= width),
+                "width {width}: {:?}",
+                fitted.iter().map(row_text).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn line_to_ansi_sanitizes_untrusted_content_but_keeps_generated_styles() {
+        let line = Line::from(Span::styled(
+            "safe\t\u{1b}[2J\u{1b}]52;c;secret\u{07}done",
+            Style::default().fg(Theme::default().accent),
+        ));
+        let ansi = line_to_ansi(&line);
+        assert!(ansi.contains("safe    done"), "{ansi:?}");
+        assert!(!ansi.contains("secret"), "OSC payload leaked: {ansi:?}");
+        assert!(!ansi.contains("[2J"), "CSI payload leaked: {ansi:?}");
+        assert!(
+            ansi.contains("\u{1b}["),
+            "generated style is missing: {ansi:?}"
+        );
     }
 
     #[test]
@@ -3366,6 +4149,113 @@ mod tests {
         assert_eq!(vertical_move(input, 1, 1), Some(5)); // after "a" → "d|efghi"
         assert_eq!(vertical_move(input, 1, -1), None); // already on the first line
         assert_eq!(vertical_move(input, input.len(), 1), None); // last line
+    }
+
+    #[test]
+    fn narrow_build_regions_keep_rows_and_cursor_bounded() {
+        for width in 1..=3 {
+            let mut ui = ui(width, 4);
+            ui.input = "你好\ttext".into();
+            ui.cursor = ui.input.len();
+            ui.busy = true;
+            let input = ui.input_layout();
+            let build = ui.build_region(&input);
+            assert!(build.rows.len() <= 4);
+            assert!(
+                build
+                    .rows
+                    .iter()
+                    .all(|line| row_width(line) <= render::content_width(width))
+            );
+            assert!(build.cursor_row < build.rows.len());
+            assert!(build.cursor_col < width as usize);
+        }
+    }
+
+    #[test]
+    fn activity_row_is_cleared_when_height_clipping_drops_it() {
+        for height in [1, 2] {
+            let mut ui = ui(20, height);
+            ui.busy = true;
+            let input = ui.input_layout();
+            let build = ui.build_region(&input);
+            assert_eq!(build.activity_row, None, "height {height}");
+            ui.region = build.rows;
+            ui.activity_region_row = build.activity_row;
+            assert!(!ui.repaint_activity_only().unwrap());
+        }
+    }
+
+    #[test]
+    fn plain_home_and_end_match_ctrl_a_and_ctrl_e() {
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let mut ui = ui(40, 10);
+        ui.input = "first\nsecond".into();
+        ui.cursor = ui.input.len();
+
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, "first\n".len());
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, ui.input.len());
+
+        ui.cursor = ui.input.len();
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, "first\n".len());
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            &input_tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(ui.cursor, ui.input.len());
+    }
+
+    #[test]
+    fn stream_caches_completed_markdown_blocks() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::TextDelta("first\n\nsecond".into()));
+        let first_cache = ui.stream_markdown_cache.as_ref().unwrap();
+        assert_eq!(first_cache.source_offset, "first\n\n".len());
+        assert_eq!(first_cache.rendered_blocks, 1);
+        let first_lines = first_cache.lines.clone();
+        ui.apply_event(UiEvent::TextDelta(" more".into()));
+        let cache = ui.stream_markdown_cache.as_ref().unwrap();
+        assert_eq!(cache.source_offset, "first\n\n".len());
+        assert_eq!(cache.rendered_blocks, 1);
+        assert_eq!(cache.lines, first_lines);
+        let rendered = ui.stream_tail_lines(render::content_width(ui.width));
+        assert!(row_text(rendered.last().unwrap()).contains("second"));
+    }
+
+    #[test]
+    fn history_window_visits_newest_entries_and_marks_hidden_rows() {
+        let entries = vec![
+            Entry::User { text: "old".into() },
+            Entry::User {
+                text: "middle".into(),
+            },
+            Entry::User { text: "new".into() },
+        ];
+        let rows = history_window(&entries, 3, 80, Theme::default(), false);
+        assert_eq!(rows.len(), 3);
+        assert!(row_text(&rows[0]).contains("older rows"));
+        assert!(row_text(&rows[2]).contains("new"));
     }
 
     #[test]
@@ -3527,6 +4417,109 @@ mod tests {
             loaded: false,
         });
         assert!(minimal.pending.is_empty());
+    }
+
+    #[test]
+    fn direct_provider_prefix_requests_its_model_catalogue() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model openrouter:".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.request_typed_backend(&tx).unwrap();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(InputMessage::ListModels {
+                provider: "openrouter".into(),
+            })
+        );
+        // A partially typed `provider:model` token addresses the same
+        // catalogue even before the prefix is Tab-accepted.
+        let mut ui2 = tests::ui(80, 24);
+        ui2.input = "/model openrouter:anthropic/claude".into();
+        ui2.cursor = ui2.input.len();
+        ui2.refresh_completion();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui2.request_typed_backend(&tx).unwrap();
+        assert_eq!(
+            rx.try_recv().ok(),
+            Some(InputMessage::ListModels {
+                provider: "openrouter".into(),
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn load_completion_combines_session_and_filesystem_context() {
+        let mut ui = ui(80, 24);
+        ui.input = "/load ./".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let completion = ui.completion.as_ref().expect("load completion");
+        assert_eq!(completion.kind, CompletionKind::Path);
+        assert_eq!(
+            completion.context.target,
+            CompletionTarget::Argument(ArgumentKind::Session)
+        );
+        assert_eq!(completion.context.query, "./");
+        // The debounced scan merges filesystem candidates with the static
+        // session-ID candidates (TUI-3: `/load` completes both).
+        let scanned = crate::paths::find_path_candidates(
+            &ui.environment.cwd,
+            "./",
+            &CancellationToken::new(),
+        );
+        let merged = merge_candidates(
+            commands::candidates_at_cursor(
+                &ui.input,
+                ui.cursor_char_col(),
+                &ui.providers,
+                &ui.model_lists,
+                &ui.provider,
+                &ui.session_candidates,
+                &ui.skills,
+            )
+            .map(|result| result.candidates)
+            .unwrap_or_default(),
+            scanned,
+        );
+        assert!(
+            !merged.is_empty(),
+            "`/load ./...` must produce filesystem candidates"
+        );
+        // And session IDs survive the merge when present: an empty query
+        // (`/load ` with no prefix) matches every cached session.
+        ui.input = "/load ".into();
+        ui.cursor = ui.input.len();
+        ui.session_candidates = vec![SessionListEntry {
+            id: "abc123-full".into(),
+            short_id: "abc123".into(),
+            title: None,
+            updated_at: "2026-08-13 12:00".into(),
+            workspace: "/workspace".into(),
+            provider: None,
+            model: None,
+        }];
+        let merged_with_session = merge_candidates(
+            commands::candidates_at_cursor(
+                &ui.input,
+                ui.cursor_char_col(),
+                &ui.providers,
+                &ui.model_lists,
+                &ui.provider,
+                &ui.session_candidates,
+                &ui.skills,
+            )
+            .map(|result| result.candidates)
+            .unwrap_or_default(),
+            Vec::new(),
+        );
+        assert!(
+            merged_with_session
+                .iter()
+                .any(|candidate| candidate.value.contains("abc123")),
+            "session IDs must survive alongside path candidates"
+        );
     }
 
     #[test]

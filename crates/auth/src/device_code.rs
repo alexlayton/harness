@@ -155,6 +155,10 @@ pub fn parse_u64(value: &Value, field: &str) -> Result<u64> {
 }
 
 /// Wait for a polling interval while still responding promptly to Ctrl+C.
+/// Tokio-aware: uses `tokio::time::sleep`, so paused-time tests
+/// auto-advance the virtual clock instead of sleeping wall-clock time.
+/// Callers that also enforce a wall-clock expiry deadline must compute
+/// that deadline from the same clock domain (see `login_device`).
 pub async fn cancellable_sleep(seconds: u64, cancel: &CancellationToken) -> Result<()> {
     tokio::select! {
         _ = cancel.cancelled() => Err(AuthError::Cancelled),

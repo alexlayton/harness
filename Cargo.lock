@@ -120,7 +120,7 @@ version = "8.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e42366bb9d958f042bf58f0a85e1b2d091997c1257ca49bddd7e4827aadc65fd"
 dependencies = [
- "nom 8.0.0",
+ "nom",
  "ratatui-core",
  "simdutf8",
  "smallvec",
@@ -315,7 +315,11 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "auth"
 version = "0.3.0"
 dependencies = [
- "base64 0.23.1",
+ "base64",
+ "bytes",
+ "fs2",
+ "futures-util",
+ "libc",
  "reqwest",
  "ring",
  "rustls",
@@ -339,12 +343,6 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
-
-[[package]]
-name = "base64"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bincode"
@@ -558,7 +556,6 @@ dependencies = [
  "llm",
  "serde_json",
  "session",
- "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -936,17 +933,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eventsource-stream"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
-dependencies = [
- "futures-core",
- "nom 7.1.3",
- "pin-project-lite",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1305,6 +1291,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
  "tools",
  "tracing",
  "tracing-subscriber",
@@ -1436,6 +1423,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hyper"
 version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1476,7 +1469,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -1952,11 +1945,10 @@ dependencies = [
  "async-trait",
  "auth",
  "bytes",
- "eventsource-stream",
  "futures-core",
  "futures-util",
+ "httpdate",
  "reqwest",
- "ring",
  "rustls",
  "serde",
  "serde_json",
@@ -2015,6 +2007,7 @@ name = "mcp"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "llm",
  "rmcp",
  "serde",
@@ -2041,12 +2034,6 @@ checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
-
-[[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
@@ -2086,16 +2073,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "nom"
-version = "7.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
-dependencies = [
- "memchr",
- "minimal-lexical",
 ]
 
 [[package]]
@@ -2367,7 +2344,7 @@ version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "indexmap 2.14.0",
  "quick-xml",
  "serde",
@@ -2727,7 +2704,7 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "futures-core",
  "futures-util",
@@ -3121,7 +3098,7 @@ version = "3.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee78f1fbe43ac4a0e47aadb3dbd357b69eb0d3793e948624cd03dd2750ab1c0a"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bs58",
  "chrono",
  "hex",
@@ -3152,6 +3129,7 @@ dependencies = [
 name = "session"
 version = "0.3.0"
 dependencies = [
+ "fs2",
  "libc",
  "llm",
  "serde",
@@ -3619,6 +3597,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -3645,15 +3624,17 @@ dependencies = [
  "diff",
  "fff-search",
  "ignore",
+ "libc",
  "llm",
  "proptest",
+ "rustix",
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",
  "tracing",
- "unicode-normalization",
+ "uuid",
 ]
 
 [[package]]
@@ -3790,6 +3771,7 @@ dependencies = [
  "fastrand",
  "futures-util",
  "ignore",
+ "memchr",
  "proptest",
  "ratatui-core",
  "tempfile",
@@ -3797,7 +3779,6 @@ dependencies = [
  "time",
  "tokio",
  "tokio-util",
- "tracing",
  "tui-markdown",
  "unicode-width",
 ]
@@ -3841,15 +3822,6 @@ name = "unicode-linebreak"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b09c83c3c29d37506a3e260c08c03743a6bb66a9cd432c6934ab501a190571f"
-
-[[package]]
-name = "unicode-normalization"
-version = "0.1.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
-dependencies = [
- "tinyvec",
-]
 
 [[package]]
 name = "unicode-segmentation"

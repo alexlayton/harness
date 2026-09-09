@@ -5,6 +5,12 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::{
+    ffi::{CStr, CString},
+    os::unix::ffi::OsStrExt,
+    sync::atomic::{AtomicU64, Ordering},
+};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
@@ -35,6 +41,28 @@ impl BashTool {
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 const RTK_REWRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Maximum shell timeout in seconds (24 hours). Documented in the JSON
+/// schema and enforced at runtime; larger values (including `u64::MAX`)
+/// are rejected as a tool error instead of overflowing deadline arithmetic.
+pub const MAX_TIMEOUT_SECS: u64 = 86_400;
+/// Grace period after TERM before escalating a process group to KILL.
+const KILL_GRACE: Duration = Duration::from_millis(500);
+/// Shared deadline for draining stdout+stderr after the shell ends.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Harness-side concurrency classification for one bash invocation.
+/// Every invocation is [`Concurrency::Exclusive`]: shell is the optimized
+/// parallel path's *escape hatch*, not a member of it — dedicated `read`,
+/// `find`, `grep`, and `multigrep` remain the parallel path. The old
+/// shell/Git read-only classifier was fragile word-level analysis that a
+/// wrong `ReadOnly` could turn into interleaved mutations; a wrong
+/// `Exclusive` merely forfeits latency, so exclusivity fails closed.
+/// Kept as a function (rather than inlining in `concurrency()`) so agent
+/// dispatch tests and callers can assert the contract directly.
+pub fn command_concurrency(_command: &str) -> Concurrency {
+    Concurrency::Exclusive
+}
 
 /// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
 /// signals support by printing the rewritten command on stdout; unsupported
@@ -71,368 +99,6 @@ async fn rtk_rewrite_cancellable(
     (accepted && !rewritten.is_empty()).then_some(rewritten)
 }
 
-/// True when a shell operand contains a control-flow keyword as a word, which
-/// would make per-operand rewriting unsafe.  Conservative: a false positive
-/// only skips the rtk split optimization, never alters execution.
-fn has_control_keyword(operand: &str) -> bool {
-    const KEYWORDS: &[&str] = &[
-        "if ",
-        "then ",
-        "else ",
-        "elif ",
-        "for ",
-        "while ",
-        "until ",
-        "case ",
-        "do ",
-        "done ",
-        "function ",
-        "select ",
-    ];
-    let bytes = operand.as_bytes();
-    KEYWORDS.iter().any(|keyword| {
-        bytes
-            .windows(keyword.len())
-            .any(|window| window == keyword.as_bytes())
-    })
-}
-
-/// Harness-side concurrency classification for one bash invocation.  This is
-/// decided here — never by the model — so scheduling correctness cannot
-/// depend on prompt compliance.  It fails closed: anything not provably
-/// side-effect-light classifies [`Concurrency::Exclusive`], which merely
-/// forfeits latency, while a wrong `ReadOnly` could interleave mutations.
-pub fn command_concurrency(command: &str) -> Concurrency {
-    match split_readonly_segments(command) {
-        Some(segments) if segments.iter().all(|segment| segment_is_read_only(segment)) => {
-            Concurrency::ReadOnly
-        }
-        _ => Concurrency::Exclusive,
-    }
-}
-
-/// Split a command on top-level separators (`&&`, `;`, and newlines, which
-/// are command separators in shell) into operands, refusing any structure a
-/// word-level analysis cannot judge: pipes, subshells, command substitution,
-/// heredocs, brace groups, redirections, or backgrounding.  Quoting and
-/// escapes are respected.  Returns `None` when the command must stay serial;
-/// a plain single command yields one segment.
-fn split_readonly_segments(command: &str) -> Option<Vec<&str>> {
-    let bytes = command.as_bytes();
-    let mut parts: Vec<&str> = Vec::new();
-    let mut start = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if escaped {
-            escaped = false;
-            index += 1;
-            continue;
-        }
-        match byte {
-            b'\\' => escaped = true,
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'`' => return None,
-            b'$' if bytes.get(index + 1) == Some(&b'(') => return None,
-            b'<' if matches!(bytes.get(index + 1), Some(b'<') | Some(b'(')) => return None,
-            b'<' | b'>' if !in_single && !in_double => return None,
-            b'|' | b'(' if !in_single && !in_double => return None,
-            b'{' if !in_single && !in_double && bytes.get(index.wrapping_sub(1)) != Some(&b'$') => {
-                return None;
-            }
-            b'&' if !in_single && !in_double => {
-                // `&&` separates; a lone `&` backgrounds the command, whose
-                // side effects would outlive the tool call — stay serial.
-                if bytes.get(index + 1) != Some(&b'&') {
-                    return None;
-                }
-                parts.push(command[start..index].trim());
-                start = index + 2;
-                index += 2;
-                continue;
-            }
-            b';' | b'\n' | b'\r' if !in_single && !in_double => {
-                parts.push(command[start..index].trim());
-                start = index + 1;
-                index += 1;
-                continue;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    let tail = command[start..].trim();
-    parts.push(tail);
-    if parts.iter().any(|part| part.is_empty()) {
-        return None;
-    }
-    if parts.iter().any(|part| has_control_keyword(part)) {
-        return None;
-    }
-    Some(parts)
-}
-
-/// Strip one layer of matching quotes so quoted words (`git "status"`)
-/// compare equal to their bare form during table lookup.
-fn strip_quotes(word: &str) -> &str {
-    let mut word = word.trim();
-    for quote in ['\'', '"'] {
-        if word.len() >= 2 && word.starts_with(quote) && word.ends_with(quote) {
-            word = &word[1..word.len() - 1];
-        }
-    }
-    word
-}
-
-/// True for `NAME=value` environment assignments preceding a command.
-fn is_env_assignment(word: &str) -> bool {
-    let Some(equals) = word.find('=') else {
-        return false;
-    };
-    let name = &word[..equals];
-    let mut bytes = name.bytes();
-    match bytes.next() {
-        // A valid identifier starts with a letter or underscore.
-        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {}
-        _ => return false,
-    }
-    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-}
-
-/// Git global options that precede the subcommand, mapped to how many
-/// following words they consume as values.  Anything unrecognized fails
-/// closed.
-const GIT_GLOBAL_FLAGS_WITH_VALUES: &[&str] = &["-C", "-c"];
-const GIT_GLOBAL_PREFIX_FLAGS: &[&str] = &["--git-dir=", "--work-tree="];
-const GIT_GLOBAL_BARE_FLAGS: &[&str] = &["--no-pager", "--literal-pathspecs"];
-
-/// Git subcommands that never mutate repository or worktree state, whatever
-/// their arguments (pathspecs and revisions are reads).
-const GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
-    "status",
-    "log",
-    "diff",
-    "show",
-    "blame",
-    "ls-files",
-    "ls-remote",
-    "cat-file",
-    "rev-parse",
-    "describe",
-    "shortlog",
-    "whatchanged",
-    "merge-base",
-    "reflog",
-    "show-branch",
-    "count-objects",
-    "cherry",
-    "version",
-];
-
-/// Listing-mode flags under which `git branch` / `git tag` are read-only.
-/// With any positional argument they create/delete/rename refs, so those
-/// fail closed.
-const GIT_LIST_MODE_FLAGS: &[&str] = &[
-    "-l",
-    "--list",
-    "-a",
-    "-r",
-    "-v",
-    "-vv",
-    "--show-current",
-    "--show-ref-names",
-    "--merged",
-    "--no-merged",
-    "--contains",
-    "--no-contains",
-    "--points-at",
-    "--sort",
-    "--format",
-    "--color",
-    "--abbrev",
-    "-n",
-];
-
-/// Read-only modes of `git config`; any other form may write configuration.
-const GIT_CONFIG_READ_FLAGS: &[&str] = &["--get", "--get-all", "--get-regexp", "--list"];
-
-/// Shell commands judged side-effect-light with arbitrary arguments.  This
-/// is deliberately an allowlist: unknown commands stay serial.  Deliberately
-/// excluded despite common read-only use: `sed` (`-i`, `w`, `r`), `awk`
-/// (`system()`, redirections), `xargs` (arbitrary execution), `env` (runs a
-/// command), and everything that can spawn processes.
-const READ_ONLY_COMMANDS: &[&str] = &[
-    "ls",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "stat",
-    "pwd",
-    "which",
-    "file",
-    "du",
-    "df",
-    "tree",
-    "uname",
-    "printenv",
-    "id",
-    "whoami",
-    "basename",
-    "dirname",
-    "realpath",
-    "readlink",
-    "echo",
-    "printf",
-    "true",
-    "false",
-    "nl",
-    "rev",
-    "tac",
-    "strings",
-    "column",
-    "cksum",
-    "md5sum",
-    "sha1sum",
-    "sha256sum",
-    "diff",
-    "cmp",
-    "comm",
-    "sort",
-    "uniq",
-    "cut",
-    "rg",
-    "grep",
-    "fd",
-];
-
-/// Version-print subcommands of build-tool binaries; anything else these
-/// tools do (builds, installs, package management) stays serial.
-const VERSION_ONLY_COMMANDS: &[&str] = &[
-    "cargo", "rustc", "rustup", "node", "npm", "npx", "python", "python3", "go",
-];
-
-/// Arguments that disqualify an otherwise read-only command: flags that
-/// write files (`sort -o`, `git diff --output=`), set state (`date -s`), or
-/// execute other programs (`rg --pre`, `fd -x`).  A flag matches exactly or
-/// as a `--flag=value` prefix.
-const READ_ONLY_COMMAND_EXCLUSIONS: &[(&str, &[&str])] = &[
-    ("rg", &["--pre", "--pre-glob"]),
-    ("fd", &["-x", "-X", "--exec", "--exec-batch"]),
-    ("sort", &["-o", "--output"]),
-    ("date", &["-s", "--set"]),
-    ("hostname", &["-F", "--file"]),
-];
-
-/// Judge one separator-free command operand.  Leading `VAR=value` assignments
-/// and a `cd <dir>` prefix are transparent; the remaining command word is
-/// looked up in the read-only tables.
-fn segment_is_read_only(segment: &str) -> bool {
-    let mut words: Vec<&str> = segment
-        .split_whitespace()
-        .map(strip_quotes)
-        .filter(|word| !word.is_empty())
-        .collect();
-    while words.first().is_some_and(|word| is_env_assignment(word)) {
-        words.remove(0);
-    }
-    let Some(first) = words.first() else {
-        return false;
-    };
-    if *first == "cd" {
-        // `cd <dir>` is transparent; bare `cd`, flags, or extra operands mean
-        // we did not parse what will really run.
-        return words.len() == 2 && !words[1].starts_with('-');
-    }
-    if *first == "git" {
-        return git_invocation_is_read_only(&words[1..]);
-    }
-    if *first == "find" {
-        // find(1) is read-only except for its mutating actions.
-        return !words[1..].iter().any(|word| {
-            *word == "-delete"
-                || *word == "-fls"
-                || word.starts_with("-exec")
-                || word.starts_with("-ok")
-                || word.starts_with("-fprint")
-        });
-    }
-    if READ_ONLY_COMMANDS.contains(first) {
-        // The allowlist entry covers arbitrary arguments except for the
-        // specific flags tabulated as disqualifiers.
-        return !words[1..].iter().any(|word| {
-            READ_ONLY_COMMAND_EXCLUSIONS
-                .iter()
-                .filter(|(command, _)| command == first)
-                .flat_map(|(_, flags)| flags.iter())
-                .any(|flag| *word == *flag || word.starts_with(&format!("{flag}=")))
-        });
-    }
-    if VERSION_ONLY_COMMANDS.contains(first) {
-        return words.len() == 2 && matches!(words[1], "--version" | "-V" | "version");
-    }
-    false
-}
-
-/// Judge a `git` invocation after the leading `git` word: skip known global
-/// options, then require the subcommand to be provably read-only.
-fn git_invocation_is_read_only(rest: &[&str]) -> bool {
-    let mut index = 0;
-    while index < rest.len() {
-        let word = rest[index];
-        if GIT_GLOBAL_FLAGS_WITH_VALUES.contains(&word) {
-            index += 2;
-        } else if GIT_GLOBAL_PREFIX_FLAGS
-            .iter()
-            .any(|flag| word.starts_with(flag))
-            || GIT_GLOBAL_BARE_FLAGS.contains(&word)
-        {
-            index += 1;
-        } else if word.starts_with('-') {
-            return false;
-        } else {
-            break;
-        }
-    }
-    let Some(subcommand) = rest.get(index) else {
-        // Bare `git` prints help: harmless, but pointless to batch.
-        return false;
-    };
-    let args = &rest[index + 1..];
-    // `git diff --output=<file>` (and `--output-indicator-*` are fine, but
-    // plain `--output` writes a file) fails closed.
-    if GIT_READ_ONLY_SUBCOMMANDS.contains(subcommand)
-        && matches!(*subcommand, "diff" | "show" | "whatchanged")
-        && args
-            .iter()
-            .any(|arg| arg.starts_with("--output=") || *arg == "--output")
-    {
-        return false;
-    }
-    match *subcommand {
-        _ if GIT_READ_ONLY_SUBCOMMANDS.contains(subcommand) => true,
-        "branch" | "tag" => {
-            !args.is_empty()
-                && args
-                    .iter()
-                    .all(|arg| arg.starts_with('-') && GIT_LIST_MODE_FLAGS.contains(arg))
-        }
-        "config" => args
-            .first()
-            .is_some_and(|arg| GIT_CONFIG_READ_FLAGS.contains(arg)),
-        "remote" => {
-            args.iter().all(|arg| matches!(*arg, "-v" | "--verbose"))
-                || args.first() == Some(&"get-url") && args.len() == 2
-        }
-        "worktree" | "stash" => args.first() == Some(&"list") || args.first() == Some(&"show"),
-        _ => false,
-    }
-}
-
 /// Resolve the bash `dir` argument against the workspace root, requiring an
 /// existing directory inside the workspace.  This mirrors the path scoping of
 /// find/grep; `cd` inside the command itself remains the escape hatch for
@@ -460,7 +126,7 @@ impl Tool for BashTool {
                 "properties": {
                     "command": { "type": "string", "description": "Command passed to sh -c" },
                     "dir": { "type": "string", "description": "Optional working directory for the command, relative to the workspace root (e.g. \"crates/tools\"). Prefer this over prefixing the command with cd <dir> && ..." },
-                    "timeout": { "type": "integer", "minimum": 1, "description": "Timeout in seconds (default 120)" }
+                    "timeout": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS, "description": "Timeout in seconds (default 120, maximum 86400)" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -476,11 +142,10 @@ impl Tool for BashTool {
         }
     }
 
-    fn concurrency(&self, args: &Value) -> Concurrency {
-        match args.get("command").and_then(Value::as_str) {
-            Some(command) => command_concurrency(command),
-            None => Concurrency::Exclusive,
-        }
+    fn concurrency(&self, _args: &Value) -> Concurrency {
+        // Every bash invocation is exclusive: shell text is never provably
+        // side-effect-light. See `command_concurrency`.
+        Concurrency::Exclusive
     }
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
@@ -488,13 +153,25 @@ impl Tool for BashTool {
             Some(command) if !command.is_empty() => command.to_owned(),
             _ => return error("bash", "missing required argument: command"),
         };
-        let timeout = match args.get("timeout") {
+        // Documented maximum timeout, enforced with checked arithmetic:
+        // `u64::MAX` (or anything past the cap) is a tool error, never a
+        // panic or wrap. `checked_add` on the `Instant` likewise fails to
+        // an error instead of overflowing the deadline.
+        let timeout_secs = match args.get("timeout") {
             None => 120,
             Some(value) => match value.as_u64() {
-                Some(value) if value > 0 => value,
-                _ => return error("bash", "timeout must be a positive integer"),
+                Some(value) if (1..=MAX_TIMEOUT_SECS).contains(&value) => value,
+                _ => {
+                    return error(
+                        "bash",
+                        &format!(
+                            "timeout must be an integer between 1 and {MAX_TIMEOUT_SECS} seconds"
+                        ),
+                    );
+                }
             },
         };
+        let timeout = timeout_secs;
         let dir = match args.get("dir") {
             None => None,
             Some(Value::String(dir)) if !dir.trim().is_empty() => Some(dir.clone()),
@@ -513,7 +190,20 @@ impl Tool for BashTool {
 
         // RTK owns rewrite policy: one cancellable whole-command request,
         // with rewrite time charged to the bash call's total deadline.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+        // Checked arithmetic: an unrepresentable deadline is a tool error,
+        // never a panic.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(timeout))
+            .ok_or_else(|| {
+                error(
+                    "bash",
+                    &format!("timeout {timeout}s overflows the deadline clock"),
+                )
+            });
+        let deadline = match deadline {
+            Ok(deadline) => deadline,
+            Err(output) => return output,
+        };
         let run_command = if self.rtk {
             rtk_rewrite_cancellable(&command, &cancel, deadline)
                 .await
@@ -523,16 +213,34 @@ impl Tool for BashTool {
         };
 
         let cwd = self.cwd.clone();
-        let mut child = match Command::new("sh")
+        let mut command_builder = Command::new("sh");
+        command_builder
             .arg("-c")
             .arg(&run_command)
             .current_dir(run_dir.as_deref().unwrap_or(&cwd))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .kill_on_drop(true);
+        // Own a process group on Unix. Linux additionally uses a private
+        // cgroup when the host exposes a writable cgroup v2 hierarchy. A
+        // process group is deliberately only a fallback: a command can call
+        // setsid(2), while cgroup membership survives that escape.
+        #[cfg(unix)]
+        command_builder.process_group(0);
+        #[cfg(target_os = "linux")]
+        let mut cgroup = CgroupGuard::new();
+        #[cfg(target_os = "linux")]
+        if let Some(scope) = cgroup.as_ref() {
+            let cgroup_procs = scope.procs_cstring();
+            // SAFETY: the closure only performs the async-signal-safe open,
+            // write, and close operations needed between fork and exec. It
+            // runs before the shell can fork any user descendants.
+            unsafe {
+                command_builder.pre_exec(move || attach_pid_to_cgroup(&cgroup_procs));
+            }
+        }
+        let mut child = match command_builder.spawn() {
             Ok(child) => child,
             Err(io_error) => {
                 return error(
@@ -541,11 +249,24 @@ impl Tool for BashTool {
                 );
             }
         };
+        // The shell's pid is the process-group leader (process_group(0)),
+        // so group signals target exactly this invocation's tree.
+        #[cfg(unix)]
+        let group_id = child.id();
+        #[cfg(not(unix))]
+        let group_id = None;
+        let mut process_guard = ProcessGroupGuard::new(
+            group_id,
+            #[cfg(target_os = "linux")]
+            cgroup.take(),
+        );
 
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
-        let mut stdout_task = tokio::spawn(read_bounded_tail(stdout));
-        let mut stderr_task = tokio::spawn(read_bounded_tail(stderr));
+        let mut readers = ReaderTasks {
+            stdout: tokio::spawn(read_bounded_tail(stdout)),
+            stderr: tokio::spawn(read_bounded_tail(stderr)),
+        };
 
         enum End {
             Exited(std::process::ExitStatus),
@@ -558,33 +279,62 @@ impl Tool for BashTool {
                 Err(_) => End::Cancelled,
             },
             _ = tokio::time::sleep_until(deadline) => {
-                let _ = child.kill().await;
+                terminate_tree(
+                    &mut child,
+                    group_id,
+                    process_guard.containment(),
+                    &cancel,
+                )
+                .await;
                 let _ = child.wait().await;
                 End::TimedOut
             },
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
+                terminate_tree(
+                    &mut child,
+                    group_id,
+                    process_guard.containment(),
+                    &cancel,
+                )
+                .await;
                 let _ = child.wait().await;
                 End::Cancelled
             },
         };
+        // The shell may have exited, or `wait` may have failed. Repeat the
+        // idempotent cleanup for every branch before draining: the Linux
+        // cgroup (when available) and the Unix process group terminate
+        // detached descendants before they can keep these pipes open or
+        // mutate the workspace after this tool returns. Other Unix platforms
+        // retain only the process-group best effort documented below.
+        terminate_tree(&mut child, group_id, process_guard.containment(), &cancel).await;
 
-        // A descendant can inherit a pipe after the shell exits. Bound drain
-        // time so such a process cannot keep the tool alive indefinitely.
-        let stdout = match tokio::time::timeout(Duration::from_secs(1), &mut stdout_task).await {
-            Ok(Ok(capture)) => capture,
-            _ => {
-                stdout_task.abort();
-                TailCapture::default()
+        // Drain stdout and stderr concurrently under one shared deadline
+        // (not two sequential one-second waits): held pipes on both
+        // streams together consume at most DRAIN_TIMEOUT.
+        let drain_deadline = tokio::time::Instant::now()
+            .checked_add(DRAIN_TIMEOUT)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let (stdout, stderr) = tokio::join!(
+            async {
+                match tokio::time::timeout_at(drain_deadline, &mut readers.stdout).await {
+                    Ok(Ok(capture)) => capture,
+                    _ => {
+                        readers.stdout.abort();
+                        TailCapture::default()
+                    }
+                }
+            },
+            async {
+                match tokio::time::timeout_at(drain_deadline, &mut readers.stderr).await {
+                    Ok(Ok(capture)) => capture,
+                    _ => {
+                        readers.stderr.abort();
+                        TailCapture::default()
+                    }
+                }
             }
-        };
-        let stderr = match tokio::time::timeout(Duration::from_secs(1), &mut stderr_task).await {
-            Ok(Ok(capture)) => capture,
-            _ => {
-                stderr_task.abort();
-                TailCapture::default()
-            }
-        };
+        );
         let mut output = stdout.render();
         if !stderr.bytes.is_empty() {
             if !output.is_empty() {
@@ -623,6 +373,7 @@ impl Tool for BashTool {
             output.push_str(&suffix);
         }
 
+        process_guard.disarm();
         ToolOutput {
             content: output,
             is_error,
@@ -631,6 +382,21 @@ impl Tool for BashTool {
                 None => format!("bash: {}", first_line(&run_command)),
             },
         }
+    }
+}
+
+/// Owns the asynchronous pipe readers. Tokio detaches a task when its
+/// `JoinHandle` is merely dropped, so the explicit abort-on-drop behavior is
+/// required when the bash execution future itself is cancelled or aborted.
+struct ReaderTasks {
+    stdout: tokio::task::JoinHandle<TailCapture>,
+    stderr: tokio::task::JoinHandle<TailCapture>,
+}
+
+impl Drop for ReaderTasks {
+    fn drop(&mut self) {
+        self.stdout.abort();
+        self.stderr.abort();
     }
 }
 
@@ -735,6 +501,270 @@ fn first_line(value: &str) -> &str {
     value.lines().next().unwrap_or(value)
 }
 
+/// Linux cgroup-v2 scope for one shell invocation. A process group is not a
+/// tree boundary: `setsid(2)` lets a descendant leave it. Cgroup membership
+/// survives that operation, so `cgroup.kill` is the strong containment path
+/// when the host grants this process a writable cgroup hierarchy.
+#[cfg(target_os = "linux")]
+struct CgroupGuard {
+    path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+static CGROUP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+impl CgroupGuard {
+    fn new() -> Option<Self> {
+        let root = Path::new("/sys/fs/cgroup");
+        if !root.join("cgroup.controllers").is_file() {
+            return None;
+        }
+        // Delegation normally grants write access to this process's current
+        // subtree, not to the cgroup-v2 mount root. Resolve `0::<path>` from
+        // procfs and reject every non-normal component before joining it.
+        let membership = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))?;
+        let mut base = root.to_path_buf();
+        for component in Path::new(relative).components() {
+            match component {
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                std::path::Component::Normal(part) => base.push(part),
+                std::path::Component::ParentDir | std::path::Component::Prefix(_) => return None,
+            }
+        }
+        for _ in 0..8 {
+            let number = CGROUP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("harness-bash-{}-{number}", std::process::id()));
+            match std::fs::create_dir(&path) {
+                Ok(()) if path.join("cgroup.kill").is_file() => {
+                    return Some(Self { path });
+                }
+                Ok(()) => {
+                    let _ = std::fs::remove_dir(&path);
+                }
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    fn procs_cstring(&self) -> CString {
+        CString::new(self.path.join("cgroup.procs").as_os_str().as_bytes())
+            .expect("cgroup path cannot contain NUL")
+    }
+
+    fn kill(&self) {
+        // cgroup.kill is atomic with respect to membership: unlike a /proc
+        // descendant walk, a concurrent fork cannot escape this operation.
+        let _ = std::fs::write(self.path.join("cgroup.kill"), b"1\n");
+    }
+
+    fn cleanup(&self) {
+        // A normal path has waited for the shell and cgroup.kill has finished
+        // the descendants. Kernel task exit is asynchronous, so retry the
+        // removal briefly; this also prevents future-drop cleanup from
+        // accumulating empty invocation cgroups.
+        for _ in 0..200 {
+            match std::fs::remove_dir(&self.path) {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CgroupGuard {
+    fn drop(&mut self) {
+        self.kill();
+        self.cleanup();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn attach_pid_to_cgroup(path: &CStr) -> std::io::Result<()> {
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut digits = [0u8; 20];
+    let mut end = digits.len();
+    let mut pid = unsafe { libc::getpid() as u64 };
+    loop {
+        end -= 1;
+        digits[end] = b'0' + (pid % 10) as u8;
+        pid /= 10;
+        if pid == 0 {
+            break;
+        }
+    }
+    let bytes = &digits[end..];
+    let mut written = 0;
+    while written < bytes.len() {
+        let result =
+            unsafe { libc::write(fd, bytes[written..].as_ptr().cast(), bytes.len() - written) };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = unsafe { libc::close(fd) };
+            return Err(error);
+        }
+        if result == 0 {
+            let _ = unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "could not attach shell to cgroup",
+            ));
+        }
+        written += result as usize;
+    }
+    let close_result = unsafe { libc::close(fd) };
+    if close_result < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Process containment kept for the lifetime of one shell invocation. Linux
+/// owns a cgroup when available; Unix process groups remain the portable
+/// best-effort fallback, and non-Unix platforms only kill the direct child.
+/// The synchronous drop path is the last line of defense when the async
+/// execution future is aborted before normal cleanup runs.
+struct Containment {
+    #[cfg(target_os = "linux")]
+    cgroup: Option<CgroupGuard>,
+}
+
+impl Containment {
+    #[cfg(target_os = "linux")]
+    fn new(cgroup: Option<CgroupGuard>) -> Self {
+        Self { cgroup }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new() -> Self {
+        Self {}
+    }
+
+    fn kill(&self) {
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup) = &self.cgroup {
+            cgroup.kill();
+        }
+    }
+}
+
+/// Owns the shell's process group and, on Linux, its cgroup until all output
+/// has drained. The cgroup is killed before the output drain, so a detached
+/// descendant cannot retain the tool's pipes on the strong Linux path.
+struct ProcessGroupGuard {
+    group_id: Option<u32>,
+    containment: Containment,
+    armed: bool,
+}
+
+impl ProcessGroupGuard {
+    fn new(group_id: Option<u32>, #[cfg(target_os = "linux")] cgroup: Option<CgroupGuard>) -> Self {
+        Self {
+            group_id,
+            containment: Containment::new(
+                #[cfg(target_os = "linux")]
+                cgroup,
+            ),
+            armed: true,
+        }
+    }
+
+    fn containment(&self) -> &Containment {
+        &self.containment
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.containment.kill();
+        #[cfg(unix)]
+        if let Some(pgid) = self.group_id {
+            // SAFETY: the group ID came from the shell created by this tool;
+            // a negative PID targets only that process group.
+            unsafe {
+                libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_group_alive(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only probes the process group selected by our child ID.
+    let result = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// `child` is used to reap the directly manageable shell handle when the
+/// group signal path is unavailable; on Unix the group signals do the
+/// work and the caller waits on the shell separately.
+async fn terminate_tree(
+    child: &mut tokio::process::Child,
+    group_id: Option<u32>,
+    containment: &Containment,
+    cancel: &CancellationToken,
+) {
+    containment.kill();
+    #[cfg(unix)]
+    {
+        let _ = child;
+        let _ = cancel;
+        if let Some(pgid) = group_id {
+            // SAFETY: `killpg`-equivalent via libc with the group's own
+            // pgid; a negative pid targets the group, signals are
+            // SIGTERM/SIGKILL constants. The pgid came from our own
+            // spawned child, never from external input.
+            unsafe {
+                libc::kill(-(pgid as libc::pid_t), libc::SIGTERM);
+            }
+            // If the shell already exited, its group normally disappears
+            // immediately. Only wait for the grace period when a descendant
+            // is still holding the group, avoiding a fixed delay on ordinary
+            // successful commands.
+            if process_group_alive(pgid) {
+                tokio::select! {
+                    _ = tokio::time::sleep(KILL_GRACE) => {}
+                    _ = cancel.cancelled() => {}
+                }
+            }
+            if process_group_alive(pgid) {
+                unsafe {
+                    libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Fallback: kill the shell handle. This cannot reach already-detached
+        // grandchildren, but the direct child must still be killed before the
+        // timeout/cancellation branch waits for it.
+        let _ = group_id;
+        let _ = cancel;
+        let _ = child.start_kill();
+    }
+}
+
 fn error(summary: &str, content: &str) -> ToolOutput {
     ToolOutput {
         content: content.to_owned(),
@@ -746,6 +776,37 @@ fn error(summary: &str, content: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn detached_marker_helper() {
+        let Some(ready) = std::env::var_os("HARNESS_BASH_HELPER_READY") else {
+            return;
+        };
+        let Some(marker) = std::env::var_os("HARNESS_BASH_HELPER_MARKER") else {
+            return;
+        };
+        let Some(pid_path) = std::env::var_os("HARNESS_BASH_HELPER_PID") else {
+            return;
+        };
+        let delay = std::env::var("HARNESS_BASH_HELPER_DELAY")
+            .expect("helper delay")
+            .parse::<u64>()
+            .expect("helper delay is an integer");
+        // This test executable is launched as an ordinary child of the shell;
+        // setsid makes it the leader of a new session/process group without
+        // relying on the non-portable external `setsid` utility.
+        assert_eq!(unsafe { libc::setsid() }, unsafe { libc::getpid() });
+        std::fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(ready, b"ready").unwrap();
+        std::thread::sleep(Duration::from_secs(delay));
+        std::fs::write(marker, b"detached").unwrap();
+    }
+
+    #[cfg(unix)]
+    fn shell_quote(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+    }
 
     #[tokio::test]
     async fn captures_stderr_and_exit_code() {
@@ -887,132 +948,310 @@ mod tests {
     }
 
     #[test]
-    fn read_only_commands_classify_concurrent() {
-        let concurrent = [
+    fn every_bash_invocation_is_exclusive() {
+        // Even env-prefixed and Git helper commands - the old classifier's
+        // read-only set - are exclusive now. Dedicated read/find/grep/
+        // multigrep remain the optimized parallel path.
+        for command in [
             "git status",
             "git log --oneline -5",
-            "git diff HEAD~1",
-            "git -C crates/tools status",
-            "git --no-pager diff",
-            "git branch --list",
-            "git tag -l",
-            "git config --get user.name",
-            "git remote -v",
-            "git stash list",
-            "cd crates/tui && git status",
             "FOO=bar git status",
             "ls -la",
             "cat README.md",
-            "head -20 src/main.rs",
-            "wc -l crates/*/*.rs",
-            "pwd",
-            "which cargo",
-            "rg TODO src/",
-            "grep -rn pattern .",
-            "find . -name '*.rs' -maxdepth 2",
-            "cargo --version",
-            "node --version",
             "echo hello",
-            "printf '%s\\n' line",
-            "stat Cargo.toml",
-            "du -sh target",
-            "uname -a",
-            "true",
-        ];
-        for command in concurrent {
-            assert_eq!(
-                command_concurrency(command),
-                Concurrency::ReadOnly,
-                "{command:?} should be read-only"
-            );
-        }
-    }
-
-    #[test]
-    fn mutating_or_unanalyzable_commands_stay_serial() {
-        let exclusive = [
-            "date +%Y",
-            "hostname",
+            "cargo --version",
+            "rg TODO src/",
             "cargo test",
-            "cargo build --release",
             "rm -rf target",
-            "touch file.txt",
-            "mkdir -p a/b",
-            "git commit -m x",
-            "git checkout main",
-            "git add .",
-            "git push",
-            "git branch new-branch",
-            "git tag v1.0.0",
-            "git config user.email a@b.c",
-            "git worktree add ../wt",
-            "find . -name '*.tmp' -delete",
-            "find . -name '*.log' -exec rm {} \\",
             "echo hi > out.txt",
-            "cat in.txt | sort",
-            "sort < input.txt",
-            "echo $(date)",
-            "echo `date`",
-            "sleep 5 & wait",
-            "cd .. && rm -rf build",
-            "npm install",
-            "python script.py",
-            "sed -i 's/a/b/' file.txt",
-            "xargs ls < files.txt",
-            "if true; then echo hi; fi",
-            "for f in *; do cat $f; done",
-            "ls; rm file",
-            "git status && cargo test",
-            "", // empty command is rejected at execute time anyway
-        ];
-        for command in exclusive {
+            "",
+        ] {
             assert_eq!(
                 command_concurrency(command),
                 Concurrency::Exclusive,
-                "{command:?} must stay serial"
+                "{command:?} must be exclusive"
             );
         }
-    }
-
-    #[test]
-    fn side_effect_flags_on_read_only_commands_fail_closed() {
-        let exclusive = [
-            "sort -o /etc/passwd input.txt",
-            "sort --output=x.txt input.txt",
-            "date -s 2000-01-01",
-            "date --set=2000-01-01",
-            "rg --pre ./hook.sh pattern",
-            "fd -x chmod 644 \\{",
-            "fd --exec echo",
-            "hostname -F hosts.txt",
-            "git diff --output=patch.txt",
-        ];
-        for command in exclusive {
-            assert_eq!(
-                command_concurrency(command),
-                Concurrency::Exclusive,
-                "{command:?} must stay serial"
-            );
-        }
-        // Unrelated flags on the same commands stay read-only.
+        // The tool-level classification agrees, with or without a command.
+        let tool = BashTool::with_workspace_root("/tmp");
         assert_eq!(
-            command_concurrency("sort -u input.txt"),
-            Concurrency::ReadOnly
-        );
-        assert_eq!(command_concurrency("rg -n TODO"), Concurrency::ReadOnly);
-    }
-
-    #[test]
-    fn quoting_and_escapes_are_respected_by_the_classifier() {
-        // Separators inside quotes do not split.
-        assert_eq!(command_concurrency("echo 'a && b'"), Concurrency::ReadOnly);
-        assert_eq!(command_concurrency("echo \"x; y\""), Concurrency::ReadOnly);
-        // A quoted word still matches the command table.
-        assert_eq!(command_concurrency("git \"status\""), Concurrency::ReadOnly);
-        // An escaped separator does not split either.
-        assert_eq!(
-            command_concurrency("echo a \\&& echo b"),
+            tool.concurrency(&json!({"command": "git status"})),
             Concurrency::Exclusive
+        );
+        assert_eq!(tool.concurrency(&json!({})), Concurrency::Exclusive);
+    }
+
+    #[test]
+    fn oversized_timeout_is_a_tool_error_not_a_panic() {
+        assert_eq!(
+            MAX_TIMEOUT_SECS, 86_400,
+            "schema maximum and runtime cap must agree"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_timeout_rejects_u64_max() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = BashTool::with_workspace_root(directory.path())
+            .execute(
+                json!({"command": "echo hi", "timeout": u64::MAX}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            output.is_error,
+            "u64::MAX must not panic: {}",
+            output.content
+        );
+        assert!(output.content.contains("timeout"), "{}", output.content);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct DetachedMarker {
+        directory: tempfile::TempDir,
+        ready: std::path::PathBuf,
+        marker: std::path::PathBuf,
+        pid: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl DetachedMarker {
+        fn new() -> Option<Self> {
+            // The production fallback is intentionally usable on hosts that
+            // do not delegate cgroup v2. These tests specifically exercise
+            // the stronger detached-descendant guarantee, so skip rather than
+            // turn a host capability limitation into a flaky process leak.
+            let cgroup = CgroupGuard::new()?;
+            drop(cgroup);
+            let directory = tempfile::tempdir().unwrap();
+            Some(Self {
+                ready: directory.path().join("ready"),
+                marker: directory.path().join("marker"),
+                pid: directory.path().join("pid"),
+                directory,
+            })
+        }
+
+        fn command(&self, delay: u64, tail: &str) -> String {
+            let helper = shell_quote(&std::env::current_exe().unwrap().display().to_string());
+            format!(
+                "HARNESS_BASH_HELPER_READY={} HARNESS_BASH_HELPER_MARKER={} HARNESS_BASH_HELPER_PID={} HARNESS_BASH_HELPER_DELAY={} {} --exact bash::tests::detached_marker_helper --nocapture & while [ ! -f {} ]; do sleep 0.01; done; {}",
+                shell_quote(&self.ready.display().to_string()),
+                shell_quote(&self.marker.display().to_string()),
+                shell_quote(&self.pid.display().to_string()),
+                delay,
+                helper,
+                shell_quote(&self.ready.display().to_string()),
+                tail,
+            )
+        }
+
+        async fn wait_until_ready(&self) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while !self.ready.exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "detached marker child did not become ready"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn assert_marker_absent(&self) {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+            while tokio::time::Instant::now() < deadline {
+                assert!(
+                    !self.marker.exists(),
+                    "detached descendant wrote after tool cleanup"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for DetachedMarker {
+        fn drop(&mut self) {
+            if let Ok(text) = std::fs::read_to_string(&self.pid)
+                && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+            {
+                // The helper calls setsid, making its PID its process-group
+                // ID. This is an unconditional test cleanup fallback for a
+                // failed assertion or a shell-startup error.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_after_normal_shell_exit() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
+        let output = BashTool::with_workspace_root(fixture.directory.path())
+            .execute(
+                json!({
+                    "command": fixture.command(2, "exit 0"),
+                    "timeout": 10,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        fixture.assert_marker_absent().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_when_execution_future_is_dropped() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
+        let command = fixture.command(2, "sleep 30");
+        let tool = BashTool::with_workspace_root(fixture.directory.path());
+        let task = tokio::spawn(async move {
+            tool.execute(
+                json!({"command": command, "timeout": 60}),
+                CancellationToken::new(),
+            )
+            .await
+        });
+        fixture.wait_until_ready().await;
+        task.abort();
+        let _ = task.await;
+        fixture.assert_marker_absent().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_on_timeout() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
+        let output = BashTool::with_workspace_root(fixture.directory.path())
+            .execute(
+                json!({
+                    "command": fixture.command(2, "sleep 30"),
+                    "timeout": 1,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "expected timeout: {}", output.content);
+        assert!(output.content.contains("timed out"), "{}", output.content);
+        fixture.assert_marker_absent().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_marker_is_killed_on_explicit_cancellation() {
+        let Some(fixture) = DetachedMarker::new() else {
+            return;
+        };
+        let cancel = CancellationToken::new();
+        let tool = BashTool::with_workspace_root(fixture.directory.path());
+        let cancel_task = cancel.clone();
+        let command = fixture.command(2, "sleep 30");
+        let task = tokio::spawn(async move {
+            tool.execute(json!({"command": command, "timeout": 60}), cancel_task)
+                .await
+        });
+        fixture.wait_until_ready().await;
+        cancel.cancel();
+        let output = task.await.unwrap();
+        assert!(output.content.contains("cancelled"), "{}", output.content);
+        fixture.assert_marker_absent().await;
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    struct DetachedChildCleanup {
+        pid_file: std::path::PathBuf,
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    impl DetachedChildCleanup {
+        fn kill(&self) {
+            if let Ok(text) = std::fs::read_to_string(&self.pid_file)
+                && let Ok(pid) = text.trim().parse::<libc::pid_t>()
+            {
+                // SAFETY: the helper called setsid, so its pid is also its
+                // process-group id. Kill both the group and direct pid; the
+                // direct signal also covers a race with session setup.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    impl Drop for DetachedChildCleanup {
+        fn drop(&mut self) {
+            self.kill();
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[tokio::test]
+    async fn held_stdout_and_stderr_share_one_drain_deadline_without_cgroup() {
+        // On Unix platforms without the Linux cgroup containment path, a
+        // survivor detached into a new session can inherit both pipes. The
+        // shared deadline still bounds Harness waiting (~1s): two sequential
+        // per-stream waits would take ~2s instead. The cleanup guard is
+        // required because this is an explicitly documented best-effort path.
+        //
+        // The survivor is backgrounded so the outer shell can exit; the
+        // trailing `sleep 1` keeps the shell alive long enough for the
+        // survivor to detach before group teardown signals the old group.
+        // True timeline is ~1s (outer sleep) + ~1s (shared drain) ~= 2s:
+        // an early EOF would finish at ~1s, sequential drains at ~3s.
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("drain-survivor.pid");
+        let cleanup = DetachedChildCleanup {
+            pid_file: pid_file.clone(),
+        };
+        let ready = directory.path().join("drain-ready");
+        let marker = directory.path().join("drain-marker");
+        let helper = shell_quote(&std::env::current_exe().unwrap().display().to_string());
+        let started = std::time::Instant::now();
+        let output = BashTool::with_workspace_root(directory.path())
+            .execute(
+                json!({
+                    "command": format!(
+                        "HARNESS_BASH_HELPER_READY={} HARNESS_BASH_HELPER_MARKER={} HARNESS_BASH_HELPER_PID={} HARNESS_BASH_HELPER_DELAY=15 {} --exact bash::tests::detached_marker_helper --nocapture & while [ ! -f {} ]; do sleep 0.01; done; sleep 1; exit 0",
+                        shell_quote(&ready.display().to_string()),
+                        shell_quote(&marker.display().to_string()),
+                        shell_quote(&pid_file.display().to_string()),
+                        helper,
+                        shell_quote(&ready.display().to_string()),
+                    ),
+                    "timeout": 30,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+        // Kill the detached survivor before asserting. The guard also repeats
+        // this cleanup during unwinding so a failed test cannot leak a
+        // pipe-holding child into later tests.
+        cleanup.kill();
+        assert!(!output.is_error, "{}", output.content);
+        // The lower bound proves both pipes were actually held through the
+        // drain (an early EOF would finish at ~1s); the upper bound proves
+        // both streams shared one deadline instead of two sequential waits
+        // (~3s).
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_500),
+            "pipes were not actually held open: finished in {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_900),
+            "stdout+stderr did not share one drain deadline: took {elapsed:?}"
         );
     }
 }

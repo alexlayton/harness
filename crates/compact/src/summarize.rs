@@ -9,11 +9,12 @@
 use crate::plan::CompactionPlan;
 use crate::policy::CompactionPolicy;
 use crate::policy::DEFAULT_TOOL_RESULT_CHARS;
-use crate::serialize::{extract_file_operations, format_file_operations, serialize_events};
-use futures_util::StreamExt;
-use llm::{
-    CompletionRequest, Message, Provider, ReasoningPolicy, StreamEvent, Usage, truncate_utf8,
+use crate::serialize::{
+    OMISSION_MARKER, extract_file_operations, format_file_operations, serialize_events,
+    truncate_bytes,
 };
+use futures_util::StreamExt;
+use llm::{CompletionRequest, Message, Provider, ReasoningPolicy, StreamEvent, Usage};
 use tokio_util::sync::CancellationToken;
 
 /// System prompt: marks the task as summarization and forbids continuing the
@@ -67,10 +68,13 @@ invocations, and error messages verbatim where they matter.";
 /// The result of a summarization attempt.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SummaryOutcome {
-    /// Successful LLM summary plus its provider usage (recorded by the agent).
-    Model { text: String, usage: Usage },
+    /// Successful LLM summary plus optional provider usage (recorded by the agent).
+    Model { text: String, usage: Option<Usage> },
     /// Deterministic fallback (no provider usage to record).
     Deterministic { text: String },
+    /// The caller cancelled compaction before a summary was completed.
+    /// Cancellation is not a summarizer failure and must not be persisted.
+    Cancelled,
 }
 
 /// Generate a summary for `plan` using the conversation's provider/model with
@@ -87,11 +91,21 @@ pub async fn summarize(
     session_id: Option<&str>,
     cancel: &CancellationToken,
 ) -> SummaryOutcome {
+    if cancel.is_cancelled() {
+        return SummaryOutcome::Cancelled;
+    }
     match model_summarize(provider, model, plan, policy, session_id, cancel).await {
-        Ok((text, usage)) => SummaryOutcome::Model {
-            text: append_file_lists(text, plan),
-            usage,
-        },
+        Ok((text, usage)) => {
+            if cancel.is_cancelled() {
+                SummaryOutcome::Cancelled
+            } else {
+                SummaryOutcome::Model {
+                    text: append_file_lists(text, plan, policy.max_summary_bytes),
+                    usage,
+                }
+            }
+        }
+        Err(_) if cancel.is_cancelled() => SummaryOutcome::Cancelled,
         Err(error) => {
             tracing::warn!(error = %error, "LLM summarization failed; using deterministic fallback");
             SummaryOutcome::Deterministic {
@@ -110,7 +124,7 @@ async fn model_summarize(
     policy: &CompactionPolicy,
     session_id: Option<&str>,
     cancel: &CancellationToken,
-) -> Result<(String, Usage), llm::LlmError> {
+) -> Result<(String, Option<Usage>), llm::LlmError> {
     let serialized = serialize_events(
         &plan.to_summarize,
         policy.max_summary_input_bytes,
@@ -122,6 +136,10 @@ async fn model_summarize(
     } else {
         &serialized.text
     });
+    if serialized.truncated && policy.max_summary_input_bytes > OMISSION_MARKER.len() {
+        prompt.push('\n');
+        prompt.push_str(OMISSION_MARKER);
+    }
     prompt.push_str("\n</conversation>\n\n");
     if let Some(previous) = &plan.previous_summary {
         prompt.push_str("<previous-summary>\n");
@@ -141,16 +159,23 @@ async fn model_summarize(
         session_id: session_id.map(str::to_owned),
     };
 
-    let mut stream = provider.stream(&request).await?;
+    let mut stream = tokio::select! {
+        result = provider.stream(&request) => result?,
+        _ = cancel.cancelled() => {
+            return Err(llm::LlmError::Stream("summarization cancelled".into()));
+        }
+    };
     let mut text = String::new();
-    let mut usage = Usage::default();
+    let mut usage = None;
     loop {
         tokio::select! {
             next = stream.next() => {
                 let Some(next) = next else { break };
                 match next {
-                    Ok(StreamEvent::TextDelta(delta)) => text.push_str(&delta),
-                    Ok(StreamEvent::Done { usage: Some(found), .. }) => usage = found,
+                    Ok(StreamEvent::TextDelta(delta)) => {
+                        append_with_limit(&mut text, &delta, policy.max_summary_bytes);
+                    }
+                    Ok(StreamEvent::Done { usage: Some(found), .. }) => usage = Some(found),
                     Ok(StreamEvent::Done { .. })
                     | Ok(StreamEvent::ReasoningDelta(_))
                     | Ok(StreamEvent::OpaqueState { .. })
@@ -168,8 +193,17 @@ async fn model_summarize(
             "summarizer produced no output".into(),
         ));
     }
-    let text = truncate_utf8(&text, policy.max_summary_bytes);
     Ok((text, usage))
+}
+
+/// Append a provider delta without allowing a long or malicious stream to
+/// defeat the configured final-summary memory budget.
+fn append_with_limit(target: &mut String, delta: &str, max_bytes: usize) {
+    if target.len() >= max_bytes {
+        return;
+    }
+    let remaining = max_bytes - target.len();
+    target.push_str(truncate_bytes(delta, remaining));
 }
 
 /// A capped `max_tokens` budget for the summarizer: large enough for the full
@@ -181,14 +215,14 @@ fn summary_max_tokens(policy: &CompactionPolicy) -> u32 {
 
 /// Append the deterministic `<files-read>` / `<files-modified>` sections to a
 /// generated summary.
-fn append_file_lists(summary: String, plan: &CompactionPlan) -> String {
+fn append_file_lists(summary: String, plan: &CompactionPlan, max_summary_bytes: usize) -> String {
     let operations = extract_file_operations(&plan.to_summarize);
     let lists = format_file_operations(&operations);
     if lists.is_empty() {
-        summary
-    } else {
-        format!("{summary}{lists}")
+        return truncate_bytes(&summary, max_summary_bytes).to_owned();
     }
+    let combined = format!("{summary}{lists}");
+    truncate_bytes(&combined, max_summary_bytes).to_owned()
 }
 
 /// Deterministic fallback: a condensed transcript of the summarized span,
@@ -205,8 +239,11 @@ fn deterministic_summary(plan: &CompactionPlan, policy: &CompactionPolicy) -> St
     } else {
         text.push_str(&serialized.text);
     }
-    let text = truncate_utf8(&text, policy.max_summary_bytes);
-    append_file_lists(text, plan)
+    if serialized.truncated && policy.max_summary_input_bytes > OMISSION_MARKER.len() {
+        text.push('\n');
+        text.push_str(OMISSION_MARKER);
+    }
+    append_file_lists(text, plan, policy.max_summary_bytes)
 }
 
 #[cfg(test)]
@@ -283,6 +320,24 @@ mod tests {
         }
     }
 
+    struct HangingSummaryProvider;
+
+    #[async_trait]
+    impl Provider for HangingSummaryProvider {
+        fn name(&self) -> &str {
+            "hanging-summary"
+        }
+
+        async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, llm::LlmError> {
+            std::future::pending::<()>().await;
+            unreachable!("the provider stream should be cancelled first")
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, llm::LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -320,13 +375,24 @@ mod tests {
         match outcome {
             SummaryOutcome::Model { text, usage } => {
                 assert!(text.contains("## Goal"));
-                assert_eq!(usage.output_tokens, 20);
+                assert_eq!(usage.unwrap().output_tokens, 20);
                 // File lists derived from the read tool calls are appended.
                 assert!(text.contains("<files-read>"));
                 assert!(text.contains("src/lib.rs"));
             }
             other => panic!("expected model outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn final_summary_budget_includes_file_operation_lists() {
+        let plan = build_plan();
+        let policy = CompactionPolicy {
+            max_summary_bytes: 128,
+            ..CompactionPolicy::default()
+        };
+        let summary = deterministic_summary(&plan, &policy);
+        assert!(summary.len() <= policy.max_summary_bytes);
     }
 
     #[test]
@@ -352,6 +418,42 @@ mod tests {
             }
             other => panic!("expected deterministic outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cancellation_interrupts_provider_stream_acquisition() {
+        let runtime = runtime();
+        let plan = build_plan();
+        let provider = HangingSummaryProvider;
+        let policy = CompactionPolicy::default();
+        let cancel = CancellationToken::new();
+        let mut summary = Box::pin(summarize(&provider, "demo", &plan, &policy, None, &cancel));
+        let outcome = runtime.block_on(async {
+            tokio::select! {
+                outcome = &mut summary => panic!("summary completed unexpectedly: {outcome:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => cancel.cancel(),
+            }
+            summary.await
+        });
+        assert_eq!(outcome, SummaryOutcome::Cancelled);
+    }
+
+    #[test]
+    fn cancelled_summarization_does_not_fall_back_or_emit_a_summary() {
+        let runtime = runtime();
+        let plan = build_plan();
+        let provider = ScriptProvider { events: Vec::new() };
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let outcome = runtime.block_on(summarize(
+            &provider,
+            "demo",
+            &plan,
+            &CompactionPolicy::default(),
+            None,
+            &cancel,
+        ));
+        assert_eq!(outcome, SummaryOutcome::Cancelled);
     }
 
     #[test]

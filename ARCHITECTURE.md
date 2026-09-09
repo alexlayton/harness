@@ -109,23 +109,43 @@ prompt metadata, concurrency class, and executor. The system prompt and
 `ToolRegistry` snapshot; never maintain a second hand-written tool list.
 
 Dedicated path tools confine resolution to the workspace and reject lexical or
-symlink escapes. The shell starts in the workspace but is not a sandbox; it can
-access anything available to the operating-system user. File mutations also
-use process-local locks to prevent overlapping writes.
+symlink escapes. The shell is not a sandbox and can access anything available
+to the operating-system user, but every bash invocation is exclusive. Bash runs
+with a 120-second default timeout (maximum 86,400 seconds) and caps output at
+2,000 lines or 50 KiB. On Linux, it creates a private writable cgroup-v2 scope
+when the host permits it, attaches the shell before exec, and uses
+`cgroup.kill` plus a process group for timeout, cancellation, future-drop, and
+normal-exit cleanup. That scope reaches descendants which call `setsid`, so
+those descendants cannot retain the tool's pipes or mutate the workspace after
+cleanup. If cgroup-v2 delegation is unavailable, Linux falls back to the
+process group and its guarantee is only best effort. macOS has the same
+process-group best effort: a descendant that calls `setsid` may survive and
+still access operating-system paths after the call returns, although the
+shared one-second drain deadline bounds Harness waiting. Other non-Unix
+platforms only guarantee direct-child termination. File mutations also use
+process-local locks to prevent overlapping writes.
 
 `mcp` starts configured stdio servers during assembly, discovers their tools,
 namespaces them, and registers adapters in the same registry. MCP calls are
-exclusive. Tool-list changes require a new connection, and MCP tools are not
-passed to subagents.
+exclusive. Limits: 15-second initialize/catalogue deadlines, 60-second call
+deadline, four-second global shutdown; each newline-delimited stdio frame is
+capped at 1 MiB before rmcp deserialization; at most 256 tools and 512 KiB of
+aggregate definitions per server; schemas bounded by depth, node count, and
+string/total size; output compacted and capped at 20 KiB. Tool-list changes
+require a new connection, and MCP tools are not passed to subagents.
 
 The subagent schema lives in `tools`, while its runner lives in `agent` to
 preserve dependency direction. Important invariants are:
 
-- Read-only children receive only `read`, `find`, and `grep`; unavailable tools,
-  not prompt wording, enforce the restriction.
+- Read-only children receive only `read`, `find`, `grep`, and `multigrep`;
+  unavailable tools, not prompt wording, enforce the restriction.
 - Workspace children can use normal built-ins and run exclusively.
 - Children cannot create subagents.
-- Each child gets fresh model context and a bounded turn count.
+- Each child gets fresh model context and bounded turns/context; older tool
+  evidence is compacted or truncated before the final synthesis request.
+  A cancelled compaction persists neither a summary nor usage; without a
+  session, automatic compaction is disabled and `/compact` reports that it
+  is unavailable.
 - Tool call IDs remain stable through scheduling, UI events, and persistence.
 - Child sessions link to their parent, but child usage is not added to parent
   totals.
@@ -162,6 +182,9 @@ See [`docs/configuration.md`](./docs/configuration.md) and
   concurrent writers.
 - `context_messages()` reconstructs valid provider history and handles
   incomplete final tool calls.
+- Model-assisted compaction appends a bounded summary event and falls back to
+  a deterministic local summary when the provider cannot summarize; history
+  remains append-only.
 - Sessions are grouped by workspace and stored outside the project by default.
 
 See [`crates/session/README.md`](./crates/session/README.md) for the format and

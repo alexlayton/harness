@@ -8,9 +8,11 @@
 //! prompt and therefore immune to compaction (the prompt is rebuilt every
 //! turn).
 //!
-//! The budget and ordering rules follow the skills/AGENTS.md design doc:
-//! global first (lowest priority), then repo root → cwd with the nearest
-//! (cwd) file loaded last so it overrides parents.
+//! Symlink policy: a candidate is read only when its canonical path stays
+//! beneath its canonical discovery directory. Contained symlinks (whose
+//! targets remain inside the same directory) are followed; external symlinks
+//! are silently skipped so untrusted outside files can never enter the
+//! prompt. Skips never include file contents in diagnostics.
 
 use std::collections::HashSet;
 use std::fs;
@@ -117,22 +119,24 @@ fn load_context_files_impl(
 
     // Pick the first existing candidate per directory, dedupe by canonical
     // path (symlinked roots on macOS can surface the same file twice), and
-    // read it. Unreadable files are skipped silently; a missing global path
-    // is the normal case and never an error.
+    // read it through the containment gate: the canonical candidate must
+    // stay beneath its canonical discovery directory, otherwise it is a
+    // symlink escape and is silently skipped (no contents in diagnostics).
+    // Unreadable files are skipped silently; a missing global path is the
+    // normal case and never an error.
     let mut found: Vec<(PathBuf, String)> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for dir in dirs {
         let Some(path) = first_candidate(&dir) else {
             continue;
         };
-        let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let Some((canonical, display, raw)) = read_contained_candidate(&dir, &path) else {
+            continue;
+        };
         if !seen.insert(canonical) {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        found.push((path, raw));
+        found.push((display, raw));
     }
 
     // Spend the budget from highest priority (cwd/nearest) to lowest, then
@@ -210,6 +214,39 @@ fn first_candidate(dir: &Path) -> Option<PathBuf> {
         .iter()
         .map(|name| dir.join(name))
         .find(|path| path.is_file())
+}
+
+/// Validate and read one context candidate through a retained discovery-root
+/// capability. Canonicalization is used only for the containment decision;
+/// the final read is handle-relative and rejects a symlink swapped in after
+/// that decision.
+fn read_contained_candidate(dir: &Path, candidate: &Path) -> Option<(PathBuf, PathBuf, String)> {
+    let workspace = super::vfs::WorkspaceFs::open_root(dir).ok()?;
+    let canonical_dir = workspace.root().to_path_buf();
+    let canonical = fs::canonicalize(candidate).ok()?;
+    if !canonical.starts_with(&canonical_dir) {
+        return None;
+    }
+    let relative = canonical.strip_prefix(&canonical_dir).ok()?;
+    let components = super::vfs::split_relative(&relative.to_string_lossy()).ok()?;
+    #[cfg(unix)]
+    let raw = {
+        use std::io::Read;
+        let fd = super::vfs::unix::open_file_relative(&workspace, &components).ok()?;
+        let mut file = std::fs::File::from(fd);
+        let mut raw = String::new();
+        file.read_to_string(&mut raw).ok()?;
+        raw
+    };
+    #[cfg(not(unix))]
+    {
+        // Do not canonicalize and then reopen by pathname on platforms where
+        // an ancestor reparse point can be swapped between those operations.
+        let _ = components;
+        return None;
+    }
+    #[cfg(unix)]
+    Some((canonical, candidate.to_path_buf(), raw))
 }
 
 /// Render loaded context files as a `<project_context>` block. Returns an
@@ -459,5 +496,48 @@ mod tests {
             Some(global.path().to_path_buf()),
         );
         assert!(files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_context_symlink_is_not_injected() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let repo = root.path().join("repo");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        write(&repo.join(".git"), "");
+        // External target with a sentinel secret: it must never be injected.
+        let secret = outside.join("AGENTS.md");
+        write(&secret, "EXTERNAL-SENTINEL-CONTENT\n");
+        symlink(&secret, repo.join("AGENTS.md")).unwrap();
+        let global = tempdir().unwrap();
+        let files = load_context_files_impl(
+            &repo,
+            &ContextFileConfig::default(),
+            true,
+            Some(global.path().to_path_buf()),
+        );
+        assert!(files.is_empty(), "external symlink: {files:?}");
+        // No contents leak through any rendered output either.
+        let rendered = format_context_files(&files);
+        assert!(!rendered.contains("EXTERNAL-SENTINEL-CONTENT"));
+
+        // A contained symlink (target in the same directory) still works.
+        fs::remove_file(repo.join("AGENTS.md")).unwrap();
+        let inner = repo.join("real.md");
+        write(&inner, "inner content\n");
+        // `first_candidate` prefers AGENTS.md, so link the inner file under
+        // the canonical candidate name.
+        symlink(&inner, repo.join("AGENTS.md")).unwrap();
+        let files = load_context_files_impl(
+            &repo,
+            &ContextFileConfig::default(),
+            true,
+            Some(global.path().to_path_buf()),
+        );
+        assert_eq!(files.len(), 1);
+        assert!(files[0].content.contains("inner content"));
     }
 }

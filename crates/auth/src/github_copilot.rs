@@ -28,6 +28,9 @@ pub const COPILOT_EDITOR_VERSION: &str = "vscode/1.107.0";
 pub const COPILOT_EDITOR_PLUGIN_VERSION: &str = "copilot-chat/0.35.0";
 pub const COPILOT_INTEGRATION_ID: &str = "vscode-chat";
 pub const COPILOT_API_VERSION: &str = "2026-06-01";
+/// Bound optional model discovery so a successful token exchange is never
+/// held hostage by an unavailable enrichment endpoint.
+const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The known model IDs used for best-effort policy enablement after login.
 /// Routing metadata lives in the LLM crate, but policy enablement belongs to
@@ -150,6 +153,39 @@ impl fmt::Debug for GithubCopilotClient {
 impl GithubCopilotClient {
     pub fn new() -> Result<Self> {
         Self::from_endpoints(CopilotEndpoints::for_domain(None)?)
+    }
+
+    /// Test seam: build a client whose token exchange and model discovery
+    /// hit injectable endpoints (local fixture), keeping production
+    /// endpoint construction untouched. `CopilotAuth` uses this in tests so
+    /// concurrent `ensure_valid` exercises the real `refresh` path.
+    /// Takes a client builder (not a built client) so the provider
+    /// install inside always precedes `reqwest::Client` construction —
+    /// the crate uses `rustls-no-provider`, and building first panics.
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the rewritten single-flight/login tests
+    pub(crate) fn with_client_and_endpoints(
+        build_http: impl FnOnce() -> Client,
+        endpoints: CopilotEndpoints,
+    ) -> Result<Self> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Ok(Self {
+            http: build_http(),
+            endpoints,
+            api_base_url: None,
+        })
+    }
+
+    /// Test seam: redirect the model-catalogue base URL at a local
+    /// fixture. Production callers leave this unset so the Copilot token's
+    /// `proxy-ep` (or the pinned host) chooses the host; tests set it so a
+    /// failing `/models` endpoint proves login still persists. Prefer this
+    /// over `with_api_base_url` in tests: the `_for_test` name marks the
+    /// redirect as fixture-only at the call site.
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the model-list-failure login test
+    pub(crate) fn with_api_base_url_for_test(self, base_url: impl Into<String>) -> Self {
+        self.with_api_base_url(base_url)
     }
 
     pub fn with_endpoints(endpoints: CopilotEndpoints) -> Result<Self> {
@@ -433,6 +469,29 @@ impl GithubCopilotClient {
         parse_available_model_ids_value(&value, fallback)
     }
 
+    /// Token-derived Copilot proxy endpoints must be HTTPS without embedded
+    /// credentials: accept only `https://host[:port]` with no userinfo,
+    /// query, or fragment.  HTTP or credential-bearing endpoints are
+    /// rejected rather than used for bearer-token requests.
+    pub fn proxy_endpoint(&self, token: &str) -> Result<String> {
+        let url = base_url_from_proxy_token(token)
+            .ok_or_else(|| AuthError::InvalidCredential("invalid Copilot proxy endpoint".into()))?;
+        let parsed = Url::parse(&url)
+            .map_err(|_| AuthError::InvalidCredential("invalid Copilot proxy endpoint".into()))?;
+        if parsed.scheme() != "https"
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(AuthError::InvalidCredential(
+                "untrusted Copilot proxy endpoint".into(),
+            ));
+        }
+        Ok(url)
+    }
+
     /// Enablement is best effort: some accounts reject policy writes even
     /// though already-enabled models work.  Cancellation remains fatal.
     pub async fn enable_known_models(
@@ -512,10 +571,29 @@ impl GithubCopilotClient {
         &self,
         enterprise_domain: Option<&str>,
         cancel: &CancellationToken,
-        mut emit: F,
+        emit: F,
     ) -> Result<CopilotCredential>
     where
         F: FnMut(AuthEvent) + Send,
+    {
+        self.login_with_events_and_persist(enterprise_domain, cancel, emit, |_| Ok(()))
+            .await
+    }
+
+    /// Complete device login while durably saving the exchanged credential
+    /// before optional model discovery. The persistence hook lets the auth
+    /// wrapper make the initial token usable even when enrichment hangs or
+    /// fails.
+    pub async fn login_with_events_and_persist<F, P>(
+        &self,
+        enterprise_domain: Option<&str>,
+        cancel: &CancellationToken,
+        mut emit: F,
+        mut persist: P,
+    ) -> Result<CopilotCredential>
+    where
+        F: FnMut(AuthEvent) + Send,
+        P: FnMut(&CopilotCredential) -> Result<()> + Send,
     {
         emit(AuthEvent::Started);
         let domain = normalize_domain(enterprise_domain)?;
@@ -536,23 +614,36 @@ impl GithubCopilotClient {
             emit(AuthEvent::Progress {
                 message: "GitHub authorized; exchanging Copilot token...".into(),
             });
-            let mut credential = client
+            // Persist the exchanged credential before optional model
+            // discovery: a models/policy failure must still leave a usable
+            // login. Discovery and enrichment stay best effort.
+            let credential = client
                 .exchange_copilot_token(&github_token, domain.as_deref(), cancel)
                 .await?;
-            emit(AuthEvent::Progress {
-                message: "Enabling available Copilot models...".into(),
-            });
-            client
-                .enable_known_models(&credential.access, domain.as_deref(), cancel)
-                .await?;
-            credential.available_model_ids = client
-                .fetch_available_model_ids(&credential.access, domain.as_deref(), cancel)
-                .await?;
-            Ok::<_, AuthError>(credential)
+            persist(&credential)?;
+            let mut enriched = credential.clone();
+            let discovery = tokio::time::timeout(
+                MODEL_DISCOVERY_TIMEOUT,
+                client.fetch_available_model_ids(&credential.access, domain.as_deref(), cancel),
+            )
+            .await;
+            match discovery {
+                Ok(Ok(ids)) => enriched.available_model_ids = ids,
+                Ok(Err(AuthError::Cancelled)) => return Err(AuthError::Cancelled),
+                Ok(Err(_)) | Err(_) => {}
+            }
+            if enriched.available_model_ids != credential.available_model_ids {
+                persist(&enriched)?;
+            }
+            Ok::<_, AuthError>(enriched)
         }
         .await;
         match result {
             Ok(credential) => {
+                // The client owns no store, so it persists nothing itself;
+                // the `CopilotAuth` wrapper persists exactly once.  A models
+                // failure was already swallowed above and can never lose the
+                // login.
                 emit(AuthEvent::Finished);
                 Ok(credential)
             }
@@ -598,6 +689,10 @@ pub fn parse_copilot_token(
 }
 
 /// Derive the API host from Copilot's semicolon-delimited token metadata.
+/// The `proxy-ep` value may be a bare host or a full URL; userinfo-bearing
+/// values are rejected here (returning `None`) so neither
+/// `base_url_from_proxy_token` nor its trusted callers can launder
+/// `user@host` into a bearer-token endpoint.
 pub fn base_url_from_proxy_token(token: &str) -> Option<String> {
     let proxy = token.split(';').find_map(|part| {
         part.trim()
@@ -606,6 +701,11 @@ pub fn base_url_from_proxy_token(token: &str) -> Option<String> {
             .filter(|value| !value.is_empty())
     })?;
     let (scheme, host) = if let Ok(url) = Url::parse(proxy) {
+        // Reject embedded credentials at parse time: `Url` splits
+        // `user@host`, and a laundered host must never become an API base.
+        if !url.username().is_empty() || url.password().is_some() {
+            return None;
+        }
         let host = url.host_str()?.to_owned();
         let host = url
             .port()
@@ -649,7 +749,19 @@ pub fn sku_from_proxy_token(token: &str) -> Option<&str> {
 }
 
 pub fn copilot_base_url(token: &str, enterprise_domain: Option<&str>) -> String {
-    if let Some(url) = base_url_from_proxy_token(token) {
+    // Only HTTPS token-derived endpoints are trusted for bearer-token use;
+    // anything else (HTTP, userinfo, query) falls through to the pinned
+    // enterprise/individual hosts so a malicious token cannot redirect API
+    // calls.
+    if let Some(url) = base_url_from_proxy_token(token)
+        && let Ok(parsed) = Url::parse(&url)
+        && parsed.scheme() == "https"
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none()
+    {
         return url;
     }
     if let Ok(Some(domain)) = normalize_domain(enterprise_domain) {
@@ -707,12 +819,6 @@ pub fn parse_available_model_ids_value(
     }
 }
 
-pub fn parse_available_model_ids(body: &str, allow_policy_fallback: bool) -> Result<Vec<String>> {
-    let value = serde_json::from_str(body)
-        .map_err(|_| AuthError::InvalidCredential("invalid Copilot models JSON".into()))?;
-    parse_available_model_ids_value(&value, allow_policy_fallback)
-}
-
 fn push_unique(values: &mut Vec<String>, value: &str) {
     if !values.iter().any(|existing| existing == value) {
         values.push(value.to_owned());
@@ -727,6 +833,10 @@ pub struct CopilotAuth {
     store: AuthStore,
     client: GithubCopilotClient,
     credential: Arc<Mutex<Option<CopilotCredential>>>,
+    /// Serializes rotating refresh-token exchanges so concurrent
+    /// `ensure_valid` calls produce one network refresh and never let an
+    /// older completion overwrite newer credentials.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl fmt::Debug for CopilotAuth {
@@ -750,6 +860,7 @@ impl CopilotAuth {
             store,
             client: GithubCopilotClient::new()?,
             credential: Arc::new(Mutex::new(credential)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -757,8 +868,22 @@ impl CopilotAuth {
         Self::new(AuthStore::default())
     }
 
-    pub fn store(&self) -> &AuthStore {
-        &self.store
+    /// Test seam: swap the HTTP client/endpoints on a live auth handle
+    /// (which already holds the seeded store + cache) so refresh tests hit
+    /// a local fixture through the real `ensure_valid` path. Takes `&self`
+    /// because `CopilotAuth` is shared by clone across waiter tasks.
+    /// (`with_client`, the by-value variant, was removed once this
+    /// landed: rebuilding from the store reseeds the cache from disk
+    /// and drops in-memory state the test had seeded.)
+    #[cfg(test)]
+    #[allow(dead_code)] // consumed by the rewritten single-flight test
+    pub(crate) fn with_client_for_test(&self, client: GithubCopilotClient) -> Self {
+        Self {
+            store: self.store.clone(),
+            client,
+            credential: self.credential.clone(),
+            refresh_lock: self.refresh_lock.clone(),
+        }
     }
 
     pub fn credential(&self) -> Result<Option<CopilotCredential>> {
@@ -799,6 +924,38 @@ impl CopilotAuth {
     }
 
     pub async fn refresh(&self) -> Result<CopilotCredential> {
+        // Single-flight: concurrent refreshers queue on the async guard,
+        // then recheck before hitting the network.  The blocking cache
+        // mutex is never held across network work.
+        let _guard = self.refresh_lock.lock().await;
+        // Reload: another waiter (or process) may have already refreshed.
+        if let Ok(Some(current)) = self.store.copilot() {
+            let cached = self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))?
+                .clone();
+            match cached {
+                Some(cached) if !cached.is_expired() => return Ok(cached),
+                Some(cached)
+                    if !current.is_expired()
+                        && (current.access != cached.access
+                            || current.refresh != cached.refresh) =>
+                {
+                    *self.credential.lock().map_err(|_| {
+                        AuthError::InvalidCredential("credential lock poisoned".into())
+                    })? = Some(current.clone());
+                    return Ok(current);
+                }
+                None if !current.is_expired() => {
+                    *self.credential.lock().map_err(|_| {
+                        AuthError::InvalidCredential("credential lock poisoned".into())
+                    })? = Some(current.clone());
+                    return Ok(current);
+                }
+                _ => {}
+            }
+        }
         let old = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
         let cancel = CancellationToken::new();
         let mut refreshed = self.client.refresh_copilot_token(&old, &cancel).await?;
@@ -818,13 +975,26 @@ impl CopilotAuth {
         } else {
             refreshed.available_model_ids = old.available_model_ids.clone();
         }
-        self.store.save_copilot(&refreshed)?;
+        // Compare and save under the auth-file lock. A separate process may
+        // have rotated the credential while this exchange and enrichment were
+        // in flight, so a stale completion must never overwrite it.
+        if self.store.save_copilot_if_current(&old, &refreshed)? {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
+                Some(refreshed.clone());
+            return Ok(refreshed);
+        }
+        let current = self.store.copilot()?.ok_or_else(|| {
+            AuthError::InvalidCredential("credential changed during refresh".into())
+        })?;
         *self
             .credential
             .lock()
             .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-            Some(refreshed.clone());
-        Ok(refreshed)
+            Some(current.clone());
+        Ok(current)
     }
 
     /// Fetch current model policy data and persist the refreshed list without
@@ -875,10 +1045,12 @@ impl CopilotAuth {
         } else {
             self.client.clone()
         };
+        let store = self.store.clone();
         let credential = client
-            .login_with_events(domain.as_deref(), cancel, emit)
+            .login_with_events_and_persist(domain.as_deref(), cancel, emit, move |credential| {
+                store.save_copilot(credential)
+            })
             .await?;
-        self.store.save_copilot(&credential)?;
         *self
             .credential
             .lock()
@@ -981,6 +1153,35 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_proxy_endpoints_fall_back_and_are_rejected() {
+        // HTTP token-derived endpoints are never trusted for bearer use.
+        assert_eq!(
+            copilot_base_url(
+                "tid=x;proxy-ep=http://proxy.individual.githubcopilot.com;exp=1",
+                None
+            ),
+            "https://api.individual.githubcopilot.com"
+        );
+        let client = GithubCopilotClient::new().unwrap();
+        assert!(
+            client
+                .proxy_endpoint("tid=x;proxy-ep=http://evil.example.com;exp=1")
+                .is_err()
+        );
+        assert!(
+            client
+                .proxy_endpoint("tid=x;proxy-ep=https://evil.example.com@other.example.com;exp=1")
+                .is_err()
+        );
+        assert_eq!(
+            client
+                .proxy_endpoint("tid=x;proxy-ep=proxy.individual.githubcopilot.com;exp=1")
+                .unwrap(),
+            "https://api.individual.githubcopilot.com"
+        );
+    }
+
+    #[test]
     fn parses_billing_sku_from_token_metadata() {
         assert_eq!(
             sku_from_proxy_token("tid=x;sku=free_limited_copilot;chat=1"),
@@ -1021,5 +1222,338 @@ mod tests {
         .unwrap();
         assert_eq!(credential.expires, 1_999_700_000);
         assert!(!format!("{credential:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_single_flights_on_one_network_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Local fixture emulating a single-use rotating refresh token:
+        // the FIRST `/copilot_internal/v2/token` exchange succeeds and
+        // rotates the token; any SECOND exchange fails, so every waiter
+        // must share the first waiter's result through the real
+        // `ensure_valid` single-flight guard — not a reimplemented copy.
+        let exchanges = std::sync::Arc::new(AtomicUsize::new(0));
+        let exchanges_task = exchanges.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                let (status, body) = if request.contains("/copilot_internal/v2/token") {
+                    let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // First exchange rotates to a fresh single-use pair.
+                        // `expires_at` is far-future seconds; the 5-minute
+                        // skew still leaves the credential unexpired.
+                        (
+                            200,
+                            r#"{"token":"access-rotated","expires_at":9999999999}"#.to_owned(),
+                        )
+                    } else {
+                        // A second exchange means single-flight failed:
+                        // the rotated refresh token is already spent.
+                        (401, r#"{"error":"rotated token already used"}"#.to_owned())
+                    }
+                } else if request.contains("GET /models ") {
+                    // Model enrichment succeeds so the persisted result is
+                    // the fully-enriched credential every waiter saw.
+                    (
+                        200,
+                        r#"{"data":[{"id":"gpt-5.4","model_picker_enabled":true}]}"#.to_owned(),
+                    )
+                } else {
+                    (404, r#"{"error":"unexpected"}"#.to_owned())
+                };
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        // Expired credential so every waiter wants a refresh.
+        store
+            .save_copilot(&CopilotCredential::new(
+                "access-old",
+                "refresh-single-use",
+                1,
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+        let auth = CopilotAuth::new(store).unwrap().with_client_for_test(
+            GithubCopilotClient::with_client_and_endpoints(
+                reqwest::Client::new,
+                CopilotEndpoints {
+                    device_code_url: format!("http://{addr}/login/device/code"),
+                    access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                    copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+                },
+            )
+            .unwrap()
+            .with_api_base_url_for_test(format!("http://{addr}")),
+        );
+        // N concurrent `ensure_valid` calls through the REAL refresh path.
+        // A barrier releases them together so they pile onto the guard
+        // while the first exchange is in flight.
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+        let waiters = (0..8)
+            .map(|_| {
+                let auth = auth.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    auth.ensure_valid().await.unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut results = Vec::new();
+        for waiter in waiters {
+            results.push(waiter.await.unwrap());
+        }
+        // One network exchange despite 8 concurrent waiters…
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        // …every waiter shares the rotated credential…
+        for credential in &results {
+            assert_eq!(credential.access, "access-rotated");
+            assert_eq!(credential.refresh, "refresh-single-use");
+        }
+        // …and the persisted credential equals what the waiters saw.
+        let persisted = auth.store.copilot().unwrap().unwrap();
+        assert_eq!(persisted.access, "access-rotated");
+        assert_eq!(persisted.refresh, "refresh-single-use");
+        assert_eq!(persisted.available_model_ids, vec!["gpt-5.4"]);
+    }
+
+    /// AUTH-2: two handles on one store (two processes, two agent
+    /// instances) racing `ensure_valid` still produce one exchange: the
+    /// loser adopts the winner's persisted rotation via the reload-
+    /// recheck guard instead of exchanging a second time. (True
+    /// simultaneity could still double-exchange — separate guards, one
+    /// file — but compare-and-save then keeps the loser's stale
+    /// completion from overwriting the winner; the single-use fixture
+    /// would reject it with 401. What this test pins is the
+    /// reload-recheck path: a handle whose guard acquisition lands after
+    /// the winner's persist never hits the network.)
+    #[tokio::test]
+    async fn two_handles_racing_refresh_share_one_exchange() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let exchanges = std::sync::Arc::new(AtomicUsize::new(0));
+        let exchanges_task = exchanges.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                let (status, body) = if request.contains("/copilot_internal/v2/token") {
+                    let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        // Hold the first exchange open so the second handle
+                        // starts its own exchange concurrently.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        (
+                            200,
+                            r#"{"token":"access-winner","expires_at":9999999999}"#.to_owned(),
+                        )
+                    } else {
+                        (401, r#"{"error":"rotated token already used"}"#.to_owned())
+                    }
+                } else if request.contains("GET /models ") {
+                    (
+                        200,
+                        r#"{"data":[{"id":"gpt-5.4","model_picker_enabled":true}]}"#.to_owned(),
+                    )
+                } else {
+                    (404, r#"{"error":"unexpected"}"#.to_owned())
+                };
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        AuthStore::new(path.clone())
+            .save_copilot(&CopilotCredential::new(
+                "access-old",
+                "refresh-single-use",
+                1,
+                None,
+                Vec::new(),
+            ))
+            .unwrap();
+        let client = || {
+            GithubCopilotClient::with_client_and_endpoints(
+                reqwest::Client::new,
+                CopilotEndpoints {
+                    device_code_url: format!("http://{addr}/login/device/code"),
+                    access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                    copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+                },
+            )
+            .unwrap()
+            .with_api_base_url_for_test(format!("http://{addr}"))
+        };
+        // Two independent handles, one shared file — the closest a unit
+        // test gets to two processes. Separate caches, separate guards.
+        let first = CopilotAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_client_for_test(client());
+        let second = CopilotAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_client_for_test(client());
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let first_task = tokio::spawn({
+            let first = first.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                first.ensure_valid().await
+            }
+        });
+        let second_task = tokio::spawn({
+            let second = second.clone();
+            let barrier = barrier.clone();
+            async move {
+                barrier.wait().await;
+                // Let the winner's persist land first so the loser's
+                // reload-recheck path is deterministic: it must adopt
+                // the winner's unexpired rotation with no new exchange.
+                // (The exchange itself cannot be delayed past the
+                // winner's persist — both handles race it — but the
+                // loser's guard acquisition can.)
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                second.ensure_valid().await
+            }
+        });
+        let (first_result, second_result) = tokio::join!(first_task, second_task);
+        let first_result = first_result.unwrap().unwrap();
+        assert_eq!(first_result.access, "access-winner");
+        // The loser adopted the winner's persisted rotation instead of
+        // exchanging a second time: one network exchange total.
+        let second_result = second_result.unwrap().unwrap();
+        assert_eq!(second_result.access, "access-winner");
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
+        let persisted = AuthStore::new(path).copilot().unwrap().unwrap();
+        assert_eq!(persisted.access, "access-winner");
+    }
+
+    /// AUTH-3: a failing model catalogue still leaves a usable persisted
+    /// credential. The fixture's `/models` endpoint fails (500); login
+    /// must return the exchanged credential anyway, `Finished` must
+    /// fire, and the store must hold the pre-discovery credential — not
+    /// an enrichment failure. (A hang would exercise the same swallow
+    /// path via the 15s discovery timeout, but failing fast keeps the
+    /// suite fast; the timeout itself is covered by construction.)
+    #[tokio::test]
+    async fn model_list_failure_still_leaves_a_usable_persisted_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 8192];
+                let _ = socket.read(&mut scratch).await;
+                let request = String::from_utf8_lossy(&scratch).into_owned();
+                // Device + access-token polls succeed immediately;
+                // exchange mints the Copilot token; `/models` hangs so
+                // discovery can only resolve via the login timeout.
+                let reply = if request.contains("POST /login/device/code ") {
+                    (
+                        200,
+                        serde_json::json!({
+                            "device_code": "device-1",
+                            "user_code": "ABCD-EFGH",
+                            "verification_uri": "https://github.com/login/device",
+                            "expires_in": 900,
+                            "interval": 0,
+                        })
+                        .to_string(),
+                    )
+                } else if request.contains("POST /login/oauth/access_token ") {
+                    (
+                        200,
+                        r#"{"access_token":"github-token","token_type":"bearer"}"#.to_owned(),
+                    )
+                } else if request.contains("/copilot_internal/v2/token") {
+                    (
+                        200,
+                        r#"{"token":"access-login","expires_at":9999999999}"#.to_owned(),
+                    )
+                } else if request.contains("GET /models ") {
+                    // Fail the catalogue: discovery swallows the error
+                    // and login keeps the pre-discovery credential.
+                    (500, r#"{"error":"catalogue unavailable"}"#.to_owned())
+                } else {
+                    (404, r#"{"error":"unexpected"}"#.to_owned())
+                };
+                let (status, body) = reply;
+                let reason = if status == 200 { "OK" } else { "Error" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(body.as_bytes()).await;
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let client = GithubCopilotClient::with_client_and_endpoints(
+            reqwest::Client::new,
+            CopilotEndpoints {
+                device_code_url: format!("http://{addr}/login/device/code"),
+                access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+            },
+        )
+        .unwrap()
+        .with_api_base_url_for_test(format!("http://{addr}"));
+        let auth = CopilotAuth::new(AuthStore::new(path.clone()))
+            .unwrap()
+            .with_client_for_test(client);
+        let mut events = Vec::new();
+        let credential = tokio::time::timeout(
+            Duration::from_secs(60),
+            auth.login_with_events(None, &CancellationToken::new(), |event| {
+                events.push(event);
+            }),
+        )
+        .await
+        .expect("login must resolve via the discovery timeout, not hang")
+        .unwrap();
+        // Returned credential is the exchanged token, unenriched…
+        assert_eq!(credential.access, "access-login");
+        assert!(credential.available_model_ids.is_empty());
+        // …and the persisted credential matches: usable without models.
+        let persisted = AuthStore::new(path).copilot().unwrap().unwrap();
+        assert_eq!(persisted.access, "access-login");
+        assert_eq!(persisted.refresh, "github-token");
+        assert!(persisted.available_model_ids.is_empty());
+        assert!(events.contains(&AuthEvent::Started));
+        assert!(events.contains(&AuthEvent::Finished));
     }
 }

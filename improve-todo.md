@@ -1,0 +1,296 @@
+# Harness improvement TODO — audit of `improve` vs `improve-plan.md`
+
+Branch: `improve` vs base `9cfa5fc674784092346e682fa4a61fb473590248`.
+Scope: 73 commits, 77 files, `+11548/-3187`.
+Method: current code + `git diff 9cfa5fc..HEAD` vs plan Implementation / Required tests / Acceptance.
+
+Legend: `DONE` / `PARTIAL` / `MISSING`.
+
+## Phase 1 — Persisted-state correctness (`crates/session`, `crates/compact`)
+
+### SESSION-1 Preserve recent tail after compaction — DONE
+- `crates/session/src/model.rs:842 latest_compaction_boundary`, `:864-883 events_after_latest_compaction` returns latest summary first, then `seq > compacted_through && !CompactionSummary` in order. Older summaries excluded.
+- `validate_record:~1146-1160` rejects `compacted_through >= record.sequence` (self/future) and `<= previous` (monotonic). `validate_compaction_boundary:1176-1212` requires existing event, `boundary >= summary_sequence` err, splits unresolved `ToolCall` err.
+- Single source: `context_messages:742-743` and `plan_compaction:plan.rs:55,72` share `latest_compaction_boundary` + `events_after_latest_compaction`.
+- Tests `model.rs:~1555-1700`: `user1,assistant1,user2,assistant2,summary(through=2) → [5,3,4] summary,user2,assistant2`; post-summary append `[5,3,4,6]`; repeat retains only newest `[8,7]`; invalid self `3`/future `99`/repeat `2`; `compaction_boundary_keeps_tool_call_result_pairs [5,2,3,4]`; `compaction_rejects_a_boundary_inside_a_parallel_batch`.
+
+### SESSION-2 Repair incomplete crash tail — DONE
+- `crates/session/src/codec.rs:109 TailRecovery{recovered,valid_bytes}`, `decode_session_file:135`, `decode_session_file_bytes:143-181` UTF-8 tail handling, `decode_session_lines:~270-420` tracks `consumed_bytes`, recovers only `recover_trailing && unterminated && last_line` serde err with `valid_bytes=consumed_bytes`.
+- Load never mutates; `load_session_file_for_append:store.rs:522-530` returns `(Session,TailRecovery)`.
+- `SessionStore::append_event:store.rs:230-340` under `SessionLock`: fast-path / `reconcile_external_tail`, else reload; if `recovered` → `truncate_to_valid_tail:534-544 set_len(valid_bytes)+sync_all` before append. Terminated/middle corruption remain `Err`.
+- Tests: `store.rs:1605 append_repairs_an_unterminated_crash_tail`; `codec.rs:654 valid_unterminated_final_line_is_not_truncated`; `store.rs:1451 append_after_valid_unterminated_record_inserts_separator`; `codec.rs:668 terminated_malformed_final_line_is_an_error`; `codec.rs:629 middle_corruption_is_not`; `codec.rs:680 recovery_reports_offset`; `store.rs:1655 append_repairs_utf8_crash_tail (\xc3 split)`.
+
+### SESSION-3 Comprehensive export redaction — DONE
+- `crates/session/src/export.rs:~180 transform_record` runs after omission/truncation; `transform_metadata` preserves IDs/numerics, transforms title/provider/model/workspace; `transform_tool_call` preserves id/name.
+- Recursive `redact_json:475` (keys `api_key/apikey/authorization/password/secret/token`, recurse arrays/objects, `redact_text` on strings) applied to standalone `ToolCall.arguments`, embedded `ToolCall{arguments}`, `Opaque{data}`, `Unknown`.
+- Text `redact_text` on user/assistant `Text`/`Reasoning`, `ToolResult` via `transform_output` (omit→`truncate_utf8`→redact), `transform_reasoning`, `transform_summary`, titles/errors/cancels.
+- Tests `export.rs:543,594`: `export_is_loadable_and_can_redact_tool_output`; `redaction_covers_every_secret_bearing_field` sentinel `sentinel-secret-9f3a1c` in header/title/provider/model/workspace, `MetadataChange`, user/assistant, embedded reasoning/opaque/tool-call, standalone `Reasoning`/`ToolCall`, both `ToolResult`s, summary, `TurnCancelled`, `Error`, `Unknown{password}`; asserts `!contains(sentinel)`, decodable, pairing intact, slim export still clean. Caveat: `redact_text:407` is key-anchored heuristic (bare secrets out of scope by design).
+
+### SESSION-4 Lock ownership + private files — DONE
+- DONE: `store.rs:SessionLock::acquire` + `auth/storage.rs:AuthFileLock::acquire` use `fs2::FileExt::try_lock_exclusive` + `LOCK_ATTEMPTS/WAIT` loop, `Drop{unlock}` retains sidecar inode. No PID/nonce steal path remains (superseded by advisory).
+- DONE: `private_dir_all:store.rs mode 0o700`, `private_file:0o600+create_new`, lock sidecar `0o600`; mirrored `auth/storage.rs`. `ensure_private_*` fail-closed; `sync_parent` after create/rename; Windows ACL documented, no privacy claimed.
+- Tests DONE: `concurrent_advisory_lock_contenders_never_overlap (store.rs, auth)`, `advisory_lock_serializes_contenders_and_retains_sidecar_inode`, `permissive_umask_still_yields_private_paths (store.rs, auth)`.
+- Tests DONE (fail-closed injection): thread-local `#[cfg(test)]` fault flags + `HardeningFaultGuard` (auto-clear on drop) force each hardening step to return its real `Io` error — running as root makes genuine `chmod`/`fsync` failures untriggerable. `store.rs`: `directory_permission_failure_fails_session_create` (`secure directory permissions`, empty workspace dir), `file_permission_failure_fails_session_append` (`secure file permissions`, no event/file growth, reopen clean), `parent_sync_failure_fails_session_create` (`sync parent directory`). `auth/storage.rs`: `directory_permission_failure_fails_auth_save` (no credential file), `file_permission_failure_fails_auth_save` (previous credentials intact/readable), `parent_sync_failure_fails_auth_save`. Guards are scoped to the write call only (construction hardens/syncs the fresh root too) and dropped before reopen reads (reads also repair permissions, so reading armed would fail by design). Stale-steal-by-nonce tests N/A by design (no nonce protocol). Acceptance (no concurrent entry, no write-then-chmod) met via OS advisory.
+
+### SESSION-5 Tool-call replay validation — DONE
+- `model.rs:645 ToolCallTracker{pending,seen,completed,cancelled}`; `validate_tool_call_id:~1215` rejects empty id/name, duplicate pending, global `seen` reuse. Applies to standalone + embedded `StoredContent::ToolCall`; `ToolResult` requires non-empty + `is_pending` + FIFO.
+- Shared `ToolCallTracker::record` via `validate_events`/`validate_next_event`/`validate_event_suffix` (`ToolValidationState`+`SuffixTracker`); `TurnCancelled` clears pending but never `seen`; `Error` keeps pending but `seen` blocks reuse.
+- Tests `model.rs:~1740-1920`: `completed_tool_call_ids_cannot_be_reused` (with/without second result); `empty_tool_call_ids_and_names_are_rejected`; `cancelled_tool_call_ids_cannot_be_reused`; `standalone_and_embedded_calls_share_one_id_namespace`; `context_reconstruction_never_yields_orphan_results_or_dangling_calls`.
+
+## Phase 2 — Authentication (`crates/auth`)
+
+### AUTH-1 Device-flow polling — DONE
+- DONE: `openai_codex.rs:OAUTH_BODY_LIMIT`, `read_bounded_body` used by `request_token_until` + `token_strict`; RFC8628 map (`pending→continue`, `slow_down→+5s`, `expired→Expired`, `denied→sanitized`) before status; `token_strict` 2xx-only no echo used by `refresh`/`login_browser`; cancel/expiry around sleep+request (Tokio-clock deadline: `grant=min(expires_in,3600)`, `Instant::now()+grant`, checks pre/post sleep + `sleep_until` in `request_token_until`).
+- Tests DONE (full `login_device` loop, not helper-only): `device_login_pending_then_success_persists` (pending→success persists, reopened handle observes, `Started/Finished`, 3 requests); `device_login_slow_down_delays_the_next_poll` (injectable sleep records `[5,10]` — 5s default + `slow_down→+5s`; recording sleep avoids paused-clock/real-socket starvation); `device_login_expired_token_fails_without_persisting` (`DeviceCodeExpired`, no file); `device_login_access_denied_is_sanitized_without_persisting` (sanitized denial, no `shh-device-secret` echo, no file); `strict_token_exchange_rejects_polling_errors` (`400 authorization_pending` → status-only `400`, no `shh-strict-secret` echo); `cancellation_during_device_poll_aborts_login` (in-flight cancel → `Cancelled`, no file); `malformed_and_oversized_bodies_are_rejected` DONE; `device_poll_errors_map_before_status` DONE (helper-level expired/denied/unrecognized-no-echo). Helper-level `device_poll_pending_then_success` / `slow_down_increases_the_poll_interval` kept as unit contracts, marked superseded.
+
+### AUTH-2 Refresh single-flight — DONE
+- DONE: `refresh_lock` (codex + copilot); reload-recheck with short lock scopes; note Codex `&&` vs Copilot `||` divergence (both require the persisted generation to differ from cache AND be unexpired before adopting); `save_openai_codex_if_current` / `save_copilot_if_current` CAS under `AuthFileLock`, callers fall back on `false`; no blocking mutex across net.
+- Cross-process lease decision: DOCUMENTED AS CAS-AT-SAVE, no `lease` symbol by design. A lease spanning reload→exchange→save would hold coordination across network I/O (explicitly forbidden: "do not hold a blocking mutex across async network work"); concurrent cross-process exchanges can still double-spend a single-use token, but the loser's stale completion can never overwrite the winner (CAS rejects it) and a retrying loser adopts the winner via reload-recheck. Pinned by `two_handles_racing_refresh_share_one_exchange`.
+- Tests DONE (real `ensure_valid` path, single-use rotating fixture — second exchange 401s): copilot `concurrent_refresh_single_flights_on_one_network_call` rewritten (8 waiters + barrier → 1 exchange, all share `access-rotated`, persisted == newest incl. enriched `gpt-5.4`); codex `codex_concurrent_refresh_single_flights_on_one_network_call` (same shape, `refresh-rotated`); copilot `two_handles_racing_refresh_share_one_exchange` (two handles/one file, loser adopts winner, 1 exchange, persisted == winner); `compare_and_save_rejects_stale_refresh_generations` (storage-level CAS).
+
+### AUTH-3 Callback + Copilot login — DONE
+- DONE: `CALLBACK_OVERALL_TIMEOUT` 10m, `wait_for_callback`→`with_idle(10s)`, `read_callback_head` 512B chunks through `\r\n\r\n`, `CALLBACK_HEAD_LIMIT` 16KiB; `is_callback_denial` + sanitized denial; `login_with_events_and_persist` persist-before `MODEL_DISCOVERY_TIMEOUT` 15s `fetch_available_model_ids`, best-effort swallow; serial policy off path (`enable_known_models` not in login); `base_url_from_proxy_token`, `copilot_base_url`, `proxy_endpoint` HTTPS-only, reject userinfo/`/?#@`/bad port.
+- Tests DONE: `idle_connection_does_not_block_a_later_valid_callback` (idle+fragmented); `live_denial_terminates_promptly` (live valid-state denial → sanitized `denied`, `Login failed` reply, resolves without idle timeout) + `callback_target_parsing_accepts_codes_and_denials` extended with near-miss non-denials (wrong error/missing state/wrong path); proxy parse/reject; `model_list_failure_still_leaves_a_usable_persisted_credential` (500 `/models` → exchanged `access-login` returned + persisted unenriched, `Finished` fires).
+
+## Phase 3 — Tools (`crates/tools`) — DONE
+
+### TOOLS-1 Symlink escapes — DONE
+- `context_files.rs:10-16,223-243 read_contained_candidate`: `WorkspaceFs::open_root` canonical root, `canonicalize(candidate)+starts_with`, final `vfs::unix::open_file_relative(O_NOFOLLOW)`. External silently skipped, no contents in diagnostics. Contained symlinks allowed.
+- `skills.rs:10-13,299-302,312,391-430 contained_path/is_contained/load_contained_skill/discover_dir`: canonical root once (`:468`), canonical every `SKILL.md`/root `.md`/base-dir, `starts_with`, retained-handle read. Base-dir symlink rejected before descent (`:321-322,351-354`). Allowlist from canonical `file_path/base_dir (:523-543)`; `<location>` canonical (safe).
+- Tests `#[cfg(unix)]`: `context_files.rs:497-539 external_context_symlink_is_not_injected (EXTERNAL-SENTINEL-CONTENT)`; `skills.rs:831-890 external_skill_symlinks_are_rejected_but_contained_ones_work (TOP-SECRET-EXTERNAL)` + diagnostics clean.
+
+### TOOLS-2 TOCTOU — DONE
+- `vfs.rs:1-27` spike documents handle-relative `openat/O_NOFOLLOW` over capability/`openat2`, open-is-validation; non-Unix fallback explicitly narrows-not-closes.
+- `vfs.rs:50-110 WorkspaceFs::open_root` (canonical+`O_DIRECTORY|O_NOFOLLOW` fd) + `split_relative`; `unix::open_dir_relative/open_file_relative/open_parent_relative/open_child_dir/open_child_file/confirm_contained` (dev/ino `..` walk) + `open_file_metadata`.
+- `read.rs:187-240 open_target`, `write.rs:150-195 write_validated` + `file_mutation.rs:atomic_write_at (openat CREATE|EXCL temp + renameat same parent_fd)`, `edit.rs:227-292 execute_edit_validated` (handle read→match→re-read→commit). Errors `cannot read/write/edit {path}: {io}` no outside leak.
+- Tests (resolve→`remove_dir_all`+`symlink(outside)`→execute): `read.rs:547-579`, `write.rs:284-310` + `write.rs:248-283 retained_workspace_capability_survives_root_path_replacement`, `edit.rs:953-993`, `lib.rs:730-767`.
+
+### TOOLS-3 Bash exclusive + tree kill — DONE
+- DONE: `bash.rs:50-62 command_concurrency→Exclusive`, `:129-133 concurrency()`; word-level classifier removed. `MAX_TIMEOUT_SECS=86400 :37-48,72-81,137-160`, `checked_add` → tool error. `process_group(0) :203-210`; Linux adds a writable cgroup-v2 scope and `cgroup.kill`, with process-group fallback elsewhere. `ProcessGroupGuard` kills containment on timeout/cancel/drop and after `Exited`; `child.wait()` reaps. `read_bounded_tail :245-305,373-410` + `timeout_at(drain_deadline) join!` one `DRAIN_TIMEOUT=1s`.
+- Tests DONE: exclusivity, timeout bounds, output tails, and four Linux detached-marker cases (`detached_marker_is_killed_after_normal_shell_exit`, `_on_timeout`, `_on_explicit_cancellation`, `_when_execution_future_is_dropped`). Unix fallback coverage keeps `held_stdout_and_stderr_share_one_drain_deadline_without_cgroup` (shared `DRAIN_TIMEOUT`, with unconditional helper cleanup).
+
+### TOOLS-4 Exact byte-preserving edit — DONE
+- `edit.rs:415-490 apply_edits_exact` via `match_positions (char_indices+starts_with)` exact bytes; `strip_bom:491-495` split+reattach; spans vs original, overlap rejected, apply `rev`; BOM/mixed CRLF/LF preserved; pre-commit re-read (`:266-280` handle, `:343-351` fallback); `unicode-normalization` removed from `Cargo.toml`.
+- Tests: `:806 preserves_bom_and_crlf`, `:828 mixed_crlf_outside_spans`, `:840 typographic/trailing-spaces_require_exact`, `:677 multiple_disjoint`, `:877 batch_match_independently`, `:732 rejects_missing_duplicate_overlap_empty`, `:904 proptest byte_preservation_outside_spans`.
+
+## Phase 4 — Provider/streaming (`crates/llm`) — DONE
+
+### LLM-1 Protocol-confirmed completion — DONE
+- `openai_chat.rs:280-285,328-352 [DONE]/usage→Done+done=true`, `finish():338 Stream` if `!done`; `openai_responses.rs:282-313,334-341 completed|incomplete→done+drain+Done`, `finish→Stream`; `codex_responses.rs:133-149` reuses `is_done/finish`; `anthropic.rs:415-436,499-506 message_stop→drain+Done`, `failed/error→Stream`, `finish→Stream`. Chat mid-stream `{"error":…}` payloads now surface `LlmError::Stream` (`parse_payload` error arm) instead of an empty `Ok` that EOF later misreported as truncation.
+- Tests: `chat:valid_done_succeeds`, `text_then_eof_without_terminator_fails`, `partial_tool_call_then_eof_fails_no_completed`; `responses:finish_without_terminal_is_stream_error`, `text_then_eof_fails`, `held_partial_tool_call_emits_nothing_at_eof` (held `function_call` never escapes pre-terminal; EOF→`Stream`, second `finish` no-op), `finish_noop_after_completed`; `anthropic:finish_without_message_stop_is_stream_error`, `partial_tool_call_then_eof…`; per-dialect `stream_error_after_partial_output_remains_an_error` (chat/responses/anthropic: partial text + provider error payload → `Stream`, never `Done`); per-dialect `terminal_event_split_across_transport_chunks_succeeds` (chat usage chunk, responses `completed`, anthropic `message_stop` reassembled across two `push_bytes`); `sse:parses_done_and_chunk_boundaries` split-terminal.
+
+### LLM-2 Incomplete/usage/ordering — DONE
+- `openai_responses.rs:282-311 incomplete` terminal, `status+incomplete_details.reason→stop_reason (incomplete: reason)` + usage. Explicit all-normal decision documented at the terminal arm and on the test: every `incomplete` reason is a normal stop (complete terminal event with status+reason+usage recorded in `Done`); only transport (`Stream`), HTTP, and auth failures are retryable per `LlmError::is_retryable`. `codex_responses.rs:63-131 convert_input` single ordered pass, replay only `provider==openai-codex`; `anthropic.rs:360-391 saturating input+creation+read→input_tokens`, `cached=read`.
+- Tests: `incomplete_terminal_event_succeeds_with_reason_and_usage` (responses+codex); `codex_opaque_state_preserves_order_before_multiple_tool_calls (enc1,c1,enc2,c2, no rs_9)`; `anthropic:full_prompt_usage_sums_all (100+50+80=230, cached 80)`.
+
+### LLM-3 Malformed tool calls — DONE
+- `openai_chat.rs:381-420 flush_calls` trim ID/name, empty→`Parse`, duplicate via `seen_ids+validated`, no `ToolCallComplete`; `accumulate_tool_call:355` no synthetic ID; `responses.rs:234-279 pending_calls` held until terminal; `anthropic.rs:447-486 finish_tool` same, `completed_tools` until `message_stop`.
+- Tests per dialect: `rejects_missing_id/name|blank`, `rejects_duplicate_ids_in_parallel`, `fragmented_valid_ids_assemble (ca+ll-1→call-1, re+ad→read)`; `codex_rejects_malformed_tool_calls_through_shared_parser` (missing ID → `Parse` via delegated `ResponsesParser`).
+
+### LLM-4 Bounded/correct SSE — DONE
+- `sse.rs:36-38,44-77,110-123 MAX_LINE 1MiB, MAX_EVENT 8MiB`; `push_bytes/finish→Result<Stream>`; `dispatch` drops `!has_data||empty` even with `event`, clears `event`; CRLF/multiline/comment/unterminated-final; `SseStream:150` propagates.
+- Tests: `empty_data_frames_are_ignored`, `event_only_frames_emit_nothing_and_do_not_leak`, `exactly_at_limit_succeeds_over_limit_fails_across_chunks`, `crlf_and_multiline_data_still_work`, `parses_comments_crlf_and_multiline`, `final_unterminated_data_frame_is_dispatched` (LF + CRLF unterminated final frame dispatches on `finish`; also fixed `finish()` to strip trailing `\r` like `push_bytes`).
+
+### LLM-5 Bounded HTTP/redaction/retry — DONE
+- `http.rs:144-163,165-184 check_status_with_secret→http_redacted_with_retry_after`; `bounded_error_body` streams `bytes_stream` to `MAX_ERROR_BODY 16KiB`, never `response.text()`; `error.rs:56-112,118-136,142-166 http/truncate_body(_,2048)`, `redacted()` for `Http/Stream/Parse/Auth`, UTF-8 `len<=max`, empty if suffix won't fit, `parse_retry_after_value` delta+http-date, `MAX_RETRY_AFTER 300s`, `retry_after_secs` 429-only; `retry.rs:16-59,61-75 MAX_ATTEMPTS 3`, `max(backoff+jitter,retry_after)`, injectable sleeper, LCG jitter; `providers/github_copilot.rs:543 redact_error→redacted`, `providers/openai_codex.rs:260` same.
+- Tests: `http:shared_http_errors_redact_keys_and_preserve_retry_headers`, `oversized_error_body_is_bounded_to_a_prefix` (256KiB chunked 500 → rendered ≤2048+64, UTF-8), `stalled_response_body_times_out`; `error:error_bodies_echoing_key_are_redacted`, `error_bodies_stay_bounded_and_utf8 (0,1,2,5,8,12,16,64+4MiB)`, `retry_after_parses_seconds_dates_and_caps`; `retry:retry_counts_attempts_and_honors_retry_after`, `retry_after_overrides_backoff_and_nonretryable_returns`; `opencode_go:provider_errors_redact_api_keys`. `opencode_go` stream/list/usage-parse errors now all pass through `LlmError::redacted` like the copilot/codex providers.
+
+## Phase 5 — Agent runtime (`crates/agent`, `crates/compact`) — DONE
+
+### AGENT-1 Turn-boundary — DONE
+- `agent/turn.rs:26 execute_turn` single executor (child token, `flush_deferred_sync`, `Shutdown/Quarantine/Continue`; `:62 run_turn_body`, `:459 TurnControl`); `persistence.rs:54 flush_deferred_sync`; `commands.rs:510 handle_invoke_skill→:543 execute_turn`, `:223 handle_compact_session_boundary+:258 flush`, `:276 handle_set_model_boundary+:285 flush`; `mod.rs:288,324,337,361` all return `TurnControl`, run-loop owns single `TurnFinished (:297,:369 quarantine)`.
+- Tests: `mod.rs:1476 skill_turn_failure_quarantines_and_never_runs_queued_work`; `:1568 shutdown_during_skill_turn_exits_the_agent`; `deferred_sync_flush_failure_quarantines_skill_manual_compact_and_model_change` (injected `sync_session` fault via `session::SyncSessionFaultGuard`: skill body runs then flush fails → quarantine + sync error, queued work never runs; manual `/compact` flush fails → quarantine + no silent success; `/model` commits `ModelChange` then flush fails → quarantine; documents flush = durability of written records, not a write gate). `execute_turn` doc now states the double-`TurnFinished` corner (body already finished + failed flush → run-loop quarantine adds a second) instead of claiming literal exactly-once.
+
+### AGENT-2 Shared dispatch — DONE
+- `agent/tool_dispatch.rs:64 plan_tool_batches`, `:306 execute_tool_batch<C,H>` generic (`DispatchCancellation/CallState/CallOutcome/BatchOutcome`, `ToolDispatchHooks/Agent/Noop`), `:199 CancellationControl`, `:229 ParentDispatchControl`, `:288 poll_control_now`; ready-drain before `batch_cancel.cancel()` retains `Completed`; `launched && class!=ReadOnly→"cancelled; execution status unknown"` else `"cancelled"`; stable IDs/original-order `slots[index]`; `dispatch_tool_batches:473+` hooks-vs-durable order comment. Child `subagent.rs:30,571,589` reuses same with `Noop`, no-recursion via registry `:250`.
+- Tests: `tool_dispatch.rs:615 shared_executor_keeps_original_result_order`, `:640 shared_executor_distinguishes_launched_and_queued_cancellation`, `shared_executor_retains_ready_result_racing_cancellation` (gated parallel pair: first reports real result while cancellation pending → retained; unresolved second → unknown-status; pins the shared path parent + child flow through); parent ordering/concurrency `mod.rs:513,544,584,635,935,1013`.
+
+### AGENT-3 Compaction cancel/no-session — DONE
+- DONE: `compact/summarize.rs:Cancelled`, pre/post `cancel.is_cancelled()→Cancelled`, `model_summarize select! stream vs cancel`; `agent/compaction.rs:132 Cancelled→Shutdown|Notice("compaction cancelled"), Ok(false)` no fallback/summary; `:143` usage only `Model{usage:Some}`; pre-turn interrupt `turn.rs:70-125 (select! compaction vs cancel vs Interrupt, queued buffer, persist_cancelled+TurnFinished)`; manual `commands.rs:223-264` same; no-session `compaction.rs:79 should_auto_compact false if none`, `:108 Notice unavailable`, `:195 try_overflow Ok(false)`.
+- Tests: existing `mod.rs:2154,2257,2333,2399` trigger/fallback/overflow/manual + new `cancelled_compaction_persists_neither_summary_nor_usage` (pre-cancelled manual compact → Shutdown path, no summary/Usage/totals movement), `summarizer_without_usage_does_not_create_a_zero_token_turn` (usageless `Done` → no Usage event, totals untouched), `no_session_compaction_stays_disabled_without_repeat_failures` (overflow declines quietly with one Error; manual → one "unavailable" notice; second turn normal; never `CompactionFinished`).
+
+### AGENT-4 Atomic model change — DONE
+- DONE: `commands.rs:295 handle_set_model` resolve `next_provider/canonical` w/o mutate→persist `ModelChange?`→commit provider/model+`runner.update_model()` (`:304` comment), `:350 ModelChanged`, reset tokens/window, `:366 spawn_model_metadata`; `:555 spawn_model_metadata` one `5s timeout(list_models)`+cancel, send only `Some`; `compaction.rs:15 apply_model_metadata` same result + stale guard; `mod.rs:236` startup off path, `:250 try_recv` drain + `:268 select metadata vs input` anti-starvation.
+- Tests: `failed_model_change_persist_leaves_parent_and_subagent_unchanged` (deleted session file → persist error, parent provider/model + `SubagentRunnerImpl::model_for_test` unmoved, no `ModelChanged`); `one_model_switch_produces_one_metadata_request` (startup + switch ≤2 `list_models`, switch's ModelList carries the model); `hanging_metadata_fetch_never_blocks_command_processing` (pending `list_models` + 5s bound never stalls a turn); `metadata_arriving_mid_turn_applies_before_the_queued_turn` (mid-turn-one ModelList relayed before queued turn-two finishes).
+
+### PERF-1 Unified estimator — DONE
+- DONE: `compact/estimate.rs:27 estimate_provider_context_tokens(system,tools,messages)` (system+name/desc/parameters+role+`Text(full)/ToolCall/ToolResult(full)/Opaque(provider+data)`, `Reasoning→0`); `agent/compaction.rs:50 context_tokens_estimate(extra once)`, `:62 estimate_history_tokens` same `system_prompt_with_workspace_context+snapshot.definitions+history` durable/ephemeral; `plan.rs:177 event_tokens` same + prefix-sum `choose_cut`.
+- Single-scan pre-turn: `should_auto_compact→Option<u64>` returns the estimate with the decision; `turn.rs` threads it into the percent notice and `compact_and_reload(..., Some(context))`, so one firing pre-turn estimates once instead of 3× (the old `should→context→compact_and_reload` triple scan).
+- Tests (`estimate.rs`): existing full-result + new `durable_and_in_memory_histories_estimate_equivalently` (event log via `context_messages` == in-memory messages), `active_compaction_summary_contributes_to_the_estimate`, `large_project_context_and_tool_schemas_can_trigger_compaction`, `no_double_count_of_pending_input_after_provider_usage`.
+
+### PERF-2 Hard byte limits — DONE
+- `compact/serialize.rs:29 serialize_events` newest→oldest, separator accounting, oversized-newest `truncate_bytes` prefix, `truncated` flag, `marker_reserve` then `truncate_bytes(text,budget)` UTF-8 loop; `summarize.rs:195 append_with_limit`, `:212 append_file_lists truncate_bytes(combined,max_summary_bytes)`, `:223` deterministic, `:125,134` input cap + `OMISSION_MARKER` (`truncated` used).
+- Tests: `serialize.rs:428 transcript_budget_includes_separators_and_oversized_newest (0..=128 len<=budget, é×200)`, `:451` zero-budget + per-item; `summarize.rs:384 len<=max (128)`. GAP: no explicit 1000s-paths test (cap holds via combined truncate).
+
+## Phase 6 — Frontend (`crates/harness`, `crates/tui`) — DONE
+
+### HARNESS-1 ACP errors/usage — DONE
+- `harness/acp.rs:120-180 PromptTracker{in_flight:{error,cancelled}}` + `mark_error/clear_error` only on `TextDelta` (metadata doesn't clear); `~463,518-522 UsageUpdated→None`, `ContextUsageUpdated→UsageUpdate`; `~1030-1090 forward_events`: `cumulative_cost→UsageUpdate` only, `TurnFinished→EndTurn/Cancelled`, `Error→mark_error`, unconditional `resolve(id,None)` on stream-end; `_context_window` unused (first-model heuristic removed); tests `~1049,1532 EndTurn`, `~1059,1064,1266,1273` billing-vs-context.
+- New: `mid_stream_provider_error_fails_the_prompt` (scripted text + stream error → prompt `Err`, error diagnostic visible as `AgentMessageChunk`, never blank `EndTurn`); `prompt_tracker_error_lifecycle_resolves_failure_and_recovery` (unknown-session mark/clear/cancel are panic-free no-ops).
+
+### HARNESS-2 ACP lifecycle — DONE
+- `acp.rs:89-180 SessionHandle{input_tx,cancel,agent_task,forwarder_task}`; `:189-360 serve` owns `AcpState{sessions,prompts}`, disconnect drains + `shutdown_session` each; `:611,645-720 load_session_inner` trim+`SessionId::parse`+canonical `to_string`+`already loaded` reject; `:720-753 delete_session` reject if `in_flight`, `shutdown_session` under `SESSION_TASK_TIMEOUT=2s` (aborts both after one deadline); `:778 delete_session_everywhere` workspace scan, `NotFound→Ok`; `:887-1020 build_session_stack` via `spawn_blocking`+`timeout`, `acp_mcp_servers` rejects HTTP/SSE, `spawn_agent builder.build()+timeout`, duplicate-after-assembly abort (`~1009` race comment); `new/load_session tokio::spawn` off dispatch.
+
+### HARNESS-3 Headless — DONE
+- `harness/headless.rs:120-290 pending_text/active_tools/error_pending/saw_turn_finished`; `TextDelta→push`, `ToolCallStarted→verbose+clear`, `ToolCallFinished+active==0→clear`, `TurnFinished+active==0+!empty→stdout+newline else flush`, `Error→clear+stderr+error_pending=true`, `UsageUpdated/Notice/etc` don't clear (`error_pending=false` only in `TextDelta`); `write!/writeln!+?` propagates; `reasoning_open` delimiter only on `ToolCallStarted/TurnFinished`; `!saw_turn_finished→Err`; `run_headless_resolved agent_task.await.context`; `:130` SIGINT; `main.rs:~130-170 resolved_prompt=resolve_prompt()` before registry/store/bundle, `needs_session_store`, ACP early-return, `run_headless_with_prompt(...,prompt,rendered)` no reload.
+- New: `multiple_tool_rounds_emit_only_the_last_text_only_round` (prose→tools→prose→tools→final ⇒ `final answer\n` only); `error_followed_by_usage_update_still_fails_the_run` (`Error→UsageUpdated→TurnFinished` stays exit 1 — only `TextDelta` clears); `blank_prompt_creates_no_session_on_disk` (blank `run_headless` errors before store touch, session dir unchanged); `agent_task_panic_surfaces_instead_of_blank_success` (`.context` on the join propagates).
+
+### TUI-1 Sanitize — DONE
+- `tui/render.rs:561-660 sanitize_terminal_text`: `\n` keep, `\t→4sp`, `ESC/CSI/OSC/string/C0/C1/DEL` via `skip_escape_sequence/skip_csi_sequence/skip_string_sequence`, `is_control/0x7f` drop; used in `plain_text/owned_markdown/fit_line_to_width/wrap_text` + `app.rs:639,725,2497,2524-2547,3103`; `Paste→sanitize`; tests `sanitizer_removes_terminal_controls_and_expands_tabs`, `consumes_unterminated`, `line_to_ansi_sanitizes OSC/CSI`.
+
+### TUI-2 Row-width/restoration — DONE
+- DONE: `render.rs:358 fit_line_to_width` + `wrap_text` + `line_width` + `<=width` tests `~926-956`; `prefix_message_lines fit_text_to_width(prefix)` + width-1 invariant; `app.rs:700-713` separate `Home/End` vs `Ctrl+A/E`, `PageUp/Down→{}`; `activity_region_row:Option` from `build.activity_row (:583,2130,3753)`; `TerminalModes{raw,bracketed,keyboard,newline}` + best-effort `restore()` first-error + `Drop` + panic-hook; width 1–3 tests (`render.rs:921`, `app.rs:3724`) and height 1–2 clamp test (`app.rs:3745`) exist.
+- New: `combining_zwj_and_zero_width_text_never_exceeds_its_budget` (combining acute, ZWJ family, ZWJ/ZWSP, mixed indent+CJK+tab × widths 1–80 × all five line renderers); `long_metadata_rows_fit_narrow_widths` (pathological cwd/branch/provider·model/context/skills through the `entry_lines→fit_line_to_width` path at widths 1–80). Known non-blocking remainder: injectable terminal backend for setup/cleanup failure injection (CrossTerm calls crossterm directly; no failure tests) — documented, not a correctness gap.
+
+### TUI-3 Commands/completion — DONE
+- `tui/commands.rs:parse_command_with_skills` alias only if `rest.is_empty()` + non-colliding else `parse_command` error (never silently drops); `paths.rs:extract_at_prefix token_end` stops at `whitespace/) ] } , ;` (preserves punctuation); `app.rs:1093-1200 request/apply_path_completion` debounced `200ms`+`spawn_blocking`+`generation/cancel`, merges static `candidates_at_cursor` + `find_path_candidates` via `merge_candidates` (`/load ./…` + session IDs); `~3992 direct_provider_prefix_requests_its_model_catalogue`; `tool_lines` expanded `output_tail` + `error.lines().skip(1).take(TAIL)` + `running…`, collapsed first-line only.
+- Fixes: skill-alias trailing text now errors `usage: /<skill> (takes no arguments)` instead of misleading `unknown command`; `request_backend` also fires on partially typed `provider:model` (not just bare `provider:`); `load_completion_combines_session_and_filesystem_context` now asserts real filesystem candidates + session-ID retention through `merge_candidates`.
+
+## Phase 7 — Token/memory/startup — DONE
+
+### PERF-3 MCP bounds — DONE
+- `mcp/config.rs`: `Debug` redacts `args/env` counts, `redact_url`, `MAX_SERVERS 64/1MiB`, name/control checks; `runtime.rs`: `MCP_INITIALIZE/LIST/SHUTDOWN_TIMEOUT`, `JoinSet` concurrent connect + sorted order, `join_all+timeout` single global shutdown, `spawn_stderr_reader` bounded `MCP_STDERR_CHUNK_BYTES` byte-count only (`debug bytes`); `list_tools_bounded timeout_at` + `MAX_REMOTE_TOOLS 256` + `validate_remote_tool` byte accounting; `tool.rs`: `MAX_NAME/DESC/SCHEMA_DEPTH 32/NODES 10k/STRING 64k/BYTES 256k`; `output.rs`: `OutputWriter MAX 20k+notice`, `utf8_prefix_len`, compact `to_writer`, `structured_duplicates_text`, `cap_display` same budget.
+
+### PERF-4 Startup context once — DONE
+- `main.rs:context::load_context_bundle(workspace,cwd,no_files,interactive?)` once, `rendered/display_paths` reused; `headless_with_prompt` takes `prompt+project_context` (no second discovery; `project_context_for` only in `#[cfg(test)]`); ACP returns before registry/store/context; `resolved_prompt` before store/registry (blank→no mutation); sync `join!` replaced (comment "only ceremony"); worktree env-normalize `set_var` before `chdir`.
+
+### PERF-5 Session append/listing — DONE
+- DONE: streamed indexing + incremental append validation (`reconcile only appended tails`, `validate current appends incrementally`, `stream index metadata`, `avoid cloning validation history`, `listing recovery-aware metadata-only`).
+- Tests: `two_stores_append_alternately_without_duplicate_sequences` (two `SessionStore` handles, one root/workspace, alternate 20 appends → sequences 1..=20, no dup; idle cursor converges on next append); `corrupt_replacement_is_rejected_by_full_validation` (garbage replacement bytes → append `Err`, file untouched, stale view gains nothing); `listing_reports_conversation_without_materializing_payloads` (4MB tool result lists with `has_conversation`, event_count 2, <1s — metadata-only scanner never builds messages).
+- Benches (`session/benches/store.rs`): 1k/10k alternating appends + listing with 4KiB tool outputs, now asserting near-linear scaling (10× turns < 40× time; measured ~10×/~11× debug). Run via `cargo bench -p session` (custom harness, not part of `cargo test`).
+
+### PERF-6 Subagent + TUI rendering — DONE
+- Subagent DONE (`perf(agent): bound subagent context growth`, reserve for final synthesis, truncate old evidence).
+- TUI DONE: `StreamMarkdownCache/refresh_stream_markdown_cache`, `history_window` newest→oldest budget-stop + `…older rows above`; `output_tail` rewritten from-the-end (rfind-located tail + `memchr` head count, no per-line allocation; ~2.5× faster release, ~7× debug on 100k lines) with parity test (`output_tail_matches_front_anchored_semantics` over 10 edge inputs) + quadratic guard (`output_tail_scales_with_the_tail_not_the_output`: 100k vs 25k lines < 10×). `memchr` added to `tui` deps (already in tree via `ignore`/`regex`, no new transitive weight).
+
+## Phase 8 — Cleanup — DONE
+- CLEANUP-1 verified via `cargo tree --workspace --duplicates`: `eventsource-stream`/`nom 7`/`minimal-lexical` gone (sole `nom 8` via `ansi-to-tui`), `tracing` out of `tui` deps, `tempfile` out of `compact` deps, direct `ring` out of `llm` (sole `ring 0.17` via `rustls`+`auth`), `tokio-util` main/compat split in `harness` (compat test-only), single `base64 0.22`. Remaining duplicates (`dirs`, `getrandom`, `hashbrown`, `syn`, etc.) are transitive-only, not workspace-removable.
+- CLEANUP-2 caller sweep: `estimate_text_tokens`, `estimated_tokens_freed`, `FileSearchIndex::_frecency`, OpenCode Chat catalogue — already removed (grep docs-only); `SerializedTranscript::truncated` confirmed LIVE (consumed at `summarize.rs:134,236` for the omission marker); Codex headers already one `codex_headers` helper; `run_agent`-history and session/auth-helper removals N/A (no such surfaces; remaining `allow(dead_code)` are test seams or were stale — `parse_retry_after_value` attribute dropped).
+- CLEANUP-3 shared implementations: parent/subagent dispatch + turn-boundary/persistence (AGENT-1/2); SSE transport loop now shared via `dialects::StreamParser`+`drive_parser_stream` (all four adapters; Codex side channel as `CodexParser` wrapper; payload parsing stays per-dialect); model catalogue fetch now shared via `fetch_model_catalogue` (`spawn_model_metadata` + `spawn_model_list`, sinks differ); find/grep/multigrep admission now shared via `FileSearchIndex::run_search` (shutdown/scope/cancel/semaphore/join once; `wait_for_scan` + `collect_grep_result` already shared); MCP bounded writing already shared (`OutputWriter`/`flatten`/`cap_display`).
+- CLEANUP-4 test replacements: compaction literal-defaults deleted (boundary/validation tests cover); retry jitter-range already deterministic; OpenCode catalogue already routing tests; ACP load already full new/load round-trip; synthetic-EOF already strict-terminal. Headless `HARNESS_SESSION_DIR` env-process test deliberately not added (process-env mutation races parallel tests; `blank_prompt_creates_no_session_on_disk` pins the same no-mutation contract in-process). Strong suites retained (scheduling, path safety, parser fixtures, stalled-body, edit property, TUI wrap).
+
+## Phase 9 — Config/CI/docs — DONE
+
+### CONFIG-1 — DONE
+- `harness/config.rs:~153-180 CompactConfig::validate` finite `0.0-1.0`, `1..16MiB/1MiB`, `reserve<window` exact-key errors (`[compaction].threshold…`); `FileConfig{flatten extra}` + `update_config_document (toml_edit::DocumentMut` targeted edit + re-validate) + `save_settings/save_reasoning` preserve unknowns; `lock_config (fs2::lock_exclusive` write+rename) + `0600` temp+rename+`sync` + `TEMP_ENTROPY/splitmix64`; `default_reserve_is_checked…` test.
+- Nested unknowns preserved at the document level: `targeted_settings_saves_preserve_unknown_nested_document_fields` seeds all five levels (`[compaction]`, `[compaction.future]`, `[subagents]`, `[tui]`, `[mcp]` + `[[mcp.servers]]`) through both save paths; `concurrent_config_mutators_do_not_lose_each_other` pins the advisory lock; `invalid_compaction_values_name_their_toml_keys` (+zero-keep, default-reserve, round-trip) covers the validation matrix. `save_file_config` stays test-only by design (canonical writes go through `update_config_document`); `docs/configuration.md` reserve/window wording now matches the effective-window check.
+
+### CI-1 — DONE
+- Locked Cargo checks everywhere + all-target Clippy (`cargo clippy --workspace --all-targets --locked -- -D warnings`) in `ci.yml:45` and `release.yml:49`; `--locked` on every test/build/metadata check; Linux test+build jobs pinned to `ubuntu-22.04` (`ci.yml`) matching the GNU artifact baseline (glibc 2.35, `release.yml:61-64` pin comment + `README.md:102-106`); native arm64 smoke (`macos-14`, `release.yml:68-72`) with every artifact executed before upload (`:93-101` smoke before `:102+` package). Merge/cache speedup deliberately not taken (isolated per-job caches stay correct and fast enough).
+
+### DOCS-1 — DONE
+- Model-assisted compaction + deterministic fallback: `ARCHITECTURE.md:171-173`, `session/README.md:69,86-88`, `docs/configuration.md:101-102`, `README.md` highlights. Read-only subagent scope resolved to `read/find/grep/multigrep` (`ARCHITECTURE.md:129`, `tools/src/lib.rs` doc, `docs/configuration.md` subagents, pinned by `read_only_registry_exposes_no_mutating_tools`). No-session compaction: disabled auto + unavailable `/compact` + no overflow recovery (`docs/configuration.md:186-190`, `ARCHITECTURE.md` subagents). Shell exclusivity + tree-kill (500 ms grace, shared 1s drain): `ARCHITECTURE.md:112-118`, `docs/configuration.md` shell section. MCP catalogue/output/time limits: `docs/configuration.md:152-157`, `ARCHITECTURE.md:121-123`. Linux baseline (glibc 2.35, Ubuntu 22.04): `README.md:102-106`, `release.yml:61-64`, `ci.yml` pin comments. Headless-stdout + ACP-purity: `ARCHITECTURE.md:69-72,185`, `README.md:61-63`, `docs/configuration.md` CLI table + logging section.
+
+
+
+## PR-readiness follow-up — completed
+
+Each post-implementation review action item below was implemented in a separate
+conventional-commit change and covered by focused regression tests. The findings
+remain as an audit trail of the work completed.
+
+### Blocking correctness, security, and lifecycle items
+
+#### REVIEW-SESSION-1: Preserve tool-call pairs across repeated compaction — DONE (Critical)
+- `crates/session/src/model.rs:1192-1197` resets tool-call state at an older `CompactionSummary`. A later boundary can therefore retain a `ToolResult` while dropping its pre-summary live-tail `ToolCall`.
+- Reproduce with `ToolCall(c), summary(through before c), ToolResult(c), summary(through first summary)` and assert that validation rejects any boundary that would orphan the result.
+- Make boundary validation use the same summary-first/live-tail semantics as `events_after_latest_compaction` and `context_messages`.
+
+#### REVIEW-LLM-1: Preserve Codex opaque/tool-call parser order — DONE (High)
+- `CodexParser` emits opaque state immediately (`openai_codex_responses.rs:145-159`), while `ResponsesParser` holds calls until the terminal event (`openai_responses.rs:274,314-318`). This reorders `opaque1, call1, opaque2, call2` into `opaque1, opaque2, call1, call2` before persistence.
+- Buffer Codex opaque items and function calls in one ordered response-item sequence.
+- Add an end-to-end stream-parser test, not only a `convert_input` test, that verifies exact parser output and replay order around multiple calls.
+
+#### REVIEW-LLM-2: Validate pending Chat calls on `[DONE]` — DONE (High)
+- `openai_chat.rs:279-283` marks the stream done without calling `flush_calls`; malformed, missing-ID/name, or partial-JSON calls can disappear and the stream succeeds without a `Done` event.
+- Validate/flush all pending calls before accepting `[DONE]`, reject unfinished calls with `LlmError::Parse`, and emit one coherent terminal event.
+- Add tests for missing ID, missing name, partial arguments, and a valid call followed directly by `[DONE]`.
+
+#### REVIEW-LLM-3: Redact errors yielded after stream construction — DONE (High)
+- Provider wrappers currently redact only `.stream(...).await` construction errors (`providers/openai_codex.rs:103-110`, `github_copilot.rs:524`, `opencode_go.rs:78-87`). Later `EventStream` items can contain raw provider-supplied SSE error text.
+- Apply active-credential redaction to every error yielded by the returned stream, including OpenRouter and all OAuth-backed providers.
+- Add a fixture whose SSE error echoes the active token and assert that the token is absent from the yielded error, persisted error, UI diagnostic, and logs where testable.
+
+#### REVIEW-AGENT-1: Make terminal events exactly once and propagate cancellation persistence failures — DONE (High)
+- `agent/turn.rs:25-29` explicitly documents a second `TurnFinished` when a completed body is followed by deferred-sync failure; the run loop emits that second event at `agent/mod.rs:296-298`.
+- `agent/persistence.rs:154-169` swallows a failed `TurnCancelled` append, allowing cancellation paths to return without quarantining divergent durable state.
+- Move terminal-event ownership to one boundary and make `persist_cancelled` return control flow that causes quarantine on persistence failure.
+- Test successful body + failed deferred sync, interrupt + failed cancellation append, shutdown + failed cancellation append, and skill equivalents; each operation must emit one terminal event and queued work must not run.
+
+#### REVIEW-AGENT-2: Keep `/model` atomic through deferred sync — DONE (High)
+- `commands.rs:319-357` mutates provider/model/subagent state and emits `ModelChanged` before `handle_set_model_boundary` performs deferred sync at `commands.rs:285`.
+- If append buffering succeeds but sync fails, the failed operation is externally visible and live state has already changed.
+- Commit live state only after the durability boundary succeeds, or roll it back completely on sync failure.
+- Extend the model-change failure test to inject deferred-sync failure and assert parent, subagent, context window, metadata task, and frontend events remain unchanged.
+
+#### REVIEW-ACP-1: Make duplicate registration atomic — DONE (High)
+- The final duplicate check (`harness/acp.rs:1004-1007`) and insertion (`:1017-1025`) use separate lock acquisitions. Two concurrent loads can both pass and one can replace the other live `SessionHandle`.
+- Reserve an `assembling` entry before expensive setup or perform one atomic occupied/vacant insertion without replacing the original.
+- Add a barrier-controlled concurrent-load test proving only one agent is started/registered and the original remains usable.
+
+#### REVIEW-ACP-2: Own in-progress session assembly tasks — DONE (High)
+- `new_session` and `load_session` spawn untracked tasks (`harness/acp.rs:566-570,624-628`), while disconnect cleanup only stops already registered sessions (`:341-357`).
+- Track, cancel, and await pending assembly tasks on disconnect and on request failure; prevent late registration or filesystem/MCP work after transport shutdown.
+- Add disconnect-during-build and disconnect-during-MCP-initialize tests.
+
+#### REVIEW-TOOLS-1: Reject special files without blocking — DONE (High)
+- Unix `open_child_file` opens the target before checking type (`tools/src/vfs.rs:255-275`) and rejects only directories. A FIFO with no writer can block a Tokio worker before cancellation is observed.
+- Open nonblocking through the retained directory handle, inspect with `fstat`, and accept only regular files for read/edit/existing-file write metadata paths.
+- Add FIFO, socket, and device/special-file tests where supported; cancellation and timeout must remain responsive.
+
+#### REVIEW-TOOLS-2: Close or accurately scope process-tree containment — DONE
+- Linux uses a private writable cgroup-v2 scope when available, attaches the shell before exec, and kills the scope plus process group on timeout, cancellation, future drop, and normal shell exit. This reaches descendants that call `setsid`, so they cannot retain tool pipes or mutate the workspace after cleanup. Hosts without cgroup-v2 delegation fall back to process-group best effort; macOS has the same documented limitation, and other platforms guarantee only direct-child termination.
+- Tests use an in-process Rust `setsid(2)` helper and a ready-synchronized detached marker writer for normal exit, timeout, explicit cancellation, and future drop. The fallback drain test is portable to macOS and always kills its helper before assertions.
+- The documented fallback keeps the shared one-second output drain and makes no post-return containment claim for a descendant that calls `setsid`.
+
+#### REVIEW-MCP-1: Enforce protocol/frame limits before deserialization — DONE
+- `mcp/runtime.rs` wraps child stdout with a fixed-chunk, newline-aware reader that rejects frames over `MCP_MAX_FRAME_BYTES` (1 MiB) before rmcp's buffered decoder and serde materialize them. The guard counts bytes across arbitrary chunks, resets per frame, preserves CRLF/pagination, and synthesizes a bounded correlated service error so initialize/list/call failures return promptly.
+- Manual child ownership retains kill-on-drop and bounded shutdown behavior; the existing catalogue validation and 20 KiB rendered output caps remain in place.
+- Runtime fake stdio tests cover oversized single/chunked initialize and catalogue frames, paginated discovery, and huge text/structured/binary/image/service-error call frames; reader unit tests cover exact boundaries, chunk splits, and frame reset ordering.
+
+#### REVIEW-CI-1: Make the drain-deadline test portable to macOS — DONE
+- The Unix drain test launches an in-process Rust helper that calls `setsid(2)` directly instead of depending on the external util-linux `setsid` command. It kills the helper process group before any assertion, so a failure cannot leak a pipe holder.
+- Linux detached-marker tests skip only when the host cannot delegate cgroup v2; the macOS test continues to pin the shared drain deadline and its documented best-effort limitation.
+
+### Additional required follow-ups
+
+#### REVIEW-AUTH-1: Adopt any newer valid on-disk Codex credential — DONE (Medium)
+- `auth/openai_codex.rs:202-206` adopts disk state only when both access and refresh tokens differ. A refresh-token-only rotation, access-token-only change, or extended expiry can leave a stale handle using an obsolete token.
+- Compare credential generation robustly and adopt a valid newer disk credential when any generation-relevant field changes.
+- Add tests for access-only, refresh-only, and expiry-only updates, plus independent-handle refresh races.
+
+#### REVIEW-TOOLS-3: Resolve non-Unix path TOCTOU behavior — DONE (Medium-High)
+- `tools/src/vfs.rs:23-27` acknowledges that non-Unix paths still use canonicalize-then-open. A Windows junction/symlink swap can redirect read/write/edit after validation.
+- Implement handle-relative containment on Windows or explicitly disable unsafe operations where the invariant cannot be enforced.
+- Add deterministic Windows ancestor-swap tests for read, write, and edit.
+
+#### REVIEW-MCP-2: Validate resolved MCP configuration sizes — DONE (Medium)
+- `McpConfig::resolve_with` (`mcp/config.rs:115-151`) clones and expands configuration without first applying the global validation or a post-expansion size cap. Small placeholders can expand into very large argument/header/environment values.
+- Validate before cloning where possible, cap each expansion, and revalidate aggregate resolved bytes/server count afterward.
+- Add excessive-server and oversized-environment-expansion tests.
+
+#### REVIEW-ACP-3: Align ACP build timeout with MCP deadlines — DONE (Medium)
+- ACP applies the two-second `SESSION_TASK_TIMEOUT` to `builder.build()` (`harness/acp.rs:718,992-995`), while MCP initialization/catalogue deadlines are documented as 15 seconds.
+- Separate shutdown timeout from assembly timeout and retain responsive JSON-RPC dispatch without rejecting otherwise valid 2–15 second MCP startup.
+- Add a delayed-but-valid MCP setup test.
+
+#### REVIEW-TUI-1: Complete terminal setup/cleanup fault coverage — DONE (Medium)
+- The TUI-2 plan required an injectable terminal backend and tests for every setup/cleanup failure. The earlier audit explicitly notes that Crossterm is still called directly and those tests are absent while marking TUI-2 `DONE`.
+- Add mode-by-mode setup and cleanup fault injection, verify all cleanup attempts run best-effort, and report only the first error after restoration attempts.
+
+### Verification status from the PR-readiness review
+
+Passed locally on Linux:
+
+```text
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked        # 568 passed, 17 suites
+cargo build --workspace --locked
+cargo tree --workspace --duplicates
+```
+
+All listed scenarios now have focused coverage. The complete locked workspace
+verification passed on Linux. The macOS suite still needs to run in its native
+CI environment because this Linux host cannot cross-compile the Apple-specific
+`ring` dependency.

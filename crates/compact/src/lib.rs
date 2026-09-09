@@ -21,6 +21,7 @@ pub mod policy;
 pub mod serialize;
 pub mod summarize;
 
-pub use plan::{CompactionPlan, estimate_live_tokens, plan_compaction};
+pub use estimate::estimate_provider_context_tokens;
+pub use plan::{CompactionPlan, plan_compaction};
 pub use policy::CompactionPolicy;
 pub use summarize::{SummaryOutcome, summarize};

@@ -42,11 +42,14 @@ jobs:
             target
           key: ${{ runner.os }}-clippy-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-clippy-
-      - run: cargo clippy --workspace
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     name: Test (Linux)
-    runs-on: ubuntu-latest
+    # Pinned to the release baseline (Ubuntu 22.04 / glibc 2.35) so CI
+    # validates the same runtime the GNU artifact ships on. Do not move
+    # this to ubuntu-latest without intentionally changing that baseline.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Select stable Rust
@@ -61,11 +64,12 @@ jobs:
             target
           key: ${{ runner.os }}-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-test-
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
 
   build:
     name: Build (Linux)
-    runs-on: ubuntu-latest
+    # Same pinned baseline as Test (Linux) above; see that comment.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Select stable Rust
@@ -80,7 +84,7 @@ jobs:
             target
           key: ${{ runner.os }}-build-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-build-
-      - run: cargo build --workspace
+      - run: cargo build --workspace --locked
 
   macos-test:
     name: Test (macOS)
@@ -99,4 +103,4 @@ jobs:
             target
           key: ${{ runner.os }}-platform-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-platform-test-
-      - run: cargo test --workspace
+      - run: cargo test --workspace --locked
