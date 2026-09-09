@@ -140,11 +140,17 @@ impl ReadTool {
         // Otherwise, allow an absolute path that is under one of the allowed
         // skill paths (or a `~`-expanded absolute under one of them). `read`
         // can load a discovered skill's files from any location (project or
-        // global roots).
-        let candidate = expand_tilde(&PathBuf::from(path));
-        if !candidate.is_absolute() {
+        // global roots). The candidate is canonicalized first: the
+        // allowlist stores canonical paths, and on macOS temp dirs
+        // (`/var` -> `/private/var`) would otherwise never prefix-match.
+        // Uncanonicalizable paths fall through to the external branch
+        // below, which reports the OS error.
+        let raw_candidate = expand_tilde(&PathBuf::from(path));
+        if !raw_candidate.is_absolute() {
             return Err(format!("cannot read {path}: outside workspace"));
         }
+        let candidate =
+            std::fs::canonicalize(&raw_candidate).unwrap_or_else(|_| raw_candidate.clone());
         if let Some(allowed) = self.allowed_paths.as_deref() {
             for capability in allowed {
                 if capability.directory {
