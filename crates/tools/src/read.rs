@@ -171,25 +171,36 @@ impl ReadTool {
                 }
             }
         }
-        Err("path is outside workspace root and not an allowed skill path".to_owned())
+        // Any other absolute path is readable directly. The shell was never
+        // a sandbox, so rejecting an external `read` only pushed the model
+        // to `cat` the same file through `bash`; reading it openly keeps the
+        // access visible in tool history instead. The usual read limits
+        // (text sniffing, line/byte caps, regular-file check) still apply.
+        // Prefer the raw (non-canonicalized) path so error messages echo
+        // what the caller passed.
+        Ok(ReadTarget::External(raw_candidate))
     }
 }
 
 /// Where a `read` resolves to: workspace components opened through the
-/// validated handle, or an allowlisted skill file opened directly.
+/// validated handle, an allowlisted skill file opened through its retained
+/// handle, or an absolute path outside the workspace opened directly.
 enum ReadTarget {
     Workspace(Vec<String>),
     Skill {
         capability: AllowedPath,
         components: Vec<String>,
     },
+    External(PathBuf),
 }
 
 /// Open a resolved target, preserving workspace-relative error messages
 /// without leaking outside paths. Workspace files go through the
 /// validated handle (`O_NOFOLLOW` per component); skill files use the same
-/// retained handle. This is only compiled on Unix: non-Unix workspace reads
-/// fail closed before resolution or opening.
+/// retained handle. External paths are opened directly: they carry no
+/// containment promise, so a plain open plus a regular-file check (matching
+/// what the shell would do) is sufficient. This is only compiled on Unix:
+/// non-Unix workspace reads fail closed before resolution or opening.
 #[cfg(unix)]
 async fn open_target(
     target: &ReadTarget,
@@ -197,6 +208,7 @@ async fn open_target(
     workspace_fs: Option<&WorkspaceFs>,
 ) -> Result<fs::File, String> {
     match target {
+        ReadTarget::External(path) => open_external(path).map(fd_into_tokio_file),
         ReadTarget::Skill {
             capability,
             components,
@@ -225,6 +237,43 @@ async fn open_target(
 }
 
 #[cfg(unix)]
+/// Open an absolute path outside the workspace. Unlike the workspace walk
+/// this follows a symlinked final component (as `cat` would) but still
+/// opens with `O_NONBLOCK` so a FIFO can never stall the executor, then
+/// refuses anything that is not a regular file via `fstat` on the open
+/// handle. Errors name only the failure, never the file contents.
+fn open_external(path: &Path) -> Result<std::os::fd::OwnedFd, String> {
+    use rustix::fs::{Mode, OFlags};
+    let fd = rustix::fs::open(
+        path,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("cannot read file: {error}"))?;
+    let file_type = rustix::fs::FileType::from_raw_mode(
+        rustix::fs::fstat(&fd)
+            .map_err(|error| format!("cannot read file: {error}"))?
+            .st_mode,
+    );
+    let name = path.to_string_lossy();
+    super::vfs::unix::ensure_regular_file(&name, file_type)
+        .map_err(|error| format!("cannot read file: {error}"))?;
+    Ok(fd)
+}
+
+#[cfg(not(unix))]
+async fn open_external_file(path: &Path) -> Result<fs::File, String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("cannot read file: {error}"))?;
+    if !metadata.is_file() {
+        return Err("cannot read file: not a regular file".into());
+    }
+    tokio::fs::File::open(path)
+        .await
+        .map_err(|error| format!("cannot read file: {error}"))
+}
+#[cfg(unix)]
 fn fd_into_tokio_file(fd: std::os::fd::OwnedFd) -> fs::File {
     use std::os::fd::IntoRawFd;
     use std::os::unix::io::FromRawFd;
@@ -241,11 +290,11 @@ impl Tool for ReadTool {
         ToolSpec {
             definition: ToolDefinition {
                 name: "read".into(),
-                description: "Read a text file, optionally selecting a range of lines. Text files are detected by scanning the first 8 KB; files containing NUL bytes are treated as binary and rejected. Output is capped at 2,000 lines and 50 KiB. Paths may be relative to the working directory or absolute; skill paths (SKILL.md and resources) are readable from any location.".into(),
+                description: "Read a text file, optionally selecting a range of lines. Text files are detected by scanning the first 8 KB; files containing NUL bytes are treated as binary and rejected. Output is capped at 2,000 lines and 50 KiB. Paths may be relative to the working directory or absolute; absolute paths outside the working directory are readable too (skill paths included).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Path relative to the working directory, or absolute path (including skill paths)" },
+                        "path": { "type": "string", "description": "Path relative to the working directory, or absolute path (readable even outside the working directory)" },
                         "offset": { "type": "integer", "minimum": 1, "description": "First 1-indexed line" },
                         "limit": { "type": "integer", "minimum": 1, "description": "Maximum number of lines" }
                     },
@@ -280,21 +329,10 @@ impl Tool for ReadTool {
         if cancel.is_cancelled() {
             return error(&format!("read {path}"), "cancelled");
         }
-        #[cfg(not(unix))]
-        {
-            return error(
-                &format!("read {path}"),
-                &format!(
-                    "cannot read {path}: {}",
-                    WorkspaceFs::unsupported_operation("read")
-                ),
-            );
-        }
 
-        // Resolve to components first (lexical confinement + legacy error
-        // messages), then open through the validated workspace handle so
-        // the file read is the file that was validated — not a later name
-        // lookup through mutable ancestors.
+        // Resolve first: workspace paths get lexical confinement plus the
+        // validated-handle open below; absolute paths outside the workspace
+        // fall through to a direct open (see `ReadTarget::External`).
         let target = match self.resolve_components(&path).await {
             Ok(target) => target,
             Err(message) => {
@@ -305,7 +343,35 @@ impl Tool for ReadTool {
             }
         };
         #[cfg(not(unix))]
-        let _ = &target;
+        {
+            // Workspace reads stay fail-closed where handle-relative I/O
+            // is unavailable; external reads use a plain open instead.
+            if !matches!(target, ReadTarget::External(_)) {
+                return error(
+                    &format!("read {path}"),
+                    &format!(
+                        "cannot read {path}: {}",
+                        WorkspaceFs::unsupported_operation("read")
+                    ),
+                );
+            }
+            let ReadTarget::External(external) = &target else {
+                unreachable!("just matched external");
+            };
+            let file = match open_external_file(external).await {
+                Ok(file) => file,
+                Err(message) => return error(&format!("read {path}"), &message),
+            };
+            let selected = match stream_range(file, offset, limit, &cancel).await {
+                Ok(content) => content,
+                Err(message) => return error(&format!("read {path}"), &message),
+            };
+            return ToolOutput {
+                content: selected,
+                is_error: false,
+                summary: format!("read {path}"),
+            };
+        }
         #[cfg(unix)]
         let file = match open_target(
             &target,
@@ -565,7 +631,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unrelated_absolute_paths_are_rejected_without_workspace() {
+    async fn absolute_paths_outside_workspace_are_readable() {
         let outside = tempdir().unwrap();
         let secret = outside.path().join("secret.txt");
         std::fs::write(&secret, "top secret").unwrap();
@@ -578,13 +644,41 @@ mod tests {
                 CancellationToken::new(),
             )
             .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("top secret"));
+        // Missing files, FIFOs, and binary files are rejected the same way
+        // inside and outside the workspace (and never leak contents).
+        let missing = outside.path().join("missing.txt");
+        let output = tool
+            .execute(
+                json!({"path": missing.to_string_lossy()}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "{}", output.content);
+        create_fifo(&outside.path().join("input.fifo"));
+        let output = tool
+            .execute(
+                json!({"path": outside.path().join("input.fifo").to_string_lossy()}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("not a regular file"),
+            "{}",
+            output.content
+        );
+        // Relative escapes still stay confined.
+        let output = tool
+            .execute(json!({"path": "../escape.txt"}), CancellationToken::new())
+            .await;
         assert!(output.is_error);
         assert!(
             output.content.contains("outside workspace"),
             "{}",
             output.content
         );
-        assert!(!output.content.contains("top secret"));
     }
 
     /// Non-Unix intentionally performs no path lookup after an ancestor is

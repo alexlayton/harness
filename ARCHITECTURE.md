@@ -108,8 +108,11 @@ prompt metadata, concurrency class, and executor. The system prompt and
 `CompletionRequest.tools` are generated from the same immutable
 `ToolRegistry` snapshot; never maintain a second hand-written tool list.
 
-Dedicated path tools confine resolution to the workspace and reject lexical or
-symlink escapes. The shell is not a sandbox and can access anything available
+Dedicated path tools confine writes to the workspace and reject lexical or
+symlink escapes. `read` accepts absolute paths outside the workspace (a plain
+open plus a regular-file check, under the same text/line/byte limits), because
+the shell was never a sandbox and rejecting the read only pushed the model to
+`cat` the same file through `bash`. The shell is not a sandbox and can access anything available
 to the operating-system user, but every bash invocation is exclusive. Bash runs
 with a 120-second default timeout (maximum 86,400 seconds) and caps output at
 2,000 lines or 50 KiB. On Linux, it creates a private writable cgroup-v2 scope
