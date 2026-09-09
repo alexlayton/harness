@@ -99,11 +99,22 @@ async fn rtk_rewrite_cancellable(
     (accepted && !rewritten.is_empty()).then_some(rewritten)
 }
 
-/// Resolve the bash `dir` argument against the workspace root, requiring an
-/// existing directory inside the workspace.  This mirrors the path scoping of
-/// find/grep; `cd` inside the command itself remains the escape hatch for
-/// running anywhere else.
+/// Resolve the bash `dir` argument: workspace-relative paths must stay
+/// inside the workspace, while absolute paths may point anywhere (the shell
+/// itself was never confined, so `cd /tmp && ...` in `command` always
+/// escaped it; accepting `dir: "/tmp"` openly keeps the access visible
+/// instead). Either way the directory must exist.
 async fn resolve_workspace_dir(root: &Path, dir: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(dir);
+    if path.is_absolute() {
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .map_err(|error| format!("dir {dir}: {error}"))?;
+        if !metadata.is_dir() {
+            return Err(format!("dir {dir} is not a directory"));
+        }
+        return Ok(path);
+    }
     let candidate = super::resolve_workspace_path(dir, Some(root), false).await?;
     let metadata = tokio::fs::metadata(&candidate)
         .await
@@ -120,12 +131,12 @@ impl Tool for BashTool {
         ToolSpec {
             definition: ToolDefinition {
             name: "bash".into(),
-            description: "Run a shell command in the working directory. Returns bounded stdout and stderr tails. Optionally run in a workspace-relative directory via the dir argument. Workspace cwd/path resolution is not an OS sandbox; shell commands can access paths allowed by the operating-system user.".into(),
+            description: "Run a shell command in the working directory. Returns bounded stdout and stderr tails. Optionally run in a workspace-relative directory via the dir argument (absolute paths outside the workspace are allowed too). Workspace cwd/path resolution is not an OS sandbox; shell commands can access paths allowed by the operating-system user.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Command passed to sh -c" },
-                    "dir": { "type": "string", "description": "Optional working directory for the command, relative to the workspace root (e.g. \"crates/tools\"). Prefer this over prefixing the command with cd <dir> && ..." },
+                    "dir": { "type": "string", "description": "Optional working directory: workspace-relative, or an absolute path (including outside the workspace). Prefer this over prefixing the command with cd <dir> && ..." },
                     "timeout": { "type": "integer", "minimum": 1, "maximum": MAX_TIMEOUT_SECS, "description": "Timeout in seconds (default 120, maximum 86400)" }
                 },
                 "required": ["command"],
@@ -878,6 +889,48 @@ mod tests {
         );
         assert!(!directory.path().join("cwd-marker").exists());
         assert!(output.summary.contains("(in src)"));
+    }
+
+    #[tokio::test]
+    async fn dir_argument_accepts_absolute_paths_outside_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let tool = BashTool::with_workspace_root(directory.path());
+        let output = tool
+            .execute(
+                json!({
+                    "command": "pwd",
+                    "dir": outside.path().to_string_lossy(),
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.trim_end().ends_with(
+                outside
+                    .path()
+                    .canonicalize()
+                    .unwrap_or_else(|_| outside.path().to_path_buf())
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "{}",
+            output.content
+        );
+        // An absolute path to a file (not a directory) is rejected.
+        let file = outside.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let output = tool
+            .execute(
+                json!({"command": "pwd", "dir": file.to_string_lossy()}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(output.content.contains("not a directory"));
     }
 
     #[tokio::test]
