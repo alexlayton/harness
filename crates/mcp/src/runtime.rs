@@ -824,8 +824,12 @@ done
 
         #[tokio::test]
         async fn oversized_initialize_frames_fail_promptly() {
+            // 10s, matching the catalogue sibling: the assertion is that
+            // frame rejection short-circuits the 15s initialize deadline,
+            // not that fixtures spawn in 3s. macOS runners are too slow
+            // for the tighter bound and tripped it spuriously.
             for mode in ["initialize-single", "initialize-chunked"] {
-                let result = tokio::time::timeout(Duration::from_secs(3), connect_fixture(mode))
+                let result = tokio::time::timeout(Duration::from_secs(10), connect_fixture(mode))
                     .await
                     .expect("frame rejection must not wait for initialize timeout");
                 assert_prompt_error(result, "initialize");
