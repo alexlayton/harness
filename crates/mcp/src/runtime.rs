@@ -880,8 +880,12 @@ done
                 runtime
                     .register_into(&mut registry)
                     .expect("fixture tool should register");
+                // 15s: same slow-fixture-spawn allowance as the
+                // initialize/catalogue siblings. The assertion is that the
+                // oversized frame fails as a bounded tool error, not that
+                // the fixture round-trips in 5s on macOS runners.
                 let output = tokio::time::timeout(
-                    Duration::from_secs(5),
+                    Duration::from_secs(15),
                     registry.execute(
                         &crate::normalized_tool_name("fixture", "fixture"),
                         serde_json::json!({}),
