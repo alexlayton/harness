@@ -299,7 +299,12 @@ pub mod unix {
             Ok(stat) => {
                 let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
                 ensure_regular_file(name, file_type)?;
-                Ok(Some(std::fs::Permissions::from_mode(stat.st_mode & 0o7777)))
+                // `st_mode` is `u32` on Linux but `u16` (`mode_t`) on macOS;
+                // widen explicitly so `Permissions::from_mode` always sees
+                // a `u32`. `allow` because on Linux this is a no-op cast.
+                #[allow(clippy::useless_conversion)]
+                let mode = u32::from(stat.st_mode) & 0o7777;
+                Ok(Some(std::fs::Permissions::from_mode(mode)))
             }
             Err(error) if error == rustix::io::Errno::NOENT => Ok(None),
             Err(error) => Err(io::Error::from(error)),

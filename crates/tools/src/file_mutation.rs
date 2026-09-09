@@ -156,11 +156,12 @@ pub async fn atomic_write_at(
 
         if let Some(permissions) = existing_permissions {
             use std::os::unix::fs::PermissionsExt;
-            rustix::fs::fchmod(
-                &tmp,
-                rustix::fs::Mode::from_bits_truncate(permissions.mode()),
-            )
-            .map_err(io::Error::from)?;
+            // `mode()` is the full `st_mode` (file-type bits included) as
+            // `u32`; mask to the permission bits, then narrow to rustix's
+            // raw mode type (`u32` on Linux, `u16` on macOS).
+            let mode = permissions.mode() & 0o7777;
+            rustix::fs::fchmod(&tmp, rustix::fs::Mode::from_raw_mode(mode as _))
+                .map_err(io::Error::from)?;
         }
 
         // Check and commit through the already validated parent handle. The
