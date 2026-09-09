@@ -539,13 +539,18 @@ pub fn discover(roots: &[(PathBuf, SkillMode)]) -> SkillCatalog {
     // reachable).  Only winners contribute; the list is deduped.  Stored
     // paths are canonical — the same form `ReadTool` compares after its own
     // canonicalization — while prompt `<location>` keeps the safe display
-    // path via `Skill::file_path`.
+    // path via `Skill::file_path`. Canonicalization matters on macOS,
+    // where temp dirs hide behind a `/var` -> `/private/var` symlink: the
+    // raw test-constructed paths would otherwise never match at read time.
     let mut read_paths = Vec::with_capacity(all_skills.len() * 2);
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
     for skill in &all_skills {
-        for path in [&skill.file_path, &skill.base_dir] {
+        for path in [
+            fs::canonicalize(&skill.file_path).unwrap_or_else(|_| skill.file_path.clone()),
+            fs::canonicalize(&skill.base_dir).unwrap_or_else(|_| skill.base_dir.clone()),
+        ] {
             if seen_paths.insert(path.clone()) {
-                read_paths.push(path.clone());
+                read_paths.push(path);
             }
         }
     }
@@ -711,27 +716,30 @@ mod tests {
             "expected a description diagnostic"
         );
         // The dropped skill's paths must not appear in read_paths.
+        // `read_paths` are canonical (macOS temp dirs hide behind a
+        // `/var` symlink), so compare against canonicalized expectations.
+        let canonical = |path: &PathBuf| fs::canonicalize(path).unwrap_or_else(|_| path.clone());
         assert!(
             !catalog
                 .read_paths
-                .contains(&harness.join("nodesc/SKILL.md")),
+                .contains(&canonical(&harness.join("nodesc/SKILL.md"))),
             "dropped skill file must not be in read_paths"
         );
         assert!(
-            !catalog.read_paths.contains(&harness.join("nodesc")),
+            !catalog
+                .read_paths
+                .contains(&canonical(&harness.join("nodesc"))),
             "dropped skill dir must not be in read_paths"
         );
         // The kept skill's file + base dir are present exactly once.
+        let ok_skill = canonical(&ok_skill);
+        let ok_dir = canonical(&harness.join("ok"));
         let file_count = catalog
             .read_paths
             .iter()
             .filter(|p| *p == &ok_skill)
             .count();
-        let dir_count = catalog
-            .read_paths
-            .iter()
-            .filter(|p| *p == &harness.join("ok"))
-            .count();
+        let dir_count = catalog.read_paths.iter().filter(|p| *p == &ok_dir).count();
         assert_eq!(file_count, 1, "kept skill file present once");
         assert_eq!(dir_count, 1, "kept skill dir present once");
     }
@@ -759,11 +767,17 @@ mod tests {
             (project.clone(), SkillMode::Harness),
             (global.clone(), SkillMode::Harness),
         ]);
-        // Only the winning (project) skill contributes paths.
-        assert!(catalog.read_paths.contains(&project_md));
-        assert!(catalog.read_paths.contains(&project.join("dup")));
-        assert!(!catalog.read_paths.contains(&global_md));
-        assert!(!catalog.read_paths.contains(&global.join("dup")));
+        // Only the winning (project) skill contributes paths. `read_paths`
+        // are canonical (macOS `/var` symlink), so canonicalize expectations.
+        let canonical = |path: &PathBuf| fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        assert!(catalog.read_paths.contains(&canonical(&project_md)));
+        assert!(
+            catalog
+                .read_paths
+                .contains(&canonical(&project.join("dup")))
+        );
+        assert!(!catalog.read_paths.contains(&canonical(&global_md)));
+        assert!(!catalog.read_paths.contains(&canonical(&global.join("dup"))));
     }
 
     #[test]
