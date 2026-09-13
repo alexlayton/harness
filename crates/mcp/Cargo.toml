@@ -19,3 +19,8 @@ tracing = "0.1"
 url = "2"
 tools.workspace = true
 llm.workspace = true
+
+[dev-dependencies]
+axum = "0.8"
+rmcp = { version = "3.1.4", default-features = false, features = ["server", "transport-streamable-http-server"] }
+tokio = { workspace = true, features = ["net"] }
