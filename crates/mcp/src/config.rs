@@ -39,9 +39,7 @@ impl fmt::Debug for McpServerConfig {
     }
 }
 
-/// Supported MCP transport configuration. HTTP is represented so configuration
-/// can be validated and preserved, but is not connected until its transport is
-/// enabled in a later release.
+/// Supported MCP transport configuration.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "transport", rename_all = "lowercase")]
 pub enum McpTransportConfig {
@@ -53,7 +51,7 @@ pub enum McpTransportConfig {
         #[serde(default)]
         env: BTreeMap<String, String>,
     },
-    /// Streamable HTTP endpoint (not enabled by this MVP runtime).
+    /// Streamable HTTP endpoint and headers applied to every request.
     Http {
         url: String,
         #[serde(default)]
@@ -232,23 +230,22 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
             if !url.contains("${") && url::Url::parse(url).is_err() {
                 return Err(invalid("HTTP URL is invalid"));
             }
-            if headers.keys().any(|key| {
-                key.is_empty()
-                    || key.len() > MAX_MCP_FIELD_BYTES
-                    || !key.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-                    })
-            }) {
-                return Err(invalid("HTTP header name is invalid"));
-            }
-            if headers
-                .values()
-                .any(|value| value.len() > MAX_MCP_FIELD_BYTES)
-            {
-                return Err(field_too_large(server, "HTTP header value"));
-            }
-            if headers.values().any(|value| value.contains('\0')) {
-                return Err(invalid("HTTP header values must contain no NUL"));
+            let mut normalized_headers = BTreeSet::new();
+            for (key, value) in headers {
+                if key.len() > MAX_MCP_FIELD_BYTES || http::HeaderName::try_from(key).is_err() {
+                    return Err(invalid("HTTP header name is invalid"));
+                }
+                if !normalized_headers.insert(key.to_ascii_lowercase()) {
+                    return Err(invalid(
+                        "HTTP header names must be case-insensitively unique",
+                    ));
+                }
+                if value.len() > MAX_MCP_FIELD_BYTES {
+                    return Err(field_too_large(server, "HTTP header value"));
+                }
+                if http::HeaderValue::try_from(value).is_err() {
+                    return Err(invalid("HTTP header value is invalid"));
+                }
             }
         }
     }
@@ -533,6 +530,28 @@ mod tests {
             .resolve_with(|_| Some("bad\0value".into()))
             .expect_err("expanded NUL must be rejected");
         assert!(error.to_string().contains("NUL"));
+    }
+
+    #[test]
+    fn rejects_unsafe_or_case_duplicate_http_headers() {
+        for headers in [
+            BTreeMap::from([("X-Test".into(), "line one\nline two".into())]),
+            BTreeMap::from([
+                ("X-Test".into(), "one".into()),
+                ("x-test".into(), "two".into()),
+            ]),
+        ] {
+            let config = McpConfig {
+                servers: vec![McpServerConfig {
+                    name: "remote".into(),
+                    transport: McpTransportConfig::Http {
+                        url: "https://example.test/mcp".into(),
+                        headers,
+                    },
+                }],
+            };
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

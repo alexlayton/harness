@@ -8,15 +8,17 @@ use crate::{
 use futures_util::future::join_all;
 use rmcp::ClientLifecycleMode;
 use rmcp::model::{
-    ErrorData, JsonRpcMessage, PaginatedRequestParams, RequestId, Tool as RemoteTool,
+    ErrorData, JsonRpcMessage, PaginatedRequestParams, ProtocolVersion, RequestId,
+    Tool as RemoteTool,
 };
 use rmcp::service::{
     RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage,
     serve_client_with_lifecycle_and_ct,
 };
-use rmcp::transport::Transport;
 use rmcp::transport::async_rw::AsyncRwTransport;
-use std::collections::VecDeque;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, Transport, TransportAdapterIdentity};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -441,34 +443,84 @@ async fn connect_server(
     workspace_root: &Path,
     cancel: CancellationToken,
 ) -> Result<ConnectedServer, McpError> {
-    let McpTransportConfig::Stdio { command, args, env } = &server.transport else {
-        return Err(McpError::operation(
-            &server.name,
-            "initialize",
-            "HTTP transport is not enabled in this build",
-        ));
-    };
-    let mut command = tokio::process::Command::new(command);
-    command
-        .kill_on_drop(true)
-        .args(args)
-        .current_dir(workspace_root)
-        .envs(env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
-    let stdin = child.stdin.take().ok_or_else(|| {
-        McpError::operation(&server.name, "initialize", "MCP child stdin was not piped")
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        McpError::operation(&server.name, "initialize", "MCP child stdout was not piped")
-    })?;
-    let stderr = child.stderr.take();
-    let transport = BoundedStdioTransport::new(child, stdout, stdin);
-    let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
+    match &server.transport {
+        McpTransportConfig::Stdio { command, args, env } => {
+            let mut command = tokio::process::Command::new(command);
+            command
+                .kill_on_drop(true)
+                .args(args)
+                .current_dir(workspace_root)
+                .envs(env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command
+                .spawn()
+                .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
+            let stdin = child.stdin.take().ok_or_else(|| {
+                McpError::operation(&server.name, "initialize", "MCP child stdin was not piped")
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                McpError::operation(&server.name, "initialize", "MCP child stdout was not piped")
+            })?;
+            let stderr = child.stderr.take();
+            let transport = BoundedStdioTransport::new(child, stdout, stdin);
+            let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
+            connect_transport(
+                server,
+                workspace_root,
+                cancel,
+                transport,
+                stderr_task,
+                ClientLifecycleMode::Initialize,
+            )
+            .await
+        }
+        McpTransportConfig::Http { url, headers } => {
+            let headers = headers
+                .iter()
+                .map(|(name, value)| {
+                    let name = http::HeaderName::try_from(name).map_err(|_| {
+                        McpError::operation(&server.name, "initialize", "invalid HTTP header name")
+                    })?;
+                    let value = http::HeaderValue::try_from(value).map_err(|_| {
+                        McpError::operation(&server.name, "initialize", "invalid HTTP header value")
+                    })?;
+                    Ok((name, value))
+                })
+                .collect::<Result<HashMap<_, _>, McpError>>()?;
+            let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
+                .custom_headers(headers)
+                .max_sse_event_size(MCP_MAX_FRAME_BYTES);
+            let transport = StreamableHttpClientTransport::from_config(config);
+            connect_transport(
+                server,
+                workspace_root,
+                cancel,
+                transport,
+                None,
+                ClientLifecycleMode::Auto {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                    legacy_version: Some(ProtocolVersion::V_2025_11_25),
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn connect_transport<T>(
+    server: &McpServerConfig,
+    workspace_root: &Path,
+    cancel: CancellationToken,
+    transport: T,
+    stderr_task: Option<JoinHandle<()>>,
+    lifecycle: ClientLifecycleMode,
+) -> Result<ConnectedServer, McpError>
+where
+    T: Transport<RoleClient> + 'static,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
     let handler = match HarnessClient::new(workspace_root) {
         Ok(handler) => handler,
         Err(error) => {
@@ -479,10 +531,10 @@ async fn connect_server(
     let server_cancel = cancel.child_token();
     let initialize = tokio::time::timeout(
         MCP_INITIALIZE_TIMEOUT,
-        serve_client_with_lifecycle_and_ct(
+        serve_client_with_lifecycle_and_ct::<_, _, _, TransportAdapterIdentity>(
             handler,
             transport,
-            ClientLifecycleMode::Initialize,
+            lifecycle,
             server_cancel.clone(),
         ),
     );
@@ -691,6 +743,87 @@ mod tests {
         let (output, error) = read_guarded(reader).await;
         assert_eq!(output, b"ok\n12345678");
         assert!(error.is_some());
+    }
+
+    #[derive(Clone, Default)]
+    struct HttpFixture;
+
+    impl rmcp::ServerHandler for HttpFixture {}
+
+    async fn connect_http_fixture(json_response: bool) {
+        use rmcp::transport::streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+        };
+
+        let server_cancel = CancellationToken::new();
+        let service: StreamableHttpService<HttpFixture, LocalSessionManager> =
+            StreamableHttpService::new(
+                || Ok(HttpFixture),
+                Default::default(),
+                StreamableHttpServerConfig::default()
+                    .with_legacy_session_mode(false)
+                    .with_json_response(json_response)
+                    .with_cancellation_token(server_cancel.child_token()),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let saw_header = Arc::new(AtomicBool::new(false));
+        let header_probe = axum::middleware::from_fn({
+            let saw_header = saw_header.clone();
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let saw_header = saw_header.clone();
+                async move {
+                    if request
+                        .headers()
+                        .get("x-harness-test")
+                        .is_some_and(|value| value == "present")
+                    {
+                        saw_header.store(true, Ordering::Release);
+                    }
+                    next.run(request).await
+                }
+            }
+        });
+        let server_task = tokio::spawn({
+            let server_cancel = server_cancel.clone();
+            async move {
+                let router = axum::Router::new()
+                    .nest_service("/mcp", service)
+                    .layer(header_probe);
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move { server_cancel.cancelled_owned().await })
+                    .await
+                    .unwrap();
+            }
+        });
+        let config = McpServerConfig {
+            name: "http-fixture".into(),
+            transport: McpTransportConfig::Http {
+                url: format!("http://{address}/mcp"),
+                headers: [("X-Harness-Test".into(), "present".into())]
+                    .into_iter()
+                    .collect(),
+            },
+        };
+
+        let runtime = McpRuntime::connect(&[config], Path::new("/"), CancellationToken::new())
+            .await
+            .expect("HTTP MCP server should connect");
+        assert_eq!(runtime.servers.len(), 1);
+        assert!(saw_header.load(Ordering::Acquire));
+        runtime.shutdown().await;
+        server_cancel.cancel();
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamable_http_accepts_json_responses() {
+        connect_http_fixture(true).await;
+    }
+
+    #[tokio::test]
+    async fn streamable_http_accepts_sse_responses() {
+        connect_http_fixture(false).await;
     }
 
     #[cfg(unix)]
