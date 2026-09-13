@@ -67,7 +67,7 @@ use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
 use crate::{
     ContextFileEntry, InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, SkillEntry,
-    SubscriptionUsage, SubscriptionUsageWindow, UiEvent,
+    StartupEntries, SubscriptionUsage, SubscriptionUsageWindow, UiEvent,
 };
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
@@ -121,6 +121,8 @@ enum Entry {
         model: String,
         /// Auto-loaded AGENTS.md / CLAUDE.md paths (display form).
         context_files: Vec<String>,
+        /// Configured MCP server names.
+        mcp_servers: Vec<String>,
         /// Discovered skill names.
         skills: Vec<String>,
     },
@@ -400,6 +402,8 @@ pub struct CrossTerm {
     skills: Vec<SkillEntry>,
     /// Auto-loaded AGENTS.md / CLAUDE.md paths for the header context row.
     context_files: Vec<ContextFileEntry>,
+    /// Configured MCP server names for the header MCP row.
+    mcp_servers: Vec<String>,
     session_completion_requested: bool,
     /// Providers we have already asked the agent to fetch, to avoid duplicate
     /// `ListModels` requests while typing through a model token.
@@ -436,13 +440,17 @@ impl CrossTerm {
         model: &str,
         provider: &str,
         providers: Vec<String>,
-        skills: Vec<SkillEntry>,
-        context_files: Vec<ContextFileEntry>,
+        startup: StartupEntries,
         width: u16,
         height: u16,
     ) -> Self {
         let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let environment = EnvironmentInfo::discover(workspace_root);
+        let StartupEntries {
+            skills,
+            context_files,
+            mcp_servers,
+        } = startup;
         let (path_completion_tx, path_completion_rx) = mpsc::unbounded_channel();
         Self {
             out: io::stdout(),
@@ -473,6 +481,7 @@ impl CrossTerm {
             session_candidates: Vec::new(),
             skills,
             context_files,
+            mcp_servers,
             session_completion_requested: false,
             model_list_requested: HashSet::new(),
             completion: None,
@@ -503,30 +512,21 @@ impl CrossTerm {
         ui
     }
 
-    /// `skills`, `context_files`, and the initial reasoning label come from
+    /// `skills`, `context_files`, MCP names, and the initial reasoning label come from
     /// startup configuration (the TUI never touches their backing stores).
     /// `minimal` suppresses only the initial banner and metadata.
     pub fn new(
         model: &str,
         provider: &str,
         providers: Vec<String>,
-        skills: Vec<SkillEntry>,
-        context_files: Vec<ContextFileEntry>,
+        startup: StartupEntries,
         reasoning: &str,
         minimal: bool,
     ) -> Result<Self> {
         let backend = CrosstermBackend;
         let (width, height) = backend.size().unwrap_or((80, 24));
         let mut ui = Self::with_backend(
-            Self::base(
-                model,
-                provider,
-                providers,
-                skills,
-                context_files,
-                width,
-                height,
-            ),
+            Self::base(model, provider, providers, startup, width, height),
             Box::new(backend),
         );
         ui.reasoning = reasoning.to_owned();
@@ -1880,6 +1880,7 @@ impl CrossTerm {
                 .iter()
                 .map(|file| file.path.clone())
                 .collect(),
+            mcp_servers: self.mcp_servers.clone(),
             skills: self.skills.iter().map(|skill| skill.name.clone()).collect(),
         }
     }
@@ -2457,6 +2458,7 @@ fn entry_lines(
             provider,
             model,
             context_files,
+            mcp_servers,
             skills,
         } => metadata_lines(
             cwd,
@@ -2464,6 +2466,7 @@ fn entry_lines(
             provider,
             model,
             context_files,
+            mcp_servers,
             skills,
             theme,
         )
@@ -2608,7 +2611,7 @@ fn push_detail_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, wi
     }
 }
 
-/// How many context/skill entries each header row shows before folding into
+/// How many context/MCP/skill entries each header row shows before folding into
 /// `+N more`. Skills are cheap to accumulate (one per directory), so the cap
 /// keeps a skill-heavy workspace from pushing the transcript out of view.
 const METADATA_MAX_ENTRIES: usize = 4;
@@ -2633,14 +2636,19 @@ fn fold_entries(entries: &[String]) -> Option<String> {
 /// The header metadata: two dim, left-aligned rows — `cwd  (branch)` on the
 /// first, `provider · model` on the second — replacing the old right-aligned
 /// split so both lines read as plain left-aligned chrome above the transcript.
-/// Two optional rows follow when project context or skills were auto-loaded:
-/// `context: …` and `skills: …`, capped at [`METADATA_MAX_ENTRIES`] names.
+/// Optional rows follow for project context, configured MCP servers, and skills:
+/// `context: …`, `mcps: …`, and `skills: …`, capped at [`METADATA_MAX_ENTRIES`] names.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the renderer keeps each metadata row explicit for focused tests"
+)]
 fn metadata_lines(
     cwd: &str,
     branch: Option<&str>,
     provider: &str,
     model: &str,
     context_files: &[String],
+    mcp_servers: &[String],
     skills: &[String],
     theme: Theme,
 ) -> Vec<Line<'static>> {
@@ -2659,7 +2667,11 @@ fn metadata_lines(
         Line::from(Span::styled(left, style)),
         Line::from(Span::styled(format!("{provider} \u{b7} {model}"), style)),
     ];
-    for (label, entries) in [("context", context_files), ("skills", skills)] {
+    for (label, entries) in [
+        ("context", context_files),
+        ("mcps", mcp_servers),
+        ("skills", skills),
+    ] {
         if let Some(text) = fold_entries(entries) {
             lines.push(Line::from(Span::styled(format!("{label}: {text}"), style)));
         }
@@ -3328,8 +3340,7 @@ mod tests {
             "test-model",
             "test-provider",
             vec!["opencode-go".into(), "openrouter".into()],
-            Vec::new(),
-            Vec::new(),
+            StartupEntries::default(),
             width,
             height,
         )
@@ -3995,22 +4006,24 @@ mod tests {
     }
 
     #[test]
-    fn metadata_header_shows_context_and_skill_rows_capped() {
+    fn metadata_header_shows_context_mcp_and_skill_rows_capped() {
         let lines = metadata_lines(
             "~/proj",
             None,
             "p",
             "m",
             &["AGENTS.md".into(), "~/.harness/AGENTS.md".into()],
+            &["github".into(), "filesystem".into()],
             &["alpha".into(), "beta".into()],
             Theme::default(),
         );
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert_eq!(
             row_text(&lines[2]),
             "context: AGENTS.md, ~/.harness/AGENTS.md"
         );
-        assert_eq!(row_text(&lines[3]), "skills: alpha, beta");
+        assert_eq!(row_text(&lines[3]), "mcps: github, filesystem");
+        assert_eq!(row_text(&lines[4]), "skills: alpha, beta");
 
         // More than the cap folds into `+N more`.
         let many = (0..6).map(|index| format!("s{index}")).collect::<Vec<_>>();
@@ -4019,6 +4032,7 @@ mod tests {
             None,
             "p",
             "m",
+            &[],
             &[],
             &many
                 .iter()
@@ -4031,7 +4045,7 @@ mod tests {
         assert_eq!(row_text(&lines[2]), "skills: s0, s1, s2, s3 · +2 more");
 
         // Nothing loaded: no extra rows.
-        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], Theme::default());
+        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &[], Theme::default());
         assert_eq!(lines.len(), 2);
     }
 
@@ -4046,6 +4060,7 @@ mod tests {
         let many_context: Vec<String> = (0..10)
             .map(|index| format!("/deep/path/to/AGENTS-{index}.md"))
             .collect();
+        let many_mcps: Vec<String> = (0..10).map(|index| format!("mcp-server-{index}")).collect();
         let many_skills: Vec<String> = (0..10)
             .map(|index| format!("skill-number-{index}"))
             .collect();
@@ -4056,6 +4071,7 @@ mod tests {
                 "provider-with-a-long-name",
                 long_model,
                 &many_context,
+                &many_mcps,
                 &many_skills,
                 Theme::default(),
             );

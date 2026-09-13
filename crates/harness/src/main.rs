@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tools::{ToolConfig, default_registry};
-use tui::{ContextFileEntry, CrossTerm};
+use tui::{ContextFileEntry, CrossTerm, StartupEntries};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -299,12 +299,19 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         &config.model,
         &provider_name,
         providers,
-        skill_entries,
-        context_bundle
-            .display_paths
-            .into_iter()
-            .map(|path| ContextFileEntry { path })
-            .collect(),
+        StartupEntries {
+            skills: skill_entries,
+            context_files: context_bundle
+                .display_paths
+                .into_iter()
+                .map(|path| ContextFileEntry { path })
+                .collect(),
+            mcp_servers: config
+                .mcp_servers
+                .iter()
+                .map(|server| server.name.clone())
+                .collect(),
+        },
         config.reasoning.as_str(),
         config.tui_minimal,
     )?;
