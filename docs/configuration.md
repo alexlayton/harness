@@ -125,22 +125,26 @@ is the enforcement, not prompt wording.
 
 ## MCP servers
 
-Harness can start external stdio MCP servers from `config.toml`. Manage them
-from the command line with:
+Harness connects external stdio and Streamable HTTP MCP servers from
+`config.toml`. Manage them from the command line with:
 
 ```text
 harness mcp
 harness mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
+harness mcp add remote --url https://example.com/mcp
+harness mcp add private --url https://example.com/mcp \
+  --header 'Authorization=Bearer ${MCP_TOKEN}'
 harness mcp delete filesystem
 ```
 
-`harness mcp` and `harness mcp list` list the configured servers. The `--`
-separates Harness options from flags passed unchanged to the server executable.
-Servers are launched directly, so add the executable and each argument as a
-separate command-line value rather than supplying one shell command string.
+`harness mcp` and `harness mcp list` list the configured servers. For stdio,
+the `--` separates Harness options from flags passed unchanged to the server
+executable. Servers are launched directly, so add the executable and each
+argument as a separate command-line value rather than supplying one shell
+command string. Repeat `--header NAME=VALUE` to configure HTTP request headers.
 The commands update `config.toml` atomically and preserve unrelated settings.
 
-The equivalent configuration is:
+The equivalent stdio configuration is:
 
 ```toml
 [[mcp.servers]]
@@ -154,9 +158,23 @@ LOG_LEVEL = "warn"
 TOKEN = "${MCP_TOKEN}"
 ```
 
-Harness expands `${ENV_VAR}` placeholders in arguments and environment values
-at startup. A missing variable stops startup. Expanded secrets are not written
-back to configuration or session history.
+Streamable HTTP uses one endpoint and supports both JSON and SSE responses:
+
+```toml
+[[mcp.servers]]
+name = "private"
+transport = "http"
+url = "https://example.com/mcp"
+
+[mcp.servers.headers]
+Authorization = "Bearer ${MCP_TOKEN}"
+```
+
+Harness expands `${ENV_VAR}` placeholders in stdio arguments/environment and
+HTTP URLs/header values at startup. A missing variable stops startup. Expanded
+secrets are not written back to configuration or session history. Prefer
+`https://` for non-local endpoints and keep bearer tokens in environment
+variables rather than literal configuration values.
 
 Servers run directly, not through a shell, and use the workspace as their
 working directory. Server stdout is reserved for MCP framing. Server stderr
@@ -166,9 +184,12 @@ MCP tools are discovered when the session starts. Reconnect to apply server
 tool-list changes. Calls are serialized as exclusive operations and run
 without a confirmation step. Subagents do not receive MCP tools.
 
-Only stdio transport is enabled. Streamable HTTP and legacy SSE transports are
-not enabled. ACP clients may declare HTTP/SSE servers, but those entries are
-rejected before any connection is attempted.
+Streamable HTTP first uses the draft `2026-07-28` discovery and request-metadata
+flow, then falls back to the initialized `2025-11-25` Streamable HTTP protocol
+for compatible older servers. Both JSON and request-scoped SSE responses are
+accepted. The deprecated HTTP+SSE transport is not supported. ACP clients may
+declare stdio or HTTP servers; legacy SSE and MCP-over-ACP entries are rejected
+before any connection is attempted.
 
 MCP has fixed safety limits rather than per-server TOML overrides: initialize
 and catalogue requests have 15-second deadlines, calls have a 60-second
@@ -180,10 +201,11 @@ at most 256 tools with at most 512 KiB of aggregate definitions. Schemas are
 limited to depth 32, 10,000 nodes, 64 KiB strings, and 256 KiB total size.
 Structured/text/error output is compacted (never pretty-printed) and capped
 at 20 KiB with a truncation notice; when structured and text carry the same
-payload only one representation is kept. Every newline-delimited stdio frame is
-also capped at 1 MiB before rmcp deserializes it, including initialize,
-pagination, calls, and protocol errors. Stderr is read in bounded 4 KiB chunks,
-counted but discarded by default, and never logged with secrets.
+payload only one representation is kept. Every newline-delimited stdio frame
+and HTTP SSE event is capped at 1 MiB before rmcp deserializes it, including
+initialization/discovery, pagination, calls, and protocol errors. Stderr is read
+in bounded 4 KiB chunks, counted but discarded by default, and never logged
+with secrets.
 
 ## Sessions
 

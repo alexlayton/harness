@@ -128,12 +128,15 @@ shared one-second drain deadline bounds Harness waiting. Other non-Unix
 platforms only guarantee direct-child termination. File mutations also use
 process-local locks to prevent overlapping writes.
 
-`mcp` starts configured stdio servers during assembly, discovers their tools,
-namespaces them, and registers adapters in the same registry. MCP calls are
-exclusive. Limits: 15-second initialize/catalogue deadlines, 60-second call
-deadline, four-second global shutdown; each newline-delimited stdio frame is
-capped at 1 MiB before rmcp deserialization; at most 256 tools and 512 KiB of
-aggregate definitions per server; schemas bounded by depth, node count, and
+`mcp` connects configured stdio and Streamable HTTP servers during assembly,
+discovers their tools, namespaces them, and registers adapters in the same
+registry. HTTP uses modern discovery with fallback to the initialized
+2025-11-25 protocol; deprecated HTTP+SSE is not supported. MCP calls are
+exclusive. Limits: 15-second initialization/discovery and catalogue deadlines,
+60-second call deadline, four-second global shutdown; each newline-delimited
+stdio frame and HTTP SSE event is capped at 1 MiB before rmcp deserialization;
+at most 256 tools and 512 KiB of aggregate definitions per server; schemas
+bounded by depth, node count, and
 string/total size; output compacted and capped at 20 KiB. Tool-list changes
 require a new connection, and MCP tools are not passed to subagents.
 

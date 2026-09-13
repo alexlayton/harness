@@ -15,9 +15,9 @@
 //! (`authenticate` answers with instructions to sign in interactively),
 //! transcript replay on `session/load` (history is intact on disk and in the
 //! agent context; the editor shows an empty transcript until the next turn),
-//! HTTP/SSE/MCP-over-ACP transports, mid-session model switching. ACP-provided
-//! stdio MCP servers are supported per session. Unhandled requests fall through
-//! to the SDK default of method-not-found.
+//! legacy SSE/MCP-over-ACP transports, mid-session model switching. ACP-provided
+//! stdio and Streamable HTTP MCP servers are supported per session. Unhandled
+//! requests fall through to the SDK default of method-not-found.
 //!
 //! Stdout ownership is inverted here: stdout carries JSON-RPC only. Tracing
 //! stays behind `HARNESS_LOG` (file-only), and this module never writes to
