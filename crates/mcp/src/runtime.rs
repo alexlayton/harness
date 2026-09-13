@@ -14,9 +14,10 @@ use rmcp::service::{
     RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage,
     serve_client_with_lifecycle_and_ct,
 };
-use rmcp::transport::Transport;
 use rmcp::transport::async_rw::AsyncRwTransport;
-use std::collections::VecDeque;
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{StreamableHttpClientTransport, Transport, TransportAdapterIdentity};
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -441,34 +442,64 @@ async fn connect_server(
     workspace_root: &Path,
     cancel: CancellationToken,
 ) -> Result<ConnectedServer, McpError> {
-    let McpTransportConfig::Stdio { command, args, env } = &server.transport else {
-        return Err(McpError::operation(
-            &server.name,
-            "initialize",
-            "HTTP transport is not enabled in this build",
-        ));
-    };
-    let mut command = tokio::process::Command::new(command);
-    command
-        .kill_on_drop(true)
-        .args(args)
-        .current_dir(workspace_root)
-        .envs(env)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
-    let stdin = child.stdin.take().ok_or_else(|| {
-        McpError::operation(&server.name, "initialize", "MCP child stdin was not piped")
-    })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
-        McpError::operation(&server.name, "initialize", "MCP child stdout was not piped")
-    })?;
-    let stderr = child.stderr.take();
-    let transport = BoundedStdioTransport::new(child, stdout, stdin);
-    let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
+    match &server.transport {
+        McpTransportConfig::Stdio { command, args, env } => {
+            let mut command = tokio::process::Command::new(command);
+            command
+                .kill_on_drop(true)
+                .args(args)
+                .current_dir(workspace_root)
+                .envs(env)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command
+                .spawn()
+                .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
+            let stdin = child.stdin.take().ok_or_else(|| {
+                McpError::operation(&server.name, "initialize", "MCP child stdin was not piped")
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                McpError::operation(&server.name, "initialize", "MCP child stdout was not piped")
+            })?;
+            let stderr = child.stderr.take();
+            let transport = BoundedStdioTransport::new(child, stdout, stdin);
+            let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
+            connect_transport(server, workspace_root, cancel, transport, stderr_task).await
+        }
+        McpTransportConfig::Http { url, headers } => {
+            let headers = headers
+                .iter()
+                .map(|(name, value)| {
+                    let name = http::HeaderName::try_from(name).map_err(|_| {
+                        McpError::operation(&server.name, "initialize", "invalid HTTP header name")
+                    })?;
+                    let value = http::HeaderValue::try_from(value).map_err(|_| {
+                        McpError::operation(&server.name, "initialize", "invalid HTTP header value")
+                    })?;
+                    Ok((name, value))
+                })
+                .collect::<Result<HashMap<_, _>, McpError>>()?;
+            let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
+                .custom_headers(headers)
+                .max_sse_event_size(MCP_MAX_FRAME_BYTES);
+            let transport = StreamableHttpClientTransport::from_config(config);
+            connect_transport(server, workspace_root, cancel, transport, None).await
+        }
+    }
+}
+
+async fn connect_transport<T>(
+    server: &McpServerConfig,
+    workspace_root: &Path,
+    cancel: CancellationToken,
+    transport: T,
+    stderr_task: Option<JoinHandle<()>>,
+) -> Result<ConnectedServer, McpError>
+where
+    T: Transport<RoleClient> + 'static,
+    T::Error: std::error::Error + Send + Sync + 'static,
+{
     let handler = match HarnessClient::new(workspace_root) {
         Ok(handler) => handler,
         Err(error) => {
@@ -479,7 +510,7 @@ async fn connect_server(
     let server_cancel = cancel.child_token();
     let initialize = tokio::time::timeout(
         MCP_INITIALIZE_TIMEOUT,
-        serve_client_with_lifecycle_and_ct(
+        serve_client_with_lifecycle_and_ct::<_, _, _, TransportAdapterIdentity>(
             handler,
             transport,
             ClientLifecycleMode::Initialize,
