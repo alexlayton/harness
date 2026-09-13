@@ -544,6 +544,59 @@ fn add_mcp_server_at(path: &Path, name: &str, command: &[String]) -> Result<()> 
     .validate()
     .map_err(|error| anyhow!(error))?;
 
+    let mut server = toml_edit::Table::new();
+    server["name"] = toml_edit::value(name);
+    server["transport"] = toml_edit::value("stdio");
+    server["command"] = toml_edit::value(executable);
+    let mut arguments = toml_edit::Array::new();
+    arguments.extend(args.iter().map(String::as_str));
+    server["args"] = toml_edit::value(arguments);
+    insert_mcp_server_at(path, name, server)
+}
+
+/// Add one Streamable HTTP MCP server while retaining unrelated settings.
+pub fn add_http_mcp_server(
+    name: &str,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<()> {
+    add_http_mcp_server_at(&config_path(), name, url, headers)
+}
+
+fn add_http_mcp_server_at(
+    path: &Path,
+    name: &str,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<()> {
+    let candidate = mcp::McpServerConfig {
+        name: name.to_owned(),
+        transport: mcp::McpTransportConfig::Http {
+            url: url.to_owned(),
+            headers: headers.clone(),
+        },
+    };
+    mcp::McpConfig {
+        servers: vec![candidate],
+    }
+    .validate()
+    .map_err(|error| anyhow!(error))?;
+
+    let mut server = toml_edit::Table::new();
+    server["name"] = toml_edit::value(name);
+    server["transport"] = toml_edit::value("http");
+    server["url"] = toml_edit::value(url);
+    if !headers.is_empty() {
+        let mut header_table = toml_edit::Table::new();
+        for (header, value) in headers {
+            header_table[header] = toml_edit::value(value);
+        }
+        server["headers"] = toml_edit::Item::Table(header_table);
+    }
+    insert_mcp_server_at(path, name, server)
+}
+
+fn insert_mcp_server_at(path: &Path, name: &str, server: toml_edit::Table) -> Result<()> {
     update_config_document(path, |document| {
         if document.get("mcp").is_none() {
             document["mcp"] = toml_edit::Item::Table(toml_edit::Table::new());
@@ -563,14 +616,6 @@ fn add_mcp_server_at(path: &Path, name: &str, command: &[String]) -> Result<()> 
         {
             anyhow::bail!("MCP server `{name}` is already configured");
         }
-
-        let mut server = toml_edit::Table::new();
-        server["name"] = toml_edit::value(name);
-        server["transport"] = toml_edit::value("stdio");
-        server["command"] = toml_edit::value(executable);
-        let mut arguments = toml_edit::Array::new();
-        arguments.extend(args.iter().map(String::as_str));
-        server["args"] = toml_edit::value(arguments);
         servers.push(server);
         Ok(())
     })
@@ -664,7 +709,7 @@ pub struct McpArgs {
 
 #[derive(Clone, Debug, clap::Subcommand)]
 pub enum McpCommand {
-    /// Add a stdio server.
+    /// Add a stdio or Streamable HTTP server.
     Add(McpAddArgs),
     /// Delete a server by name.
     #[command(alias = "remove", alias = "rm")]
@@ -676,13 +721,23 @@ pub enum McpCommand {
 #[derive(Clone, Debug, clap::Args)]
 #[command(
     trailing_var_arg = true,
-    after_help = "Example: harness mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ."
+    after_help = "Examples:\n  harness mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .\n  harness mcp add remote --url https://example.com/mcp --header 'Authorization=Bearer ${MCP_TOKEN}'"
 )]
 pub struct McpAddArgs {
     /// Stable name used to namespace this server's tools.
     pub name: String,
+    /// Streamable HTTP endpoint instead of a stdio command.
+    #[arg(long, value_name = "URL", conflicts_with = "command")]
+    pub url: Option<String>,
+    /// HTTP header as NAME=VALUE. Values may contain `${ENV_VAR}` placeholders.
+    #[arg(long, value_name = "NAME=VALUE", requires = "url")]
+    pub header: Vec<String>,
     /// Executable followed by its arguments. Use `--` before flags intended for the executable.
-    #[arg(required = true, allow_hyphen_values = true, value_name = "COMMAND...")]
+    #[arg(
+        required_unless_present = "url",
+        allow_hyphen_values = true,
+        value_name = "COMMAND..."
+    )]
     pub command: Vec<String>,
 }
 
@@ -1078,8 +1133,28 @@ mod tests {
         assert!(matches!(
             mcp.command,
             Some(Command::Mcp(McpArgs {
-                command: Some(McpCommand::Add(McpAddArgs { name, command }))
+                command: Some(McpCommand::Add(McpAddArgs { name, command, .. }))
             })) if name == "filesystem" && command == ["npx", "-y", "server-filesystem"]
+        ));
+        let http_mcp = Cli::try_parse_from([
+            "harness",
+            "mcp",
+            "add",
+            "remote",
+            "--url",
+            "https://example.test/mcp",
+            "--header",
+            "Authorization=Bearer ${MCP_TOKEN}",
+        ])
+        .unwrap();
+        assert!(matches!(
+            http_mcp.command,
+            Some(Command::Mcp(McpArgs {
+                command: Some(McpCommand::Add(McpAddArgs { name, url: Some(url), header, command }))
+            })) if name == "remote"
+                && url == "https://example.test/mcp"
+                && header == ["Authorization=Bearer ${MCP_TOKEN}"]
+                && command.is_empty()
         ));
         assert!(matches!(
             Cli::try_parse_from(["harness", "mcp"]).unwrap().command,
@@ -1414,6 +1489,26 @@ future_server_key = "keep"
             assert!(saved.contains(fragment), "missing {fragment} in {saved}");
         }
         assert!(!saved.contains("filesystem"));
+    }
+
+    #[test]
+    fn adds_http_mcp_server_with_environment_backed_headers() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let headers = BTreeMap::from([
+            ("Authorization".into(), "Bearer ${MCP_TOKEN}".into()),
+            ("X-Tenant".into(), "acme".into()),
+        ]);
+
+        add_http_mcp_server_at(&path, "remote", "https://example.test/mcp", &headers).unwrap();
+        let loaded = load_file_config(&path).unwrap();
+        let server = &loaded.mcp.unwrap().servers[0];
+        let mcp::McpTransportConfig::Http { url, headers } = &server.transport else {
+            panic!("expected HTTP server")
+        };
+        assert_eq!(url, "https://example.test/mcp");
+        assert_eq!(headers["Authorization"], "Bearer ${MCP_TOKEN}");
+        assert_eq!(headers["X-Tenant"], "acme");
     }
 
     #[test]

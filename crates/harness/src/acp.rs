@@ -1244,9 +1244,9 @@ async fn build_agent_with_timeout(
     }
 }
 
-/// Convert ACP's session-local stdio declarations without retaining ACP wire
-/// types outside this frontend. HTTP, SSE, and MCP-over-ACP are rejected
-/// rather than silently omitted.
+/// Convert ACP's session-local stdio and Streamable HTTP declarations without
+/// retaining ACP wire types outside this frontend. Deprecated SSE and
+/// MCP-over-ACP transports are rejected rather than silently omitted.
 fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
     let servers = servers
         .iter()
@@ -1263,10 +1263,17 @@ fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
                         .collect(),
                 },
             }),
-            McpServer::Http(server) => anyhow::bail!(
-                "MCP server `{}` requests HTTP, which this Harness build does not support",
-                server.name
-            ),
+            McpServer::Http(server) => Ok(mcp::McpServerConfig {
+                name: server.name.clone(),
+                transport: mcp::McpTransportConfig::Http {
+                    url: server.url.clone(),
+                    headers: server
+                        .headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect(),
+                },
+            }),
             McpServer::Sse(server) => anyhow::bail!(
                 "MCP server `{}` requests SSE, which this Harness build does not support",
                 server.name
