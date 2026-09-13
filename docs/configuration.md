@@ -125,7 +125,22 @@ is the enforcement, not prompt wording.
 
 ## MCP servers
 
-Harness can start external stdio MCP servers from `config.toml`:
+Harness can start external stdio MCP servers from `config.toml`. Manage them
+from the command line with:
+
+```text
+harness mcp
+harness mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
+harness mcp delete filesystem
+```
+
+`harness mcp` and `harness mcp list` list the configured servers. The `--`
+separates Harness options from flags passed unchanged to the server executable.
+Servers are launched directly, so add the executable and each argument as a
+separate command-line value rather than supplying one shell command string.
+The commands update `config.toml` atomically and preserve unrelated settings.
+
+The equivalent configuration is:
 
 ```toml
 [[mcp.servers]]
