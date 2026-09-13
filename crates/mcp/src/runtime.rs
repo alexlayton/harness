@@ -489,22 +489,53 @@ async fn connect_server(
                     Ok((name, value))
                 })
                 .collect::<Result<HashMap<_, _>, McpError>>()?;
-            let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
-                .custom_headers(headers)
-                .max_sse_event_size(MCP_MAX_FRAME_BYTES);
-            let transport = StreamableHttpClientTransport::from_config(config);
-            connect_transport(
+            let make_transport = || {
+                let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
+                    .custom_headers(headers.clone())
+                    .max_sse_event_size(MCP_MAX_FRAME_BYTES);
+                StreamableHttpClientTransport::from_config(config)
+            };
+            let result = connect_transport(
                 server,
                 workspace_root,
-                cancel,
-                transport,
+                cancel.clone(),
+                make_transport(),
                 None,
                 ClientLifecycleMode::Auto {
                     preferred_versions: vec![ProtocolVersion::V_2026_07_28],
                     legacy_version: Some(ProtocolVersion::V_2025_11_25),
                 },
             )
-            .await
+            .await;
+
+            // Some legacy Streamable HTTP servers close a stateless request
+            // when they receive the newer server/discover method. rmcp's Auto
+            // mode can fall back after a JSON-RPC rejection, but not after the
+            // transport closes; reconnect before using legacy initialization.
+            if matches!(
+                &result,
+                Err(McpError::Operation {
+                    operation: "initialize",
+                    message,
+                    ..
+                }) if message == "connection closed: discover response"
+            ) && !cancel.is_cancelled()
+            {
+                tracing::debug!(
+                    server = %server.name,
+                    "MCP discovery connection closed; retrying legacy initialization"
+                );
+                return connect_transport(
+                    server,
+                    workspace_root,
+                    cancel,
+                    make_transport(),
+                    None,
+                    ClientLifecycleMode::Initialize,
+                )
+                .await;
+            }
+            result
         }
     }
 }
