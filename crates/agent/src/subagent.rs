@@ -47,7 +47,7 @@ use std::sync::RwLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tools::{
-    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry,
+    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolExecutionGate, ToolRegistry,
     default_registry_with_index, read_only_registry_with_index,
 };
 
@@ -128,6 +128,10 @@ pub struct SubagentRunnerImpl {
     model_state: RwLock<SubagentModelState>,
     workspace_root: PathBuf,
     search_index: Arc<FileSearchIndex>,
+    /// Gate shared with the parent registry and sibling agents targeting this
+    /// workspace. Child mutations acquire it directly; the outer subagent
+    /// invocation deliberately does not, avoiding nested mutex acquisition.
+    execution_gate: Option<ToolExecutionGate>,
     rtk: bool,
     project_context: String,
     /// Resolved delegation bounds (`max_turns`; `0` disables subagents).
@@ -188,6 +192,7 @@ impl SubagentRunnerImpl {
             }),
             workspace_root,
             search_index,
+            execution_gate: None,
             rtk,
             project_context: project_context.into(),
             config,
@@ -209,6 +214,12 @@ impl SubagentRunnerImpl {
     /// parent index before the runner can be shared or used.
     pub fn with_file_search_index(mut self, index: Arc<FileSearchIndex>) -> Self {
         self.search_index = index;
+        self
+    }
+
+    /// Coordinate child tool mutations with the parent and sibling registries.
+    pub fn with_execution_gate(mut self, gate: ToolExecutionGate) -> Self {
+        self.execution_gate = Some(gate);
         self
     }
 
@@ -263,6 +274,7 @@ impl SubagentRunnerImpl {
         let workspace_root = self.workspace_root.clone();
         let rtk = self.rtk;
         let search_index = self.search_index.clone();
+        let execution_gate = self.execution_gate.clone();
         #[cfg(test)]
         let builds = &self.test_registry_builds;
         let built = cache.get_or_init(move || {
@@ -279,7 +291,12 @@ impl SubagentRunnerImpl {
                 ),
             };
             result
-                .map(Arc::new)
+                .map(|mut registry| {
+                    if let Some(gate) = execution_gate {
+                        registry.set_execution_gate(gate);
+                    }
+                    Arc::new(registry)
+                })
                 .map_err(|error| format!("could not build subagent tools: {error}"))
         });
         match built {
@@ -1073,6 +1090,18 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn execution_gate_is_propagated_to_child_registries() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let runner = runner_with_dyn(Arc::new(ScriptProvider::new(Vec::new())))
+            .with_execution_gate(gate.clone());
+
+        for mode in [SubagentMode::ReadOnly, SubagentMode::Workspace] {
+            let registry = runner.registry(mode).unwrap();
+            assert!(Arc::ptr_eq(registry.execution_gate().unwrap(), &gate));
+        }
     }
 
     #[tokio::test]

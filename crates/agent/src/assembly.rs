@@ -153,6 +153,7 @@ impl AgentBuilder {
         }
         let parent_session = self.session.as_ref().map(|(_, session)| session.id());
         let search_index = self.tools.file_search_index().cloned();
+        let execution_gate = self.tools.execution_gate().cloned();
         let runner = if self.subagents.max_turns > 0 {
             let mut runner = SubagentRunnerImpl::new(
                 self.provider.clone(),
@@ -167,6 +168,9 @@ impl AgentBuilder {
             .with_reasoning(self.reasoning);
             if let Some(index) = search_index {
                 runner = runner.with_file_search_index(index);
+            }
+            if let Some(gate) = execution_gate {
+                runner = runner.with_execution_gate(gate);
             }
             let runner = Arc::new(runner);
             if let Err(error) = self.tools.register_subagent(runner.clone()) {

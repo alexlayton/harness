@@ -93,6 +93,11 @@ impl ToolRegistry {
         self.execution_gate = Some(gate);
     }
 
+    /// Return the shared execution gate, when cross-registry coordination is enabled.
+    pub fn execution_gate(&self) -> Option<&ToolExecutionGate> {
+        self.execution_gate.as_ref()
+    }
+
     /// Set the discovered skill catalog (called by `default_registry`).
     pub fn set_skills(&mut self, skills: super::skills::SkillCatalog) {
         self.skills = Some(skills);
@@ -194,6 +199,14 @@ impl ToolRegistry {
         if tool.tool.concurrency(&args) == super::Concurrency::ReadOnly {
             return tool.tool.execute(args, cancel).await;
         }
+        // A workspace subagent acquires this same gate around each mutating
+        // child tool. Holding the non-reentrant mutex around the outer future
+        // would deadlock as soon as the child attempted its first mutation.
+        // The child registry is the coordination boundary instead; direct
+        // parent mutations continue through the gate below.
+        if name == super::subagent::SUBAGENT_TOOL_NAME {
+            return tool.tool.execute(args, cancel).await;
+        }
         let Some(gate) = &self.execution_gate else {
             return tool.tool.execute(args, cancel).await;
         };
@@ -291,6 +304,29 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    struct GatedWorkspaceRunner {
+        gate: ToolExecutionGate,
+        entered: mpsc::UnboundedSender<()>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl super::super::SubagentRunner for GatedWorkspaceRunner {
+        async fn run(
+            &self,
+            _: &str,
+            _: &str,
+            mode: super::super::SubagentMode,
+            _: CancellationToken,
+        ) -> Result<String, String> {
+            assert_eq!(mode, super::super::SubagentMode::Workspace);
+            let _guard = self.gate.lock().await;
+            self.entered.send(()).unwrap();
+            self.release.notified().await;
+            Ok("done".into())
+        }
+    }
+
     #[async_trait]
     impl Tool for BlockingTool {
         fn spec(&self) -> super::super::ToolSpec {
@@ -374,6 +410,64 @@ mod tests {
         release.notify_one();
         first_task.await.unwrap();
         second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_subagents_gate_children_without_nested_deadlock() {
+        let gate = Arc::new(Mutex::new(()));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let make_registry = || {
+            let mut registry = ToolRegistry::empty().with_execution_gate(gate.clone());
+            registry
+                .register_subagent(Arc::new(GatedWorkspaceRunner {
+                    gate: gate.clone(),
+                    entered: entered_tx.clone(),
+                    release: release.clone(),
+                }))
+                .unwrap();
+            registry
+        };
+        let first = make_registry();
+        let second = make_registry();
+        let args = json!({"description": "test", "prompt": "test", "mode": "workspace"});
+        let first_task = tokio::spawn({
+            let args = args.clone();
+            async move {
+                first
+                    .execute("subagent", args, CancellationToken::new())
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("outer subagent call deadlocked")
+            .unwrap();
+        let second_task = tokio::spawn(async move {
+            second
+                .execute("subagent", args, CancellationToken::new())
+                .await
+        });
+        assert!(
+            timeout(Duration::from_millis(50), entered_rx.recv())
+                .await
+                .is_err(),
+            "workspace child mutations overlapped"
+        );
+        release.notify_one();
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.notify_one();
+        timeout(Duration::from_secs(1), first_task)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), second_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
