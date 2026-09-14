@@ -3,6 +3,7 @@ mod config;
 mod context;
 mod headless;
 mod login;
+mod mcp_command;
 mod tui_adapter;
 mod worktree;
 
@@ -42,6 +43,9 @@ async fn main_inner() -> Result<ExitCode> {
     // resolution: a stale configured API key cannot prevent signing in.
     if let Some(Command::Login(args)) = &cli.command {
         return login::run(args).await;
+    }
+    if let Some(Command::Mcp(args)) = &cli.command {
+        return mcp_command::run(args);
     }
 
     // Worktree is a launch mode rather than a separate frontend. Enter it

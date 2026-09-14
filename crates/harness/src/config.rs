@@ -409,7 +409,7 @@ fn sync_config_parent(_parent: &Path) -> Result<()> {
 
 fn update_config_document(
     path: &Path,
-    update: impl FnOnce(&mut toml_edit::DocumentMut),
+    update: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
 ) -> Result<()> {
     let _lock = lock_config(path)?;
     let contents = match fs::read_to_string(path) {
@@ -422,7 +422,7 @@ fn update_config_document(
     let mut document: toml_edit::DocumentMut = contents
         .parse()
         .with_context(|| format!("parse config file {}", path.display()))?;
-    update(&mut document);
+    update(&mut document)?;
     let rendered = document.to_string();
     parse_file_config(&rendered, path)?;
     write_config_contents(path, &rendered)
@@ -485,6 +485,7 @@ pub fn save_settings_at(path: &Path, provider: &str, model: &str) -> Result<()> 
     update_config_document(path, |document| {
         document["provider"] = toml_edit::value(provider);
         document["model"] = toml_edit::value(model);
+        Ok(())
     })
 }
 
@@ -498,6 +499,7 @@ pub fn save_reasoning(reasoning: ReasoningPolicy) -> Result<()> {
 pub fn save_reasoning_at(path: &Path, reasoning: ReasoningPolicy) -> Result<()> {
     update_config_document(path, |document| {
         document["reasoning_effort"] = toml_edit::value(reasoning.as_str());
+        Ok(())
     })
 }
 
@@ -514,8 +516,99 @@ fn select_provider_after_login_at(path: &Path, provider: ProviderArg) -> Result<
             document["provider"] = toml_edit::value(provider.to_string());
             selected.set(true);
         }
+        Ok(())
     })?;
     Ok(selected.get())
+}
+
+/// Add one stdio MCP server while retaining unrelated and unknown settings.
+pub fn add_mcp_server(name: &str, command: &[String]) -> Result<()> {
+    add_mcp_server_at(&config_path(), name, command)
+}
+
+fn add_mcp_server_at(path: &Path, name: &str, command: &[String]) -> Result<()> {
+    let (executable, args) = command
+        .split_first()
+        .ok_or_else(|| anyhow!("an MCP server command is required"))?;
+    let candidate = mcp::McpServerConfig {
+        name: name.to_owned(),
+        transport: mcp::McpTransportConfig::Stdio {
+            command: executable.into(),
+            args: args.to_vec(),
+            env: BTreeMap::new(),
+        },
+    };
+    mcp::McpConfig {
+        servers: vec![candidate],
+    }
+    .validate()
+    .map_err(|error| anyhow!(error))?;
+
+    update_config_document(path, |document| {
+        if document.get("mcp").is_none() {
+            document["mcp"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let mcp = document["mcp"]
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("`mcp` must be a table"))?;
+        if mcp.get("servers").is_none() {
+            mcp["servers"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        let servers = mcp["servers"]
+            .as_array_of_tables_mut()
+            .ok_or_else(|| anyhow!("`mcp.servers` must be an array of tables"))?;
+        if servers
+            .iter()
+            .any(|server| server.get("name").and_then(|item| item.as_str()) == Some(name))
+        {
+            anyhow::bail!("MCP server `{name}` is already configured");
+        }
+
+        let mut server = toml_edit::Table::new();
+        server["name"] = toml_edit::value(name);
+        server["transport"] = toml_edit::value("stdio");
+        server["command"] = toml_edit::value(executable);
+        let mut arguments = toml_edit::Array::new();
+        arguments.extend(args.iter().map(String::as_str));
+        server["args"] = toml_edit::value(arguments);
+        servers.push(server);
+        Ok(())
+    })
+}
+
+/// Delete one named MCP server while retaining unrelated and unknown settings.
+pub fn delete_mcp_server(name: &str) -> Result<()> {
+    delete_mcp_server_at(&config_path(), name)
+}
+
+fn delete_mcp_server_at(path: &Path, name: &str) -> Result<()> {
+    update_config_document(path, |document| {
+        let Some(servers) = document
+            .get_mut("mcp")
+            .and_then(toml_edit::Item::as_table_mut)
+            .and_then(|mcp| mcp.get_mut("servers"))
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+        else {
+            anyhow::bail!("MCP server `{name}` is not configured");
+        };
+        let Some(index) = servers
+            .iter()
+            .position(|server| server.get("name").and_then(|item| item.as_str()) == Some(name))
+        else {
+            anyhow::bail!("MCP server `{name}` is not configured");
+        };
+        servers.remove(index);
+        if servers.is_empty() {
+            let mcp = document["mcp"]
+                .as_table_mut()
+                .expect("MCP table was checked above");
+            mcp.remove("servers");
+            if mcp.is_empty() {
+                document.remove("mcp");
+            }
+        }
+        Ok(())
+    })
 }
 
 #[derive(Clone, Debug, Default, Parser)]
@@ -557,8 +650,40 @@ pub enum Command {
     Prompt(PromptArgs),
     /// Create or reuse a Git worktree and start a frontend there.
     Worktree(WorktreeArgs),
+    /// Manage configured MCP servers.
+    Mcp(McpArgs),
     /// Serve Agent Client Protocol over stdio for editor integrations.
     Acp,
+}
+
+#[derive(Clone, Debug, clap::Args)]
+pub struct McpArgs {
+    #[command(subcommand)]
+    pub command: Option<McpCommand>,
+}
+
+#[derive(Clone, Debug, clap::Subcommand)]
+pub enum McpCommand {
+    /// Add a stdio server.
+    Add(McpAddArgs),
+    /// Delete a server by name.
+    #[command(alias = "remove", alias = "rm")]
+    Delete { name: String },
+    /// List configured servers.
+    List,
+}
+
+#[derive(Clone, Debug, clap::Args)]
+#[command(
+    trailing_var_arg = true,
+    after_help = "Example: harness mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem ."
+)]
+pub struct McpAddArgs {
+    /// Stable name used to namespace this server's tools.
+    pub name: String,
+    /// Executable followed by its arguments. Use `--` before flags intended for the executable.
+    #[arg(required = true, allow_hyphen_values = true, value_name = "COMMAND...")]
+    pub command: Vec<String>,
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -939,6 +1064,28 @@ mod tests {
             })) if start_point == "main~2" && prompt == ["summarize"]
         ));
 
+        let mcp = Cli::try_parse_from([
+            "harness",
+            "mcp",
+            "add",
+            "filesystem",
+            "--",
+            "npx",
+            "-y",
+            "server-filesystem",
+        ])
+        .unwrap();
+        assert!(matches!(
+            mcp.command,
+            Some(Command::Mcp(McpArgs {
+                command: Some(McpCommand::Add(McpAddArgs { name, command }))
+            })) if name == "filesystem" && command == ["npx", "-y", "server-filesystem"]
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["harness", "mcp"]).unwrap().command,
+            Some(Command::Mcp(McpArgs { command: None }))
+        ));
+
         let acp = Cli::try_parse_from(["harness", "acp", "--provider", "openai-codex"]).unwrap();
         assert!(matches!(acp.command, Some(Command::Acp)));
         assert!(Cli::try_parse_from(["harness", "--acp"]).is_err());
@@ -1224,6 +1371,49 @@ future_server_key = "keep"
             config.reasoning_effort,
             Some(ReasoningPolicy::Effort(llm::ReasoningEffort::High))
         );
+    }
+
+    #[test]
+    fn mcp_mutators_preserve_unknown_fields_and_reject_missing_names() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            "future = true\n\n[mcp]\nfuture_setting = 7\n\n[[mcp.servers]]\nname = \"existing\"\ntransport = \"stdio\"\ncommand = \"old\"\nfuture_server_key = \"keep\"\n",
+        )
+        .unwrap();
+
+        add_mcp_server_at(
+            &path,
+            "filesystem",
+            &["npx".into(), "-y".into(), "server-filesystem".into()],
+        )
+        .unwrap();
+        assert!(add_mcp_server_at(&path, "filesystem", &["other".into()]).is_err());
+        let loaded = load_file_config(&path).unwrap();
+        let servers = &loaded.mcp.unwrap().servers;
+        assert_eq!(servers.len(), 2);
+        let added = servers
+            .iter()
+            .find(|server| server.name == "filesystem")
+            .unwrap();
+        let mcp::McpTransportConfig::Stdio { command, args, .. } = &added.transport else {
+            panic!("expected stdio server")
+        };
+        assert_eq!(command, Path::new("npx"));
+        assert_eq!(args, &["-y", "server-filesystem"]);
+
+        delete_mcp_server_at(&path, "filesystem").unwrap();
+        assert!(delete_mcp_server_at(&path, "missing").is_err());
+        let saved = fs::read_to_string(&path).unwrap();
+        for fragment in [
+            "future = true",
+            "future_setting = 7",
+            "future_server_key = \"keep\"",
+        ] {
+            assert!(saved.contains(fragment), "missing {fragment} in {saved}");
+        }
+        assert!(!saved.contains("filesystem"));
     }
 
     #[test]
