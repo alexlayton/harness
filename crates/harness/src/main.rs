@@ -53,18 +53,22 @@ async fn main_inner() -> Result<ExitCode> {
     // then always restore the launch directory and attempt safe cleanup after
     // application startup or shutdown.
     if let Some(Command::Worktree(args)) = cli.command.clone() {
-        // Resolve every process-level path override before prepare changes the
-        // cwd. This includes config/auth, logging, and both session roots.
+        let launch_directory = std::fs::canonicalize(
+            std::env::current_dir().context("resolve the worktree launch directory")?,
+        )
+        .context("resolve the worktree launch directory")?;
+        // Resolve every process-level path override before entering the
+        // workspace. This includes config/auth, logging, and session roots.
         absolutize_process_path_overrides()?;
         // Relative state/session overrides must retain launch-directory
-        // semantics after prepare changes the process cwd.
+        // semantics after the process cwd changes.
         let session_root = std::path::absolute(session::default_session_dir())
             .context("resolve the session state directory")?;
         let report_lifecycle = args
             .command
             .as_ref()
             .is_none_or(|WorktreeCommand::Prompt(prompt)| prompt.verbose);
-        let lease = worktree::prepare(&args)?;
+        let lease = worktree::prepare(&args, &launch_directory)?;
         if report_lifecycle {
             let action = if lease.was_created() {
                 "created"
@@ -82,7 +86,30 @@ async fn main_inner() -> Result<ExitCode> {
             .command
             .map(|WorktreeCommand::Prompt(prompt)| Command::Prompt(prompt));
 
+        if let Err(error) = std::env::set_current_dir(lease.workspace_path()) {
+            let enter_error = anyhow::Error::new(error).context(format!(
+                "enter worktree workspace `{}`",
+                lease.workspace_path().display()
+            ));
+            if let Err(cleanup_error) = lease.finish() {
+                eprintln!("worktree: cleanup failed: {cleanup_error:#}");
+            }
+            return Err(enter_error);
+        }
         let application_result = run_application(cli, Some(session_root)).await;
+        if let Err(error) = std::env::set_current_dir(&launch_directory) {
+            let retained_path = lease.release_without_cleanup();
+            let restore_error = anyhow::Error::new(error).context(format!(
+                "leave worktree and restore `{}`; retained `{}`",
+                launch_directory.display(),
+                retained_path.display()
+            ));
+            if application_result.is_ok() {
+                return Err(restore_error);
+            }
+            eprintln!("worktree: cleanup failed: {restore_error:#}");
+            return application_result;
+        }
         match lease.finish() {
             Ok(worktree::CleanupOutcome::Removed(path)) if report_lifecycle => {
                 eprintln!("worktree: removed {}", path.display());
