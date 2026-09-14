@@ -226,7 +226,13 @@ fn create_slot(
         WorkspaceChoice::Directory { path, name } => (name.clone(), path.clone(), false),
         WorkspaceChoice::Worktree { branch, .. } => (branch.clone(), launch.to_path_buf(), true),
     };
-    let provisional_pane = pane(&settings, provisional_workspace.clone(), vec![], vec![]);
+    let provisional_pane = pane(
+        &settings,
+        provisional_workspace.clone(),
+        vec![],
+        vec![],
+        config.tui_minimal,
+    );
     let _ = event_tx.send(MuxEvent::Add {
         id,
         name: provisional_name,
@@ -345,7 +351,13 @@ fn create_slot(
                         return Ok(());
                     }
                     let worktree = lease.0.is_some();
-                    let ready_pane = pane(&task_settings, workspace.clone(), skills, context_files);
+                    let ready_pane = pane(
+                        &task_settings,
+                        workspace.clone(),
+                        skills,
+                        context_files,
+                        config.tui_minimal,
+                    );
                     let _ = runtime_tx.send(RuntimeMessage::Prepared {
                         id,
                         name,
@@ -472,14 +484,16 @@ fn pane(
     workspace: PathBuf,
     skills: Vec<tui::SkillEntry>,
     context: Vec<ContextFileEntry>,
+    minimal: bool,
 ) -> AgentPane {
-    AgentPane::new(
+    AgentPane::new_with_minimal(
         &settings.model,
         &settings.provider,
         ProviderArg::ALL.iter().map(ToString::to_string).collect(),
         skills,
         context,
         settings.reasoning.as_str(),
+        minimal,
         workspace,
     )
 }

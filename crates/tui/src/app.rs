@@ -3389,6 +3389,31 @@ impl AgentPane {
         reasoning: &str,
         workspace_root: PathBuf,
     ) -> Self {
+        Self::new_with_minimal(
+            model,
+            provider,
+            providers,
+            skills,
+            context_files,
+            reasoning,
+            false,
+            workspace_root,
+        )
+    }
+
+    /// Create a retained pane with the standalone `[tui].minimal` startup
+    /// behavior. Minimal mode suppresses only the canonical welcome entries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_minimal(
+        model: &str,
+        provider: &str,
+        providers: Vec<String>,
+        skills: Vec<SkillEntry>,
+        context_files: Vec<ContextFileEntry>,
+        reasoning: &str,
+        minimal: bool,
+        workspace_root: PathBuf,
+    ) -> Self {
         let mut state = CrossTerm::base(
             model,
             provider,
@@ -3403,6 +3428,7 @@ impl AgentPane {
             24,
         );
         state.reasoning = reasoning.to_owned();
+        state.minimal = minimal;
         state.enqueue_welcome();
         Self { state }
     }
@@ -3586,6 +3612,26 @@ mod tests {
                 .iter()
                 .any(|line| row_text(line).contains("second answer"))
         );
+    }
+
+    #[test]
+    fn retained_pane_minimal_suppresses_canonical_welcome() {
+        let root = PathBuf::from("/workspace");
+        let mut normal = pane(root.clone());
+        let mut minimal = AgentPane::new_with_minimal(
+            "test-model",
+            "test-provider",
+            vec!["openrouter".into()],
+            Vec::new(),
+            Vec::new(),
+            "auto",
+            true,
+            root,
+        );
+
+        assert!(!normal.state.pending.is_empty());
+        assert!(minimal.state.pending.is_empty());
+        assert!(normal.render(80, 24).lines.len() > minimal.render(80, 24).lines.len());
     }
 
     #[test]

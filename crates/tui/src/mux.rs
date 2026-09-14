@@ -49,14 +49,6 @@ pub enum MuxStatus {
 }
 
 impl MuxStatus {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Starting => "◐ Starting",
-            Self::Running => "● Running",
-            Self::Idle => "✓ Idle",
-            Self::Error => "! Error",
-        }
-    }
     fn glyph(self) -> &'static str {
         match self {
             Self::Starting => "◐",
@@ -186,10 +178,8 @@ pub struct MuxLayout {
     pub main_x: u16,
     /// Width available to the selected agent pane.
     pub main_width: u16,
-    /// Height above the mux footer.
+    /// Full height available to both the sidebar and selected agent pane.
     pub body_height: u16,
-    /// Row occupied by the mux footer.
-    pub footer_y: u16,
 }
 
 /// Stateful mux controller. Constructing it does not touch the terminal.
@@ -254,7 +244,7 @@ impl MuxUi {
     }
     /// Compute host-neutral pane geometry for terminal dimensions.
     pub fn layout(&self, width: u16, height: u16) -> MuxLayout {
-        let body_height = height.saturating_sub(1);
+        let body_height = height;
         let side = if self.sidebar_visible && width >= 42 {
             Some((0, (width / 4).clamp(20, 32)))
         } else {
@@ -266,7 +256,6 @@ impl MuxUi {
             main_x,
             main_width: width.saturating_sub(main_x),
             body_height,
-            footer_y: height.saturating_sub(1),
         }
     }
     /// Apply a host lifecycle or agent UI event to retained mux state.
@@ -353,12 +342,22 @@ impl MuxUi {
             }
         }
     }
+    fn sidebar_hint_rows(&self) -> u16 {
+        // Prefix mode gets a compact three-line command legend. On tiny
+        // terminals retain at least the ordinary one-line hint.
+        if self.prefix && self.height >= 3 {
+            3
+        } else {
+            1
+        }
+    }
+
     fn visible_rows(&self) -> usize {
         let step = if self.width >= 70 { 2 } else { 1 };
-        // Two headers and one always-visible `+ New agent` row occupy the rest.
+        // Two headers, `+ New agent`, and the bottom hint/legend are fixed.
         self.layout(self.width, self.height)
             .body_height
-            .saturating_sub(3) as usize
+            .saturating_sub(3 + self.sidebar_hint_rows()) as usize
             / step
     }
     fn clamp_sidebar_scroll(&mut self) {
@@ -511,9 +510,6 @@ impl MuxUi {
 
     fn handle_mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
         let layout = self.layout(self.width, self.height);
-        if y >= layout.body_height {
-            return;
-        }
         let sidebar_width = layout.sidebar.map(|(_, width)| width);
         if sidebar_width.is_none_or(|width| x > width) {
             match kind {
@@ -898,8 +894,23 @@ impl MuxUi {
                 .saturating_sub(self.sidebar_scroll)
                 .min(self.visible_rows());
             let new_y = 2 + visible * step;
-            if new_y < layout.body_height as usize {
+            let hints_start = layout.body_height.saturating_sub(self.sidebar_hint_rows()) as usize;
+            if new_y < hints_start {
                 rows[new_y] = styled_fit(" + New agent", sidebar_width as usize, muted);
+            }
+            let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 3 {
+                &[
+                    " n:new  j/k:switch",
+                    " 1-9:jump  x:close",
+                    " r:rename b:sidebar ?:help",
+                ]
+            } else {
+                &[" ^Space shortcuts"]
+            };
+            for (offset, hint) in hints.iter().enumerate() {
+                if let Some(row) = rows.get_mut(hints_start + offset) {
+                    *row = styled_fit(hint, sidebar_width as usize, muted);
+                }
             }
             for row in rows.iter_mut().take(layout.body_height as usize) {
                 row.push_str(&line_to_ansi(&Line::from(Span::styled("│", muted))));
@@ -908,32 +919,16 @@ impl MuxUi {
 
         let mut pane_cursor = None;
         if let Some(i) = self.selected {
-            let status_style = status_style(self.slots[i].status, theme);
-            let title = styled_fit(
-                &format!(" {}", self.slots[i].name),
-                layout.main_width as usize,
-                muted,
-            );
-            // Paint status over the right side without measuring ANSI bytes.
-            if let Some(row) = rows.get_mut(0) {
-                row.push_str(&title);
-            }
-            let label = self.slots[i].status.label();
-            if layout.main_width as usize > label.width() + 1 {
-                let x = layout.main_x + layout.main_width - label.width() as u16 - 1;
-                let _ = write!(
-                    rows[0],
-                    "{}{}",
-                    MoveTo(x, 0),
-                    line_to_ansi(&Line::from(Span::styled(label, status_style)))
-                );
-            }
             let frame = self.slots[i]
                 .pane
-                .render(layout.main_width, layout.body_height.saturating_sub(1));
-            for n in 0..layout.body_height.saturating_sub(1) as usize {
+                .render(layout.main_width, layout.body_height);
+            for (n, row) in rows
+                .iter_mut()
+                .enumerate()
+                .take(layout.body_height as usize)
+            {
                 let line = frame.lines.get(n).cloned().unwrap_or_default();
-                rows[n + 1].push_str(&padded_line(&line, layout.main_width as usize));
+                row.push_str(&padded_line(&line, layout.main_width as usize));
             }
             pane_cursor = Some(pane_cursor_position(layout, &frame));
         } else {
@@ -958,18 +953,6 @@ impl MuxUi {
                 ));
             }
         }
-        if let Some(row) = rows.get_mut(layout.footer_y as usize) {
-            *row = styled_fit(
-                if self.prefix {
-                    " MUX > n:new  j/k:switch  1-9:jump  x:close  r:rename  b:sidebar  ?:help"
-                } else {
-                    " ^Space prefix   n new   j/k switch   1-9 jump   x close   ? help"
-                },
-                w as usize,
-                muted,
-            );
-        }
-
         let mut buffer = Hide.to_string();
         for (index, row) in rows.iter().enumerate() {
             // Every frame row is padded to the terminal width. Writing a CRLF
@@ -992,7 +975,7 @@ impl MuxUi {
 fn pane_cursor_position(layout: MuxLayout, frame: &crate::PaneFrame) -> (u16, u16) {
     (
         layout.main_x.saturating_add(frame.cursor_col),
-        1_u16.saturating_add(frame.cursor_row),
+        frame.cursor_row,
     )
 }
 
@@ -1098,15 +1081,6 @@ fn padded_line(line: &Line<'_>, width: usize) -> String {
 
 fn styled_fit(text: &str, width: usize, style: Style) -> String {
     padded_line(&Line::from(Span::styled(text.to_owned(), style)), width)
-}
-
-fn status_style(status: MuxStatus, theme: render::Theme) -> Style {
-    Style::default().fg(match status {
-        MuxStatus::Starting => theme.muted_text,
-        MuxStatus::Running => theme.accent,
-        MuxStatus::Idle => theme.success,
-        MuxStatus::Error => theme.error,
-    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1505,10 +1479,13 @@ mod tests {
     }
 
     #[test]
-    fn narrow_layout_collapses_sidebar() {
+    fn layout_gives_both_panes_the_full_terminal_height() {
         let m = MuxUi::new("/x".into());
         assert!(m.layout(41, 10).sidebar.is_none());
-        assert!(m.layout(80, 20).sidebar.is_some())
+        let layout = m.layout(80, 20);
+        assert!(layout.sidebar.is_some());
+        assert_eq!(layout.body_height, 20);
+        assert_eq!(layout.main_x + layout.main_width, 80);
     }
 
     #[test]
@@ -1594,6 +1571,22 @@ mod tests {
     }
 
     #[test]
+    fn prefix_legend_reserves_sidebar_capacity() {
+        let mut mux = MuxUi::new("/".into());
+        mux.handle(Event::Resize(80, 10)).unwrap();
+        assert_eq!(mux.sidebar_hint_rows(), 1);
+        assert_eq!(mux.visible_rows(), 3);
+
+        mux.handle(Event::Key(KeyEvent::new(
+            KeyCode::Null,
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+        assert_eq!(mux.sidebar_hint_rows(), 3);
+        assert_eq!(mux.visible_rows(), 2);
+    }
+
+    #[test]
     fn remove_selects_neighbor() {
         let mut m = MuxUi::new("/".into());
         for id in 1..=2 {
@@ -1611,7 +1604,7 @@ mod tests {
     }
 
     #[test]
-    fn cursor_is_offset_by_pane_rectangle_and_header() {
+    fn cursor_starts_at_the_top_of_the_main_pane() {
         let layout = MuxLayout {
             main_x: 23,
             ..MuxLayout::default()
@@ -1621,7 +1614,7 @@ mod tests {
             cursor_row: 4,
             cursor_col: 7,
         };
-        assert_eq!(pane_cursor_position(layout, &frame), (30, 5));
+        assert_eq!(pane_cursor_position(layout, &frame), (30, 4));
     }
 
     #[test]
@@ -1640,7 +1633,7 @@ mod tests {
             KeyModifiers::NONE,
         )))
         .unwrap();
-        assert_eq!(mux.slots[0].pane.scroll_offset(), 23);
+        assert_eq!(mux.slots[0].pane.scroll_offset(), 24);
 
         mux.handle(Event::Mouse(crossterm::event::MouseEvent {
             kind: MouseEventKind::ScrollDown,
@@ -1649,7 +1642,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }))
         .unwrap();
-        assert_eq!(mux.slots[0].pane.scroll_offset(), 20);
+        assert_eq!(mux.slots[0].pane.scroll_offset(), 21);
 
         mux.handle(Event::Mouse(crossterm::event::MouseEvent {
             kind: MouseEventKind::ScrollUp,
@@ -1658,7 +1651,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }))
         .unwrap();
-        assert_eq!(mux.slots[0].pane.scroll_offset(), 20);
+        assert_eq!(mux.slots[0].pane.scroll_offset(), 21);
         assert_eq!(mux.sidebar_scroll, 0);
     }
 
