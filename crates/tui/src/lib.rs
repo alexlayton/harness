@@ -8,11 +8,13 @@ mod commands;
 mod commit;
 mod environment;
 mod input;
+mod mux;
 mod paths;
 mod render;
 mod state;
 
-pub use app::{AgentPane, CrossTerm, PaneFrame};
+pub use app::{AgentPane, CrossTerm, PaneFrame, PaneInput};
+pub use mux::{MuxAction, MuxEvent, MuxId, MuxLayout, MuxStatus, MuxUi, WorkspaceChoice};
 pub use state::{ToolRecord, ToolStatus};
 
 /// Messages sent from the terminal UI to the agent. Keeping this protocol in

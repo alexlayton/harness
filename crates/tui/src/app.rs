@@ -353,6 +353,8 @@ pub struct CrossTerm {
     /// Cached terminal size, refreshed on resize events.
     width: u16,
     height: u16,
+    /// Retained-pane history offset; standalone mode leaves this at zero.
+    pane_scroll: usize,
 
     /// Final entries of the current conversation, in order. Unlike the inline
     /// UI (which tracks a commit index into one transcript) these are kept as
@@ -463,6 +465,7 @@ impl CrossTerm {
             minimal: false,
             width,
             height,
+            pane_scroll: 0,
             transcript: Vec::new(),
             pending: Vec::new(),
             stream: None,
@@ -3244,7 +3247,7 @@ fn friendly_reset_time(value: &str) -> String {
 /// reset is required when adjacent effective styles differ. Without it the
 /// input prefix's bold attribute leaks into the first text row even though
 /// continuation rows correctly use normal weight.
-fn line_to_ansi(line: &Line<'_>) -> String {
+pub(crate) fn line_to_ansi(line: &Line<'_>) -> String {
     let mut out = String::new();
     let mut previous = None;
     let mut styled = false;
@@ -3344,9 +3347,19 @@ fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize, width: usize) 
 /// where that rectangle lives on screen.
 #[derive(Clone, Debug)]
 pub struct PaneFrame {
+    /// Styled rows, already clipped and padded to the requested pane width.
     pub lines: Vec<Line<'static>>,
+    /// Zero-based row of the editor's real terminal cursor.
     pub cursor_row: u16,
+    /// Zero-based display column of the editor's real terminal cursor.
     pub cursor_col: u16,
+}
+
+/// Result of semantically dispatching terminal input to an [`AgentPane`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneInput {
+    pub messages: Vec<InputMessage>,
+    pub exit_requested: bool,
 }
 
 /// Retained presentation and editor state for one agent UI.
@@ -3408,8 +3421,62 @@ impl AgentPane {
         &self.state.input
     }
 
+    /// Return the explicit workspace root used for path completion and metadata.
     pub fn workspace_root(&self) -> &Path {
         &self.state.environment.cwd
+    }
+
+    /// Handle one terminal input event using the same editor and command
+    /// semantics as standalone mode. The returned messages are destined for
+    /// this pane's agent; `exit_requested` represents Ctrl+C/Ctrl+D and lets
+    /// the terminal owner decide whether that closes a slot or the whole UI.
+    pub fn handle_input(&mut self, event: &Event) -> Result<PaneInput> {
+        // Ctrl+O is the sole standalone input path that paints immediately.
+        // A retained pane only mutates state and leaves painting to its owner.
+        if let Event::Key(key) = event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.code == KeyCode::Char('o')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.state.tools_expanded = !self.state.tools_expanded;
+            return Ok(PaneInput::default());
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let exit_requested = self.state.handle_input(event, &tx, &cancel)?;
+        let mut messages = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            messages.push(message);
+        }
+        Ok(PaneInput {
+            messages,
+            exit_requested: exit_requested || cancel.is_cancelled(),
+        })
+    }
+
+    /// Apply any completed asynchronous path-completion scan. Mux owners call
+    /// this from their periodic tick because an [`AgentPane`] owns no runtime.
+    pub fn tick_completion(&mut self) {
+        while let Ok(result) = self.state.path_completion_rx.try_recv() {
+            self.state.apply_path_completion(result);
+        }
+    }
+
+    /// Scroll the retained transcript viewport. Positive values move toward
+    /// older rows; editing or receiving output keeps the offset until reset.
+    pub fn scroll(&mut self, rows: i32) {
+        self.state.pane_scroll = if rows >= 0 {
+            self.state.pane_scroll.saturating_add(rows as usize)
+        } else {
+            self.state
+                .pane_scroll
+                .saturating_sub(rows.unsigned_abs() as usize)
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.state.pane_scroll
     }
 
     /// Render retained history plus the live editor into arbitrary dimensions.
@@ -3433,6 +3500,18 @@ impl AgentPane {
             self.state.theme,
             self.state.tools_expanded,
         );
+        if self.state.pane_scroll > 0 {
+            let all = history_window(
+                &entries,
+                usize::MAX / 4,
+                render::content_width(self.state.width),
+                self.state.theme,
+                self.state.tools_expanded,
+            );
+            let end = all.len().saturating_sub(self.state.pane_scroll);
+            let start = end.saturating_sub(history_budget);
+            lines = all[start..end].to_vec();
+        }
         let history_rows = lines.len();
         lines.extend(live.rows);
         lines.truncate(self.state.height as usize);
