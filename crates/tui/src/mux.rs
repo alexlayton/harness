@@ -970,12 +970,13 @@ impl MuxUi {
             );
         }
 
-        let mut buffer = format!("{}{}", Hide, MoveTo(0, 0));
+        let mut buffer = Hide.to_string();
         for (index, row) in rows.iter().enumerate() {
-            if index > 0 {
-                buffer.push_str("\r\n");
-            }
-            buffer.push_str(row);
+            // Every frame row is padded to the terminal width. Writing a CRLF
+            // after the final column can advance twice on terminals that
+            // eagerly auto-wrap, making the sidebar appear to end halfway
+            // down the screen. Address each row absolutely instead.
+            let _ = write!(buffer, "{}{}", MoveTo(0, index as u16), row);
         }
         if let Some(overlay) = &self.overlay {
             draw_overlay(&mut buffer, layout, overlay, theme);
