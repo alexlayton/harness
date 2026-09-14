@@ -190,8 +190,23 @@ impl Agent {
             send(events, AgentEvent::Error("sessions are not enabled".into()));
             return;
         };
-        let destination = destination.map(PathBuf::from);
-        match export_jsonl(&session, destination.as_deref(), &ExportOptions::default()) {
+        // Resolve against the agent's explicit workspace rather than the
+        // process cwd. This matters for multi-workspace frontends such as mux.
+        let destination = destination
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    self.tools.workspace_root().join(path)
+                }
+            })
+            .unwrap_or_else(|| {
+                self.tools
+                    .workspace_root()
+                    .join(format!("harness-session-{}.jsonl", session.id()))
+            });
+        match export_jsonl(&session, Some(&destination), &ExportOptions::default()) {
             Ok(path) => {
                 let path = path.display().to_string();
                 send(events, AgentEvent::SessionExported { path: path.clone() });
