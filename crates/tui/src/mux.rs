@@ -21,8 +21,11 @@ use crossterm::terminal::{
 use futures_util::StreamExt;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use unicode_width::UnicodeWidthChar;
 
@@ -197,6 +200,20 @@ pub struct MuxUi {
     cwd: PathBuf,
     width: u16,
     height: u16,
+    directory_generation: u64,
+    directory_request: Option<DirectoryRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DirectoryRequest {
+    generation: u64,
+    input: String,
+}
+
+struct DirectoryCompletion {
+    generation: u64,
+    input: String,
+    suggestions: Vec<PathBuf>,
 }
 
 impl MuxUi {
@@ -212,6 +229,8 @@ impl MuxUi {
             cwd,
             width: 80,
             height: 24,
+            directory_generation: 0,
+            directory_request: None,
         }
     }
     /// Return the stable ID of the selected slot.
@@ -286,9 +305,13 @@ impl MuxUi {
                 workspace,
                 worktree,
                 status,
-                pane,
+                mut pane,
             } => {
                 if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == id) {
+                    // Workspace setup may finish after the user has started a
+                    // draft in the provisional pane. Carry that editor state
+                    // into the fully configured pane rather than discarding it.
+                    pane.set_draft(slot.pane.editor_text());
                     *slot = Slot {
                         id,
                         name,
@@ -328,17 +351,29 @@ impl MuxUi {
         }
     }
     fn visible_rows(&self) -> usize {
-        self.height.saturating_sub(5) as usize / if self.width >= 70 { 2 } else { 1 }
+        let step = if self.width >= 70 { 2 } else { 1 };
+        // Two headers and one always-visible `+ New agent` row occupy the rest.
+        self.layout(self.width, self.height)
+            .body_height
+            .saturating_sub(3) as usize
+            / step
+    }
+    fn clamp_sidebar_scroll(&mut self) {
+        self.sidebar_scroll = self
+            .sidebar_scroll
+            .min(self.slots.len().saturating_sub(self.visible_rows()));
     }
     fn reveal_selected(&mut self) {
+        self.clamp_sidebar_scroll();
         if let Some(i) = self.selected {
-            let n = self.visible_rows().max(1);
+            let n = self.visible_rows();
             if i < self.sidebar_scroll {
                 self.sidebar_scroll = i
-            } else if i >= self.sidebar_scroll + n {
+            } else if n > 0 && i >= self.sidebar_scroll + n {
                 self.sidebar_scroll = i + 1 - n
             }
         }
+        self.clamp_sidebar_scroll();
     }
     fn switch(&mut self, delta: isize) {
         if self.slots.is_empty() {
@@ -434,6 +469,21 @@ impl MuxUi {
         let Some(i) = self.selected else {
             return Ok(vec![]);
         };
+        // Keep drafts editable during setup, but do not submit into a runtime
+        // that is not ready (or has failed). Shift/Alt+Enter still edits a
+        // multiline draft through the normal pane handler.
+        if matches!(self.slots[i].status, MuxStatus::Starting | MuxStatus::Error)
+            && matches!(
+                &event,
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                })
+            )
+        {
+            return Ok(vec![]);
+        }
         let id = self.slots[i].id;
         let result = self.slots[i].pane.handle_input(&event)?;
         let out = result
@@ -473,19 +523,24 @@ impl MuxUi {
         match kind {
             MouseEventKind::ScrollUp => self.sidebar_scroll = self.sidebar_scroll.saturating_sub(1),
             MouseEventKind::ScrollDown => {
-                self.sidebar_scroll =
-                    (self.sidebar_scroll + 1).min(self.slots.len().saturating_sub(1))
+                self.sidebar_scroll += 1;
+                self.clamp_sidebar_scroll();
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let compact = self.width < 70;
-                let row = y.saturating_sub(2) as usize / (if compact { 1 } else { 2 });
-                let visible = self.visible_rows();
-                if row < visible {
+                let step = if self.width < 70 { 1 } else { 2 };
+                let visible_count = self
+                    .slots
+                    .len()
+                    .saturating_sub(self.sidebar_scroll)
+                    .min(self.visible_rows());
+                let new_y = 2 + visible_count * step;
+                if y as usize == new_y {
+                    self.overlay = Some(Overlay::NewMenu { selected: 0 });
+                } else if y as usize >= 2 && (y as usize) < new_y {
+                    let row = (y as usize - 2) / step;
                     let i = self.sidebar_scroll + row;
                     if i < self.slots.len() {
                         self.selected = Some(i)
-                    } else if i == self.slots.len() {
-                        self.overlay = Some(Overlay::NewMenu { selected: 0 })
                     }
                 }
             }
@@ -516,6 +571,9 @@ impl MuxUi {
 
     fn handle_overlay(&mut self, mut overlay: Overlay, key: KeyEvent, out: &mut Vec<MuxAction>) {
         if key.code == KeyCode::Esc {
+            if matches!(overlay, Overlay::Directory { .. }) {
+                self.invalidate_directory_completion();
+            }
             if matches!(
                 overlay,
                 Overlay::Worktree { .. } | Overlay::Current { .. } | Overlay::Directory { .. }
@@ -611,9 +669,17 @@ impl MuxUi {
                     }
                 }
                 _ => {
+                    let old_input = input.clone();
                     edit_string(input, key);
-                    *suggestions = directory_suggestions(input, &self.cwd);
-                    *selected = 0;
+                    if *input != old_input {
+                        suggestions.clear();
+                        *selected = 0;
+                        self.directory_generation = self.directory_generation.wrapping_add(1);
+                        self.directory_request = Some(DirectoryRequest {
+                            generation: self.directory_generation,
+                            input: input.clone(),
+                        });
+                    }
                     self.overlay = Some(overlay)
                 }
             },
@@ -653,17 +719,46 @@ impl MuxUi {
         }
     }
 
+    fn invalidate_directory_completion(&mut self) {
+        self.directory_generation = self.directory_generation.wrapping_add(1);
+        self.directory_request = None;
+    }
+
+    fn apply_directory_completion(&mut self, completion: DirectoryCompletion) -> bool {
+        if completion.generation != self.directory_generation {
+            return false;
+        }
+        let Some(Overlay::Directory {
+            input,
+            suggestions,
+            selected,
+        }) = &mut self.overlay
+        else {
+            return false;
+        };
+        if *input != completion.input {
+            return false;
+        }
+        *suggestions = completion.suggestions;
+        *selected = (*selected).min(suggestions.len().saturating_sub(1));
+        true
+    }
+
     /// Run as the sole terminal owner. Restoration is attempted on normal
-    /// return, cancellation, input failure, and panic (via RAII unwinding).
+    /// return, cancellation, input failure, and panic (including aborting
+    /// release builds, via the process panic hook).
     pub async fn run(
         mut self,
         mut events: mpsc::UnboundedReceiver<MuxEvent>,
         actions: mpsc::UnboundedSender<MuxAction>,
         cancel: CancellationToken,
     ) -> Result<()> {
+        install_mux_panic_hook();
         let mut terminal = TerminalGuard::enter()?;
         let mut input = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let mut completion_task: Option<JoinHandle<()>> = None;
         self.draw(terminal.out())?;
 
         let result: Result<()> = async {
@@ -680,6 +775,35 @@ impl MuxUi {
                                 return Ok(());
                             }
                         }
+                        if let Some(request) = self.directory_request.take() {
+                            if let Some(task) = completion_task.take() {
+                                task.abort();
+                            }
+                            let tx = completion_tx.clone();
+                            let cwd = self.cwd.clone();
+                            completion_task = Some(tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(120)).await;
+                                let input = request.input;
+                                let scan_input = input.clone();
+                                let suggestions = tokio::task::spawn_blocking(move || {
+                                    directory_suggestions(&scan_input, &cwd)
+                                }).await;
+                                if let Ok(suggestions) = suggestions {
+                                    let _ = tx.send(DirectoryCompletion {
+                                        generation: request.generation,
+                                        input,
+                                        suggestions,
+                                    });
+                                }
+                            }));
+                        } else if !matches!(self.overlay, Some(Overlay::Directory { .. }))
+                            && let Some(task) = completion_task.take()
+                        {
+                            task.abort();
+                        }
+                    }
+                    Some(completion) = completion_rx.recv() => {
+                        self.apply_directory_completion(completion);
                     }
                     _ = tick.tick() => {
                         for slot in &mut self.slots {
@@ -696,6 +820,9 @@ impl MuxUi {
             Ok(())
         }
         .await;
+        if let Some(task) = completion_task {
+            task.abort();
+        }
         drop(terminal);
         result
     }
@@ -707,8 +834,14 @@ impl MuxUi {
         let l = self.layout(w, h);
         let mut rows = vec![String::new(); h as usize];
         if let Some((_, sw)) = l.sidebar {
-            rows[0] = " MUX".into();
-            rows[1] = " SESSIONS".into();
+            if let Some(row) = rows.get_mut(0) {
+                *row = " MUX".into();
+            }
+            if l.body_height > 1
+                && let Some(row) = rows.get_mut(1)
+            {
+                *row = " SESSIONS".into();
+            }
             let compact = w < 70;
             let step = if compact { 1 } else { 2 };
             for (n, s) in self
@@ -744,7 +877,12 @@ impl MuxUi {
                     )
                 }
             }
-            let y = 2 + self.slots.len().saturating_sub(self.sidebar_scroll) * step;
+            let visible_count = self
+                .slots
+                .len()
+                .saturating_sub(self.sidebar_scroll)
+                .min(self.visible_rows());
+            let y = 2 + visible_count * step;
             if y < l.body_height as usize {
                 rows[y] = " + New agent".into()
             }
@@ -754,10 +892,12 @@ impl MuxUi {
         }
         let mut pane_cursor = None;
         if let Some(i) = self.selected {
-            rows[0].push_str(&fit(
-                &format!(" {}   {}", self.slots[i].name, self.slots[i].status.label()),
-                l.main_width as usize,
-            ));
+            if let Some(row) = rows.get_mut(0) {
+                row.push_str(&fit(
+                    &format!(" {}   {}", self.slots[i].name, self.slots[i].status.label()),
+                    l.main_width as usize,
+                ));
+            }
             let frame = self.slots[i]
                 .pane
                 .render(l.main_width, l.body_height.saturating_sub(1));
@@ -783,14 +923,16 @@ impl MuxUi {
             rows[y].push_str(" No agents yet");
             rows[y + 1].push_str(" Press Ctrl+Space then n to create one.");
         }
-        rows[l.footer_y as usize] = fit(
-            if self.prefix {
-                " MUX > n:new  j/k:switch  1-9:jump  x:close  r:rename  b:sidebar  ?:help"
-            } else {
-                " ^Space prefix   n new   j/k switch   1-9 jump   x close   ? help"
-            },
-            w as usize,
-        );
+        if let Some(row) = rows.get_mut(l.footer_y as usize) {
+            *row = fit(
+                if self.prefix {
+                    " MUX > n:new  j/k:switch  1-9:jump  x:close  r:rename  b:sidebar  ?:help"
+                } else {
+                    " ^Space prefix   n new   j/k switch   1-9 jump   x close   ? help"
+                },
+                w as usize,
+            );
+        }
 
         let mut buffer = format!("{}{}", Hide, MoveTo(0, 0));
         for (index, row) in rows.iter().enumerate() {
@@ -805,9 +947,9 @@ impl MuxUi {
         }
         if let Some(overlay) = &self.overlay {
             draw_overlay(&mut buffer, w, h, overlay);
-        } else if let Some((x, y)) = pane_cursor {
+        } else if let Some((x, y)) = pane_cursor.and_then(|cursor| bounded_cursor(cursor, w, h)) {
             use std::fmt::Write as _;
-            let _ = write!(buffer, "{}{}", MoveTo(x.min(w.saturating_sub(1)), y), Show);
+            let _ = write!(buffer, "{}{}", MoveTo(x, y), Show);
         }
         out.write_all(buffer.as_bytes())?;
         out.flush()?;
@@ -820,6 +962,10 @@ fn pane_cursor_position(layout: MuxLayout, frame: &crate::PaneFrame) -> (u16, u1
         layout.main_x.saturating_add(frame.cursor_col),
         1_u16.saturating_add(frame.cursor_row),
     )
+}
+
+fn bounded_cursor(cursor: (u16, u16), width: u16, height: u16) -> Option<(u16, u16)> {
+    (width > 0 && height > 0).then(|| (cursor.0.min(width - 1), cursor.1.min(height - 1)))
 }
 
 fn edit_string(s: &mut String, key: KeyEvent) {
@@ -981,25 +1127,66 @@ fn draw_overlay(buffer: &mut String, width: u16, height: u16, overlay: &Overlay)
     }
 }
 
+static MUX_RAW_MODE: AtomicBool = AtomicBool::new(false);
+static MUX_ALT_SCREEN: AtomicBool = AtomicBool::new(false);
+static MUX_BRACKETED_PASTE: AtomicBool = AtomicBool::new(false);
+static MUX_MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
+static MUX_KEYBOARD_FLAGS: AtomicBool = AtomicBool::new(false);
+
+fn restore_mux_terminal(out: &mut Stdout) {
+    if MUX_KEYBOARD_FLAGS.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(out, Show);
+    if MUX_MOUSE_CAPTURE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, DisableMouseCapture);
+    }
+    if MUX_BRACKETED_PASTE.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, DisableBracketedPaste);
+    }
+    if MUX_ALT_SCREEN.swap(false, Ordering::SeqCst) {
+        let _ = execute!(out, LeaveAlternateScreen);
+    }
+    if MUX_RAW_MODE.swap(false, Ordering::SeqCst) {
+        let _ = disable_raw_mode();
+    }
+    let _ = out.flush();
+}
+
+fn install_mux_panic_hook() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            // Do not rely on unwinding: release builds abort after this hook.
+            // Only reverse modes this mux successfully enabled, so a partial
+            // setup cannot pop terminal state owned by another component.
+            restore_mux_terminal(&mut io::stdout());
+            previous(panic);
+        }));
+    });
+}
+
 struct TerminalGuard {
     out: Stdout,
-    keyboard: bool,
 }
 impl TerminalGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode().context("enable raw mode")?;
-        let mut this = Self {
-            out: io::stdout(),
-            keyboard: false,
-        };
-        if let Err(e) = execute!(
-            this.out,
-            EnterAlternateScreen,
-            EnableBracketedPaste,
-            EnableMouseCapture
-        ) {
+        MUX_RAW_MODE.store(true, Ordering::SeqCst);
+        let mut this = Self { out: io::stdout() };
+        let setup = (|| -> io::Result<()> {
+            execute!(this.out, EnterAlternateScreen)?;
+            MUX_ALT_SCREEN.store(true, Ordering::SeqCst);
+            execute!(this.out, EnableBracketedPaste)?;
+            MUX_BRACKETED_PASTE.store(true, Ordering::SeqCst);
+            execute!(this.out, EnableMouseCapture)?;
+            MUX_MOUSE_CAPTURE.store(true, Ordering::SeqCst);
+            Ok(())
+        })();
+        if let Err(error) = setup {
             drop(this);
-            return Err(e).context("configure mux terminal");
+            return Err(error).context("configure mux terminal");
         }
         if execute!(
             this.out,
@@ -1007,7 +1194,7 @@ impl TerminalGuard {
         )
         .is_ok()
         {
-            this.keyboard = true
+            MUX_KEYBOARD_FLAGS.store(true, Ordering::SeqCst);
         }
         Ok(this)
     }
@@ -1017,18 +1204,7 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.keyboard {
-            let _ = execute!(self.out, PopKeyboardEnhancementFlags);
-        }
-        let _ = execute!(
-            self.out,
-            Show,
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
-        let _ = disable_raw_mode();
-        let _ = self.out.flush();
+        restore_mux_terminal(&mut self.out);
     }
 }
 
@@ -1187,11 +1363,93 @@ mod tests {
     }
 
     #[test]
+    fn directory_completion_is_debounced_and_stale_results_are_ignored() {
+        let mut mux = MuxUi::new("/x".into());
+        mux.overlay = Some(Overlay::Directory {
+            input: String::new(),
+            suggestions: vec![],
+            selected: 0,
+        });
+        mux.handle(key('a')).unwrap();
+        let first = mux.directory_request.take().unwrap();
+        mux.handle(key('b')).unwrap();
+        let second = mux.directory_request.as_ref().unwrap();
+        assert!(second.generation > first.generation);
+        assert_eq!(second.input, "ab");
+        let generation = second.generation;
+
+        assert!(!mux.apply_directory_completion(DirectoryCompletion {
+            generation: first.generation,
+            input: first.input,
+            suggestions: vec!["/stale".into()],
+        }));
+        let Overlay::Directory { suggestions, .. } = mux.overlay.as_ref().unwrap() else {
+            panic!("directory overlay closed unexpectedly");
+        };
+        assert!(suggestions.is_empty());
+
+        assert!(mux.apply_directory_completion(DirectoryCompletion {
+            generation,
+            input: "ab".into(),
+            suggestions: vec!["/fresh".into()],
+        }));
+        mux.handle(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+            .unwrap();
+        assert!(!mux.apply_directory_completion(DirectoryCompletion {
+            generation,
+            input: "ab".into(),
+            suggestions: vec!["/late".into()],
+        }));
+    }
+
+    #[test]
     fn narrow_layout_collapses_sidebar() {
         let m = MuxUi::new("/x".into());
         assert!(m.layout(41, 10).sidebar.is_none());
         assert!(m.layout(80, 20).sidebar.is_some())
     }
+
+    #[test]
+    fn tiny_layout_overlay_and_cursor_are_bounded() {
+        let m = MuxUi::new("/x".into());
+        for height in 0..=2 {
+            for width in 0..=1 {
+                let layout = m.layout(width, height);
+                assert!(layout.main_x <= width);
+                assert!(layout.main_width <= width);
+                assert!(layout.body_height <= height);
+                draw_overlay(&mut String::new(), width, height, &Overlay::Help);
+            }
+        }
+        assert_eq!(bounded_cursor((9, 9), 0, 2), None);
+        assert_eq!(bounded_cursor((9, 9), 1, 1), Some((0, 0)));
+        assert_eq!(bounded_cursor((9, 9), 2, 2), Some((1, 1)));
+    }
+
+    #[test]
+    fn sidebar_scroll_and_new_hit_use_rendered_capacity() {
+        let mut mux = MuxUi::new("/".into());
+        mux.handle(Event::Resize(80, 10)).unwrap();
+        for id in 1..=5 {
+            mux.apply(MuxEvent::Add {
+                id,
+                name: id.to_string(),
+                workspace: "/".into(),
+                worktree: false,
+                status: MuxStatus::Idle,
+                pane: pane("/"),
+            });
+        }
+        for _ in 0..10 {
+            mux.handle_mouse(MouseEventKind::ScrollDown, 0, 2);
+        }
+        assert_eq!(mux.visible_rows(), 3);
+        assert_eq!(mux.sidebar_scroll, 2);
+
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 8);
+        assert!(matches!(mux.overlay, Some(Overlay::NewMenu { .. })));
+    }
+
     #[test]
     fn remove_selects_neighbor() {
         let mut m = MuxUi::new("/".into());

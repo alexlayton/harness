@@ -12,8 +12,9 @@ use session::{SessionCreateOptions, SessionStore};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tools::{ToolConfig, ToolExecutionGate, default_registry};
 use tui::{
@@ -86,8 +87,10 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
-    let ui_task = tokio::spawn(MuxUi::new(launch.clone()).run(event_rx, action_tx, cancel.clone()));
+    let mut ui_task =
+        tokio::spawn(MuxUi::new(launch.clone()).run(event_rx, action_tx, cancel.clone()));
     let mut slots = HashMap::<MuxId, SlotHandle>::new();
+    let mut reapers = JoinSet::new();
     let mutation_coordinator = WorkspaceMutationCoordinator::default();
     let mut next_id = 1;
     let defaults = SlotSettings {
@@ -117,7 +120,18 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
         tokio::select! {
             action = action_rx.recv() => match action {
                 Some(MuxAction::AgentInput { id, input }) => {
-                    if let Some(slot) = slots.get(&id) { let _ = slot.input.send(tui_adapter::into_agent_input(input)); }
+                    let starts_work = matches!(
+                        &input,
+                        tui::InputMessage::Message(_)
+                            | tui::InputMessage::InvokeSkill { .. }
+                            | tui::InputMessage::CompactSession
+                    );
+                    if let Some(slot) = slots.get(&id)
+                        && slot.input.send(tui_adapter::into_agent_input(input)).is_ok()
+                        && starts_work
+                    {
+                        let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Running });
+                    }
                 }
                 Some(MuxAction::Rename { id, name }) => { let _ = event_tx.send(MuxEvent::Rename { id, name }); }
                 Some(MuxAction::Create { choice, inherit_from }) => {
@@ -125,7 +139,7 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                     create_slot(next_id, choice, settings, &config, cli, &launch, &event_tx, &runtime_tx, &mut slots, &mutation_coordinator);
                     next_id += 1;
                 }
-                Some(MuxAction::Close { id }) => close_slot(id, &mut slots, &event_tx).await,
+                Some(MuxAction::Close { id }) => close_slot(id, &mut slots, &mut reapers, &event_tx),
                 Some(MuxAction::Exit) | None => break,
             },
             message = runtime_rx.recv() => match message {
@@ -166,14 +180,36 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
             }
         }
     }
+    // Stop terminal ownership independently of agent teardown. In particular, a
+    // slot may currently be inside uninterruptible spawn_blocking preparation.
     cancel.cancel();
-    for (_, slot) in slots.drain() {
-        slot.cancel.cancel();
-        let _ = slot.task.await;
-    }
     drop(event_tx);
-    ui_task.await.context("join mux terminal task")??;
-    Ok(())
+    for (_, slot) in slots.drain() {
+        start_reap(slot, &mut reapers);
+    }
+    let mut shutdown_task =
+        tokio::spawn(async move { while reapers.join_next().await.is_some() {} });
+
+    let terminal_result = match tokio::time::timeout(Duration::from_secs(2), &mut ui_task).await {
+        Ok(result) => result.context("join mux terminal task")?,
+        Err(_) => {
+            ui_task.abort();
+            let _ = ui_task.await;
+            Ok(())
+        }
+    };
+
+    if tokio::time::timeout(Duration::from_secs(8), &mut shutdown_task)
+        .await
+        .is_err()
+    {
+        // Dropping the reaper JoinSet aborts its Tokio tasks. An already-running
+        // blocking closure cannot be force-aborted; its owned RetainedLease will
+        // still retain the worktree when that closure eventually returns.
+        shutdown_task.abort();
+        let _ = shutdown_task.await;
+    }
+    terminal_result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,10 +252,23 @@ fn create_slot(
     let task = tokio::spawn(async move {
         let setup_settings = task_settings.clone();
         let setup_config = config.clone();
+        let preparation_cancel = task_cancel.clone();
         let preparation = tokio::task::spawn_blocking(move || -> Result<_> {
+            anyhow::ensure!(
+                !preparation_cancel.is_cancelled(),
+                "slot preparation cancelled"
+            );
             let (workspace, name, lease) = prepare_workspace(choice, &launch)?;
             let lease = RetainedLease(lease);
+            anyhow::ensure!(
+                !preparation_cancel.is_cancelled(),
+                "slot preparation cancelled"
+            );
             let context_bundle = context::load_context_bundle(&workspace, no_context_files, true);
+            anyhow::ensure!(
+                !preparation_cancel.is_cancelled(),
+                "slot preparation cancelled"
+            );
             let mut tools = default_registry(ToolConfig::new(&workspace, setup_config.rtk))?;
             tools.set_execution_gate(mutation_coordinator.gate_for(&workspace, lease.0.is_some()));
             let skills = tools
@@ -241,11 +290,19 @@ fn create_slot(
                 .cloned()
                 .map(|path| ContextFileEntry { path })
                 .collect();
+            anyhow::ensure!(
+                !preparation_cancel.is_cancelled(),
+                "slot preparation cancelled"
+            );
             let provider = build_provider_with_auths(
                 &setup_settings.provider,
                 setup_config.copilot_auth.clone(),
                 setup_config.codex_auth.clone(),
             )?;
+            anyhow::ensure!(
+                !preparation_cancel.is_cancelled(),
+                "slot preparation cancelled"
+            );
             let store =
                 SessionStore::default_for_workspace(&workspace)?.with_deferred_sync(deferred);
             let session = store.create(SessionCreateOptions {
@@ -382,17 +439,32 @@ fn prepare_workspace(
     }
 }
 
-async fn close_slot(
+fn close_slot(
     id: MuxId,
     slots: &mut HashMap<MuxId, SlotHandle>,
+    reapers: &mut JoinSet<()>,
     events: &mpsc::UnboundedSender<MuxEvent>,
 ) {
     if let Some(slot) = slots.remove(&id) {
-        slot.cancel.cancel();
-        drop(slot.input);
-        let _ = slot.task.await;
+        // Remove first so rendering and routing change in this supervisor turn.
         let _ = events.send(MuxEvent::Remove { id });
+        start_reap(slot, reapers);
     }
+}
+
+fn start_reap(slot: SlotHandle, reapers: &mut JoinSet<()>) {
+    slot.cancel.cancel();
+    drop(slot.input);
+    reapers.spawn(async move {
+        let mut task = slot.task;
+        if tokio::time::timeout(Duration::from_secs(6), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    });
 }
 
 fn pane(
