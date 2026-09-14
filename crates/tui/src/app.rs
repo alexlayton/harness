@@ -516,6 +516,16 @@ impl CrossTerm {
         ui
     }
 
+    /// Add the canonical startup entries shared by standalone and retained panes.
+    fn enqueue_welcome(&mut self) {
+        if !self.minimal {
+            self.pending.push(Entry::Banner {
+                title_order: render::WelcomeTitleOrder::random(),
+            });
+            self.pending.push(self.metadata_entry());
+        }
+    }
+
     /// `skills`, `context_files`, MCP names, and the initial reasoning label come from
     /// startup configuration (the TUI never touches their backing stores).
     /// `minimal` suppresses only the initial banner and metadata.
@@ -545,6 +555,7 @@ impl CrossTerm {
         );
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
+        ui.enqueue_welcome();
         install_panic_hook(ui.terminal.clone());
         ui.setup_terminal()?;
         Ok(ui)
@@ -632,14 +643,6 @@ impl CrossTerm {
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        // The startup header: the wordmark banner augmented with the
-        // cwd/branch and provider/model metadata line.
-        if !self.minimal {
-            self.pending.push(Entry::Banner {
-                title_order: render::WelcomeTitleOrder::random(),
-            });
-            self.pending.push(self.metadata_entry());
-        }
         self.paint()?;
 
         let mut input_events = EventStream::new();
@@ -3400,6 +3403,7 @@ impl AgentPane {
             24,
         );
         state.reasoning = reasoning.to_owned();
+        state.enqueue_welcome();
         Self { state }
     }
 
@@ -3515,6 +3519,12 @@ impl AgentPane {
         let history_rows = lines.len();
         lines.extend(live.rows);
         lines.truncate(self.state.height as usize);
+        // Every retained row must obey the pane rectangle even when startup
+        // metadata or a banner is wider than a degenerate pane.
+        lines = lines
+            .into_iter()
+            .map(|line| render::fit_line_to_width(&line, self.state.width as usize))
+            .collect();
         PaneFrame {
             lines,
             cursor_row: (history_rows + live.cursor_row)
@@ -4362,6 +4372,27 @@ mod tests {
                 fitted.iter().map(row_text).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn retained_pane_starts_with_the_canonical_welcome_entries() {
+        let pane = pane(PathBuf::from("/workspace"));
+        assert_eq!(pane.state.pending.len(), 2);
+        assert!(matches!(pane.state.pending[0], Entry::Banner { .. }));
+        let Entry::Metadata {
+            provider,
+            model,
+            context_files,
+            skills,
+            ..
+        } = &pane.state.pending[1]
+        else {
+            panic!("second startup entry was not metadata");
+        };
+        assert_eq!(provider, "test-provider");
+        assert_eq!(model, "test-model");
+        assert!(context_files.is_empty());
+        assert!(skills.is_empty());
     }
 
     #[test]

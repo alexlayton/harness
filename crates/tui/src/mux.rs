@@ -19,6 +19,9 @@ use crossterm::terminal::{
     self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
+use ratatui_core::style::{Modifier, Style};
+use ratatui_core::text::{Line, Span};
+use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -27,7 +30,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Stable host-assigned identifier. IDs are never derived from sidebar order.
 pub type MuxId = u64;
@@ -834,20 +837,28 @@ impl MuxUi {
         let (w, h) = terminal::size().unwrap_or((self.width, self.height));
         self.width = w;
         self.height = h;
-        let l = self.layout(w, h);
+        let layout = self.layout(w, h);
+        let theme = render::Theme::default();
+        let muted = Style::default()
+            .fg(theme.muted_text)
+            .add_modifier(Modifier::DIM);
+        let accent = Style::default().fg(theme.accent);
         let mut rows = vec![String::new(); h as usize];
-        if let Some((_, sw)) = l.sidebar {
+
+        if let Some((_, sidebar_width)) = layout.sidebar {
             if let Some(row) = rows.get_mut(0) {
-                *row = " MUX".into();
+                *row = styled_fit(
+                    " MUX",
+                    sidebar_width as usize,
+                    accent.add_modifier(Modifier::BOLD),
+                );
             }
-            if l.body_height > 1
-                && let Some(row) = rows.get_mut(1)
-            {
-                *row = " SESSIONS".into();
+            if layout.body_height > 1 {
+                rows[1] = styled_fit(" SESSIONS", sidebar_width as usize, muted);
             }
             let compact = w < 70;
             let step = if compact { 1 } else { 2 };
-            for (n, s) in self
+            for (n, slot) in self
                 .slots
                 .iter()
                 .skip(self.sidebar_scroll)
@@ -855,85 +866,107 @@ impl MuxUi {
                 .enumerate()
             {
                 let y = 2 + n * step;
-                let mark = if Some(self.sidebar_scroll + n) == self.selected {
-                    ">"
-                } else {
-                    " "
-                };
-                rows[y] = fit(
-                    &format!(
-                        "{mark} {}  {}  {}",
-                        self.sidebar_scroll + n + 1,
-                        s.name,
-                        s.status.glyph()
-                    ),
-                    sw as usize,
+                let selected = Some(self.sidebar_scroll + n) == self.selected;
+                let text = format!(
+                    "{} {}  {}  {}",
+                    if selected { ">" } else { " " },
+                    self.sidebar_scroll + n + 1,
+                    slot.name,
+                    slot.status.glyph()
                 );
-                if !compact && y + 1 < l.body_height as usize {
-                    rows[y + 1] = fit(
-                        &format!(
-                            "    {}{}",
-                            s.workspace.display(),
-                            if s.worktree { " · worktree" } else { "" }
-                        ),
-                        sw as usize,
-                    )
+                rows[y] = styled_fit(
+                    &text,
+                    sidebar_width as usize,
+                    if selected {
+                        accent.add_modifier(Modifier::BOLD)
+                    } else {
+                        muted
+                    },
+                );
+                if !compact && y + 1 < layout.body_height as usize {
+                    let detail = format!(
+                        "    {}{}",
+                        slot.workspace.display(),
+                        if slot.worktree { " · worktree" } else { "" }
+                    );
+                    rows[y + 1] = styled_fit(&detail, sidebar_width as usize, muted);
                 }
             }
-            let visible_count = self
+            let visible = self
                 .slots
                 .len()
                 .saturating_sub(self.sidebar_scroll)
                 .min(self.visible_rows());
-            let y = 2 + visible_count * step;
-            if y < l.body_height as usize {
-                rows[y] = " + New agent".into()
+            let new_y = 2 + visible * step;
+            if new_y < layout.body_height as usize {
+                rows[new_y] = styled_fit(" + New agent", sidebar_width as usize, muted);
             }
-            for row in rows.iter_mut().take(l.body_height as usize) {
-                *row = format!("{}│", fit(row, sw as usize))
+            for row in rows.iter_mut().take(layout.body_height as usize) {
+                row.push_str(&line_to_ansi(&Line::from(Span::styled("│", muted))));
             }
         }
+
         let mut pane_cursor = None;
         if let Some(i) = self.selected {
+            let status_style = status_style(self.slots[i].status, theme);
+            let title = styled_fit(
+                &format!(" {}", self.slots[i].name),
+                layout.main_width as usize,
+                muted,
+            );
+            // Paint status over the right side without measuring ANSI bytes.
             if let Some(row) = rows.get_mut(0) {
-                row.push_str(&fit(
-                    &format!(" {}   {}", self.slots[i].name, self.slots[i].status.label()),
-                    l.main_width as usize,
-                ));
+                row.push_str(&title);
+            }
+            let label = self.slots[i].status.label();
+            if layout.main_width as usize > label.width() + 1 {
+                let x = layout.main_x + layout.main_width - label.width() as u16 - 1;
+                let _ = write!(
+                    rows[0],
+                    "{}{}",
+                    MoveTo(x, 0),
+                    line_to_ansi(&Line::from(Span::styled(label, status_style)))
+                );
             }
             let frame = self.slots[i]
                 .pane
-                .render(l.main_width, l.body_height.saturating_sub(1));
-            for n in 0..l.body_height.saturating_sub(1) as usize {
-                if let Some(line) = frame.lines.get(n) {
-                    let fitted = render::fit_line_to_width(line, l.main_width as usize);
-                    let rendered_width = fitted
-                        .spans
-                        .iter()
-                        .map(|span| unicode_width::UnicodeWidthStr::width(span.content.as_ref()))
-                        .sum::<usize>();
-                    rows[n + 1].push_str(&line_to_ansi(&fitted));
-                    rows[n + 1].push_str(
-                        &" ".repeat((l.main_width as usize).saturating_sub(rendered_width)),
-                    );
-                } else {
-                    rows[n + 1].push_str(&" ".repeat(l.main_width as usize));
-                }
+                .render(layout.main_width, layout.body_height.saturating_sub(1));
+            for n in 0..layout.body_height.saturating_sub(1) as usize {
+                let line = frame.lines.get(n).cloned().unwrap_or_default();
+                rows[n + 1].push_str(&padded_line(&line, layout.main_width as usize));
             }
-            pane_cursor = Some(pane_cursor_position(l, &frame));
-        } else if l.body_height > 4 {
-            let y = l.body_height as usize / 2;
-            rows[y].push_str(" No agents yet");
-            rows[y + 1].push_str(" Press Ctrl+Space then n to create one.");
+            pane_cursor = Some(pane_cursor_position(layout, &frame));
+        } else {
+            for row in rows.iter_mut().take(layout.body_height as usize) {
+                row.push_str(&" ".repeat(layout.main_width as usize));
+            }
+            if layout.body_height > 4 {
+                let y = layout.body_height as usize / 2;
+                rows[y].push_str(&format!(
+                    "{}{}",
+                    MoveTo(layout.main_x, y as u16),
+                    styled_fit(" No agents yet", layout.main_width as usize, muted)
+                ));
+                rows[y + 1].push_str(&format!(
+                    "{}{}",
+                    MoveTo(layout.main_x, y as u16 + 1),
+                    styled_fit(
+                        " Press Ctrl+Space then n to create one.",
+                        layout.main_width as usize,
+                        muted
+                    )
+                ));
+            }
         }
-        if let Some(row) = rows.get_mut(l.footer_y as usize) {
-            *row = fit(
+        if let Some(row) = rows.get_mut(layout.footer_y as usize) {
+            *row = styled_fit(
                 if self.prefix {
                     " MUX > n:new  j/k:switch  1-9:jump  x:close  r:rename  b:sidebar  ?:help"
                 } else {
                     " ^Space prefix   n new   j/k switch   1-9 jump   x close   ? help"
                 },
                 w as usize,
+                muted,
             );
         }
 
@@ -942,16 +975,11 @@ impl MuxUi {
             if index > 0 {
                 buffer.push_str("\r\n");
             }
-            if self.selected.is_some() && index < l.body_height as usize {
-                buffer.push_str(row);
-            } else {
-                buffer.push_str(&fit(row, w as usize));
-            }
+            buffer.push_str(row);
         }
         if let Some(overlay) = &self.overlay {
-            draw_overlay(&mut buffer, w, h, overlay);
+            draw_overlay(&mut buffer, layout, overlay, theme);
         } else if let Some((x, y)) = pane_cursor.and_then(|cursor| bounded_cursor(cursor, w, h)) {
-            use std::fmt::Write as _;
             let _ = write!(buffer, "{}{}", MoveTo(x, y), Show);
         }
         out.write_all(buffer.as_bytes())?;
@@ -1053,9 +1081,42 @@ fn fit(text: &str, width: usize) -> String {
     out.push_str(&" ".repeat(width.saturating_sub(used)));
     out
 }
-fn draw_overlay(buffer: &mut String, width: u16, height: u16, overlay: &Overlay) {
-    use std::fmt::Write as _;
+fn padded_line(line: &Line<'_>, width: usize) -> String {
+    let fitted = render::fit_line_to_width(line, width);
+    let used = fitted
+        .spans
+        .iter()
+        .map(|span| span.content.width())
+        .sum::<usize>();
+    format!(
+        "{}{}",
+        line_to_ansi(&fitted),
+        " ".repeat(width.saturating_sub(used))
+    )
+}
 
+fn styled_fit(text: &str, width: usize, style: Style) -> String {
+    padded_line(&Line::from(Span::styled(text.to_owned(), style)), width)
+}
+
+fn status_style(status: MuxStatus, theme: render::Theme) -> Style {
+    Style::default().fg(match status {
+        MuxStatus::Starting => theme.muted_text,
+        MuxStatus::Running => theme.accent,
+        MuxStatus::Idle => theme.success,
+        MuxStatus::Error => theme.error,
+    })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OverlayFrame {
+    x: u16,
+    y: u16,
+    width: u16,
+    rows: Vec<String>,
+}
+
+fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
     let title = match overlay {
         Overlay::NewMenu { .. } | Overlay::Current { .. } => "New agent",
         Overlay::Worktree { .. } => "New worktree agent",
@@ -1101,31 +1162,68 @@ fn draw_overlay(buffer: &mut String, width: u16, height: u16, overlay: &Overlay)
         )
         .into(),
     };
-    let box_width = if width < 10 {
-        width
+    let width = if layout.main_width < 10 {
+        layout.main_width
     } else {
-        width.saturating_sub(4).clamp(10, 58)
+        layout.main_width.saturating_sub(4).clamp(10, 58)
     };
-    let lines = content.lines().collect::<Vec<_>>();
-    let box_height = (lines.len() + 4).min(height as usize) as u16;
-    let x = (width - box_width) / 2;
-    let y = (height - box_height) / 2;
-    for row in 0..box_height {
-        let text = if row == 0 {
-            format!("┌─ {title} ")
-        } else if row == box_height - 1 {
-            "└".into()
-        } else {
-            format!(
+    let content_lines = content.lines().collect::<Vec<_>>();
+    let height = (content_lines.len() + 4).min(layout.body_height as usize) as u16;
+    let x = layout.main_x + layout.main_width.saturating_sub(width) / 2;
+    let y = layout.body_height.saturating_sub(height) / 2;
+    let mut rows = Vec::with_capacity(height as usize);
+    for row in 0..height {
+        let text = match (width, height, row) {
+            (0, _, _) => String::new(),
+            (1, _, _) => "│".into(),
+            (_, 1, _) => format!("┌{}┐", "─".repeat(width.saturating_sub(2) as usize)),
+            (_, _, 0) => format!("┌─ {title} "),
+            (_, _, r) if r == height - 1 => "└".into(),
+            _ => format!(
                 "│ {}",
-                lines.get(row.saturating_sub(2) as usize).unwrap_or(&"")
-            )
+                content_lines
+                    .get(row.saturating_sub(2) as usize)
+                    .unwrap_or(&"")
+            ),
+        };
+        let mut fitted = fit(&text, width as usize);
+        if width >= 2 {
+            let right = if row == 0 {
+                '┐'
+            } else if row == height - 1 {
+                '┘'
+            } else {
+                '│'
+            };
+            fitted.pop();
+            fitted.push(right);
+        }
+        rows.push(fitted);
+    }
+    OverlayFrame { x, y, width, rows }
+}
+
+fn draw_overlay(buffer: &mut String, layout: MuxLayout, overlay: &Overlay, theme: render::Theme) {
+    use std::fmt::Write as _;
+    let frame = overlay_frame(layout, overlay);
+    let primary = Style::default().fg(theme.primary_text);
+    let muted = Style::default()
+        .fg(theme.muted_text)
+        .add_modifier(Modifier::DIM);
+    let accent = Style::default().fg(theme.accent);
+    for (row, text) in frame.rows.iter().enumerate() {
+        let style = if row == 0 || row + 1 == frame.rows.len() {
+            muted
+        } else if text.starts_with("│ >") {
+            accent
+        } else {
+            primary
         };
         let _ = write!(
             buffer,
             "{}{}",
-            MoveTo(x, y + row),
-            fit(&text, box_width as usize)
+            MoveTo(frame.x, frame.y + row as u16),
+            styled_fit(text, frame.width as usize, style)
         );
     }
 }
@@ -1421,12 +1519,53 @@ mod tests {
                 assert!(layout.main_x <= width);
                 assert!(layout.main_width <= width);
                 assert!(layout.body_height <= height);
-                draw_overlay(&mut String::new(), width, height, &Overlay::Help);
+                let frame = overlay_frame(layout, &Overlay::Help);
+                assert!(frame.x.saturating_add(frame.width) <= width);
+                assert!(frame.y.saturating_add(frame.rows.len() as u16) <= layout.body_height);
             }
         }
         assert_eq!(bounded_cursor((9, 9), 0, 2), None);
         assert_eq!(bounded_cursor((9, 9), 1, 1), Some((0, 0)));
         assert_eq!(bounded_cursor((9, 9), 2, 2), Some((1, 1)));
+    }
+
+    #[test]
+    fn overlays_are_centered_in_main_pane_closed_and_opaque() {
+        let mux = MuxUi::new("/x".into());
+        let layout = mux.layout(100, 30);
+        let first = overlay_frame(layout, &Overlay::NewMenu { selected: 0 });
+        assert!(first.x >= layout.main_x);
+        assert_eq!(
+            first.x - layout.main_x,
+            (layout.main_width - first.width) / 2
+        );
+        assert!(first.rows[0].starts_with('┌') && first.rows[0].ends_with('┐'));
+        assert!(
+            first.rows.last().unwrap().starts_with('└')
+                && first.rows.last().unwrap().ends_with('┘')
+        );
+        assert!(
+            first
+                .rows
+                .iter()
+                .all(|row| row.width() == first.width as usize)
+        );
+        assert!(
+            first.rows[1..first.rows.len() - 1]
+                .iter()
+                .all(|row| row.starts_with('│') && row.ends_with('│'))
+        );
+
+        // A subsequent, shorter overlay still paints every cell in its rectangle;
+        // no text or divider from the New Agent menu can survive underneath it.
+        let second = overlay_frame(layout, &Overlay::Close);
+        assert!(
+            second
+                .rows
+                .iter()
+                .all(|row| row.width() == second.width as usize)
+        );
+        assert!(!second.rows.join("\n").contains("New worktree"));
     }
 
     #[test]
