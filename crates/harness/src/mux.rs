@@ -30,16 +30,13 @@ struct SlotSettings {
 
 #[derive(Clone, Default)]
 struct WorkspaceMutationCoordinator {
-    direct_gates: Arc<Mutex<HashMap<PathBuf, ToolExecutionGate>>>,
+    workspace_gates: Arc<Mutex<HashMap<PathBuf, ToolExecutionGate>>>,
 }
 
 impl WorkspaceMutationCoordinator {
-    fn gate_for(&self, workspace: &Path, worktree: bool) -> ToolExecutionGate {
-        if worktree {
-            return Arc::new(tokio::sync::Mutex::new(()));
-        }
+    fn gate_for(&self, workspace: &Path) -> ToolExecutionGate {
         let mut gates = self
-            .direct_gates
+            .workspace_gates
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         gates
@@ -270,7 +267,10 @@ fn create_slot(
                 "slot preparation cancelled"
             );
             let mut tools = default_registry(ToolConfig::new(&workspace, setup_config.rtk))?;
-            tools.set_execution_gate(mutation_coordinator.gate_for(&workspace, lease.0.is_some()));
+            // Canonical path identity, rather than creation origin, is the
+            // safety boundary: a worktree can also be opened through the
+            // direct-directory picker.
+            tools.set_execution_gate(mutation_coordinator.gate_for(&workspace));
             let skills = tools
                 .skills()
                 .map(|catalog| {
@@ -513,18 +513,15 @@ mod tests {
     }
 
     #[test]
-    fn mutation_coordinator_shares_only_direct_workspace_gates() {
+    fn mutation_coordinator_keys_every_slot_by_canonical_workspace() {
         let coordinator = WorkspaceMutationCoordinator::default();
         let root = Path::new("/canonical/workspace");
-        let shared_a = coordinator.gate_for(root, false);
-        let shared_b = coordinator.clone().gate_for(root, false);
-        let distinct = coordinator.gate_for(Path::new("/canonical/other"), false);
-        let worktree_a = coordinator.gate_for(root, true);
-        let worktree_b = coordinator.gate_for(root, true);
+        let shared_a = coordinator.gate_for(root);
+        let shared_b = coordinator.clone().gate_for(root);
+        let distinct = coordinator.gate_for(Path::new("/canonical/other"));
 
         assert!(Arc::ptr_eq(&shared_a, &shared_b));
         assert!(!Arc::ptr_eq(&shared_a, &distinct));
-        assert!(!Arc::ptr_eq(&worktree_a, &worktree_b));
     }
 
     #[test]

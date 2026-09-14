@@ -552,7 +552,10 @@ impl MuxUi {
             WorkspaceChoice::Directory { path, .. } => {
                 std::fs::canonicalize(path).ok().is_some_and(|path| {
                     self.slots.iter().any(|slot| {
-                        !slot.worktree
+                        // A starting worktree temporarily displays the launch
+                        // directory until Git returns its real path; do not
+                        // treat that provisional label as a duplicate.
+                        (!slot.worktree || slot.status != MuxStatus::Starting)
                             && std::fs::canonicalize(&slot.workspace).ok().as_ref() == Some(&path)
                     })
                 })
