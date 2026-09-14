@@ -341,6 +341,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         },
         config.reasoning.as_str(),
         config.tui_minimal,
+        workspace_root,
     )?;
     let ui_result = ui.run(ui_event_rx, tui_input_tx, cancel.clone()).await;
     cancel.cancel();

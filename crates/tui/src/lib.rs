@@ -12,7 +12,7 @@ mod paths;
 mod render;
 mod state;
 
-pub use app::CrossTerm;
+pub use app::{AgentPane, CrossTerm, PaneFrame};
 pub use state::{ToolRecord, ToolStatus};
 
 /// Messages sent from the terminal UI to the agent. Keeping this protocol in

@@ -436,15 +436,16 @@ pub struct CrossTerm {
 impl CrossTerm {
     /// Assemble the UI state without touching the terminal. `new` layers the
     /// terminal setup on top, and tests use this directly.
+    #[allow(clippy::too_many_arguments)]
     fn base(
         model: &str,
         provider: &str,
         providers: Vec<String>,
         startup: StartupEntries,
+        workspace_root: PathBuf,
         width: u16,
         height: u16,
     ) -> Self {
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let environment = EnvironmentInfo::discover(workspace_root);
         let StartupEntries {
             skills,
@@ -515,6 +516,7 @@ impl CrossTerm {
     /// `skills`, `context_files`, MCP names, and the initial reasoning label come from
     /// startup configuration (the TUI never touches their backing stores).
     /// `minimal` suppresses only the initial banner and metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &str,
         provider: &str,
@@ -522,11 +524,20 @@ impl CrossTerm {
         startup: StartupEntries,
         reasoning: &str,
         minimal: bool,
+        workspace_root: PathBuf,
     ) -> Result<Self> {
         let backend = CrosstermBackend;
         let (width, height) = backend.size().unwrap_or((80, 24));
         let mut ui = Self::with_backend(
-            Self::base(model, provider, providers, startup, width, height),
+            Self::base(
+                model,
+                provider,
+                providers,
+                startup,
+                workspace_root,
+                width,
+                height,
+            ),
             Box::new(backend),
         );
         ui.reasoning = reasoning.to_owned();
@@ -3328,6 +3339,114 @@ fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize, width: usize) 
     buffer.push_str(&line_to_ansi(&line));
 }
 
+/// A retained rendering result produced by [`AgentPane`]. Coordinates are
+/// relative to the rectangle supplied to `render`; the terminal owner decides
+/// where that rectangle lives on screen.
+#[derive(Clone, Debug)]
+pub struct PaneFrame {
+    pub lines: Vec<Line<'static>>,
+    pub cursor_row: u16,
+    pub cursor_col: u16,
+}
+
+/// Retained presentation and editor state for one agent UI.
+///
+/// This component deliberately does not enter raw mode, read terminal events,
+/// or write stdout. A future mux can keep one value per agent and render only
+/// the selected value into its assigned rectangle. [`CrossTerm`] remains the
+/// native-scrollback terminal owner for standalone mode; this type is the
+/// extraction seam while its proven conversation representation remains the
+/// single canonical representation.
+pub struct AgentPane {
+    state: CrossTerm,
+}
+
+impl AgentPane {
+    /// Create an independent pane rooted at an explicit workspace. Path
+    /// completion and environment metadata never consult the process cwd.
+    pub fn new(
+        model: &str,
+        provider: &str,
+        providers: Vec<String>,
+        skills: Vec<SkillEntry>,
+        context_files: Vec<ContextFileEntry>,
+        reasoning: &str,
+        workspace_root: PathBuf,
+    ) -> Self {
+        let mut state = CrossTerm::base(
+            model,
+            provider,
+            providers,
+            StartupEntries {
+                skills,
+                context_files,
+                mcp_servers: Vec::new(),
+            },
+            workspace_root,
+            80,
+            24,
+        );
+        state.reasoning = reasoning.to_owned();
+        Self { state }
+    }
+
+    /// Apply one provider-independent runtime event to this pane only.
+    pub fn apply_event(&mut self, event: UiEvent) {
+        self.state.apply_event(event);
+    }
+
+    /// Replace the editor draft. This small host-facing operation also makes
+    /// pane switching testable without synthesizing terminal key encodings.
+    pub fn set_draft(&mut self, draft: impl Into<String>) {
+        self.state.input = draft.into();
+        self.state.cursor = self.state.input.len();
+        self.state.refresh_completion();
+    }
+
+    /// Return the active editor contents, including an unsubmitted draft.
+    pub fn editor_text(&self) -> &str {
+        &self.state.input
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.state.environment.cwd
+    }
+
+    /// Render retained history plus the live editor into arbitrary dimensions.
+    /// Zero dimensions are accepted and normalized to a one-cell model so all
+    /// returned cursor coordinates remain bounded.
+    pub fn render(&mut self, width: u16, height: u16) -> PaneFrame {
+        self.state.width = width.max(1);
+        self.state.height = height.max(1);
+        let input = self.state.input_layout();
+        let live = self
+            .state
+            .build_region_with_running(&input, self.state.running_region());
+        let mut entries = self.state.transcript.clone();
+        entries.extend(self.state.pending.iter().cloned());
+        let history_budget =
+            self.state.height as usize - live.rows.len().min(self.state.height as usize);
+        let mut lines = history_window(
+            &entries,
+            history_budget,
+            render::content_width(self.state.width),
+            self.state.theme,
+            self.state.tools_expanded,
+        );
+        let history_rows = lines.len();
+        lines.extend(live.rows);
+        lines.truncate(self.state.height as usize);
+        PaneFrame {
+            lines,
+            cursor_row: (history_rows + live.cursor_row)
+                .min(self.state.height.saturating_sub(1) as usize) as u16,
+            cursor_col: live
+                .cursor_col
+                .min(self.state.width.saturating_sub(1) as usize) as u16,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3335,12 +3454,90 @@ mod tests {
     use std::panic::AssertUnwindSafe;
     use std::sync::OnceLock;
 
+    fn pane(root: PathBuf) -> AgentPane {
+        AgentPane::new(
+            "test-model",
+            "test-provider",
+            vec!["openrouter".into()],
+            Vec::new(),
+            Vec::new(),
+            "auto",
+            root,
+        )
+    }
+
+    #[test]
+    fn panes_retain_independent_conversations_and_drafts_when_switched() {
+        let mut first = pane(PathBuf::from("/workspace/first"));
+        let mut second = pane(PathBuf::from("/workspace/second"));
+        first.set_draft("first draft");
+        second.set_draft("second draft");
+        first.apply_event(UiEvent::TextDelta("first answer".into()));
+        second.apply_event(UiEvent::TextDelta("second answer".into()));
+
+        let second_frame = second.render(40, 8);
+        let first_frame = first.render(40, 8);
+        assert_eq!(first.editor_text(), "first draft");
+        assert_eq!(second.editor_text(), "second draft");
+        assert!(
+            first_frame
+                .lines
+                .iter()
+                .any(|line| row_text(line).contains("first answer"))
+        );
+        assert!(
+            !first_frame
+                .lines
+                .iter()
+                .any(|line| row_text(line).contains("second answer"))
+        );
+        assert!(
+            second_frame
+                .lines
+                .iter()
+                .any(|line| row_text(line).contains("second answer"))
+        );
+    }
+
+    #[test]
+    fn pane_rendering_bounds_lines_and_cursor_at_arbitrary_dimensions() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.set_draft("a long unicode draft 你好 that wraps repeatedly");
+        for (width, height) in [(0, 0), (1, 1), (3, 2), (17, 4), (120, 40)] {
+            let frame = pane.render(width, height);
+            let width = width.max(1);
+            let height = height.max(1);
+            assert!(frame.lines.len() <= height as usize);
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .all(|line| row_width(line) <= width as usize)
+            );
+            assert!(frame.cursor_row < height);
+            assert!(frame.cursor_col < width);
+        }
+    }
+
+    #[test]
+    fn pane_uses_explicit_workspace_for_environment_and_completion() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("completion-target")).unwrap();
+        let pane = pane(root.path().to_path_buf());
+        assert_eq!(pane.workspace_root(), root.path());
+        assert_eq!(
+            pane.state.environment.cwd_display,
+            root.path().to_string_lossy()
+        );
+    }
+
     fn ui(width: u16, height: u16) -> CrossTerm {
         CrossTerm::base(
             "test-model",
             "test-provider",
             vec!["opencode-go".into(), "openrouter".into()],
             StartupEntries::default(),
+            PathBuf::from("."),
             width,
             height,
         )
