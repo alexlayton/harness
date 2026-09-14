@@ -77,6 +77,17 @@ pub struct ContextFileEntry {
     pub path: String,
 }
 
+/// Startup catalogues displayed in the launch header and used for completion.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StartupEntries {
+    /// Discovered skills available for invocation and completion.
+    pub skills: Vec<SkillEntry>,
+    /// Project instruction files loaded into agent context.
+    pub context_files: Vec<ContextFileEntry>,
+    /// Configured MCP server names.
+    pub mcp_servers: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionSnapshotEntry {
     User {

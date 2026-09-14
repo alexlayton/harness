@@ -1,15 +1,22 @@
 use crate::config::{
-    McpArgs, McpCommand, add_mcp_server, config_path, delete_mcp_server, load_file_config,
+    McpArgs, McpCommand, add_http_mcp_server, add_mcp_server, config_path, delete_mcp_server,
+    load_file_config,
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use mcp::McpTransportConfig;
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 /// Run configuration-only MCP commands without starting an agent or provider.
 pub fn run(args: &McpArgs) -> Result<ExitCode> {
     match &args.command {
         Some(McpCommand::Add(args)) => {
-            add_mcp_server(&args.name, &args.command)?;
+            if let Some(url) = &args.url {
+                let headers = parse_headers(&args.header)?;
+                add_http_mcp_server(&args.name, url, &headers)?;
+            } else {
+                add_mcp_server(&args.name, &args.command)?;
+            }
             println!("Added MCP server `{}`.", args.name);
         }
         Some(McpCommand::Delete { name }) => {
@@ -19,6 +26,21 @@ pub fn run(args: &McpArgs) -> Result<ExitCode> {
         Some(McpCommand::List) | None => list()?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn parse_headers(headers: &[String]) -> Result<BTreeMap<String, String>> {
+    headers
+        .iter()
+        .map(|header| {
+            let (name, value) = header
+                .split_once('=')
+                .ok_or_else(|| anyhow!("HTTP header must use NAME=VALUE syntax"))?;
+            if name.is_empty() {
+                return Err(anyhow!("HTTP header name must not be empty"));
+            }
+            Ok((name.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn list() -> Result<()> {

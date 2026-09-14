@@ -15,9 +15,9 @@
 //! (`authenticate` answers with instructions to sign in interactively),
 //! transcript replay on `session/load` (history is intact on disk and in the
 //! agent context; the editor shows an empty transcript until the next turn),
-//! HTTP/SSE/MCP-over-ACP transports, mid-session model switching. ACP-provided
-//! stdio MCP servers are supported per session. Unhandled requests fall through
-//! to the SDK default of method-not-found.
+//! legacy SSE/MCP-over-ACP transports, mid-session model switching. ACP-provided
+//! stdio and Streamable HTTP MCP servers are supported per session. Unhandled
+//! requests fall through to the SDK default of method-not-found.
 //!
 //! Stdout ownership is inverted here: stdout carries JSON-RPC only. Tracing
 //! stays behind `HARNESS_LOG` (file-only), and this module never writes to
@@ -1244,9 +1244,9 @@ async fn build_agent_with_timeout(
     }
 }
 
-/// Convert ACP's session-local stdio declarations without retaining ACP wire
-/// types outside this frontend. HTTP, SSE, and MCP-over-ACP are rejected
-/// rather than silently omitted.
+/// Convert ACP's session-local stdio and Streamable HTTP declarations without
+/// retaining ACP wire types outside this frontend. Deprecated SSE and
+/// MCP-over-ACP transports are rejected rather than silently omitted.
 fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
     let servers = servers
         .iter()
@@ -1263,10 +1263,17 @@ fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
                         .collect(),
                 },
             }),
-            McpServer::Http(server) => anyhow::bail!(
-                "MCP server `{}` requests HTTP, which this Harness build does not support",
-                server.name
-            ),
+            McpServer::Http(server) => Ok(mcp::McpServerConfig {
+                name: server.name.clone(),
+                transport: mcp::McpTransportConfig::Http {
+                    url: server.url.clone(),
+                    headers: server
+                        .headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect(),
+                },
+            }),
             McpServer::Sse(server) => anyhow::bail!(
                 "MCP server `{}` requests SSE, which this Harness build does not support",
                 server.name
