@@ -78,10 +78,23 @@ pub enum WorkspaceChoice {
 /// Lifecycle/editor output from mux to its host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MuxAction {
-    AgentInput { id: MuxId, input: InputMessage },
-    Create(WorkspaceChoice),
-    Rename { id: MuxId, name: String },
-    Close { id: MuxId },
+    AgentInput {
+        id: MuxId,
+        input: InputMessage,
+    },
+    /// Create a slot, inheriting mutable model settings from the slot that was
+    /// selected when the dialog was confirmed.
+    Create {
+        choice: WorkspaceChoice,
+        inherit_from: Option<MuxId>,
+    },
+    Rename {
+        id: MuxId,
+        name: String,
+    },
+    Close {
+        id: MuxId,
+    },
     Exit,
 }
 
@@ -89,6 +102,15 @@ pub enum MuxAction {
 #[allow(clippy::large_enum_variant)]
 pub enum MuxEvent {
     Add {
+        id: MuxId,
+        name: String,
+        workspace: PathBuf,
+        worktree: bool,
+        status: MuxStatus,
+        pane: AgentPane,
+    },
+    /// Replace an existing provisional pane without changing the active slot.
+    Replace {
         id: MuxId,
         name: String,
         workspace: PathBuf,
@@ -143,6 +165,9 @@ enum Overlay {
         input: String,
     },
     Close,
+    ConfirmDuplicate {
+        choice: WorkspaceChoice,
+    },
     Help,
 }
 
@@ -254,6 +279,25 @@ impl MuxUi {
                 }
                 self.selected = self.slots.iter().position(|s| s.id == id);
                 self.reveal_selected();
+            }
+            MuxEvent::Replace {
+                id,
+                name,
+                workspace,
+                worktree,
+                status,
+                pane,
+            } => {
+                if let Some(slot) = self.slots.iter_mut().find(|slot| slot.id == id) {
+                    *slot = Slot {
+                        id,
+                        name,
+                        workspace,
+                        worktree,
+                        status,
+                        pane,
+                    };
+                }
             }
             MuxEvent::Ui { id, event } => {
                 if let Some(s) = self.slots.iter_mut().find(|s| s.id == id) {
@@ -398,10 +442,10 @@ impl MuxUi {
             .map(|input| MuxAction::AgentInput { id, input })
             .collect::<Vec<_>>();
         if result.exit_requested {
-            // Standalone's second Ctrl+C means "request exit". In a mux the
-            // terminal owner must retain the documented destructive-action
-            // confirmation rather than translating that request immediately.
-            self.overlay = Some(Overlay::Close);
+            // Preserve standalone semantics: after Ctrl+C first clears a
+            // draft, a second Ctrl+C exits the frontend. Closing just one slot
+            // remains the explicit, confirmed mux-prefix `x` action.
+            return Ok(vec![MuxAction::Exit]);
         }
         Ok(out)
     }
@@ -448,6 +492,28 @@ impl MuxUi {
             _ => {}
         }
     }
+    fn request_create(&mut self, choice: WorkspaceChoice, out: &mut Vec<MuxAction>) {
+        let duplicate = match &choice {
+            WorkspaceChoice::Directory { path, .. } => {
+                std::fs::canonicalize(path).ok().is_some_and(|path| {
+                    self.slots.iter().any(|slot| {
+                        !slot.worktree
+                            && std::fs::canonicalize(&slot.workspace).ok().as_ref() == Some(&path)
+                    })
+                })
+            }
+            WorkspaceChoice::Worktree { .. } => false,
+        };
+        if duplicate {
+            self.overlay = Some(Overlay::ConfirmDuplicate { choice });
+        } else {
+            out.push(MuxAction::Create {
+                choice,
+                inherit_from: self.selected_id(),
+            });
+        }
+    }
+
     fn handle_overlay(&mut self, mut overlay: Overlay, key: KeyEvent, out: &mut Vec<MuxAction>) {
         if key.code == KeyCode::Esc {
             if matches!(
@@ -482,12 +548,13 @@ impl MuxUi {
                 _ => self.overlay = Some(overlay),
             },
             Overlay::Worktree { branch, keep } => match key.code {
-                KeyCode::Enter if !branch.trim().is_empty() => {
-                    out.push(MuxAction::Create(WorkspaceChoice::Worktree {
+                KeyCode::Enter if !branch.trim().is_empty() => self.request_create(
+                    WorkspaceChoice::Worktree {
                         branch: branch.trim().into(),
                         keep: *keep,
-                    }))
-                }
+                    },
+                    out,
+                ),
                 KeyCode::Tab => *keep = !*keep,
                 _ => {
                     edit_string(branch, key);
@@ -495,12 +562,13 @@ impl MuxUi {
                 }
             },
             Overlay::Current { name } => match key.code {
-                KeyCode::Enter if !name.trim().is_empty() => {
-                    out.push(MuxAction::Create(WorkspaceChoice::Directory {
+                KeyCode::Enter if !name.trim().is_empty() => self.request_create(
+                    WorkspaceChoice::Directory {
                         path: self.cwd.clone(),
                         name: name.trim().into(),
-                    }))
-                }
+                    },
+                    out,
+                ),
                 _ => {
                     edit_string(name, key);
                     self.overlay = Some(overlay)
@@ -531,10 +599,13 @@ impl MuxUi {
                         .cloned()
                         .unwrap_or_else(|| expand_path(input, &self.cwd));
                     if p.is_dir() {
-                        out.push(MuxAction::Create(WorkspaceChoice::Directory {
-                            name: basename(&p),
-                            path: p,
-                        }))
+                        self.request_create(
+                            WorkspaceChoice::Directory {
+                                name: basename(&p),
+                                path: p,
+                            },
+                            out,
+                        )
                     } else {
                         self.overlay = Some(overlay)
                     }
@@ -567,6 +638,16 @@ impl MuxUi {
                     }
                 } else {
                     self.overlay = Some(overlay)
+                }
+            }
+            Overlay::ConfirmDuplicate { choice } => {
+                if key.code == KeyCode::Enter {
+                    out.push(MuxAction::Create {
+                        choice: choice.clone(),
+                        inherit_from: self.selected_id(),
+                    });
+                } else {
+                    self.overlay = Some(overlay);
                 }
             }
         }
@@ -832,6 +913,7 @@ fn draw_overlay(buffer: &mut String, width: u16, height: u16, overlay: &Overlay)
         Overlay::Directory { .. } => "Choose directory",
         Overlay::Rename { .. } => "Rename agent",
         Overlay::Close => "Close agent?",
+        Overlay::ConfirmDuplicate { .. } => "Duplicate workspace?",
         Overlay::Help => "Mux help",
     };
     let content = match overlay {
@@ -859,6 +941,10 @@ fn draw_overlay(buffer: &mut String, width: u16, height: u16, overlay: &Overlay)
         ),
         Overlay::Rename { input } => format!("Name: {input}"),
         Overlay::Close => "Enter to close; Esc to cancel".into(),
+        Overlay::ConfirmDuplicate { .. } => {
+            "A direct agent already uses this directory. Enter to create anyway; Esc to cancel"
+                .into()
+        }
         Overlay::Help => concat!(
             "Ctrl+Space n new · j/k switch · 1-9 jump\n",
             "x close · r rename · b sidebar · ? help\n",
@@ -965,6 +1051,42 @@ mod tests {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
     #[test]
+    fn provisional_add_activates_but_replacement_preserves_newer_selection() {
+        let mut mux = MuxUi::new("/x".into());
+        mux.apply(MuxEvent::Add {
+            id: 1,
+            name: "first".into(),
+            workspace: "/pending".into(),
+            worktree: true,
+            status: MuxStatus::Starting,
+            pane: pane("/pending"),
+        });
+        assert_eq!(mux.selected_id(), Some(1));
+        mux.apply(MuxEvent::Add {
+            id: 2,
+            name: "second".into(),
+            workspace: "/second".into(),
+            worktree: false,
+            status: MuxStatus::Starting,
+            pane: pane("/second"),
+        });
+        assert_eq!(mux.selected_id(), Some(2));
+
+        mux.apply(MuxEvent::Replace {
+            id: 1,
+            name: "ready".into(),
+            workspace: "/first".into(),
+            worktree: true,
+            status: MuxStatus::Starting,
+            pane: pane("/first"),
+        });
+
+        assert_eq!(mux.selected_id(), Some(2));
+        assert_eq!(mux.slots[0].name, "ready");
+        assert_eq!(mux.slots[0].workspace, PathBuf::from("/first"));
+    }
+
+    #[test]
     fn routes_by_stable_id_and_retains_drafts() {
         let mut m = MuxUi::new("/x".into());
         m.apply(MuxEvent::Add {
@@ -1024,6 +1146,46 @@ mod tests {
             .unwrap();
         assert!(m.overlay.is_none())
     }
+    #[test]
+    fn duplicate_direct_workspace_requires_confirmation_and_keeps_inheritance() {
+        let cwd = std::fs::canonicalize(".").unwrap();
+        let mut mux = MuxUi::new(cwd.clone());
+        mux.apply(MuxEvent::Add {
+            id: 12,
+            name: "one".into(),
+            workspace: cwd.clone(),
+            worktree: false,
+            status: MuxStatus::Idle,
+            pane: pane(cwd.to_str().unwrap()),
+        });
+        let mut actions = vec![];
+        mux.request_create(
+            WorkspaceChoice::Directory {
+                path: cwd,
+                name: "two".into(),
+            },
+            &mut actions,
+        );
+        assert!(actions.is_empty());
+        assert!(matches!(
+            mux.overlay,
+            Some(Overlay::ConfirmDuplicate { .. })
+        ));
+        let actions = mux
+            .handle(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [MuxAction::Create {
+                inherit_from: Some(12),
+                ..
+            }]
+        ));
+    }
+
     #[test]
     fn narrow_layout_collapses_sidebar() {
         let m = MuxUi::new("/x".into());
@@ -1100,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_exit_opens_confirmation() {
+    fn delegated_exit_preserves_standalone_ctrl_c_semantics() {
         let mut mux = MuxUi::new("/".into());
         mux.apply(MuxEvent::Add {
             id: 7,
@@ -1114,7 +1276,9 @@ mod tests {
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(mux.handle(ctrl_c.clone()).unwrap().is_empty());
         assert!(mux.overlay.is_none());
-        assert!(mux.handle(ctrl_c).unwrap().is_empty());
-        assert!(matches!(mux.overlay, Some(Overlay::Close)));
+        assert!(matches!(
+            mux.handle(ctrl_c).unwrap().as_slice(),
+            [MuxAction::Exit]
+        ));
     }
 }
