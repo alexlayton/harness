@@ -343,9 +343,9 @@ impl MuxUi {
         }
     }
     fn sidebar_hint_rows(&self) -> u16 {
-        // Prefix mode gets a compact three-line command legend. On tiny
-        // terminals retain at least the ordinary one-line hint.
-        if self.prefix && self.height >= 3 {
+        // The expanded legend needs three interior rows. Keep tiny panes to a
+        // single hint so the top and bottom border can never be displaced.
+        if self.prefix && self.height >= 6 {
             3
         } else {
             1
@@ -354,7 +354,7 @@ impl MuxUi {
 
     fn visible_rows(&self) -> usize {
         let step = if self.width >= 70 { 2 } else { 1 };
-        // Two headers, `+ New agent`, and the bottom hint/legend are fixed.
+        // Both border rows, `+ New agent`, and the bottom hint/legend are fixed.
         self.layout(self.width, self.height)
             .body_height
             .saturating_sub(3 + self.sidebar_hint_rows()) as usize
@@ -532,11 +532,11 @@ impl MuxUi {
                     .len()
                     .saturating_sub(self.sidebar_scroll)
                     .min(self.visible_rows());
-                let new_y = 2 + visible_count * step;
-                if y as usize == new_y {
+                let new_y = 1 + visible_count * step;
+                if y as usize == new_y && y > 0 && y < layout.body_height.saturating_sub(1) {
                     self.overlay = Some(Overlay::NewMenu { selected: 0 });
-                } else if y as usize >= 2 && (y as usize) < new_y {
-                    let row = (y as usize - 2) / step;
+                } else if y as usize >= 1 && (y as usize) < new_y {
+                    let row = (y as usize - 1) / step;
                     let i = self.sidebar_scroll + row;
                     if i < self.slots.len() {
                         self.selected = Some(i)
@@ -829,6 +829,127 @@ impl MuxUi {
         result
     }
 
+    /// Render a complete, fixed-height sidebar. Each returned row has exactly
+    /// `sidebar_width + 1` cells: the right border is therefore also the
+    /// constant boundary immediately before `MuxLayout::main_x`.
+    fn sidebar_rows(
+        &self,
+        sidebar_width: u16,
+        height: u16,
+        muted: Style,
+        accent: Style,
+    ) -> Vec<String> {
+        let total_width = sidebar_width.saturating_add(1) as usize;
+        if height == 0 || total_width == 0 {
+            return vec![];
+        }
+        let border = |text: &str| line_to_ansi(&Line::from(Span::styled(text.to_owned(), muted)));
+        if total_width == 1 {
+            let mut rows = (0..height).map(|_| border("│")).collect::<Vec<_>>();
+            rows[0] = border("┌");
+            if height > 1 {
+                rows[height as usize - 1] = border("└");
+            }
+            return rows;
+        }
+        let interior = total_width.saturating_sub(2);
+        let framed = |text: &str, style: Style| {
+            format!(
+                "{}{}{}",
+                border("│"),
+                styled_fit(text, interior, style),
+                border("│")
+            )
+        };
+        let mut rows = (0..height).map(|_| framed("", muted)).collect::<Vec<_>>();
+
+        let top_label = "─ SESSIONS ";
+        let top_inner = if interior >= top_label.width() {
+            format!("{top_label}{}", "─".repeat(interior - top_label.width()))
+        } else {
+            fit(top_label, interior)
+        };
+        rows[0] = format!(
+            "{}{}{}",
+            border("┌"),
+            line_to_ansi(&Line::from(Span::styled(
+                top_inner,
+                accent.add_modifier(Modifier::BOLD),
+            ))),
+            border("┐")
+        );
+        if height == 1 {
+            return rows;
+        }
+        rows[height as usize - 1] =
+            border(&format!("└{}┘", "─".repeat(total_width.saturating_sub(2))));
+        if height == 2 {
+            return rows;
+        }
+
+        let compact = self.width < 70;
+        let step = if compact { 1 } else { 2 };
+        for (n, slot) in self
+            .slots
+            .iter()
+            .skip(self.sidebar_scroll)
+            .take(self.visible_rows())
+            .enumerate()
+        {
+            let y = 1 + n * step;
+            let selected = Some(self.sidebar_scroll + n) == self.selected;
+            let text = format!(
+                " {} {}  {}  {}",
+                if selected { ">" } else { " " },
+                self.sidebar_scroll + n + 1,
+                slot.name,
+                slot.status.glyph()
+            );
+            rows[y] = framed(
+                &text,
+                if selected {
+                    accent.add_modifier(Modifier::BOLD)
+                } else {
+                    muted
+                },
+            );
+            if !compact && y + 1 < height.saturating_sub(1) as usize {
+                let detail = format!(
+                    "     {}{}",
+                    slot.workspace.display(),
+                    if slot.worktree { " · worktree" } else { "" }
+                );
+                rows[y + 1] = framed(&detail, muted);
+            }
+        }
+        let visible = self
+            .slots
+            .len()
+            .saturating_sub(self.sidebar_scroll)
+            .min(self.visible_rows());
+        let new_y = 1 + visible * step;
+        let hints_start = height.saturating_sub(1 + self.sidebar_hint_rows()).max(1) as usize;
+        if new_y < hints_start {
+            rows[new_y] = framed(" + New agent", muted);
+        }
+        let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 3 {
+            &[
+                " n:new  j/k:switch",
+                " 1-9:jump  x:close",
+                " r:rename b:sidebar ?:help",
+            ]
+        } else {
+            &[" ^Space shortcuts"]
+        };
+        for (offset, hint) in hints.iter().enumerate() {
+            let y = hints_start + offset;
+            if y < height.saturating_sub(1) as usize {
+                rows[y] = framed(hint, muted);
+            }
+        }
+        rows
+    }
+
     fn draw(&mut self, out: &mut Stdout) -> Result<()> {
         let (w, h) = terminal::size().unwrap_or((self.width, self.height));
         self.width = w;
@@ -842,78 +963,9 @@ impl MuxUi {
         let mut rows = vec![String::new(); h as usize];
 
         if let Some((_, sidebar_width)) = layout.sidebar {
-            if let Some(row) = rows.get_mut(0) {
-                *row = styled_fit(
-                    " MUX",
-                    sidebar_width as usize,
-                    accent.add_modifier(Modifier::BOLD),
-                );
-            }
-            if layout.body_height > 1 {
-                rows[1] = styled_fit(" SESSIONS", sidebar_width as usize, muted);
-            }
-            let compact = w < 70;
-            let step = if compact { 1 } else { 2 };
-            for (n, slot) in self
-                .slots
-                .iter()
-                .skip(self.sidebar_scroll)
-                .take(self.visible_rows())
-                .enumerate()
-            {
-                let y = 2 + n * step;
-                let selected = Some(self.sidebar_scroll + n) == self.selected;
-                let text = format!(
-                    "{} {}  {}  {}",
-                    if selected { ">" } else { " " },
-                    self.sidebar_scroll + n + 1,
-                    slot.name,
-                    slot.status.glyph()
-                );
-                rows[y] = styled_fit(
-                    &text,
-                    sidebar_width as usize,
-                    if selected {
-                        accent.add_modifier(Modifier::BOLD)
-                    } else {
-                        muted
-                    },
-                );
-                if !compact && y + 1 < layout.body_height as usize {
-                    let detail = format!(
-                        "    {}{}",
-                        slot.workspace.display(),
-                        if slot.worktree { " · worktree" } else { "" }
-                    );
-                    rows[y + 1] = styled_fit(&detail, sidebar_width as usize, muted);
-                }
-            }
-            let visible = self
-                .slots
-                .len()
-                .saturating_sub(self.sidebar_scroll)
-                .min(self.visible_rows());
-            let new_y = 2 + visible * step;
-            let hints_start = layout.body_height.saturating_sub(self.sidebar_hint_rows()) as usize;
-            if new_y < hints_start {
-                rows[new_y] = styled_fit(" + New agent", sidebar_width as usize, muted);
-            }
-            let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 3 {
-                &[
-                    " n:new  j/k:switch",
-                    " 1-9:jump  x:close",
-                    " r:rename b:sidebar ?:help",
-                ]
-            } else {
-                &[" ^Space shortcuts"]
-            };
-            for (offset, hint) in hints.iter().enumerate() {
-                if let Some(row) = rows.get_mut(hints_start + offset) {
-                    *row = styled_fit(hint, sidebar_width as usize, muted);
-                }
-            }
-            for row in rows.iter_mut().take(layout.body_height as usize) {
-                row.push_str(&line_to_ansi(&Line::from(Span::styled("│", muted))));
+            let sidebar = self.sidebar_rows(sidebar_width, layout.body_height, muted, accent);
+            for (row, sidebar_row) in rows.iter_mut().zip(sidebar) {
+                *row = sidebar_row;
             }
         }
 
@@ -1302,6 +1354,34 @@ mod tests {
     fn key(c: char) -> Event {
         Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
+    fn strip_ansi(value: &str) -> String {
+        let mut plain = String::new();
+        let mut chars = value.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for code in chars.by_ref() {
+                    if code.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                plain.push(c);
+            }
+        }
+        plain
+    }
+    fn add_slots(mux: &mut MuxUi, count: u64) {
+        for id in 1..=count {
+            mux.apply(MuxEvent::Add {
+                id,
+                name: format!("agent-{id}"),
+                workspace: PathBuf::from(format!("/agent-{id}")),
+                worktree: false,
+                status: MuxStatus::Idle,
+                pane: pane("/"),
+            });
+        }
+    }
     #[test]
     fn provisional_add_activates_but_replacement_preserves_newer_selection() {
         let mut mux = MuxUi::new("/x".into());
@@ -1489,6 +1569,56 @@ mod tests {
     }
 
     #[test]
+    fn rendered_sidebar_boundary_spans_every_screen_row_for_any_session_count() {
+        let theme = render::Theme::default();
+        let muted = Style::default().fg(theme.muted_text);
+        let accent = Style::default().fg(theme.accent);
+
+        for count in [1, 6] {
+            let mut mux = MuxUi::new("/".into());
+            mux.handle(Event::Resize(80, 12)).unwrap();
+            add_slots(&mut mux, count);
+            let layout = mux.layout(80, 12);
+            let (_, sidebar_width) = layout.sidebar.unwrap();
+            let sidebar = mux.sidebar_rows(sidebar_width, 12, muted, accent);
+            assert_eq!(sidebar.len(), 12);
+
+            for (y, row) in sidebar.iter().enumerate() {
+                let plain = strip_ansi(row);
+                assert_eq!(plain.width(), layout.main_x as usize, "sidebar row {y}");
+                let boundary = plain.chars().last().unwrap();
+                assert!(matches!(boundary, '┐' | '│' | '┘'), "sidebar row {y}");
+
+                // Model final composition with a visible main-pane first cell.
+                let screen = format!(
+                    "{plain}A{}",
+                    " ".repeat(layout.main_width.saturating_sub(1) as usize)
+                );
+                assert_eq!(screen.width(), 80, "screen row {y}");
+                assert_eq!(screen.chars().nth(layout.main_x as usize), Some('A'));
+            }
+            assert!(strip_ansi(&sidebar[0]).contains("SESSIONS"));
+            assert!(strip_ansi(sidebar.last().unwrap()).starts_with('└'));
+        }
+    }
+
+    #[test]
+    fn sidebar_rows_handle_tiny_heights_without_overflow() {
+        let mux = MuxUi::new("/".into());
+        let style = Style::default();
+        for height in 0..=2 {
+            for sidebar_width in 0..=20 {
+                let rows = mux.sidebar_rows(sidebar_width, height, style, style);
+                assert_eq!(rows.len(), height as usize);
+                assert!(
+                    rows.iter()
+                        .all(|row| strip_ansi(row).width() == sidebar_width as usize + 1)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tiny_layout_overlay_and_cursor_are_bounded() {
         let m = MuxUi::new("/x".into());
         for height in 0..=2 {
@@ -1566,7 +1696,7 @@ mod tests {
         assert_eq!(mux.visible_rows(), 3);
         assert_eq!(mux.sidebar_scroll, 2);
 
-        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 8);
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 7);
         assert!(matches!(mux.overlay, Some(Overlay::NewMenu { .. })));
     }
 
