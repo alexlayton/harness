@@ -3435,6 +3435,16 @@ impl AgentPane {
 
     /// Apply one provider-independent runtime event to this pane only.
     pub fn apply_event(&mut self, event: UiEvent) {
+        if matches!(
+            &event,
+            UiEvent::SessionChanged { .. } | UiEvent::SessionSnapshot { .. }
+        ) {
+            // Standalone mode commits pending entries into native terminal
+            // scrollback after every paint. A retained pane has no such paint
+            // boundary, so materialize the same state transition before a
+            // session replacement discards the previous conversation.
+            self.state.transcript.append(&mut self.state.pending);
+        }
         self.state.apply_event(event);
     }
 
@@ -4461,6 +4471,41 @@ mod tests {
         assert_eq!(model, "test-model");
         assert!(context_files.is_empty());
         assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn retained_session_snapshot_replaces_pending_conversation() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.apply_event(UiEvent::SessionChanged {
+            id: "initial".into(),
+            title: None,
+            loaded: false,
+        });
+        pane.apply_event(UiEvent::TextDelta("old answer".into()));
+        pane.apply_event(UiEvent::TurnFinished);
+
+        pane.apply_event(UiEvent::SessionChanged {
+            id: "abcd1234efgh".into(),
+            title: None,
+            loaded: true,
+        });
+        pane.apply_event(UiEvent::SessionSnapshot {
+            entries: vec![SessionSnapshotEntry::Assistant {
+                markdown: "loaded answer".into(),
+                reasoning: String::new(),
+            }],
+        });
+
+        let frame = pane.render(80, 24);
+        let text = frame
+            .lines
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("old answer"), "{text}");
+        assert!(text.contains("loaded answer"), "{text}");
+        assert!(text.contains("Loaded Session abcd1234"), "{text}");
     }
 
     #[test]

@@ -692,10 +692,12 @@ impl MuxUi {
                     self.overlay = Some(overlay)
                 }
                 KeyCode::Enter => {
-                    let p = suggestions
-                        .get(*selected)
-                        .cloned()
-                        .unwrap_or_else(|| expand_path(input, &self.cwd));
+                    let typed = expand_path(input, &self.cwd);
+                    let p = if typed.is_dir() {
+                        typed
+                    } else {
+                        suggestions.get(*selected).cloned().unwrap_or(typed)
+                    };
                     if p.is_dir() {
                         self.request_create(
                             WorkspaceChoice::Directory {
@@ -1045,18 +1047,8 @@ impl MuxUi {
         let (frame, cursor) = self.compose_frame(width, height);
         let mut output = Hide.to_string();
         for y in 0..height {
-            let spans = (0..width)
-                .map(|x| {
-                    let cell = &frame[(x, y)];
-                    Span::styled(cell.symbol().to_owned(), cell.style())
-                })
-                .collect::<Vec<_>>();
-            let _ = write!(
-                output,
-                "{}{}",
-                MoveTo(0, y),
-                line_to_ansi(&Line::from(spans))
-            );
+            let line = buffer_row(&frame, y, width);
+            let _ = write!(output, "{}{}", MoveTo(0, y), line_to_ansi(&line));
         }
         if let Some((x, y)) = cursor {
             let _ = write!(output, "{}{}", MoveTo(x, y), Show);
@@ -1065,6 +1057,22 @@ impl MuxUi {
         out.flush()?;
         Ok(())
     }
+}
+
+/// Convert one Ratatui buffer row back to styled text without emitting the
+/// reset continuation cells that follow a wide grapheme. Writing those cells
+/// would make the physical terminal row wider than its buffer geometry.
+fn buffer_row(buffer: &Buffer, y: u16, width: u16) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut x = 0;
+    while x < width {
+        let cell = &buffer[(x, y)];
+        let symbol = cell.symbol();
+        spans.push(Span::styled(symbol.to_owned(), cell.style()));
+        let cells = symbol.width().max(1).min(u16::MAX as usize) as u16;
+        x = x.saturating_add(cells);
+    }
+    Line::from(spans)
 }
 
 fn pane_cursor_position(layout: MuxLayout, frame: &crate::PaneFrame) -> (u16, u16) {
@@ -1646,6 +1654,35 @@ mod tests {
     }
 
     #[test]
+    fn directory_enter_prefers_an_exact_directory_over_its_suggestions() {
+        let root = tempfile::tempdir().unwrap();
+        let typed = root.path().join("typed");
+        let child = typed.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let mut mux = MuxUi::new(root.path().to_path_buf());
+        mux.overlay = Some(Overlay::Directory {
+            input: typed.display().to_string(),
+            suggestions: vec![child],
+            selected: 0,
+        });
+
+        let actions = mux
+            .handle(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(matches!(
+            actions.as_slice(),
+            [MuxAction::Create {
+                choice: WorkspaceChoice::Directory { path, .. },
+                ..
+            }] if path == &typed
+        ));
+    }
+
+    #[test]
     fn directory_completion_is_debounced_and_stale_results_are_ignored() {
         let mut mux = MuxUi::new("/x".into());
         mux.overlay = Some(Overlay::Directory {
@@ -1772,6 +1809,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn buffer_rows_emit_wide_graphemes_once() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buffer.set_string(0, 0, "界ab", Style::default());
+
+        let row = buffer_row(&buffer, 0, 4);
+        let text = row
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "界ab");
+        assert_eq!(text.width(), 4);
     }
 
     #[test]
