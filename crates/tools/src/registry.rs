@@ -209,7 +209,14 @@ impl ToolRegistry {
         let Some(gate) = &self.execution_gate else {
             return tool.tool.execute(args, cancel).await;
         };
-        let _guard = gate.lock().await;
+        let _guard = tokio::select! {
+            guard = gate.lock() => guard,
+            _ = cancel.cancelled() => return ToolOutput {
+                content: "cancelled before workspace execution".into(),
+                is_error: true,
+                summary: super::call_summary(name, &args),
+            },
+        };
         tool.tool.execute(args, cancel).await
     }
 
@@ -467,6 +474,33 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_stops_waiting_for_the_execution_gate() {
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock().await;
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let registry = ToolRegistry::new(vec![Box::new(BlockingTool {
+            class: super::super::Concurrency::Exclusive,
+            entered: entered_tx,
+            release: Arc::new(Notify::new()),
+        })])
+        .with_execution_gate(gate.clone());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let output = timeout(
+            Duration::from_millis(50),
+            registry.execute("block", json!({}), cancel),
+        )
+        .await
+        .expect("cancelled invocation remained queued");
+
+        assert!(output.is_error);
+        assert!(output.content.contains("cancelled"));
+        assert!(entered_rx.try_recv().is_err());
+        drop(guard);
     }
 
     #[tokio::test]
