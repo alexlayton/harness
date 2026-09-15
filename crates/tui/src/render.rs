@@ -85,6 +85,7 @@ pub(crate) fn content_width(width: u16) -> usize {
 // The startup wordmarks are embedded rather than read from a workspace file:
 // installed binaries should have the same welcome screen regardless of cwd.
 // Each inner slice is one font from `headers.txt`, plus the original wordmark.
+const WELCOME_TITLE_HEIGHT: usize = 7;
 const WELCOME_TITLES: &[&[&str]] = &[
     &[
         "██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██",
@@ -109,19 +110,6 @@ const WELCOME_TITLES: &[&[&str]] = &[
         "░▓█▒░██▓ ▓█   ▓██▒░██▓ ▒██▒▒██░   ▓██░░▒████▒▒██████▒▒▒██████▒▒",
         " ▒ ░░▒░▒ ▒▒   ▓▒█░░ ▒▓ ░▒▓░░ ▒░   ▒ ▒ ░░ ▒░ ░▒ ▒▓▒ ▒ ░▒ ▒▓▒ ▒ ░",
         " ▒ ░▒░ ░  ▒   ▒▒ ░  ░▒ ░ ▒░░ ░░   ░ ▒░ ░ ░  ░░ ░▒  ░ ░░ ░▒  ░ ░",
-        " ░  ░░ ░  ░   ▒     ░░   ░    ░   ░ ░    ░   ░  ░  ░  ░  ░  ░",
-        " ░  ░  ░      ░  ░   ░              ░    ░  ░      ░        ░",
-    ],
-    &[
-        "▄█    █▄       ▄████████    ▄████████ ███▄▄▄▄      ▄████████    ▄████████    ▄████████",
-        "  ███    ███     ███    ███   ███    ███ ███▀▀▀██▄   ███    ███   ███    ███   ███    ███",
-        "  ███    ███     ███    ███   ███    ███ ███   ███   ███    █▀    ███    █▀    ███    █▀",
-        " ▄███▄▄▄▄███▄▄   ███    ███  ▄███▄▄▄▄██▀ ███   ███  ▄███▄▄▄       ███          ███",
-        "▀▀███▀▀▀▀███▀  ▀███████████ ▀▀███▀▀▀▀▀   ███   ███ ▀▀███▀▀▀     ▀███████████ ▀███████████",
-        "  ███    ███     ███    ███ ▀███████████ ███   ███   ███    █▄           ███          ███",
-        "  ███    ███     ███    ███   ███    ███ ███   ███   ███    ███    ▄█    ███    ▄█    ███",
-        "  ███    █▀      ███    █▀    ███    ███  ▀█   █▀    ██████████  ▄████████▀   ▄████████▀",
-        "                              ███    ███",
     ],
     &[
         " ▄ .▄ ▄▄▄· ▄▄▄   ▐ ▄ ▄▄▄ ..▄▄ · .▄▄ ·",
@@ -129,6 +117,17 @@ const WELCOME_TITLES: &[&[&str]] = &[
         "██▀▐█▄█▀▀█ ▐▀▀▄ ▐█▐▐▌▐▀▀▪▄▄▀▀▀█▄▄▀▀▀█▄",
         "██▌▐▀▐█ ▪▐▌▐█•█▌██▐█▌▐█▄▄▌▐█▄▪▐█▐█▄▪▐█",
         "▀▀▀ · ▀  ▀ .▀  ▀▀▀ █▪ ▀▀▀  ▀▀▀▀  ▀▀▀▀",
+    ],
+    &[
+        "░█░█░█▀█░█▀▄░█▀█░█▀▀░█▀▀░█▀▀",
+        "░█▀█░█▀█░█▀▄░█░█░█▀▀░▀▀█░▀▀█",
+        "░▀░▀░▀░▀░▀░▀░▀░▀░▀▀▀░▀▀▀░▀▀▀",
+    ],
+    &[
+        "▌",
+        "▛▀▖▝▀▖▙▀▖▛▀▖▞▀▖▞▀▘▞▀▘",
+        "▌ ▌▞▀▌▌  ▌ ▌▛▀ ▝▀▖▝▀▖",
+        "▘ ▘▝▀▘▘  ▘ ▘▝▀▘▀▀ ▀▀",
     ],
 ];
 
@@ -173,11 +172,21 @@ pub(crate) fn welcome_lines(
     // The banner opens scrollback immediately below whatever the shell left
     // on screen; give the title the design system's breathing room.
     push_blank(&mut lines, SECTION_GAP);
-    if let Some(title) = title_order.fitting_title(width) {
+    let title = title_order.fitting_title(width);
+    let rendered_title_height = title.map_or(1, |title| title.len());
+    let available_padding = WELCOME_TITLE_HEIGHT.saturating_sub(rendered_title_height);
+    let padding_above = available_padding / 2;
+    let padding_below = available_padding - padding_above;
+
+    // Reserve the tallest wordmark's height so the footer and metadata remain
+    // stable, centering shorter wordmarks within the available rows.
+    push_blank(&mut lines, padding_above);
+    if let Some(title) = title {
         lines.extend(title.iter().map(|line| line_with_style(*line, title_style)));
     } else {
         lines.push(line_with_style("Harness", title_style));
     }
+    push_blank(&mut lines, padding_below);
     // Keep the discoverability footer close to the wordmark, then end the
     // banner so workspace metadata and the transcript continue below.
     push_blank(&mut lines, BLOCK_GAP);
@@ -1168,8 +1177,11 @@ mod tests {
         let order = WelcomeTitleOrder((0..WELCOME_TITLES.len()).collect());
         let lines = welcome_lines(minimum_width - 1, Theme::default(), &order);
 
-        // The first row is the standard opening gap.
-        assert_eq!(span_contents(&lines[1]), "Harness");
+        let padding_above = (WELCOME_TITLE_HEIGHT - 1) / 2;
+        assert_eq!(
+            span_contents(&lines[SECTION_GAP + padding_above]),
+            "Harness"
+        );
     }
 
     #[test]
@@ -1177,6 +1189,39 @@ mod tests {
         let mut order = WelcomeTitleOrder::random().0;
         order.sort_unstable();
         assert_eq!(order, (0..WELCOME_TITLES.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn welcome_titles_are_centered_at_a_common_height() {
+        assert_eq!(
+            WELCOME_TITLES.iter().map(|title| title.len()).max(),
+            Some(WELCOME_TITLE_HEIGHT)
+        );
+
+        let footer_index = SECTION_GAP + WELCOME_TITLE_HEIGHT + BLOCK_GAP;
+        for (index, title) in WELCOME_TITLES.iter().enumerate() {
+            let lines = welcome_lines(
+                usize::MAX,
+                Theme::default(),
+                &WelcomeTitleOrder(vec![index]),
+            );
+            let padding_above = (WELCOME_TITLE_HEIGHT - title.len()) / 2;
+            assert!(
+                lines[SECTION_GAP..SECTION_GAP + padding_above]
+                    .iter()
+                    .all(|line| span_contents(line).is_empty())
+            );
+            assert_eq!(span_contents(&lines[SECTION_GAP + padding_above]), title[0]);
+            assert_eq!(lines.len() - 1, footer_index);
+        }
+
+        let fallback = welcome_lines(0, Theme::default(), &WelcomeTitleOrder(vec![0]));
+        let fallback_padding_above = (WELCOME_TITLE_HEIGHT - 1) / 2;
+        assert_eq!(
+            span_contents(&fallback[SECTION_GAP + fallback_padding_above]),
+            "Harness"
+        );
+        assert_eq!(fallback.len() - 1, footer_index);
     }
 
     #[test]
