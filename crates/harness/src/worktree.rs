@@ -4,7 +4,7 @@ use fs2::FileExt;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output, Stdio};
 
 /// A prepared Git worktree whose lifetime surrounds one frontend run.
@@ -559,13 +559,18 @@ fn normalized_destination(path: &Path) -> Result<PathBuf> {
     let mut existing = absolute.as_path();
     let mut missing = Vec::new();
     while !existing.exists() {
-        let name = existing.file_name().ok_or_else(|| {
-            anyhow!(
-                "worktree destination `{}` has no existing ancestor",
-                path.display()
-            )
-        })?;
-        missing.push(name.to_os_string());
+        let component = match existing.components().next_back() {
+            Some(Component::Normal(name)) => name.to_os_string(),
+            Some(Component::ParentDir) => OsStr::new("..").to_os_string(),
+            Some(Component::CurDir) => OsStr::new(".").to_os_string(),
+            _ => {
+                return Err(anyhow!(
+                    "worktree destination `{}` has no existing ancestor",
+                    path.display()
+                ));
+            }
+        };
+        missing.push(component);
         existing = existing.parent().ok_or_else(|| {
             anyhow!(
                 "worktree destination `{}` has no existing ancestor",
@@ -576,7 +581,18 @@ fn normalized_destination(path: &Path) -> Result<PathBuf> {
     let mut resolved = fs::canonicalize(existing)
         .with_context(|| format!("resolve destination ancestor `{}`", existing.display()))?;
     for component in missing.iter().rev() {
-        resolved.push(component);
+        if component == OsStr::new(".") {
+            continue;
+        }
+        if component == OsStr::new("..") {
+            anyhow::ensure!(
+                resolved.pop(),
+                "worktree destination `{}` traverses above the filesystem root",
+                path.display()
+            );
+        } else {
+            resolved.push(component);
+        }
     }
     Ok(resolved)
 }
@@ -651,7 +667,7 @@ fn remove_empty_managed_parent(path: &Path) {
 fn paths_match(left: &Path, right: &Path) -> bool {
     match (fs::canonicalize(left), fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
-        _ => absolute_path(left).ok() == absolute_path(right).ok(),
+        _ => normalized_destination(left).ok() == normalized_destination(right).ok(),
     }
 }
 
@@ -860,6 +876,18 @@ mod tests {
             CleanupOutcome::Removed(_)
         ));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn missing_destination_aliases_normalize_to_one_lock_identity() {
+        let root = tempdir().unwrap();
+        let direct = root.path().join("tree");
+        let alias = root.path().join("missing").join("..").join("tree");
+
+        assert_eq!(
+            normalized_destination(&alias).unwrap(),
+            normalized_destination(&direct).unwrap()
+        );
     }
 
     #[test]

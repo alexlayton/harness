@@ -69,7 +69,10 @@ MCP, and subagent setup has one implementation.
 - **Mux:** `harness mux` owns one full-screen terminal and hosts several
   retained agent panes. Each slot has an independent workspace, durable
   session, tools, cancellation, and MCP lifecycle; the mux roster itself is
-  process-local. Mux-created worktrees are path-based and retained on close.
+  process-local. Mutating tool workflows are conservatively serialized across
+  all slots in that mux process, while model requests and read-only tools
+  remain concurrent. Mux-created worktrees are path-based and retained on
+  close.
 - **Headless:** `harness prompt "…"` writes only the final answer to stdout.
   Optional progress goes to stderr behind `-v`; stdout purity is an invariant.
 - **ACP:** `harness acp` serves Agent Client Protocol over stdio. Stdout is
