@@ -160,6 +160,8 @@ pub enum UiEvent {
         message: String,
     },
     TurnFinished,
+    /// A host-visible non-turn operation returned to the input loop.
+    OperationFinished,
     Error(String),
     /// Informational command feedback committed to the retained transcript.
     Notice(String),

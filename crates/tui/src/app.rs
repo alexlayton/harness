@@ -1657,6 +1657,10 @@ impl CrossTerm {
                 self.busy = false;
                 self.activity = Activity::Preparing;
             }
+            UiEvent::OperationFinished => {
+                self.busy = false;
+                self.activity = Activity::Preparing;
+            }
             UiEvent::Notice(notice) => self.add_notice(notice),
             UiEvent::ModelChanged { provider, model } => {
                 self.provider = provider;

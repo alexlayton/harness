@@ -482,13 +482,11 @@ fn status_for_agent_event(event: &AgentEvent) -> Option<MuxStatus> {
     match event {
         AgentEvent::TextDelta(_)
         | AgentEvent::ReasoningDelta(_)
-        | AgentEvent::ToolCallStarted { .. } => Some(MuxStatus::Running),
-        // Agent errors are presentation events, not proof that the runtime
-        // stopped. Command validation and provider failures are recoverable;
-        // a genuinely terminated slot is reported separately by `Stopped`.
-        AgentEvent::Error(_) | AgentEvent::TurnFinished | AgentEvent::CompactionFinished { .. } => {
-            Some(MuxStatus::Idle)
-        }
+        | AgentEvent::ToolCallStarted { .. }
+        | AgentEvent::Retrying { .. } => Some(MuxStatus::Running),
+        AgentEvent::OperationFinished
+        | AgentEvent::TurnFinished
+        | AgentEvent::CompactionFinished { .. } => Some(MuxStatus::Idle),
         _ => None,
     }
 }
@@ -553,9 +551,13 @@ mod tests {
     }
 
     #[test]
-    fn recoverable_errors_and_compaction_completion_restore_idle_status() {
+    fn operation_completion_restores_idle_without_misclassifying_errors() {
         assert_eq!(
-            status_for_agent_event(&AgentEvent::Error("bad command".into())),
+            status_for_agent_event(&AgentEvent::Error("retrying".into())),
+            None
+        );
+        assert_eq!(
+            status_for_agent_event(&AgentEvent::OperationFinished),
             Some(MuxStatus::Idle)
         );
         assert_eq!(
@@ -569,6 +571,13 @@ mod tests {
         );
         assert_eq!(
             status_for_agent_event(&AgentEvent::TextDelta("working".into())),
+            Some(MuxStatus::Running)
+        );
+        assert_eq!(
+            status_for_agent_event(&AgentEvent::Retrying {
+                attempt: 1,
+                message: "again".into(),
+            }),
             Some(MuxStatus::Running)
         );
     }

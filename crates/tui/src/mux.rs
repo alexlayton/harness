@@ -186,6 +186,7 @@ pub struct MuxUi {
     height: u16,
     directory_generation: u64,
     directory_request: Option<DirectoryRequest>,
+    directory_selection_explicit: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -214,6 +215,7 @@ impl MuxUi {
             height: 24,
             directory_generation: 0,
             directory_request: None,
+            directory_selection_explicit: false,
         }
     }
     /// Return the stable ID of the selected slot.
@@ -583,6 +585,7 @@ impl MuxUi {
     }
 
     fn open_directory_overlay(&mut self) {
+        self.directory_selection_explicit = false;
         self.overlay = Some(Overlay::Directory {
             input: String::new(),
             suggestions: vec![],
@@ -679,24 +682,27 @@ impl MuxUi {
                         *input = p.display().to_string();
                         suggestions.clear();
                         *selected = 0;
+                        self.directory_selection_explicit = false;
                         self.queue_directory_completion(input.clone());
                     }
                     self.overlay = Some(overlay)
                 }
                 KeyCode::Up => {
                     *selected = selected.saturating_sub(1);
+                    self.directory_selection_explicit = true;
                     self.overlay = Some(overlay)
                 }
                 KeyCode::Down => {
                     *selected = (*selected + 1).min(suggestions.len().saturating_sub(1));
+                    self.directory_selection_explicit = true;
                     self.overlay = Some(overlay)
                 }
                 KeyCode::Enter => {
                     let typed = expand_path(input, &self.cwd);
-                    let p = if typed.is_dir() {
-                        typed
-                    } else {
+                    let p = if self.directory_selection_explicit || !typed.is_dir() {
                         suggestions.get(*selected).cloned().unwrap_or(typed)
+                    } else {
+                        typed
                     };
                     if p.is_dir() {
                         self.request_create(
@@ -716,6 +722,7 @@ impl MuxUi {
                     if *input != old_input {
                         suggestions.clear();
                         *selected = 0;
+                        self.directory_selection_explicit = false;
                         self.queue_directory_completion(input.clone());
                     }
                     self.overlay = Some(overlay)
@@ -776,6 +783,7 @@ impl MuxUi {
             .take(MAX_DIRECTORY_SUGGESTIONS)
             .collect();
         *selected = 0;
+        self.directory_selection_explicit = false;
         true
     }
 
@@ -1679,6 +1687,37 @@ mod tests {
                 choice: WorkspaceChoice::Directory { path, .. },
                 ..
             }] if path == &typed
+        ));
+    }
+
+    #[test]
+    fn directory_enter_honors_an_explicit_suggestion_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let typed = root.path().join("typed");
+        let child = typed.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let mut mux = MuxUi::new(root.path().to_path_buf());
+        mux.overlay = Some(Overlay::Directory {
+            input: typed.display().to_string(),
+            suggestions: vec![child.clone()],
+            selected: 0,
+        });
+        mux.handle(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+
+        let actions = mux
+            .handle(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+
+        assert!(matches!(
+            actions.as_slice(),
+            [MuxAction::Create {
+                choice: WorkspaceChoice::Directory { path, .. },
+                ..
+            }] if path == &child
         ));
     }
 

@@ -180,16 +180,16 @@ impl Agent {
         self
     }
 
-    /// Attach a loaded/new durable session. Active provider/model selection
-    /// remains the caller's choice; saved metadata is informational only.
-    ///
-    /// This compatibility constructor does not acquire an active-session
-    /// lease. Frontends should assemble agents through [`crate::assembly::AgentBuilder`],
-    /// which rejects a conversation already owned by another runtime.
-    pub fn with_session(mut self, store: SessionStore, mut session: Session) -> Self {
-        if let Err(error) = store.repair_incomplete_tool_calls(&mut session) {
-            tracing::warn!(error = %error, "could not repair incomplete session tool calls");
-        }
+    /// Attach a loaded/new durable session after claiming exclusive ownership.
+    /// Active provider/model selection remains the caller's choice; saved
+    /// metadata is informational only.
+    pub fn with_session(
+        mut self,
+        store: SessionStore,
+        mut session: Session,
+    ) -> session::Result<Self> {
+        let active_lease = store.acquire_active(&session)?;
+        store.repair_incomplete_tool_calls(&mut session)?;
         self.history = session.context_messages();
         if let Some(runner) = &self.subagent_runner {
             runner.update_parent_session(Some(session.id()));
@@ -197,9 +197,9 @@ impl Agent {
         self.session = Some(AgentSessionState {
             store,
             session,
-            active_lease: None,
+            active_lease: Some(active_lease),
         });
-        self
+        Ok(self)
     }
 
     /// Attach a durable session whose exclusive active lease was acquired by
@@ -350,7 +350,7 @@ impl Agent {
                         .await
                     {
                         TurnControl::Shutdown | TurnControl::Quarantine => break,
-                        TurnControl::Continue => {}
+                        TurnControl::Continue => send(&events, AgentEvent::OperationFinished),
                     }
                     continue;
                 }
@@ -391,7 +391,7 @@ impl Agent {
                     match self.handle_invoke_skill(name, &events, &mut input).await {
                         TurnControl::Shutdown => break,
                         TurnControl::Quarantine => break,
-                        TurnControl::Continue => {}
+                        TurnControl::Continue => send(&events, AgentEvent::OperationFinished),
                     }
                     continue;
                 }
@@ -528,7 +528,8 @@ mod tests {
             "demo",
             CancellationToken::new(),
         )
-        .with_session(store, current);
+        .with_session(store, current)
+        .unwrap();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
         agent.handle_load_session(target.id().to_string(), &event_tx);
@@ -538,6 +539,38 @@ mod tests {
             event_rx.try_recv(),
             Ok(AgentEvent::Error(message)) if message.contains("already active")
         ));
+    }
+
+    #[tokio::test]
+    async fn failed_skill_operation_emits_a_completion_boundary() {
+        let provider = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::InvokeSkill {
+                name: "missing".into(),
+            })
+            .unwrap();
+        drop(input_tx);
+
+        Agent::new(
+            provider,
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .run(input_rx, event_tx)
+        .await;
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(events.iter().any(
+            |event| matches!(event, AgentEvent::Error(message) if message.contains("unknown skill"))
+        ));
+        assert!(events.contains(&AgentEvent::OperationFinished));
     }
 
     fn run_agent(provider: MockProvider) -> Vec<AgentEvent> {
@@ -1105,7 +1138,8 @@ mod tests {
             "demo",
             cancel,
         )
-        .with_session(store.clone(), session);
+        .with_session(store.clone(), session)
+        .unwrap();
         let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
         // Wait until both calls are announced and running, then interrupt:
@@ -1461,6 +1495,7 @@ mod tests {
             drop(input_tx);
             Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel)
                 .with_session(store.clone(), session.clone())
+                .unwrap()
                 .run(input_rx, event_tx)
                 .await;
             let loaded = store.open(&session.id()).unwrap();
@@ -1504,6 +1539,7 @@ mod tests {
                 CancellationToken::new(),
             )
             .with_session(store, session)
+            .unwrap()
             .run(input_rx, event_tx)
             .await;
 
@@ -1550,7 +1586,8 @@ mod tests {
             .send(InputMessage::Message("queued must never run".into()))
             .unwrap();
         let agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel)
-            .with_session(store, session);
+            .with_session(store, session)
+            .unwrap();
         let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
         tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
@@ -1611,7 +1648,8 @@ mod tests {
             .send(InputMessage::Message("queued must never run".into()))
             .unwrap();
         let agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel.clone())
-            .with_session(store, session);
+            .with_session(store, session)
+            .unwrap();
         let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
         tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
@@ -1682,7 +1720,8 @@ mod tests {
             .send(InputMessage::Message("queued must never run".into()))
             .unwrap();
         let agent = Agent::new(provider, registry, "demo", CancellationToken::new())
-            .with_session(store, session);
+            .with_session(store, session)
+            .unwrap();
         let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
         tokio::time::timeout(Duration::from_secs(5), stream_polled.notified())
@@ -1763,6 +1802,7 @@ mod tests {
                     CancellationToken::new(),
                 )
                 .with_session(store, session)
+                .unwrap()
                 .run(input_rx, event_tx)
                 .await;
                 drop(_guard);
@@ -1836,6 +1876,7 @@ mod tests {
                 let _guard = SyncSessionFaultGuard::arm();
                 Agent::new(provider, registry, "demo", CancellationToken::new())
                     .with_session(store, session)
+                    .unwrap()
                     .run(input_rx, event_tx)
                     .await;
                 drop(_guard);
@@ -1905,6 +1946,7 @@ mod tests {
                     CancellationToken::new(),
                 )
                 .with_session(store.clone(), session)
+                .unwrap()
                 .run(input_rx, event_tx)
                 .await;
                 drop(_guard);
@@ -1984,6 +2026,7 @@ mod tests {
                     CancellationToken::new(),
                 )
                 .with_session(store.clone(), session)
+                .unwrap()
                 .run(input_rx, event_tx)
                 .await;
                 drop(_guard);
@@ -2091,6 +2134,7 @@ mod tests {
             let _ = &mut session;
             Agent::new(provider.clone(), registry, "demo", CancellationToken::new())
                 .with_session(store, session)
+                .unwrap()
                 .run(input_rx, event_tx)
                 .await;
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
@@ -2317,6 +2361,7 @@ mod tests {
             drop(input_tx);
             Agent::new(Arc::new(provider), ToolRegistry::empty(), "demo", cancel)
                 .with_session(store.clone(), session.clone())
+                .unwrap()
                 .run(input_rx, event_tx)
                 .await;
 
@@ -2397,6 +2442,7 @@ mod tests {
             drop(input_tx);
             Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
                 .with_session(store.clone(), session.clone())
+                .unwrap()
                 .run(input_rx, event_tx)
                 .await;
 
@@ -2694,6 +2740,7 @@ mod tests {
         drop(input_tx);
         Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
             .with_session(store.clone(), session)
+            .unwrap()
             .run(input_rx, event_tx)
             .await;
         let mut events = Vec::new();
@@ -3155,6 +3202,7 @@ mod tests {
         drop(input_tx);
         Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
             .with_session(store.clone(), session)
+            .unwrap()
             .run(input_rx, event_tx)
             .await;
         let mut events = Vec::new();
@@ -3381,7 +3429,8 @@ mod tests {
         let mut agent = Agent::new(old_provider.clone(), ToolRegistry::empty(), "demo", cancel)
             .with_provider_factory(factory)
             .with_subagent_runner(runner.clone())
-            .with_session(store.clone(), session);
+            .with_session(store.clone(), session)
+            .unwrap();
         // Drive one step manually: the boundary quarantines on the failed
         // persist instead of committing.
         agent
@@ -3482,7 +3531,8 @@ mod tests {
         )
         .with_provider_factory(factory)
         .with_subagent_runner(runner.clone())
-        .with_session(store.clone(), session);
+        .with_session(store.clone(), session)
+        .unwrap();
         agent.context_window = 77_777;
         agent.last_context_tokens = Some(123);
         agent.model_metadata_tx = Some(metadata_tx);
@@ -3594,6 +3644,7 @@ mod tests {
         let agent_task = tokio::spawn(
             Agent::new(provider.clone(), ToolRegistry::empty(), "demo", cancel)
                 .with_session(store, session)
+                .unwrap()
                 .run(input_rx, event_tx),
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
