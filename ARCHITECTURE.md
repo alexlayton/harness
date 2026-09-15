@@ -189,7 +189,8 @@ See [`docs/configuration.md`](./docs/configuration.md) and
 - One JSON object per line, with a header first and append-only events after it.
 - Metadata changes are events; existing history is never rewritten.
 - Appends are flushed and normally synced, with a sidecar lock preventing
-  concurrent writers.
+  interleaved records. A separate lifetime lease prevents two live agents from
+  owning the same conversation and diverging in-memory model histories.
 - `context_messages()` reconstructs valid provider history and handles
   incomplete final tool calls.
 - Model-assisted compaction appends a bounded summary event and falls back to

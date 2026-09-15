@@ -64,11 +64,13 @@ startup has just created an empty placeholder, `latest` skips that placeholder
 so it resumes the previous non-empty conversation. Saved provider/model
 metadata is shown in listings but does **not** replace the
 provider/model selected at startup. `/sessions` lists sessions scoped to the
-current workspace. `/export [path]` writes canonical JSONL to the requested
-path, or to a generated file in the current directory. `/compact` asks the
-active model for a bounded summary and falls back to a deterministic local
-summary when model summarization fails. The default policy is intentionally
-conservative.
+current workspace. A session already owned by another live agent cannot be
+loaded until that agent releases it; this prevents one durable log from
+combining divergent model histories. `/export [path]` writes canonical JSONL
+to the requested path, or to a generated file in the current directory.
+`/compact` asks the active model for a bounded summary and falls back to a
+deterministic local summary when model summarization fails. The default policy
+is intentionally conservative.
 
 Exports are canonical JSONL and can be validated independently by the codec.
 `ExportOptions` can omit reasoning/tool output, cap tool output, or apply an
