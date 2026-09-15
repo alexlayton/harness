@@ -138,6 +138,11 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                 Some(MuxAction::Close { id }) => close_slot(id, &mut slots, &mut reapers, &event_tx),
                 Some(MuxAction::Exit) | None => break,
             },
+            reaped = reapers.join_next(), if !reapers.is_empty() => {
+                if let Some(Err(error)) = reaped {
+                    tracing::warn!(error = %error, "mux slot reaper failed");
+                }
+            }
             message = runtime_rx.recv() => match message {
                 Some(RuntimeMessage::Prepared { id, name, workspace, worktree, pane, notices }) => if slots.contains_key(&id) {
                     let _ = event_tx.send(MuxEvent::Replace {
