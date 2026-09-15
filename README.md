@@ -181,8 +181,9 @@ a different `--dir` creates a separate session namespace.
 
 Mux starts one persisted agent in the launch directory. Press `Ctrl+Space`
 then `n` to add an agent for the current directory, another directory, or a
-new worktree. The same prefix supports `j`/`k` and `1`–`9` for switching,
-`x` to close, and `?` for help. Mux roster ordering is process-local, while
+new worktree. The same prefix supports `w`, `c`, and `d` to open those
+workspace forms directly, `j`/`k` and `1`–`9` for switching, `x` to close,
+and `?` for help. Mux roster ordering is process-local, while
 each conversation uses
 the normal durable session store. Mux-created worktrees are retained when an
 agent closes; their creation dialog defaults to the sticky keep policy.

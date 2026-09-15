@@ -326,8 +326,8 @@ impl MuxUi {
     }
     fn sidebar_hint_rows(&self) -> u16 {
         // Commands grow upward while the prefix line remains anchored at bottom.
-        if self.prefix && self.height >= 7 {
-            4
+        if self.prefix && self.height >= 8 {
+            5
         } else {
             1
         }
@@ -428,6 +428,24 @@ impl MuxUi {
             match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Char('n') => self.overlay = Some(Overlay::NewMenu { selected: 0 }),
+                KeyCode::Char('w') => {
+                    self.overlay = Some(Overlay::Worktree {
+                        branch: String::new(),
+                        keep: true,
+                    })
+                }
+                KeyCode::Char('c') => {
+                    self.overlay = Some(Overlay::Current {
+                        name: basename(&self.cwd),
+                    })
+                }
+                KeyCode::Char('d') => {
+                    self.overlay = Some(Overlay::Directory {
+                        input: String::new(),
+                        suggestions: vec![],
+                        selected: 0,
+                    })
+                }
                 KeyCode::Char('j') => self.switch(1),
                 KeyCode::Char('k') => self.switch(-1),
                 KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
@@ -732,8 +750,8 @@ impl MuxUi {
         if *input != completion.input {
             return false;
         }
-        *suggestions = completion.suggestions;
-        *selected = (*selected).min(suggestions.len().saturating_sub(1));
+        *suggestions = completion.suggestions.into_iter().take(1).collect();
+        *selected = 0;
         true
     }
 
@@ -924,11 +942,12 @@ impl MuxUi {
         if new_y < hints_start {
             rows[new_y] = framed(" ⊕ New agent", muted);
         }
-        let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 4 {
+        let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 5 {
             &[
-                " n new  j/k switch",
-                " 1-9 jump  x close",
-                " ? help",
+                " n menu · c current",
+                " w worktree · d dir",
+                " j/k switch · 1-9",
+                " x close · ? help",
                 " Ctrl + Space  prefix",
             ]
         } else {
@@ -1095,9 +1114,9 @@ fn directory_suggestions(value: &str, cwd: &Path) -> Vec<PathBuf> {
             let name = e.file_name().to_string_lossy().to_lowercase();
             is_subsequence(&needle, &name).then_some(p)
         })
-        .take(20)
         .collect::<Vec<_>>();
     found.sort();
+    found.truncate(1);
     found
 }
 fn is_subsequence(q: &str, s: &str) -> bool {
@@ -1135,49 +1154,49 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
         Overlay::ConfirmDuplicate { .. } => "Duplicate workspace?",
         Overlay::Help => "Mux help",
     };
-    let content = match overlay {
+    let content_lines = match overlay {
         Overlay::NewMenu { selected } => ["New worktree", "Current directory", "Another directory"]
             .iter()
             .enumerate()
-            .map(|(index, label)| {
-                format!("{} {label}\n", if index == *selected { '›' } else { ' ' })
+            .flat_map(|(index, label)| {
+                [
+                    format!("{} {label}", if index == *selected { '›' } else { ' ' }),
+                    String::new(),
+                ]
             })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Overlay::Worktree { branch, keep } => format!(
-            "Branch / name: {branch}\nKeep worktree: {} (Tab)",
-            if *keep { "yes" } else { "no" }
-        ),
-        Overlay::Current { name } => format!("Session name: {name}"),
+            .collect::<Vec<_>>(),
+        Overlay::Worktree { branch, keep } => vec![
+            format!("Branch / name: {branch}"),
+            format!("Keep worktree: {} (Tab)", if *keep { "yes" } else { "no" }),
+        ],
+        Overlay::Current { name } => vec![format!("Session name: {name}")],
+        // Keep one suggestion row reserved even while completion is pending or
+        // has no match, so asynchronous scans never move or resize the editor.
         Overlay::Directory {
             input, suggestions, ..
-        } => format!(
-            "Directory: {input}\n{}",
+        } => vec![
+            format!("Directory: {input}"),
             suggestions
-                .iter()
-                .take(4)
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-        Overlay::Close => "Enter to close; Esc to cancel".into(),
-        Overlay::ConfirmDuplicate { .. } => {
+                .first()
+                .map_or_else(String::new, |path| path.display().to_string()),
+        ],
+        Overlay::Close => vec!["Enter to close; Esc to cancel".into()],
+        Overlay::ConfirmDuplicate { .. } => vec![
             "A direct agent already uses this directory. Enter to create anyway; Esc to cancel"
-                .into()
-        }
-        Overlay::Help => concat!(
-            "Ctrl+Space n new · j/k switch · 1-9 jump\n",
-            "x close · ? help\n",
-            "Mouse: click sessions/new/menu choices; wheel scroll"
-        )
-        .into(),
+                .into(),
+        ],
+        Overlay::Help => vec![
+            "Ctrl+Space: n menu · w worktree · c current".into(),
+            "d directory · j/k switch · 1-9 jump".into(),
+            "x close · ? help".into(),
+            "Mouse: click sessions/new/menu choices; wheel scroll".into(),
+        ],
     };
     let width = if layout.main_width < 10 {
         layout.main_width
     } else {
         layout.main_width.saturating_sub(4).clamp(10, 58)
     };
-    let content_lines = content.lines().collect::<Vec<_>>();
     let height = (content_lines.len() + 4).min(layout.body_height as usize) as u16;
     let x = layout.main_x + layout.main_width.saturating_sub(width) / 2;
     let y = layout.body_height.saturating_sub(height) / 2;
@@ -1190,7 +1209,13 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
             (_, _, 0) => format!("┌─ {title} "),
             (_, _, r) if r == height - 1 => "└".into(),
             (_, _, 1) => "│".into(),
-            _ => format!("│ {}", content_lines.get((row - 2) as usize).unwrap_or(&"")),
+            _ => format!(
+                "│ {}",
+                content_lines
+                    .get((row - 2) as usize)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            ),
         };
         let mut fitted = fit(&text, width as usize);
         if width >= 2 {
@@ -1243,9 +1268,15 @@ fn draw_overlay(
         .add_modifier(Modifier::DIM);
     let accent = Style::default().fg(theme.accent);
     for (row, text) in frame.rows.iter().enumerate() {
-        let style = if row == 0 || row + 1 == frame.rows.len() {
+        let style = if row == 0
+            || row + 1 == frame.rows.len()
+            || (matches!(overlay, Overlay::Directory { .. }) && row == 3)
+        {
             muted
-        } else if text.starts_with("│ ›") {
+        } else if matches!(overlay, Overlay::NewMenu { selected: 0 }) && row == 2
+            || matches!(overlay, Overlay::NewMenu { selected: 1 }) && row == 4
+            || matches!(overlay, Overlay::NewMenu { selected: 2 }) && row == 6
+        {
             accent.add_modifier(Modifier::BOLD)
         } else {
             primary
@@ -1836,8 +1867,118 @@ mod tests {
             KeyModifiers::CONTROL,
         )))
         .unwrap();
-        assert_eq!(mux.sidebar_hint_rows(), 4);
+        assert_eq!(mux.sidebar_hint_rows(), 5);
         assert_eq!(mux.visible_rows(), 1);
+
+        let theme = render::Theme::default();
+        let muted = Style::default().fg(theme.muted_text);
+        let accent = Style::default().fg(theme.accent);
+        let lines = mux.sidebar_lines(24, 10, muted, accent);
+        let legend = lines
+            .iter()
+            .map(|line| strip_ansi(&line_to_ansi(line)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for shortcut in [
+            "n menu",
+            "w worktree",
+            "c current",
+            "d dir",
+            "j/k",
+            "1-9",
+            "x close",
+            "? help",
+        ] {
+            assert!(legend.contains(shortcut), "missing {shortcut}: {legend}");
+        }
+        assert!(strip_ansi(&line_to_ansi(&lines[8])).contains("Ctrl + Space  prefix"));
+    }
+
+    #[test]
+    fn direct_workspace_prefix_shortcuts_open_editors() {
+        let mut mux = MuxUi::new("/some/project".into());
+        for (shortcut, expected) in [('w', "worktree"), ('c', "current"), ('d', "directory")] {
+            mux.overlay = None;
+            mux.handle(Event::Key(KeyEvent::new(
+                KeyCode::Null,
+                KeyModifiers::CONTROL,
+            )))
+            .unwrap();
+            mux.handle(key(shortcut)).unwrap();
+            match (expected, mux.overlay.as_ref()) {
+                ("worktree", Some(Overlay::Worktree { branch, keep })) => {
+                    assert!(branch.is_empty());
+                    assert!(*keep);
+                }
+                ("current", Some(Overlay::Current { name })) => assert_eq!(name, "project"),
+                (
+                    "directory",
+                    Some(Overlay::Directory {
+                        input, suggestions, ..
+                    }),
+                ) => {
+                    assert!(input.is_empty());
+                    assert!(suggestions.is_empty());
+                }
+                _ => panic!("{shortcut} opened the wrong overlay"),
+            }
+        }
+    }
+
+    #[test]
+    fn directory_overlay_has_fixed_single_muted_suggestion_row() {
+        let layout = MuxUi::new("/x".into()).layout(100, 30);
+        let empty = Overlay::Directory {
+            input: "a".into(),
+            suggestions: vec![],
+            selected: 0,
+        };
+        let many = Overlay::Directory {
+            input: "a".into(),
+            suggestions: vec!["/first".into(), "/second".into(), "/third".into()],
+            selected: 0,
+        };
+        let empty_frame = overlay_frame(layout, &empty);
+        let many_frame = overlay_frame(layout, &many);
+        assert_eq!(empty_frame.rows.len(), many_frame.rows.len());
+        assert_eq!(empty_frame.y, many_frame.y);
+        assert!(many_frame.rows.join("\n").contains("/first"));
+        assert!(!many_frame.rows.join("\n").contains("/second"));
+
+        let theme = render::Theme::default();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
+        draw_overlay(&mut buffer, layout, &many, theme);
+        let suggestion_y = many_frame.y + 3;
+        let muted = Style::default()
+            .fg(theme.muted_text)
+            .add_modifier(Modifier::DIM);
+        for x in many_frame.x..many_frame.x + many_frame.width {
+            let style = buffer[(x, suggestion_y)].style();
+            assert_eq!(style.fg, muted.fg);
+            assert!(style.add_modifier.contains(Modifier::DIM));
+        }
+        let input_style = buffer[(many_frame.x + 2, many_frame.y + 2)].style();
+        assert_eq!(input_style.fg, Some(theme.primary_text));
+        assert!(!input_style.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn help_lists_all_prefix_shortcuts() {
+        let text = overlay_frame(MuxUi::new("/".into()).layout(100, 30), &Overlay::Help)
+            .rows
+            .join("\n");
+        for shortcut in [
+            "n menu",
+            "w worktree",
+            "c current",
+            "d directory",
+            "j/k",
+            "1-9",
+            "x close",
+            "? help",
+        ] {
+            assert!(text.contains(shortcut), "missing {shortcut}: {text}");
+        }
     }
 
     #[test]
