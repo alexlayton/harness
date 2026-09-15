@@ -11,7 +11,6 @@ use llm::ReasoningPolicy;
 use session::{SessionCreateOptions, SessionStore};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -30,19 +29,14 @@ struct SlotSettings {
 
 #[derive(Clone, Default)]
 struct WorkspaceMutationCoordinator {
-    workspace_gates: Arc<Mutex<HashMap<PathBuf, ToolExecutionGate>>>,
+    // One conservative gate also covers ancestor/descendant workspace roots.
+    // Model requests and read-only tools remain concurrent across all slots.
+    gate: ToolExecutionGate,
 }
 
 impl WorkspaceMutationCoordinator {
-    fn gate_for(&self, workspace: &Path) -> ToolExecutionGate {
-        let mut gates = self
-            .workspace_gates
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        gates
-            .entry(workspace.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    fn gate(&self) -> ToolExecutionGate {
+        self.gate.clone()
     }
 }
 
@@ -272,10 +266,7 @@ fn create_slot(
                 "slot preparation cancelled"
             );
             let mut tools = default_registry(ToolConfig::new(&workspace, setup_config.rtk))?;
-            // Canonical path identity, rather than creation origin, is the
-            // safety boundary: a worktree can also be opened through the
-            // direct-directory picker.
-            tools.set_execution_gate(mutation_coordinator.gate_for(&workspace));
+            tools.set_execution_gate(mutation_coordinator.gate());
             let skills = tools
                 .skills()
                 .map(|catalog| {
@@ -519,6 +510,7 @@ fn basename(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]
@@ -539,15 +531,12 @@ mod tests {
     }
 
     #[test]
-    fn mutation_coordinator_keys_every_slot_by_canonical_workspace() {
+    fn mutation_coordinator_uses_one_gate_for_overlapping_roots() {
         let coordinator = WorkspaceMutationCoordinator::default();
-        let root = Path::new("/canonical/workspace");
-        let shared_a = coordinator.gate_for(root);
-        let shared_b = coordinator.clone().gate_for(root);
-        let distinct = coordinator.gate_for(Path::new("/canonical/other"));
+        let first = coordinator.gate();
+        let second = coordinator.clone().gate();
 
-        assert!(Arc::ptr_eq(&shared_a, &shared_b));
-        assert!(!Arc::ptr_eq(&shared_a, &distinct));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

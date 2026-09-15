@@ -129,8 +129,8 @@ pub struct SubagentRunnerImpl {
     workspace_root: PathBuf,
     search_index: Arc<FileSearchIndex>,
     /// Gate shared with the parent registry and sibling agents targeting this
-    /// workspace. Child mutations acquire it directly; the outer subagent
-    /// invocation deliberately does not, avoiding nested mutex acquisition.
+    /// workspace. A workspace-mode run holds it for the entire delegated
+    /// workflow; its child registry therefore must not reacquire it.
     execution_gate: Option<ToolExecutionGate>,
     rtk: bool,
     project_context: String,
@@ -274,7 +274,6 @@ impl SubagentRunnerImpl {
         let workspace_root = self.workspace_root.clone();
         let rtk = self.rtk;
         let search_index = self.search_index.clone();
-        let execution_gate = self.execution_gate.clone();
         #[cfg(test)]
         let builds = &self.test_registry_builds;
         let built = cache.get_or_init(move || {
@@ -291,12 +290,7 @@ impl SubagentRunnerImpl {
                 ),
             };
             result
-                .map(|mut registry| {
-                    if let Some(gate) = execution_gate {
-                        registry.set_execution_gate(gate);
-                    }
-                    Arc::new(registry)
-                })
+                .map(Arc::new)
                 .map_err(|error| format!("could not build subagent tools: {error}"))
         });
         match built {
@@ -673,6 +667,17 @@ impl SubagentRunner for SubagentRunnerImpl {
         mode: SubagentMode,
         cancel: CancellationToken,
     ) -> Result<String, String> {
+        let _workspace_permit = if mode == SubagentMode::Workspace {
+            match self.execution_gate.as_ref() {
+                Some(gate) => Some(tokio::select! {
+                    permit = gate.lock() => permit,
+                    _ = cancel.cancelled() => return Err("cancelled by user".into()),
+                }),
+                None => None,
+            }
+        } else {
+            None
+        };
         self.execute(
             &SubagentRun {
                 description: description.to_owned(),
@@ -1107,15 +1112,30 @@ mod tests {
     }
 
     #[test]
-    fn execution_gate_is_propagated_to_child_registries() {
+    fn workspace_child_registry_does_not_reacquire_the_outer_gate() {
         let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let runner =
+            runner_with_dyn(Arc::new(ScriptProvider::new(Vec::new()))).with_execution_gate(gate);
+
+        let registry = runner.registry(SubagentMode::Workspace).unwrap();
+        assert!(registry.execution_gate().is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_subagent_cancels_while_waiting_for_the_outer_gate() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let owner = gate.lock().await;
         let runner = runner_with_dyn(Arc::new(ScriptProvider::new(Vec::new())))
             .with_execution_gate(gate.clone());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
 
-        for mode in [SubagentMode::ReadOnly, SubagentMode::Workspace] {
-            let registry = runner.registry(mode).unwrap();
-            assert!(Arc::ptr_eq(registry.execution_gate().unwrap(), &gate));
-        }
+        let result = runner
+            .run("blocked", "prompt", SubagentMode::Workspace, cancel)
+            .await;
+
+        assert_eq!(result.unwrap_err(), "cancelled by user");
+        drop(owner);
     }
 
     #[tokio::test]

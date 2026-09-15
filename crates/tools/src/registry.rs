@@ -199,11 +199,10 @@ impl ToolRegistry {
         if tool.tool.concurrency(&args) == super::Concurrency::ReadOnly {
             return tool.tool.execute(args, cancel).await;
         }
-        // A workspace subagent acquires this same gate around each mutating
-        // child tool. Holding the non-reentrant mutex around the outer future
-        // would deadlock as soon as the child attempted its first mutation.
-        // The child registry is the coordination boundary instead; direct
-        // parent mutations continue through the gate below.
+        // A workspace subagent runner acquires this same gate around its
+        // complete delegated workflow. Holding the non-reentrant mutex here
+        // as well would deadlock before the child could begin. Direct parent
+        // mutations continue through the gate below.
         if name == super::subagent::SUBAGENT_TOOL_NAME {
             return tool.tool.execute(args, cancel).await;
         }
