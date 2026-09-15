@@ -19,6 +19,8 @@ use crossterm::terminal::{
     self, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
+use ratatui_core::buffer::Buffer;
+use ratatui_core::layout::Rect;
 use ratatui_core::style::{Modifier, Style};
 use ratatui_core::text::{Line, Span};
 use std::fmt::Write as _;
@@ -592,8 +594,14 @@ impl MuxUi {
         match &mut overlay {
             Overlay::Help => self.overlay = Some(overlay),
             Overlay::NewMenu { selected } => match key.code {
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down => *selected = (*selected + 1).min(2),
+                KeyCode::Up => {
+                    *selected = selected.saturating_sub(1);
+                    self.overlay = Some(overlay);
+                }
+                KeyCode::Down => {
+                    *selected = (*selected + 1).min(2);
+                    self.overlay = Some(overlay);
+                }
                 KeyCode::Enter => {
                     self.overlay = Some(match *selected {
                         0 => Overlay::Worktree {
@@ -840,34 +848,35 @@ impl MuxUi {
     /// Render a complete, fixed-height sidebar. Each returned row has exactly
     /// `sidebar_width + 1` cells: the right border is therefore also the
     /// constant boundary immediately before `MuxLayout::main_x`.
-    fn sidebar_rows(
+    fn sidebar_lines(
         &self,
         sidebar_width: u16,
         height: u16,
         muted: Style,
         accent: Style,
-    ) -> Vec<String> {
+    ) -> Vec<Line<'static>> {
         let total_width = sidebar_width.saturating_add(1) as usize;
         if height == 0 || total_width == 0 {
             return vec![];
         }
-        let border = |text: &str| line_to_ansi(&Line::from(Span::styled(text.to_owned(), muted)));
+        let border = |text: &str| Span::styled(text.to_owned(), muted);
         if total_width == 1 {
-            let mut rows = (0..height).map(|_| border("│")).collect::<Vec<_>>();
-            rows[0] = border("┌");
+            let mut rows = (0..height)
+                .map(|_| Line::from(border("│")))
+                .collect::<Vec<_>>();
+            rows[0] = Line::from(border("┌"));
             if height > 1 {
-                rows[height as usize - 1] = border("└");
+                rows[height as usize - 1] = Line::from(border("└"));
             }
             return rows;
         }
         let interior = total_width.saturating_sub(2);
         let framed = |text: &str, style: Style| {
-            format!(
-                "{}{}{}",
+            Line::from(vec![
                 border("│"),
-                styled_fit(text, interior, style),
-                border("│")
-            )
+                Span::styled(fit(text, interior), style),
+                border("│"),
+            ])
         };
         let mut rows = (0..height).map(|_| framed("", muted)).collect::<Vec<_>>();
 
@@ -877,20 +886,18 @@ impl MuxUi {
         } else {
             fit(top_label, interior)
         };
-        rows[0] = format!(
-            "{}{}{}",
+        rows[0] = Line::from(vec![
             border("┌"),
-            line_to_ansi(&Line::from(Span::styled(
-                top_inner,
-                accent.add_modifier(Modifier::BOLD),
-            ))),
-            border("┐")
-        );
+            Span::styled(top_inner, accent.add_modifier(Modifier::BOLD)),
+            border("┐"),
+        ]);
         if height == 1 {
             return rows;
         }
-        rows[height as usize - 1] =
-            border(&format!("└{}┘", "─".repeat(total_width.saturating_sub(2))));
+        rows[height as usize - 1] = Line::from(border(&format!(
+            "└{}┘",
+            "─".repeat(total_width.saturating_sub(2))
+        )));
         if height == 2 {
             return rows;
         }
@@ -958,78 +965,83 @@ impl MuxUi {
         rows
     }
 
-    fn draw(&mut self, out: &mut Stdout) -> Result<()> {
-        let (w, h) = terminal::size().unwrap_or((self.width, self.height));
-        self.width = w;
-        self.height = h;
-        let layout = self.layout(w, h);
+    fn compose_frame(&mut self, width: u16, height: u16) -> (Buffer, Option<(u16, u16)>) {
+        self.width = width;
+        self.height = height;
+        let layout = self.layout(width, height);
         let theme = render::Theme::default();
         let muted = Style::default()
             .fg(theme.muted_text)
             .add_modifier(Modifier::DIM);
         let accent = Style::default().fg(theme.accent);
-        let mut rows = vec![String::new(); h as usize];
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
 
         if let Some((_, sidebar_width)) = layout.sidebar {
-            let sidebar = self.sidebar_rows(sidebar_width, layout.body_height, muted, accent);
-            for (row, sidebar_row) in rows.iter_mut().zip(sidebar) {
-                *row = format!("{sidebar_row}  ");
+            for (y, line) in self
+                .sidebar_lines(sidebar_width, layout.body_height, muted, accent)
+                .iter()
+                .enumerate()
+            {
+                buffer.set_line(0, y as u16, line, sidebar_width.saturating_add(1));
             }
         }
 
-        let mut pane_cursor = None;
-        if let Some(i) = self.selected {
+        let pane_cursor = if let Some(i) = self.selected {
             let frame = self.slots[i]
                 .pane
                 .render(layout.main_width, layout.body_height);
-            for (n, row) in rows
-                .iter_mut()
-                .enumerate()
-                .take(layout.body_height as usize)
-            {
-                let line = frame.lines.get(n).cloned().unwrap_or_default();
-                row.push_str(&padded_line(&line, layout.main_width as usize));
+            for y in 0..layout.body_height {
+                let line = frame.lines.get(y as usize).cloned().unwrap_or_default();
+                buffer.set_line(layout.main_x, y, &line, layout.main_width);
             }
-            pane_cursor = Some(pane_cursor_position(layout, &frame));
+            Some(pane_cursor_position(layout, &frame))
         } else {
-            for row in rows.iter_mut().take(layout.body_height as usize) {
-                row.push_str(&" ".repeat(layout.main_width as usize));
-            }
             if layout.body_height > 4 {
-                let y = layout.body_height as usize / 2;
-                rows[y].push_str(&format!(
-                    "{}{}",
-                    MoveTo(layout.main_x, y as u16),
-                    styled_fit(" No agents yet", layout.main_width as usize, muted)
-                ));
-                rows[y + 1].push_str(&format!(
-                    "{}{}",
-                    MoveTo(layout.main_x, y as u16 + 1),
-                    styled_fit(
-                        " Press Ctrl+Space then n to create one.",
-                        layout.main_width as usize,
-                        muted
-                    )
-                ));
+                let y = layout.body_height / 2;
+                buffer.set_string(layout.main_x, y, " No agents yet", muted);
+                buffer.set_string(
+                    layout.main_x,
+                    y + 1,
+                    " Press Ctrl+Space then n to create one.",
+                    muted,
+                );
             }
+            None
+        };
+
+        let cursor = if let Some(overlay) = &self.overlay {
+            draw_overlay(&mut buffer, layout, overlay, theme)
+        } else {
+            pane_cursor
+        };
+        (
+            buffer,
+            cursor.and_then(|cursor| bounded_cursor(cursor, width, height)),
+        )
+    }
+
+    fn draw(&mut self, out: &mut Stdout) -> Result<()> {
+        let (width, height) = terminal::size().unwrap_or((self.width, self.height));
+        let (frame, cursor) = self.compose_frame(width, height);
+        let mut output = Hide.to_string();
+        for y in 0..height {
+            let spans = (0..width)
+                .map(|x| {
+                    let cell = &frame[(x, y)];
+                    Span::styled(cell.symbol().to_owned(), cell.style())
+                })
+                .collect::<Vec<_>>();
+            let _ = write!(
+                output,
+                "{}{}",
+                MoveTo(0, y),
+                line_to_ansi(&Line::from(spans))
+            );
         }
-        let mut buffer = Hide.to_string();
-        for (index, row) in rows.iter().enumerate() {
-            // Every frame row is padded to the terminal width. Writing a CRLF
-            // after the final column can advance twice on terminals that
-            // eagerly auto-wrap, making the sidebar appear to end halfway
-            // down the screen. Address each row absolutely instead.
-            let _ = write!(buffer, "{}{}", MoveTo(0, index as u16), row);
+        if let Some((x, y)) = cursor {
+            let _ = write!(output, "{}{}", MoveTo(x, y), Show);
         }
-        if let Some(overlay) = &self.overlay {
-            let cursor = draw_overlay(&mut buffer, layout, overlay, theme);
-            if let Some((x, y)) = cursor.and_then(|cursor| bounded_cursor(cursor, w, h)) {
-                let _ = write!(buffer, "{}{}", MoveTo(x, y), Show);
-            }
-        } else if let Some((x, y)) = pane_cursor.and_then(|cursor| bounded_cursor(cursor, w, h)) {
-            let _ = write!(buffer, "{}{}", MoveTo(x, y), Show);
-        }
-        out.write_all(buffer.as_bytes())?;
+        out.write_all(output.as_bytes())?;
         out.flush()?;
         Ok(())
     }
@@ -1128,24 +1140,6 @@ fn fit(text: &str, width: usize) -> String {
     out.push_str(&" ".repeat(width.saturating_sub(used)));
     out
 }
-fn padded_line(line: &Line<'_>, width: usize) -> String {
-    let fitted = render::fit_line_to_width(line, width);
-    let used = fitted
-        .spans
-        .iter()
-        .map(|span| span.content.width())
-        .sum::<usize>();
-    format!(
-        "{}{}",
-        line_to_ansi(&fitted),
-        " ".repeat(width.saturating_sub(used))
-    )
-}
-
-fn styled_fit(text: &str, width: usize, style: Style) -> String {
-    padded_line(&Line::from(Span::styled(text.to_owned(), style)), width)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OverlayFrame {
     x: u16,
@@ -1217,12 +1211,8 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
             (_, 1, _) => format!("┌{}┐", "─".repeat(width.saturating_sub(2) as usize)),
             (_, _, 0) => format!("┌─ {title} "),
             (_, _, r) if r == height - 1 => "└".into(),
-            _ => format!(
-                "│ {}",
-                content_lines
-                    .get(row.saturating_sub(2) as usize)
-                    .unwrap_or(&"")
-            ),
+            (_, _, 1) => "│".into(),
+            _ => format!("│ {}", content_lines.get((row - 2) as usize).unwrap_or(&"")),
         };
         let mut fitted = fit(&text, width as usize);
         if width >= 2 {
@@ -1263,12 +1253,11 @@ fn overlay_cursor(frame: &OverlayFrame, overlay: &Overlay) -> Option<(u16, u16)>
 }
 
 fn draw_overlay(
-    buffer: &mut String,
+    buffer: &mut Buffer,
     layout: MuxLayout,
     overlay: &Overlay,
     theme: render::Theme,
 ) -> Option<(u16, u16)> {
-    use std::fmt::Write as _;
     let frame = overlay_frame(layout, overlay);
     let cursor = overlay_cursor(&frame, overlay);
     let primary = Style::default().fg(theme.primary_text);
@@ -1284,11 +1273,11 @@ fn draw_overlay(
         } else {
             primary
         };
-        let _ = write!(
-            buffer,
-            "{}{}",
-            MoveTo(frame.x, frame.y + row as u16),
-            styled_fit(text, frame.width as usize, style)
+        buffer.set_line(
+            frame.x,
+            frame.y + row as u16,
+            &Line::from(Span::styled(text.clone(), style)),
+            frame.width,
         );
     }
     cursor
@@ -1619,11 +1608,11 @@ mod tests {
             add_slots(&mut mux, count);
             let layout = mux.layout(80, 12);
             let (_, sidebar_width) = layout.sidebar.unwrap();
-            let sidebar = mux.sidebar_rows(sidebar_width, 12, muted, accent);
+            let sidebar = mux.sidebar_lines(sidebar_width, 12, muted, accent);
             assert_eq!(sidebar.len(), 12);
 
             for (y, row) in sidebar.iter().enumerate() {
-                let plain = strip_ansi(row);
+                let plain = strip_ansi(&line_to_ansi(row));
                 assert_eq!(plain.width(), sidebar_width as usize + 1, "sidebar row {y}");
                 let boundary = plain.chars().last().unwrap();
                 assert!(matches!(boundary, '┐' | '│' | '┘'), "sidebar row {y}");
@@ -1636,8 +1625,8 @@ mod tests {
                 assert_eq!(screen.width(), 80, "screen row {y}");
                 assert_eq!(screen.chars().nth(layout.main_x as usize), Some('A'));
             }
-            assert!(strip_ansi(&sidebar[0]).contains("MUX"));
-            assert!(strip_ansi(sidebar.last().unwrap()).starts_with('└'));
+            assert!(strip_ansi(&line_to_ansi(&sidebar[0])).contains("MUX"));
+            assert!(strip_ansi(&line_to_ansi(sidebar.last().unwrap())).starts_with('└'));
         }
     }
 
@@ -1647,11 +1636,11 @@ mod tests {
         let style = Style::default();
         for height in 0..=2 {
             for sidebar_width in 0..=20 {
-                let rows = mux.sidebar_rows(sidebar_width, height, style, style);
+                let rows = mux.sidebar_lines(sidebar_width, height, style, style);
                 assert_eq!(rows.len(), height as usize);
                 assert!(
                     rows.iter()
-                        .all(|row| strip_ansi(row).width() == sidebar_width as usize + 1)
+                        .all(|row| row.width() == sidebar_width as usize + 1)
                 );
             }
         }
@@ -1674,6 +1663,75 @@ mod tests {
         assert_eq!(bounded_cursor((9, 9), 0, 2), None);
         assert_eq!(bounded_cursor((9, 9), 1, 1), Some((0, 0)));
         assert_eq!(bounded_cursor((9, 9), 2, 2), Some((1, 1)));
+    }
+
+    fn visible_buffer(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn composed_new_agent_frame_is_unique_selectable_and_activates_selection() {
+        let mut mux = MuxUi::new("/workspace".into());
+        mux.handle(Event::Key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+        mux.handle(key('n')).unwrap();
+
+        let (initial, _) = mux.compose_frame(100, 30);
+        let initial_text = visible_buffer(&initial);
+        for option in ["New worktree", "Current directory", "Another directory"] {
+            assert_eq!(
+                initial_text.matches(option).count(),
+                1,
+                "{option}: {initial_text}"
+            );
+        }
+        assert!(initial_text.contains("> New worktree"));
+        assert!(!initial_text.contains("> Current directory"));
+
+        mux.handle(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+            .unwrap();
+        let (selected, _) = mux.compose_frame(100, 30);
+        let selected_text = visible_buffer(&selected);
+        assert!(!selected_text.contains("> New worktree"));
+        assert!(
+            selected_text.contains("> Current directory"),
+            "{selected_text}"
+        );
+
+        mux.handle(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert!(matches!(mux.overlay, Some(Overlay::Current { .. })));
+        let (current, cursor) = mux.compose_frame(100, 30);
+        let current_text = visible_buffer(&current);
+        assert!(current_text.contains("Session name:"));
+        assert!(!current_text.contains("New worktree"));
+        assert!(cursor.is_some());
+
+        mux.overlay = Some(Overlay::NewMenu { selected: 2 });
+        mux.handle(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        assert!(matches!(mux.overlay, Some(Overlay::Directory { .. })));
+        let (directory, cursor) = mux.compose_frame(100, 30);
+        let directory_text = visible_buffer(&directory);
+        assert!(directory_text.contains("Directory:"));
+        assert!(!directory_text.contains("Current directory"));
+        assert!(cursor.is_some());
     }
 
     #[test]
