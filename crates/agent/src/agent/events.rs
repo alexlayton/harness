@@ -63,6 +63,9 @@ pub enum AgentEvent {
         message: String,
     },
     TurnFinished,
+    /// A non-turn operation that can be shown as running has returned to the
+    /// input loop. Fatal outcomes stop the runtime instead of emitting this.
+    OperationFinished,
     Error(String),
     Notice(String),
     ModelChanged {

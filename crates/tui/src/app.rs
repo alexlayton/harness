@@ -353,6 +353,8 @@ pub struct CrossTerm {
     /// Cached terminal size, refreshed on resize events.
     width: u16,
     height: u16,
+    /// Retained-pane history offset; standalone mode leaves this at zero.
+    pane_scroll: usize,
 
     /// Final entries of the current conversation, in order. Unlike the inline
     /// UI (which tracks a commit index into one transcript) these are kept as
@@ -436,15 +438,16 @@ pub struct CrossTerm {
 impl CrossTerm {
     /// Assemble the UI state without touching the terminal. `new` layers the
     /// terminal setup on top, and tests use this directly.
+    #[allow(clippy::too_many_arguments)]
     fn base(
         model: &str,
         provider: &str,
         providers: Vec<String>,
         startup: StartupEntries,
+        workspace_root: PathBuf,
         width: u16,
         height: u16,
     ) -> Self {
-        let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let environment = EnvironmentInfo::discover(workspace_root);
         let StartupEntries {
             skills,
@@ -462,6 +465,7 @@ impl CrossTerm {
             minimal: false,
             width,
             height,
+            pane_scroll: 0,
             transcript: Vec::new(),
             pending: Vec::new(),
             stream: None,
@@ -512,9 +516,20 @@ impl CrossTerm {
         ui
     }
 
+    /// Add the canonical startup entries shared by standalone and retained panes.
+    fn enqueue_welcome(&mut self) {
+        if !self.minimal {
+            self.pending.push(Entry::Banner {
+                title_order: render::WelcomeTitleOrder::random(),
+            });
+            self.pending.push(self.metadata_entry());
+        }
+    }
+
     /// `skills`, `context_files`, MCP names, and the initial reasoning label come from
     /// startup configuration (the TUI never touches their backing stores).
     /// `minimal` suppresses only the initial banner and metadata.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         model: &str,
         provider: &str,
@@ -522,15 +537,25 @@ impl CrossTerm {
         startup: StartupEntries,
         reasoning: &str,
         minimal: bool,
+        workspace_root: PathBuf,
     ) -> Result<Self> {
         let backend = CrosstermBackend;
         let (width, height) = backend.size().unwrap_or((80, 24));
         let mut ui = Self::with_backend(
-            Self::base(model, provider, providers, startup, width, height),
+            Self::base(
+                model,
+                provider,
+                providers,
+                startup,
+                workspace_root,
+                width,
+                height,
+            ),
             Box::new(backend),
         );
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
+        ui.enqueue_welcome();
         install_panic_hook(ui.terminal.clone());
         ui.setup_terminal()?;
         Ok(ui)
@@ -618,14 +643,6 @@ impl CrossTerm {
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()> {
-        // The startup header: the wordmark banner augmented with the
-        // cwd/branch and provider/model metadata line.
-        if !self.minimal {
-            self.pending.push(Entry::Banner {
-                title_order: render::WelcomeTitleOrder::random(),
-            });
-            self.pending.push(self.metadata_entry());
-        }
         self.paint()?;
 
         let mut input_events = EventStream::new();
@@ -1637,6 +1654,10 @@ impl CrossTerm {
             UiEvent::TurnFinished => {
                 self.finalize_stream();
                 self.running_tools.clear();
+                self.busy = false;
+                self.activity = Activity::Preparing;
+            }
+            UiEvent::OperationFinished => {
                 self.busy = false;
                 self.activity = Activity::Preparing;
             }
@@ -3233,7 +3254,7 @@ fn friendly_reset_time(value: &str) -> String {
 /// reset is required when adjacent effective styles differ. Without it the
 /// input prefix's bold attribute leaks into the first text row even though
 /// continuation rows correctly use normal weight.
-fn line_to_ansi(line: &Line<'_>) -> String {
+pub(crate) fn line_to_ansi(line: &Line<'_>) -> String {
     let mut out = String::new();
     let mut previous = None;
     let mut styled = false;
@@ -3328,6 +3349,274 @@ fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize, width: usize) 
     buffer.push_str(&line_to_ansi(&line));
 }
 
+/// A retained rendering result produced by [`AgentPane`]. Coordinates are
+/// relative to the rectangle supplied to `render`; the terminal owner decides
+/// where that rectangle lives on screen.
+#[derive(Clone, Debug)]
+pub struct PaneFrame {
+    /// Styled rows, already clipped and padded to the requested pane width.
+    pub lines: Vec<Line<'static>>,
+    /// Zero-based row of the editor's real terminal cursor.
+    pub cursor_row: u16,
+    /// Zero-based display column of the editor's real terminal cursor.
+    pub cursor_col: u16,
+}
+
+/// Result of semantically dispatching terminal input to an [`AgentPane`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneInput {
+    pub messages: Vec<InputMessage>,
+    pub exit_requested: bool,
+}
+
+/// Retained presentation and editor state for one agent UI.
+///
+/// This component deliberately does not enter raw mode, read terminal events,
+/// or write stdout. A future mux can keep one value per agent and render only
+/// the selected value into its assigned rectangle. [`CrossTerm`] remains the
+/// native-scrollback terminal owner for standalone mode; this type is the
+/// extraction seam while its proven conversation representation remains the
+/// single canonical representation.
+pub struct AgentPane {
+    state: CrossTerm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaneDraft {
+    text: String,
+    cursor: usize,
+}
+
+impl AgentPane {
+    /// Create an independent pane rooted at an explicit workspace. Path
+    /// completion and environment metadata never consult the process cwd.
+    pub fn new(
+        model: &str,
+        provider: &str,
+        providers: Vec<String>,
+        skills: Vec<SkillEntry>,
+        context_files: Vec<ContextFileEntry>,
+        reasoning: &str,
+        workspace_root: PathBuf,
+    ) -> Self {
+        Self::new_with_minimal(
+            model,
+            provider,
+            providers,
+            skills,
+            context_files,
+            reasoning,
+            false,
+            workspace_root,
+        )
+    }
+
+    /// Create a retained pane with the standalone `[tui].minimal` startup
+    /// behavior. Minimal mode suppresses only the canonical welcome entries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_minimal(
+        model: &str,
+        provider: &str,
+        providers: Vec<String>,
+        skills: Vec<SkillEntry>,
+        context_files: Vec<ContextFileEntry>,
+        reasoning: &str,
+        minimal: bool,
+        workspace_root: PathBuf,
+    ) -> Self {
+        let mut state = CrossTerm::base(
+            model,
+            provider,
+            providers,
+            StartupEntries {
+                skills,
+                context_files,
+                mcp_servers: Vec::new(),
+            },
+            workspace_root,
+            80,
+            24,
+        );
+        state.reasoning = reasoning.to_owned();
+        state.minimal = minimal;
+        state.enqueue_welcome();
+        Self { state }
+    }
+
+    /// Apply one provider-independent runtime event to this pane only.
+    pub fn apply_event(&mut self, event: UiEvent) {
+        if matches!(
+            &event,
+            UiEvent::SessionChanged { .. } | UiEvent::SessionSnapshot { .. }
+        ) {
+            // Standalone mode commits pending entries into native terminal
+            // scrollback after every paint. A retained pane has no such paint
+            // boundary, so materialize the same state transition before a
+            // session replacement discards the previous conversation.
+            self.state.transcript.append(&mut self.state.pending);
+        }
+        self.state.apply_event(event);
+    }
+
+    /// Replace the editor draft. This small host-facing operation also makes
+    /// pane switching testable without synthesizing terminal key encodings.
+    pub fn set_draft(&mut self, draft: impl Into<String>) {
+        self.state.input = draft.into();
+        self.state.cursor = self.state.input.len();
+        self.state.refresh_completion();
+    }
+
+    /// Return the active editor contents, including an unsubmitted draft.
+    pub fn editor_text(&self) -> &str {
+        &self.state.input
+    }
+
+    pub(crate) fn draft_snapshot(&self) -> PaneDraft {
+        PaneDraft {
+            text: self.state.input.clone(),
+            cursor: self.state.cursor,
+        }
+    }
+
+    pub(crate) fn restore_draft(&mut self, draft: PaneDraft) {
+        self.state.input = draft.text;
+        self.state.cursor = draft.cursor.min(self.state.input.len());
+        while !self.state.input.is_char_boundary(self.state.cursor) {
+            self.state.cursor = self.state.cursor.saturating_sub(1);
+        }
+        self.state.refresh_completion();
+    }
+
+    /// Return the explicit workspace root used for path completion and metadata.
+    pub fn workspace_root(&self) -> &Path {
+        &self.state.environment.cwd
+    }
+
+    /// Handle one terminal input event using the same editor and command
+    /// semantics as standalone mode. The returned messages are destined for
+    /// this pane's agent; `exit_requested` represents Ctrl+C/Ctrl+D and lets
+    /// the terminal owner decide whether that closes a slot or the whole UI.
+    pub fn handle_input(&mut self, event: &Event) -> Result<PaneInput> {
+        // Ctrl+O is the sole standalone input path that paints immediately.
+        // A retained pane only mutates state and leaves painting to its owner.
+        if let Event::Key(key) = event
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+            && key.code == KeyCode::Char('o')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.state.tools_expanded = !self.state.tools_expanded;
+            return Ok(PaneInput::default());
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let exit_requested = self.state.handle_input(event, &tx, &cancel)?;
+        let mut messages = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            messages.push(message);
+        }
+        Ok(PaneInput {
+            messages,
+            exit_requested: exit_requested || cancel.is_cancelled(),
+        })
+    }
+
+    /// Apply completed path scans and optionally advance visible animation.
+    /// Hidden panes consume their asynchronous results without requesting a
+    /// redraw; their next selected frame observes the updated state.
+    pub fn tick(&mut self, visible: bool) -> bool {
+        let mut completion_changed = false;
+        while let Ok(result) = self.state.path_completion_rx.try_recv() {
+            self.state.apply_path_completion(result);
+            completion_changed = true;
+        }
+        let animate = visible && self.state.busy;
+        if animate {
+            self.state.spinner = self.state.spinner.wrapping_add(1);
+        }
+        visible && (completion_changed || animate)
+    }
+
+    /// Scroll the retained transcript viewport. Positive values move toward
+    /// older rows; editing or receiving output keeps the offset until reset.
+    pub fn scroll(&mut self, rows: i32) {
+        self.state.pane_scroll = if rows >= 0 {
+            self.state.pane_scroll.saturating_add(rows as usize)
+        } else {
+            self.state
+                .pane_scroll
+                .saturating_sub(rows.unsigned_abs() as usize)
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.state.pane_scroll
+    }
+
+    /// Render retained history plus the live editor into arbitrary dimensions.
+    /// Zero dimensions are accepted and normalized to a one-cell model so all
+    /// returned cursor coordinates remain bounded.
+    pub fn render(&mut self, width: u16, height: u16) -> PaneFrame {
+        self.state.width = width.max(1);
+        self.state.height = height.max(1);
+        let input = self.state.input_layout();
+        let live = self
+            .state
+            .build_region_with_running(&input, self.state.running_region());
+        let mut entries = self.state.transcript.clone();
+        entries.extend(self.state.pending.iter().cloned());
+        let history_budget =
+            self.state.height as usize - live.rows.len().min(self.state.height as usize);
+        let mut lines = history_window(
+            &entries,
+            history_budget,
+            render::content_width(self.state.width),
+            self.state.theme,
+            self.state.tools_expanded,
+        );
+        if self.state.pane_scroll > 0 {
+            let all = history_window(
+                &entries,
+                usize::MAX / 4,
+                render::content_width(self.state.width),
+                self.state.theme,
+                self.state.tools_expanded,
+            );
+            let max_scroll = if history_budget == 0 {
+                0
+            } else {
+                all.len().saturating_sub(history_budget.min(all.len()))
+            };
+            self.state.pane_scroll = self.state.pane_scroll.min(max_scroll);
+            let end = all.len().saturating_sub(self.state.pane_scroll);
+            let start = end.saturating_sub(history_budget);
+            lines = all[start..end].to_vec();
+        }
+        let history_rows = lines.len();
+        lines.extend(live.rows);
+        lines.truncate(self.state.height as usize);
+        // Every retained row must obey the pane rectangle even when startup
+        // metadata or a banner is wider than a degenerate pane.
+        let gutter = render::horizontal_pad(self.state.width) as usize;
+        lines = lines
+            .into_iter()
+            .map(|line| {
+                let mut padded = Line::from(Span::raw(" ".repeat(gutter)));
+                padded.spans.extend(line.spans);
+                render::fit_line_to_width(&padded, self.state.width as usize)
+            })
+            .collect();
+        PaneFrame {
+            lines,
+            cursor_row: (history_rows + live.cursor_row)
+                .min(self.state.height.saturating_sub(1) as usize) as u16,
+            cursor_col: live
+                .cursor_col
+                .min(self.state.width.saturating_sub(1) as usize) as u16,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3335,12 +3624,124 @@ mod tests {
     use std::panic::AssertUnwindSafe;
     use std::sync::OnceLock;
 
+    fn pane(root: PathBuf) -> AgentPane {
+        AgentPane::new(
+            "test-model",
+            "test-provider",
+            vec!["openrouter".into()],
+            Vec::new(),
+            Vec::new(),
+            "auto",
+            root,
+        )
+    }
+
+    #[test]
+    fn panes_retain_independent_conversations_and_drafts_when_switched() {
+        let mut first = pane(PathBuf::from("/workspace/first"));
+        let mut second = pane(PathBuf::from("/workspace/second"));
+        first.set_draft("first draft");
+        second.set_draft("second draft");
+        first.apply_event(UiEvent::TextDelta("first answer".into()));
+        second.apply_event(UiEvent::TextDelta("second answer".into()));
+
+        let second_frame = second.render(40, 8);
+        let first_frame = first.render(40, 8);
+        assert_eq!(first.editor_text(), "first draft");
+        assert_eq!(second.editor_text(), "second draft");
+        assert!(
+            first_frame
+                .lines
+                .iter()
+                .any(|line| row_text(line).contains("first answer"))
+        );
+        assert!(
+            !first_frame
+                .lines
+                .iter()
+                .any(|line| row_text(line).contains("second answer"))
+        );
+        assert!(
+            second_frame
+                .lines
+                .iter()
+                .any(|line| row_text(line).contains("second answer"))
+        );
+    }
+
+    #[test]
+    fn retained_pane_minimal_suppresses_canonical_welcome() {
+        let root = PathBuf::from("/workspace");
+        let mut normal = pane(root.clone());
+        let mut minimal = AgentPane::new_with_minimal(
+            "test-model",
+            "test-provider",
+            vec!["openrouter".into()],
+            Vec::new(),
+            Vec::new(),
+            "auto",
+            true,
+            root,
+        );
+
+        assert!(!normal.state.pending.is_empty());
+        assert!(minimal.state.pending.is_empty());
+        assert!(normal.render(80, 24).lines.len() > minimal.render(80, 24).lines.len());
+    }
+
+    #[test]
+    fn pane_rendering_bounds_lines_and_cursor_at_arbitrary_dimensions() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.set_draft("a long unicode draft 你好 that wraps repeatedly");
+        for (width, height) in [(0, 0), (1, 1), (3, 2), (17, 4), (120, 40)] {
+            let frame = pane.render(width, height);
+            let width = width.max(1);
+            let height = height.max(1);
+            assert!(frame.lines.len() <= height as usize);
+            assert!(
+                frame
+                    .lines
+                    .iter()
+                    .all(|line| row_width(line) <= width as usize)
+            );
+            assert!(frame.cursor_row < height);
+            assert!(frame.cursor_col < width);
+        }
+    }
+
+    #[test]
+    fn retained_input_text_and_cursor_share_horizontal_coordinates() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        for draft in ["", "hé界"] {
+            pane.set_draft(draft);
+            let frame = pane.render(80, 12);
+            let row = row_text(&frame.lines[frame.cursor_row as usize]);
+            let prefix = row.find('›').expect("input prefix is rendered");
+            let through_draft = &row[..prefix + '›'.len_utf8() + 1 + draft.len()];
+            assert_eq!(frame.cursor_col as usize, through_draft.width());
+            assert_eq!(&row[prefix + '›'.len_utf8() + 1..][..draft.len()], draft);
+        }
+    }
+
+    #[test]
+    fn pane_uses_explicit_workspace_for_environment_and_completion() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("completion-target")).unwrap();
+        let pane = pane(root.path().to_path_buf());
+        assert_eq!(pane.workspace_root(), root.path());
+        assert_eq!(
+            pane.state.environment.cwd_display,
+            root.path().to_string_lossy()
+        );
+    }
+
     fn ui(width: u16, height: u16) -> CrossTerm {
         CrossTerm::base(
             "test-model",
             "test-provider",
             vec!["opencode-go".into(), "openrouter".into()],
             StartupEntries::default(),
+            PathBuf::from("."),
             width,
             height,
         )
@@ -4086,6 +4487,106 @@ mod tests {
                 fitted.iter().map(row_text).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn retained_pane_starts_with_the_canonical_welcome_entries() {
+        let pane = pane(PathBuf::from("/workspace"));
+        assert_eq!(pane.state.pending.len(), 2);
+        assert!(matches!(pane.state.pending[0], Entry::Banner { .. }));
+        let Entry::Metadata {
+            provider,
+            model,
+            context_files,
+            skills,
+            ..
+        } = &pane.state.pending[1]
+        else {
+            panic!("second startup entry was not metadata");
+        };
+        assert_eq!(provider, "test-provider");
+        assert_eq!(model, "test-model");
+        assert!(context_files.is_empty());
+        assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn retained_tick_advances_the_busy_spinner() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.set_draft("hello");
+        let submitted = pane
+            .handle_input(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(submitted.messages.len(), 1);
+        let before = pane.state.spinner;
+
+        assert!(!pane.tick(false));
+        assert_eq!(pane.state.spinner, before);
+        assert!(pane.tick(true));
+        assert_eq!(pane.state.spinner, before + 1);
+    }
+
+    #[test]
+    fn retained_scroll_clamps_to_the_oldest_complete_window() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.state.pending.clear();
+        for index in 0..20 {
+            pane.apply_event(UiEvent::Notice(format!("notice {index}")));
+        }
+        pane.scroll(10_000);
+
+        let frame = pane.render(80, 8);
+        let text = frame
+            .lines
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(pane.scroll_offset() < 10_000);
+        assert!(text.contains("notice 0"), "{text}");
+
+        pane.scroll(10_000);
+        pane.render(80, 1);
+        assert_eq!(pane.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn retained_session_snapshot_replaces_pending_conversation() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.apply_event(UiEvent::SessionChanged {
+            id: "initial".into(),
+            title: None,
+            loaded: false,
+        });
+        pane.apply_event(UiEvent::TextDelta("old answer".into()));
+        pane.apply_event(UiEvent::TurnFinished);
+
+        pane.apply_event(UiEvent::SessionChanged {
+            id: "abcd1234efgh".into(),
+            title: None,
+            loaded: true,
+        });
+        pane.apply_event(UiEvent::SessionSnapshot {
+            entries: vec![SessionSnapshotEntry::Assistant {
+                markdown: "loaded answer".into(),
+                reasoning: String::new(),
+            }],
+        });
+
+        let frame = pane.render(80, 24);
+        let text = frame
+            .lines
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text.contains("old answer"), "{text}");
+        assert!(text.contains("loaded answer"), "{text}");
+        assert!(text.contains("Loaded Session abcd1234"), "{text}");
     }
 
     #[test]

@@ -275,7 +275,8 @@ async fn drive_headless_events_into(
                     )?;
                 }
             }
-            AgentEvent::SessionSnapshot { .. }
+            AgentEvent::OperationFinished
+            | AgentEvent::SessionSnapshot { .. }
             | AgentEvent::SessionList { .. }
             | AgentEvent::ModelList { .. }
             | AgentEvent::ContextUsageUpdated { .. }

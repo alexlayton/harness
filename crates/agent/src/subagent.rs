@@ -47,7 +47,7 @@ use std::sync::RwLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tools::{
-    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolRegistry,
+    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolExecutionGate, ToolRegistry,
     default_registry_with_index, read_only_registry_with_index,
 };
 
@@ -128,6 +128,10 @@ pub struct SubagentRunnerImpl {
     model_state: RwLock<SubagentModelState>,
     workspace_root: PathBuf,
     search_index: Arc<FileSearchIndex>,
+    /// Gate shared with the parent registry and sibling agents targeting this
+    /// workspace. A workspace-mode run holds it for the entire delegated
+    /// workflow; its child registry therefore must not reacquire it.
+    execution_gate: Option<ToolExecutionGate>,
     rtk: bool,
     project_context: String,
     /// Resolved delegation bounds (`max_turns`; `0` disables subagents).
@@ -188,6 +192,7 @@ impl SubagentRunnerImpl {
             }),
             workspace_root,
             search_index,
+            execution_gate: None,
             rtk,
             project_context: project_context.into(),
             config,
@@ -209,6 +214,12 @@ impl SubagentRunnerImpl {
     /// parent index before the runner can be shared or used.
     pub fn with_file_search_index(mut self, index: Arc<FileSearchIndex>) -> Self {
         self.search_index = index;
+        self
+    }
+
+    /// Coordinate child tool mutations with the parent and sibling registries.
+    pub fn with_execution_gate(mut self, gate: ToolExecutionGate) -> Self {
+        self.execution_gate = Some(gate);
         self
     }
 
@@ -360,6 +371,20 @@ impl SubagentRunnerImpl {
             &run.description,
             parent_session,
         );
+        let _active_lease = match (self.store.as_ref(), session.as_ref()) {
+            (Some(store), Some(child)) => match store.acquire_active(child) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    // A freshly generated child ID should never contend, but
+                    // do not append to a conversation whose ownership cannot
+                    // be proven. The delegation can still run ephemerally.
+                    tracing::warn!(error = %error, "could not activate subagent session");
+                    session = None;
+                    None
+                }
+            },
+            _ => None,
+        };
         Self::persist(
             &self.store,
             &mut session,
@@ -642,6 +667,27 @@ impl SubagentRunner for SubagentRunnerImpl {
         mode: SubagentMode,
         cancel: CancellationToken,
     ) -> Result<String, String> {
+        let _workspace_permit = if mode == SubagentMode::Workspace {
+            match self.execution_gate.as_ref() {
+                Some(gate) => {
+                    if cancel.is_cancelled() {
+                        return Err("cancelled by user".into());
+                    }
+                    let permit = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err("cancelled by user".into()),
+                        permit = gate.lock() => permit,
+                    };
+                    if cancel.is_cancelled() {
+                        return Err("cancelled by user".into());
+                    }
+                    Some(permit)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         self.execute(
             &SubagentRun {
                 description: description.to_owned(),
@@ -1073,6 +1119,33 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn workspace_child_registry_does_not_reacquire_the_outer_gate() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let runner =
+            runner_with_dyn(Arc::new(ScriptProvider::new(Vec::new()))).with_execution_gate(gate);
+
+        let registry = runner.registry(SubagentMode::Workspace).unwrap();
+        assert!(registry.execution_gate().is_none());
+    }
+
+    #[tokio::test]
+    async fn workspace_subagent_cancels_while_waiting_for_the_outer_gate() {
+        let gate = Arc::new(tokio::sync::Mutex::new(()));
+        let owner = gate.lock().await;
+        let runner = runner_with_dyn(Arc::new(ScriptProvider::new(Vec::new())))
+            .with_execution_gate(gate.clone());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = runner
+            .run("blocked", "prompt", SubagentMode::Workspace, cancel)
+            .await;
+
+        assert_eq!(result.unwrap_err(), "cancelled by user");
+        drop(owner);
     }
 
     #[tokio::test]

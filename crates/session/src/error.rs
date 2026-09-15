@@ -54,6 +54,9 @@ pub enum SessionError {
     #[error("could not acquire session lock {}", .0.display())]
     LockUnavailable(PathBuf),
 
+    #[error("session is already active in another agent: {}", .0.display())]
+    AlreadyActive(PathBuf),
+
     #[error("invalid session event: {0}")]
     InvalidEvent(String),
 

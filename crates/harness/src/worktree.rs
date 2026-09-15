@@ -4,19 +4,18 @@ use fs2::FileExt;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Output, Stdio};
 
 /// A prepared Git worktree whose lifetime surrounds one frontend run.
 pub(crate) struct WorktreeLease {
-    original_cwd: PathBuf,
     repository: Repository,
     worktree_path: PathBuf,
+    workspace_path: PathBuf,
     keep: bool,
     created: bool,
     managed_destination: bool,
     source_was_dirty: bool,
-    finished: bool,
     _run_lock: WorktreeRunLock,
 }
 
@@ -52,22 +51,23 @@ enum EnsureOutcome {
     Reused,
 }
 
-/// Create or reuse the requested worktree and enter its corresponding launch
-/// directory. The caller must call [`WorktreeLease::finish`] after the frontend
-/// shuts down so the process leaves the directory before Git removes it.
-pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
-    let original_cwd =
-        fs::canonicalize(std::env::current_dir().context("resolve the worktree launch directory")?)
-            .context("resolve the worktree launch directory")?;
-    let repository = Repository::discover(&original_cwd)?;
+/// Create or reuse the requested worktree for `launch_directory`.
+///
+/// Preparation is path-based and does not change the process current directory.
+/// The caller can enter [`WorktreeLease::workspace_path`] for the frontend and
+/// must leave it before calling [`WorktreeLease::finish`].
+pub(crate) fn prepare(args: &WorktreeArgs, launch_directory: &Path) -> Result<WorktreeLease> {
+    let launch_directory =
+        fs::canonicalize(launch_directory).context("resolve the worktree launch directory")?;
+    let repository = Repository::discover(&launch_directory)?;
     validate_branch(&repository, &args.branch)?;
 
-    let relative_cwd = original_cwd
+    let relative_cwd = launch_directory
         .strip_prefix(&repository.root)
         .with_context(|| {
             format!(
                 "launch directory `{}` is outside repository `{}`",
-                original_cwd.display(),
+                launch_directory.display(),
                 repository.root.display()
             )
         })?
@@ -75,19 +75,19 @@ pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
     let managed_destination = args.dir.is_none();
     let worktree_path = match &args.dir {
         Some(path) if path.is_absolute() => path.clone(),
-        Some(path) => original_cwd.join(path),
+        Some(path) => launch_directory.join(path),
         None => default_destination(&repository, &args.branch)?,
     };
     let worktree_path = normalized_destination(&worktree_path)?;
     if let Ok(existing_path) = fs::canonicalize(&worktree_path)
-        && original_cwd.starts_with(&existing_path)
+        && launch_directory.starts_with(&existing_path)
     {
         return Err(anyhow!(
             "already inside selected worktree `{}`; run `harness` directly there",
             existing_path.display()
         ));
     }
-    let run_lock = WorktreeRunLock::acquire(&repository, &args.branch)?;
+    let run_lock = WorktreeRunLock::acquire(&repository, &worktree_path)?;
 
     let source_was_dirty = source_has_changes(&repository)?;
     let ensured = ensure_worktree(
@@ -114,28 +114,22 @@ pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
             args.branch
         ));
     }
-    if let Err(error) = std::env::set_current_dir(&workspace) {
-        rollback_created(&repository, &worktree_path, created);
-        return Err(error).with_context(|| format!("enter worktree `{}`", workspace.display()));
-    }
     let keep = match resolve_keep_policy(&repository, &args.branch, &resolved_worktree, args) {
         Ok(keep) => keep,
         Err(error) => {
-            let _ = std::env::set_current_dir(&original_cwd);
             rollback_created(&repository, &resolved_worktree, created);
             return Err(error);
         }
     };
 
     Ok(WorktreeLease {
-        original_cwd,
         repository,
         worktree_path: resolved_worktree,
+        workspace_path: workspace,
         keep,
         created,
         managed_destination,
         source_was_dirty: created && source_was_dirty,
-        finished: false,
         _run_lock: run_lock,
     })
 }
@@ -143,6 +137,10 @@ pub(crate) fn prepare(args: &WorktreeArgs) -> Result<WorktreeLease> {
 impl WorktreeLease {
     pub(crate) fn path(&self) -> &Path {
         &self.worktree_path
+    }
+
+    pub(crate) fn workspace_path(&self) -> &Path {
+        &self.workspace_path
     }
 
     pub(crate) fn was_created(&self) -> bool {
@@ -153,18 +151,12 @@ impl WorktreeLease {
         self.source_was_dirty
     }
 
-    /// Restore the launch directory, then remove the worktree without force.
-    /// Git refusal is a retained outcome rather than an error. Modified or
-    /// untracked files keep the tree; ignored-only output follows Git cleanup.
-    pub(crate) fn finish(mut self) -> Result<CleanupOutcome> {
-        std::env::set_current_dir(&self.original_cwd).with_context(|| {
-            format!(
-                "leave worktree and restore `{}`",
-                self.original_cwd.display()
-            )
-        })?;
-        self.finished = true;
-
+    /// Remove the worktree without force. Git refusal is a retained outcome
+    /// rather than an error. Modified or untracked files keep the tree;
+    /// ignored-only output follows Git cleanup.
+    ///
+    /// The caller must ensure the process is no longer inside the worktree.
+    pub(crate) fn finish(self) -> Result<CleanupOutcome> {
         if self.keep {
             return Ok(CleanupOutcome::Kept(self.worktree_path.clone()));
         }
@@ -174,27 +166,27 @@ impl WorktreeLease {
         }
         Ok(outcome)
     }
-}
 
-impl Drop for WorktreeLease {
-    fn drop(&mut self) {
-        // Explicit finish reports cleanup failures. This fallback only avoids
-        // leaving the process inside the worktree on an unexpected early path.
-        if !self.finished {
-            let _ = std::env::set_current_dir(&self.original_cwd);
-        }
+    /// Release the process lock while intentionally retaining the worktree.
+    /// This is used when ownership of the prepared tree outlives this lease.
+    pub(crate) fn release_without_cleanup(self) -> PathBuf {
+        self.worktree_path
     }
 }
 
 impl WorktreeRunLock {
-    fn acquire(repository: &Repository, branch: &str) -> Result<Self> {
+    fn acquire(repository: &Repository, worktree_path: &Path) -> Result<Self> {
         let directory = repository.common_dir.join("harness").join("worktree-locks");
         fs::create_dir_all(&directory)
             .with_context(|| format!("create worktree lock directory `{}`", directory.display()))?;
+        let label = worktree_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("worktree");
         let path = directory.join(format!(
             "{}-{:016x}.lock",
-            slug(branch, "branch"),
-            stable_hash(branch.as_bytes())
+            slug(label, "worktree"),
+            stable_hash(path_hash_bytes(worktree_path))
         ));
         let mut file = OpenOptions::new()
             .read(true)
@@ -209,7 +201,10 @@ impl WorktreeRunLock {
                 .map(|pid| format!(" by process {pid}"))
                 .unwrap_or_default();
             if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Err(anyhow!("branch `{branch}` is already in use{owner}"));
+                return Err(anyhow!(
+                    "worktree `{}` is already in use{owner}",
+                    worktree_path.display()
+                ));
             }
             return Err(error).with_context(|| format!("lock worktree lease `{}`", path.display()));
         }
@@ -564,13 +559,18 @@ fn normalized_destination(path: &Path) -> Result<PathBuf> {
     let mut existing = absolute.as_path();
     let mut missing = Vec::new();
     while !existing.exists() {
-        let name = existing.file_name().ok_or_else(|| {
-            anyhow!(
-                "worktree destination `{}` has no existing ancestor",
-                path.display()
-            )
-        })?;
-        missing.push(name.to_os_string());
+        let component = match existing.components().next_back() {
+            Some(Component::Normal(name)) => name.to_os_string(),
+            Some(Component::ParentDir) => OsStr::new("..").to_os_string(),
+            Some(Component::CurDir) => OsStr::new(".").to_os_string(),
+            _ => {
+                return Err(anyhow!(
+                    "worktree destination `{}` has no existing ancestor",
+                    path.display()
+                ));
+            }
+        };
+        missing.push(component);
         existing = existing.parent().ok_or_else(|| {
             anyhow!(
                 "worktree destination `{}` has no existing ancestor",
@@ -581,7 +581,18 @@ fn normalized_destination(path: &Path) -> Result<PathBuf> {
     let mut resolved = fs::canonicalize(existing)
         .with_context(|| format!("resolve destination ancestor `{}`", existing.display()))?;
     for component in missing.iter().rev() {
-        resolved.push(component);
+        if component == OsStr::new(".") {
+            continue;
+        }
+        if component == OsStr::new("..") {
+            anyhow::ensure!(
+                resolved.pop(),
+                "worktree destination `{}` traverses above the filesystem root",
+                path.display()
+            );
+        } else {
+            resolved.push(component);
+        }
     }
     Ok(resolved)
 }
@@ -656,7 +667,7 @@ fn remove_empty_managed_parent(path: &Path) {
 fn paths_match(left: &Path, right: &Path) -> bool {
     match (fs::canonicalize(left), fs::canonicalize(right)) {
         (Ok(left), Ok(right)) => left == right,
-        _ => absolute_path(left).ok() == absolute_path(right).ok(),
+        _ => normalized_destination(left).ok() == normalized_destination(right).ok(),
     }
 }
 
@@ -868,13 +879,27 @@ mod tests {
     }
 
     #[test]
-    fn process_lock_excludes_another_harness_run_for_the_branch() {
-        let (_root, repository) = test_repository();
-        let first = WorktreeRunLock::acquire(&repository, "feature").unwrap();
-        assert!(WorktreeRunLock::acquire(&repository, "feature").is_err());
-        assert!(WorktreeRunLock::acquire(&repository, "other").is_ok());
+    fn missing_destination_aliases_normalize_to_one_lock_identity() {
+        let root = tempdir().unwrap();
+        let direct = root.path().join("tree");
+        let alias = root.path().join("missing").join("..").join("tree");
+
+        assert_eq!(
+            normalized_destination(&alias).unwrap(),
+            normalized_destination(&direct).unwrap()
+        );
+    }
+
+    #[test]
+    fn process_lock_excludes_another_harness_run_for_the_path() {
+        let (root, repository) = test_repository();
+        let first_path = root.path().join("feature");
+        let other_path = root.path().join("other");
+        let first = WorktreeRunLock::acquire(&repository, &first_path).unwrap();
+        assert!(WorktreeRunLock::acquire(&repository, &first_path).is_err());
+        assert!(WorktreeRunLock::acquire(&repository, &other_path).is_ok());
         drop(first);
-        assert!(WorktreeRunLock::acquire(&repository, "feature").is_ok());
+        assert!(WorktreeRunLock::acquire(&repository, &first_path).is_ok());
     }
 
     #[test]
@@ -922,25 +947,34 @@ mod tests {
     }
 
     #[test]
-    fn prepare_and_finish_restore_the_launch_directory() {
+    fn preparation_is_path_based_and_preserves_nested_workspace() {
         const CHILD: &str = "HARNESS_WORKTREE_LIFECYCLE_CHILD";
         if std::env::var_os(CHILD).is_some() {
             let destination = PathBuf::from(std::env::var_os("HARNESS_TEST_DEST").unwrap());
-            let original = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+            let launch_directory = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
             let args = worktree_args("lifecycle", destination.clone());
-            let lease = prepare(&args).unwrap();
+            let lease = prepare(&args, &launch_directory).unwrap();
+
             assert_eq!(
                 fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
+                launch_directory
+            );
+            assert_eq!(
+                lease.workspace_path(),
                 fs::canonicalize(destination.join("nested")).unwrap()
             );
+            assert_eq!(lease.path(), fs::canonicalize(&destination).unwrap());
             assert!(lease.was_created());
+
+            std::env::set_current_dir(lease.workspace_path()).unwrap();
+            std::env::set_current_dir(&launch_directory).unwrap();
             assert!(matches!(
                 lease.finish().unwrap(),
                 CleanupOutcome::Removed(_)
             ));
             assert_eq!(
                 fs::canonicalize(std::env::current_dir().unwrap()).unwrap(),
-                original
+                launch_directory
             );
             return;
         }
@@ -950,7 +984,7 @@ mod tests {
         let output = ProcessCommand::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "worktree::tests::prepare_and_finish_restore_the_launch_directory",
+                "worktree::tests::preparation_is_path_based_and_preserves_nested_workspace",
             ])
             .arg("--nocapture")
             .env(CHILD, "1")
