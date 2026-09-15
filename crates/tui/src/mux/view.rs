@@ -1,4 +1,5 @@
-use super::{MAX_DIRECTORY_SUGGESTIONS, MuxLayout, MuxUi, Overlay};
+use super::directory::MAX_DIRECTORY_SUGGESTIONS;
+use super::{MuxLayout, MuxUi, Overlay};
 use crate::app::line_to_ansi;
 use crate::render;
 use anyhow::Result;
