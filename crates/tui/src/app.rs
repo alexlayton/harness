@@ -3520,19 +3520,20 @@ impl AgentPane {
         })
     }
 
-    /// Advance retained animation and apply completed path scans. Mux owners
-    /// call this periodically because an [`AgentPane`] owns no runtime.
-    pub fn tick(&mut self) -> bool {
-        let mut changed = false;
+    /// Apply completed path scans and optionally advance visible animation.
+    /// Hidden panes consume their asynchronous results without requesting a
+    /// redraw; their next selected frame observes the updated state.
+    pub fn tick(&mut self, visible: bool) -> bool {
+        let mut completion_changed = false;
         while let Ok(result) = self.state.path_completion_rx.try_recv() {
             self.state.apply_path_completion(result);
-            changed = true;
+            completion_changed = true;
         }
-        if self.state.busy {
+        let animate = visible && self.state.busy;
+        if animate {
             self.state.spinner = self.state.spinner.wrapping_add(1);
-            changed = true;
         }
-        changed
+        visible && (completion_changed || animate)
     }
 
     /// Scroll the retained transcript viewport. Positive values move toward
@@ -3581,7 +3582,11 @@ impl AgentPane {
                 self.state.theme,
                 self.state.tools_expanded,
             );
-            let max_scroll = all.len().saturating_sub(history_budget.min(all.len()));
+            let max_scroll = if history_budget == 0 {
+                0
+            } else {
+                all.len().saturating_sub(history_budget.min(all.len()))
+            };
             self.state.pane_scroll = self.state.pane_scroll.min(max_scroll);
             let end = all.len().saturating_sub(self.state.pane_scroll);
             let start = end.saturating_sub(history_budget);
@@ -4518,7 +4523,9 @@ mod tests {
         assert_eq!(submitted.messages.len(), 1);
         let before = pane.state.spinner;
 
-        assert!(pane.tick());
+        assert!(!pane.tick(false));
+        assert_eq!(pane.state.spinner, before);
+        assert!(pane.tick(true));
         assert_eq!(pane.state.spinner, before + 1);
     }
 
@@ -4541,6 +4548,10 @@ mod tests {
 
         assert!(pane.scroll_offset() < 10_000);
         assert!(text.contains("notice 0"), "{text}");
+
+        pane.scroll(10_000);
+        pane.render(80, 1);
+        assert_eq!(pane.scroll_offset(), 0);
     }
 
     #[test]

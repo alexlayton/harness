@@ -415,12 +415,12 @@ impl MuxUi {
             return Ok(out);
         }
         if let Event::Paste(text) = event {
-            if self.overlay.is_none() && !self.prefix {
+            if self.overlay.is_none() {
+                self.prefix = false;
+                self.reveal_selected();
                 return self.delegate(Event::Paste(text));
             }
-            if self.overlay.is_some() {
-                self.paste_into_overlay(&text);
-            }
+            self.paste_into_overlay(&text);
             return Ok(out);
         }
         let Event::Key(key) = event else {
@@ -537,8 +537,8 @@ impl MuxUi {
             }
             return;
         }
-        // The two cells between the sidebar border and main pane are inert.
-        if sidebar_width.is_some_and(|width| x > width) {
+        // Sidebar borders and the gap before the main pane are inert.
+        if sidebar_width.is_some_and(|width| x == 0 || x >= width) {
             return;
         }
         match kind {
@@ -887,9 +887,11 @@ impl MuxUi {
                         self.apply_directory_completion(completion);
                     }
                     _ = tick.tick() => {
-                        let changed = self.slots.iter_mut().fold(false, |changed, slot| {
-                            slot.pane.tick() || changed
-                        });
+                        let selected = self.selected;
+                        let changed = self.slots.iter_mut().enumerate().fold(
+                            false,
+                            |changed, (index, slot)| slot.pane.tick(selected == Some(index)) || changed,
+                        );
                         if !changed {
                             continue;
                         }
@@ -1733,6 +1735,18 @@ mod tests {
     }
 
     #[test]
+    fn paste_cancels_the_prefix_and_reaches_the_selected_pane() {
+        let mut mux = MuxUi::new("/x".into());
+        add_slots(&mut mux, 1);
+        mux.prefix = true;
+
+        mux.handle(Event::Paste("pasted".into())).unwrap();
+
+        assert!(!mux.prefix);
+        assert_eq!(mux.slots[0].pane.editor_text(), "pasted");
+    }
+
+    #[test]
     fn paste_populates_text_overlays_and_refreshes_directory_completion() {
         let mut mux = MuxUi::new("/x".into());
         mux.overlay = Some(Overlay::Worktree {
@@ -1938,13 +1952,28 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_borders_are_not_session_hit_targets() {
+        let mut mux = MuxUi::new("/".into());
+        mux.width = 80;
+        mux.height = 14;
+        add_slots(&mut mux, 2);
+        let sidebar_width = mux.layout(mux.width, mux.height).sidebar.unwrap().1;
+        assert_eq!(mux.selected_id(), Some(2));
+
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 2);
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), sidebar_width, 2);
+
+        assert_eq!(mux.selected_id(), Some(2));
+    }
+
+    #[test]
     fn hidden_new_row_has_no_mouse_hit_target_in_tiny_prefix_layout() {
         let mut mux = MuxUi::new("/".into());
         mux.width = 80;
         mux.height = 8;
         mux.prefix = true;
 
-        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 3);
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 1, 3);
 
         assert!(mux.overlay.is_none());
     }
@@ -2185,15 +2214,15 @@ mod tests {
             });
         }
         for _ in 0..10 {
-            mux.handle_mouse(MouseEventKind::ScrollDown, 0, 2);
+            mux.handle_mouse(MouseEventKind::ScrollDown, 1, 2);
         }
         assert_eq!(mux.visible_rows(), 2);
         assert_eq!(mux.sidebar_scroll, 3);
 
         // The session rows are 2..4, row 4 is the spacer, and New is row 5.
-        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 4);
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 1, 4);
         assert!(mux.overlay.is_none());
-        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 5);
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 1, 5);
         assert!(matches!(mux.overlay, Some(Overlay::NewMenu { .. })));
     }
 

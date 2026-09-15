@@ -669,10 +669,20 @@ impl SubagentRunner for SubagentRunnerImpl {
     ) -> Result<String, String> {
         let _workspace_permit = if mode == SubagentMode::Workspace {
             match self.execution_gate.as_ref() {
-                Some(gate) => Some(tokio::select! {
-                    permit = gate.lock() => permit,
-                    _ = cancel.cancelled() => return Err("cancelled by user".into()),
-                }),
+                Some(gate) => {
+                    if cancel.is_cancelled() {
+                        return Err("cancelled by user".into());
+                    }
+                    let permit = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => return Err("cancelled by user".into()),
+                        permit = gate.lock() => permit,
+                    };
+                    if cancel.is_cancelled() {
+                        return Err("cancelled by user".into());
+                    }
+                    Some(permit)
+                }
                 None => None,
             }
         } else {

@@ -209,14 +209,22 @@ impl ToolRegistry {
         let Some(gate) = &self.execution_gate else {
             return tool.tool.execute(args, cancel).await;
         };
-        let _guard = tokio::select! {
-            guard = gate.lock() => guard,
-            _ = cancel.cancelled() => return ToolOutput {
-                content: "cancelled before workspace execution".into(),
-                is_error: true,
-                summary: super::call_summary(name, &args),
-            },
+        let cancelled = || ToolOutput {
+            content: "cancelled before workspace execution".into(),
+            is_error: true,
+            summary: super::call_summary(name, &args),
         };
+        if cancel.is_cancelled() {
+            return cancelled();
+        }
+        let _guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return cancelled(),
+            guard = gate.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            return cancelled();
+        }
         tool.tool.execute(args, cancel).await
     }
 
