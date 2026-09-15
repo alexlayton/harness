@@ -642,6 +642,13 @@ fn overlays_are_centered_in_main_pane_closed_and_opaque() {
             .all(|row| row.width() == second.width as usize)
     );
     assert!(!second.rows.join("\n").contains("New worktree"));
+
+    let exit = overlay_frame(layout, &Overlay::ConfirmExit);
+    let exit_text = exit.rows.join("\n");
+    assert!(exit.rows[0].contains("Exit Mux?"));
+    assert!(exit_text.contains("All running agents will stop."));
+    assert!(exit_text.contains("Enter to exit the mux."));
+    assert!(exit_text.contains("Esc to cancel."));
 }
 
 #[test]

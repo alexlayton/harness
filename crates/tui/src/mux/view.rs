@@ -270,7 +270,7 @@ pub(super) fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFram
         Overlay::Worktree { .. } => "New worktree agent",
         Overlay::Directory { .. } => "Choose directory",
         Overlay::Close => "Close agent?",
-        Overlay::ConfirmExit => "Exit Harness?",
+        Overlay::ConfirmExit => "Exit Mux?",
         Overlay::ConfirmDuplicate { .. } => "Duplicate workspace?",
         Overlay::Help => "Mux help",
     };
@@ -311,9 +311,11 @@ pub(super) fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFram
             }))
             .collect(),
         Overlay::Close => vec!["Enter to close; Esc to cancel".into()],
-        Overlay::ConfirmExit => {
-            vec!["All running agents will stop. Enter to exit; Esc to cancel".into()]
-        }
+        Overlay::ConfirmExit => vec![
+            "All running agents will stop.".into(),
+            "Enter to exit the mux.".into(),
+            "Esc to cancel.".into(),
+        ],
         Overlay::ConfirmDuplicate { .. } => vec![
             "A direct agent already uses this directory. Enter to create anyway; Esc to cancel"
                 .into(),
