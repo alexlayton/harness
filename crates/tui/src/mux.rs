@@ -88,10 +88,6 @@ pub enum MuxAction {
         choice: WorkspaceChoice,
         inherit_from: Option<MuxId>,
     },
-    Rename {
-        id: MuxId,
-        name: String,
-    },
     Close {
         id: MuxId,
     },
@@ -126,10 +122,6 @@ pub enum MuxEvent {
         id: MuxId,
         status: MuxStatus,
     },
-    Rename {
-        id: MuxId,
-        name: String,
-    },
     Remove {
         id: MuxId,
     },
@@ -161,9 +153,6 @@ enum Overlay {
         suggestions: Vec<PathBuf>,
         selected: usize,
     },
-    Rename {
-        input: String,
-    },
     Close,
     ConfirmDuplicate {
         choice: WorkspaceChoice,
@@ -188,7 +177,6 @@ pub struct MuxLayout {
 pub struct MuxUi {
     slots: Vec<Slot>,
     selected: Option<usize>,
-    sidebar_visible: bool,
     sidebar_scroll: usize,
     prefix: bool,
     overlay: Option<Overlay>,
@@ -217,7 +205,6 @@ impl MuxUi {
         Self {
             slots: vec![],
             selected: None,
-            sidebar_visible: true,
             sidebar_scroll: 0,
             prefix: false,
             overlay: None,
@@ -240,14 +227,11 @@ impl MuxUi {
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
     }
-    /// Return whether the sidebar is enabled (it may still collapse when narrow).
-    pub fn sidebar_visible(&self) -> bool {
-        self.sidebar_visible
-    }
     /// Compute host-neutral pane geometry for terminal dimensions.
     pub fn layout(&self, width: u16, height: u16) -> MuxLayout {
         let body_height = height;
-        let side = if self.sidebar_visible && width >= 42 {
+        // Hide only when reserving the minimum sidebar would leave no useful pane.
+        let side = if width >= 30 {
             Some((0, (width / 4).clamp(20, 32)))
         } else {
             None
@@ -327,11 +311,6 @@ impl MuxUi {
                     s.status = status;
                 }
             }
-            MuxEvent::Rename { id, name } => {
-                if let Some(s) = self.slots.iter_mut().find(|s| s.id == id) {
-                    s.name = name;
-                }
-            }
             MuxEvent::Remove { id } => {
                 if let Some(i) = self.slots.iter().position(|s| s.id == id) {
                     self.slots.remove(i);
@@ -346,10 +325,9 @@ impl MuxUi {
         }
     }
     fn sidebar_hint_rows(&self) -> u16 {
-        // The expanded legend needs three interior rows. Keep tiny panes to a
-        // single hint so the top and bottom border can never be displaced.
-        if self.prefix && self.height >= 6 {
-            3
+        // Commands grow upward while the prefix line remains anchored at bottom.
+        if self.prefix && self.height >= 7 {
+            4
         } else {
             1
         }
@@ -357,7 +335,7 @@ impl MuxUi {
 
     fn visible_rows(&self) -> usize {
         let step = if self.width >= 70 { 2 } else { 1 };
-        // Both border rows, `+ New agent`, and the bottom hint/legend are fixed.
+        // Both border rows, `⊕ New agent`, and the bottom hint/legend are fixed.
         self.layout(self.width, self.height)
             .body_height
             .saturating_sub(3 + self.sidebar_hint_rows()) as usize
@@ -407,7 +385,27 @@ impl MuxUi {
             return Ok(out);
         }
         if let Event::Mouse(mouse) = event {
-            if self.overlay.is_none() {
+            if matches!(self.overlay, Some(Overlay::NewMenu { .. })) {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    let frame = overlay_frame(
+                        self.layout(self.width, self.height),
+                        self.overlay.as_ref().expect("overlay exists"),
+                    );
+                    if mouse.column >= frame.x && mouse.column < frame.x + frame.width {
+                        let relative = mouse.row.saturating_sub(frame.y) as usize;
+                        // Choices occupy content rows 2, 4, and 6. Include the
+                        // blank row below each as a forgiving hit target.
+                        if (2..=7).contains(&relative) {
+                            if let Some(Overlay::NewMenu { selected }) = &mut self.overlay {
+                                *selected = ((relative - 2) / 2).min(2);
+                            }
+                            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+                            let overlay = self.overlay.take().expect("overlay exists");
+                            self.handle_overlay(overlay, enter, &mut out);
+                        }
+                    }
+                }
+            } else if self.overlay.is_none() {
                 self.handle_mouse(mouse.kind, mouse.column, mouse.row);
             }
             return Ok(out);
@@ -432,15 +430,9 @@ impl MuxUi {
                 KeyCode::Char('n') => self.overlay = Some(Overlay::NewMenu { selected: 0 }),
                 KeyCode::Char('j') => self.switch(1),
                 KeyCode::Char('k') => self.switch(-1),
-                KeyCode::Char('b') => self.sidebar_visible = !self.sidebar_visible,
                 KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
                 KeyCode::Char('x') if self.selected.is_some() => {
                     self.overlay = Some(Overlay::Close)
-                }
-                KeyCode::Char('r') if self.selected.is_some() => {
-                    self.overlay = Some(Overlay::Rename {
-                        input: self.slots[self.selected.unwrap()].name.clone(),
-                    })
                 }
                 KeyCode::Char(c @ '1'..='9') => {
                     let i = (c as u8 - b'1') as usize;
@@ -698,20 +690,6 @@ impl MuxUi {
                     self.overlay = Some(overlay)
                 }
             },
-            Overlay::Rename { input } => match key.code {
-                KeyCode::Enter if !input.trim().is_empty() => {
-                    if let Some(id) = self.selected_id() {
-                        out.push(MuxAction::Rename {
-                            id,
-                            name: input.trim().into(),
-                        })
-                    }
-                }
-                _ => {
-                    edit_string(input, key);
-                    self.overlay = Some(overlay)
-                }
-            },
             Overlay::Close => {
                 if key.code == KeyCode::Enter {
                     if let Some(id) = self.selected_id() {
@@ -914,9 +892,8 @@ impl MuxUi {
             let y = 1 + n * step;
             let selected = Some(self.sidebar_scroll + n) == self.selected;
             let text = format!(
-                " {} {}  {}  {}",
-                if selected { ">" } else { " " },
-                self.sidebar_scroll + n + 1,
+                " {} {}  {}",
+                if selected { "›" } else { " " },
                 slot.name,
                 slot.status.glyph()
             );
@@ -945,16 +922,17 @@ impl MuxUi {
         let new_y = 1 + visible * step;
         let hints_start = height.saturating_sub(1 + self.sidebar_hint_rows()).max(1) as usize;
         if new_y < hints_start {
-            rows[new_y] = framed(" + New agent", muted);
+            rows[new_y] = framed(" ⊕ New agent", muted);
         }
-        let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 3 {
+        let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 4 {
             &[
-                " n:new  j/k:switch",
-                " 1-9:jump  x:close",
-                " r:rename b:sidebar ?:help",
+                " n new  j/k switch",
+                " 1-9 jump  x close",
+                " ? help",
+                " Ctrl + Space  prefix",
             ]
         } else {
-            &[" ^Space shortcuts"]
+            &[" Ctrl + Space  prefix"]
         };
         for (offset, hint) in hints.iter().enumerate() {
             let y = hints_start + offset;
@@ -1153,7 +1131,6 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
         Overlay::NewMenu { .. } | Overlay::Current { .. } => "New agent",
         Overlay::Worktree { .. } => "New worktree agent",
         Overlay::Directory { .. } => "Choose directory",
-        Overlay::Rename { .. } => "Rename agent",
         Overlay::Close => "Close agent?",
         Overlay::ConfirmDuplicate { .. } => "Duplicate workspace?",
         Overlay::Help => "Mux help",
@@ -1162,7 +1139,9 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
         Overlay::NewMenu { selected } => ["New worktree", "Current directory", "Another directory"]
             .iter()
             .enumerate()
-            .map(|(index, label)| format!("{} {label}", if index == *selected { '>' } else { ' ' }))
+            .map(|(index, label)| {
+                format!("{} {label}\n", if index == *selected { '›' } else { ' ' })
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         Overlay::Worktree { branch, keep } => format!(
@@ -1181,7 +1160,6 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
                 .collect::<Vec<_>>()
                 .join("\n")
         ),
-        Overlay::Rename { input } => format!("Name: {input}"),
         Overlay::Close => "Enter to close; Esc to cancel".into(),
         Overlay::ConfirmDuplicate { .. } => {
             "A direct agent already uses this directory. Enter to create anyway; Esc to cancel"
@@ -1189,8 +1167,8 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
         }
         Overlay::Help => concat!(
             "Ctrl+Space n new · j/k switch · 1-9 jump\n",
-            "x close · r rename · b sidebar · ? help\n",
-            "Mouse: click sessions/new; wheel scroll"
+            "x close · ? help\n",
+            "Mouse: click sessions/new/menu choices; wheel scroll"
         )
         .into(),
     };
@@ -1236,7 +1214,6 @@ fn overlay_cursor(frame: &OverlayFrame, overlay: &Overlay) -> Option<(u16, u16)>
         Overlay::Worktree { branch, .. } => ("Branch / name: ", branch.as_str()),
         Overlay::Current { name } => ("Session name: ", name.as_str()),
         Overlay::Directory { input, .. } => ("Directory: ", input.as_str()),
-        Overlay::Rename { input } => ("Name: ", input.as_str()),
         _ => return None,
     };
     // Editable content is on the first content row, after the left border and
@@ -1268,8 +1245,8 @@ fn draw_overlay(
     for (row, text) in frame.rows.iter().enumerate() {
         let style = if row == 0 || row + 1 == frame.rows.len() {
             muted
-        } else if text.starts_with("│ >") {
-            accent
+        } else if text.starts_with("│ ›") {
+            accent.add_modifier(Modifier::BOLD)
         } else {
             primary
         };
@@ -1589,7 +1566,8 @@ mod tests {
     #[test]
     fn layout_gives_both_panes_the_full_terminal_height() {
         let m = MuxUi::new("/x".into());
-        assert!(m.layout(41, 10).sidebar.is_none());
+        assert!(m.layout(29, 10).sidebar.is_none());
+        assert!(m.layout(41, 10).sidebar.is_some());
         let layout = m.layout(80, 20);
         assert!(layout.sidebar.is_some());
         assert_eq!(layout.body_height, 20);
@@ -1695,16 +1673,16 @@ mod tests {
                 "{option}: {initial_text}"
             );
         }
-        assert!(initial_text.contains("> New worktree"));
-        assert!(!initial_text.contains("> Current directory"));
+        assert!(initial_text.contains("› New worktree"));
+        assert!(!initial_text.contains("› Current directory"));
 
         mux.handle(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
             .unwrap();
         let (selected, _) = mux.compose_frame(100, 30);
         let selected_text = visible_buffer(&selected);
-        assert!(!selected_text.contains("> New worktree"));
+        assert!(!selected_text.contains("› New worktree"));
         assert!(
-            selected_text.contains("> Current directory"),
+            selected_text.contains("› Current directory"),
             "{selected_text}"
         );
 
@@ -1858,8 +1836,8 @@ mod tests {
             KeyModifiers::CONTROL,
         )))
         .unwrap();
-        assert_eq!(mux.sidebar_hint_rows(), 3);
-        assert_eq!(mux.visible_rows(), 2);
+        assert_eq!(mux.sidebar_hint_rows(), 4);
+        assert_eq!(mux.visible_rows(), 1);
     }
 
     #[test]

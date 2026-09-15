@@ -130,8 +130,7 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                         let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Running });
                     }
                 }
-                Some(MuxAction::Rename { id, name }) => { let _ = event_tx.send(MuxEvent::Rename { id, name }); }
-                Some(MuxAction::Create { choice, inherit_from }) => {
+                    Some(MuxAction::Create { choice, inherit_from }) => {
                     let settings = inherit_from.and_then(|id| slots.get(&id)).map(|s| s.settings.clone()).unwrap_or_else(|| defaults.clone());
                     create_slot(next_id, choice, settings, &config, cli, &launch, &event_tx, &runtime_tx, &mut slots, &mutation_coordinator);
                     next_id += 1;
