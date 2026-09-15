@@ -3381,6 +3381,12 @@ pub struct AgentPane {
     state: CrossTerm,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PaneDraft {
+    text: String,
+    cursor: usize,
+}
+
 impl AgentPane {
     /// Create an independent pane rooted at an explicit workspace. Path
     /// completion and environment metadata never consult the process cwd.
@@ -3465,6 +3471,22 @@ impl AgentPane {
         &self.state.input
     }
 
+    pub(crate) fn draft_snapshot(&self) -> PaneDraft {
+        PaneDraft {
+            text: self.state.input.clone(),
+            cursor: self.state.cursor,
+        }
+    }
+
+    pub(crate) fn restore_draft(&mut self, draft: PaneDraft) {
+        self.state.input = draft.text;
+        self.state.cursor = draft.cursor.min(self.state.input.len());
+        while !self.state.input.is_char_boundary(self.state.cursor) {
+            self.state.cursor = self.state.cursor.saturating_sub(1);
+        }
+        self.state.refresh_completion();
+    }
+
     /// Return the explicit workspace root used for path completion and metadata.
     pub fn workspace_root(&self) -> &Path {
         &self.state.environment.cwd
@@ -3498,12 +3520,16 @@ impl AgentPane {
         })
     }
 
-    /// Apply any completed asynchronous path-completion scan. Mux owners call
-    /// this from their periodic tick because an [`AgentPane`] owns no runtime.
-    pub fn tick_completion(&mut self) -> bool {
+    /// Advance retained animation and apply completed path scans. Mux owners
+    /// call this periodically because an [`AgentPane`] owns no runtime.
+    pub fn tick(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.state.path_completion_rx.try_recv() {
             self.state.apply_path_completion(result);
+            changed = true;
+        }
+        if self.state.busy {
+            self.state.spinner = self.state.spinner.wrapping_add(1);
             changed = true;
         }
         changed
@@ -3555,6 +3581,8 @@ impl AgentPane {
                 self.state.theme,
                 self.state.tools_expanded,
             );
+            let max_scroll = all.len().saturating_sub(history_budget.min(all.len()));
+            self.state.pane_scroll = self.state.pane_scroll.min(max_scroll);
             let end = all.len().saturating_sub(self.state.pane_scroll);
             let start = end.saturating_sub(history_budget);
             lines = all[start..end].to_vec();
@@ -4475,6 +4503,44 @@ mod tests {
         assert_eq!(model, "test-model");
         assert!(context_files.is_empty());
         assert!(skills.is_empty());
+    }
+
+    #[test]
+    fn retained_tick_advances_the_busy_spinner() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.set_draft("hello");
+        let submitted = pane
+            .handle_input(&Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(submitted.messages.len(), 1);
+        let before = pane.state.spinner;
+
+        assert!(pane.tick());
+        assert_eq!(pane.state.spinner, before + 1);
+    }
+
+    #[test]
+    fn retained_scroll_clamps_to_the_oldest_complete_window() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        pane.state.pending.clear();
+        for index in 0..20 {
+            pane.apply_event(UiEvent::Notice(format!("notice {index}")));
+        }
+        pane.scroll(10_000);
+
+        let frame = pane.render(80, 8);
+        let text = frame
+            .lines
+            .iter()
+            .map(row_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(pane.scroll_offset() < 10_000);
+        assert!(text.contains("notice 0"), "{text}");
     }
 
     #[test]

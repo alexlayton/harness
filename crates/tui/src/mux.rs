@@ -295,7 +295,7 @@ impl MuxUi {
                     // Workspace setup may finish after the user has started a
                     // draft in the provisional pane. Carry that editor state
                     // into the fully configured pane rather than discarding it.
-                    pane.set_draft(slot.pane.editor_text());
+                    pane.restore_draft(slot.pane.draft_snapshot());
                     *slot = Slot {
                         id,
                         name,
@@ -414,8 +414,14 @@ impl MuxUi {
             }
             return Ok(out);
         }
-        if matches!(event, Event::Paste(_)) && self.overlay.is_none() && !self.prefix {
-            return self.delegate(event);
+        if let Event::Paste(text) = event {
+            if self.overlay.is_none() && !self.prefix {
+                return self.delegate(Event::Paste(text));
+            }
+            if self.overlay.is_some() {
+                self.paste_into_overlay(&text);
+            }
+            return Ok(out);
         }
         let Event::Key(key) = event else {
             return Ok(out);
@@ -548,7 +554,11 @@ impl MuxUi {
                     .saturating_sub(self.sidebar_scroll)
                     .min(self.visible_rows());
                 let new_y = 3 + visible_count;
-                if y as usize == new_y && y < layout.body_height.saturating_sub(1) {
+                let footer_start = layout
+                    .body_height
+                    .saturating_sub(1 + self.sidebar_footer_rows())
+                    as usize;
+                if y as usize == new_y && new_y < footer_start {
                     self.overlay = Some(Overlay::NewMenu { selected: 0 });
                 } else if (2..2 + visible_count).contains(&(y as usize)) {
                     let i = self.sidebar_scroll + y as usize - 2;
@@ -758,6 +768,33 @@ impl MuxUi {
         }
     }
 
+    fn paste_into_overlay(&mut self, text: &str) {
+        let text = render::sanitize_terminal_text(text).replace('\n', "");
+        if text.is_empty() {
+            return;
+        }
+        let mut directory_input = None;
+        match self.overlay.as_mut() {
+            Some(Overlay::Worktree { branch, .. }) => branch.push_str(&text),
+            Some(Overlay::Current { name }) => name.push_str(&text),
+            Some(Overlay::Directory {
+                input,
+                suggestions,
+                selected,
+            }) => {
+                input.push_str(&text);
+                suggestions.clear();
+                *selected = 0;
+                self.directory_selection_explicit = false;
+                directory_input = Some(input.clone());
+            }
+            _ => {}
+        }
+        if let Some(input) = directory_input {
+            self.queue_directory_completion(input);
+        }
+    }
+
     fn invalidate_directory_completion(&mut self) {
         self.directory_generation = self.directory_generation.wrapping_add(1);
         self.directory_request = None;
@@ -851,7 +888,7 @@ impl MuxUi {
                     }
                     _ = tick.tick() => {
                         let changed = self.slots.iter_mut().fold(false, |changed, slot| {
-                            slot.pane.tick_completion() || changed
+                            slot.pane.tick() || changed
                         });
                         if !changed {
                             continue;
@@ -1551,6 +1588,34 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preserves_the_provisional_draft_cursor() {
+        let mut mux = MuxUi::new("/x".into());
+        mux.apply(MuxEvent::Add {
+            id: 1,
+            name: "pending".into(),
+            workspace: "/pending".into(),
+            worktree: false,
+            status: MuxStatus::Idle,
+            pane: pane("/pending"),
+        });
+        mux.slots[0].pane.set_draft("abc");
+        mux.handle(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)))
+            .unwrap();
+
+        mux.apply(MuxEvent::Replace {
+            id: 1,
+            name: "ready".into(),
+            workspace: "/ready".into(),
+            worktree: false,
+            status: MuxStatus::Idle,
+            pane: pane("/ready"),
+        });
+        mux.handle(key('X')).unwrap();
+
+        assert_eq!(mux.slots[0].pane.editor_text(), "abXc");
+    }
+
+    #[test]
     fn routes_by_stable_id_and_retains_drafts() {
         let mut m = MuxUi::new("/x".into());
         m.apply(MuxEvent::Add {
@@ -1665,6 +1730,38 @@ mod tests {
             mux.overlay,
             Some(Overlay::Worktree { keep: false, .. })
         ));
+    }
+
+    #[test]
+    fn paste_populates_text_overlays_and_refreshes_directory_completion() {
+        let mut mux = MuxUi::new("/x".into());
+        mux.overlay = Some(Overlay::Worktree {
+            branch: String::new(),
+            keep: true,
+        });
+        mux.handle(Event::Paste("feat/pasted\n".into())).unwrap();
+        assert!(matches!(
+            mux.overlay,
+            Some(Overlay::Worktree { ref branch, .. }) if branch == "feat/pasted"
+        ));
+
+        mux.overlay = Some(Overlay::Directory {
+            input: String::new(),
+            suggestions: vec!["/stale".into()],
+            selected: 0,
+        });
+        mux.handle(Event::Paste("/tmp/project".into())).unwrap();
+        assert!(matches!(
+            mux.overlay,
+            Some(Overlay::Directory { ref input, ref suggestions, .. })
+                if input == "/tmp/project" && suggestions.is_empty()
+        ));
+        assert_eq!(
+            mux.directory_request
+                .as_ref()
+                .map(|request| request.input.as_str()),
+            Some("/tmp/project")
+        );
     }
 
     #[test]
@@ -1838,6 +1935,18 @@ mod tests {
         assert_eq!(plain[13], format!("╰{}╯", "─".repeat(25)));
         assert_eq!(session_ordinal(8), "9");
         assert_eq!(session_ordinal(9), "10");
+    }
+
+    #[test]
+    fn hidden_new_row_has_no_mouse_hit_target_in_tiny_prefix_layout() {
+        let mut mux = MuxUi::new("/".into());
+        mux.width = 80;
+        mux.height = 8;
+        mux.prefix = true;
+
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 3);
+
+        assert!(mux.overlay.is_none());
     }
 
     #[test]
