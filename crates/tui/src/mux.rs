@@ -250,7 +250,8 @@ impl MuxUi {
         } else {
             None
         };
-        let main_x = side.map_or(0, |(_, w)| w.saturating_add(1));
+        // Keep the sidebar border visually separate from pane content.
+        let main_x = side.map_or(0, |(_, w)| w.saturating_add(3));
         MuxLayout {
             sidebar: side,
             main_x,
@@ -511,12 +512,16 @@ impl MuxUi {
     fn handle_mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
         let layout = self.layout(self.width, self.height);
         let sidebar_width = layout.sidebar.map(|(_, width)| width);
-        if sidebar_width.is_none_or(|width| x > width) {
+        if x >= layout.main_x {
             match kind {
                 MouseEventKind::ScrollUp => self.scroll_selected(3),
                 MouseEventKind::ScrollDown => self.scroll_selected(-3),
                 _ => {}
             }
+            return;
+        }
+        // The two cells between the sidebar border and main pane are inert.
+        if sidebar_width.is_some_and(|width| x > width) {
             return;
         }
         match kind {
@@ -808,8 +813,11 @@ impl MuxUi {
                         self.apply_directory_completion(completion);
                     }
                     _ = tick.tick() => {
-                        for slot in &mut self.slots {
-                            slot.pane.tick_completion();
+                        let changed = self.slots.iter_mut().fold(false, |changed, slot| {
+                            slot.pane.tick_completion() || changed
+                        });
+                        if !changed {
+                            continue;
                         }
                     }
                     _ = cancel.cancelled() => {
@@ -863,7 +871,7 @@ impl MuxUi {
         };
         let mut rows = (0..height).map(|_| framed("", muted)).collect::<Vec<_>>();
 
-        let top_label = "─ SESSIONS ";
+        let top_label = "─ MUX ";
         let top_inner = if interior >= top_label.width() {
             format!("{top_label}{}", "─".repeat(interior - top_label.width()))
         } else {
@@ -965,7 +973,7 @@ impl MuxUi {
         if let Some((_, sidebar_width)) = layout.sidebar {
             let sidebar = self.sidebar_rows(sidebar_width, layout.body_height, muted, accent);
             for (row, sidebar_row) in rows.iter_mut().zip(sidebar) {
-                *row = sidebar_row;
+                *row = format!("{sidebar_row}  ");
             }
         }
 
@@ -1014,7 +1022,10 @@ impl MuxUi {
             let _ = write!(buffer, "{}{}", MoveTo(0, index as u16), row);
         }
         if let Some(overlay) = &self.overlay {
-            draw_overlay(&mut buffer, layout, overlay, theme);
+            let cursor = draw_overlay(&mut buffer, layout, overlay, theme);
+            if let Some((x, y)) = cursor.and_then(|cursor| bounded_cursor(cursor, w, h)) {
+                let _ = write!(buffer, "{}{}", MoveTo(x, y), Show);
+            }
         } else if let Some((x, y)) = pane_cursor.and_then(|cursor| bounded_cursor(cursor, w, h)) {
             let _ = write!(buffer, "{}{}", MoveTo(x, y), Show);
         }
@@ -1230,9 +1241,36 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
     OverlayFrame { x, y, width, rows }
 }
 
-fn draw_overlay(buffer: &mut String, layout: MuxLayout, overlay: &Overlay, theme: render::Theme) {
+fn overlay_cursor(frame: &OverlayFrame, overlay: &Overlay) -> Option<(u16, u16)> {
+    let (label, input) = match overlay {
+        Overlay::Worktree { branch, .. } => ("Branch / name: ", branch.as_str()),
+        Overlay::Current { name } => ("Session name: ", name.as_str()),
+        Overlay::Directory { input, .. } => ("Directory: ", input.as_str()),
+        Overlay::Rename { input } => ("Name: ", input.as_str()),
+        _ => return None,
+    };
+    // Editable content is on the first content row, after the left border and
+    // its padding. Clamp the caret to the final opaque interior cell when the
+    // value is wider than the modal.
+    if frame.width < 3 || frame.rows.len() <= 3 {
+        return None;
+    }
+    let column = 2usize + label.width() + input.width();
+    Some((
+        frame.x + column.min(frame.width.saturating_sub(2) as usize) as u16,
+        frame.y + 2,
+    ))
+}
+
+fn draw_overlay(
+    buffer: &mut String,
+    layout: MuxLayout,
+    overlay: &Overlay,
+    theme: render::Theme,
+) -> Option<(u16, u16)> {
     use std::fmt::Write as _;
     let frame = overlay_frame(layout, overlay);
+    let cursor = overlay_cursor(&frame, overlay);
     let primary = Style::default().fg(theme.primary_text);
     let muted = Style::default()
         .fg(theme.muted_text)
@@ -1253,6 +1291,7 @@ fn draw_overlay(buffer: &mut String, layout: MuxLayout, overlay: &Overlay, theme
             styled_fit(text, frame.width as usize, style)
         );
     }
+    cursor
 }
 
 static MUX_RAW_MODE: AtomicBool = AtomicBool::new(false);
@@ -1585,19 +1624,19 @@ mod tests {
 
             for (y, row) in sidebar.iter().enumerate() {
                 let plain = strip_ansi(row);
-                assert_eq!(plain.width(), layout.main_x as usize, "sidebar row {y}");
+                assert_eq!(plain.width(), sidebar_width as usize + 1, "sidebar row {y}");
                 let boundary = plain.chars().last().unwrap();
                 assert!(matches!(boundary, '┐' | '│' | '┘'), "sidebar row {y}");
 
                 // Model final composition with a visible main-pane first cell.
                 let screen = format!(
-                    "{plain}A{}",
+                    "{plain}  A{}",
                     " ".repeat(layout.main_width.saturating_sub(1) as usize)
                 );
                 assert_eq!(screen.width(), 80, "screen row {y}");
                 assert_eq!(screen.chars().nth(layout.main_x as usize), Some('A'));
             }
-            assert!(strip_ansi(&sidebar[0]).contains("SESSIONS"));
+            assert!(strip_ansi(&sidebar[0]).contains("MUX"));
             assert!(strip_ansi(sidebar.last().unwrap()).starts_with('└'));
         }
     }
@@ -1674,6 +1713,55 @@ mod tests {
                 .all(|row| row.width() == second.width as usize)
         );
         assert!(!second.rows.join("\n").contains("New worktree"));
+    }
+
+    #[test]
+    fn editable_overlay_cursor_tracks_unicode_and_edits() {
+        let mut mux = MuxUi::new("/x".into());
+        mux.handle(Event::Resize(100, 30)).unwrap();
+        mux.handle(Event::Key(KeyEvent::new(
+            KeyCode::Null,
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+        mux.handle(key('n')).unwrap();
+        mux.handle(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+
+        let layout = mux.layout(100, 30);
+        let Overlay::Worktree { .. } = mux.overlay.as_ref().unwrap() else {
+            panic!("new menu did not open worktree editor");
+        };
+        let empty = overlay_frame(layout, mux.overlay.as_ref().unwrap());
+        let empty_cursor = overlay_cursor(&empty, mux.overlay.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            empty_cursor,
+            (empty.x + 2 + "Branch / name: ".width() as u16, empty.y + 2)
+        );
+
+        mux.handle(key('界')).unwrap();
+        let typed = overlay_frame(layout, mux.overlay.as_ref().unwrap());
+        assert_eq!(
+            overlay_cursor(&typed, mux.overlay.as_ref().unwrap())
+                .unwrap()
+                .0,
+            empty_cursor.0 + 2
+        );
+        mux.handle(Event::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )))
+        .unwrap();
+        let erased = overlay_frame(layout, mux.overlay.as_ref().unwrap());
+        assert_eq!(
+            overlay_cursor(&erased, mux.overlay.as_ref().unwrap()).unwrap(),
+            empty_cursor
+        );
+
+        assert!(overlay_cursor(&empty, &Overlay::Help).is_none());
     }
 
     #[test]

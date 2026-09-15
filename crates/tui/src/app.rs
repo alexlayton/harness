@@ -3486,10 +3486,13 @@ impl AgentPane {
 
     /// Apply any completed asynchronous path-completion scan. Mux owners call
     /// this from their periodic tick because an [`AgentPane`] owns no runtime.
-    pub fn tick_completion(&mut self) {
+    pub fn tick_completion(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(result) = self.state.path_completion_rx.try_recv() {
             self.state.apply_path_completion(result);
+            changed = true;
         }
+        changed
     }
 
     /// Scroll the retained transcript viewport. Positive values move toward
@@ -3547,9 +3550,14 @@ impl AgentPane {
         lines.truncate(self.state.height as usize);
         // Every retained row must obey the pane rectangle even when startup
         // metadata or a banner is wider than a degenerate pane.
+        let gutter = render::horizontal_pad(self.state.width) as usize;
         lines = lines
             .into_iter()
-            .map(|line| render::fit_line_to_width(&line, self.state.width as usize))
+            .map(|line| {
+                let mut padded = Line::from(Span::raw(" ".repeat(gutter)));
+                padded.spans.extend(line.spans);
+                render::fit_line_to_width(&padded, self.state.width as usize)
+            })
             .collect();
         PaneFrame {
             lines,
@@ -3651,6 +3659,20 @@ mod tests {
             );
             assert!(frame.cursor_row < height);
             assert!(frame.cursor_col < width);
+        }
+    }
+
+    #[test]
+    fn retained_input_text_and_cursor_share_horizontal_coordinates() {
+        let mut pane = pane(PathBuf::from("/workspace"));
+        for draft in ["", "hé界"] {
+            pane.set_draft(draft);
+            let frame = pane.render(80, 12);
+            let row = row_text(&frame.lines[frame.cursor_row as usize]);
+            let prefix = row.find('›').expect("input prefix is rendered");
+            let through_draft = &row[..prefix + '›'.len_utf8() + 1 + draft.len()];
+            assert_eq!(frame.cursor_col as usize, through_draft.width());
+            assert_eq!(&row[prefix + '›'.len_utf8() + 1..][..draft.len()], draft);
         }
     }
 
