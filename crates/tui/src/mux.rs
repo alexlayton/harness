@@ -154,6 +154,7 @@ enum Overlay {
         selected: usize,
     },
     Close,
+    ConfirmExit,
     ConfirmDuplicate {
         choice: WorkspaceChoice,
     },
@@ -232,8 +233,8 @@ impl MuxUi {
         let body_height = height;
         // The command strip needs a little more room than the original roster.
         // Hide it only when that minimum would leave no useful agent pane.
-        let side = if width >= 38 {
-            Some((0, (width / 3).clamp(26, 32)))
+        let side = if width >= 36 {
+            Some((0, (width / 3).clamp(24, 30)))
         } else {
             None
         };
@@ -439,13 +440,7 @@ impl MuxUi {
                         name: basename(&self.cwd),
                     })
                 }
-                KeyCode::Char('d') => {
-                    self.overlay = Some(Overlay::Directory {
-                        input: String::new(),
-                        suggestions: vec![],
-                        selected: 0,
-                    })
-                }
+                KeyCode::Char('d') => self.open_directory_overlay(),
                 KeyCode::Char('j') => self.switch(1),
                 KeyCode::Char('k') => self.switch(-1),
                 KeyCode::Char('?') => self.overlay = Some(Overlay::Help),
@@ -508,10 +503,10 @@ impl MuxUi {
             .map(|input| MuxAction::AgentInput { id, input })
             .collect::<Vec<_>>();
         if result.exit_requested {
-            // Preserve standalone semantics: after Ctrl+C first clears a
-            // draft, a second Ctrl+C exits the frontend. Closing just one slot
-            // remains the explicit, confirmed mux-prefix `x` action.
-            return Ok(vec![MuxAction::Exit]);
+            // A mux roster is process-local, so an accidental Ctrl+C/Ctrl+D
+            // would discard every running agent. Require explicit confirmation.
+            self.overlay = Some(Overlay::ConfirmExit);
+            return Ok(vec![]);
         }
         Ok(out)
     }
@@ -587,6 +582,23 @@ impl MuxUi {
         }
     }
 
+    fn open_directory_overlay(&mut self) {
+        self.overlay = Some(Overlay::Directory {
+            input: String::new(),
+            suggestions: vec![],
+            selected: 0,
+        });
+        self.queue_directory_completion(String::new());
+    }
+
+    fn queue_directory_completion(&mut self, input: String) {
+        self.directory_generation = self.directory_generation.wrapping_add(1);
+        self.directory_request = Some(DirectoryRequest {
+            generation: self.directory_generation,
+            input,
+        });
+    }
+
     fn handle_overlay(&mut self, mut overlay: Overlay, key: KeyEvent, out: &mut Vec<MuxAction>) {
         if key.code == KeyCode::Esc {
             if matches!(overlay, Overlay::Directory { .. }) {
@@ -611,22 +623,20 @@ impl MuxUi {
                     *selected = (*selected + 1).min(2);
                     self.overlay = Some(overlay);
                 }
-                KeyCode::Enter => {
-                    self.overlay = Some(match *selected {
-                        0 => Overlay::Worktree {
+                KeyCode::Enter => match *selected {
+                    0 => {
+                        self.overlay = Some(Overlay::Worktree {
                             branch: String::new(),
                             keep: true,
-                        },
-                        1 => Overlay::Current {
+                        })
+                    }
+                    1 => {
+                        self.overlay = Some(Overlay::Current {
                             name: basename(&self.cwd),
-                        },
-                        _ => Overlay::Directory {
-                            input: String::new(),
-                            suggestions: vec![],
-                            selected: 0,
-                        },
-                    })
-                }
+                        })
+                    }
+                    _ => self.open_directory_overlay(),
+                },
                 _ => self.overlay = Some(overlay),
             },
             Overlay::Worktree { branch, keep } => match key.code {
@@ -637,7 +647,10 @@ impl MuxUi {
                     },
                     out,
                 ),
-                KeyCode::Tab => *keep = !*keep,
+                KeyCode::Tab => {
+                    *keep = !*keep;
+                    self.overlay = Some(overlay);
+                }
                 _ => {
                     edit_string(branch, key);
                     self.overlay = Some(overlay)
@@ -663,7 +676,10 @@ impl MuxUi {
             } => match key.code {
                 KeyCode::Tab => {
                     if let Some(p) = suggestions.get(*selected) {
-                        *input = p.display().to_string()
+                        *input = p.display().to_string();
+                        suggestions.clear();
+                        *selected = 0;
+                        self.queue_directory_completion(input.clone());
                     }
                     self.overlay = Some(overlay)
                 }
@@ -698,11 +714,7 @@ impl MuxUi {
                     if *input != old_input {
                         suggestions.clear();
                         *selected = 0;
-                        self.directory_generation = self.directory_generation.wrapping_add(1);
-                        self.directory_request = Some(DirectoryRequest {
-                            generation: self.directory_generation,
-                            input: input.clone(),
-                        });
+                        self.queue_directory_completion(input.clone());
                     }
                     self.overlay = Some(overlay)
                 }
@@ -714,6 +726,13 @@ impl MuxUi {
                     }
                 } else {
                     self.overlay = Some(overlay)
+                }
+            }
+            Overlay::ConfirmExit => {
+                if key.code == KeyCode::Enter {
+                    out.push(MuxAction::Exit);
+                } else {
+                    self.overlay = Some(overlay);
                 }
             }
             Overlay::ConfirmDuplicate { choice } => {
@@ -749,7 +768,11 @@ impl MuxUi {
         if *input != completion.input {
             return false;
         }
-        *suggestions = completion.suggestions.into_iter().take(1).collect();
+        *suggestions = completion
+            .suggestions
+            .into_iter()
+            .take(MAX_DIRECTORY_SUGGESTIONS)
+            .collect();
         *selected = 0;
         true
     }
@@ -887,7 +910,7 @@ impl MuxUi {
             ])
         };
         let mut rows = (0..height).map(|_| framed("", muted)).collect::<Vec<_>>();
-        rows[0] = ruled("╭", "─ SESSIONS ", "╮", accent.add_modifier(Modifier::BOLD));
+        rows[0] = ruled("╭", "─ SESSIONS ", "╮", muted.add_modifier(Modifier::BOLD));
         if height == 1 {
             return rows;
         }
@@ -906,16 +929,15 @@ impl MuxUi {
             let y = 2 + n;
             let index = self.sidebar_scroll + n;
             let selected = Some(index) == self.selected;
-            let left = format!(
-                " {} {} {}",
-                if selected { "›" } else { " " },
-                session_ordinal(index),
-                slot.name
-            );
-            let text = format!(
-                "{} {}",
-                fit(&left, interior.saturating_sub(2)),
-                slot.status.glyph()
+            let text = fit(
+                &format!(
+                    " {} {} {} {}",
+                    if selected { "›" } else { " " },
+                    session_ordinal(index),
+                    slot.name,
+                    slot.status.glyph()
+                ),
+                interior,
             );
             rows[y] = framed(
                 &text,
@@ -1089,6 +1111,8 @@ fn expand_path(value: &str, cwd: &Path) -> PathBuf {
     };
     if p.is_absolute() { p } else { cwd.join(p) }
 }
+const MAX_DIRECTORY_SUGGESTIONS: usize = 6;
+
 fn directory_suggestions(value: &str, cwd: &Path) -> Vec<PathBuf> {
     let path = expand_path(value, cwd);
     let (parent, needle) = if path.is_dir() {
@@ -1109,27 +1133,28 @@ fn directory_suggestions(value: &str, cwd: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if !p.is_dir() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !p.is_dir() || name.starts_with('.') {
                 return None;
             }
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            is_subsequence(&needle, &name).then_some(p)
+            let lower = name.to_lowercase();
+            is_subsequence(&needle, &lower).then_some((
+                if lower.starts_with(&needle) { 0 } else { 1 },
+                lower,
+                p,
+            ))
         })
         .collect::<Vec<_>>();
-    found.sort();
-    found.truncate(1);
-    found
+    found.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    found.truncate(MAX_DIRECTORY_SUGGESTIONS);
+    found.into_iter().map(|(_, _, path)| path).collect()
 }
 fn is_subsequence(q: &str, s: &str) -> bool {
     let mut chars = s.chars();
     q.chars().all(|c| chars.by_ref().any(|v| v == c))
 }
 fn session_ordinal(index: usize) -> String {
-    const CIRCLED: [char; 9] = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨'];
-    CIRCLED
-        .get(index)
-        .map(char::to_string)
-        .unwrap_or_else(|| (index + 1).to_string())
+    (index + 1).to_string()
 }
 
 fn fit(text: &str, width: usize) -> String {
@@ -1160,6 +1185,7 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
         Overlay::Worktree { .. } => "New worktree agent",
         Overlay::Directory { .. } => "Choose directory",
         Overlay::Close => "Close agent?",
+        Overlay::ConfirmExit => "Exit Harness?",
         Overlay::ConfirmDuplicate { .. } => "Duplicate workspace?",
         Overlay::Help => "Mux help",
     };
@@ -1179,17 +1205,27 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
             format!("Keep worktree: {} (Tab)", if *keep { "yes" } else { "no" }),
         ],
         Overlay::Current { name } => vec![format!("Session name: {name}")],
-        // Keep one suggestion row reserved even while completion is pending or
-        // has no match, so asynchronous scans never move or resize the editor.
+        // Reserve a compact candidate list so asynchronous scans do not move
+        // or resize the editor while results filter down as the user types.
         Overlay::Directory {
-            input, suggestions, ..
-        } => vec![
-            format!("Directory: {input}"),
-            suggestions
-                .first()
-                .map_or_else(String::new, |path| path.display().to_string()),
-        ],
+            input,
+            suggestions,
+            selected,
+        } => std::iter::once(format!("Directory: {input}"))
+            .chain((0..MAX_DIRECTORY_SUGGESTIONS).map(|index| {
+                suggestions.get(index).map_or_else(String::new, |path| {
+                    format!(
+                        "{} {}",
+                        if index == *selected { '›' } else { ' ' },
+                        path.display()
+                    )
+                })
+            }))
+            .collect(),
         Overlay::Close => vec!["Enter to close; Esc to cancel".into()],
+        Overlay::ConfirmExit => {
+            vec!["All running agents will stop. Enter to exit; Esc to cancel".into()]
+        }
         Overlay::ConfirmDuplicate { .. } => vec![
             "A direct agent already uses this directory. Enter to create anyway; Esc to cancel"
                 .into(),
@@ -1214,9 +1250,20 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
         let text = match (width, height, row) {
             (0, _, _) => String::new(),
             (1, _, _) => "│".into(),
-            (_, 1, _) => format!("┌{}┐", "─".repeat(width.saturating_sub(2) as usize)),
-            (_, _, 0) => format!("┌─ {title} "),
-            (_, _, r) if r == height - 1 => "└".into(),
+            (_, 1, _) => format!("╭{}╮", "─".repeat(width.saturating_sub(2) as usize)),
+            (_, _, 0) => {
+                let interior = width.saturating_sub(2) as usize;
+                let label = format!("─ {title} ");
+                let rule = if label.width() <= interior {
+                    format!("{label}{}", "─".repeat(interior - label.width()))
+                } else {
+                    fit(&label, interior)
+                };
+                format!("╭{rule}╮")
+            }
+            (_, _, r) if r == height - 1 => {
+                format!("╰{}╯", "─".repeat(width.saturating_sub(2) as usize))
+            }
             (_, _, 1) => "│".into(),
             _ => format!(
                 "│ {}",
@@ -1229,9 +1276,9 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
         let mut fitted = fit(&text, width as usize);
         if width >= 2 {
             let right = if row == 0 {
-                '┐'
+                '╮'
             } else if row == height - 1 {
-                '┘'
+                '╯'
             } else {
                 '│'
             };
@@ -1277,10 +1324,15 @@ fn draw_overlay(
         .add_modifier(Modifier::DIM);
     let accent = Style::default().fg(theme.accent);
     for (row, text) in frame.rows.iter().enumerate() {
-        let style = if row == 0
-            || row + 1 == frame.rows.len()
-            || (matches!(overlay, Overlay::Directory { .. }) && row == 3)
-        {
+        let directory_selection = match overlay {
+            Overlay::Directory { selected, .. } => row == selected + 3,
+            _ => false,
+        };
+        let style = if row == 0 || row + 1 == frame.rows.len() {
+            muted
+        } else if directory_selection {
+            accent.add_modifier(Modifier::BOLD)
+        } else if matches!(overlay, Overlay::Directory { .. }) && row >= 3 {
             muted
         } else if matches!(overlay, Overlay::NewMenu { selected: 0 }) && row == 2
             || matches!(overlay, Overlay::NewMenu { selected: 1 }) && row == 4
@@ -1290,12 +1342,25 @@ fn draw_overlay(
         } else {
             primary
         };
+        let y = frame.y + row as u16;
         buffer.set_line(
             frame.x,
-            frame.y + row as u16,
+            y,
             &Line::from(Span::styled(text.clone(), style)),
             frame.width,
         );
+        // Keep every modal outline the same muted gray as the sidebar,
+        // independently of highlighted or primary-colored content.
+        if row == 0 || row + 1 == frame.rows.len() {
+            for x in frame.x..frame.x.saturating_add(frame.width) {
+                buffer[(x, y)].set_style(muted);
+            }
+        } else if frame.width > 0 {
+            buffer[(frame.x, y)].set_style(muted);
+            if frame.width > 1 {
+                buffer[(frame.x + frame.width - 1, y)].set_style(muted);
+            }
+        }
     }
     cursor
 }
@@ -1564,6 +1629,23 @@ mod tests {
     }
 
     #[test]
+    fn worktree_tab_toggles_keep_without_closing_editor() {
+        let mut mux = MuxUi::new("/x".into());
+        mux.overlay = Some(Overlay::Worktree {
+            branch: "feature".into(),
+            keep: true,
+        });
+
+        mux.handle(Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)))
+            .unwrap();
+
+        assert!(matches!(
+            mux.overlay,
+            Some(Overlay::Worktree { keep: false, .. })
+        ));
+    }
+
+    #[test]
     fn directory_completion_is_debounced_and_stale_results_are_ignored() {
         let mut mux = MuxUi::new("/x".into());
         mux.overlay = Some(Overlay::Directory {
@@ -1663,16 +1745,16 @@ mod tests {
 
         assert!(plain[0].starts_with("╭─ SESSIONS "));
         assert!(plain[1].trim_matches(['│', ' ']).is_empty());
-        assert!(plain[2].contains("› ① agent-1"));
-        assert!(plain[3].contains("  ② agent-2"));
-        assert!(plain[7].contains("  ⑥ agent-6"));
+        assert!(plain[2].contains("› 1 agent-1 ✓"));
+        assert!(plain[3].contains("  2 agent-2 ✓"));
+        assert!(plain[7].contains("  6 agent-6 ✓"));
         assert!(plain[8].trim_matches(['│', ' ']).is_empty());
         assert!(plain[9].contains("+ New agent"));
         assert!(plain[10].trim_matches(['│', ' ']).is_empty());
         assert_eq!(plain[11], format!("├{}┤", "─".repeat(25)));
         assert!(plain[12].contains("^Space  mux"));
         assert_eq!(plain[13], format!("╰{}╯", "─".repeat(25)));
-        assert_eq!(session_ordinal(8), "⑨");
+        assert_eq!(session_ordinal(8), "9");
         assert_eq!(session_ordinal(9), "10");
     }
 
@@ -1790,10 +1872,24 @@ mod tests {
             first.x - layout.main_x,
             (layout.main_width - first.width) / 2
         );
-        assert!(first.rows[0].starts_with('┌') && first.rows[0].ends_with('┐'));
+        assert!(first.rows[0].starts_with("╭─ New agent "));
+        assert!(first.rows[0].ends_with('╮'));
         assert!(
-            first.rows.last().unwrap().starts_with('└')
-                && first.rows.last().unwrap().ends_with('┘')
+            first.rows[0]
+                .trim_matches(['╭', '╮', '─'])
+                .contains("New agent")
+        );
+        assert!(
+            first.rows.last().unwrap().starts_with('╰')
+                && first.rows.last().unwrap().ends_with('╯')
+                && first
+                    .rows
+                    .last()
+                    .unwrap()
+                    .chars()
+                    .skip(1)
+                    .take(first.width.saturating_sub(2) as usize)
+                    .all(|character| character == '─')
         );
         assert!(
             first
@@ -1967,7 +2063,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_overlay_has_fixed_single_muted_suggestion_row() {
+    fn directory_overlay_has_fixed_filterable_suggestion_list() {
         let layout = MuxUi::new("/x".into()).layout(100, 30);
         let empty = Overlay::Directory {
             input: "a".into(),
@@ -1983,21 +2079,19 @@ mod tests {
         let many_frame = overlay_frame(layout, &many);
         assert_eq!(empty_frame.rows.len(), many_frame.rows.len());
         assert_eq!(empty_frame.y, many_frame.y);
-        assert!(many_frame.rows.join("\n").contains("/first"));
-        assert!(!many_frame.rows.join("\n").contains("/second"));
+        assert!(many_frame.rows.join("\n").contains("› /first"));
+        assert!(many_frame.rows.join("\n").contains("/second"));
+        assert!(many_frame.rows.join("\n").contains("/third"));
 
         let theme = render::Theme::default();
         let mut buffer = Buffer::empty(Rect::new(0, 0, 100, 30));
         draw_overlay(&mut buffer, layout, &many, theme);
-        let suggestion_y = many_frame.y + 3;
-        let muted = Style::default()
-            .fg(theme.muted_text)
-            .add_modifier(Modifier::DIM);
-        for x in many_frame.x..many_frame.x + many_frame.width {
-            let style = buffer[(x, suggestion_y)].style();
-            assert_eq!(style.fg, muted.fg);
-            assert!(style.add_modifier.contains(Modifier::DIM));
-        }
+        let selected_style = buffer[(many_frame.x + 2, many_frame.y + 3)].style();
+        assert_eq!(selected_style.fg, Some(theme.accent));
+        assert!(selected_style.add_modifier.contains(Modifier::BOLD));
+        let other_style = buffer[(many_frame.x + 2, many_frame.y + 4)].style();
+        assert_eq!(other_style.fg, Some(theme.muted_text));
+        assert!(other_style.add_modifier.contains(Modifier::DIM));
         let input_style = buffer[(many_frame.x + 2, many_frame.y + 2)].style();
         assert_eq!(input_style.fg, Some(theme.primary_text));
         assert!(!input_style.add_modifier.contains(Modifier::DIM));
@@ -2092,7 +2186,7 @@ mod tests {
     }
 
     #[test]
-    fn delegated_exit_preserves_standalone_ctrl_c_semantics() {
+    fn delegated_exit_requires_confirmation_after_draft_is_cleared() {
         let mut mux = MuxUi::new("/".into());
         mux.apply(MuxEvent::Add {
             id: 7,
@@ -2106,8 +2200,25 @@ mod tests {
         let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(mux.handle(ctrl_c.clone()).unwrap().is_empty());
         assert!(mux.overlay.is_none());
+        assert!(mux.handle(ctrl_c.clone()).unwrap().is_empty());
+        assert!(matches!(mux.overlay, Some(Overlay::ConfirmExit)));
+
+        assert!(
+            mux.handle(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(mux.overlay.is_none());
+
+        assert!(mux.handle(ctrl_c).unwrap().is_empty());
+        assert!(matches!(mux.overlay, Some(Overlay::ConfirmExit)));
         assert!(matches!(
-            mux.handle(ctrl_c).unwrap().as_slice(),
+            mux.handle(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE
+            )))
+            .unwrap()
+            .as_slice(),
             [MuxAction::Exit]
         ));
     }
