@@ -873,18 +873,8 @@ struct IndexEnvelope {
     event_id: Option<String>,
     sequence: Option<u64>,
     timestamp: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct IndexedDataEnvelope {
     #[serde(default)]
     data: IndexedData,
-}
-
-#[derive(Deserialize, Default)]
-struct IndexedMessageEnvelope {
-    #[serde(default)]
-    data: IndexedMessage,
 }
 
 #[derive(Deserialize, Default)]
@@ -892,10 +882,6 @@ struct IndexedData {
     provider: Option<String>,
     model: Option<String>,
     title: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct IndexedMessage {
     #[serde(default)]
     content: Vec<IndexedContent>,
 }
@@ -927,17 +913,10 @@ fn index_title(value: &str) -> String {
     format!("{}…", &first_line[..end])
 }
 
-#[derive(Clone, Copy)]
-struct IndexSpan {
-    start: u64,
-    bytes: u64,
-    end: u64,
-}
-
 enum IndexRecord<T> {
     Eof,
     Invalid,
-    Value(T, IndexSpan),
+    Value(T),
 }
 
 /// Deserialize one physical JSONL line without first collecting it in a
@@ -981,25 +960,10 @@ fn next_index_record<T: serde::de::DeserializeOwned>(
     reader.seek(SeekFrom::Start(start))?;
     let parsed = serde_json::from_reader(reader.by_ref().take(line_bytes));
     reader.seek(SeekFrom::Start(end))?;
-    let span = IndexSpan {
-        start,
-        bytes: line_bytes,
-        end,
-    };
     Ok(match parsed {
-        Ok(value) => IndexRecord::Value(value, span),
+        Ok(value) => IndexRecord::Value(value),
         Err(_) => IndexRecord::Invalid,
     })
-}
-
-fn parse_index_span<T: serde::de::DeserializeOwned>(
-    reader: &mut BufReader<File>,
-    span: IndexSpan,
-) -> std::io::Result<Option<T>> {
-    reader.seek(SeekFrom::Start(span.start))?;
-    let parsed = serde_json::from_reader(reader.by_ref().take(span.bytes)).ok();
-    reader.seek(SeekFrom::Start(span.end))?;
-    Ok(parsed)
 }
 
 /// Read only the metadata needed by the session picker. This deliberately
@@ -1010,7 +974,7 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
     let header: IndexHeaderEnvelope = match next_index_record(&mut reader)
         .map_err(|source| io_error("read session header", path, source))?
     {
-        IndexRecord::Value(header, _) => header,
+        IndexRecord::Value(header) => header,
         IndexRecord::Eof | IndexRecord::Invalid => return Ok(None),
     };
     if header.version.is_none()
@@ -1051,11 +1015,10 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
         let raw = match next_index_record::<IndexEnvelope>(&mut reader)
             .map_err(|source| io_error("read session index", path, source))?
         {
-            IndexRecord::Value(raw, span) => (raw, span),
+            IndexRecord::Value(raw) => raw,
             IndexRecord::Eof => break,
             IndexRecord::Invalid => return Ok(None),
         };
-        let (raw, span) = raw;
         if raw.version.is_none()
             || raw.version.unwrap_or_default() > crate::model::FORMAT_VERSION
             || raw.kind.as_deref() == Some("session")
@@ -1082,19 +1045,13 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
         event_count = event_count.saturating_add(1);
         expected_sequence = expected_sequence.saturating_add(1);
         match kind {
-            // Re-read only metadata-bearing records from the bounded physical
-            // span. This second pass is independent of JSON object key order;
-            // large tool-result payloads are never materialized.
+            // `IndexEnvelope` decodes this small metadata subset in the same
+            // pass. Unknown fields (including large tool outputs) are skipped
+            // by serde without allocating their payloads or seeking backward.
             "user_message" | "assistant_message" => {
-                let Some(message) =
-                    parse_index_span::<IndexedMessageEnvelope>(&mut reader, span)
-                        .map_err(|source| io_error("read session message index", path, source))?
-                else {
-                    return Ok(None);
-                };
-                has_conversation |= !message.data.content.is_empty();
+                has_conversation |= !raw.data.content.is_empty();
                 if title.is_none() && kind == "user_message" {
-                    title = message
+                    title = raw
                         .data
                         .content
                         .iter()
@@ -1111,21 +1068,11 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
                 has_conversation = true;
             }
             "model_change" => {
-                let Some(change) = parse_index_span::<IndexedDataEnvelope>(&mut reader, span)
-                    .map_err(|source| io_error("read session model index", path, source))?
-                else {
-                    return Ok(None);
-                };
-                provider = change.data.provider;
-                model = change.data.model;
+                provider = raw.data.provider;
+                model = raw.data.model;
             }
             "metadata_change" => {
-                let Some(change) = parse_index_span::<IndexedDataEnvelope>(&mut reader, span)
-                    .map_err(|source| io_error("read session metadata index", path, source))?
-                else {
-                    return Ok(None);
-                };
-                title = change.data.title;
+                title = raw.data.title;
             }
             _ => {}
         }
