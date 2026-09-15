@@ -1,7 +1,8 @@
 //! Host-side lifecycle supervisor for the terminal multiplexer.
 
 use crate::config::{
-    Config, ProviderArg, WorktreeArgs, build_provider_with_auths, provider_factory,
+    Config, ProviderArg, WorktreeArgs, build_provider_with_auths, provider_factory, save_reasoning,
+    save_settings,
 };
 use crate::{context, tui_adapter, worktree};
 use agent::assembly::AgentBuilder;
@@ -68,6 +69,7 @@ enum RuntimeMessage {
         workspace: PathBuf,
         worktree: bool,
         pane: Box<AgentPane>,
+        notices: Vec<String>,
     },
     Ready(MuxId),
     Event(MuxId, AgentEvent),
@@ -137,7 +139,7 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                 Some(MuxAction::Exit) | None => break,
             },
             message = runtime_rx.recv() => match message {
-                Some(RuntimeMessage::Prepared { id, name, workspace, worktree, pane }) => if slots.contains_key(&id) {
+                Some(RuntimeMessage::Prepared { id, name, workspace, worktree, pane, notices }) => if slots.contains_key(&id) {
                     let _ = event_tx.send(MuxEvent::Replace {
                         id,
                         name,
@@ -146,6 +148,9 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                         status: MuxStatus::Starting,
                         pane: *pane,
                     });
+                    for notice in notices {
+                        let _ = event_tx.send(MuxEvent::Ui { id, event: tui::UiEvent::Notice(notice) });
+                    }
                 },
                 Some(RuntimeMessage::Ready(id)) => if slots.contains_key(&id) {
                     let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Idle });
@@ -153,8 +158,19 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                 Some(RuntimeMessage::Event(id, event)) => {
                     if let Some(slot) = slots.get_mut(&id) {
                         match &event {
-                            AgentEvent::ModelChanged { provider, model } => { slot.settings.provider = provider.clone(); slot.settings.model = model.clone(); }
-                            AgentEvent::ReasoningChanged { level } => if let Ok(value) = level.parse() { slot.settings.reasoning = value; },
+                            AgentEvent::ModelChanged { provider, model } => {
+                                slot.settings.provider = provider.clone();
+                                slot.settings.model = model.clone();
+                                if let Err(error) = save_settings(provider, model) {
+                                    tracing::warn!(error = %error, "could not persist mux model settings");
+                                }
+                            }
+                            AgentEvent::ReasoningChanged { level } => if let Ok(value) = level.parse() {
+                                slot.settings.reasoning = value;
+                                if let Err(error) = save_reasoning(value) {
+                                    tracing::warn!(error = %error, "could not persist mux reasoning setting");
+                                }
+                            },
                             _ => {}
                         }
                         if let Some(status) = status_for_agent_event(&event) {
@@ -277,7 +293,7 @@ fn create_slot(
                 !preparation_cancel.is_cancelled(),
                 "slot preparation cancelled"
             );
-            let (workspace, name, lease) = prepare_workspace(choice, &launch)?;
+            let (workspace, name, lease, notices) = prepare_workspace(choice, &launch)?;
             let lease = RetainedLease(lease);
             anyhow::ensure!(
                 !preparation_cancel.is_cancelled(),
@@ -340,6 +356,7 @@ fn create_slot(
                 provider,
                 store,
                 session,
+                notices,
             ))
         })
         .await;
@@ -358,6 +375,7 @@ fn create_slot(
                 provider,
                 store,
                 session,
+                notices,
             ))) => {
                 let result = async {
                     if task_cancel.is_cancelled() {
@@ -377,6 +395,7 @@ fn create_slot(
                         workspace: workspace.clone(),
                         worktree,
                         pane: Box::new(ready_pane),
+                        notices,
                     });
                     let agent = AgentBuilder::new(
                         provider,
@@ -437,7 +456,12 @@ fn create_slot(
 fn prepare_workspace(
     choice: WorkspaceChoice,
     launch: &Path,
-) -> Result<(PathBuf, String, Option<worktree::WorktreeLease>)> {
+) -> Result<(
+    PathBuf,
+    String,
+    Option<worktree::WorktreeLease>,
+    Vec<String>,
+)> {
     match choice {
         WorkspaceChoice::Directory { path, name } => {
             let path = std::fs::canonicalize(&path)
@@ -447,7 +471,7 @@ fn prepare_workspace(
                 "workspace is not a directory: {}",
                 path.display()
             );
-            Ok((path, name, None))
+            Ok((path, name, None, vec![]))
         }
         WorkspaceChoice::Worktree { branch, keep } => {
             let args = WorktreeArgs {
@@ -455,11 +479,22 @@ fn prepare_workspace(
                 start_point: None,
                 dir: None,
                 keep,
-                ephemeral: false,
+                // A mux retains the current tree on close independently of
+                // this policy. Choosing "no" clears an older sticky marker so
+                // a later explicit ephemeral run can clean it up.
+                ephemeral: !keep,
                 command: None,
             };
             let lease = worktree::prepare(&args, launch)?;
-            Ok((lease.workspace_path().to_path_buf(), branch, Some(lease)))
+            let notices = lease.source_was_dirty().then(|| {
+                "warning: the launch checkout has uncommitted changes; the new worktree contains committed Git state only".to_owned()
+            });
+            Ok((
+                lease.workspace_path().to_path_buf(),
+                branch,
+                Some(lease),
+                notices.into_iter().collect(),
+            ))
         }
     }
 }
@@ -555,11 +590,12 @@ mod tests {
             name: "project".into(),
         };
 
-        let (workspace, name, lease) = prepare_workspace(choice, root.path()).unwrap();
+        let (workspace, name, lease, notices) = prepare_workspace(choice, root.path()).unwrap();
 
         assert_eq!(workspace, std::fs::canonicalize(root.path()).unwrap());
         assert_eq!(name, "project");
         assert!(lease.is_none());
+        assert!(notices.is_empty());
     }
 
     #[test]

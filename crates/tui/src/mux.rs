@@ -64,7 +64,8 @@ impl MuxStatus {
 /// Workspace requested by the mux's new-agent flow.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkspaceChoice {
-    /// Ask the host to create a worktree from HEAD. `keep` defaults true in UI.
+    /// Ask the host to create a worktree from HEAD. `keep` controls whether
+    /// retention remains sticky for later runs; mux always retains on close.
     Worktree { branch: String, keep: bool },
     /// Run in an existing directory with a user-visible session name.
     Directory {
@@ -1218,7 +1219,10 @@ fn overlay_frame(layout: MuxLayout, overlay: &Overlay) -> OverlayFrame {
             .collect::<Vec<_>>(),
         Overlay::Worktree { branch, keep } => vec![
             format!("Branch / name: {branch}"),
-            format!("Keep worktree: {} (Tab)", if *keep { "yes" } else { "no" }),
+            format!(
+                "Retain for future runs: {} (Tab)",
+                if *keep { "yes" } else { "no" }
+            ),
         ],
         Overlay::Current { name } => vec![format!("Session name: {name}")],
         // Reserve a compact candidate list so asynchronous scans do not move

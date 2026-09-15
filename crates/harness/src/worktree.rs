@@ -87,7 +87,7 @@ pub(crate) fn prepare(args: &WorktreeArgs, launch_directory: &Path) -> Result<Wo
             existing_path.display()
         ));
     }
-    let run_lock = WorktreeRunLock::acquire(&repository, &args.branch)?;
+    let run_lock = WorktreeRunLock::acquire(&repository, &worktree_path)?;
 
     let source_was_dirty = source_has_changes(&repository)?;
     let ensured = ensure_worktree(
@@ -175,14 +175,18 @@ impl WorktreeLease {
 }
 
 impl WorktreeRunLock {
-    fn acquire(repository: &Repository, branch: &str) -> Result<Self> {
+    fn acquire(repository: &Repository, worktree_path: &Path) -> Result<Self> {
         let directory = repository.common_dir.join("harness").join("worktree-locks");
         fs::create_dir_all(&directory)
             .with_context(|| format!("create worktree lock directory `{}`", directory.display()))?;
+        let label = worktree_path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or("worktree");
         let path = directory.join(format!(
             "{}-{:016x}.lock",
-            slug(branch, "branch"),
-            stable_hash(branch.as_bytes())
+            slug(label, "worktree"),
+            stable_hash(path_hash_bytes(worktree_path))
         ));
         let mut file = OpenOptions::new()
             .read(true)
@@ -197,7 +201,10 @@ impl WorktreeRunLock {
                 .map(|pid| format!(" by process {pid}"))
                 .unwrap_or_default();
             if error.kind() == std::io::ErrorKind::WouldBlock {
-                return Err(anyhow!("branch `{branch}` is already in use{owner}"));
+                return Err(anyhow!(
+                    "worktree `{}` is already in use{owner}",
+                    worktree_path.display()
+                ));
             }
             return Err(error).with_context(|| format!("lock worktree lease `{}`", path.display()));
         }
@@ -856,13 +863,15 @@ mod tests {
     }
 
     #[test]
-    fn process_lock_excludes_another_harness_run_for_the_branch() {
-        let (_root, repository) = test_repository();
-        let first = WorktreeRunLock::acquire(&repository, "feature").unwrap();
-        assert!(WorktreeRunLock::acquire(&repository, "feature").is_err());
-        assert!(WorktreeRunLock::acquire(&repository, "other").is_ok());
+    fn process_lock_excludes_another_harness_run_for_the_path() {
+        let (root, repository) = test_repository();
+        let first_path = root.path().join("feature");
+        let other_path = root.path().join("other");
+        let first = WorktreeRunLock::acquire(&repository, &first_path).unwrap();
+        assert!(WorktreeRunLock::acquire(&repository, &first_path).is_err());
+        assert!(WorktreeRunLock::acquire(&repository, &other_path).is_ok());
         drop(first);
-        assert!(WorktreeRunLock::acquire(&repository, "feature").is_ok());
+        assert!(WorktreeRunLock::acquire(&repository, &first_path).is_ok());
     }
 
     #[test]

@@ -186,7 +186,9 @@ workspace forms directly, `j`/`k` and `1`–`9` for switching, `x` to close,
 and `?` for help. Mux roster ordering is process-local, while
 each conversation uses
 the normal durable session store. Mux-created worktrees are retained when an
-agent closes; their creation dialog defaults to the sticky keep policy.
+agent closes. Their creation dialog defaults to retaining that worktree for
+future runs too; toggling the policy off clears an older sticky marker but does
+not remove the worktree when the mux slot closes.
 
 Run one prompt without the terminal UI:
 
