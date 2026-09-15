@@ -663,11 +663,8 @@ impl SessionStore {
     }
 
     fn ensure_path_in_root(&self, path: &Path) -> Result<()> {
-        let canonical_root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
-        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical_root = canonicalize_with_missing_tail(&self.root);
+        let canonical_path = canonicalize_with_missing_tail(path);
         if !canonical_path.starts_with(&canonical_root) {
             return Err(SessionError::PathOutsideStore {
                 path: path.to_path_buf(),
@@ -675,6 +672,28 @@ impl SessionStore {
             });
         }
         Ok(())
+    }
+}
+
+/// Canonicalize the longest existing prefix, preserving any missing suffix.
+/// This matters on macOS where temporary paths use `/var` while canonicalized
+/// ancestors use `/private/var`; a deliberately removed session file must
+/// still compare in the same path namespace as its store root.
+fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = existing.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        existing = parent;
     }
 }
 
@@ -1556,6 +1575,23 @@ mod tests {
     use crate::model::{SessionEvent, StoredMessage};
     use llm::Message;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalizes_missing_tail_in_the_existing_ancestors_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&real, &alias).unwrap();
+
+        assert_eq!(
+            canonicalize_with_missing_tail(&alias.join("missing/session.jsonl")),
+            real.canonicalize().unwrap().join("missing/session.jsonl")
+        );
+    }
 
     #[test]
     fn create_append_load_and_list_round_trip() {
