@@ -157,10 +157,10 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                         match &event {
                             AgentEvent::ModelChanged { provider, model } => { slot.settings.provider = provider.clone(); slot.settings.model = model.clone(); }
                             AgentEvent::ReasoningChanged { level } => if let Ok(value) = level.parse() { slot.settings.reasoning = value; },
-                            AgentEvent::TurnFinished => { let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Idle }); }
-                            AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) | AgentEvent::ToolCallStarted { .. } => { let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Running }); }
-                            AgentEvent::Error(_) => { let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Error }); }
                             _ => {}
+                        }
+                        if let Some(status) = status_for_agent_event(&event) {
+                            let _ = event_tx.send(MuxEvent::Status { id, status });
                         }
                         let _ = event_tx.send(MuxEvent::Ui { id, event: tui_adapter::into_ui_event(event) });
                     }
@@ -478,6 +478,21 @@ fn start_reap(slot: SlotHandle, reapers: &mut JoinSet<()>) {
     });
 }
 
+fn status_for_agent_event(event: &AgentEvent) -> Option<MuxStatus> {
+    match event {
+        AgentEvent::TextDelta(_)
+        | AgentEvent::ReasoningDelta(_)
+        | AgentEvent::ToolCallStarted { .. } => Some(MuxStatus::Running),
+        // Agent errors are presentation events, not proof that the runtime
+        // stopped. Command validation and provider failures are recoverable;
+        // a genuinely terminated slot is reported separately by `Stopped`.
+        AgentEvent::Error(_) | AgentEvent::TurnFinished | AgentEvent::CompactionFinished { .. } => {
+            Some(MuxStatus::Idle)
+        }
+        _ => None,
+    }
+}
+
 fn pane(
     settings: &SlotSettings,
     workspace: PathBuf,
@@ -535,6 +550,27 @@ mod tests {
 
         assert!(Arc::ptr_eq(&shared_a, &shared_b));
         assert!(!Arc::ptr_eq(&shared_a, &distinct));
+    }
+
+    #[test]
+    fn recoverable_errors_and_compaction_completion_restore_idle_status() {
+        assert_eq!(
+            status_for_agent_event(&AgentEvent::Error("bad command".into())),
+            Some(MuxStatus::Idle)
+        );
+        assert_eq!(
+            status_for_agent_event(&AgentEvent::CompactionFinished {
+                compacted_through: 1,
+                summary_bytes: 2,
+                auto: false,
+                reason: agent::CompactionReason::Manual,
+            }),
+            Some(MuxStatus::Idle)
+        );
+        assert_eq!(
+            status_for_agent_event(&AgentEvent::TextDelta("working".into())),
+            Some(MuxStatus::Running)
+        );
     }
 
     #[test]
