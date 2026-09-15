@@ -7,9 +7,12 @@ use crate::{context, tui_adapter, worktree};
 use agent::assembly::AgentBuilder;
 use agent::{AgentEvent, InputMessage};
 use anyhow::{Context, Result};
+use futures_util::FutureExt;
 use llm::ReasoningPolicy;
 use session::{SessionCreateOptions, SessionStore};
 use std::collections::HashMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -69,6 +72,7 @@ enum RuntimeMessage {
     Ready(MuxId),
     Event(MuxId, AgentEvent),
     AssemblyError(MuxId, String),
+    Panicked(MuxId),
     Stopped(MuxId),
 }
 
@@ -163,6 +167,13 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                     let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Error });
                     let _ = event_tx.send(MuxEvent::Ui { id, event: tui::UiEvent::Error(error) });
                 },
+                Some(RuntimeMessage::Panicked(id)) => if slots.contains_key(&id) {
+                    let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Error });
+                    let _ = event_tx.send(MuxEvent::Ui {
+                        id,
+                        event: tui::UiEvent::Error("agent task panicked; close this slot and retry".into()),
+                    });
+                },
                 Some(RuntimeMessage::Stopped(id)) => if slots.contains_key(&id) {
                     let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Error });
                 },
@@ -200,6 +211,18 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
         let _ = shutdown_task.await;
     }
     terminal_result
+}
+
+async fn run_slot_guarded<F>(
+    id: MuxId,
+    runtime_tx: mpsc::UnboundedSender<RuntimeMessage>,
+    future: F,
+) where
+    F: Future<Output = ()>,
+{
+    if AssertUnwindSafe(future).catch_unwind().await.is_err() {
+        let _ = runtime_tx.send(RuntimeMessage::Panicked(id));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -245,7 +268,7 @@ fn create_slot(
     let no_context_files = cli.no_context_files;
     let deferred = cli.defer_session_sync;
     let mutation_coordinator = mutation_coordinator.clone();
-    let task = tokio::spawn(async move {
+    let task = tokio::spawn(run_slot_guarded(id, runtime_tx.clone(), async move {
         let setup_settings = task_settings.clone();
         let setup_config = config.clone();
         let preparation_cancel = task_cancel.clone();
@@ -385,7 +408,7 @@ fn create_slot(
                     });
                     let _ = runtime_tx.send(RuntimeMessage::Ready(id));
                     agent.run(input_rx, agent_tx).await;
-                    let _ = drain.await;
+                    drain.await.context("join agent event forwarder")?;
                     Ok(())
                 }
                 .await;
@@ -399,7 +422,7 @@ fn create_slot(
             let _ = runtime_tx.send(RuntimeMessage::AssemblyError(id, format!("{error:#}")));
         }
         let _ = runtime_tx.send(RuntimeMessage::Stopped(id));
-    });
+    }));
     slots.insert(
         id,
         SlotHandle {
@@ -512,6 +535,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn guarded_slot_reports_panics_to_the_supervisor() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        run_slot_guarded(7, tx, async { panic!("boom") }).await;
+
+        assert!(matches!(rx.recv().await, Some(RuntimeMessage::Panicked(7))));
+    }
 
     #[test]
     fn prepares_and_canonicalizes_directory_workspace() {

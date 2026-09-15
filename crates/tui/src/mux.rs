@@ -1412,9 +1412,11 @@ fn install_mux_panic_hook() {
     INSTALL.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic| {
-            // Do not rely on unwinding: release builds abort after this hook.
-            // Only reverse modes this mux successfully enabled, so a partial
-            // setup cannot pop terminal state owned by another component.
+            // Abort builds cannot run guards, so restoration must happen in
+            // the hook. Unwind builds may catch a background-task panic; in
+            // that case restoring here would dismantle a still-running mux.
+            // The terminal-owning future restores through its guard instead.
+            #[cfg(panic = "abort")]
             restore_mux_terminal(&mut io::stdout());
             previous(panic);
         }));
