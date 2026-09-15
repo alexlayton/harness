@@ -43,12 +43,26 @@ impl Agent {
                 return;
             }
         };
+        let active_lease = match store.acquire_active(&session) {
+            Ok(lease) => lease,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(format!("could not activate session: {error}")),
+                );
+                return;
+            }
+        };
         let id = session.id().to_string();
         let parent_session_id = session.id();
         let title = session.metadata.title.clone();
         self.history.clear();
         self.last_context_tokens = None;
-        self.session = Some(AgentSessionState { store, session });
+        self.session = Some(AgentSessionState {
+            store,
+            session,
+            active_lease: Some(active_lease),
+        });
         if let Some(runner) = &self.subagent_runner {
             runner.update_parent_session(Some(parent_session_id));
         }
@@ -110,6 +124,23 @@ impl Agent {
                 }
             }
         }
+        let reuses_active_lease = self.session.as_ref().is_some_and(|state| {
+            state.session.id() == session.id() && state.active_lease.is_some()
+        });
+        let new_active_lease = if reuses_active_lease {
+            None
+        } else {
+            match store.acquire_active(&session) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    send(
+                        events,
+                        AgentEvent::Error(format!("could not load session: {error}")),
+                    );
+                    return;
+                }
+            }
+        };
         if let Err(error) = store.repair_incomplete_tool_calls(&mut session) {
             send(
                 events,
@@ -117,13 +148,22 @@ impl Agent {
             );
             return;
         }
+        let active_lease = if reuses_active_lease {
+            self.session.take().and_then(|state| state.active_lease)
+        } else {
+            new_active_lease
+        };
         let id = session.id().to_string();
         let parent_session_id = session.id();
         let title = session.metadata.title.clone();
         self.history = session.context_messages();
         self.last_context_tokens = None;
         let snapshot = ui_snapshot_entries(snapshot_entries(&session));
-        self.session = Some(AgentSessionState { store, session });
+        self.session = Some(AgentSessionState {
+            store,
+            session,
+            active_lease,
+        });
         if let Some(runner) = &self.subagent_runner {
             runner.update_parent_session(Some(parent_session_id));
         }

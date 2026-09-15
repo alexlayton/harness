@@ -377,6 +377,20 @@ impl SubagentRunnerImpl {
             &run.description,
             parent_session,
         );
+        let _active_lease = match (self.store.as_ref(), session.as_ref()) {
+            (Some(store), Some(child)) => match store.acquire_active(child) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    // A freshly generated child ID should never contend, but
+                    // do not append to a conversation whose ownership cannot
+                    // be proven. The delegation can still run ephemerally.
+                    tracing::warn!(error = %error, "could not activate subagent session");
+                    session = None;
+                    None
+                }
+            },
+            _ => None,
+        };
         Self::persist(
             &self.store,
             &mut session,

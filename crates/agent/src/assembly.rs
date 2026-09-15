@@ -121,6 +121,15 @@ impl AgentBuilder {
     /// Connect optional MCP servers, register optional subagents, and produce
     /// a runtime that keeps external server processes alive for the agent.
     pub async fn build(mut self) -> Result<AssembledAgent> {
+        // Claim the conversation before repairing it. Another live agent may
+        // have a durable tool call in flight that must not be mistaken for a
+        // crashed tail, even though per-append locking keeps JSONL writes safe.
+        let active_lease = self
+            .session
+            .as_ref()
+            .map(|(store, session)| store.acquire_active(session))
+            .transpose()
+            .context("acquire active session")?;
         // Repair a loaded crash tail before starting MCP servers or exposing a
         // live agent. Failing here is preferable to reporting a successful
         // load that predictably quarantines on its first append.
@@ -199,7 +208,11 @@ impl AgentBuilder {
             agent = agent.with_subagent_runner(runner);
         }
         if let Some((store, session)) = self.session {
-            agent = agent.with_session(store, session);
+            agent = agent.with_leased_session(
+                store,
+                session,
+                active_lease.expect("a configured session always has a lease"),
+            );
         }
         if assembly_cancel.is_cancelled() {
             if let Some(mcp) = mcp {

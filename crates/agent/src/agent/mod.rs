@@ -180,8 +180,12 @@ impl Agent {
         self
     }
 
-    /// Attach a loaded/new durable session.  Active provider/model selection
+    /// Attach a loaded/new durable session. Active provider/model selection
     /// remains the caller's choice; saved metadata is informational only.
+    ///
+    /// This compatibility constructor does not acquire an active-session
+    /// lease. Frontends should assemble agents through [`crate::assembly::AgentBuilder`],
+    /// which rejects a conversation already owned by another runtime.
     pub fn with_session(mut self, store: SessionStore, mut session: Session) -> Self {
         if let Err(error) = store.repair_incomplete_tool_calls(&mut session) {
             tracing::warn!(error = %error, "could not repair incomplete session tool calls");
@@ -190,7 +194,31 @@ impl Agent {
         if let Some(runner) = &self.subagent_runner {
             runner.update_parent_session(Some(session.id()));
         }
-        self.session = Some(AgentSessionState { store, session });
+        self.session = Some(AgentSessionState {
+            store,
+            session,
+            active_lease: None,
+        });
+        self
+    }
+
+    /// Attach a durable session whose exclusive active lease was acquired by
+    /// assembly before any repair or runtime work began.
+    pub(crate) fn with_leased_session(
+        mut self,
+        store: SessionStore,
+        session: Session,
+        active_lease: session::SessionActiveLease,
+    ) -> Self {
+        self.history = session.context_messages();
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_parent_session(Some(session.id()));
+        }
+        self.session = Some(AgentSessionState {
+            store,
+            session,
+            active_lease: Some(active_lease),
+        });
         self
     }
 }
@@ -478,6 +506,38 @@ mod tests {
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn loading_a_session_owned_by_another_agent_is_rejected() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let target = store.create(SessionCreateOptions::default()).unwrap();
+        let _owner = store.acquire_active(&target).unwrap();
+        let current = store.create(SessionCreateOptions::default()).unwrap();
+        let current_id = current.id();
+        let provider = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        });
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_session(store, current);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        agent.handle_load_session(target.id().to_string(), &event_tx);
+
+        assert_eq!(agent.session.as_ref().unwrap().session.id(), current_id);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::Error(message)) if message.contains("already active")
+        ));
     }
 
     fn run_agent(provider: MockProvider) -> Vec<AgentEvent> {

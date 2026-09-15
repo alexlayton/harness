@@ -170,6 +170,15 @@ pub struct SessionIndexEntry {
     pub bytes: u64,
 }
 
+/// Exclusive process lease held while an agent owns a durable conversation.
+///
+/// The sidecar file is intentionally retained after unlock so all current and
+/// future contenders continue to lock the same inode.
+#[derive(Debug)]
+pub struct SessionActiveLease {
+    file: Option<File>,
+}
+
 /// Filesystem-backed session storage.  Sessions are grouped by a stable key
 /// derived from the workspace root, so a project never appears in another
 /// project's normal listing.
@@ -266,6 +275,50 @@ impl SessionStore {
 
     pub fn is_path_in_store(&self, path: &Path) -> bool {
         self.ensure_path_in_root(path).is_ok()
+    }
+
+    /// Acquire exclusive ownership of a session for an agent's lifetime.
+    ///
+    /// Plain loads and exports do not require this lease. Any runtime that can
+    /// append conversation events must hold it so independent in-memory model
+    /// histories cannot write to the same durable log.
+    pub fn acquire_active(&self, session: &Session) -> Result<SessionActiveLease> {
+        let Some(session_path) = session.path() else {
+            return Ok(SessionActiveLease { file: None });
+        };
+        self.ensure_path_in_root(session_path)?;
+        let path = session_path.with_extension("jsonl.active.lock");
+        let file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(&path)
+            }
+            #[cfg(not(unix))]
+            {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+            }
+        }
+        .map_err(|source| io_error("open active session lease", &path, source))?;
+        ensure_private_file(&path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(SessionError::AlreadyActive(session_path.to_path_buf()))
+            }
+            Err(source) => Err(io_error("lock active session lease", &path, source)),
+        }
     }
 
     /// Create and immediately persist a new session header.
@@ -1542,6 +1595,14 @@ impl Drop for SessionLock {
     }
 }
 
+impl Drop for SessionActiveLease {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2188,6 +2249,22 @@ mod tests {
         let second_store = SessionStore::new(root.path(), second.path()).unwrap();
         let error = second_store.load_path(session.path().unwrap()).unwrap_err();
         assert!(matches!(error, SessionError::WorkspaceMismatch { .. }));
+    }
+
+    #[test]
+    fn active_lease_rejects_a_second_agent_until_released() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+
+        let owner = store.acquire_active(&session).unwrap();
+        assert!(matches!(
+            store.acquire_active(&session),
+            Err(SessionError::AlreadyActive(_))
+        ));
+        drop(owner);
+        store.acquire_active(&session).unwrap();
     }
 
     #[test]
