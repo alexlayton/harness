@@ -1,6 +1,10 @@
-
 use super::*;
+use crate::app::line_to_ansi;
 use crate::{ContextFileEntry, SkillEntry};
+use ratatui_core::buffer::Buffer;
+use ratatui_core::layout::Rect;
+use ratatui_core::style::{Modifier, Style};
+use unicode_width::UnicodeWidthStr;
 fn pane(path: &str) -> AgentPane {
     AgentPane::new(
         "m",
