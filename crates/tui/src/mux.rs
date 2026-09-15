@@ -230,9 +230,10 @@ impl MuxUi {
     /// Compute host-neutral pane geometry for terminal dimensions.
     pub fn layout(&self, width: u16, height: u16) -> MuxLayout {
         let body_height = height;
-        // Hide only when reserving the minimum sidebar would leave no useful pane.
-        let side = if width >= 30 {
-            Some((0, (width / 4).clamp(20, 32)))
+        // The command strip needs a little more room than the original roster.
+        // Hide it only when that minimum would leave no useful agent pane.
+        let side = if width >= 38 {
+            Some((0, (width / 3).clamp(26, 32)))
         } else {
             None
         };
@@ -324,22 +325,21 @@ impl MuxUi {
             }
         }
     }
-    fn sidebar_hint_rows(&self) -> u16 {
-        // Commands grow upward while the prefix line remains anchored at bottom.
-        if self.prefix && self.height >= 8 {
-            5
+    fn sidebar_footer_rows(&self) -> u16 {
+        // The separator and command rows grow upward from the bottom border.
+        if self.prefix && self.height >= 7 {
+            6
         } else {
-            1
+            2
         }
     }
 
     fn visible_rows(&self) -> usize {
-        let step = if self.width >= 70 { 2 } else { 1 };
-        // Both border rows, `⊕ New agent`, and the bottom hint/legend are fixed.
+        // Top border, leading spacer, spacer before New, New, trailing spacer,
+        // footer, and bottom border are fixed; every session occupies one row.
         self.layout(self.width, self.height)
             .body_height
-            .saturating_sub(3 + self.sidebar_hint_rows()) as usize
-            / step
+            .saturating_sub(6 + self.sidebar_footer_rows()) as usize
     }
     fn clamp_sidebar_scroll(&mut self) {
         self.sidebar_scroll = self
@@ -465,6 +465,7 @@ impl MuxUi {
         }
         if Self::is_prefix(&key) {
             self.prefix = true;
+            self.reveal_selected();
             return Ok(out);
         }
         match key.code {
@@ -543,18 +544,16 @@ impl MuxUi {
                 self.clamp_sidebar_scroll();
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                let step = if self.width < 70 { 1 } else { 2 };
                 let visible_count = self
                     .slots
                     .len()
                     .saturating_sub(self.sidebar_scroll)
                     .min(self.visible_rows());
-                let new_y = 1 + visible_count * step;
-                if y as usize == new_y && y > 0 && y < layout.body_height.saturating_sub(1) {
+                let new_y = 3 + visible_count;
+                if y as usize == new_y && y < layout.body_height.saturating_sub(1) {
                     self.overlay = Some(Overlay::NewMenu { selected: 0 });
-                } else if y as usize >= 1 && (y as usize) < new_y {
-                    let row = (y as usize - 1) / step;
-                    let i = self.sidebar_scroll + row;
+                } else if (2..2 + visible_count).contains(&(y as usize)) {
+                    let i = self.sidebar_scroll + y as usize - 2;
                     if i < self.slots.len() {
                         self.selected = Some(i)
                     }
@@ -860,9 +859,9 @@ impl MuxUi {
             let mut rows = (0..height)
                 .map(|_| Line::from(border("│")))
                 .collect::<Vec<_>>();
-            rows[0] = Line::from(border("┌"));
+            rows[0] = Line::from(border("╭"));
             if height > 1 {
-                rows[height as usize - 1] = Line::from(border("└"));
+                rows[height as usize - 1] = Line::from(border("╰"));
             }
             return rows;
         }
@@ -874,32 +873,29 @@ impl MuxUi {
                 border("│"),
             ])
         };
-        let mut rows = (0..height).map(|_| framed("", muted)).collect::<Vec<_>>();
-
-        let top_label = "─ MUX ";
-        let top_inner = if interior >= top_label.width() {
-            format!("{top_label}{}", "─".repeat(interior - top_label.width()))
-        } else {
-            fit(top_label, interior)
+        let ruled = |left: &str, label: &str, right: &str, style: Style| {
+            let label = if label.width() <= interior {
+                label.to_owned()
+            } else {
+                fit(label, interior)
+            };
+            let fill = "─".repeat(interior.saturating_sub(label.width()));
+            Line::from(vec![
+                border(left),
+                Span::styled(format!("{label}{fill}"), style),
+                border(right),
+            ])
         };
-        rows[0] = Line::from(vec![
-            border("┌"),
-            Span::styled(top_inner, accent.add_modifier(Modifier::BOLD)),
-            border("┐"),
-        ]);
+        let mut rows = (0..height).map(|_| framed("", muted)).collect::<Vec<_>>();
+        rows[0] = ruled("╭", "─ SESSIONS ", "╮", accent.add_modifier(Modifier::BOLD));
         if height == 1 {
             return rows;
         }
-        rows[height as usize - 1] = Line::from(border(&format!(
-            "└{}┘",
-            "─".repeat(total_width.saturating_sub(2))
-        )));
+        rows[height as usize - 1] = Line::from(border(&format!("╰{}╯", "─".repeat(interior))));
         if height == 2 {
             return rows;
         }
 
-        let compact = self.width < 70;
-        let step = if compact { 1 } else { 2 };
         for (n, slot) in self
             .slots
             .iter()
@@ -907,12 +903,18 @@ impl MuxUi {
             .take(self.visible_rows())
             .enumerate()
         {
-            let y = 1 + n * step;
-            let selected = Some(self.sidebar_scroll + n) == self.selected;
-            let text = format!(
-                " {} {}  {}",
+            let y = 2 + n;
+            let index = self.sidebar_scroll + n;
+            let selected = Some(index) == self.selected;
+            let left = format!(
+                " {} {} {}",
                 if selected { "›" } else { " " },
-                slot.name,
+                session_ordinal(index),
+                slot.name
+            );
+            let text = format!(
+                "{} {}",
+                fit(&left, interior.saturating_sub(2)),
                 slot.status.glyph()
             );
             rows[y] = framed(
@@ -923,41 +925,40 @@ impl MuxUi {
                     muted
                 },
             );
-            if !compact && y + 1 < height.saturating_sub(1) as usize {
-                let detail = format!(
-                    "     {}{}",
-                    slot.workspace.display(),
-                    if slot.worktree { " · worktree" } else { "" }
-                );
-                rows[y + 1] = framed(&detail, muted);
-            }
         }
         let visible = self
             .slots
             .len()
             .saturating_sub(self.sidebar_scroll)
             .min(self.visible_rows());
-        let new_y = 1 + visible * step;
-        let hints_start = height.saturating_sub(1 + self.sidebar_hint_rows()).max(1) as usize;
-        if new_y < hints_start {
-            rows[new_y] = framed(" ⊕ New agent", muted);
+        let new_y = 3 + visible;
+        let footer_start = height.saturating_sub(1 + self.sidebar_footer_rows()) as usize;
+        if new_y < footer_start {
+            rows[new_y] = framed("   + New agent", muted);
         }
-        let hints: &[&str] = if self.prefix && self.sidebar_hint_rows() == 5 {
-            &[
-                " n menu · c current",
-                " w worktree · d dir",
-                " j/k switch · 1-9",
-                " x close · ? help",
-                " Ctrl + Space  prefix",
+
+        if self.prefix && self.sidebar_footer_rows() == 6 {
+            rows[footer_start] = ruled(
+                "├",
+                "─ MUX › ^Space ",
+                "┤",
+                accent.add_modifier(Modifier::BOLD),
+            );
+            for (offset, command) in [
+                " n  new      w  worktree",
+                " c  current  d  directory",
+                " x  close    j  next",
+                " k  prev     1–9 jump",
+                " ?  help",
             ]
-        } else {
-            &[" Ctrl + Space  prefix"]
-        };
-        for (offset, hint) in hints.iter().enumerate() {
-            let y = hints_start + offset;
-            if y < height.saturating_sub(1) as usize {
-                rows[y] = framed(hint, muted);
+            .iter()
+            .enumerate()
+            {
+                rows[footer_start + 1 + offset] = framed(command, muted);
             }
+        } else {
+            rows[footer_start] = ruled("├", "", "┤", muted);
+            rows[footer_start + 1] = framed(" ^Space  mux", muted);
         }
         rows
     }
@@ -1123,6 +1124,14 @@ fn is_subsequence(q: &str, s: &str) -> bool {
     let mut chars = s.chars();
     q.chars().all(|c| chars.by_ref().any(|v| v == c))
 }
+fn session_ordinal(index: usize) -> String {
+    const CIRCLED: [char; 9] = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨'];
+    CIRCLED
+        .get(index)
+        .map(char::to_string)
+        .unwrap_or_else(|| (index + 1).to_string())
+}
+
 fn fit(text: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
@@ -1624,7 +1633,7 @@ mod tests {
                 let plain = strip_ansi(&line_to_ansi(row));
                 assert_eq!(plain.width(), sidebar_width as usize + 1, "sidebar row {y}");
                 let boundary = plain.chars().last().unwrap();
-                assert!(matches!(boundary, '┐' | '│' | '┘'), "sidebar row {y}");
+                assert!(matches!(boundary, '╮' | '│' | '┤' | '╯'), "sidebar row {y}");
 
                 // Model final composition with a visible main-pane first cell.
                 let screen = format!(
@@ -1634,9 +1643,37 @@ mod tests {
                 assert_eq!(screen.width(), 80, "screen row {y}");
                 assert_eq!(screen.chars().nth(layout.main_x as usize), Some('A'));
             }
-            assert!(strip_ansi(&line_to_ansi(&sidebar[0])).contains("MUX"));
-            assert!(strip_ansi(&line_to_ansi(sidebar.last().unwrap())).starts_with('└'));
+            assert!(strip_ansi(&line_to_ansi(&sidebar[0])).starts_with("╭─ SESSIONS "));
+            assert!(strip_ansi(&line_to_ansi(sidebar.last().unwrap())).starts_with('╰'));
         }
+    }
+
+    #[test]
+    fn normal_sidebar_uses_compact_ordinals_spacers_and_anchored_footer() {
+        let mut mux = MuxUi::new("/".into());
+        mux.handle(Event::Resize(80, 14)).unwrap();
+        add_slots(&mut mux, 10);
+        mux.selected = Some(0);
+        mux.sidebar_scroll = 0;
+        let lines = mux.sidebar_lines(26, 14, Style::default(), Style::default());
+        let plain = lines
+            .iter()
+            .map(|line| strip_ansi(&line_to_ansi(line)))
+            .collect::<Vec<_>>();
+
+        assert!(plain[0].starts_with("╭─ SESSIONS "));
+        assert!(plain[1].trim_matches(['│', ' ']).is_empty());
+        assert!(plain[2].contains("› ① agent-1"));
+        assert!(plain[3].contains("  ② agent-2"));
+        assert!(plain[7].contains("  ⑥ agent-6"));
+        assert!(plain[8].trim_matches(['│', ' ']).is_empty());
+        assert!(plain[9].contains("+ New agent"));
+        assert!(plain[10].trim_matches(['│', ' ']).is_empty());
+        assert_eq!(plain[11], format!("├{}┤", "─".repeat(25)));
+        assert!(plain[12].contains("^Space  mux"));
+        assert_eq!(plain[13], format!("╰{}╯", "─".repeat(25)));
+        assert_eq!(session_ordinal(8), "⑨");
+        assert_eq!(session_ordinal(9), "10");
     }
 
     #[test]
@@ -1848,50 +1885,54 @@ mod tests {
         for _ in 0..10 {
             mux.handle_mouse(MouseEventKind::ScrollDown, 0, 2);
         }
-        assert_eq!(mux.visible_rows(), 3);
-        assert_eq!(mux.sidebar_scroll, 2);
+        assert_eq!(mux.visible_rows(), 2);
+        assert_eq!(mux.sidebar_scroll, 3);
 
-        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 7);
+        // The session rows are 2..4, row 4 is the spacer, and New is row 5.
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 4);
+        assert!(mux.overlay.is_none());
+        mux.handle_mouse(MouseEventKind::Down(MouseButton::Left), 0, 5);
         assert!(matches!(mux.overlay, Some(Overlay::NewMenu { .. })));
     }
 
     #[test]
-    fn prefix_legend_reserves_sidebar_capacity() {
+    fn prefix_command_strip_is_titled_complete_and_bottom_anchored() {
         let mut mux = MuxUi::new("/".into());
-        mux.handle(Event::Resize(80, 10)).unwrap();
-        assert_eq!(mux.sidebar_hint_rows(), 1);
-        assert_eq!(mux.visible_rows(), 3);
+        mux.handle(Event::Resize(80, 16)).unwrap();
+        assert_eq!(mux.sidebar_footer_rows(), 2);
+        assert_eq!(mux.visible_rows(), 8);
 
         mux.handle(Event::Key(KeyEvent::new(
             KeyCode::Null,
             KeyModifiers::CONTROL,
         )))
         .unwrap();
-        assert_eq!(mux.sidebar_hint_rows(), 5);
-        assert_eq!(mux.visible_rows(), 1);
+        assert_eq!(mux.sidebar_footer_rows(), 6);
+        assert_eq!(mux.visible_rows(), 4);
 
         let theme = render::Theme::default();
         let muted = Style::default().fg(theme.muted_text);
         let accent = Style::default().fg(theme.accent);
-        let lines = mux.sidebar_lines(24, 10, muted, accent);
-        let legend = lines
+        let lines = mux.sidebar_lines(26, 16, muted, accent);
+        let plain = lines
             .iter()
             .map(|line| strip_ansi(&line_to_ansi(line)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        for shortcut in [
-            "n menu",
-            "w worktree",
-            "c current",
-            "d dir",
-            "j/k",
-            "1-9",
-            "x close",
-            "? help",
+            .collect::<Vec<_>>();
+        assert!(plain[9].starts_with("├─ MUX › ^Space "));
+        for (row, label) in [
+            (10, "n  new      w  worktree"),
+            (11, "c  current  d  directory"),
+            (12, "x  close    j  next"),
+            (13, "k  prev     1–9 jump"),
+            (14, "?  help"),
         ] {
-            assert!(legend.contains(shortcut), "missing {shortcut}: {legend}");
+            assert!(
+                plain[row].contains(label),
+                "missing {label}: {}",
+                plain[row]
+            );
         }
-        assert!(strip_ansi(&line_to_ansi(&lines[8])).contains("Ctrl + Space  prefix"));
+        assert!(plain[15].starts_with('╰'));
     }
 
     #[test]
