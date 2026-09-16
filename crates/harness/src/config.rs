@@ -697,6 +697,8 @@ pub enum Command {
     Worktree(WorktreeArgs),
     /// Manage configured MCP servers.
     Mcp(McpArgs),
+    /// Run multiple independent agents in one terminal UI.
+    Mux,
     /// Serve Agent Client Protocol over stdio for editor integrations.
     Acp,
 }
@@ -1160,6 +1162,10 @@ mod tests {
             Cli::try_parse_from(["harness", "mcp"]).unwrap().command,
             Some(Command::Mcp(McpArgs { command: None }))
         ));
+
+        let mux = Cli::try_parse_from(["harness", "mux", "--model", "test-model"]).unwrap();
+        assert!(matches!(mux.command, Some(Command::Mux)));
+        assert_eq!(mux.model.as_deref(), Some("test-model"));
 
         let acp = Cli::try_parse_from(["harness", "acp", "--provider", "openai-codex"]).unwrap();
         assert!(matches!(acp.command, Some(Command::Acp)));

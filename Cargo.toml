@@ -3,18 +3,16 @@ resolver = "3"
 members = ["crates/agent", "crates/auth", "crates/compact", "crates/harness", "crates/llm", "crates/mcp", "crates/session", "crates/tui", "crates/tools"]
 default-members = ["crates/harness", "crates/agent"]
 
-# Release ships lean: symbol tables stripped, cross-crate DCE via fat LTO,
-# one codegen unit for inlining, and abort-on-panic to drop unwind tables.
-# These slow release builds by design — never mirror them in `[profile.dev]`.
-# `panic = "abort"` is the only entry with semantic consequences: Drop
-# handlers no longer run on panic and a panicking tokio worker kills the
-# process instead of just its task. The TUI panic hook still restores the
-# terminal before the abort.
+# Release ships lean: symbol tables are stripped, with cross-crate DCE via fat
+# LTO and one codegen unit for inlining. These slow release builds by design —
+# never mirror them in `[profile.dev]`. Keep unwind semantics so the mux can
+# contain one agent-task panic, report the failed slot, and retain sibling
+# agents; terminal guards also get a chance to restore their modes.
 [profile.release]
 strip = "symbols"
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 
 # Source package managers still produce an optimized, stripped binary, but
 # avoid the fat-LTO/single-codegen-unit cost paid by official artifacts.

@@ -22,7 +22,8 @@ pub use grep::GrepTool;
 pub use multigrep::MultiGrepTool;
 pub use read::ReadTool;
 pub use registry::{
-    ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError, ToolRegistrySnapshot,
+    ToolExecutionGate, ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError,
+    ToolRegistrySnapshot,
 };
 pub use skills::{
     Skill, SkillCatalog, SkillDiagnostic, SkillEntry, SkillMode, SkillSeverity, discover,

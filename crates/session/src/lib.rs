@@ -33,4 +33,6 @@ pub use model::{
     snapshot_entries, usage_summary,
 };
 pub use store::SyncSessionFaultGuard;
-pub use store::{SessionCreateOptions, SessionIndexEntry, SessionStore, default_session_dir};
+pub use store::{
+    SessionActiveLease, SessionCreateOptions, SessionIndexEntry, SessionStore, default_session_dir,
+};

@@ -4,6 +4,7 @@ mod context;
 mod headless;
 mod login;
 mod mcp_command;
+mod mux;
 mod tui_adapter;
 mod worktree;
 
@@ -53,18 +54,22 @@ async fn main_inner() -> Result<ExitCode> {
     // then always restore the launch directory and attempt safe cleanup after
     // application startup or shutdown.
     if let Some(Command::Worktree(args)) = cli.command.clone() {
-        // Resolve every process-level path override before prepare changes the
-        // cwd. This includes config/auth, logging, and both session roots.
+        let launch_directory = std::fs::canonicalize(
+            std::env::current_dir().context("resolve the worktree launch directory")?,
+        )
+        .context("resolve the worktree launch directory")?;
+        // Resolve every process-level path override before entering the
+        // workspace. This includes config/auth, logging, and session roots.
         absolutize_process_path_overrides()?;
         // Relative state/session overrides must retain launch-directory
-        // semantics after prepare changes the process cwd.
+        // semantics after the process cwd changes.
         let session_root = std::path::absolute(session::default_session_dir())
             .context("resolve the session state directory")?;
         let report_lifecycle = args
             .command
             .as_ref()
             .is_none_or(|WorktreeCommand::Prompt(prompt)| prompt.verbose);
-        let lease = worktree::prepare(&args)?;
+        let lease = worktree::prepare(&args, &launch_directory)?;
         if report_lifecycle {
             let action = if lease.was_created() {
                 "created"
@@ -82,7 +87,30 @@ async fn main_inner() -> Result<ExitCode> {
             .command
             .map(|WorktreeCommand::Prompt(prompt)| Command::Prompt(prompt));
 
+        if let Err(error) = std::env::set_current_dir(lease.workspace_path()) {
+            let enter_error = anyhow::Error::new(error).context(format!(
+                "enter worktree workspace `{}`",
+                lease.workspace_path().display()
+            ));
+            if let Err(cleanup_error) = lease.finish() {
+                eprintln!("worktree: cleanup failed: {cleanup_error:#}");
+            }
+            return Err(enter_error);
+        }
         let application_result = run_application(cli, Some(session_root)).await;
+        if let Err(error) = std::env::set_current_dir(&launch_directory) {
+            let retained_path = lease.release_without_cleanup();
+            let restore_error = anyhow::Error::new(error).context(format!(
+                "leave worktree and restore `{}`; retained `{}`",
+                launch_directory.display(),
+                retained_path.display()
+            ));
+            if application_result.is_ok() {
+                return Err(restore_error);
+            }
+            eprintln!("worktree: cleanup failed: {restore_error:#}");
+            return application_result;
+        }
         match lease.finish() {
             Ok(worktree::CleanupOutcome::Removed(path)) if report_lifecycle => {
                 eprintln!("worktree: removed {}", path.display());
@@ -153,6 +181,17 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let config: Config = Config::resolve(&cli)?;
     tracing::info!(stage = "config", elapsed_ms = since_start());
 
+    let workspace_root =
+        std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
+    tracing::info!(stage = "workspace", elapsed_ms = since_start());
+
+    // Mux owns per-slot providers, registries, stores, MCP runtimes, and
+    // cancellation. Dispatch before assembling any single-workspace state.
+    if matches!(&cli.command, Some(Command::Mux)) {
+        mux::run(config, &cli, workspace_root).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // Reuse auth handles loaded during config resolution instead of re-reading
     // auth.json. OAuth providers remain constructible without credentials so
     // their local model catalogs work before login.
@@ -164,9 +203,6 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         config.codex_auth.clone(),
     )?;
     let provider_name = provider.name().to_owned();
-    let workspace_root =
-        std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
-    tracing::info!(stage = "workspace", elapsed_ms = since_start());
 
     // ACP is the third frontend: same provider/config setup, but the process
     // becomes a stdio JSON-RPC server and never touches the terminal. The
@@ -314,6 +350,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         },
         config.reasoning.as_str(),
         config.tui_minimal,
+        workspace_root,
     )?;
     let ui_result = ui.run(ui_event_rx, tui_input_tx, cancel.clone()).await;
     cancel.cancel();

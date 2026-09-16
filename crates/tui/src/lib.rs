@@ -8,11 +8,13 @@ mod commands;
 mod commit;
 mod environment;
 mod input;
+mod mux;
 mod paths;
 mod render;
 mod state;
 
-pub use app::CrossTerm;
+pub use app::{AgentPane, CrossTerm, PaneFrame, PaneInput};
+pub use mux::{MuxAction, MuxEvent, MuxId, MuxLayout, MuxStatus, MuxUi, WorkspaceChoice};
 pub use state::{ToolRecord, ToolStatus};
 
 /// Messages sent from the terminal UI to the agent. Keeping this protocol in
@@ -158,6 +160,8 @@ pub enum UiEvent {
         message: String,
     },
     TurnFinished,
+    /// A host-visible non-turn operation returned to the input loop.
+    OperationFinished,
     Error(String),
     /// Informational command feedback committed to the retained transcript.
     Notice(String),

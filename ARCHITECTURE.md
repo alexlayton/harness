@@ -1,8 +1,8 @@
 # Architecture
 
 Harness is a terminal coding agent. It streams LLM responses, executes tools,
-renders output through one of three frontends, and stores an append-only session
-log.
+renders output through a terminal, mux, headless, or ACP frontend, and stores
+an append-only session log.
 
 This document is a map of stable boundaries and invariants. For implementation
 detail, read the linked module or focused documentation for the subsystem you
@@ -66,6 +66,13 @@ MCP, and subagent setup has one implementation.
 
 - **TUI:** direct Crossterm UI with completed output in native terminal
   scrollback. `tui` receives only provider-independent `UiEvent`s.
+- **Mux:** `harness mux` owns one full-screen terminal and hosts several
+  retained agent panes. Each slot has an independent workspace, durable
+  session, tools, cancellation, and MCP lifecycle; the mux roster itself is
+  process-local. Mutating tool workflows are conservatively serialized across
+  all slots in that mux process, while model requests and read-only tools
+  remain concurrent. Mux-created worktrees are path-based and retained on
+  close.
 - **Headless:** `harness prompt "…"` writes only the final answer to stdout.
   Optional progress goes to stderr behind `-v`; stdout purity is an invariant.
 - **ACP:** `harness acp` serves Agent Client Protocol over stdio. Stdout is
@@ -185,7 +192,8 @@ See [`docs/configuration.md`](./docs/configuration.md) and
 - One JSON object per line, with a header first and append-only events after it.
 - Metadata changes are events; existing history is never rewritten.
 - Appends are flushed and normally synced, with a sidecar lock preventing
-  concurrent writers.
+  interleaved records. A separate lifetime lease prevents two live agents from
+  owning the same conversation and diverging in-memory model histories.
 - `context_messages()` reconstructs valid provider history and handles
   incomplete final tool calls.
 - Model-assisted compaction appends a bounded summary event and falls back to

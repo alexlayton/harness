@@ -2,7 +2,13 @@ use super::{Tool, ToolOutput};
 use llm::ToolDefinition;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+
+/// Cloneable gate used to serialize workspace-mutating tool executions across
+/// otherwise independent registries.
+pub type ToolExecutionGate = Arc<Mutex<()>>;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ToolRegistryError {
@@ -26,7 +32,8 @@ pub struct ToolRegistry {
     /// Optional skills catalog discovered at startup; used to render the
     /// skills section of the system prompt and to hand read-paths to tools.
     skills: Option<super::skills::SkillCatalog>,
-    file_search_index: Option<std::sync::Arc<super::FileSearchIndex>>,
+    file_search_index: Option<Arc<super::FileSearchIndex>>,
+    execution_gate: Option<ToolExecutionGate>,
 }
 
 impl ToolRegistry {
@@ -51,6 +58,7 @@ impl ToolRegistry {
             workspace_root: workspace_root.into(),
             skills: None,
             file_search_index: None,
+            execution_gate: None,
         };
         for tool in tools {
             registry.register(tool)?;
@@ -64,6 +72,30 @@ impl ToolRegistry {
 
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
+    }
+
+    /// Configure a shared execution gate for workspace-affecting tools.
+    ///
+    /// Registries using clones of the same gate serialize every invocation
+    /// not classified as [`super::Concurrency::ReadOnly`]. Read-only tools do
+    /// not acquire the gate. Without a gate, execution behavior is unchanged.
+    pub fn with_execution_gate(mut self, gate: ToolExecutionGate) -> Self {
+        self.set_execution_gate(gate);
+        self
+    }
+
+    /// Set the shared execution gate for workspace-affecting tools.
+    ///
+    /// The gate is held for the complete tool future. Share one gate between
+    /// registries that target the same workspace and use distinct gates for
+    /// independent workspaces.
+    pub fn set_execution_gate(&mut self, gate: ToolExecutionGate) {
+        self.execution_gate = Some(gate);
+    }
+
+    /// Return the shared execution gate, when cross-registry coordination is enabled.
+    pub fn execution_gate(&self) -> Option<&ToolExecutionGate> {
+        self.execution_gate.as_ref()
     }
 
     /// Set the discovered skill catalog (called by `default_registry`).
@@ -164,6 +196,35 @@ impl ToolRegistry {
                 summary: name.to_owned(),
             };
         };
+        if tool.tool.concurrency(&args) == super::Concurrency::ReadOnly {
+            return tool.tool.execute(args, cancel).await;
+        }
+        // A workspace subagent runner acquires this same gate around its
+        // complete delegated workflow. Holding the non-reentrant mutex here
+        // as well would deadlock before the child could begin. Direct parent
+        // mutations continue through the gate below.
+        if name == super::subagent::SUBAGENT_TOOL_NAME {
+            return tool.tool.execute(args, cancel).await;
+        }
+        let Some(gate) = &self.execution_gate else {
+            return tool.tool.execute(args, cancel).await;
+        };
+        let cancelled = || ToolOutput {
+            content: "cancelled before workspace execution".into(),
+            is_error: true,
+            summary: super::call_summary(name, &args),
+        };
+        if cancel.is_cancelled() {
+            return cancelled();
+        }
+        let _guard = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return cancelled(),
+            guard = gate.lock() => guard,
+        };
+        if cancel.is_cancelled() {
+            return cancelled();
+        }
         tool.tool.execute(args, cancel).await
     }
 
@@ -214,6 +275,9 @@ mod tests {
     use async_trait::async_trait;
     use llm::ToolDefinition;
     use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, Notify, mpsc};
+    use tokio::time::{Duration, timeout};
 
     struct TestTool {
         name: &'static str,
@@ -235,11 +299,65 @@ mod tests {
             }
         }
 
+        fn concurrency(&self, _: &Value) -> super::super::Concurrency {
+            super::super::Concurrency::ReadOnly
+        }
+
         async fn execute(&self, _: Value, _: CancellationToken) -> ToolOutput {
             ToolOutput {
                 content: "ok".into(),
                 is_error: false,
                 summary: self.name.into(),
+            }
+        }
+    }
+
+    struct BlockingTool {
+        class: super::super::Concurrency,
+        entered: mpsc::UnboundedSender<()>,
+        release: Arc<Notify>,
+    }
+
+    struct GatedWorkspaceRunner {
+        gate: ToolExecutionGate,
+        entered: mpsc::UnboundedSender<()>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl super::super::SubagentRunner for GatedWorkspaceRunner {
+        async fn run(
+            &self,
+            _: &str,
+            _: &str,
+            mode: super::super::SubagentMode,
+            _: CancellationToken,
+        ) -> Result<String, String> {
+            assert_eq!(mode, super::super::SubagentMode::Workspace);
+            let _guard = self.gate.lock().await;
+            self.entered.send(()).unwrap();
+            self.release.notified().await;
+            Ok("done".into())
+        }
+    }
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn spec(&self) -> super::super::ToolSpec {
+            TestTool { name: "block" }.spec()
+        }
+
+        fn concurrency(&self, _: &Value) -> super::super::Concurrency {
+            self.class
+        }
+
+        async fn execute(&self, _: Value, _: CancellationToken) -> ToolOutput {
+            self.entered.send(()).unwrap();
+            self.release.notified().await;
+            ToolOutput {
+                content: "ok".into(),
+                is_error: false,
+                summary: "block".into(),
             }
         }
     }
@@ -264,6 +382,149 @@ mod tests {
             snapshot.definitions[0].name,
             snapshot.prompt_context.snippets[0].name
         );
+    }
+
+    #[tokio::test]
+    async fn shared_gate_serializes_exclusive_tools_across_registries() {
+        let gate = Arc::new(Mutex::new(()));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let make_registry = || {
+            ToolRegistry::new(vec![Box::new(BlockingTool {
+                class: super::super::Concurrency::Exclusive,
+                entered: entered_tx.clone(),
+                release: release.clone(),
+            })])
+            .with_execution_gate(gate.clone())
+        };
+        let first = make_registry();
+        let second = make_registry();
+        let first_task = tokio::spawn(async move {
+            first
+                .execute("block", json!({}), CancellationToken::new())
+                .await
+        });
+        entered_rx.recv().await.unwrap();
+        let second_task = tokio::spawn(async move {
+            second
+                .execute("block", json!({}), CancellationToken::new())
+                .await
+        });
+
+        assert!(
+            timeout(Duration::from_millis(50), entered_rx.recv())
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.notify_one();
+        first_task.await.unwrap();
+        second_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workspace_subagents_gate_children_without_nested_deadlock() {
+        let gate = Arc::new(Mutex::new(()));
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let release = Arc::new(Notify::new());
+        let make_registry = || {
+            let mut registry = ToolRegistry::empty().with_execution_gate(gate.clone());
+            registry
+                .register_subagent(Arc::new(GatedWorkspaceRunner {
+                    gate: gate.clone(),
+                    entered: entered_tx.clone(),
+                    release: release.clone(),
+                }))
+                .unwrap();
+            registry
+        };
+        let first = make_registry();
+        let second = make_registry();
+        let args = json!({"description": "test", "prompt": "test", "mode": "workspace"});
+        let first_task = tokio::spawn({
+            let args = args.clone();
+            async move {
+                first
+                    .execute("subagent", args, CancellationToken::new())
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .expect("outer subagent call deadlocked")
+            .unwrap();
+        let second_task = tokio::spawn(async move {
+            second
+                .execute("subagent", args, CancellationToken::new())
+                .await
+        });
+        assert!(
+            timeout(Duration::from_millis(50), entered_rx.recv())
+                .await
+                .is_err(),
+            "workspace child mutations overlapped"
+        );
+        release.notify_one();
+        timeout(Duration::from_secs(1), entered_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.notify_one();
+        timeout(Duration::from_secs(1), first_task)
+            .await
+            .unwrap()
+            .unwrap();
+        timeout(Duration::from_secs(1), second_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_stops_waiting_for_the_execution_gate() {
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock().await;
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let registry = ToolRegistry::new(vec![Box::new(BlockingTool {
+            class: super::super::Concurrency::Exclusive,
+            entered: entered_tx,
+            release: Arc::new(Notify::new()),
+        })])
+        .with_execution_gate(gate.clone());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let output = timeout(
+            Duration::from_millis(50),
+            registry.execute("block", json!({}), cancel),
+        )
+        .await
+        .expect("cancelled invocation remained queued");
+
+        assert!(output.is_error);
+        assert!(output.content.contains("cancelled"));
+        assert!(entered_rx.try_recv().is_err());
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_do_not_acquire_execution_gate() {
+        let gate = Arc::new(Mutex::new(()));
+        let guard = gate.lock().await;
+        let registry = ToolRegistry::new(vec![Box::new(TestTool { name: "one" })])
+            .with_execution_gate(gate.clone());
+
+        timeout(
+            Duration::from_millis(50),
+            registry.execute("one", json!({}), CancellationToken::new()),
+        )
+        .await
+        .expect("read-only invocation waited for execution gate");
+        drop(guard);
     }
 
     #[tokio::test]

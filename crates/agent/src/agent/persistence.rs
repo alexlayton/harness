@@ -1,6 +1,8 @@
 use super::{Agent, AgentEvent, SessionSnapshotEntry, TurnError, send};
 use llm::{Content, Message, ToolCall};
-use session::{Session, SessionEvent, SessionStore, StoredMessage, StoredToolCall};
+use session::{
+    Session, SessionActiveLease, SessionEvent, SessionStore, StoredMessage, StoredToolCall,
+};
 use tokio::sync::mpsc;
 use tools::call_summary;
 
@@ -9,6 +11,8 @@ use tools::call_summary;
 pub struct AgentSessionState {
     pub store: SessionStore,
     pub session: Session,
+    /// Exclusive ownership held for the lifetime of this active conversation.
+    pub active_lease: Option<SessionActiveLease>,
 }
 
 impl Agent {

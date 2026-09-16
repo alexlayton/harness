@@ -170,6 +170,15 @@ pub struct SessionIndexEntry {
     pub bytes: u64,
 }
 
+/// Exclusive process lease held while an agent owns a durable conversation.
+///
+/// The sidecar file is intentionally retained after unlock so all current and
+/// future contenders continue to lock the same inode.
+#[derive(Debug)]
+pub struct SessionActiveLease {
+    file: Option<File>,
+}
+
 /// Filesystem-backed session storage.  Sessions are grouped by a stable key
 /// derived from the workspace root, so a project never appears in another
 /// project's normal listing.
@@ -266,6 +275,50 @@ impl SessionStore {
 
     pub fn is_path_in_store(&self, path: &Path) -> bool {
         self.ensure_path_in_root(path).is_ok()
+    }
+
+    /// Acquire exclusive ownership of a session for an agent's lifetime.
+    ///
+    /// Plain loads and exports do not require this lease. Any runtime that can
+    /// append conversation events must hold it so independent in-memory model
+    /// histories cannot write to the same durable log.
+    pub fn acquire_active(&self, session: &Session) -> Result<SessionActiveLease> {
+        let Some(session_path) = session.path() else {
+            return Ok(SessionActiveLease { file: None });
+        };
+        self.ensure_path_in_root(session_path)?;
+        let path = session_path.with_extension("jsonl.active.lock");
+        let file = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(&path)
+            }
+            #[cfg(not(unix))]
+            {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&path)
+            }
+        }
+        .map_err(|source| io_error("open active session lease", &path, source))?;
+        ensure_private_file(&path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(SessionError::AlreadyActive(session_path.to_path_buf()))
+            }
+            Err(source) => Err(io_error("lock active session lease", &path, source)),
+        }
     }
 
     /// Create and immediately persist a new session header.
@@ -610,11 +663,8 @@ impl SessionStore {
     }
 
     fn ensure_path_in_root(&self, path: &Path) -> Result<()> {
-        let canonical_root = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
-        let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical_root = canonicalize_with_missing_tail(&self.root);
+        let canonical_path = canonicalize_with_missing_tail(path);
         if !canonical_path.starts_with(&canonical_root) {
             return Err(SessionError::PathOutsideStore {
                 path: path.to_path_buf(),
@@ -622,6 +672,28 @@ impl SessionStore {
             });
         }
         Ok(())
+    }
+}
+
+/// Canonicalize the longest existing prefix, preserving any missing suffix.
+/// This matters on macOS where temporary paths use `/var` while canonicalized
+/// ancestors use `/private/var`; a deliberately removed session file must
+/// still compare in the same path namespace as its store root.
+fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
+    let mut existing = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut canonical) = existing.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return path.to_path_buf();
+        };
+        missing.push(name.to_os_string());
+        existing = parent;
     }
 }
 
@@ -820,18 +892,8 @@ struct IndexEnvelope {
     event_id: Option<String>,
     sequence: Option<u64>,
     timestamp: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct IndexedDataEnvelope {
     #[serde(default)]
     data: IndexedData,
-}
-
-#[derive(Deserialize, Default)]
-struct IndexedMessageEnvelope {
-    #[serde(default)]
-    data: IndexedMessage,
 }
 
 #[derive(Deserialize, Default)]
@@ -839,10 +901,6 @@ struct IndexedData {
     provider: Option<String>,
     model: Option<String>,
     title: Option<String>,
-}
-
-#[derive(Deserialize, Default)]
-struct IndexedMessage {
     #[serde(default)]
     content: Vec<IndexedContent>,
 }
@@ -874,17 +932,10 @@ fn index_title(value: &str) -> String {
     format!("{}…", &first_line[..end])
 }
 
-#[derive(Clone, Copy)]
-struct IndexSpan {
-    start: u64,
-    bytes: u64,
-    end: u64,
-}
-
 enum IndexRecord<T> {
     Eof,
     Invalid,
-    Value(T, IndexSpan),
+    Value(T),
 }
 
 /// Deserialize one physical JSONL line without first collecting it in a
@@ -928,25 +979,10 @@ fn next_index_record<T: serde::de::DeserializeOwned>(
     reader.seek(SeekFrom::Start(start))?;
     let parsed = serde_json::from_reader(reader.by_ref().take(line_bytes));
     reader.seek(SeekFrom::Start(end))?;
-    let span = IndexSpan {
-        start,
-        bytes: line_bytes,
-        end,
-    };
     Ok(match parsed {
-        Ok(value) => IndexRecord::Value(value, span),
+        Ok(value) => IndexRecord::Value(value),
         Err(_) => IndexRecord::Invalid,
     })
-}
-
-fn parse_index_span<T: serde::de::DeserializeOwned>(
-    reader: &mut BufReader<File>,
-    span: IndexSpan,
-) -> std::io::Result<Option<T>> {
-    reader.seek(SeekFrom::Start(span.start))?;
-    let parsed = serde_json::from_reader(reader.by_ref().take(span.bytes)).ok();
-    reader.seek(SeekFrom::Start(span.end))?;
-    Ok(parsed)
 }
 
 /// Read only the metadata needed by the session picker. This deliberately
@@ -957,7 +993,7 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
     let header: IndexHeaderEnvelope = match next_index_record(&mut reader)
         .map_err(|source| io_error("read session header", path, source))?
     {
-        IndexRecord::Value(header, _) => header,
+        IndexRecord::Value(header) => header,
         IndexRecord::Eof | IndexRecord::Invalid => return Ok(None),
     };
     if header.version.is_none()
@@ -998,11 +1034,10 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
         let raw = match next_index_record::<IndexEnvelope>(&mut reader)
             .map_err(|source| io_error("read session index", path, source))?
         {
-            IndexRecord::Value(raw, span) => (raw, span),
+            IndexRecord::Value(raw) => raw,
             IndexRecord::Eof => break,
             IndexRecord::Invalid => return Ok(None),
         };
-        let (raw, span) = raw;
         if raw.version.is_none()
             || raw.version.unwrap_or_default() > crate::model::FORMAT_VERSION
             || raw.kind.as_deref() == Some("session")
@@ -1029,19 +1064,13 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
         event_count = event_count.saturating_add(1);
         expected_sequence = expected_sequence.saturating_add(1);
         match kind {
-            // Re-read only metadata-bearing records from the bounded physical
-            // span. This second pass is independent of JSON object key order;
-            // large tool-result payloads are never materialized.
+            // `IndexEnvelope` decodes this small metadata subset in the same
+            // pass. Unknown fields (including large tool outputs) are skipped
+            // by serde without allocating their payloads or seeking backward.
             "user_message" | "assistant_message" => {
-                let Some(message) =
-                    parse_index_span::<IndexedMessageEnvelope>(&mut reader, span)
-                        .map_err(|source| io_error("read session message index", path, source))?
-                else {
-                    return Ok(None);
-                };
-                has_conversation |= !message.data.content.is_empty();
+                has_conversation |= !raw.data.content.is_empty();
                 if title.is_none() && kind == "user_message" {
-                    title = message
+                    title = raw
                         .data
                         .content
                         .iter()
@@ -1058,21 +1087,11 @@ fn index_file(path: &Path, workspace: Option<&Path>) -> Result<Option<SessionInd
                 has_conversation = true;
             }
             "model_change" => {
-                let Some(change) = parse_index_span::<IndexedDataEnvelope>(&mut reader, span)
-                    .map_err(|source| io_error("read session model index", path, source))?
-                else {
-                    return Ok(None);
-                };
-                provider = change.data.provider;
-                model = change.data.model;
+                provider = raw.data.provider;
+                model = raw.data.model;
             }
             "metadata_change" => {
-                let Some(change) = parse_index_span::<IndexedDataEnvelope>(&mut reader, span)
-                    .map_err(|source| io_error("read session metadata index", path, source))?
-                else {
-                    return Ok(None);
-                };
-                title = change.data.title;
+                title = raw.data.title;
             }
             _ => {}
         }
@@ -1542,12 +1561,37 @@ impl Drop for SessionLock {
     }
 }
 
+impl Drop for SessionActiveLease {
+    fn drop(&mut self) {
+        if let Some(file) = &self.file {
+            let _ = file.unlock();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{SessionEvent, StoredMessage};
     use llm::Message;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalizes_missing_tail_in_the_existing_ancestors_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempdir().unwrap();
+        let real = directory.path().join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = directory.path().join("alias");
+        symlink(&real, &alias).unwrap();
+
+        assert_eq!(
+            canonicalize_with_missing_tail(&alias.join("missing/session.jsonl")),
+            real.canonicalize().unwrap().join("missing/session.jsonl")
+        );
+    }
 
     #[test]
     fn create_append_load_and_list_round_trip() {
@@ -2188,6 +2232,22 @@ mod tests {
         let second_store = SessionStore::new(root.path(), second.path()).unwrap();
         let error = second_store.load_path(session.path().unwrap()).unwrap_err();
         assert!(matches!(error, SessionError::WorkspaceMismatch { .. }));
+    }
+
+    #[test]
+    fn active_lease_rejects_a_second_agent_until_released() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+
+        let owner = store.acquire_active(&session).unwrap();
+        assert!(matches!(
+            store.acquire_active(&session),
+            Err(SessionError::AlreadyActive(_))
+        ));
+        drop(owner);
+        store.acquire_active(&session).unwrap();
     }
 
     #[test]
