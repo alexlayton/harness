@@ -1,5 +1,6 @@
 use super::InputMessage;
 use super::{Agent, AgentEvent, TurnError, send};
+use crate::secrets::SecretMasker;
 use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::task::noop_waker_ref;
@@ -63,9 +64,21 @@ impl ToolBatch {
 /// model may intend the read to observe that write's effect; parallel
 /// fan-out tools are likewise never merged across an intervening call.
 pub(crate) fn plan_tool_batches(calls: Vec<ToolCall>, registry: &ToolRegistry) -> Vec<ToolBatch> {
+    plan_tool_batches_with_secrets(calls, registry, None, false)
+}
+
+/// Plan calls with the same temporary argument view that execution will use.
+/// Public calls remain masked for hooks, history, and persistence.
+pub(crate) fn plan_tool_batches_with_secrets(
+    calls: Vec<ToolCall>,
+    registry: &ToolRegistry,
+    secrets: Option<&SecretMasker>,
+    restore_secrets: bool,
+) -> Vec<ToolBatch> {
     let mut batches: Vec<ToolBatch> = Vec::new();
     for call in calls {
-        let class = registry.concurrency(&call.name, &call.arguments);
+        let arguments = execution_arguments(registry, secrets, restore_secrets, &call);
+        let class = registry.concurrency(&call.name, &arguments);
         match batches.last_mut() {
             // Read-only calls all share one class, so any maximal run merges.
             Some(batch)
@@ -89,6 +102,20 @@ pub(crate) fn plan_tool_batches(calls: Vec<ToolCall>, registry: &ToolRegistry) -
         }
     }
     batches
+}
+
+fn execution_arguments(
+    registry: &ToolRegistry,
+    secrets: Option<&SecretMasker>,
+    restore_secrets: bool,
+    call: &ToolCall,
+) -> serde_json::Value {
+    match secrets {
+        Some(masker) if restore_secrets && registry.accepts_restored_secrets(&call.name) => {
+            masker.restore_json(&call.arguments)
+        }
+        _ => call.arguments.clone(),
+    }
 }
 
 /// The reason a shared tool batch stopped admitting work.
@@ -303,12 +330,31 @@ type ToolRun<'a> = Pin<Box<dyn Future<Output = (usize, ToolOutput, Instant)> + S
 /// Execute one planned batch with bounded admission and shared cancellation
 /// semantics. Results are returned in `batch.calls` order; hooks are called
 /// as work completes, so a frontend can render real-time completion order.
+#[cfg(test)]
 pub(crate) async fn execute_tool_batch<C, H>(
     registry: &ToolRegistry,
     batch: &ToolBatch,
     launch_limit: usize,
     control: &mut C,
     hooks: &mut H,
+) -> BatchOutcome
+where
+    C: Future<Output = DispatchCancellation> + Unpin,
+    H: ToolDispatchHooks,
+{
+    execute_tool_batch_with_secrets(registry, batch, launch_limit, control, hooks, None, false)
+        .await
+}
+
+/// Execute with optional output masking and local-tool argument restoration.
+pub(crate) async fn execute_tool_batch_with_secrets<C, H>(
+    registry: &ToolRegistry,
+    batch: &ToolBatch,
+    launch_limit: usize,
+    control: &mut C,
+    hooks: &mut H,
+    secrets: Option<&SecretMasker>,
+    restore_secrets: bool,
 ) -> BatchOutcome
 where
     C: Future<Output = DispatchCancellation> + Unpin,
@@ -329,11 +375,15 @@ where
         starts[next_launch] = Some(started);
         hooks.started(call, started, false);
         let name = call.name.clone();
-        let arguments = call.arguments.clone();
+        let arguments = execution_arguments(registry, secrets, restore_secrets, call);
         let index = next_launch;
         let cancel = batch_cancel.clone();
         futures.push(Box::pin(async move {
             let output = registry.execute(&name, arguments, cancel).await;
+            let output = match secrets {
+                Some(masker) => masker.mask_tool_output(output),
+                None => output,
+            };
             (index, output, started)
         }));
         next_launch += 1;
@@ -365,11 +415,15 @@ where
                         starts[next_launch] = Some(started);
                         hooks.started(call, started, false);
                         let name = call.name.clone();
-                        let arguments = call.arguments.clone();
+                        let arguments = execution_arguments(registry, secrets, restore_secrets, call);
                         let index = next_launch;
                         let cancel = batch_cancel.clone();
                         futures.push(Box::pin(async move {
                             let output = registry.execute(&name, arguments, cancel).await;
+                            let output = match secrets {
+                                Some(masker) => masker.mask_tool_output(output),
+                                None => output,
+                            };
                             (index, output, started)
                         }));
                         next_launch += 1;
@@ -451,7 +505,12 @@ impl Agent {
         input: &mut mpsc::UnboundedReceiver<InputMessage>,
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
-        for batch in plan_tool_batches(tool_calls, &self.tools) {
+        for batch in plan_tool_batches_with_secrets(
+            tool_calls,
+            &self.tools,
+            Some(self.secret_masker.as_ref()),
+            true,
+        ) {
             let limit = if batch.concurrent() {
                 match batch.class {
                     Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
@@ -478,8 +537,16 @@ impl Agent {
                 cancel,
             );
             let mut hooks = AgentToolDispatchHooks::new(events);
-            let outcome =
-                execute_tool_batch(&self.tools, &batch, limit, &mut control, &mut hooks).await;
+            let outcome = execute_tool_batch_with_secrets(
+                &self.tools,
+                &batch,
+                limit,
+                &mut control,
+                &mut hooks,
+                Some(self.secret_masker.as_ref()),
+                true,
+            )
+            .await;
             drop(control);
 
             for (call, call_outcome) in batch.calls.iter().zip(outcome.outcomes) {
@@ -608,6 +675,100 @@ mod tests {
             name: "test".into(),
             arguments: json!({"label": label, "delay_ms": delay_ms}),
         }
+    }
+
+    #[tokio::test]
+    async fn restores_only_for_opted_in_tools_and_masks_the_result() {
+        struct SecretTool {
+            name: &'static str,
+            restore: bool,
+            received: Arc<std::sync::Mutex<Option<Value>>>,
+        }
+
+        #[async_trait]
+        impl Tool for SecretTool {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    definition: llm::ToolDefinition {
+                        name: self.name.into(),
+                        description: "secret test".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    prompt: tools::ToolPrompt::default(),
+                }
+            }
+
+            fn accepts_restored_secrets(&self) -> bool {
+                self.restore
+            }
+
+            async fn execute(&self, args: Value, _cancel: CancellationToken) -> ToolOutput {
+                *self.received.lock().unwrap() = Some(args.clone());
+                ToolOutput {
+                    content: args["value"].as_str().unwrap().into(),
+                    is_error: false,
+                    summary: args["value"].as_str().unwrap().into(),
+                }
+            }
+        }
+
+        let local_received = Arc::new(std::sync::Mutex::new(None));
+        let external_received = Arc::new(std::sync::Mutex::new(None));
+        let registry = ToolRegistry::try_new(vec![
+            Box::new(SecretTool {
+                name: "local",
+                restore: true,
+                received: local_received.clone(),
+            }),
+            Box::new(SecretTool {
+                name: "external",
+                restore: false,
+                received: external_received.clone(),
+            }),
+        ])
+        .unwrap();
+        let masker = SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap();
+        let placeholder = "{{harness-secret:TOKEN}}";
+        let batch = ToolBatch {
+            calls: vec![
+                ToolCall {
+                    id: "local".into(),
+                    name: "local".into(),
+                    arguments: json!({"value": placeholder}),
+                },
+                ToolCall {
+                    id: "external".into(),
+                    name: "external".into(),
+                    arguments: json!({"value": placeholder}),
+                },
+            ],
+            class: Concurrency::Exclusive,
+        };
+        let cancel = CancellationToken::new();
+        let mut control = CancellationControl::new(&cancel, DispatchCancellation::Explicit);
+        let mut hooks = NoopToolDispatchHooks;
+
+        let outcome = execute_tool_batch_with_secrets(
+            &registry,
+            &batch,
+            1,
+            &mut control,
+            &mut hooks,
+            Some(&masker),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            local_received.lock().unwrap().as_ref().unwrap()["value"],
+            "secret-value"
+        );
+        assert_eq!(
+            external_received.lock().unwrap().as_ref().unwrap()["value"],
+            placeholder
+        );
+        assert_eq!(outcome.outcomes[0].output.content, placeholder);
+        assert_eq!(outcome.outcomes[0].output.summary, placeholder);
     }
 
     #[tokio::test]

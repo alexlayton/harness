@@ -1,4 +1,5 @@
 use super::{Agent, AgentEvent, SessionSnapshotEntry, TurnError, send};
+use crate::secrets::SecretMasker;
 use llm::{Content, Message, ToolCall};
 use session::{
     Session, SessionActiveLease, SessionEvent, SessionStore, StoredMessage, StoredToolCall,
@@ -228,17 +229,20 @@ impl Agent {
 /// conversion is presentational only.
 pub(crate) fn ui_snapshot_entries(
     entries: Vec<session::SessionSnapshotEntry>,
+    secret_masker: &SecretMasker,
 ) -> Vec<SessionSnapshotEntry> {
     entries
         .into_iter()
         .map(|entry| match entry {
-            session::SessionSnapshotEntry::User { text } => SessionSnapshotEntry::User { text },
+            session::SessionSnapshotEntry::User { text } => SessionSnapshotEntry::User {
+                text: secret_masker.mask_text(&text),
+            },
             session::SessionSnapshotEntry::Assistant {
                 markdown,
                 reasoning,
             } => SessionSnapshotEntry::Assistant {
-                markdown,
-                reasoning,
+                markdown: secret_masker.mask_text(&markdown),
+                reasoning: secret_masker.mask_text(&reasoning),
             },
             session::SessionSnapshotEntry::Tool {
                 name,
@@ -246,14 +250,17 @@ pub(crate) fn ui_snapshot_entries(
                 ok,
                 output,
                 error,
-            } => SessionSnapshotEntry::Tool {
-                summary: call_summary(&name, &arguments),
-                name,
-                ok,
-                duration_ms: 0,
-                output,
-                error,
-            },
+            } => {
+                let arguments = secret_masker.mask_json(&arguments);
+                SessionSnapshotEntry::Tool {
+                    summary: call_summary(&name, &arguments),
+                    name,
+                    ok,
+                    duration_ms: 0,
+                    output: secret_masker.mask_text(&output),
+                    error: error.map(|error| secret_masker.mask_text(&error)),
+                }
+            }
         })
         .collect()
 }

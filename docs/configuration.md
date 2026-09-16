@@ -49,6 +49,38 @@ Set `rtk = true` to let the bash tool rewrite supported commands through an
 installed `rtk` executable for smaller tool output. This feature is off by
 default.
 
+## Secret masking
+
+Harness can replace explicitly configured environment-variable values before
+conversation content is sent to a model or stored in a new session event:
+
+```toml
+[secrets]
+env = ["DEPLOY_TOKEN", "AWS_SECRET_ACCESS_KEY"]
+```
+
+Harness resolves these variables once at startup. Startup fails if a configured
+variable is missing, is not valid Unicode, or contains fewer than eight bytes.
+The configuration stores names only. Resolved values stay in process memory and
+are not included in debug output.
+
+The model sees stable placeholders such as
+`{{harness-secret:DEPLOY_TOKEN}}`. Harness can restore known placeholders in a
+temporary argument copy for built-in local tools. The tool call kept in session
+history stays masked. Harness does not restore placeholders for subagent prompts,
+MCP tools, or other external tools. Tool results are masked before they reach the
+UI, model history, or session store.
+
+Masking uses exact string matches. It does not detect encoded, split, derived,
+or unknown credentials. It also is not a sandbox. In particular, `bash` can
+read the process environment and use the network without first returning a
+secret to Harness. Use this feature to reduce accidental provider and session
+disclosure, not to defend against a malicious model or prompt injection.
+
+Existing append-only session files are not rewritten. When an old session is
+loaded, Harness masks its provider and UI views in memory, but any plaintext
+that was already written remains in the JSONL file.
+
 ## Terminal UI
 
 To start directly at the input field without printing the welcome banner and

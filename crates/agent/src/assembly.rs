@@ -4,6 +4,7 @@
 //! the resulting agent policy identical once those inputs have been resolved.
 
 use crate::agent::{Agent, AgentEvent, InputMessage, ProviderFactory, SubagentLimits};
+use crate::secrets::{SecretMasker, mask_provider};
 use crate::subagent::SubagentRunnerImpl;
 use anyhow::{Context, Result};
 use compact::CompactionPolicy;
@@ -47,6 +48,7 @@ pub struct AgentBuilder {
     rtk: bool,
     session: Option<(SessionStore, Session)>,
     provider_factory: Option<ProviderFactory>,
+    secret_masker: Arc<SecretMasker>,
     mcp_servers: Vec<mcp::McpServerConfig>,
 }
 
@@ -70,6 +72,7 @@ impl AgentBuilder {
             rtk: false,
             session: None,
             provider_factory: None,
+            secret_masker: Arc::new(SecretMasker::default()),
             mcp_servers: Vec::new(),
         }
     }
@@ -105,6 +108,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Attach the resolved exact-value secret policy.
+    pub fn with_secret_masker(mut self, secret_masker: Arc<SecretMasker>) -> Self {
+        self.secret_masker = secret_masker;
+        self
+    }
+
     /// Attach host-owned provider construction for `/model` and `/models`.
     pub fn with_provider_factory(mut self, factory: ProviderFactory) -> Self {
         self.provider_factory = Some(factory);
@@ -121,6 +130,14 @@ impl AgentBuilder {
     /// Connect optional MCP servers, register optional subagents, and produce
     /// a runtime that keeps external server processes alive for the agent.
     pub async fn build(mut self) -> Result<AssembledAgent> {
+        self.provider = mask_provider(self.provider, self.secret_masker.clone());
+        self.provider_factory = self.provider_factory.map(|factory| {
+            let masker = self.secret_masker.clone();
+            Arc::new(move |name: &str| {
+                factory(name).map(|provider| mask_provider(provider, masker.clone()))
+            }) as ProviderFactory
+        });
+
         // Claim the conversation before repairing it. Another live agent may
         // have a durable tool call in flight that must not be mistaken for a
         // crashed tail, even though per-append locking keeps JSONL writes safe.
@@ -174,7 +191,8 @@ impl AgentBuilder {
                 self.session.as_ref().map(|(store, _)| store.clone()),
                 parent_session,
             )
-            .with_reasoning(self.reasoning);
+            .with_reasoning(self.reasoning)
+            .with_secret_masker(self.secret_masker.clone());
             if let Some(index) = search_index {
                 runner = runner.with_file_search_index(index);
             }
@@ -195,6 +213,7 @@ impl AgentBuilder {
 
         let assembly_cancel = self.cancel.clone();
         let mut agent = Agent::new(self.provider, self.tools, self.model, self.cancel)
+            .with_secret_masker(self.secret_masker)
             .with_reasoning(self.reasoning)
             .with_project_context(self.project_context)
             .with_compaction(self.compaction)

@@ -1,3 +1,4 @@
+use crate::secrets::SecretMasker;
 use compact::CompactionPolicy;
 use llm::{Message, Provider};
 use session::{Session, SessionStore, snapshot_entries};
@@ -33,7 +34,8 @@ use persistence::{ui_snapshot_entries, usage_event};
 pub use tool_dispatch::SubagentLimits;
 pub(crate) use tool_dispatch::{
     CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
-    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch, plan_tool_batches,
+    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch_with_secrets,
+    plan_tool_batches,
 };
 pub(crate) use turn::TurnControl;
 
@@ -65,6 +67,8 @@ pub struct Agent {
     pub history: Vec<Message>,
     pub cancel: CancellationToken,
     pub session: Option<AgentSessionState>,
+    /// Exact-value masking shared by provider, persistence, and tool dispatch.
+    pub(crate) secret_masker: Arc<SecretMasker>,
     /// Host-supplied provider construction used by `/model` and `/models`.
     provider_factory: Option<ProviderFactory>,
     /// Input messages received while a turn is running.  They are drained by
@@ -118,6 +122,7 @@ impl Agent {
             history: Vec::new(),
             cancel,
             session: None,
+            secret_masker: Arc::new(SecretMasker::default()),
             provider_factory: None,
             queued: VecDeque::new(),
             input_open: true,
@@ -174,6 +179,17 @@ impl Agent {
         self
     }
 
+    /// Attach the exact-value masker used by every local data boundary.
+    pub fn with_secret_masker(mut self, secret_masker: Arc<SecretMasker>) -> Self {
+        self.secret_masker = secret_masker;
+        self.history = self
+            .history
+            .iter()
+            .map(|message| self.secret_masker.mask_message(message))
+            .collect();
+        self
+    }
+
     /// Attach host-owned provider construction for runtime model commands.
     pub fn with_provider_factory(mut self, factory: ProviderFactory) -> Self {
         self.provider_factory = Some(factory);
@@ -190,7 +206,11 @@ impl Agent {
     ) -> session::Result<Self> {
         let active_lease = store.acquire_active(&session)?;
         store.repair_incomplete_tool_calls(&mut session)?;
-        self.history = session.context_messages();
+        self.history = session
+            .context_messages()
+            .iter()
+            .map(|message| self.secret_masker.mask_message(message))
+            .collect();
         if let Some(runner) = &self.subagent_runner {
             runner.update_parent_session(Some(session.id()));
         }
@@ -210,7 +230,11 @@ impl Agent {
         session: Session,
         active_lease: session::SessionActiveLease,
     ) -> Self {
-        self.history = session.context_messages();
+        self.history = session
+            .context_messages()
+            .iter()
+            .map(|message| self.secret_masker.mask_message(message))
+            .collect();
         if let Some(runner) = &self.subagent_runner {
             runner.update_parent_session(Some(session.id()));
         }
@@ -244,7 +268,10 @@ impl Agent {
             send(
                 &events,
                 AgentEvent::SessionSnapshot {
-                    entries: ui_snapshot_entries(snapshot_entries(&session.session)),
+                    entries: ui_snapshot_entries(
+                        snapshot_entries(&session.session),
+                        &self.secret_masker,
+                    ),
                 },
             );
             send(&events, usage_event(&session.session.metadata.usage));
@@ -539,6 +566,58 @@ mod tests {
             event_rx.try_recv(),
             Ok(AgentEvent::Error(message)) if message.contains("already active")
         ));
+    }
+
+    #[tokio::test]
+    async fn configured_secret_never_enters_events_or_new_session_records() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let masker = Arc::new(
+            crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap(),
+        );
+        let provider = crate::secrets::mask_provider(
+            Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![script(vec![
+                    StreamEvent::TextDelta("secret-".into()),
+                    StreamEvent::TextDelta("value".into()),
+                    StreamEvent::Done {
+                        usage: None,
+                        stop_reason: None,
+                    },
+                ])],
+                error_kind: MockErrorKind::Stream,
+            }),
+            masker.clone(),
+        );
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("use secret-value".into()))
+            .unwrap();
+        drop(input_tx);
+
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_secret_masker(masker)
+        .with_session(store, session)
+        .unwrap();
+        agent.run(input_rx, event_tx).await;
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let event_debug = format!("{events:?}");
+        let durable = std::fs::read_to_string(session_path).unwrap();
+        for content in [&event_debug, &durable] {
+            assert!(!content.contains("secret-value"), "{content}");
+            assert!(content.contains("{{harness-secret:TOKEN}}"), "{content}");
+        }
     }
 
     #[tokio::test]

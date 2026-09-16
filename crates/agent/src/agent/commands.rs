@@ -156,9 +156,13 @@ impl Agent {
         let id = session.id().to_string();
         let parent_session_id = session.id();
         let title = session.metadata.title.clone();
-        self.history = session.context_messages();
+        self.history = session
+            .context_messages()
+            .iter()
+            .map(|message| self.secret_masker.mask_message(message))
+            .collect();
         self.last_context_tokens = None;
-        let snapshot = ui_snapshot_entries(snapshot_entries(&session));
+        let snapshot = ui_snapshot_entries(snapshot_entries(&session), &self.secret_masker);
         self.session = Some(AgentSessionState {
             store,
             session,

@@ -119,6 +119,10 @@ impl Tool for EditTool {
         }
     }
 
+    fn accepts_restored_secrets(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         let (path, edits) = match parse_args(&args) {
             Ok(value) => value,

@@ -165,14 +165,16 @@ impl Agent {
 
         let compacted_through = plan.boundary;
         let summary = match &outcome {
-            SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text } => text,
+            SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text } => {
+                self.secret_masker.mask_text(text)
+            }
             SummaryOutcome::Cancelled => unreachable!("cancelled outcome handled above"),
         };
         let summary_bytes = summary.len();
 
         self.persist_event(
             SessionEvent::CompactionSummary {
-                summary: summary.clone(),
+                summary,
                 compacted_through,
             },
             events,
@@ -182,7 +184,12 @@ impl Agent {
         // rebuild the live conversation would keep stale (uncompacted) history
         // until next restart.
         if let Some(state) = self.session.as_ref() {
-            self.history = state.session.context_messages();
+            self.history = state
+                .session
+                .context_messages()
+                .iter()
+                .map(|message| self.secret_masker.mask_message(message))
+                .collect();
             send(events, usage_event(&state.session.metadata.usage));
         }
         self.last_context_tokens = None;

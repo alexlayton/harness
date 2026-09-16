@@ -79,6 +79,10 @@ impl Tool for GrepTool {
         Concurrency::ReadOnly
     }
 
+    fn accepts_restored_secrets(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         let pattern = match args.get("pattern").and_then(Value::as_str) {
             Some(pattern) if !pattern.trim().is_empty() => pattern.to_owned(),

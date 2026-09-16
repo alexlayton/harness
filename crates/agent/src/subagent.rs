@@ -28,10 +28,12 @@
 
 use crate::agent::{
     CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
-    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch, plan_tool_batches,
+    MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch_with_secrets,
+    plan_tool_batches,
 };
 use crate::assembly::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
+use crate::secrets::SecretMasker;
 use async_trait::async_trait;
 use compact::estimate_provider_context_tokens;
 use futures_util::stream::StreamExt;
@@ -132,6 +134,7 @@ pub struct SubagentRunnerImpl {
     /// workspace. A workspace-mode run holds it for the entire delegated
     /// workflow; its child registry therefore must not reacquire it.
     execution_gate: Option<ToolExecutionGate>,
+    secret_masker: Arc<SecretMasker>,
     rtk: bool,
     project_context: String,
     /// Resolved delegation bounds (`max_turns`; `0` disables subagents).
@@ -193,6 +196,7 @@ impl SubagentRunnerImpl {
             workspace_root,
             search_index,
             execution_gate: None,
+            secret_masker: Arc::new(SecretMasker::default()),
             rtk,
             project_context: project_context.into(),
             config,
@@ -214,6 +218,13 @@ impl SubagentRunnerImpl {
     /// parent index before the runner can be shared or used.
     pub fn with_file_search_index(mut self, index: Arc<FileSearchIndex>) -> Self {
         self.search_index = index;
+        self
+    }
+
+    /// Mask child tool evidence without giving child prompts restoration
+    /// authority.
+    pub fn with_secret_masker(mut self, secret_masker: Arc<SecretMasker>) -> Self {
+        self.secret_masker = secret_masker;
         self
     }
 
@@ -625,8 +636,16 @@ impl SubagentRunnerImpl {
             };
             let mut control = CancellationControl::new(cancel, DispatchCancellation::Explicit);
             let mut hooks = NoopToolDispatchHooks;
-            let outcome =
-                execute_tool_batch(registry, &batch, launch_limit, &mut control, &mut hooks).await;
+            let outcome = execute_tool_batch_with_secrets(
+                registry,
+                &batch,
+                launch_limit,
+                &mut control,
+                &mut hooks,
+                Some(self.secret_masker.as_ref()),
+                false,
+            )
+            .await;
 
             for (call, call_outcome) in batch.calls.iter().zip(outcome.outcomes) {
                 let content = call_outcome.output.content;

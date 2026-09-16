@@ -128,6 +128,14 @@ pub trait Tool: Send + Sync {
         Concurrency::Exclusive
     }
 
+    /// Whether the agent may restore configured secret placeholders in a
+    /// temporary argument copy before this tool runs. External tools and
+    /// delegated model prompts default to false so restoration cannot silently
+    /// cross another process or provider boundary.
+    fn accepts_restored_secrets(&self) -> bool {
+        false
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput;
 }
 
