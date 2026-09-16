@@ -1,4 +1,4 @@
-use crate::secrets::SecretMasker;
+use crate::secrets::{SecretMasker, mask_provider};
 use compact::CompactionPolicy;
 use llm::{Message, Provider};
 use session::{Session, SessionStore, snapshot_entries};
@@ -180,7 +180,16 @@ impl Agent {
     }
 
     /// Attach the exact-value masker used by every local data boundary.
+    ///
+    /// This also decorates the active provider and any provider factory that
+    /// was attached first, so direct users of [`Agent`] cannot accidentally
+    /// configure local masking while leaving provider traffic unmasked.
     pub fn with_secret_masker(mut self, secret_masker: Arc<SecretMasker>) -> Self {
+        self.provider = mask_provider(self.provider, secret_masker.clone());
+        self.provider_factory = self
+            .provider_factory
+            .take()
+            .map(|factory| masked_provider_factory(factory, secret_masker.clone()));
         self.secret_masker = secret_masker;
         self.history = self
             .history
@@ -192,7 +201,7 @@ impl Agent {
 
     /// Attach host-owned provider construction for runtime model commands.
     pub fn with_provider_factory(mut self, factory: ProviderFactory) -> Self {
-        self.provider_factory = Some(factory);
+        self.provider_factory = Some(masked_provider_factory(factory, self.secret_masker.clone()));
         self
     }
 
@@ -261,7 +270,12 @@ impl Agent {
                 &events,
                 AgentEvent::SessionChanged {
                     id: session.session.id().to_string(),
-                    title: session.session.metadata.title.clone(),
+                    title: session
+                        .session
+                        .metadata
+                        .title
+                        .as_deref()
+                        .map(|title| self.secret_masker.mask_text(title)),
                     loaded: false,
                 },
             );
@@ -431,6 +445,15 @@ fn send(events: &mpsc::UnboundedSender<AgentEvent>, event: AgentEvent) {
     let _ = events.send(event);
 }
 
+fn masked_provider_factory(
+    factory: ProviderFactory,
+    secret_masker: Arc<SecretMasker>,
+) -> ProviderFactory {
+    Arc::new(move |name| {
+        factory(name).map(|provider| mask_provider(provider, secret_masker.clone()))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +592,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_secret_masks_legacy_titles_in_all_session_events() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut legacy = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut legacy,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("legacy conversation")),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut legacy,
+                SessionEvent::MetadataChange {
+                    title: Some("legacy secret-value title".into()),
+                },
+            )
+            .unwrap();
+        let legacy_id = legacy.id();
+        let current = store.create(SessionCreateOptions::default()).unwrap();
+        let masker = Arc::new(
+            crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap(),
+        );
+        let provider = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: Vec::new(),
+            error_kind: MockErrorKind::Stream,
+        });
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_secret_masker(masker.clone())
+        .with_session(store.clone(), current)
+        .unwrap();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        agent.handle_list_sessions(&event_tx);
+        agent.handle_load_session(legacy_id.to_string(), &event_tx);
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let event_debug = format!("{events:?}");
+        assert!(!event_debug.contains("secret-value"), "{event_debug}");
+        assert_eq!(event_debug.matches("{{harness-secret:TOKEN}}").count(), 2);
+        drop(agent);
+
+        let legacy = store.load(&legacy_id.to_string()).unwrap();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        drop(input_tx);
+        Agent::new(
+            provider,
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_secret_masker(masker)
+        .with_session(store, legacy)
+        .unwrap()
+        .run(input_rx, event_tx)
+        .await;
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let event_debug = format!("{events:?}");
+        assert!(!event_debug.contains("secret-value"), "{event_debug}");
+        assert!(event_debug.contains("{{harness-secret:TOKEN}}"));
+    }
+
+    #[tokio::test]
     async fn configured_secret_never_enters_events_or_new_session_records() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
@@ -578,21 +675,18 @@ mod tests {
         let masker = Arc::new(
             crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap(),
         );
-        let provider = crate::secrets::mask_provider(
-            Arc::new(MockProvider {
-                calls: AtomicUsize::new(0),
-                scripts: vec![script(vec![
-                    StreamEvent::TextDelta("secret-".into()),
-                    StreamEvent::TextDelta("value".into()),
-                    StreamEvent::Done {
-                        usage: None,
-                        stop_reason: None,
-                    },
-                ])],
-                error_kind: MockErrorKind::Stream,
-            }),
-            masker.clone(),
-        );
+        let provider = Arc::new(MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![script(vec![
+                StreamEvent::TextDelta("secret-".into()),
+                StreamEvent::TextDelta("value".into()),
+                StreamEvent::Done {
+                    usage: None,
+                    stop_reason: None,
+                },
+            ])],
+            error_kind: MockErrorKind::Stream,
+        });
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
         input_tx
@@ -691,33 +785,30 @@ mod tests {
             crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap(),
         );
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let provider = crate::secrets::mask_provider(
-            Arc::new(RecordingScriptProvider {
-                calls: AtomicUsize::new(0),
-                scripts: vec![
-                    script(vec![
-                        StreamEvent::ToolCallComplete(ToolCall {
-                            id: "call".into(),
-                            name: "secret_echo".into(),
-                            arguments: json!({"value": "secret-value"}),
-                        }),
-                        StreamEvent::Done {
-                            usage: None,
-                            stop_reason: Some("tool_calls".into()),
-                        },
-                    ]),
-                    script(vec![
-                        StreamEvent::TextDelta("done".into()),
-                        StreamEvent::Done {
-                            usage: None,
-                            stop_reason: None,
-                        },
-                    ]),
-                ],
-                requests: requests.clone(),
-            }),
-            masker.clone(),
-        );
+        let provider = Arc::new(RecordingScriptProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![
+                script(vec![
+                    StreamEvent::ToolCallComplete(ToolCall {
+                        id: "call".into(),
+                        name: "secret_echo".into(),
+                        arguments: json!({"value": "secret-value"}),
+                    }),
+                    StreamEvent::Done {
+                        usage: None,
+                        stop_reason: Some("tool_calls".into()),
+                    },
+                ]),
+                script(vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Done {
+                        usage: None,
+                        stop_reason: None,
+                    },
+                ]),
+            ],
+            requests: requests.clone(),
+        });
         let received = Arc::new(Mutex::new(None));
         let tools = ToolRegistry::try_new(vec![Box::new(SecretEchoTool {
             received: received.clone(),

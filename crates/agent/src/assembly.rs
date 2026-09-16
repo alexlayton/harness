@@ -130,14 +130,6 @@ impl AgentBuilder {
     /// Connect optional MCP servers, register optional subagents, and produce
     /// a runtime that keeps external server processes alive for the agent.
     pub async fn build(mut self) -> Result<AssembledAgent> {
-        self.provider = mask_provider(self.provider, self.secret_masker.clone());
-        self.provider_factory = self.provider_factory.map(|factory| {
-            let masker = self.secret_masker.clone();
-            Arc::new(move |name: &str| {
-                factory(name).map(|provider| mask_provider(provider, masker.clone()))
-            }) as ProviderFactory
-        });
-
         // Claim the conversation before repairing it. Another live agent may
         // have a durable tool call in flight that must not be mistaken for a
         // crashed tail, even though per-append locking keeps JSONL writes safe.
@@ -182,7 +174,7 @@ impl AgentBuilder {
         let execution_gate = self.tools.execution_gate().cloned();
         let runner = if self.subagents.max_turns > 0 {
             let mut runner = SubagentRunnerImpl::new(
-                self.provider.clone(),
+                mask_provider(self.provider.clone(), self.secret_masker.clone()),
                 self.model.clone(),
                 self.tools.workspace_root().to_path_buf(),
                 self.rtk,

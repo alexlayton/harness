@@ -55,7 +55,11 @@ impl Agent {
         };
         let id = session.id().to_string();
         let parent_session_id = session.id();
-        let title = session.metadata.title.clone();
+        let title = session
+            .metadata
+            .title
+            .as_deref()
+            .map(|title| self.secret_masker.mask_text(title));
         self.history.clear();
         self.last_context_tokens = None;
         self.session = Some(AgentSessionState {
@@ -155,7 +159,11 @@ impl Agent {
         };
         let id = session.id().to_string();
         let parent_session_id = session.id();
-        let title = session.metadata.title.clone();
+        let title = session
+            .metadata
+            .title
+            .as_deref()
+            .map(|title| self.secret_masker.mask_text(title));
         self.history = session
             .context_messages()
             .iter()
@@ -209,11 +217,22 @@ impl Agent {
                         .map(|entry| SessionListItem {
                             id: entry.id.to_string(),
                             short_id: entry.short_id,
-                            title: entry.title,
+                            title: entry
+                                .title
+                                .as_deref()
+                                .map(|title| self.secret_masker.mask_text(title)),
                             updated_at: entry.updated_at,
-                            workspace: entry.workspace_root.display().to_string(),
-                            provider: entry.provider,
-                            model: entry.model,
+                            workspace: self
+                                .secret_masker
+                                .mask_text(&entry.workspace_root.display().to_string()),
+                            provider: entry
+                                .provider
+                                .as_deref()
+                                .map(|provider| self.secret_masker.mask_text(provider)),
+                            model: entry
+                                .model
+                                .as_deref()
+                                .map(|model| self.secret_masker.mask_text(model)),
                         })
                         .collect(),
                 },
