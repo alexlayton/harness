@@ -621,6 +621,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_secrets_are_restored_only_for_execution_and_masked_everywhere_else() {
+        struct RecordingScriptProvider {
+            calls: AtomicUsize,
+            scripts: Vec<Vec<ScriptStep>>,
+            requests: Arc<Mutex<Vec<CompletionRequest>>>,
+        }
+
+        #[async_trait]
+        impl Provider for RecordingScriptProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                self.requests.lock().unwrap().push(request.clone());
+                let index = self.calls.fetch_add(1, Ordering::SeqCst);
+                let script = self.scripts.get(index).cloned().unwrap_or_default();
+                Ok(Box::pin(stream::iter(
+                    script
+                        .into_iter()
+                        .map(|step| step.map_err(LlmError::Stream)),
+                )))
+            }
+
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(Vec::new())
+            }
+        }
+
+        struct SecretEchoTool {
+            received: Arc<Mutex<Option<Value>>>,
+        }
+
+        #[async_trait]
+        impl Tool for SecretEchoTool {
+            fn spec(&self) -> tools::ToolSpec {
+                tools::ToolSpec {
+                    definition: llm::ToolDefinition {
+                        name: "secret_echo".into(),
+                        description: "echo a test value".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    prompt: tools::ToolPrompt::default(),
+                }
+            }
+
+            fn accepts_restored_secrets(&self) -> bool {
+                true
+            }
+
+            async fn execute(&self, arguments: Value, _cancel: CancellationToken) -> ToolOutput {
+                *self.received.lock().unwrap() = Some(arguments.clone());
+                let value = arguments["value"].as_str().unwrap().to_owned();
+                ToolOutput {
+                    content: value.clone(),
+                    is_error: false,
+                    summary: value,
+                }
+            }
+        }
+
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let session_path = session.file_path().unwrap().to_path_buf();
+        let masker = Arc::new(
+            crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap(),
+        );
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = crate::secrets::mask_provider(
+            Arc::new(RecordingScriptProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    script(vec![
+                        StreamEvent::ToolCallComplete(ToolCall {
+                            id: "call".into(),
+                            name: "secret_echo".into(),
+                            arguments: json!({"value": "secret-value"}),
+                        }),
+                        StreamEvent::Done {
+                            usage: None,
+                            stop_reason: Some("tool_calls".into()),
+                        },
+                    ]),
+                    script(vec![
+                        StreamEvent::TextDelta("done".into()),
+                        StreamEvent::Done {
+                            usage: None,
+                            stop_reason: None,
+                        },
+                    ]),
+                ],
+                requests: requests.clone(),
+            }),
+            masker.clone(),
+        );
+        let received = Arc::new(Mutex::new(None));
+        let tools = ToolRegistry::try_new(vec![Box::new(SecretEchoTool {
+            received: received.clone(),
+        })])
+        .unwrap();
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("use secret-value".into()))
+            .unwrap();
+        drop(input_tx);
+
+        Agent::new(provider, tools, "demo", CancellationToken::new())
+            .with_secret_masker(masker)
+            .with_session(store, session)
+            .unwrap()
+            .run(input_rx, event_tx)
+            .await;
+
+        assert_eq!(
+            received.lock().unwrap().as_ref().unwrap()["value"],
+            "secret-value"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.iter().any(|message| {
+            message.content.iter().any(|content| {
+                matches!(
+                    content,
+                    Content::ToolResult { content, .. }
+                        if content == "{{harness-secret:TOKEN}}"
+                )
+            })
+        }));
+
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        let externally_visible = [
+            format!("{requests:?}"),
+            format!("{events:?}"),
+            std::fs::read_to_string(session_path).unwrap(),
+        ];
+        for content in &externally_visible {
+            assert!(!content.contains("secret-value"), "{content}");
+            assert!(content.contains("{{harness-secret:TOKEN}}"), "{content}");
+        }
+    }
+
+    #[tokio::test]
     async fn failed_skill_operation_emits_a_completion_boundary() {
         let provider = Arc::new(MockProvider {
             calls: AtomicUsize::new(0),
