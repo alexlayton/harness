@@ -191,6 +191,7 @@ impl Agent {
             .provider_factory
             .take()
             .map(|factory| masked_provider_factory(factory, secret_masker.clone()));
+        self.model = secret_masker.mask_text(&self.model);
         self.secret_masker = secret_masker;
         if let Some(runner) = &self.subagent_runner {
             runner.update_secret_masker(self.secret_masker.clone());
@@ -311,7 +312,7 @@ impl Agent {
         spawn_model_metadata(
             metadata_tx,
             self.provider.clone(),
-            self.provider.name().to_owned(),
+            self.secret_masker.mask_text(self.provider.name()),
             self.model.clone(),
             self.cancel.clone(),
         );
@@ -842,12 +843,17 @@ mod tests {
             .unwrap();
         drop(input_tx);
 
-        Agent::new(provider, tools, "demo", CancellationToken::new())
-            .with_secret_masker(masker)
-            .with_session(store, session)
-            .unwrap()
-            .run(input_rx, event_tx)
-            .await;
+        Agent::new(
+            provider,
+            tools,
+            "model-secret-value",
+            CancellationToken::new(),
+        )
+        .with_secret_masker(masker)
+        .with_session(store, session)
+        .unwrap()
+        .run(input_rx, event_tx)
+        .await;
 
         assert_eq!(
             received.lock().unwrap().as_ref().unwrap()["value"],
@@ -855,6 +861,7 @@ mod tests {
         );
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].model, "model-{{harness-secret:TOKEN}}");
         assert!(requests[1].messages.iter().any(|message| {
             message.content.iter().any(|content| {
                 matches!(

@@ -1012,6 +1012,13 @@ impl Config {
             .unwrap_or_default();
         let secret_masker =
             Arc::new(SecretMasker::new(secret_entries).map_err(|error| anyhow!(error))?);
+        if secret_masker.mask_text(&model) != model
+            || secret_masker.mask_text(&provider.to_string()) != provider.to_string()
+        {
+            return Err(anyhow!(
+                "provider and model names cannot contain a configured secret"
+            ));
+        }
         let mcp_servers = file
             .mcp
             .as_ref()

@@ -235,6 +235,7 @@ impl SubagentRunnerImpl {
             .write()
             .expect("subagent model state lock poisoned");
         state.provider = mask_provider(state.provider.clone(), secret_masker.clone());
+        state.model = secret_masker.mask_text(&state.model);
         state.secret_masker = secret_masker;
     }
 
@@ -253,7 +254,8 @@ impl SubagentRunnerImpl {
             .write()
             .expect("subagent model state lock poisoned");
         state.provider = mask_provider(provider, state.secret_masker.clone());
-        state.model = model.into();
+        let model = model.into();
+        state.model = state.secret_masker.mask_text(&model);
     }
 
     /// Current child-target model (test seam for AGENT-4 atomicity: proves
@@ -325,7 +327,7 @@ impl SubagentRunnerImpl {
     /// /model snapshot this run started with, not whatever the parent uses now.
     fn create_child_session(
         store: &Option<SessionStore>,
-        provider: &Arc<dyn Provider>,
+        provider: &str,
         model: &str,
         description: &str,
         parent_session: Option<session::SessionId>,
@@ -333,7 +335,7 @@ impl SubagentRunnerImpl {
         let store = store.as_ref()?;
         match store.create(SessionCreateOptions {
             title: Some(description.to_owned()),
-            provider: Some(provider.name().to_owned()),
+            provider: Some(provider.to_owned()),
             model: Some(model.to_owned()),
             parent_session,
         }) {
@@ -382,6 +384,7 @@ impl SubagentRunnerImpl {
         };
         let registry = self.registry(mode)?;
         let registry_snapshot = registry.snapshot();
+        let provider_name = secret_masker.mask_text(provider.name());
         let description = secret_masker.mask_text(&run.description);
         let mut history = vec![Message::user(secret_masker.mask_text(&run.prompt))];
         let system = subagent_system_prompt(
@@ -393,7 +396,7 @@ impl SubagentRunnerImpl {
         );
         let mut session = Self::create_child_session(
             &self.store,
-            &provider,
+            &provider_name,
             &model,
             &description,
             parent_session,
@@ -435,7 +438,7 @@ impl SubagentRunnerImpl {
         tracing::info!(
             description = %description,
             mode = mode.as_str(),
-            provider = provider.name(),
+            provider = %provider_name,
             model = %model,
             child_session = ?session.as_ref().map(|child| child.id().to_string()),
             duration_ms = started.elapsed().as_millis() as u64,

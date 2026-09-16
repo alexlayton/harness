@@ -79,7 +79,8 @@ a secret-bearing key with a safe rejection marker and does not execute a local
 tool call that contains that marker. Harness also omits a tool definition or
 model-list entry if its routing name contains a configured value. Other
 provider-supplied labels and protocol identifiers are masked before display or
-persistence.
+persistence. Harness rejects a configured provider or model name that contains
+a secret because those routing values cannot be changed before use.
 
 Masking uses exact string matches. It does not detect encoded, split, derived,
 or unknown credentials. It also is not a sandbox. In particular, `bash` can
