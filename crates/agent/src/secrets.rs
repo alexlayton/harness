@@ -162,7 +162,7 @@ impl SecretMasker {
     /// An object with a secret in a key is replaced by a rejection marker;
     /// changing keys can merge distinct fields and silently alter a tool call.
     pub fn mask_json(&self, value: &Value) -> Value {
-        self.transform_json(value, false)
+        self.transform_json(value, false).0
     }
 
     /// Restore known placeholders in JSON string values recursively.
@@ -170,22 +170,38 @@ impl SecretMasker {
     /// An object with a placeholder in a key is replaced by a rejection marker
     /// for the same collision-safety reason as [`Self::mask_json`].
     pub fn restore_json(&self, value: &Value) -> Value {
+        self.transform_json(value, true).0
+    }
+
+    /// Restore execution arguments and report whether a placeholder appeared
+    /// in an object key. The rejection flag stays out of band so ordinary JSON
+    /// can never forge it.
+    pub(crate) fn restore_json_for_execution(&self, value: &Value) -> (Value, bool) {
         self.transform_json(value, true)
     }
 
-    fn transform_json(&self, value: &Value, restore: bool) -> Value {
+    fn transform_json(&self, value: &Value, restore: bool) -> (Value, bool) {
         match value {
-            Value::String(text) => Value::String(if restore {
-                self.restore_text(text)
-            } else {
-                self.mask_text(text)
-            }),
-            Value::Array(values) => Value::Array(
-                values
-                    .iter()
-                    .map(|value| self.transform_json(value, restore))
-                    .collect(),
+            Value::String(text) => (
+                Value::String(if restore {
+                    self.restore_text(text)
+                } else {
+                    self.mask_text(text)
+                }),
+                false,
             ),
+            Value::Array(values) => {
+                let mut rejected_key = false;
+                let values = values
+                    .iter()
+                    .map(|value| {
+                        let (value, rejected) = self.transform_json(value, restore);
+                        rejected_key |= rejected;
+                        value
+                    })
+                    .collect();
+                (Value::Array(values), rejected_key)
+            }
             Value::Object(values) => {
                 let has_protected_key = values.keys().any(|key| {
                     if restore {
@@ -195,34 +211,27 @@ impl SecretMasker {
                     }
                 });
                 if has_protected_key {
-                    Value::Object(serde_json::Map::from_iter([(
-                        REJECTED_JSON_KEY_FIELD.to_owned(),
-                        Value::String(REJECTED_JSON_KEY_MESSAGE.to_owned()),
-                    )]))
-                } else {
-                    Value::Object(
-                        values
-                            .iter()
-                            .map(|(key, value)| (key.clone(), self.transform_json(value, restore)))
-                            .collect(),
+                    (
+                        Value::Object(serde_json::Map::from_iter([(
+                            REJECTED_JSON_KEY_FIELD.to_owned(),
+                            Value::String(REJECTED_JSON_KEY_MESSAGE.to_owned()),
+                        )])),
+                        true,
                     )
+                } else {
+                    let mut rejected_key = false;
+                    let values = values
+                        .iter()
+                        .map(|(key, value)| {
+                            let (value, rejected) = self.transform_json(value, restore);
+                            rejected_key |= rejected;
+                            (key.clone(), value)
+                        })
+                        .collect();
+                    (Value::Object(values), rejected_key)
                 }
             }
-            other => other.clone(),
-        }
-    }
-
-    /// Whether a JSON transformation rejected a secret-bearing object key.
-    pub(crate) fn has_rejected_json_key(&self, value: &Value) -> bool {
-        match value {
-            Value::Array(values) => values.iter().any(|value| self.has_rejected_json_key(value)),
-            Value::Object(values) => {
-                values.contains_key(REJECTED_JSON_KEY_FIELD)
-                    || values
-                        .values()
-                        .any(|value| self.has_rejected_json_key(value))
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+            other => (other.clone(), false),
         }
     }
 
@@ -265,12 +274,19 @@ impl SecretMasker {
         }
     }
 
-    /// Mask a tool call while keeping its protocol identity unchanged.
+    /// Mask a tool call, making secret-bearing argument keys unexecutable.
     pub fn mask_tool_call(&self, call: &ToolCall) -> ToolCall {
+        let (arguments, rejected_key) = self.transform_json(&call.arguments, false);
         ToolCall {
             id: self.mask_text(&call.id),
-            name: self.mask_text(&call.name),
-            arguments: self.mask_json(&call.arguments),
+            // An empty name cannot match a registered tool. This safely
+            // rejects raw secrets in keys without an in-band JSON sentinel.
+            name: if rejected_key {
+                String::new()
+            } else {
+                self.mask_text(&call.name)
+            },
+            arguments,
         }
     }
 
@@ -586,16 +602,23 @@ mod tests {
             "abcdefgh": "raw key",
             "{{harness-secret:SHORT}}": "placeholder key"
         });
-        let masked = masker.mask_json(&raw);
+        let (masked, rejected) = masker.transform_json(&raw, false);
         let serialized = masked.to_string();
         assert!(!serialized.contains("abcdefgh"), "{serialized}");
-        assert!(masker.has_rejected_json_key(&masked));
+        assert!(rejected);
 
-        let restored = masker.restore_json(&serde_json::json!({
+        let legitimate_marker = serde_json::json!({
+            "__harness_secret_key_error": REJECTED_JSON_KEY_MESSAGE
+        });
+        let (unchanged, rejected) = masker.restore_json_for_execution(&legitimate_marker);
+        assert_eq!(unchanged, legitimate_marker);
+        assert!(!rejected);
+
+        let (restored, rejected) = masker.restore_json_for_execution(&serde_json::json!({
             "{{harness-secret:SHORT}}": "placeholder key",
             "other": "value"
         }));
-        assert!(masker.has_rejected_json_key(&restored));
+        assert!(rejected);
         assert_eq!(restored.as_object().unwrap().len(), 1);
     }
 
