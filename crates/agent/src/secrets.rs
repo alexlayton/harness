@@ -1,9 +1,11 @@
 //! Exact-value secret masking at the agent/provider boundary.
 //!
 //! Secret values stay in memory. Provider requests, provider text, tool calls,
-//! and tool results use stable named placeholders instead. This is privacy
-//! hygiene rather than a sandbox: local tools can still read process state and
-//! access the network.
+//! and tool results use stable named placeholders instead. Opaque provider
+//! continuation items that contain an exact secret are dropped because their
+//! authenticated data cannot be changed safely. This is privacy hygiene rather
+//! than a sandbox: local tools can still read process state and access the
+//! network.
 
 use futures_util::Stream;
 use llm::{
@@ -103,6 +105,21 @@ impl SecretMasker {
         self.replace_entries(text, true)
     }
 
+    fn contains_secret(&self, text: &str) -> bool {
+        self.entries.iter().any(|entry| text.contains(&entry.value))
+    }
+
+    fn json_contains_secret(&self, value: &Value) -> bool {
+        match value {
+            Value::String(text) => self.contains_secret(text),
+            Value::Array(values) => values.iter().any(|value| self.json_contains_secret(value)),
+            Value::Object(values) => values
+                .iter()
+                .any(|(key, value)| self.contains_secret(key) || self.json_contains_secret(value)),
+            Value::Null | Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
     fn replace_entries(&self, text: &str, restore: bool) -> String {
         let mut output = String::with_capacity(text.len());
         let mut cursor = 0;
@@ -184,23 +201,28 @@ impl SecretMasker {
             content: message
                 .content
                 .iter()
-                .map(|content| match content {
-                    Content::Text(text) => Content::Text(self.mask_text(text)),
-                    Content::Reasoning(text) => Content::Reasoning(self.mask_text(text)),
-                    Content::Opaque { provider, data } => Content::Opaque {
+                .filter_map(|content| match content {
+                    Content::Text(text) => Some(Content::Text(self.mask_text(text))),
+                    Content::Reasoning(text) => Some(Content::Reasoning(self.mask_text(text))),
+                    // Opaque continuation data must not be modified because
+                    // providers can authenticate its exact bytes. Dropping a
+                    // contaminated item is safer than persisting plaintext or
+                    // sending corrupted continuation state back.
+                    Content::Opaque { data, .. } if self.json_contains_secret(data) => None,
+                    Content::Opaque { provider, data } => Some(Content::Opaque {
                         provider: provider.clone(),
                         data: data.clone(),
-                    },
-                    Content::ToolCall(call) => Content::ToolCall(self.mask_tool_call(call)),
+                    }),
+                    Content::ToolCall(call) => Some(Content::ToolCall(self.mask_tool_call(call))),
                     Content::ToolResult {
                         tool_call_id,
                         content,
                         is_error,
-                    } => Content::ToolResult {
+                    } => Some(Content::ToolResult {
                         tool_call_id: tool_call_id.clone(),
                         content: self.mask_text(content),
                         is_error: *is_error,
-                    },
+                    }),
                 })
                 .collect(),
         }
@@ -378,8 +400,10 @@ impl Stream for MaskedEventStream {
                     self.queue_flush();
                     self.queued.push_back(Ok(event));
                 }
-                Poll::Ready(Some(Ok(event @ StreamEvent::OpaqueState { .. }))) => {
-                    return Poll::Ready(Some(Ok(event)));
+                Poll::Ready(Some(Ok(StreamEvent::OpaqueState { provider, data }))) => {
+                    if !self.masker.json_contains_secret(&data) {
+                        return Poll::Ready(Some(Ok(StreamEvent::OpaqueState { provider, data })));
+                    }
                 }
                 Poll::Ready(Some(Err(error))) => {
                     self.queue_flush();
@@ -525,6 +549,14 @@ mod tests {
                     name: "bash".into(),
                     arguments: serde_json::json!({"command": "echo abcdefgh-extra"}),
                 })),
+                Ok(StreamEvent::OpaqueState {
+                    provider: "recording".into(),
+                    data: serde_json::json!({"state": "abcdefgh-extra"}),
+                }),
+                Ok(StreamEvent::OpaqueState {
+                    provider: "recording".into(),
+                    data: serde_json::json!({"state": "safe"}),
+                }),
                 Ok(StreamEvent::Done {
                     usage: None,
                     stop_reason: None,
@@ -549,7 +581,19 @@ mod tests {
         let request = CompletionRequest {
             model: "demo".into(),
             system: Some("system abcdefgh-extra".into()),
-            messages: vec![Message::user("user abcdefgh-extra")],
+            messages: vec![
+                Message::user("user abcdefgh-extra"),
+                Message::assistant(vec![
+                    Content::Opaque {
+                        provider: "recording".into(),
+                        data: serde_json::json!({"state": "abcdefgh-extra"}),
+                    },
+                    Content::Opaque {
+                        provider: "recording".into(),
+                        data: serde_json::json!({"state": "safe"}),
+                    },
+                ]),
+            ],
             tools: Vec::new(),
             max_tokens: None,
             temperature: None,
@@ -560,10 +604,12 @@ mod tests {
         let mut response = provider.stream(&request).await.unwrap();
         let mut text = String::new();
         let mut tool_call = None;
+        let mut opaque = Vec::new();
         while let Some(event) = response.next().await {
             match event.unwrap() {
                 StreamEvent::TextDelta(delta) => text.push_str(&delta),
                 StreamEvent::ToolCallComplete(call) => tool_call = Some(call),
+                StreamEvent::OpaqueState { data, .. } => opaque.push(data),
                 _ => {}
             }
         }
@@ -574,6 +620,14 @@ mod tests {
             &sent.messages[0].content[0],
             Content::Text(text) if text.contains("{{harness-secret:LONG}}")
         ));
+        assert_eq!(
+            sent.messages[1].content,
+            vec![Content::Opaque {
+                provider: "recording".into(),
+                data: serde_json::json!({"state": "safe"}),
+            }]
+        );
+        assert_eq!(opaque, vec![serde_json::json!({"state": "safe"})]);
         assert_eq!(text, "{{harness-secret:LONG}}");
         assert_eq!(
             tool_call.unwrap().arguments["command"],

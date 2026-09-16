@@ -69,7 +69,9 @@ The model sees stable placeholders such as
 temporary argument copy for built-in local tools. The tool call kept in session
 history stays masked. Harness does not restore placeholders for subagent prompts,
 MCP tools, or other external tools. Tool results are masked before they reach the
-UI, model history, or session store.
+UI, model history, or session store. Harness does not modify opaque provider
+continuation state because changing it can make it invalid. It drops a complete
+opaque item if that item contains an exact configured value.
 
 Masking uses exact string matches. It does not detect encoded, split, derived,
 or unknown credentials. It also is not a sandbox. In particular, `bash` can
