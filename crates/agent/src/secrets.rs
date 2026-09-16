@@ -136,13 +136,12 @@ impl SecretMasker {
         output
     }
 
-    /// Mask JSON string values recursively. Object keys are protocol
-    /// structure and are intentionally not changed.
+    /// Mask JSON strings recursively, including object keys.
     pub fn mask_json(&self, value: &Value) -> Value {
         self.transform_json(value, false)
     }
 
-    /// Restore known placeholders in JSON string values recursively.
+    /// Restore known placeholders in JSON strings recursively, including keys.
     pub fn restore_json(&self, value: &Value) -> Value {
         self.transform_json(value, true)
     }
@@ -163,7 +162,14 @@ impl SecretMasker {
             Value::Object(values) => Value::Object(
                 values
                     .iter()
-                    .map(|(key, value)| (key.clone(), self.transform_json(value, restore)))
+                    .map(|(key, value)| {
+                        let key = if restore {
+                            self.restore_text(key)
+                        } else {
+                            self.mask_text(key)
+                        };
+                        (key, self.transform_json(value, restore))
+                    })
                     .collect(),
             ),
             other => other.clone(),
@@ -463,17 +469,19 @@ mod tests {
     }
 
     #[test]
-    fn masks_and_restores_nested_json_values_but_not_keys() {
+    fn masks_and_restores_nested_json_values_and_keys() {
         let masker = masker();
         let original = serde_json::json!({
-            "abcdefgh": ["prefix abcdefgh-extra suffix", {"value": "abcdefgh"}]
+            "abcdefgh": [
+                "prefix abcdefgh-extra suffix",
+                {"key-abcdefgh-extra": "abcdefgh"}
+            ]
         });
         let masked = masker.mask_json(&original);
-        assert!(masked.to_string().contains("harness-secret:LONG"));
-        assert_eq!(
-            masked.as_object().unwrap().keys().next().unwrap(),
-            "abcdefgh"
-        );
+        let serialized = masked.to_string();
+        assert!(!serialized.contains("abcdefgh"), "{serialized}");
+        assert!(serialized.contains("harness-secret:SHORT"));
+        assert!(serialized.contains("harness-secret:LONG"));
         assert_eq!(masker.restore_json(&masked), original);
     }
 
