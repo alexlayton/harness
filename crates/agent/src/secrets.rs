@@ -23,6 +23,10 @@ use std::task::{Context, Poll};
 /// replacement in source code, paths, and natural-language output.
 pub const MIN_SECRET_BYTES: usize = 8;
 
+const REJECTED_JSON_KEY_FIELD: &str = "__harness_secret_key_error";
+const REJECTED_JSON_KEY_MESSAGE: &str =
+    "secret values and placeholders are not supported in JSON object keys";
+
 #[derive(Clone)]
 struct SecretEntry {
     name: String,
@@ -153,12 +157,18 @@ impl SecretMasker {
         output
     }
 
-    /// Mask JSON strings recursively, including object keys.
+    /// Mask JSON string values recursively.
+    ///
+    /// An object with a secret in a key is replaced by a rejection marker;
+    /// changing keys can merge distinct fields and silently alter a tool call.
     pub fn mask_json(&self, value: &Value) -> Value {
         self.transform_json(value, false)
     }
 
-    /// Restore known placeholders in JSON strings recursively, including keys.
+    /// Restore known placeholders in JSON string values recursively.
+    ///
+    /// An object with a placeholder in a key is replaced by a rejection marker
+    /// for the same collision-safety reason as [`Self::mask_json`].
     pub fn restore_json(&self, value: &Value) -> Value {
         self.transform_json(value, true)
     }
@@ -176,20 +186,43 @@ impl SecretMasker {
                     .map(|value| self.transform_json(value, restore))
                     .collect(),
             ),
-            Value::Object(values) => Value::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| {
-                        let key = if restore {
-                            self.restore_text(key)
-                        } else {
-                            self.mask_text(key)
-                        };
-                        (key, self.transform_json(value, restore))
-                    })
-                    .collect(),
-            ),
+            Value::Object(values) => {
+                let has_protected_key = values.keys().any(|key| {
+                    if restore {
+                        self.restore_text(key) != *key
+                    } else {
+                        self.mask_text(key) != *key
+                    }
+                });
+                if has_protected_key {
+                    Value::Object(serde_json::Map::from_iter([(
+                        REJECTED_JSON_KEY_FIELD.to_owned(),
+                        Value::String(REJECTED_JSON_KEY_MESSAGE.to_owned()),
+                    )]))
+                } else {
+                    Value::Object(
+                        values
+                            .iter()
+                            .map(|(key, value)| (key.clone(), self.transform_json(value, restore)))
+                            .collect(),
+                    )
+                }
+            }
             other => other.clone(),
+        }
+    }
+
+    /// Whether a JSON transformation rejected a secret-bearing object key.
+    pub(crate) fn has_rejected_json_key(&self, value: &Value) -> bool {
+        match value {
+            Value::Array(values) => values.iter().any(|value| self.has_rejected_json_key(value)),
+            Value::Object(values) => {
+                values.contains_key(REJECTED_JSON_KEY_FIELD)
+                    || values
+                        .values()
+                        .any(|value| self.has_rejected_json_key(value))
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
         }
     }
 
@@ -493,12 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn masks_and_restores_nested_json_values_and_keys() {
+    fn masks_and_restores_nested_json_values() {
         let masker = masker();
         let original = serde_json::json!({
-            "abcdefgh": [
+            "outer": [
                 "prefix abcdefgh-extra suffix",
-                {"key-abcdefgh-extra": "abcdefgh"}
+                {"value": "abcdefgh"}
             ]
         });
         let masked = masker.mask_json(&original);
@@ -507,6 +540,26 @@ mod tests {
         assert!(serialized.contains("harness-secret:SHORT"));
         assert!(serialized.contains("harness-secret:LONG"));
         assert_eq!(masker.restore_json(&masked), original);
+    }
+
+    #[test]
+    fn rejects_secret_values_and_placeholders_in_json_keys_without_collisions() {
+        let masker = masker();
+        let raw = serde_json::json!({
+            "abcdefgh": "raw key",
+            "{{harness-secret:SHORT}}": "placeholder key"
+        });
+        let masked = masker.mask_json(&raw);
+        let serialized = masked.to_string();
+        assert!(!serialized.contains("abcdefgh"), "{serialized}");
+        assert!(masker.has_rejected_json_key(&masked));
+
+        let restored = masker.restore_json(&serde_json::json!({
+            "{{harness-secret:SHORT}}": "placeholder key",
+            "other": "value"
+        }));
+        assert!(masker.has_rejected_json_key(&restored));
+        assert_eq!(restored.as_object().unwrap().len(), 1);
     }
 
     #[test]

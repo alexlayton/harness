@@ -346,6 +346,28 @@ where
         .await
 }
 
+async fn execute_with_secret_policy(
+    registry: &ToolRegistry,
+    name: &str,
+    arguments: serde_json::Value,
+    cancel: CancellationToken,
+    secrets: Option<&SecretMasker>,
+) -> ToolOutput {
+    let output = if secrets.is_some_and(|masker| masker.has_rejected_json_key(&arguments)) {
+        ToolOutput {
+            content: "tool arguments were rejected because secret values and placeholders are not supported in JSON object keys".into(),
+            is_error: true,
+            summary: "rejected secret-bearing argument key".into(),
+        }
+    } else {
+        registry.execute(name, arguments, cancel).await
+    };
+    match secrets {
+        Some(masker) => masker.mask_tool_output(output),
+        None => output,
+    }
+}
+
 /// Execute with optional output masking and local-tool argument restoration.
 pub(crate) async fn execute_tool_batch_with_secrets<C, H>(
     registry: &ToolRegistry,
@@ -379,11 +401,8 @@ where
         let index = next_launch;
         let cancel = batch_cancel.clone();
         futures.push(Box::pin(async move {
-            let output = registry.execute(&name, arguments, cancel).await;
-            let output = match secrets {
-                Some(masker) => masker.mask_tool_output(output),
-                None => output,
-            };
+            let output =
+                execute_with_secret_policy(registry, &name, arguments, cancel, secrets).await;
             (index, output, started)
         }));
         next_launch += 1;
@@ -419,11 +438,10 @@ where
                         let index = next_launch;
                         let cancel = batch_cancel.clone();
                         futures.push(Box::pin(async move {
-                            let output = registry.execute(&name, arguments, cancel).await;
-                            let output = match secrets {
-                                Some(masker) => masker.mask_tool_output(output),
-                                None => output,
-                            };
+                            let output = execute_with_secret_policy(
+                                registry, &name, arguments, cancel, secrets,
+                            )
+                            .await;
                             (index, output, started)
                         }));
                         next_launch += 1;
@@ -769,6 +787,36 @@ mod tests {
         );
         assert_eq!(outcome.outcomes[0].output.content, placeholder);
         assert_eq!(outcome.outcomes[0].output.summary, placeholder);
+
+        let rejected_batch = ToolBatch {
+            calls: vec![ToolCall {
+                id: "rejected".into(),
+                name: "local".into(),
+                arguments: Value::Object(serde_json::Map::from_iter([(
+                    placeholder.into(),
+                    json!("cannot become a secret key"),
+                )])),
+            }],
+            class: Concurrency::Exclusive,
+        };
+        let mut control = CancellationControl::new(&cancel, DispatchCancellation::Explicit);
+        let rejected = execute_tool_batch_with_secrets(
+            &registry,
+            &rejected_batch,
+            1,
+            &mut control,
+            &mut hooks,
+            Some(&masker),
+            true,
+        )
+        .await;
+        assert!(rejected.outcomes[0].output.is_error);
+        assert!(
+            rejected.outcomes[0]
+                .output
+                .content
+                .contains("were rejected")
+        );
     }
 
     #[tokio::test]

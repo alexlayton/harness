@@ -73,6 +73,11 @@ UI, model history, or session store. Harness does not modify opaque provider
 continuation state because changing it can make it invalid. It drops a complete
 opaque item if that item contains an exact configured value.
 
+Harness supports secret placeholders in JSON values, but not in JSON object
+keys. Changing a key can merge two fields. Harness replaces an object that has
+a secret-bearing key with a safe rejection marker and does not execute a local
+tool call that contains that marker.
+
 Masking uses exact string matches. It does not detect encoded, split, derived,
 or unknown credentials. It also is not a sandbox. In particular, `bash` can
 read the process environment and use the network without first returning a
