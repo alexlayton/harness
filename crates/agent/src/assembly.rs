@@ -4,7 +4,7 @@
 //! the resulting agent policy identical once those inputs have been resolved.
 
 use crate::agent::{Agent, AgentEvent, InputMessage, ProviderFactory, SubagentLimits};
-use crate::secrets::{SecretMasker, mask_provider};
+use crate::secrets::SecretMasker;
 use crate::subagent::SubagentRunnerImpl;
 use anyhow::{Context, Result};
 use compact::CompactionPolicy;
@@ -156,10 +156,14 @@ impl AgentBuilder {
                 self.cancel.clone(),
             )
             .await
+            .map_err(|error| anyhow::anyhow!(self.secret_masker.mask_text(&error.to_string())))
             .context("connect MCP servers")?;
             if let Err(error) = runtime.register_into(&mut self.tools) {
                 runtime.shutdown().await;
-                return Err(error).context("register MCP tools");
+                return Err(anyhow::anyhow!(
+                    self.secret_masker.mask_text(&error.to_string())
+                ))
+                .context("register MCP tools");
             }
             Some(runtime)
         };
@@ -174,7 +178,7 @@ impl AgentBuilder {
         let execution_gate = self.tools.execution_gate().cloned();
         let runner = if self.subagents.max_turns > 0 {
             let mut runner = SubagentRunnerImpl::new(
-                mask_provider(self.provider.clone(), self.secret_masker.clone()),
+                self.provider.clone(),
                 self.model.clone(),
                 self.tools.workspace_root().to_path_buf(),
                 self.rtk,
@@ -183,8 +187,7 @@ impl AgentBuilder {
                 self.session.as_ref().map(|(store, _)| store.clone()),
                 parent_session,
             )
-            .with_reasoning(self.reasoning)
-            .with_secret_masker(self.secret_masker.clone());
+            .with_reasoning(self.reasoning);
             if let Some(index) = search_index {
                 runner = runner.with_file_search_index(index);
             }

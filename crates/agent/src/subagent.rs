@@ -33,7 +33,7 @@ use crate::agent::{
 };
 use crate::assembly::SubagentPolicy;
 use crate::prompt::subagent_system_prompt;
-use crate::secrets::SecretMasker;
+use crate::secrets::{SecretMasker, mask_provider};
 use async_trait::async_trait;
 use compact::estimate_provider_context_tokens;
 use futures_util::stream::StreamExt;
@@ -122,6 +122,7 @@ struct SubagentModelState {
     provider: Arc<dyn Provider>,
     model: String,
     reasoning: ReasoningPolicy,
+    secret_masker: Arc<SecretMasker>,
 }
 
 /// Everything a nested loop needs from the host process. One instance is
@@ -134,7 +135,6 @@ pub struct SubagentRunnerImpl {
     /// workspace. A workspace-mode run holds it for the entire delegated
     /// workflow; its child registry therefore must not reacquire it.
     execution_gate: Option<ToolExecutionGate>,
-    secret_masker: Arc<SecretMasker>,
     rtk: bool,
     project_context: String,
     /// Resolved delegation bounds (`max_turns`; `0` disables subagents).
@@ -192,11 +192,11 @@ impl SubagentRunnerImpl {
                 provider,
                 model: model.into(),
                 reasoning: ReasoningPolicy::Auto,
+                secret_masker: Arc::new(SecretMasker::default()),
             }),
             workspace_root,
             search_index,
             execution_gate: None,
-            secret_masker: Arc::new(SecretMasker::default()),
             rtk,
             project_context: project_context.into(),
             config,
@@ -221,11 +221,21 @@ impl SubagentRunnerImpl {
         self
     }
 
-    /// Mask child tool evidence without giving child prompts restoration
-    /// authority.
-    pub fn with_secret_masker(mut self, secret_masker: Arc<SecretMasker>) -> Self {
-        self.secret_masker = secret_masker;
+    /// Mask child provider traffic and tool evidence without giving child
+    /// prompts restoration authority.
+    pub fn with_secret_masker(self, secret_masker: Arc<SecretMasker>) -> Self {
+        self.update_secret_masker(secret_masker);
         self
+    }
+
+    /// Apply a new masking policy to future child runs.
+    pub(crate) fn update_secret_masker(&self, secret_masker: Arc<SecretMasker>) {
+        let mut state = self
+            .model_state
+            .write()
+            .expect("subagent model state lock poisoned");
+        state.provider = mask_provider(state.provider.clone(), secret_masker.clone());
+        state.secret_masker = secret_masker;
     }
 
     /// Coordinate child tool mutations with the parent and sibling registries.
@@ -242,7 +252,7 @@ impl SubagentRunnerImpl {
             .model_state
             .write()
             .expect("subagent model state lock poisoned");
-        state.provider = provider;
+        state.provider = mask_provider(provider, state.secret_masker.clone());
         state.model = model.into();
     }
 
@@ -358,16 +368,22 @@ impl SubagentRunnerImpl {
             .parent_session_id
             .read()
             .expect("subagent parent session lock poisoned");
-        let (provider, model, reasoning) = {
+        let (provider, model, reasoning, secret_masker) = {
             let state = self
                 .model_state
                 .read()
                 .expect("subagent model state lock poisoned");
-            (state.provider.clone(), state.model.clone(), state.reasoning)
+            (
+                state.provider.clone(),
+                state.model.clone(),
+                state.reasoning,
+                state.secret_masker.clone(),
+            )
         };
         let registry = self.registry(mode)?;
         let registry_snapshot = registry.snapshot();
-        let mut history = vec![Message::user(run.prompt.clone())];
+        let description = secret_masker.mask_text(&run.description);
+        let mut history = vec![Message::user(secret_masker.mask_text(&run.prompt))];
         let system = subagent_system_prompt(
             &self.workspace_root.display().to_string(),
             &registry_snapshot.prompt_context,
@@ -379,7 +395,7 @@ impl SubagentRunnerImpl {
             &self.store,
             &provider,
             &model,
-            &run.description,
+            &description,
             parent_session,
         );
         let _active_lease = match (self.store.as_ref(), session.as_ref()) {
@@ -410,13 +426,14 @@ impl SubagentRunnerImpl {
                 &registry,
                 &system,
                 reasoning,
+                &secret_masker,
                 &mut history,
                 &mut session,
                 cancel,
             )
             .await;
         tracing::info!(
-            description = %run.description,
+            description = %description,
             mode = mode.as_str(),
             provider = provider.name(),
             model = %model,
@@ -461,6 +478,7 @@ impl SubagentRunnerImpl {
         registry: &ToolRegistry,
         system: &str,
         reasoning: ReasoningPolicy,
+        secret_masker: &Arc<SecretMasker>,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         cancel: CancellationToken,
@@ -606,8 +624,15 @@ impl SubagentRunnerImpl {
                 return Ok(truncate_utf8(text.trim(), REPORT_MAX_BYTES).to_owned());
             }
 
-            self.dispatch_tool_batches(registry, history, session, tool_calls, &cancel)
-                .await?;
+            self.dispatch_tool_batches(
+                registry,
+                secret_masker,
+                history,
+                session,
+                tool_calls,
+                &cancel,
+            )
+            .await?;
         }
     }
 
@@ -619,6 +644,7 @@ impl SubagentRunnerImpl {
     async fn dispatch_tool_batches(
         &self,
         registry: &ToolRegistry,
+        secret_masker: &Arc<SecretMasker>,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         tool_calls: Vec<llm::ToolCall>,
@@ -642,7 +668,7 @@ impl SubagentRunnerImpl {
                 launch_limit,
                 &mut control,
                 &mut hooks,
-                Some(self.secret_masker.as_ref()),
+                Some(secret_masker.as_ref()),
                 false,
             )
             .await;
@@ -873,11 +899,13 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
+    type SeenRequest = (Option<String>, Vec<String>, Vec<Message>);
+
     /// Provider that answers each request from a scripted list, recording
-    /// every system prompt and tool set it was handed.
+    /// every system prompt, tool set, and message list it was handed.
     struct ScriptProvider {
         scripts: Vec<Vec<Result<StreamEvent, String>>>,
-        seen: Mutex<Vec<(Option<String>, Vec<String>)>>,
+        seen: Mutex<Vec<SeenRequest>>,
         calls: std::sync::atomic::AtomicUsize,
     }
 
@@ -911,6 +939,7 @@ mod tests {
             self.seen.lock().unwrap().push((
                 request.system.clone(),
                 request.tools.iter().map(|t| t.name.clone()).collect(),
+                request.messages.clone(),
             ));
             let script = self.scripts.get(index).cloned().unwrap_or_default();
             Ok(Box::pin(stream::iter(
@@ -960,7 +989,7 @@ mod tests {
             .unwrap();
         assert_eq!(report, "found 3 issues");
         // The child saw a fresh one-message context with the subagent prompt.
-        let (system, tools) = &provider.seen.lock().unwrap()[0];
+        let (system, tools, _) = &provider.seen.lock().unwrap()[0];
         // The read-only preamble is mode-aware and states the enforced
         // restriction.
         assert!(system.as_deref().unwrap().contains("read-only subagent"));
@@ -971,6 +1000,32 @@ mod tests {
                 .contains("mutation and command tools are unavailable")
         );
         assert!(!tools.iter().any(|name| name == "subagent"), "{tools:?}");
+    }
+
+    #[tokio::test]
+    async fn direct_runner_masks_provider_requests_and_responses() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![
+            Ok(StreamEvent::TextDelta("secret-value".into())),
+            ScriptProvider::done("stop"),
+        ]]));
+        let masker =
+            Arc::new(SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap());
+        let runner = runner_with(provider.clone()).with_secret_masker(masker);
+
+        let report = runner
+            .run(
+                "audit secret-value",
+                "inspect secret-value",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(report, "{{harness-secret:TOKEN}}");
+        let seen = format!("{:?}", provider.seen.lock().unwrap());
+        assert!(!seen.contains("secret-value"), "{seen}");
+        assert!(seen.contains("{{harness-secret:TOKEN}}"), "{seen}");
     }
 
     #[tokio::test]
@@ -989,7 +1044,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (system, _) = &provider.seen.lock().unwrap()[0];
+        let (system, _, _) = &provider.seen.lock().unwrap()[0];
         assert!(
             system
                 .as_deref()

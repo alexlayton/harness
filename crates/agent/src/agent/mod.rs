@@ -161,6 +161,7 @@ impl Agent {
         if let Some(state) = self.session.as_ref() {
             runner.update_parent_session(Some(state.session.id()));
         }
+        runner.update_secret_masker(self.secret_masker.clone());
         self.subagent_runner = Some(runner);
         self
     }
@@ -191,6 +192,9 @@ impl Agent {
             .take()
             .map(|factory| masked_provider_factory(factory, secret_masker.clone()));
         self.secret_masker = secret_masker;
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_secret_masker(self.secret_masker.clone());
+        }
         self.history = self
             .history
             .iter()
@@ -449,8 +453,9 @@ fn masked_provider_factory(
     factory: ProviderFactory,
     secret_masker: Arc<SecretMasker>,
 ) -> ProviderFactory {
-    Arc::new(move |name| {
-        factory(name).map(|provider| mask_provider(provider, secret_masker.clone()))
+    Arc::new(move |name| match factory(name) {
+        Ok(provider) => Ok(mask_provider(provider, secret_masker.clone())),
+        Err(error) => Err(anyhow::anyhow!(secret_masker.mask_text(&error.to_string()))),
     })
 }
 
@@ -589,6 +594,22 @@ mod tests {
             event_rx.try_recv(),
             Ok(AgentEvent::Error(message)) if message.contains("already active")
         ));
+    }
+
+    #[test]
+    fn configured_secret_masks_provider_factory_errors() {
+        let masker = Arc::new(
+            crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap(),
+        );
+        let factory: ProviderFactory =
+            Arc::new(|_| Err::<Arc<dyn Provider>, _>(anyhow::anyhow!("failed with secret-value")));
+
+        let error = masked_provider_factory(factory, masker)("demo")
+            .err()
+            .unwrap();
+        let error = error.to_string();
+        assert!(!error.contains("secret-value"), "{error}");
+        assert!(error.contains("{{harness-secret:TOKEN}}"), "{error}");
     }
 
     #[tokio::test]
