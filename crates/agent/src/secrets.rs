@@ -241,7 +241,11 @@ impl SecretMasker {
                     // providers can authenticate its exact bytes. Dropping a
                     // contaminated item is safer than persisting plaintext or
                     // sending corrupted continuation state back.
-                    Content::Opaque { data, .. } if self.json_contains_secret(data) => None,
+                    Content::Opaque { provider, data }
+                        if self.contains_secret(provider) || self.json_contains_secret(data) =>
+                    {
+                        None
+                    }
                     Content::Opaque { provider, data } => Some(Content::Opaque {
                         provider: provider.clone(),
                         data: data.clone(),
@@ -252,7 +256,7 @@ impl SecretMasker {
                         content,
                         is_error,
                     } => Some(Content::ToolResult {
-                        tool_call_id: tool_call_id.clone(),
+                        tool_call_id: self.mask_text(tool_call_id),
                         content: self.mask_text(content),
                         is_error: *is_error,
                     }),
@@ -264,8 +268,8 @@ impl SecretMasker {
     /// Mask a tool call while keeping its protocol identity unchanged.
     pub fn mask_tool_call(&self, call: &ToolCall) -> ToolCall {
         ToolCall {
-            id: call.id.clone(),
-            name: call.name.clone(),
+            id: self.mask_text(&call.id),
+            name: self.mask_text(&call.name),
             arguments: self.mask_json(&call.arguments),
         }
     }
@@ -292,6 +296,7 @@ impl SecretMasker {
             tools: request
                 .tools
                 .iter()
+                .filter(|tool| !self.contains_secret(&tool.name))
                 .map(|tool| llm::ToolDefinition {
                     name: tool.name.clone(),
                     description: self.mask_text(&tool.description),
@@ -429,12 +434,16 @@ impl Stream for MaskedEventStream {
                         self.masker.mask_tool_call(&call),
                     ))));
                 }
-                Poll::Ready(Some(Ok(event @ StreamEvent::Done { .. }))) => {
+                Poll::Ready(Some(Ok(StreamEvent::Done { usage, stop_reason }))) => {
                     self.queue_flush();
-                    self.queued.push_back(Ok(event));
+                    let stop_reason = stop_reason.map(|reason| self.masker.mask_text(&reason));
+                    self.queued
+                        .push_back(Ok(StreamEvent::Done { usage, stop_reason }));
                 }
                 Poll::Ready(Some(Ok(StreamEvent::OpaqueState { provider, data }))) => {
-                    if !self.masker.json_contains_secret(&data) {
+                    if !self.masker.contains_secret(&provider)
+                        && !self.masker.json_contains_secret(&data)
+                    {
                         return Poll::Ready(Some(Ok(StreamEvent::OpaqueState { provider, data })));
                     }
                 }
@@ -485,17 +494,45 @@ impl Provider for MaskingProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        self.inner
+        let mut models = self
+            .inner
             .list_models()
             .await
-            .map_err(|error| self.masker.mask_error(error))
+            .map_err(|error| self.masker.mask_error(error))?;
+        models.retain(|model| !self.masker.contains_secret(&model.id));
+        for model in &mut models {
+            model.name = model
+                .name
+                .as_deref()
+                .map(|name| self.masker.mask_text(name));
+        }
+        Ok(models)
     }
 
     async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {
-        self.inner
+        let usage = self
+            .inner
             .subscription_usage()
             .await
-            .map_err(|error| self.masker.mask_error(error))
+            .map_err(|error| self.masker.mask_error(error))?;
+        Ok(usage.map(|mut usage| {
+            usage.plan = usage
+                .plan
+                .as_deref()
+                .map(|plan| self.masker.mask_text(plan));
+            for window in &mut usage.windows {
+                window.label = self.masker.mask_text(&window.label);
+                window.status = window
+                    .status
+                    .as_deref()
+                    .map(|status| self.masker.mask_text(status));
+                window.resets_at = window
+                    .resets_at
+                    .as_deref()
+                    .map(|resets_at| self.masker.mask_text(resets_at));
+            }
+            usage
+        }))
     }
 }
 
@@ -598,8 +635,8 @@ mod tests {
                 Ok(StreamEvent::TextDelta("abcdefgh".into())),
                 Ok(StreamEvent::TextDelta("-extra".into())),
                 Ok(StreamEvent::ToolCallComplete(ToolCall {
-                    id: "call".into(),
-                    name: "bash".into(),
+                    id: "call-abcdefgh-extra".into(),
+                    name: "bash-abcdefgh-extra".into(),
                     arguments: serde_json::json!({"command": "echo abcdefgh-extra"}),
                 })),
                 Ok(StreamEvent::OpaqueState {
@@ -612,13 +649,37 @@ mod tests {
                 }),
                 Ok(StreamEvent::Done {
                     usage: None,
-                    stop_reason: None,
+                    stop_reason: Some("stop abcdefgh-extra".into()),
                 }),
             ])))
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-            Ok(Vec::new())
+            Ok(vec![
+                ModelInfo {
+                    id: "model-abcdefgh-extra".into(),
+                    name: Some("unsafe".into()),
+                    context_length: None,
+                },
+                ModelInfo {
+                    id: "safe-model".into(),
+                    name: Some("name abcdefgh-extra".into()),
+                    context_length: Some(1_000),
+                },
+            ])
+        }
+
+        async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {
+            Ok(Some(SubscriptionUsage {
+                plan: Some("plan abcdefgh-extra".into()),
+                windows: vec![llm::SubscriptionUsageWindow {
+                    label: "window abcdefgh-extra".into(),
+                    used_percent: 10,
+                    status: Some("status abcdefgh-extra".into()),
+                    resets_at: Some("reset abcdefgh-extra".into()),
+                    resets_after_seconds: None,
+                }],
+            }))
         }
     }
 
@@ -647,7 +708,18 @@ mod tests {
                     },
                 ]),
             ],
-            tools: Vec::new(),
+            tools: vec![
+                llm::ToolDefinition {
+                    name: "tool-abcdefgh-extra".into(),
+                    description: "unsafe".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                llm::ToolDefinition {
+                    name: "safe-tool".into(),
+                    description: "description abcdefgh-extra".into(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            ],
             max_tokens: None,
             temperature: None,
             reasoning: llm::ReasoningPolicy::Auto,
@@ -658,11 +730,15 @@ mod tests {
         let mut text = String::new();
         let mut tool_call = None;
         let mut opaque = Vec::new();
+        let mut stop_reason = None;
         while let Some(event) = response.next().await {
             match event.unwrap() {
                 StreamEvent::TextDelta(delta) => text.push_str(&delta),
                 StreamEvent::ToolCallComplete(call) => tool_call = Some(call),
                 StreamEvent::OpaqueState { data, .. } => opaque.push(data),
+                StreamEvent::Done {
+                    stop_reason: found, ..
+                } => stop_reason = found,
                 _ => {}
             }
         }
@@ -681,10 +757,32 @@ mod tests {
             }]
         );
         assert_eq!(opaque, vec![serde_json::json!({"state": "safe"})]);
-        assert_eq!(text, "{{harness-secret:LONG}}");
+        assert_eq!(stop_reason.as_deref(), Some("stop {{harness-secret:LONG}}"));
+        assert_eq!(sent.tools.len(), 1);
+        assert_eq!(sent.tools[0].name, "safe-tool");
         assert_eq!(
-            tool_call.unwrap().arguments["command"],
+            sent.tools[0].description,
+            "description {{harness-secret:LONG}}"
+        );
+        assert_eq!(text, "{{harness-secret:LONG}}");
+        let tool_call = tool_call.unwrap();
+        assert_eq!(tool_call.id, "call-{{harness-secret:LONG}}");
+        assert_eq!(tool_call.name, "bash-{{harness-secret:LONG}}");
+        assert_eq!(
+            tool_call.arguments["command"],
             "echo {{harness-secret:LONG}}"
         );
+
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "safe-model");
+        assert_eq!(
+            models[0].name.as_deref(),
+            Some("name {{harness-secret:LONG}}")
+        );
+        let usage = provider.subscription_usage().await.unwrap().unwrap();
+        let usage_debug = format!("{usage:?}");
+        assert!(!usage_debug.contains("abcdefgh"), "{usage_debug}");
+        assert!(usage_debug.contains("{{harness-secret:LONG}}"));
     }
 }

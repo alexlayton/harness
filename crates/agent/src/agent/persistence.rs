@@ -251,6 +251,7 @@ pub(crate) fn ui_snapshot_entries(
                 output,
                 error,
             } => {
+                let name = secret_masker.mask_text(&name);
                 let arguments = secret_masker.mask_json(&arguments);
                 SessionSnapshotEntry::Tool {
                     summary: call_summary(&name, &arguments),
