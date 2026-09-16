@@ -19,7 +19,7 @@ impl Agent {
         models: Vec<llm::ModelInfo>,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        if provider == self.provider.name() && model == self.model {
+        if provider == self.secret_masker.mask_text(self.provider.name()) && model == self.model {
             let reported = models
                 .iter()
                 .find(|candidate| {
