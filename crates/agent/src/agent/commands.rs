@@ -30,7 +30,7 @@ impl Agent {
             return;
         };
         let session = match store.create(SessionCreateOptions {
-            provider: Some(self.provider.name().to_owned()),
+            provider: Some(self.secret_masker.mask_text(self.provider.name())),
             model: Some(self.model.clone()),
             ..SessionCreateOptions::default()
         }) {
@@ -55,7 +55,11 @@ impl Agent {
         };
         let id = session.id().to_string();
         let parent_session_id = session.id();
-        let title = session.metadata.title.clone();
+        let title = session
+            .metadata
+            .title
+            .as_deref()
+            .map(|title| self.secret_masker.mask_text(title));
         self.history.clear();
         self.last_context_tokens = None;
         self.session = Some(AgentSessionState {
@@ -155,10 +159,18 @@ impl Agent {
         };
         let id = session.id().to_string();
         let parent_session_id = session.id();
-        let title = session.metadata.title.clone();
-        self.history = session.context_messages();
+        let title = session
+            .metadata
+            .title
+            .as_deref()
+            .map(|title| self.secret_masker.mask_text(title));
+        self.history = session
+            .context_messages()
+            .iter()
+            .map(|message| self.secret_masker.mask_message(message))
+            .collect();
         self.last_context_tokens = None;
-        let snapshot = ui_snapshot_entries(snapshot_entries(&session));
+        let snapshot = ui_snapshot_entries(snapshot_entries(&session), &self.secret_masker);
         self.session = Some(AgentSessionState {
             store,
             session,
@@ -184,7 +196,7 @@ impl Agent {
             events,
             AgentEvent::Notice(format!(
                 "Loaded session; active model remains {} · {}",
-                self.provider.name(),
+                self.secret_masker.mask_text(self.provider.name()),
                 self.model
             )),
         );
@@ -205,11 +217,22 @@ impl Agent {
                         .map(|entry| SessionListItem {
                             id: entry.id.to_string(),
                             short_id: entry.short_id,
-                            title: entry.title,
+                            title: entry
+                                .title
+                                .as_deref()
+                                .map(|title| self.secret_masker.mask_text(title)),
                             updated_at: entry.updated_at,
-                            workspace: entry.workspace_root.display().to_string(),
-                            provider: entry.provider,
-                            model: entry.model,
+                            workspace: self
+                                .secret_masker
+                                .mask_text(&entry.workspace_root.display().to_string()),
+                            provider: entry
+                                .provider
+                                .as_deref()
+                                .map(|provider| self.secret_masker.mask_text(provider)),
+                            model: entry
+                                .model
+                                .as_deref()
+                                .map(|model| self.secret_masker.mask_text(model)),
                         })
                         .collect(),
                 },
@@ -394,6 +417,17 @@ impl Agent {
         // mutating live state. The session append is also staged so a
         // deferred-sync failure leaves every live model-related field alone.
         let requested = provider.unwrap_or_else(|| self.provider.name().to_owned());
+        if self.secret_masker.mask_text(&requested) != requested
+            || self.secret_masker.mask_text(&model) != model
+        {
+            send(
+                events,
+                AgentEvent::Error(
+                    "provider and model names cannot contain a configured secret".into(),
+                ),
+            );
+            return Ok(None);
+        }
         let current = self.provider.name().to_owned();
         let next_provider = if requested.eq_ignore_ascii_case(&current) {
             None
@@ -415,6 +449,13 @@ impl Agent {
         };
         let candidate = next_provider.unwrap_or_else(|| self.provider.clone());
         let canonical = candidate.name().to_owned();
+        if self.secret_masker.mask_text(&canonical) != canonical {
+            send(
+                events,
+                AgentEvent::Error("the selected provider name contains a configured secret".into()),
+            );
+            return Ok(None);
+        }
         let staged_session = self.stage_model_change(canonical.clone(), model.clone(), events)?;
         Ok(Some(PendingModelChange {
             provider: candidate,
@@ -511,7 +552,7 @@ impl Agent {
     /// account endpoint cannot block subsequent input processing.
     pub(crate) fn handle_subscription_usage(&self, events: &mpsc::UnboundedSender<AgentEvent>) {
         let provider = self.provider.clone();
-        let provider_name = provider.name().to_owned();
+        let provider_name = self.secret_masker.mask_text(provider.name());
         let events = events.clone();
         tokio::spawn(async move {
             match provider.subscription_usage().await {
@@ -562,7 +603,11 @@ impl Agent {
                 return;
             }
         };
-        spawn_model_list(provider.name().to_owned(), provider, events.clone());
+        spawn_model_list(
+            self.secret_masker.mask_text(provider.name()),
+            provider,
+            events.clone(),
+        );
     }
 
     /// Reply to `/skills` with the discovered-skill view: invocable skills

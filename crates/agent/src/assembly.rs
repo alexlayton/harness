@@ -4,6 +4,7 @@
 //! the resulting agent policy identical once those inputs have been resolved.
 
 use crate::agent::{Agent, AgentEvent, InputMessage, ProviderFactory, SubagentLimits};
+use crate::secrets::SecretMasker;
 use crate::subagent::SubagentRunnerImpl;
 use anyhow::{Context, Result};
 use compact::CompactionPolicy;
@@ -47,6 +48,7 @@ pub struct AgentBuilder {
     rtk: bool,
     session: Option<(SessionStore, Session)>,
     provider_factory: Option<ProviderFactory>,
+    secret_masker: Arc<SecretMasker>,
     mcp_servers: Vec<mcp::McpServerConfig>,
 }
 
@@ -70,6 +72,7 @@ impl AgentBuilder {
             rtk: false,
             session: None,
             provider_factory: None,
+            secret_masker: Arc::new(SecretMasker::default()),
             mcp_servers: Vec::new(),
         }
     }
@@ -102,6 +105,12 @@ impl AgentBuilder {
     /// Attach an optional durable store/session pair.
     pub fn with_session(mut self, store: SessionStore, session: Session) -> Self {
         self.session = Some((store, session));
+        self
+    }
+
+    /// Attach the resolved exact-value secret policy.
+    pub fn with_secret_masker(mut self, secret_masker: Arc<SecretMasker>) -> Self {
+        self.secret_masker = secret_masker;
         self
     }
 
@@ -147,10 +156,14 @@ impl AgentBuilder {
                 self.cancel.clone(),
             )
             .await
+            .map_err(|error| anyhow::anyhow!(self.secret_masker.mask_text(&error.to_string())))
             .context("connect MCP servers")?;
             if let Err(error) = runtime.register_into(&mut self.tools) {
                 runtime.shutdown().await;
-                return Err(error).context("register MCP tools");
+                return Err(anyhow::anyhow!(
+                    self.secret_masker.mask_text(&error.to_string())
+                ))
+                .context("register MCP tools");
             }
             Some(runtime)
         };
@@ -195,6 +208,7 @@ impl AgentBuilder {
 
         let assembly_cancel = self.cancel.clone();
         let mut agent = Agent::new(self.provider, self.tools, self.model, self.cancel)
+            .with_secret_masker(self.secret_masker)
             .with_reasoning(self.reasoning)
             .with_project_context(self.project_context)
             .with_compaction(self.compaction)

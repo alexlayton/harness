@@ -684,6 +684,10 @@ impl Tool for FindTool {
         Concurrency::ReadOnly
     }
 
+    fn accepts_restored_secrets(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         let query = match args.get("query").and_then(Value::as_str) {
             Some(query) if !query.trim().is_empty() => query.trim().to_owned(),

@@ -215,6 +215,19 @@ file-only tracing.
 Do not write API keys or OAuth credentials to configuration, session history,
 tool output, or logs.
 
+Opt-in exact-value masking is configured with environment-variable names under
+`[secrets]`. `harness` resolves the values once and injects an immutable masker
+through `AgentBuilder`; `agent` masks provider traffic, new durable conversation
+content, and tool results. Opaque provider continuation items cannot be changed
+safely, so an item containing an exact secret is dropped as a unit. Only built-in
+local tools can receive a temporary argument copy with placeholders restored.
+JSON object keys are not restoration targets: secret-bearing key objects become
+rejection markers so key collisions cannot silently alter a tool call. Subagent
+prompts, MCP tools, and other external tools keep placeholders. This reduces
+accidental disclosure but is not
+a sandbox: local shell commands retain the operating-system access described
+above.
+
 ## Reading guide
 
 For a focused change, read the crate map and only the relevant section above,

@@ -74,6 +74,10 @@ impl Tool for MultiGrepTool {
         Concurrency::ReadOnly
     }
 
+    fn accepts_restored_secrets(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         let values = match args.get("patterns").and_then(Value::as_array) {
             Some(values) if !values.is_empty() && values.len() <= MAX_PATTERNS => values,

@@ -290,6 +290,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
 
     let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+        .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)
         .with_project_context(context_bundle.rendered)
         .with_compaction(config.compaction.clone())

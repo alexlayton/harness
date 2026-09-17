@@ -63,6 +63,10 @@ impl Tool for WriteTool {
         }
     }
 
+    fn accepts_restored_secrets(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(path) if !path.is_empty() => path.to_owned(),

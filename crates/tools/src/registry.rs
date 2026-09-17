@@ -228,6 +228,16 @@ impl ToolRegistry {
         tool.tool.execute(args, cancel).await
     }
 
+    /// Whether one registered tool accepts a temporary argument copy with
+    /// configured secret placeholders restored. Unknown and external tools
+    /// fail closed.
+    pub fn accepts_restored_secrets(&self, name: &str) -> bool {
+        self.tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .is_some_and(|tool| tool.tool.accepts_restored_secrets())
+    }
+
     /// Harness-side concurrency classification for one invocation. Unknown
     /// tools classify as [`super::Concurrency::Exclusive`], mirroring the
     /// trait default, so a name that misses the registry can never join a

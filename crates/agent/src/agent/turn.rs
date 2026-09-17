@@ -3,9 +3,7 @@ use super::persistence::usage_event;
 use super::{Agent, AgentEvent, CompactionReason, MAX_TURN_RECOVERIES, TurnError, send};
 use crate::prompt::system_prompt_with_workspace_context;
 use futures_util::stream::StreamExt;
-use llm::{
-    CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent, truncate_utf8,
-};
+use llm::{CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent};
 use session::{SessionEvent, usage_summary};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -63,8 +61,8 @@ impl Agent {
     /// [`Self::execute_turn`]).
     #[tracing::instrument(
         name = "turn",
-        skip(self, events, input, cancel),
-        fields(user_text = %truncate_utf8(&user_text, 200))
+        skip(self, user_text, events, input, cancel),
+        fields(user_bytes = user_text.len())
     )]
     async fn run_turn_body(
         &mut self,
@@ -73,6 +71,7 @@ impl Agent {
         input: &mut mpsc::UnboundedReceiver<InputMessage>,
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
+        let user_text = self.secret_masker.mask_text(&user_text);
         // Pre-turn auto-compaction trigger: run *before* the request is built
         // (never mid-stream), so provider-history validity is trivial. Exact
         // context from the last request when available, plus the new message

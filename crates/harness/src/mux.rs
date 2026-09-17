@@ -408,6 +408,7 @@ fn create_slot(
                         tools,
                         task_cancel.clone(),
                     )
+                    .with_secret_masker(config.secret_masker.clone())
                     .with_reasoning(task_settings.reasoning)
                     .with_project_context(context_bundle.rendered)
                     .with_compaction(config.compaction)

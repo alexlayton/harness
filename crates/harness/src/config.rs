@@ -1,4 +1,5 @@
 use agent::assembly::SubagentPolicy;
+use agent::secrets::SecretMasker;
 use anyhow::{Context, Result, anyhow};
 use auth::OpenAiCodexAuth;
 use auth::{CopilotAuth, sku_from_proxy_token};
@@ -130,6 +131,40 @@ pub struct TuiConfig {
     pub minimal: bool,
 }
 
+/// Explicit environment variables whose values are masked from model and
+/// durable conversation content.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SecretsConfig {
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+impl SecretsConfig {
+    fn validate(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for name in &self.env {
+            let mut characters = name.chars();
+            let valid_first = characters
+                .next()
+                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
+            if !valid_first
+                || !characters
+                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
+            {
+                return Err(anyhow!(
+                    "[secrets].env contains invalid environment variable name `{name}`"
+                ));
+            }
+            if !seen.insert(name) {
+                return Err(anyhow!(
+                    "[secrets].env contains duplicate environment variable `{name}`"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 fn resolve_subagents(config: &SubagentConfig) -> SubagentPolicy {
     let defaults = SubagentPolicy::default();
     SubagentPolicy {
@@ -232,6 +267,9 @@ pub struct FileConfig {
     /// `compaction`: absent from disk when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<SubagentConfig>,
+    /// Exact-value secret masking configured under `[secrets]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretsConfig>,
     /// External MCP servers configured under `[[mcp.servers]]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<mcp::McpConfig>,
@@ -253,6 +291,7 @@ impl PartialEq for FileConfig {
             && self.rtk == other.rtk
             && self.compaction == other.compaction
             && self.subagents == other.subagents
+            && self.secrets == other.secrets
             && self.mcp == other.mcp
             && self.tui == other.tui
             && self.extra == other.extra
@@ -315,6 +354,9 @@ impl FileConfig {
     pub fn validate(&self) -> Result<()> {
         if let Some(compaction) = &self.compaction {
             compaction.validate()?;
+        }
+        if let Some(secrets) = &self.secrets {
+            secrets.validate()?;
         }
         if let Some(mcp) = &self.mcp {
             mcp.validate().map_err(|error| anyhow!(error))?;
@@ -829,6 +871,8 @@ pub struct Config {
     pub compaction: CompactionPolicy,
     /// Resolved subagent bounds (file `[subagents]` over defaults).
     pub subagents: SubagentPolicy,
+    /// Resolved once at startup. Its `Debug` implementation omits values.
+    pub secret_masker: Arc<SecretMasker>,
     /// MCP servers after deterministic validation and `${ENV_VAR}` expansion.
     pub mcp_servers: Vec<mcp::McpServerConfig>,
     /// Whether the interactive frontend skips its welcome header.
@@ -944,6 +988,37 @@ impl Config {
             .clone()
             .or_else(|| file.model.clone())
             .unwrap_or_else(|| provider.default_model().to_owned());
+        let secret_entries = file
+            .secrets
+            .as_ref()
+            .map(|secrets| {
+                secrets
+                    .env
+                    .iter()
+                    .map(|name| {
+                        let value = std::env::var(name).map_err(|error| match error {
+                            std::env::VarError::NotPresent => anyhow!(
+                                "configured secret environment variable `{name}` is not set"
+                            ),
+                            std::env::VarError::NotUnicode(_) => anyhow!(
+                                "configured secret environment variable `{name}` is not valid Unicode"
+                            ),
+                        })?;
+                        Ok((name.clone(), value))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let secret_masker =
+            Arc::new(SecretMasker::new(secret_entries).map_err(|error| anyhow!(error))?);
+        if secret_masker.mask_text(&model) != model
+            || secret_masker.mask_text(&provider.to_string()) != provider.to_string()
+        {
+            return Err(anyhow!(
+                "provider and model names cannot contain a configured secret"
+            ));
+        }
         let mcp_servers = file
             .mcp
             .as_ref()
@@ -968,6 +1043,7 @@ impl Config {
                 .as_ref()
                 .map(resolve_subagents)
                 .unwrap_or_default(),
+            secret_masker,
             mcp_servers: mcp_servers.unwrap_or_default(),
             tui_minimal: file.tui.as_ref().is_some_and(|tui| tui.minimal),
             // Only the process-wide [`Config::resolve`] loads credentials;
@@ -1350,6 +1426,7 @@ mod tests {
                 max_turns: Some(10),
                 max_concurrent: Some(2),
             }),
+            secrets: None,
             mcp: None,
             tui: Some(TuiConfig { minimal: true }),
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
@@ -1652,6 +1729,38 @@ future_server_key = "keep"
         // The unknown-field survival path must not see the compaction table.
         let loaded = load_file_config(&path).unwrap();
         assert!(!loaded.extra.contains_key("compaction"));
+    }
+
+    #[test]
+    fn secrets_config_round_trips_and_rejects_unsafe_names() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let original = FileConfig {
+            secrets: Some(SecretsConfig {
+                env: vec!["DEPLOY_TOKEN".into(), "_PRIVATE_KEY".into()],
+            }),
+            ..FileConfig::default()
+        };
+        save_file_config(&path, &original).unwrap();
+        assert_eq!(load_file_config(&path).unwrap(), original);
+
+        for names in [
+            vec![""],
+            vec!["BAD-NAME"],
+            vec!["1TOKEN"],
+            vec!["TOKEN", "TOKEN"],
+        ] {
+            let error = FileConfig {
+                secrets: Some(SecretsConfig {
+                    env: names.into_iter().map(str::to_owned).collect(),
+                }),
+                ..FileConfig::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("[secrets].env"), "{error}");
+        }
     }
 
     #[test]

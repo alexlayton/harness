@@ -423,6 +423,7 @@ async fn run_headless_resolved(
     let (event_tx, event_rx) = mpsc::unbounded_channel();
 
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+        .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)

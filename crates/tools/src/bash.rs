@@ -159,6 +159,10 @@ impl Tool for BashTool {
         Concurrency::Exclusive
     }
 
+    fn accepts_restored_secrets(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         let command = match args.get("command").and_then(Value::as_str) {
             Some(command) if !command.is_empty() => command.to_owned(),

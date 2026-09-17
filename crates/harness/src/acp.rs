@@ -1382,6 +1382,7 @@ async fn spawn_agent(
         tools,
         cancel.clone(),
     )
+    .with_secret_masker(state.config.secret_masker.clone())
     .with_reasoning(state.config.reasoning)
     .with_compaction(state.config.compaction.clone())
     .with_subagents(state.config.subagents, false)
