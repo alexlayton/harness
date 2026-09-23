@@ -146,7 +146,7 @@ impl Tool for BashTool {
             prompt: ToolPrompt::new(
                 "Run commands",
                 [
-                    "Use bash for tests, builds, git, or when no dedicated tool applies.".to_owned(),
+                    "Use bash for tests, builds, git, or when no dedicated tool applies. Prefer python for standalone Python calculations instead of launching Python with bash.".to_owned(),
                     "Use dir for commands in subdirectories instead of cd.".to_owned(),
                 ],
             ),

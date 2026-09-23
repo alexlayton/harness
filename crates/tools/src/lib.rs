@@ -6,6 +6,7 @@ mod find;
 mod grep;
 mod multigrep;
 mod outline;
+mod python;
 mod read;
 mod registry;
 pub mod skills;
@@ -22,6 +23,7 @@ pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;
 pub use multigrep::MultiGrepTool;
 pub use outline::OutlineTool;
+pub use python::PythonTool;
 pub use read::ReadTool;
 pub use registry::{
     ToolExecutionGate, ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError,
@@ -228,6 +230,7 @@ pub fn default_registry_with_index(
                 config.rtk,
                 &workspace_root,
             )),
+            Box::new(PythonTool),
             Box::new(OutlineTool::new(workspace_fs.clone())),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
@@ -509,6 +512,11 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             .and_then(Value::as_str)
             .map(|command| format!("bash: {}", first_line(command)))
             .unwrap_or_else(|| "bash".into()),
+        "python" => args
+            .get("code")
+            .and_then(Value::as_str)
+            .map(|code| format!("python: {}", first_line(code)))
+            .unwrap_or_else(|| "python".into()),
         "find" => {
             let query = args.get("query").and_then(Value::as_str);
             let path = args.get("path").and_then(Value::as_str);
