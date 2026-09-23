@@ -5,6 +5,7 @@ pub mod file_mutation;
 mod find;
 mod grep;
 mod multigrep;
+mod outline;
 mod read;
 mod registry;
 pub mod skills;
@@ -20,6 +21,7 @@ pub use edit::EditTool;
 pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;
 pub use multigrep::MultiGrepTool;
+pub use outline::OutlineTool;
 pub use read::ReadTool;
 pub use registry::{
     ToolExecutionGate, ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError,
@@ -226,6 +228,7 @@ pub fn default_registry_with_index(
                 config.rtk,
                 &workspace_root,
             )),
+            Box::new(OutlineTool::new(workspace_fs.clone())),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
             Box::new(MultiGrepTool::new(index.clone())),
@@ -239,7 +242,7 @@ pub fn default_registry_with_index(
 }
 
 /// Construct the read-only subregistry used by `read_only` subagents:
-/// `read`, `find`, `grep`, and `multigrep`, plus the same skill
+/// `read`, `outline`, `find`, `grep`, and `multigrep`, plus the same skill
 /// discovery/read allowlists and one shared file index. Deliberately no
 /// `edit`/`write`/`bash`: the scheduler class is not a sandbox, so
 /// exclusion of mutating tools is the actual enforcement, not prompt
@@ -275,9 +278,10 @@ pub fn read_only_registry_with_index(
     let mut registry = ToolRegistry::try_new_with_workspace(
         vec![
             Box::new(
-                ReadTool::with_workspace_fs(&workspace_root, workspace_fs)
+                ReadTool::with_workspace_fs(&workspace_root, workspace_fs.clone())
                     .with_allowed_paths(read_paths),
             ),
+            Box::new(OutlineTool::new(workspace_fs)),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
             Box::new(MultiGrepTool::new(index.clone())),
@@ -592,7 +596,16 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec!["read", "edit", "write", "bash", "find", "grep", "multigrep"]
+            vec![
+                "read",
+                "edit",
+                "write",
+                "bash",
+                "outline",
+                "find",
+                "grep",
+                "multigrep"
+            ]
         );
         let context = registry.prompt_context();
         let snippets: Vec<(&str, &str)> = context
@@ -607,6 +620,7 @@ mod tests {
                 ("edit", "Apply exact replacements"),
                 ("write", "Create or replace files"),
                 ("bash", "Run commands"),
+                ("outline", "Outline source files"),
                 ("find", "Find files and directories"),
                 ("grep", "Search file contents"),
                 ("multigrep", "Search multiple literal patterns"),
@@ -630,7 +644,7 @@ mod tests {
             .into_iter()
             .map(|definition| definition.name)
             .collect();
-        assert_eq!(names, vec!["read", "find", "grep", "multigrep"]);
+        assert_eq!(names, vec!["read", "outline", "find", "grep", "multigrep"]);
         // Skill discovery still applies, so skill bodies stay loadable.
         assert_eq!(
             registry.workspace_root(),
