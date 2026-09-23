@@ -150,7 +150,7 @@ require a new connection, and MCP tools are not passed to subagents.
 The subagent schema lives in `tools`, while its runner lives in `agent` to
 preserve dependency direction. Important invariants are:
 
-- Read-only children receive only `read`, `find`, `grep`, and `multigrep`;
+- Read-only children receive only `read`, `outline`, `find`, `grep`, and `multigrep`;
   unavailable tools, not prompt wording, enforce the restriction.
 - Workspace children can use normal built-ins and run exclusively.
 - Children cannot create subagents.

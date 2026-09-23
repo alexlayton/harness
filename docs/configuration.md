@@ -162,7 +162,7 @@ parallel read-only delegations and is clamped to at least one. Workspace-mode
 subagents are exclusive and run in sequence.
 
 Subagents do not receive external MCP tools and cannot create more subagents.
-Read-only children receive exactly `read`, `find`, `grep`, and `multigrep`;
+Read-only children receive exactly `read`, `outline`, `find`, `grep`, and `multigrep`;
 workspace children receive the normal built-ins. Exclusion from the registry
 is the enforcement, not prompt wording.
 
