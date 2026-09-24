@@ -104,9 +104,12 @@ jobs:
           package="harness-${{ needs.checks.outputs.tag }}-${{ matrix.target }}"
           mkdir -p "dist/$package"
           cp "target/${{ matrix.target }}/release/harness" README.md LICENSE "dist/$package/"
+          mkdir -p "dist/$package/assets"
+          cp assets/header.png "dist/$package/assets/"
           tar -C dist -czf "dist/${{ matrix.archive }}" "$package"
           tar -tzf "dist/${{ matrix.archive }}" | grep -Fx "$package/harness"
           tar -tzf "dist/${{ matrix.archive }}" | grep -Fx "$package/README.md"
+          tar -tzf "dist/${{ matrix.archive }}" | grep -Fx "$package/assets/header.png"
           tar -tzf "dist/${{ matrix.archive }}" | grep -Fx "$package/LICENSE"
           rm -rf "dist/$package"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
