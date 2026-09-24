@@ -32,21 +32,22 @@ impl Tool for PythonTool {
             definition: ToolDefinition {
                 name: "python".into(),
                 description: format!(
-                    "Run a standalone Python snippet in Monty for calculations and data transformations. Prefer this over bash for Python computation; use dedicated tools for files and bash for commands, tests, builds and git. Each call starts fresh. Returns print output and the final expression. Available modules (some have limited APIs): {AVAILABLE_MODULES}. Unavailable modules (not exhaustive): {UNAVAILABLE_MODULES}. No third-party packages, filesystem access, or host functions. This in-process interpreter is NOT crash-isolated; do not use it to execute untrusted third-party scripts."
+                    "Run a standalone Python snippet in Monty for calculations and data transformations. Prefer this over bash for Python computation; use dedicated tools for files and bash for commands, tests, builds and git. Each call starts fresh. Provide a short description of the calculation for the visible tool status. Returns print output and the final expression. Available modules (some have limited APIs): {AVAILABLE_MODULES}. Unavailable modules (not exhaustive): {UNAVAILABLE_MODULES}. No third-party packages, filesystem access, or host functions. This in-process interpreter is NOT crash-isolated; do not use it to execute untrusted third-party scripts."
                 ),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "code": { "type": "string", "description": "Python source (at most 32 KiB). print() output and the final expression are returned. No state persists between calls." }
+                        "code": { "type": "string", "description": "Python source (at most 32 KiB). print() output and the final expression are returned. No state persists between calls." },
+                        "description": { "type": "string", "minLength": 1, "maxLength": 80, "description": "Short, single-line action label shown in the tool status, e.g. 'Compute the 100th Fibonacci number'. Describe the purpose, not the Python source." }
                     },
-                    "required": ["code"],
+                    "required": ["code", "description"],
                     "additionalProperties": false
                 }),
             },
             prompt: ToolPrompt::new(
                 "Run short Python calculations (Monty, no filesystem)",
                 [
-                    "Prefer python over bash for standalone Python calculations; use dedicated file tools for workspace files, and bash for external commands, builds, tests and git.",
+                    "Prefer python over bash for standalone Python calculations; use dedicated file tools for workspace files, and bash for external commands, builds, tests and git. Supply a short description of what this call computes so the tool status is meaningful.",
                     "Python runs in Monty, not CPython: no pip/third-party packages or file access (including via os/pathlib). The tool definition lists available and unavailable modules. Each invocation has fresh globals and a 5-second execution budget.",
                 ],
             ),
@@ -61,14 +62,20 @@ impl Tool for PythonTool {
     }
 
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
+        let Some(description) = description(&args) else {
+            return error(
+                "description must be a non-empty, single-line label of at most 80 characters",
+            );
+        };
+        let summary = format!("python {description}");
         let Some(code) = args.get("code").and_then(Value::as_str) else {
-            return error("missing required argument: code");
+            return error_with_summary("missing required argument: code", summary);
         };
         if code.len() > MAX_CODE_BYTES {
-            return error("code exceeds 32 KiB");
+            return error_with_summary("code exceeds 32 KiB", summary);
         }
         if cancel.is_cancelled() {
-            return error("cancelled");
+            return error_with_summary("cancelled", summary);
         }
         let code = code.to_owned();
         // Parsing and execution are synchronous. Monty's duration limit is
@@ -76,19 +83,34 @@ impl Tool for PythonTool {
         // Dropping this future cannot stop an already running blocking task;
         // its own execution limit is the backstop.
         let task = tokio::task::spawn_blocking(move || run_code(code));
-        tokio::select! {
+        let mut output = tokio::select! {
             biased;
             _ = cancel.cancelled() => error("cancelled (running code may continue until its execution limit)"),
             result = task => match result {
                 Ok(output) => output,
                 Err(join_error) => error(&format!("interpreter task failed: {join_error}")),
             },
-        }
+        };
+        output.summary = summary;
+        output
     }
 }
 
+fn description(args: &Value) -> Option<&str> {
+    let description = args.get("description")?.as_str()?.trim();
+    (!description.is_empty()
+        && description.chars().count() <= 80
+        && !description.chars().any(char::is_control))
+    .then_some(description)
+}
+
+/// The same label is used before dispatch, on completion and in session replay.
+pub(crate) fn summary(args: &Value) -> String {
+    description(args).map_or_else(|| "python".into(), |label| format!("python {label}"))
+}
+
 fn run_code(code: String) -> ToolOutput {
-    let mut runner = match MontyRun::new(code, "<python>", vec![], CompileOptions::default()) {
+    let runner = match MontyRun::new(code, "<python>", vec![], CompileOptions::default()) {
         Ok(runner) => runner,
         Err(err) => return error(&err.to_string()),
     };
@@ -180,10 +202,14 @@ impl Write for BoundedOutput {
 }
 
 fn error(message: &str) -> ToolOutput {
+    error_with_summary(message, "python".into())
+}
+
+fn error_with_summary(message: &str, summary: String) -> ToolOutput {
     ToolOutput {
         content: message.into(),
         is_error: true,
-        summary: "python".into(),
+        summary,
     }
 }
 
@@ -196,19 +222,21 @@ mod tests {
         let tool = PythonTool;
         let output = tool
             .execute(
-                json!({"code": "print('hello')\n6 * 7"}),
+                json!({"code": "print('hello')\n6 * 7", "description": "Calculate six times seven"}),
                 CancellationToken::new(),
             )
             .await;
         assert!(!output.is_error, "{}", output.content);
         assert_eq!(output.content, "hello\nResult: 42");
+        assert_eq!(output.summary, "python Calculate six times seven");
 
         let denied = tool
             .execute(
-                json!({"code": "open('/etc/passwd').read()"}),
+                json!({"code": "open('/etc/passwd').read()", "description": "Read system file"}),
                 CancellationToken::new(),
             )
             .await;
         assert!(denied.is_error);
+        assert_eq!(denied.summary, "python Read system file");
     }
 }
