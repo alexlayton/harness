@@ -19,10 +19,10 @@ headless scripts, or from an editor through the Agent Client Protocol (ACP).
 > illusion of informed consent has been removed for your convenience.
 >
 > This applies to the terminal UI, headless mode, ACP, and external MCP tools.
-> Harness is not a sandbox. The dedicated file tools restrict paths to the
-> workspace, but shell commands and MCP tools can access all resources available
-> to the current operating-system user. Run Harness only in workspaces and
-> environments where you accept that behavior.
+> Harness is not a sandbox. Dedicated file tools restrict writes to the
+> workspace, but `read` can open absolute paths outside it. Shell commands and
+> MCP tools can access resources available to the operating-system user. Run
+> Harness only in workspaces and environments where you accept that behavior.
 
 ## The gimmick: spend fewer tokens
 
@@ -35,10 +35,17 @@ by default; set `rtk = true` in `config.toml` to enable it.
 The `find`, `grep`, and `multigrep` tools use the [fff-search crate][fff]. They
 share one lazy, watched workspace index. The `grep` tool uses fff-search's
 ripgrep-compatible engine directly, so the model can search files without
-building a shell pipeline.
+building a shell pipeline. For source navigation, `outline` uses Tree-sitter to
+list declarations and their line ranges before the model reads a full file.
 
-See [Configuration][configuration] for the RTK setting and other advanced
-options.
+For small calculations and data transformations, `python` runs a fresh snippet
+in [Monty][monty] without a separate Python installation. It has no file access,
+third-party packages, or host callbacks. It runs in the Harness process, so it
+is **not** a security sandbox for untrusted code; use the file tools for files
+and the shell for commands, builds, and tests.
+
+See [Configuration][configuration] for tool limits, the RTK setting, and other
+advanced options.
 
 ## Highlights
 
@@ -50,7 +57,8 @@ options.
 - ACP support for compatible editors.
 - OpenCode Go, OpenRouter, GitHub Copilot, and OpenAI Codex subscription
   providers.
-- Workspace-scoped file tools, an unrestricted shell, optional MCP servers,
+- Indexed search, Tree-sitter source outlines, Monty Python calculations,
+  workspace-scoped file tools, an unrestricted shell, optional MCP servers,
   and bounded subagents.
 - Model-assisted context compaction with a deterministic local fallback.
 - Automatic `AGENTS.md`/`CLAUDE.md` context and Agent Skills discovery.
@@ -234,6 +242,7 @@ Harness is available under the [MIT License](./LICENSE).
 [configuration]: https://github.com/alexlayton/harness/blob/main/docs/configuration.md
 [editor-integration]: https://github.com/alexlayton/harness/blob/main/docs/editor-integration.md
 [fff]: https://crates.io/crates/fff-search
+[monty]: https://pydantic.dev/docs/monty/
 [providers]: https://github.com/alexlayton/harness/blob/main/docs/providers.md
 [releases]: https://github.com/alexlayton/harness/releases
 [rtk]: https://github.com/rtk-ai/rtk

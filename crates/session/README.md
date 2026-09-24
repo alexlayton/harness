@@ -41,13 +41,14 @@ Unknown event types are retained and exported, but are excluded from provider
 context until a reader understands them. IDs and sequence numbers make
 ordering and tool-call pairing inspectable.
 
-Writes append one complete newline-terminated record, flush it, and call
-`sync_all` before returning. A create-new sidecar lock prevents concurrent
-Harness writers from interleaving records. Metadata changes are events rather
-than rewrites, preserving the append-only history. The header is the initial
-metadata snapshot; current title, model, compaction, and usage values are
-obtained by replaying those events. Header/index replacement files use a
-temporary file and rename.
+By default, writes append one complete newline-terminated record, flush it,
+and call `sync_all` before returning. With `--defer-session-sync`, syncs occur
+at turn boundaries instead. A retained sidecar file with an advisory exclusive
+lock prevents concurrent Harness writers from interleaving records. Metadata
+changes are events rather than rewrites, preserving the append-only history.
+The header is the initial metadata snapshot; current title, model, compaction,
+and usage values are obtained by replaying those events. Header/index
+replacement files use a temporary file and rename.
 
 A malformed unterminated final line is treated as an interrupted write and is
 ignored on load. A malformed middle or newline-terminated line is an error.

@@ -115,6 +115,13 @@ prompt metadata, concurrency class, and executor. The system prompt and
 `CompletionRequest.tools` are generated from the same immutable
 `ToolRegistry` snapshot; never maintain a second hand-written tool list.
 
+`find`, `grep`, and `multigrep` use a shared indexed search. `outline` uses
+Tree-sitter to locate declarations and line ranges in supported workspace
+source files. `python` runs fresh Monty snippets for calculations without
+filesystem access or host callbacks; it runs in-process and is not
+crash-isolated or a security sandbox. Use dedicated file tools for files and
+bash for commands, builds, and tests.
+
 Dedicated path tools confine writes to the workspace and reject lexical or
 symlink escapes. `read` accepts absolute paths outside the workspace (a plain
 open plus a regular-file check, under the same text/line/byte limits), because

@@ -11,10 +11,10 @@ Configure the editor to start this subprocess:
 harness acp
 ```
 
-The editor sends `session/new`, `session/load`, `session/prompt`, and
-`session/cancel` JSON-RPC messages. Harness returns streamed text, reasoning,
-usage, and tool-call updates. Sessions are scoped to the workspace that the
-editor opens.
+The editor sends `session/new`, `session/load`, `session/list`,
+`session/delete`, `session/prompt`, and `session/cancel` JSON-RPC messages.
+Harness returns streamed text, reasoning, usage, and tool-call updates.
+Sessions are scoped to the workspace that the editor opens.
 
 > [!NOTE]
 > `session/load` restores the saved history for the agent, but Harness does not
