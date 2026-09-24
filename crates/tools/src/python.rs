@@ -118,9 +118,9 @@ fn run_code(code: String) -> ToolOutput {
             let mut bounded = BoundedOutput::new(output);
             if value != monty_types::MontyObject::none() {
                 if !bounded.text.is_empty() && !bounded.text.ends_with('\n') {
-                    bounded.push_str("\n");
+                    let _ = bounded.write_str("\n");
                 }
-                bounded.push_str("Result: ");
+                let _ = bounded.write_str("Result: ");
                 let _ = write!(bounded, "{value}");
             }
             ToolOutput {
@@ -132,7 +132,7 @@ fn run_code(code: String) -> ToolOutput {
         Err(err) => {
             let mut bounded = BoundedOutput::new(output);
             if !bounded.text.is_empty() && !bounded.text.ends_with('\n') {
-                bounded.push_str("\n");
+                let _ = bounded.write_str("\n");
             }
             let _ = write!(bounded, "{err}");
             ToolOutput {
