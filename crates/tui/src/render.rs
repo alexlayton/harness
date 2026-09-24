@@ -85,51 +85,55 @@ pub(crate) fn content_width(width: u16) -> usize {
 // The startup wordmarks are embedded rather than read from a workspace file:
 // installed binaries should have the same welcome screen regardless of cwd.
 // Each inner slice is one font from `headers.txt`, plus the original wordmark.
-const WELCOME_TITLE_HEIGHT: usize = 7;
+const WELCOME_TITLE_HEIGHT: usize = 6;
 const WELCOME_TITLES: &[&[&str]] = &[
+    // 0 — Pristine
+    &[
+        "██  ██ ██▀▀██ ██▀▀██ ██▀▀██ ██▀▀██ ██▀▀██ ██▀▀██",
+        "██▀▀██ ██  ██ ██     ██  ██ ██▄▄██ ██▄▄▄▄ ██▄▄▄▄",
+        "██  ██ ██▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ██ ▄▄  ██",
+        "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
+    ],
+    // 1 — Scuffed
+    &[
+        "██  ██ ▓█▀▀██ ██▀▀██ ██▀▀██ ██▀▀▓▒ ▓█▀▀██ ▓█▀▀██",
+        "██▀▀██ ▓█  ██ ██     ██  ██ ██▄▄█▓ ██▄▄▄▄ ██▄▄▄▄",
+        "██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▓█ ▄▄  ▓█",
+        "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
+    ],
+    // 2 — DemonicLand / original
     &[
         "██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██",
         "██▀▀██ ▒▓  ██ ██     ██  ██ ██▄▄▓▒ ▓█▄▄▄▄ ▓█▄▄▄▄",
         "██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▒▒ ▄▄  ▒▒",
         "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
     ],
+    // 3 — Ragged
     &[
-        " ▄  █ ██   █▄▄▄▄   ▄   ▄███▄     ▄▄▄▄▄    ▄▄▄▄▄",
-        "█   █ █ █  █  ▄▀    █  █▀   ▀   █     ▀▄ █     ▀▄",
-        "██▀▀█ █▄▄█ █▀▀▌ ██   █ ██▄▄   ▄  ▀▀▀▀▄ ▄  ▀▀▀▀▄",
-        "█   █ █  █ █  █ █ █  █ █▄   ▄▀ ▀▄▄▄▄▀   ▀▄▄▄▄▀",
-        "   █     █   █  █  █ █ ▀███▀",
-        "  ▀     █   ▀   █   ██",
-        "       ▀",
+        "▓█  ██ ░▒▀▀▓█ ██▀▀█▓ ██▀▀██ ██▀▀▒░ ▒▓▀▀█▒ ░▓▀▀██",
+        "██▀▀█▓ ▒▓  ██ █▓     ██  █▓ ██▄▄▓▒ ▓█▄▄▒░ ▓█▄▄▓▒",
+        "██  ██ ▓█▀▀█▓ ██     █▓  ██ ██▄▓▒░ ▄▄  ▒░ ▄▄  ▓▒",
+        "       ▀▒                          ▀▀▀▀▒░ ▀▀▀▓▒░",
     ],
+    // 4 — Mauled
     &[
-        " ██░ ██  ▄▄▄       ██▀███   ███▄    █ ▓█████   ██████   ██████",
-        "▓██░ ██▒▒████▄    ▓██ ▒ ██▒ ██ ▀█   █ ▓█   ▀ ▒██    ▒ ▒██    ▒",
-        "▒██▀▀██░▒██  ▀█▄  ▓██ ░▄█ ▒▓██  ▀█ ██▒▒███   ░ ▓██▄   ░ ▓██▄",
-        "░▓█ ░██ ░██▄▄▄▄██ ▒██▀▀█▄  ▓██▒  ▐▌██▒▒▓█  ▄   ▒   ██▒  ▒   ██▒",
-        "░▓█▒░██▓ ▓█   ▓██▒░██▓ ▒██▒▒██░   ▓██░░▒████▒▒██████▒▒▒██████▒▒",
-        " ▒ ░░▒░▒ ▒▒   ▓▒█░░ ▒▓ ░▒▓░░ ▒░   ▒ ▒ ░░ ▒░ ░▒ ▒▓▒ ▒ ░▒ ▒▓▒ ▒ ░",
-        " ▒ ░▒░ ░  ▒   ▒▒ ░  ░▒ ░ ▒░░ ░░   ░ ▒░ ░ ░  ░░ ░▒  ░ ░░ ░▒  ░ ░",
+        "▓█  █▒ ░▒▀▀▓░ █▓▀▀█▒ ██▀▀▓▒ █▓▀▀▒░ ▒▓▀▀▒░ ░▓▀▀█▒",
+        "██▀▒█▓ ▒▓  █▓ █▒     █▓  █▒ ██▄▓▒░ ▓█▄▒░  ▓█▄▄▒░",
+        "█▓  ▓▒ ▓█▀▒█▓ ▓█     ██  ▓▒ █▓▄▒░  ▄▄  ░▒ ▄▓  ▒▒",
+        "       ▀▒                          ▀▀▓▒░  ▀▀▀▒░",
     ],
+    // 5 — Barely holding together
     &[
-        " ▄ .▄ ▄▄▄· ▄▄▄   ▐ ▄ ▄▄▄ ..▄▄ · .▄▄ ·",
-        "██▪▐█▐█ ▀█ ▀▄ █·•█▌▐█▀▄.▀·▐█ ▀. ▐█ ▀.",
-        "██▀▐█▄█▀▀█ ▐▀▀▄ ▐█▐▐▌▐▀▀▪▄▄▀▀▀█▄▄▀▀▀█▄",
-        "██▌▐▀▐█ ▪▐▌▐█•█▌██▐█▌▐█▄▄▌▐█▄▪▐█▐█▄▪▐█",
-        "▀▀▀ · ▀  ▀ .▀  ▀▀▀ █▪ ▀▀▀  ▀▀▀▀  ▀▀▀▀",
-    ],
-    &[
-        "░█░█░█▀█░█▀▄░█▀█░█▀▀░█▀▀░█▀▀",
-        "░█▀█░█▀█░█▀▄░█░█░█▀▀░▀▀█░▀▀█",
-        "░▀░▀░▀░▀░▀░▀░▀░▀░▀▀▀░▀▀▀░▀▀▀",
-    ],
-    &[
-        "▌",
-        "▛▀▖▝▀▖▙▀▖▛▀▖▞▀▖▞▀▘▞▀▘",
-        "▌ ▌▞▀▌▌  ▌ ▌▛▀ ▝▀▖▝▀▖",
-        "▘ ▘▝▀▘▘  ▘ ▘▝▀▘▀▀ ▀▀",
+        "▓▒  █░ ░▒▀▀▓░ █▓▀ ▓▒ ▓█▀▀▒░ █▓▀ ░  ▒▓▀ ▒░ ░▓▀▀▒░",
+        "█▓▀▒▓░ ▒▓  █▒ █░     ▓▒  █░ █▓▄▒░  ▓█▄░   █▓▄▒░ ",
+        "▓▒  █░ ▓█▀▒▓░ ▓▒     █░  ▓▒ ▓▒▄░   ▄▒  ░  ▄▓  ▒░",
+        "       ▀░                          ▀▒▒░   ▀▀▒░ ",
     ],
 ];
+
+// Relative launch probabilities, from pristine to barely holding together.
+// The last two variants remain rare enough to feel like easter eggs.
+const WELCOME_TITLE_WEIGHTS: [usize; WELCOME_TITLES.len()] = [20, 30, 30, 10, 5, 5];
 
 /// A launch-randomized priority order. Keeping it in the transcript entry
 /// makes resize repaints stable while still allowing a narrower title to take
@@ -139,8 +143,28 @@ pub(crate) struct WelcomeTitleOrder(Vec<usize>);
 
 impl WelcomeTitleOrder {
     pub(crate) fn random() -> Self {
-        let mut order = (0..WELCOME_TITLES.len()).collect::<Vec<_>>();
-        fastrand::shuffle(&mut order);
+        let mut remaining = (0..WELCOME_TITLES.len()).collect::<Vec<_>>();
+        let mut order = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let total = remaining
+                .iter()
+                .map(|&index| WELCOME_TITLE_WEIGHTS[index])
+                .sum();
+            let mut draw = fastrand::usize(0..total);
+            let position = remaining
+                .iter()
+                .position(|&index| {
+                    let weight = WELCOME_TITLE_WEIGHTS[index];
+                    if draw < weight {
+                        true
+                    } else {
+                        draw -= weight;
+                        false
+                    }
+                })
+                .expect("welcome title weights must be positive");
+            order.push(remaining.remove(position));
+        }
         Self(order)
     }
 

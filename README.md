@@ -1,9 +1,4 @@
-```text
-██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██
-██▀▀██ ▒▓  ██ ██     ██  ██ ██▄▄▓▒ ▓█▄▄▄▄ ▓█▄▄▄▄
-██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▒▒ ▄▄  ▒▒
-       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀
-```
+![Harness header](assets/header.png)
 
 > **NEW ACHIEVEMENT! YOU BUILT YOUR OWN CODING HARNESS.**
 >
