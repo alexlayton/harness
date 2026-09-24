@@ -1,15 +1,11 @@
-```text
-██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██
-██▀▀██ ▒▓  ██ ██     ██  ██ ██▄▄▓▒ ▓█▄▄▄▄ ▓█▄▄▄▄
-██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▒▒ ▄▄  ▒▒
-       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀
-```
+![Harness header](assets/header.png)
 
 > **NEW ACHIEVEMENT! YOU BUILT YOUR OWN CODING HARNESS.**
 >
-> **REWARD:** You get to use the harness. That is all.
+> **REWARD:** You get to use the harness. That's it.
 
-100% slop. You probably should not use it.
+99.999% slop. That's five nines! You should probably pick a different
+harness.
 
 Harness is a Rust-based coding agent with an emphasis on speed and efficiency.
 It streams model responses, runs workspace-scoped file tools, delegates work to
@@ -17,17 +13,19 @@ subagents, and stores durable sessions. Use it in a direct terminal UI, in
 headless scripts, or from an editor through the Agent Client Protocol (ACP).
 
 > [!WARNING]
-> **NEW ACHIEVEMENT: THE ILLUSION OF CHOICE!**
+> **THE ILLUSION OF CHOICE!**
 >
 > Harness runs tools without a confirmation step. But you were going to blindly
 > click **Accept all** anyway, weren't you? Congratulations. The tedious
 > illusion of informed consent has been removed for your convenience.
 >
 > This applies to the terminal UI, headless mode, ACP, and external MCP tools.
-> Harness is not a sandbox. The dedicated file tools restrict paths to the
-> workspace, but shell commands and MCP tools can access all resources available
-> to the current operating-system user. Run Harness only in workspaces and
-> environments where you accept that behavior.
+> Harness is not a sandbox. Dedicated file tools restrict writes to the
+> workspace, but `read` can open absolute paths outside it. Shell commands and
+> MCP tools can access resources available to the operating-system user. Run
+> Harness only in workspaces and environments where you accept that behavior.
+>
+> A permission system would be nice. There isn't one yet.
 
 ## The gimmick: spend fewer tokens
 
@@ -40,10 +38,17 @@ by default; set `rtk = true` in `config.toml` to enable it.
 The `find`, `grep`, and `multigrep` tools use the [fff-search crate][fff]. They
 share one lazy, watched workspace index. The `grep` tool uses fff-search's
 ripgrep-compatible engine directly, so the model can search files without
-building a shell pipeline.
+building a shell pipeline. For source navigation, `outline` uses Tree-sitter to
+list declarations and their line ranges before the model reads a full file.
 
-See [Configuration][configuration] for the RTK setting and other advanced
-options.
+For small calculations and data transformations, `python` runs a fresh snippet
+in [Monty][monty] without a separate Python installation. It has no file access,
+third-party packages, or host callbacks. It runs in the Harness process, so it
+is **not** a security sandbox for untrusted code; use the file tools for files
+and the shell for commands, builds, and tests.
+
+See [Configuration][configuration] for tool limits, the RTK setting, and other
+advanced options.
 
 ## Highlights
 
@@ -55,7 +60,8 @@ options.
 - ACP support for compatible editors.
 - OpenCode Go, OpenRouter, GitHub Copilot, and OpenAI Codex subscription
   providers.
-- Workspace-scoped file tools, an unrestricted shell, optional MCP servers,
+- Indexed search, Tree-sitter source outlines, Monty Python calculations,
+  workspace-scoped file tools, an unrestricted shell, optional MCP servers,
   and bounded subagents.
 - Model-assisted context compaction with a deterministic local fallback.
 - Automatic `AGENTS.md`/`CLAUDE.md` context and Agent Skills discovery.
@@ -164,8 +170,8 @@ leaves the branch in place. Modified or untracked files cause the worktree to
 be retained rather than force-removed. Ignored-only files do not pin an
 ephemeral worktree and are removed with it, so use `--keep` if an ignored file
 contains data you need. `--keep` makes retention sticky across later Harness
-runs at the same branch and path; `--ephemeral` clears
-that policy and restores automatic cleanup.
+runs at the same branch and path; `--ephemeral` clears that policy and
+restores automatic cleanup.
 
 A new worktree contains committed Git state, not uncommitted changes from the
 launch checkout; Harness warns when it detects those changes. To run a
@@ -183,12 +189,11 @@ Mux starts one persisted agent in the launch directory. Press `Ctrl+Space`
 then `n` to add an agent for the current directory, another directory, or a
 new worktree. The same prefix supports `w`, `c`, and `d` to open those
 workspace forms directly, `j`/`k` and `1`–`9` for switching, `x` to close,
-and `?` for help. Mux roster ordering is process-local, while
-each conversation uses
-the normal durable session store. Mux-created worktrees are retained when an
-agent closes. Their creation dialog defaults to retaining that worktree for
-future runs too; toggling the policy off clears an older sticky marker but does
-not remove the worktree when the mux slot closes.
+and `?` for help. Mux roster ordering is process-local, while each
+conversation uses the normal durable session store. Mux-created worktrees are
+retained when an agent closes. Their creation dialog defaults to retaining
+that worktree for future runs too; toggling the policy off clears an older
+sticky marker but does not remove the worktree when the mux slot closes.
 
 Run one prompt without the terminal UI:
 
@@ -239,6 +244,7 @@ Harness is available under the [MIT License](./LICENSE).
 [configuration]: https://github.com/alexlayton/harness/blob/main/docs/configuration.md
 [editor-integration]: https://github.com/alexlayton/harness/blob/main/docs/editor-integration.md
 [fff]: https://crates.io/crates/fff-search
+[monty]: https://pydantic.dev/docs/monty/
 [providers]: https://github.com/alexlayton/harness/blob/main/docs/providers.md
 [releases]: https://github.com/alexlayton/harness/releases
 [rtk]: https://github.com/rtk-ai/rtk

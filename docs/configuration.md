@@ -49,6 +49,21 @@ Set `rtk = true` to let the bash tool rewrite supported commands through an
 installed `rtk` executable for smaller tool output. This feature is off by
 default.
 
+## Built-in tools
+
+`find`, `grep`, and `multigrep` search a shared, watched workspace index.
+`outline` uses Tree-sitter to show declarations and line ranges in supported
+source files (Rust, Python, Swift, Go, C, C++, JavaScript, and TypeScript).
+Use `read` for the relevant lines after finding a declaration.
+
+`python` runs standalone Monty snippets for calculations and data
+transformations. Each call starts with fresh state and has a five-second
+execution budget. It does not provide third-party packages, filesystem access,
+or host callbacks; use the dedicated file tools for files and bash for commands,
+builds, and tests. Monty runs in the Harness process and is **not** a security
+boundary or crash-isolated sandbox. No configuration is needed to enable these
+tools.
+
 ## Secret masking
 
 Harness can replace explicitly configured environment-variable values before
@@ -340,6 +355,9 @@ harness acp --provider openai-codex
 |---|---|
 | `prompt [PROMPT]` | Run one prompt and print only the final answer to stdout. Reads piped stdin when the prompt is omitted. |
 | `acp` | Serve ACP over stdio (stdout carries JSON-RPC protocol traffic only). |
+| `mux` | Start the experimental multi-agent terminal frontend. |
+| `worktree <branch>` | Run in a dedicated Git worktree (see the [README](../README.md#usage-overview)). |
+| `mcp` | List, add, or delete MCP servers (see [MCP servers](#mcp-servers)). |
 | `login <provider>` | Authenticate with an OAuth provider. |
 | `--provider <provider>` | Override the configured provider. |
 | `--model <model>` | Override the configured model. |

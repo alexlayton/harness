@@ -12,7 +12,10 @@ Harness prints setup instructions instead of assuming an API-key provider.
 | OpenAI Codex | `openai-codex` (`codex`) | Browser or device login |
 
 API keys are environment-only secrets. Harness does not write them to
-`config.toml` or session files.
+`config.toml` or session files. Without an explicit model, the configured
+fallbacks are `gpt-5.6-luna` for OpenCode Go, `openai/gpt-5.6-luna` for
+OpenRouter, `gpt-5.4` for Copilot, and `gpt-5.5` for Codex. Copilot can instead
+select a model available to the signed-in account.
 
 ## OpenCode Go
 
@@ -74,11 +77,11 @@ metadata in `crates/auth` and
 `crates/llm/src/providers/github_copilot.rs` so that they can change without
 leaking into the agent loop.
 
-Harness selects a wire protocol from Copilot's per-model endpoint metadata:
-
-- Claude models use the Anthropic-compatible `/v1/messages` endpoint.
-- GPT-5-family and MAI models use `/responses`.
-- Other supported models use `/chat/completions`.
+Harness selects a wire protocol from its per-model catalog, not only from the
+model name. Most Claude models use the Anthropic-compatible `/v1/messages`
+endpoint, but `claude-fable-5` uses `/chat/completions`. GPT-5-family and MAI
+models use `/responses`, as does `grok-4.5`. Other catalogued models can use
+`/chat/completions`.
 
 Free plans restrict many premium models. If you do not configure a model,
 Harness tries to select one that the signed-in plan can use. Plan-gated

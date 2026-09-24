@@ -84,52 +84,57 @@ pub(crate) fn content_width(width: u16) -> usize {
 
 // The startup wordmarks are embedded rather than read from a workspace file:
 // installed binaries should have the same welcome screen regardless of cwd.
-// Each inner slice is one font from `headers.txt`, plus the original wordmark.
-const WELCOME_TITLE_HEIGHT: usize = 7;
+// Each inner slice is a progressive decay of the same wordmark.
+// Reserve six rows so the title and plain-text fallback keep the same spacing.
+const WELCOME_TITLE_HEIGHT: usize = 6;
 const WELCOME_TITLES: &[&[&str]] = &[
+    // 0 — Pristine
+    &[
+        "██  ██ ██▀▀██ ██▀▀██ ██▀▀██ ██▀▀██ ██▀▀██ ██▀▀██",
+        "██▀▀██ ██  ██ ██     ██  ██ ██▄▄██ ██▄▄▄▄ ██▄▄▄▄",
+        "██  ██ ██▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ██ ▄▄  ██",
+        "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
+    ],
+    // 1 — Scuffed
+    &[
+        "██  ██ ▓█▀▀██ ██▀▀██ ██▀▀██ ██▀▀▓▒ ▓█▀▀██ ▓█▀▀██",
+        "██▀▀██ ▓█  ██ ██     ██  ██ ██▄▄█▓ ██▄▄▄▄ ██▄▄▄▄",
+        "██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▓█ ▄▄  ▓█",
+        "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
+    ],
+    // 2 — DemonicLand / original
     &[
         "██  ██ ░▒▀▀██ ██▀▀██ ██▀▀██ ██▀▀▒░ ▒▓▀▀██ ▒▓▀▀██",
         "██▀▀██ ▒▓  ██ ██     ██  ██ ██▄▄▓▒ ▓█▄▄▄▄ ▓█▄▄▄▄",
         "██  ██ ▓█▀▀██ ██     ██  ██ ██▄▄▄▄ ▄▄  ▒▒ ▄▄  ▒▒",
         "       ▀▀                          ▀▀▀▀▀▀ ▀▀▀▀▀▀",
     ],
+    // 3 — Ragged
     &[
-        " ▄  █ ██   █▄▄▄▄   ▄   ▄███▄     ▄▄▄▄▄    ▄▄▄▄▄",
-        "█   █ █ █  █  ▄▀    █  █▀   ▀   █     ▀▄ █     ▀▄",
-        "██▀▀█ █▄▄█ █▀▀▌ ██   █ ██▄▄   ▄  ▀▀▀▀▄ ▄  ▀▀▀▀▄",
-        "█   █ █  █ █  █ █ █  █ █▄   ▄▀ ▀▄▄▄▄▀   ▀▄▄▄▄▀",
-        "   █     █   █  █  █ █ ▀███▀",
-        "  ▀     █   ▀   █   ██",
-        "       ▀",
+        "▓█  ██ ░▒▀▀▓█ ██▀▀█▓ ██▀▀██ ██▀▀▒░ ▒▓▀▀█▒ ░▓▀▀██",
+        "██▀▀█▓ ▒▓  ██ █▓     ██  █▓ ██▄▄▓▒ ▓█▄▄▒░ ▓█▄▄▓▒",
+        "██  ██ ▓█▀▀█▓ ██     █▓  ██ ██▄▓▒░ ▄▄  ▒░ ▄▄  ▓▒",
+        "       ▀▒                          ▀▀▀▀▒░ ▀▀▀▓▒░",
     ],
+    // 4 — Mauled
     &[
-        " ██░ ██  ▄▄▄       ██▀███   ███▄    █ ▓█████   ██████   ██████",
-        "▓██░ ██▒▒████▄    ▓██ ▒ ██▒ ██ ▀█   █ ▓█   ▀ ▒██    ▒ ▒██    ▒",
-        "▒██▀▀██░▒██  ▀█▄  ▓██ ░▄█ ▒▓██  ▀█ ██▒▒███   ░ ▓██▄   ░ ▓██▄",
-        "░▓█ ░██ ░██▄▄▄▄██ ▒██▀▀█▄  ▓██▒  ▐▌██▒▒▓█  ▄   ▒   ██▒  ▒   ██▒",
-        "░▓█▒░██▓ ▓█   ▓██▒░██▓ ▒██▒▒██░   ▓██░░▒████▒▒██████▒▒▒██████▒▒",
-        " ▒ ░░▒░▒ ▒▒   ▓▒█░░ ▒▓ ░▒▓░░ ▒░   ▒ ▒ ░░ ▒░ ░▒ ▒▓▒ ▒ ░▒ ▒▓▒ ▒ ░",
-        " ▒ ░▒░ ░  ▒   ▒▒ ░  ░▒ ░ ▒░░ ░░   ░ ▒░ ░ ░  ░░ ░▒  ░ ░░ ░▒  ░ ░",
+        "▓█  █▒ ░▒▀▀▓░ █▓▀▀█▒ ██▀▀▓▒ █▓▀▀▒░ ▒▓▀▀▒░ ░▓▀▀█▒",
+        "██▀▒█▓ ▒▓  █▓ █▒     █▓  █▒ ██▄▓▒░ ▓█▄▒░  ▓█▄▄▒░",
+        "█▓  ▓▒ ▓█▀▒█▓ ▓█     ██  ▓▒ █▓▄▒░  ▄▄  ░▒ ▄▓  ▒▒",
+        "       ▀▒                          ▀▀▓▒░  ▀▀▀▒░",
     ],
+    // 5 — Barely holding together
     &[
-        " ▄ .▄ ▄▄▄· ▄▄▄   ▐ ▄ ▄▄▄ ..▄▄ · .▄▄ ·",
-        "██▪▐█▐█ ▀█ ▀▄ █·•█▌▐█▀▄.▀·▐█ ▀. ▐█ ▀.",
-        "██▀▐█▄█▀▀█ ▐▀▀▄ ▐█▐▐▌▐▀▀▪▄▄▀▀▀█▄▄▀▀▀█▄",
-        "██▌▐▀▐█ ▪▐▌▐█•█▌██▐█▌▐█▄▄▌▐█▄▪▐█▐█▄▪▐█",
-        "▀▀▀ · ▀  ▀ .▀  ▀▀▀ █▪ ▀▀▀  ▀▀▀▀  ▀▀▀▀",
-    ],
-    &[
-        "░█░█░█▀█░█▀▄░█▀█░█▀▀░█▀▀░█▀▀",
-        "░█▀█░█▀█░█▀▄░█░█░█▀▀░▀▀█░▀▀█",
-        "░▀░▀░▀░▀░▀░▀░▀░▀░▀▀▀░▀▀▀░▀▀▀",
-    ],
-    &[
-        "▌",
-        "▛▀▖▝▀▖▙▀▖▛▀▖▞▀▖▞▀▘▞▀▘",
-        "▌ ▌▞▀▌▌  ▌ ▌▛▀ ▝▀▖▝▀▖",
-        "▘ ▘▝▀▘▘  ▘ ▘▝▀▘▀▀ ▀▀",
+        "▓▒  █░ ░▒▀▀▓░ █▓▀ ▓▒ ▓█▀▀▒░ █▓▀ ░  ▒▓▀ ▒░ ░▓▀▀▒░",
+        "█▓▀▒▓░ ▒▓  █▒ █░     ▓▒  █░ █▓▄▒░  ▓█▄░   █▓▄▒░ ",
+        "▓▒  █░ ▓█▀▒▓░ ▓▒     █░  ▓▒ ▓▒▄░   ▄▒  ░  ▄▓  ▒░",
+        "       ▀░                          ▀▒▒░   ▀▀▒░ ",
     ],
 ];
+
+// Relative launch probabilities, from pristine to barely holding together.
+// The last two variants remain rare enough to feel like easter eggs.
+const WELCOME_TITLE_WEIGHTS: [usize; WELCOME_TITLES.len()] = [20, 30, 30, 10, 5, 5];
 
 /// A launch-randomized priority order. Keeping it in the transcript entry
 /// makes resize repaints stable while still allowing a narrower title to take
@@ -139,8 +144,28 @@ pub(crate) struct WelcomeTitleOrder(Vec<usize>);
 
 impl WelcomeTitleOrder {
     pub(crate) fn random() -> Self {
-        let mut order = (0..WELCOME_TITLES.len()).collect::<Vec<_>>();
-        fastrand::shuffle(&mut order);
+        let mut remaining = (0..WELCOME_TITLES.len()).collect::<Vec<_>>();
+        let mut order = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            let total = remaining
+                .iter()
+                .map(|&index| WELCOME_TITLE_WEIGHTS[index])
+                .sum();
+            let mut draw = fastrand::usize(0..total);
+            let position = remaining
+                .iter()
+                .position(|&index| {
+                    let weight = WELCOME_TITLE_WEIGHTS[index];
+                    if draw < weight {
+                        true
+                    } else {
+                        draw -= weight;
+                        false
+                    }
+                })
+                .expect("welcome title weights must be positive");
+            order.push(remaining.remove(position));
+        }
         Self(order)
     }
 
@@ -1145,26 +1170,16 @@ mod tests {
     }
 
     #[test]
-    fn welcome_title_falls_back_to_a_shorter_font() {
-        let (shortest, shortest_width) = WELCOME_TITLES
-            .iter()
-            .enumerate()
-            .map(|(index, title)| (index, title_width(title)))
-            .min_by_key(|(_, width)| *width)
-            .unwrap();
-        let (widest, widest_width) = WELCOME_TITLES
-            .iter()
-            .enumerate()
-            .map(|(index, title)| (index, title_width(title)))
-            .max_by_key(|(_, width)| *width)
-            .unwrap();
-        assert!(widest_width > shortest_width);
-
-        let order = WelcomeTitleOrder(vec![widest, shortest]);
-        assert_eq!(
-            order.fitting_title(shortest_width),
-            Some(WELCOME_TITLES[shortest])
+    fn welcome_title_uses_priority_when_fonts_have_equal_width() {
+        let width = title_width(WELCOME_TITLES[0]);
+        assert!(
+            WELCOME_TITLES
+                .iter()
+                .all(|title| title_width(title) == width)
         );
+
+        let order = WelcomeTitleOrder(vec![1, 0]);
+        assert_eq!(order.fitting_title(width), Some(WELCOME_TITLES[1]));
     }
 
     #[test]
@@ -1193,9 +1208,10 @@ mod tests {
 
     #[test]
     fn welcome_titles_are_centered_at_a_common_height() {
-        assert_eq!(
-            WELCOME_TITLES.iter().map(|title| title.len()).max(),
-            Some(WELCOME_TITLE_HEIGHT)
+        assert!(
+            WELCOME_TITLES
+                .iter()
+                .all(|title| title.len() <= WELCOME_TITLE_HEIGHT)
         );
 
         let footer_index = SECTION_GAP + WELCOME_TITLE_HEIGHT + BLOCK_GAP;
