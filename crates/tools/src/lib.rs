@@ -6,6 +6,7 @@ mod find;
 mod grep;
 mod multigrep;
 mod outline;
+mod python;
 mod read;
 mod registry;
 pub mod skills;
@@ -22,6 +23,7 @@ pub use find::{FileSearchIndex, FindConfig, FindTool};
 pub use grep::GrepTool;
 pub use multigrep::MultiGrepTool;
 pub use outline::OutlineTool;
+pub use python::PythonTool;
 pub use read::ReadTool;
 pub use registry::{
     ToolExecutionGate, ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError,
@@ -228,6 +230,7 @@ pub fn default_registry_with_index(
                 config.rtk,
                 &workspace_root,
             )),
+            Box::new(PythonTool),
             Box::new(OutlineTool::new(workspace_fs.clone())),
             Box::new(FindTool::new(index.clone())),
             Box::new(GrepTool::new(index.clone())),
@@ -509,6 +512,7 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             .and_then(Value::as_str)
             .map(|command| format!("bash: {}", first_line(command)))
             .unwrap_or_else(|| "bash".into()),
+        "python" => python::summary(args),
         "find" => {
             let query = args.get("query").and_then(Value::as_str);
             let path = args.get("path").and_then(Value::as_str);
@@ -585,6 +589,19 @@ mod tests {
     }
 
     #[test]
+    fn python_call_summary_uses_description_not_source() {
+        let args = serde_json::json!({"code": "print('private value')", "description": "Compute Fibonacci 100"});
+        assert_eq!(
+            call_summary("python", &args),
+            "python Compute Fibonacci 100"
+        );
+        assert_eq!(
+            call_summary("python", &serde_json::json!({"code": "1 + 1"})),
+            "python"
+        );
+    }
+
+    #[test]
     fn default_registry_has_all_tools_and_prompt_metadata() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("main.rs"), "fn main() {}\n").unwrap();
@@ -601,6 +618,7 @@ mod tests {
                 "edit",
                 "write",
                 "bash",
+                "python",
                 "outline",
                 "find",
                 "grep",
@@ -620,6 +638,10 @@ mod tests {
                 ("edit", "Apply exact replacements"),
                 ("write", "Create or replace files"),
                 ("bash", "Run commands"),
+                (
+                    "python",
+                    "Run short Python calculations (Monty, no filesystem)"
+                ),
                 ("outline", "Outline source files"),
                 ("find", "Find files and directories"),
                 ("grep", "Search file contents"),
