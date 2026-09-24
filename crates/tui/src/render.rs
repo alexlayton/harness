@@ -84,7 +84,8 @@ pub(crate) fn content_width(width: u16) -> usize {
 
 // The startup wordmarks are embedded rather than read from a workspace file:
 // installed binaries should have the same welcome screen regardless of cwd.
-// Each inner slice is one font from `headers.txt`, plus the original wordmark.
+// Each inner slice is a progressive decay of the same wordmark.
+// Reserve six rows so the title and plain-text fallback keep the same spacing.
 const WELCOME_TITLE_HEIGHT: usize = 6;
 const WELCOME_TITLES: &[&[&str]] = &[
     // 0 — Pristine
@@ -1169,26 +1170,16 @@ mod tests {
     }
 
     #[test]
-    fn welcome_title_falls_back_to_a_shorter_font() {
-        let (shortest, shortest_width) = WELCOME_TITLES
-            .iter()
-            .enumerate()
-            .map(|(index, title)| (index, title_width(title)))
-            .min_by_key(|(_, width)| *width)
-            .unwrap();
-        let (widest, widest_width) = WELCOME_TITLES
-            .iter()
-            .enumerate()
-            .map(|(index, title)| (index, title_width(title)))
-            .max_by_key(|(_, width)| *width)
-            .unwrap();
-        assert!(widest_width > shortest_width);
-
-        let order = WelcomeTitleOrder(vec![widest, shortest]);
-        assert_eq!(
-            order.fitting_title(shortest_width),
-            Some(WELCOME_TITLES[shortest])
+    fn welcome_title_uses_priority_when_fonts_have_equal_width() {
+        let width = title_width(WELCOME_TITLES[0]);
+        assert!(
+            WELCOME_TITLES
+                .iter()
+                .all(|title| title_width(title) == width)
         );
+
+        let order = WelcomeTitleOrder(vec![1, 0]);
+        assert_eq!(order.fitting_title(width), Some(WELCOME_TITLES[1]));
     }
 
     #[test]
@@ -1217,9 +1208,10 @@ mod tests {
 
     #[test]
     fn welcome_titles_are_centered_at_a_common_height() {
-        assert_eq!(
-            WELCOME_TITLES.iter().map(|title| title.len()).max(),
-            Some(WELCOME_TITLE_HEIGHT)
+        assert!(
+            WELCOME_TITLES
+                .iter()
+                .all(|title| title.len() <= WELCOME_TITLE_HEIGHT)
         );
 
         let footer_index = SECTION_GAP + WELCOME_TITLE_HEIGHT + BLOCK_GAP;
