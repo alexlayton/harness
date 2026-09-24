@@ -2,9 +2,10 @@
 
 > **NEW ACHIEVEMENT! YOU BUILT YOUR OWN CODING HARNESS.**
 >
-> **REWARD:** You get to use the harness. That is all.
+> **REWARD:** You get to use the harness. That's it.
 
-100% slop. You probably should not use it.
+99.999% slop. That's five nines! You should probably pick a different
+harness.
 
 Harness is a Rust-based coding agent with an emphasis on speed and efficiency.
 It streams model responses, runs workspace-scoped file tools, delegates work to
@@ -12,7 +13,7 @@ subagents, and stores durable sessions. Use it in a direct terminal UI, in
 headless scripts, or from an editor through the Agent Client Protocol (ACP).
 
 > [!WARNING]
-> **NEW ACHIEVEMENT: THE ILLUSION OF CHOICE!**
+> **THE ILLUSION OF CHOICE!**
 >
 > Harness runs tools without a confirmation step. But you were going to blindly
 > click **Accept all** anyway, weren't you? Congratulations. The tedious
@@ -23,6 +24,8 @@ headless scripts, or from an editor through the Agent Client Protocol (ACP).
 > workspace, but `read` can open absolute paths outside it. Shell commands and
 > MCP tools can access resources available to the operating-system user. Run
 > Harness only in workspaces and environments where you accept that behavior.
+>
+> A permission system would be nice. There isn't one yet.
 
 ## The gimmick: spend fewer tokens
 
@@ -167,8 +170,8 @@ leaves the branch in place. Modified or untracked files cause the worktree to
 be retained rather than force-removed. Ignored-only files do not pin an
 ephemeral worktree and are removed with it, so use `--keep` if an ignored file
 contains data you need. `--keep` makes retention sticky across later Harness
-runs at the same branch and path; `--ephemeral` clears
-that policy and restores automatic cleanup.
+runs at the same branch and path; `--ephemeral` clears that policy and
+restores automatic cleanup.
 
 A new worktree contains committed Git state, not uncommitted changes from the
 launch checkout; Harness warns when it detects those changes. To run a
@@ -186,12 +189,11 @@ Mux starts one persisted agent in the launch directory. Press `Ctrl+Space`
 then `n` to add an agent for the current directory, another directory, or a
 new worktree. The same prefix supports `w`, `c`, and `d` to open those
 workspace forms directly, `j`/`k` and `1`–`9` for switching, `x` to close,
-and `?` for help. Mux roster ordering is process-local, while
-each conversation uses
-the normal durable session store. Mux-created worktrees are retained when an
-agent closes. Their creation dialog defaults to retaining that worktree for
-future runs too; toggling the policy off clears an older sticky marker but does
-not remove the worktree when the mux slot closes.
+and `?` for help. Mux roster ordering is process-local, while each
+conversation uses the normal durable session store. Mux-created worktrees are
+retained when an agent closes. Their creation dialog defaults to retaining
+that worktree for future runs too; toggling the policy off clears an older
+sticky marker but does not remove the worktree when the mux slot closes.
 
 Run one prompt without the terminal UI:
 
