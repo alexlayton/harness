@@ -915,12 +915,26 @@ impl CopilotAuth {
     pub async fn ensure_valid(&self) -> Result<CopilotCredential> {
         let credential = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
         if !credential.is_expired() {
+            // A separate process can rotate the token before this cache
+            // expires. A failed disk read is not evidence the cache is still
+            // current: fail closed rather than reuse an unconfirmed token.
+            let current = self.store.copilot()?.ok_or(AuthError::NotAuthenticated)?;
+            if copilot_newer_generation(&current, &credential) {
+                self.cache_credential(&current)?;
+                return Ok(current);
+            }
             return Ok(credential);
         }
-        if credential.refresh.trim().is_empty() {
-            return Err(AuthError::NotAuthenticated);
-        }
         self.refresh().await
+    }
+
+    fn cache_credential(&self, credential: &CopilotCredential) -> Result<()> {
+        *self
+            .credential
+            .lock()
+            .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
+            Some(credential.clone());
+        Ok(())
     }
 
     pub async fn refresh(&self) -> Result<CopilotCredential> {
@@ -928,35 +942,22 @@ impl CopilotAuth {
         // then recheck before hitting the network.  The blocking cache
         // mutex is never held across network work.
         let _guard = self.refresh_lock.lock().await;
-        // Reload: another waiter (or process) may have already refreshed.
-        if let Ok(Some(current)) = self.store.copilot() {
-            let cached = self
-                .credential
-                .lock()
-                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))?
-                .clone();
-            match cached {
-                Some(cached) if !cached.is_expired() => return Ok(cached),
-                Some(cached)
-                    if !current.is_expired()
-                        && (current.access != cached.access
-                            || current.refresh != cached.refresh) =>
-                {
-                    *self.credential.lock().map_err(|_| {
-                        AuthError::InvalidCredential("credential lock poisoned".into())
-                    })? = Some(current.clone());
-                    return Ok(current);
-                }
-                None if !current.is_expired() => {
-                    *self.credential.lock().map_err(|_| {
-                        AuthError::InvalidCredential("credential lock poisoned".into())
-                    })? = Some(current.clone());
-                    return Ok(current);
-                }
-                _ => {}
-            }
+        // Reload after taking the single-flight lock. Disk read failures
+        // propagate: they must not turn into a refresh of an obsolete cache.
+        let current = self.store.copilot()?.ok_or(AuthError::NotAuthenticated)?;
+        let cached = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
+        if !current.is_expired()
+            && (cached.is_expired() || copilot_newer_generation(&current, &cached))
+        {
+            self.cache_credential(&current)?;
+            return Ok(current);
         }
-        let old = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
+        if !cached.is_expired() {
+            return Ok(cached);
+        }
+        // If both are expired, use the persisted refresh token even if it
+        // changed while this handle was idle.
+        let old = current;
         let cancel = CancellationToken::new();
         let mut refreshed = self.client.refresh_copilot_token(&old, &cancel).await?;
         // Token refresh must remain useful if the optional model-policy
@@ -979,21 +980,13 @@ impl CopilotAuth {
         // have rotated the credential while this exchange and enrichment were
         // in flight, so a stale completion must never overwrite it.
         if self.store.save_copilot_if_current(&old, &refreshed)? {
-            *self
-                .credential
-                .lock()
-                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-                Some(refreshed.clone());
+            self.cache_credential(&refreshed)?;
             return Ok(refreshed);
         }
         let current = self.store.copilot()?.ok_or_else(|| {
             AuthError::InvalidCredential("credential changed during refresh".into())
         })?;
-        *self
-            .credential
-            .lock()
-            .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-            Some(current.clone());
+        self.cache_credential(&current)?;
         Ok(current)
     }
 
@@ -1077,6 +1070,17 @@ impl CopilotAuth {
             Some(credential.clone());
         Ok(credential)
     }
+}
+
+/// With no persisted sequence number, changed token/domain identity or an
+/// extended expiry identifies a newer usable on-disk generation. Model-list
+/// changes alone are optional enrichment, not token rotation.
+fn copilot_newer_generation(current: &CopilotCredential, cached: &CopilotCredential) -> bool {
+    !current.is_expired()
+        && (current.access != cached.access
+            || current.refresh != cached.refresh
+            || current.enterprise_url != cached.enterprise_url
+            || current.expires > cached.expires)
 }
 
 fn copilot_headers() -> HeaderMap {
@@ -1548,6 +1552,41 @@ mod tests {
         assert_eq!(persisted.access, "new-access");
         assert_eq!(persisted.refresh, "new-refresh");
         assert_eq!(auth.credential().unwrap().unwrap(), persisted);
+    }
+
+    #[tokio::test]
+    async fn independent_copilot_handles_adopt_rotated_disk_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let old = CopilotCredential::new("old", "refresh-old", u64::MAX - 1, None, vec![]);
+        store.save_copilot(&old).unwrap();
+        let first = CopilotAuth::new(store.clone()).unwrap();
+        let second = CopilotAuth::new(store.clone()).unwrap();
+        let newer = CopilotCredential::new("new", "refresh-new", u64::MAX, None, vec![]);
+        store.save_copilot(&newer).unwrap();
+        assert_eq!(first.ensure_valid().await.unwrap(), newer);
+        assert_eq!(second.refresh().await.unwrap(), newer);
+        assert_eq!(first.credential().unwrap(), Some(newer.clone()));
+        assert_eq!(second.credential().unwrap(), Some(newer));
+    }
+
+    #[tokio::test]
+    async fn unreadable_copilot_store_does_not_fall_back_to_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        store
+            .save_copilot(&CopilotCredential::new(
+                "old",
+                "refresh-old",
+                u64::MAX,
+                None,
+                vec![],
+            ))
+            .unwrap();
+        let auth = CopilotAuth::new(store.clone()).unwrap();
+        std::fs::write(store.path(), "invalid JSON").unwrap();
+        assert!(auth.ensure_valid().await.is_err());
+        assert!(auth.refresh().await.is_err());
     }
 
     /// AUTH-3: a failing model catalogue still leaves a usable persisted
