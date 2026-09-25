@@ -3328,6 +3328,84 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn overflow_compaction_interrupt_keeps_next_message_and_writes_no_summary() {
+        struct HangingSummarizer {
+            started: Arc<Notify>,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for HangingSummarizer {
+            fn name(&self) -> &str {
+                "hanging-summarizer"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                std::future::pending().await
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(Vec::new())
+            }
+        }
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = populate_session(&store, 12, 12_000);
+        let session_id = session.id();
+        let provider = Arc::new(HangingSummarizer {
+            started: Arc::new(Notify::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_session(store.clone(), session)
+        .unwrap();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let turn_cancel = agent.cancel.child_token();
+        let started = provider.started.notified();
+        let operation = async {
+            let mut attempts = 0;
+            agent
+                .try_overflow_recovery(
+                    &LlmError::Stream("context length exceeded".into()),
+                    &event_tx,
+                    &mut input_rx,
+                    &turn_cancel,
+                    &mut attempts,
+                )
+                .await
+        };
+        let sender = async {
+            started.await;
+            input_tx
+                .send(InputMessage::Message("next message".into()))
+                .unwrap();
+            input_tx.send(InputMessage::Interrupt).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(operation, sender)
+        })
+        .await
+        .expect("interrupt must stop the hanging summarizer");
+        assert!(!result.unwrap());
+        assert!(turn_cancel.is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(agent.queued.pop_front(), Some(InputMessage::Message(text)) if text == "next message")
+        );
+        let loaded = store.open(&session_id).unwrap();
+        assert!(!loaded.events.iter().any(|record| matches!(
+            record.event,
+            SessionEvent::CompactionSummary { .. } | SessionEvent::Usage { .. }
+        )));
+    }
+
     #[test]
     fn overflow_recovery_compacts_and_retries_successfully() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
