@@ -961,16 +961,19 @@ impl CopilotAuth {
         let cancel = CancellationToken::new();
         let mut refreshed = self.client.refresh_copilot_token(&old, &cancel).await?;
         // Token refresh must remain useful if the optional model-policy
-        // endpoint is temporarily unavailable.  Keep the last known list and
-        // let an explicit model-list refresh report that endpoint failure.
-        if let Ok(available_model_ids) = self
-            .client
-            .fetch_available_model_ids(
+        // endpoint hangs or fails. Bound enrichment just like login: a
+        // stalled /models request must not hold the single-flight lock
+        // indefinitely. Keep the last known list on timeout or failure;
+        // an explicit model-list refresh still reports endpoint errors.
+        if let Ok(Ok(available_model_ids)) = tokio::time::timeout(
+            MODEL_DISCOVERY_TIMEOUT,
+            self.client.fetch_available_model_ids(
                 &refreshed.access,
                 refreshed.enterprise_url.as_deref(),
                 &cancel,
-            )
-            .await
+            ),
+        )
+        .await
         {
             refreshed.available_model_ids = available_model_ids;
         } else {
@@ -1356,6 +1359,84 @@ mod tests {
         assert_eq!(persisted.access, "access-rotated");
         assert_eq!(persisted.refresh, "refresh-single-use");
         assert_eq!(persisted.available_model_ids, vec!["gpt-5.4"]);
+    }
+
+    #[tokio::test]
+    async fn hanging_model_discovery_does_not_block_token_refresh() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (models_started_tx, models_started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut token_socket, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 8192];
+            let read = token_socket.read(&mut scratch).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&scratch[..read]).contains("/copilot_internal/v2/token")
+            );
+            let body = r#"{"token":"access-new","expires_at":9999999999}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            token_socket.write_all(header.as_bytes()).await.unwrap();
+            token_socket.write_all(body.as_bytes()).await.unwrap();
+            drop(token_socket);
+
+            let (mut models_socket, _) = listener.accept().await.unwrap();
+            let read = models_socket.read(&mut scratch).await.unwrap();
+            assert!(String::from_utf8_lossy(&scratch[..read]).contains("GET /models "));
+            models_started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        store
+            .save_copilot(&CopilotCredential::new(
+                "access-old",
+                "refresh-old",
+                1,
+                None,
+                vec!["saved-model".into()],
+            ))
+            .unwrap();
+        let auth = CopilotAuth::new(store.clone())
+            .unwrap()
+            .with_client_for_test(
+                GithubCopilotClient::with_client_and_endpoints(
+                    reqwest::Client::new,
+                    CopilotEndpoints {
+                        device_code_url: format!("http://{addr}/login/device/code"),
+                        access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                        copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+                    },
+                )
+                .unwrap()
+                .with_api_base_url_for_test(format!("http://{addr}")),
+            );
+        let first = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.ensure_valid().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), models_started_rx)
+            .await
+            .expect("optional models request did not start")
+            .unwrap();
+        let second = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.ensure_valid().await }
+        });
+        tokio::time::pause();
+        tokio::time::advance(MODEL_DISCOVERY_TIMEOUT + Duration::from_millis(1)).await;
+        let refreshed = first.await.unwrap().unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), refreshed);
+        assert_eq!(refreshed.access, "access-new");
+        assert_eq!(refreshed.available_model_ids, vec!["saved-model"]);
+        assert_eq!(store.copilot().unwrap().unwrap(), refreshed);
+        server.abort();
+        let _ = server.await;
     }
 
     /// AUTH-2: two handles on one store (two processes, two agent
