@@ -15,6 +15,9 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
+/// Maximum source size for an exact edit (4 MiB). Larger files need a
+/// different workflow; bounded reads also protect against concurrent growth.
+const MAX_EDIT_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 80;
 const MAX_DIFF_INPUT_LINES: usize = 10_000;
 const DIFF_CONTEXT_LINES: usize = 2;
@@ -79,7 +82,7 @@ impl Tool for EditTool {
         ToolSpec {
             definition: ToolDefinition {
             name: "edit".into(),
-            description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".into(),
+            description: "Edit a single file up to 4 MiB using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -250,7 +253,6 @@ async fn execute_edit_validated(
     check_cancelled(cancel)?;
     #[cfg(unix)]
     if let Some(root) = root {
-        use std::io::Read;
         let owned_fs;
         let fs = if let Some(workspace_fs) = workspace_fs {
             workspace_fs
@@ -261,17 +263,15 @@ async fn execute_edit_validated(
         };
         let fd = super::vfs::unix::open_file_relative(fs, components)
             .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        let mut original_bytes = Vec::new();
         let mut file = std::fs::File::from(fd);
-        file.read_to_end(&mut original_bytes)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        let original_bytes = read_edit_file(&mut file, path)?;
         check_cancelled(cancel)?;
         if original_bytes.contains(&0) {
             return Err(format!(
                 "Could not edit file: {path}. Binary files are not supported."
             ));
         }
-        let raw_content = String::from_utf8(original_bytes.clone()).map_err(|_| {
+        let raw_content = String::from_utf8(original_bytes).map_err(|_| {
             format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
         })?;
         let (bom, content) = strip_bom(&raw_content);
@@ -283,12 +283,9 @@ async fn execute_edit_validated(
         // Re-read from the same handle before committing.
         let fd = super::vfs::unix::open_file_relative(fs, components)
             .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        let mut current_bytes = Vec::new();
         let mut current = std::fs::File::from(fd);
-        current
-            .read_to_end(&mut current_bytes)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        if current_bytes != original_bytes {
+        let current_bytes = read_edit_file(&mut current, path)?;
+        if current_bytes != raw_content.as_bytes() {
             return Err(format!(
                 "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
             ));
@@ -335,6 +332,34 @@ async fn execute_edit_validated(
 }
 
 #[cfg(unix)]
+fn oversized_edit_error(path: &str) -> String {
+    format!(
+        "Could not edit file: {path}. Input exceeds the 4 MiB edit limit; use another method for large files."
+    )
+}
+
+/// Check the opened file first, then read one byte beyond the limit so a
+/// file that grows after the metadata check cannot cause a large allocation.
+#[cfg(unix)]
+fn read_edit_file(file: &mut std::fs::File, path: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    if metadata.len() > MAX_EDIT_INPUT_BYTES as u64 {
+        return Err(oversized_edit_error(path));
+    }
+    let mut bytes = Vec::new();
+    file.take((MAX_EDIT_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    if bytes.len() > MAX_EDIT_INPUT_BYTES {
+        return Err(oversized_edit_error(path));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
 async fn execute_edit(
     path: &str,
     target_path: &Path,
@@ -355,16 +380,29 @@ async fn execute_edit(
         return Err(format!("Could not edit file: {path}. {message}"));
     }
 
-    let original_bytes = fs::read(target_path)
+    use tokio::io::AsyncReadExt;
+    if metadata.len() > MAX_EDIT_INPUT_BYTES as u64 {
+        return Err(oversized_edit_error(path));
+    }
+    let mut file = fs::File::open(target_path)
         .await
         .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    let mut original_bytes = Vec::new();
+    (&mut file)
+        .take((MAX_EDIT_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut original_bytes)
+        .await
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    if original_bytes.len() > MAX_EDIT_INPUT_BYTES {
+        return Err(oversized_edit_error(path));
+    }
     check_cancelled(cancel)?;
     if original_bytes.contains(&0) {
         return Err(format!(
             "Could not edit file: {path}. Binary files are not supported."
         ));
     }
-    let raw_content = String::from_utf8(original_bytes.clone()).map_err(|_| {
+    let raw_content = String::from_utf8(original_bytes).map_err(|_| {
         format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
     })?;
 
@@ -385,10 +423,28 @@ async fn execute_edit(
     // Re-read the snapshot immediately before committing. The per-file queue
     // handles other harness mutations; this check catches ordinary external
     // edits without silently overwriting them.
-    let current_bytes = fs::read(target_path)
+    let mut current = fs::File::open(target_path)
         .await
         .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-    if current_bytes != original_bytes {
+    if current
+        .metadata()
+        .await
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?
+        .len()
+        > MAX_EDIT_INPUT_BYTES as u64
+    {
+        return Err(oversized_edit_error(path));
+    }
+    let mut current_bytes = Vec::new();
+    (&mut current)
+        .take((MAX_EDIT_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut current_bytes)
+        .await
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    if current_bytes.len() > MAX_EDIT_INPUT_BYTES {
+        return Err(oversized_edit_error(path));
+    }
+    if current_bytes != raw_content.as_bytes() {
         return Err(format!(
             "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
         ));
@@ -756,6 +812,31 @@ mod tests {
         assert_eq!(
             fs::read_to_string(path).unwrap(),
             "fn main() {\n    println!(\"new\");\n}\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oversized_input_is_rejected_before_editing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("large.txt");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((MAX_EDIT_INPUT_BYTES + 1) as u64).unwrap();
+        let output = EditTool::with_workspace_root(directory.path())
+            .execute(
+                json!({"path":"large.txt","edits":[{"oldText":"a","newText":"b"}]}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("4 MiB edit limit"),
+            "{}",
+            output.content
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().len(),
+            (MAX_EDIT_INPUT_BYTES + 1) as u64
         );
     }
 
