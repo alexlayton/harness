@@ -3,8 +3,8 @@ use crate::codec::{
 };
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{
-    EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, StoredToolCall,
-    Timestamp, now_timestamp, validate_event_suffix, validate_next_event,
+    EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, Timestamp,
+    now_timestamp, validate_event_suffix, validate_next_event,
 };
 use fs2::FileExt;
 use serde::Deserialize;
@@ -1559,7 +1559,7 @@ impl Drop for SessionActiveLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SessionEvent, StoredMessage};
+    use crate::model::{SessionEvent, StoredMessage, StoredToolCall};
     use llm::Message;
     use tempfile::tempdir;
 
