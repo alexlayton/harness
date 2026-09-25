@@ -111,9 +111,7 @@ enum Entry {
         /// Random launch order retained so resize repaints stay consistent.
         title_order: render::WelcomeTitleOrder,
     },
-    /// The header metadata line: `cwd  (branch)` left, `provider · model`
-    /// right — the same metadata a classic status bar would show above
-    /// its input box.
+    /// Startup details in aligned, accented rows above the transcript.
     Metadata {
         cwd: String,
         branch: Option<String>,
@@ -2654,11 +2652,9 @@ fn fold_entries(entries: &[String]) -> Option<String> {
     Some(text)
 }
 
-/// The header metadata: two dim, left-aligned rows — `cwd  (branch)` on the
-/// first, `provider · model` on the second — replacing the old right-aligned
-/// split so both lines read as plain left-aligned chrome above the transcript.
-/// Optional rows follow for project context, configured MCP servers, and skills:
-/// `context: …`, `mcps: …`, and `skills: …`, capped at [`METADATA_MAX_ENTRIES`] names.
+/// An accent bar and aligned, muted labels make startup details easy to scan.
+/// Values use the terminal's normal text colour; optional context, skill, and
+/// MCP rows remain capped at [`METADATA_MAX_ENTRIES`] names.
 #[expect(
     clippy::too_many_arguments,
     reason = "the renderer keeps each metadata row explicit for focused tests"
@@ -2673,31 +2669,39 @@ fn metadata_lines(
     skills: &[String],
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    let style = Style::default()
-        .fg(theme.dim_text)
-        .add_modifier(Modifier::DIM);
     let cwd = render::sanitize_terminal_text(cwd);
-    let branch = branch.map(render::sanitize_terminal_text);
-    let provider = render::sanitize_terminal_text(provider);
-    let model = render::sanitize_terminal_text(model);
-    let left = match branch {
+    let cwd = match branch.map(render::sanitize_terminal_text) {
         Some(branch) => format!("{cwd}  ({branch})"),
         None => cwd,
     };
     let mut lines = vec![
-        Line::from(Span::styled(left, style)),
-        Line::from(Span::styled(format!("{provider} \u{b7} {model}"), style)),
+        metadata_row("cwd", cwd, theme),
+        metadata_row("provider", render::sanitize_terminal_text(provider), theme),
+        metadata_row("model", render::sanitize_terminal_text(model), theme),
     ];
     for (label, entries) in [
         ("context", context_files),
-        ("mcps", mcp_servers),
         ("skills", skills),
+        ("mcps", mcp_servers),
     ] {
         if let Some(text) = fold_entries(entries) {
-            lines.push(Line::from(Span::styled(format!("{label}: {text}"), style)));
+            lines.push(metadata_row(label, text, theme));
         }
     }
     lines
+}
+
+fn metadata_row(label: &str, value: String, theme: Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("│ ", Style::default().fg(theme.accent)),
+        Span::styled(
+            format!("{label:<8}  "),
+            Style::default()
+                .fg(theme.dim_text)
+                .add_modifier(Modifier::DIM),
+        ),
+        Span::styled(value, Style::default().fg(theme.primary_text)),
+    ])
 }
 
 /// A left-oriented rule marking a session boundary. An empty label is the
@@ -4408,51 +4412,48 @@ mod tests {
 
     #[test]
     fn metadata_header_shows_context_mcp_and_skill_rows_capped() {
+        let theme = Theme::default();
         let lines = metadata_lines(
             "~/proj",
-            None,
+            Some("feature"),
             "p",
             "m",
             &["AGENTS.md".into(), "~/.harness/AGENTS.md".into()],
             &["github".into(), "filesystem".into()],
             &["alpha".into(), "beta".into()],
-            Theme::default(),
+            theme,
         );
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(row_text(&lines[0]), "│ cwd       ~/proj  (feature)");
+        assert_eq!(row_text(&lines[1]), "│ provider  p");
+        assert_eq!(row_text(&lines[2]), "│ model     m");
         assert_eq!(
-            row_text(&lines[2]),
-            "context: AGENTS.md, ~/.harness/AGENTS.md"
+            row_text(&lines[3]),
+            "│ context   AGENTS.md, ~/.harness/AGENTS.md"
         );
-        assert_eq!(row_text(&lines[3]), "mcps: github, filesystem");
-        assert_eq!(row_text(&lines[4]), "skills: alpha, beta");
+        assert_eq!(row_text(&lines[4]), "│ skills    alpha, beta");
+        assert_eq!(row_text(&lines[5]), "│ mcps      github, filesystem");
+        for line in &lines {
+            assert_eq!(line.spans[0].style.fg, Some(theme.accent));
+            assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
+            assert_eq!(line.spans[2].style.fg, Some(theme.primary_text));
+            assert!(!line.spans[2].style.add_modifier.contains(Modifier::DIM));
+        }
 
         // More than the cap folds into `+N more`.
         let many = (0..6).map(|index| format!("s{index}")).collect::<Vec<_>>();
-        let lines = metadata_lines(
-            "~/proj",
-            None,
-            "p",
-            "m",
-            &[],
-            &[],
-            &many
-                .iter()
-                .map(String::as_str)
-                .map(str::to_owned)
-                .collect::<Vec<_>>(),
-            Theme::default(),
-        );
-        assert_eq!(lines.len(), 3);
-        assert_eq!(row_text(&lines[2]), "skills: s0, s1, s2, s3 · +2 more");
+        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &many, theme);
+        assert_eq!(lines.len(), 4);
+        assert_eq!(row_text(&lines[3]), "│ skills    s0, s1, s2, s3 · +2 more");
 
         // Nothing loaded: no extra rows.
-        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &[], Theme::default());
-        assert_eq!(lines.len(), 2);
+        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &[], theme);
+        assert_eq!(lines.len(), 3);
     }
 
     #[test]
     fn long_metadata_rows_fit_narrow_widths() {
-        // TUI-2: header metadata (cwd/branch/provider·model/context/skills)
+        // TUI-2: header metadata (cwd/branch/provider/model/context/skills)
         // goes through `entry_lines` → `fit_line_to_width`, so even
         // pathological inputs fit widths 1–3 as well as normal widths.
         let long_cwd = "/very/long/working/directory/that/keeps/going/and/going";
