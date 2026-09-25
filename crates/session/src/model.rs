@@ -1051,6 +1051,7 @@ impl<'a> SuffixTracker<'a> {
     fn new(base: &'a ToolCallTracker) -> Self {
         let local = ToolCallTracker {
             pending: base.pending.clone(),
+            pending_calls: base.pending_calls.clone(),
             cancelled: base.cancelled,
             ..ToolCallTracker::default()
         };
