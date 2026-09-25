@@ -48,6 +48,55 @@ fn add_slots(mux: &mut MuxUi, count: u64) {
     }
 }
 #[test]
+fn submit_keys_wait_for_ready_pane_and_preserve_draft() {
+    let mut mux = MuxUi::new("/x".into());
+    mux.apply(MuxEvent::Add {
+        id: 1,
+        name: "pending".into(),
+        workspace: "/pending".into(),
+        worktree: false,
+        status: MuxStatus::Starting,
+        pane: pane("/pending"),
+    });
+    mux.handle(Event::Paste("first".into())).unwrap();
+    for status in [MuxStatus::Starting, MuxStatus::Error] {
+        mux.apply(MuxEvent::Status { id: 1, status });
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            assert!(
+                mux.handle(Event::Key(KeyEvent::new(KeyCode::Enter, modifiers)))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(mux.slots[0].pane.editor_text(), "first");
+        }
+    }
+    mux.handle(Event::Key(KeyEvent::new(
+        KeyCode::Enter,
+        KeyModifiers::SHIFT,
+    )))
+    .unwrap();
+    mux.handle(Event::Paste("second".into())).unwrap();
+    mux.apply(MuxEvent::Replace {
+        id: 1,
+        name: "ready".into(),
+        workspace: "/ready".into(),
+        worktree: false,
+        status: MuxStatus::Idle,
+        pane: pane("/ready"),
+    });
+    assert_eq!(mux.slots[0].pane.editor_text(), "first\nsecond");
+    let actions = mux
+        .handle(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::CONTROL,
+        )))
+        .unwrap();
+    assert!(matches!(actions.as_slice(), [MuxAction::AgentInput {
+        id: 1, input: InputMessage::Message(text)
+    }] if text == "first\nsecond"));
+}
+
+#[test]
 fn provisional_add_activates_but_replacement_preserves_newer_selection() {
     let mut mux = MuxUi::new("/x".into());
     mux.apply(MuxEvent::Add {
