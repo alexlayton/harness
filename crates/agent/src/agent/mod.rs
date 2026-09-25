@@ -1291,6 +1291,30 @@ mod tests {
         }
     }
 
+    struct NeverRunTool;
+
+    #[async_trait]
+    impl Tool for NeverRunTool {
+        fn spec(&self) -> tools::ToolSpec {
+            tools::ToolSpec {
+                definition: llm::ToolDefinition {
+                    name: "never".into(),
+                    description: "must not run after interrupt".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                prompt: tools::ToolPrompt::default(),
+            }
+        }
+
+        fn concurrency(&self, _args: &Value) -> Concurrency {
+            Concurrency::ReadOnly
+        }
+
+        async fn execute(&self, _args: Value, _cancel: CancellationToken) -> ToolOutput {
+            panic!("unstarted batch was executed")
+        }
+    }
+
     fn parallel_calls_script() -> Vec<Vec<ScriptStep>> {
         vec![
             script(vec![
@@ -1453,12 +1477,15 @@ mod tests {
             .unwrap();
 
         let session_id = session.id();
-        // Both calls target the same parallel tool so they merge into one
-        // concurrent batch; each hangs until the interrupt drops the batch.
-        let registry = ToolRegistry::try_new(vec![Box::new(HangingTool {
-            name: "hang",
-            class: Concurrency::Parallel,
-        })])
+        // The exclusive first batch hangs. Later read-only calls have
+        // already entered assistant history but must never be launched.
+        let registry = ToolRegistry::try_new(vec![
+            Box::new(HangingTool {
+                name: "hang",
+                class: Concurrency::Exclusive,
+            }),
+            Box::new(NeverRunTool),
+        ])
         .unwrap();
         let cancel = CancellationToken::new();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1469,7 +1496,8 @@ mod tests {
                 calls: AtomicUsize::new(0),
                 scripts: vec![script(vec![
                     StreamEvent::ToolCallComplete(call("t1", "hang")),
-                    StreamEvent::ToolCallComplete(call("t2", "hang")),
+                    StreamEvent::ToolCallComplete(call("t2", "never")),
+                    StreamEvent::ToolCallComplete(call("t3", "never")),
                     StreamEvent::Done {
                         stop_reason: Some("tool_calls".into()),
                         usage: None,
@@ -1485,7 +1513,7 @@ mod tests {
         .unwrap();
         let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
-        // Wait until both calls are announced and running, then interrupt:
+        // Wait until the first call starts, then interrupt:
         // the dispatcher is provably parked in its select loop at that point,
         // so the interrupt lands on the tool batch deterministically.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1502,7 +1530,7 @@ mod tests {
                         .iter()
                         .filter(|event| matches!(event, AgentEvent::ToolCallStarted { .. }))
                         .count();
-                    if starts >= 2 {
+                    if starts >= 1 {
                         break;
                     }
                 }
@@ -1510,7 +1538,7 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    panic!("agent exited before both tools started")
+                    panic!("agent exited before the first tool started")
                 }
             }
         }
@@ -1523,8 +1551,8 @@ mod tests {
 
         // Balanced lifecycle: one start per call, one cancelled finish per
         // call, no duplicates.
-        assert_eq!(started_ids(&events), vec!["t1", "t2"]);
-        assert_eq!(finished_ids(&events), vec!["t1", "t2"]);
+        assert_eq!(started_ids(&events), vec!["t1", "t2", "t3"]);
+        assert_eq!(finished_ids(&events), vec!["t1", "t2", "t3"]);
         for event in &events {
             if let AgentEvent::ToolCallFinished { ok, output, .. } = event {
                 assert!(!ok);
@@ -1545,14 +1573,35 @@ mod tests {
                     is_error,
                     content,
                     ..
-                } if content == "cancelled; execution status unknown" => {
+                } if content == "cancelled; execution status unknown" || content == "cancelled" => {
                     Some((tool_call_id, is_error))
                 }
                 _ => None,
             })
             .collect();
-        assert_eq!(results.len(), 2, "{results:?}");
+        assert_eq!(
+            results
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t2", "t3"]
+        );
         assert!(results.iter().all(|(_, is_error)| **is_error));
+        let reloaded_ids: Vec<_> = loaded
+            .context_messages()
+            .iter()
+            .flat_map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|content| match content {
+                        Content::ToolResult { tool_call_id, .. } => Some(tool_call_id.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(reloaded_ids, vec!["t1", "t2", "t3"]);
         assert!(
             loaded
                 .events
@@ -3277,6 +3326,84 @@ mod tests {
                 "fallback summary must be the deterministic transcript"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn overflow_compaction_interrupt_keeps_next_message_and_writes_no_summary() {
+        struct HangingSummarizer {
+            started: Arc<Notify>,
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for HangingSummarizer {
+            fn name(&self) -> &str {
+                "hanging-summarizer"
+            }
+            async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_one();
+                std::future::pending().await
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(Vec::new())
+            }
+        }
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = populate_session(&store, 12, 12_000);
+        let session_id = session.id();
+        let provider = Arc::new(HangingSummarizer {
+            started: Arc::new(Notify::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut agent = Agent::new(
+            provider.clone(),
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_session(store.clone(), session)
+        .unwrap();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let turn_cancel = agent.cancel.child_token();
+        let started = provider.started.notified();
+        let operation = async {
+            let mut attempts = 0;
+            agent
+                .try_overflow_recovery(
+                    &LlmError::Stream("context length exceeded".into()),
+                    &event_tx,
+                    &mut input_rx,
+                    &turn_cancel,
+                    &mut attempts,
+                )
+                .await
+        };
+        let sender = async {
+            started.await;
+            input_tx
+                .send(InputMessage::Message("next message".into()))
+                .unwrap();
+            input_tx.send(InputMessage::Interrupt).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(operation, sender)
+        })
+        .await
+        .expect("interrupt must stop the hanging summarizer");
+        assert!(!result.unwrap());
+        assert!(turn_cancel.is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(agent.queued.pop_front(), Some(InputMessage::Message(text)) if text == "next message")
+        );
+        let loaded = store.open(&session_id).unwrap();
+        assert!(!loaded.events.iter().any(|record| matches!(
+            record.event,
+            SessionEvent::CompactionSummary { .. } | SessionEvent::Usage { .. }
+        )));
     }
 
     #[test]

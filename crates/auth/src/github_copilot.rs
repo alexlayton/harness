@@ -915,12 +915,26 @@ impl CopilotAuth {
     pub async fn ensure_valid(&self) -> Result<CopilotCredential> {
         let credential = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
         if !credential.is_expired() {
+            // A separate process can rotate the token before this cache
+            // expires. A failed disk read is not evidence the cache is still
+            // current: fail closed rather than reuse an unconfirmed token.
+            let current = self.store.copilot()?.ok_or(AuthError::NotAuthenticated)?;
+            if copilot_newer_generation(&current, &credential) {
+                self.cache_credential(&current)?;
+                return Ok(current);
+            }
             return Ok(credential);
         }
-        if credential.refresh.trim().is_empty() {
-            return Err(AuthError::NotAuthenticated);
-        }
         self.refresh().await
+    }
+
+    fn cache_credential(&self, credential: &CopilotCredential) -> Result<()> {
+        *self
+            .credential
+            .lock()
+            .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
+            Some(credential.clone());
+        Ok(())
     }
 
     pub async fn refresh(&self) -> Result<CopilotCredential> {
@@ -928,48 +942,38 @@ impl CopilotAuth {
         // then recheck before hitting the network.  The blocking cache
         // mutex is never held across network work.
         let _guard = self.refresh_lock.lock().await;
-        // Reload: another waiter (or process) may have already refreshed.
-        if let Ok(Some(current)) = self.store.copilot() {
-            let cached = self
-                .credential
-                .lock()
-                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))?
-                .clone();
-            match cached {
-                Some(cached) if !cached.is_expired() => return Ok(cached),
-                Some(cached)
-                    if !current.is_expired()
-                        && (current.access != cached.access
-                            || current.refresh != cached.refresh) =>
-                {
-                    *self.credential.lock().map_err(|_| {
-                        AuthError::InvalidCredential("credential lock poisoned".into())
-                    })? = Some(current.clone());
-                    return Ok(current);
-                }
-                None if !current.is_expired() => {
-                    *self.credential.lock().map_err(|_| {
-                        AuthError::InvalidCredential("credential lock poisoned".into())
-                    })? = Some(current.clone());
-                    return Ok(current);
-                }
-                _ => {}
-            }
+        // Reload after taking the single-flight lock. Disk read failures
+        // propagate: they must not turn into a refresh of an obsolete cache.
+        let current = self.store.copilot()?.ok_or(AuthError::NotAuthenticated)?;
+        let cached = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
+        if !current.is_expired()
+            && (cached.is_expired() || copilot_newer_generation(&current, &cached))
+        {
+            self.cache_credential(&current)?;
+            return Ok(current);
         }
-        let old = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
+        if !cached.is_expired() {
+            return Ok(cached);
+        }
+        // If both are expired, use the persisted refresh token even if it
+        // changed while this handle was idle.
+        let old = current;
         let cancel = CancellationToken::new();
         let mut refreshed = self.client.refresh_copilot_token(&old, &cancel).await?;
         // Token refresh must remain useful if the optional model-policy
-        // endpoint is temporarily unavailable.  Keep the last known list and
-        // let an explicit model-list refresh report that endpoint failure.
-        if let Ok(available_model_ids) = self
-            .client
-            .fetch_available_model_ids(
+        // endpoint hangs or fails. Bound enrichment just like login: a
+        // stalled /models request must not hold the single-flight lock
+        // indefinitely. Keep the last known list on timeout or failure;
+        // an explicit model-list refresh still reports endpoint errors.
+        if let Ok(Ok(available_model_ids)) = tokio::time::timeout(
+            MODEL_DISCOVERY_TIMEOUT,
+            self.client.fetch_available_model_ids(
                 &refreshed.access,
                 refreshed.enterprise_url.as_deref(),
                 &cancel,
-            )
-            .await
+            ),
+        )
+        .await
         {
             refreshed.available_model_ids = available_model_ids;
         } else {
@@ -979,21 +983,13 @@ impl CopilotAuth {
         // have rotated the credential while this exchange and enrichment were
         // in flight, so a stale completion must never overwrite it.
         if self.store.save_copilot_if_current(&old, &refreshed)? {
-            *self
-                .credential
-                .lock()
-                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-                Some(refreshed.clone());
+            self.cache_credential(&refreshed)?;
             return Ok(refreshed);
         }
         let current = self.store.copilot()?.ok_or_else(|| {
             AuthError::InvalidCredential("credential changed during refresh".into())
         })?;
-        *self
-            .credential
-            .lock()
-            .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-            Some(current.clone());
+        self.cache_credential(&current)?;
         Ok(current)
     }
 
@@ -1010,15 +1006,34 @@ impl CopilotAuth {
                 &cancel,
             )
             .await?;
-        let mut updated = credential;
+        // Discovery is optional enrichment, not a token refresh. Another
+        // process can rotate the token while /models is in flight. Serialize
+        // local refreshers, then compare under the auth-file lock so the old
+        // token cannot be restored by a late model-list response.
+        let _guard = self.refresh_lock.lock().await;
+        let mut updated = credential.clone();
         updated.available_model_ids = ids.clone();
-        self.store.save_copilot(&updated)?;
+        if self.store.save_copilot_if_current(&credential, &updated)? {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
+                Some(updated);
+            return Ok(ids);
+        }
+        // Do not retry discovery with a second token here: return that
+        // generation's existing list, leaving token refresh errors separate
+        // from optional catalogue errors.
+        let current = self.store.copilot()?.ok_or_else(|| {
+            AuthError::InvalidCredential("credential changed during model discovery".into())
+        })?;
+        let current_ids = current.available_model_ids.clone();
         *self
             .credential
             .lock()
             .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-            Some(updated);
-        Ok(ids)
+            Some(current);
+        Ok(current_ids)
     }
 
     pub async fn login(
@@ -1058,6 +1073,17 @@ impl CopilotAuth {
             Some(credential.clone());
         Ok(credential)
     }
+}
+
+/// With no persisted sequence number, changed token/domain identity or an
+/// extended expiry identifies a newer usable on-disk generation. Model-list
+/// changes alone are optional enrichment, not token rotation.
+fn copilot_newer_generation(current: &CopilotCredential, cached: &CopilotCredential) -> bool {
+    !current.is_expired()
+        && (current.access != cached.access
+            || current.refresh != cached.refresh
+            || current.enterprise_url != cached.enterprise_url
+            || current.expires > cached.expires)
 }
 
 fn copilot_headers() -> HeaderMap {
@@ -1335,6 +1361,84 @@ mod tests {
         assert_eq!(persisted.available_model_ids, vec!["gpt-5.4"]);
     }
 
+    #[tokio::test]
+    async fn hanging_model_discovery_does_not_block_token_refresh() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (models_started_tx, models_started_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut token_socket, _) = listener.accept().await.unwrap();
+            let mut scratch = [0u8; 8192];
+            let read = token_socket.read(&mut scratch).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&scratch[..read]).contains("/copilot_internal/v2/token")
+            );
+            let body = r#"{"token":"access-new","expires_at":9999999999}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            token_socket.write_all(header.as_bytes()).await.unwrap();
+            token_socket.write_all(body.as_bytes()).await.unwrap();
+            drop(token_socket);
+
+            let (mut models_socket, _) = listener.accept().await.unwrap();
+            let read = models_socket.read(&mut scratch).await.unwrap();
+            assert!(String::from_utf8_lossy(&scratch[..read]).contains("GET /models "));
+            models_started_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        store
+            .save_copilot(&CopilotCredential::new(
+                "access-old",
+                "refresh-old",
+                1,
+                None,
+                vec!["saved-model".into()],
+            ))
+            .unwrap();
+        let auth = CopilotAuth::new(store.clone())
+            .unwrap()
+            .with_client_for_test(
+                GithubCopilotClient::with_client_and_endpoints(
+                    reqwest::Client::new,
+                    CopilotEndpoints {
+                        device_code_url: format!("http://{addr}/login/device/code"),
+                        access_token_url: format!("http://{addr}/login/oauth/access_token"),
+                        copilot_token_url: format!("http://{addr}/copilot_internal/v2/token"),
+                    },
+                )
+                .unwrap()
+                .with_api_base_url_for_test(format!("http://{addr}")),
+            );
+        let first = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.ensure_valid().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), models_started_rx)
+            .await
+            .expect("optional models request did not start")
+            .unwrap();
+        let second = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.ensure_valid().await }
+        });
+        tokio::time::pause();
+        tokio::time::advance(MODEL_DISCOVERY_TIMEOUT + Duration::from_millis(1)).await;
+        let refreshed = first.await.unwrap().unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), refreshed);
+        assert_eq!(refreshed.access, "access-new");
+        assert_eq!(refreshed.available_model_ids, vec!["saved-model"]);
+        assert_eq!(store.copilot().unwrap().unwrap(), refreshed);
+        server.abort();
+        let _ = server.await;
+    }
+
     /// AUTH-2: two handles on one store (two processes, two agent
     /// instances) racing `ensure_valid` still produce one exchange: the
     /// loser adopts the winner's persisted rotation via the reload-
@@ -1456,6 +1560,114 @@ mod tests {
         assert_eq!(exchanges.load(Ordering::SeqCst), 1);
         let persisted = AuthStore::new(path).copilot().unwrap().unwrap();
         assert_eq!(persisted.access, "access-winner");
+    }
+
+    #[tokio::test]
+    async fn model_discovery_cannot_restore_token_rotated_during_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8192];
+            let bytes = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..bytes]).contains("GET /models "));
+            arrived_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            let body = r#"{"data":[{"id":"stale-model","model_picker_enabled":true}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let expires = 9_999_999_999_000;
+        store
+            .save_copilot(&CopilotCredential::new(
+                "old-access",
+                "old-refresh",
+                expires,
+                None,
+                vec!["old-model".into()],
+            ))
+            .unwrap();
+        let client = GithubCopilotClient::new()
+            .unwrap()
+            .with_api_base_url_for_test(format!("http://{addr}"));
+        let auth = CopilotAuth::new(store.clone())
+            .unwrap()
+            .with_client_for_test(client);
+        let task = tokio::spawn({
+            let auth = auth.clone();
+            async move { auth.refresh_available_model_ids().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), arrived_rx)
+            .await
+            .expect("model request did not reach fixture")
+            .unwrap();
+        store
+            .save_copilot(&CopilotCredential::new(
+                "new-access",
+                "new-refresh",
+                expires,
+                None,
+                vec!["new-model".into()],
+            ))
+            .unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("model refresh did not complete")
+                .unwrap()
+                .unwrap(),
+            vec!["new-model"]
+        );
+        server.await.unwrap();
+        let persisted = store.copilot().unwrap().unwrap();
+        assert_eq!(persisted.access, "new-access");
+        assert_eq!(persisted.refresh, "new-refresh");
+        assert_eq!(auth.credential().unwrap().unwrap(), persisted);
+    }
+
+    #[tokio::test]
+    async fn independent_copilot_handles_adopt_rotated_disk_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let old = CopilotCredential::new("old", "refresh-old", u64::MAX - 1, None, vec![]);
+        store.save_copilot(&old).unwrap();
+        let first = CopilotAuth::new(store.clone()).unwrap();
+        let second = CopilotAuth::new(store.clone()).unwrap();
+        let newer = CopilotCredential::new("new", "refresh-new", u64::MAX, None, vec![]);
+        store.save_copilot(&newer).unwrap();
+        assert_eq!(first.ensure_valid().await.unwrap(), newer);
+        assert_eq!(second.refresh().await.unwrap(), newer);
+        assert_eq!(first.credential().unwrap(), Some(newer.clone()));
+        assert_eq!(second.credential().unwrap(), Some(newer));
+    }
+
+    #[tokio::test]
+    async fn unreadable_copilot_store_does_not_fall_back_to_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        store
+            .save_copilot(&CopilotCredential::new(
+                "old",
+                "refresh-old",
+                u64::MAX,
+                None,
+                vec![],
+            ))
+            .unwrap();
+        let auth = CopilotAuth::new(store.clone()).unwrap();
+        std::fs::write(store.path(), "invalid JSON").unwrap();
+        assert!(auth.ensure_valid().await.is_err());
+        assert!(auth.refresh().await.is_err());
     }
 
     /// AUTH-3: a failing model catalogue still leaves a usable persisted

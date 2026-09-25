@@ -443,17 +443,14 @@ impl MuxUi {
         let Some(i) = self.selected else {
             return Ok(vec![]);
         };
-        // Keep drafts editable during setup, but do not submit into a runtime
-        // that is not ready (or has failed). Shift/Alt+Enter still edits a
-        // multiline draft through the normal pane handler.
+        // The pane submits every Enter that is not Shift/Alt+Enter,
+        // including Ctrl+Enter. Keep drafts editable during setup or error,
+        // but never send one to a runtime that is not ready.
         if matches!(self.slots[i].status, MuxStatus::Starting | MuxStatus::Error)
             && matches!(
                 &event,
-                Event::Key(KeyEvent {
-                    code: KeyCode::Enter,
-                    modifiers: KeyModifiers::NONE,
-                    ..
-                })
+                Event::Key(KeyEvent { code: KeyCode::Enter, modifiers, .. })
+                    if !modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
             )
         {
             return Ok(vec![]);

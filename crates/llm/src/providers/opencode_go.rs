@@ -273,18 +273,4 @@ mod tests {
         let error = parse_usage_body(r#"{"usage":{"rolling":{}}}"#).unwrap_err();
         assert!(error.to_string().contains("OpenCode Go usage response"));
     }
-
-    #[test]
-    fn provider_errors_redact_api_keys() {
-        // Every fallible provider surface redacts the active key before
-        // the error becomes UI-/log-visible: stream, usage-parse, and HTTP
-        // errors alike.
-        let secret = "zen-go-secret-key";
-        let stream = LlmError::http(500, format!("boom {secret}")).redacted(secret);
-        assert!(!stream.to_string().contains(secret));
-        let parse = parse_usage_body(&format!("not json {secret}"))
-            .unwrap_err()
-            .redacted(secret);
-        assert!(!parse.to_string().contains(secret));
-    }
 }

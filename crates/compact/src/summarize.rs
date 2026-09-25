@@ -225,8 +225,10 @@ fn append_file_lists(summary: String, plan: &CompactionPlan, max_summary_bytes: 
     truncate_bytes(&combined, max_summary_bytes).to_owned()
 }
 
-/// Deterministic fallback: a condensed transcript of the summarized span,
-/// capped at `max_summary_bytes`, tagged as non-verbatim context.
+/// Deterministic fallback, capped at `max_summary_bytes`. Earlier generated
+/// context takes priority over the new span, then file lists. Preserve the
+/// transcript omission notice and reserve room for a distinct final-budget
+/// notice when needed (if the budget permits it). Never split a UTF-8 point.
 fn deterministic_summary(plan: &CompactionPlan, policy: &CompactionPolicy) -> String {
     let serialized = serialize_events(
         &plan.to_summarize,
@@ -234,6 +236,11 @@ fn deterministic_summary(plan: &CompactionPlan, policy: &CompactionPolicy) -> St
         DEFAULT_TOOL_RESULT_CHARS,
     );
     let mut text = String::from("This is generated context, not a verbatim transcript.\n");
+    if let Some(previous) = &plan.previous_summary {
+        text.push_str("<previous-generated-summary>\n");
+        text.push_str(previous);
+        text.push_str("\n</previous-generated-summary>\n");
+    }
     if serialized.text.is_empty() {
         text.push_str("(no conversation material)");
     } else {
@@ -243,7 +250,20 @@ fn deterministic_summary(plan: &CompactionPlan, policy: &CompactionPolicy) -> St
         text.push('\n');
         text.push_str(OMISSION_MARKER);
     }
-    append_file_lists(text, plan, policy.max_summary_bytes)
+    text.push_str(&format_file_operations(&extract_file_operations(
+        &plan.to_summarize,
+    )));
+
+    const BUDGET_NOTICE: &str = "[... summary content omitted ...]";
+    let budget = policy.max_summary_bytes;
+    if text.len() <= budget {
+        return text;
+    }
+    if budget < BUDGET_NOTICE.len() {
+        return truncate_bytes(&text, budget).to_owned();
+    }
+    let prefix = truncate_bytes(&text, budget - BUDGET_NOTICE.len());
+    format!("{prefix}{BUDGET_NOTICE}")
 }
 
 #[cfg(test)]
@@ -418,6 +438,57 @@ mod tests {
             }
             other => panic!("expected deterministic outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn repeated_compaction_fallback_keeps_earlier_summary_in_provider_history() {
+        let runtime = runtime();
+        let policy = CompactionPolicy {
+            keep_recent_turns: 2,
+            max_summary_bytes: 512,
+            ..CompactionPolicy::default()
+        };
+        let mut session = Session::new(SessionMetadata::new("/tmp/project", None, None));
+        for index in 0..4 {
+            push_user(&mut session, &format!("question {index}"));
+            push_assistant(&mut session, "reply");
+        }
+        let first = plan_compaction(&session, &policy, 100_000).unwrap();
+        let cancel = CancellationToken::new();
+        let initial = ScriptProvider {
+            events: vec![Ok(StreamEvent::TextDelta(
+                "unique earlier fact: café".into(),
+            ))],
+        };
+        let SummaryOutcome::Model { text, .. } =
+            runtime.block_on(summarize(&initial, "demo", &first, &policy, None, &cancel))
+        else {
+            panic!("first summary must use the model");
+        };
+        session.append(SessionEvent::CompactionSummary {
+            summary: text,
+            compacted_through: first.boundary,
+        });
+        for index in 4..7 {
+            push_user(&mut session, &format!("question {index}"));
+            push_assistant(&mut session, "reply");
+        }
+        let second = plan_compaction(&session, &policy, 100_000).unwrap();
+        let failure = ScriptProvider {
+            events: vec![Err("offline".into())],
+        };
+        let SummaryOutcome::Deterministic { text } =
+            runtime.block_on(summarize(&failure, "demo", &second, &policy, None, &cancel))
+        else {
+            panic!("second summary must fall back");
+        };
+        assert!(text.len() <= policy.max_summary_bytes);
+        session.append(SessionEvent::CompactionSummary {
+            summary: text,
+            compacted_through: second.boundary,
+        });
+        let history = session.context_messages();
+        assert!(format!("{history:?}").contains("unique earlier fact: café"));
     }
 
     #[test]

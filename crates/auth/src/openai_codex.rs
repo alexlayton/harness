@@ -213,6 +213,7 @@ impl OpenAiCodexAuth {
         // the async guard is released before any `.await` on the mutex.
         let _guard = self.refresh_lock.lock().await;
         // Reload: another waiter (or process) may have already refreshed.
+        let mut expired_stored = None;
         if let Ok(Some(current)) = self.store.openai_codex() {
             let cached = self
                 .credential
@@ -245,10 +246,17 @@ impl OpenAiCodexAuth {
                     Some(current.clone());
                 return Ok(current);
             }
+            // Both copies have expired. The on-disk generation is still
+            // authoritative for the refresh token: another process may
+            // have rotated it since this handle cached its old credential.
+            expired_stored = Some(current);
         }
-        let old = self
-            .credential()?
-            .ok_or(AuthError::OpenAiCodexNotAuthenticated)?;
+        let old = match expired_stored {
+            Some(current) => current,
+            None => self
+                .credential()?
+                .ok_or(AuthError::OpenAiCodexNotAuthenticated)?,
+        };
         let old_refresh = old.refresh.clone();
         // Refresh exchanges use strict status handling like the browser
         // flow: only 2xx with a token payload succeeds.
@@ -893,6 +901,66 @@ mod tests {
         OpenAiCodexAuth::new(store)
             .unwrap()
             .with_endpoints(token_endpoints(&fixture.addr))
+    }
+
+    #[tokio::test]
+    async fn expired_rotated_disk_token_supplies_the_refresh_exchange() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "token request ended before its body");
+                request.extend_from_slice(&buffer[..read]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some((headers, body)) = text.split_once("\r\n\r\n") {
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|length| length.trim().parse::<usize>().ok())
+                        })
+                        .expect("form request has Content-Length");
+                    if body.len() >= content_length {
+                        let refresh = url::form_urlencoded::parse(body.as_bytes())
+                            .find(|(key, _)| key == "refresh_token")
+                            .map(|(_, value)| value.into_owned());
+                        assert_eq!(refresh.as_deref(), Some("refresh-from-disk"));
+                        break;
+                    }
+                }
+            }
+            let body = success_token_body("refresh-next");
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            socket.write_all(header.as_bytes()).await.unwrap();
+            socket.write_all(body.as_bytes()).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let old = expired_codex_credential();
+        store.save_openai_codex(&old).unwrap();
+        let auth = OpenAiCodexAuth::new(store.clone())
+            .unwrap()
+            .with_endpoints(token_endpoints(&addr));
+        let mut rotated = old;
+        rotated.refresh = "refresh-from-disk".into();
+        store.save_openai_codex(&rotated).unwrap();
+
+        let refreshed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), auth.ensure_valid())
+                .await
+                .expect("refresh must not use the obsolete cached token")
+                .unwrap();
+        assert_eq!(refreshed.refresh, "refresh-next");
+        assert_eq!(store.openai_codex().unwrap(), Some(refreshed));
+        server.await.unwrap();
     }
 
     #[tokio::test]

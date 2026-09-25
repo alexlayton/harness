@@ -3,8 +3,8 @@ use crate::codec::{
 };
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{
-    EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, StoredContent,
-    StoredToolCall, Timestamp, now_timestamp, validate_event_suffix, validate_next_event,
+    EventId, Session, SessionEvent, SessionEventRecord, SessionId, SessionMetadata, Timestamp,
+    now_timestamp, validate_event_suffix, validate_next_event,
 };
 use fs2::FileExt;
 use serde::Deserialize;
@@ -523,14 +523,27 @@ impl SessionStore {
                     .cmp(&left.updated_at)
                     .then_with(|| right.created_at.cmp(&left.created_at))
             });
-            // Harness creates a persisted header immediately. Skip every
-            // session without provider conversation context so repeated
-            // `/new` commands cannot make `latest` select a placeholder.
-            return entries
-                .iter()
-                .find(|entry| entry.has_conversation)
-                .map(|entry| self.load_path(&entry.path))
-                .unwrap_or(Err(SessionError::NoSession));
+            // Harness creates a persisted header immediately. Skip empty
+            // placeholders, then validate conversation candidates in order:
+            // the lightweight index cannot detect all invalid event data.
+            // Preserve the first validation error if none can load. An I/O or
+            // permission error is not corrupt data and must surface at once.
+            let mut first_invalid = None;
+            for entry in entries.iter().filter(|entry| entry.has_conversation) {
+                match self.load_path(&entry.path) {
+                    Ok(session) => return Ok(session),
+                    Err(
+                        error @ (SessionError::Json { .. }
+                        | SessionError::InvalidLine { .. }
+                        | SessionError::InvalidEvent(_)
+                        | SessionError::UnsupportedVersion { .. }),
+                    ) => {
+                        first_invalid.get_or_insert(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(first_invalid.unwrap_or(SessionError::NoSession));
         }
 
         let path = PathBuf::from(selector);
@@ -586,36 +599,10 @@ impl SessionStore {
     /// appends synthetic `ToolResult` events before the marker, so every
     /// repaired call is already complete when the marker lands.
     pub fn repair_incomplete_tool_calls(&self, session: &mut Session) -> Result<usize> {
-        let mut pending = Vec::<StoredToolCall>::new();
-        for record in &session.events {
-            match &record.event {
-                SessionEvent::AssistantMessage { message } => {
-                    pending.extend(message.content.iter().filter_map(|content| {
-                        let StoredContent::ToolCall {
-                            id,
-                            name,
-                            arguments,
-                        } = content
-                        else {
-                            return None;
-                        };
-                        Some(StoredToolCall {
-                            id: id.clone(),
-                            name: name.clone(),
-                            arguments: arguments.clone(),
-                        })
-                    }));
-                }
-                SessionEvent::ToolCall { call } => pending.push(call.clone()),
-                SessionEvent::ToolResult { tool_call_id, .. } => {
-                    if let Some(index) = pending.iter().position(|call| call.id == *tool_call_id) {
-                        pending.remove(index);
-                    }
-                }
-                SessionEvent::TurnCancelled { .. } => pending.clear(),
-                _ => {}
-            }
-        }
+        // The validated session tracker already applies the same lifecycle
+        // rules used for replay and append validation. Copy pending calls
+        // before appending, since each result updates that tracker in place.
+        let pending = session.tracker.pending_calls().cloned().collect::<Vec<_>>();
         if pending.is_empty() {
             return Ok(0);
         }
@@ -1572,7 +1559,7 @@ impl Drop for SessionActiveLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{SessionEvent, StoredMessage};
+    use crate::model::{SessionEvent, StoredMessage, StoredToolCall};
     use llm::Message;
     use tempfile::tempdir;
 
@@ -1652,6 +1639,77 @@ mod tests {
                 .has_conversation
         );
         assert_eq!(store.load("latest").unwrap().id(), session.id());
+    }
+
+    #[test]
+    fn latest_skips_invalid_newest_conversation_but_reports_all_invalid() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut older = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut older,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("valid")),
+                },
+            )
+            .unwrap();
+        let mut newest = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut newest,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("invalid newest")),
+                },
+            )
+            .unwrap();
+        // The index sees the valid user event and skips the call's data.
+        // Full replay alone detects its invalid blank ID.
+        let invalid = SessionEventRecord {
+            id: EventId::new(),
+            sequence: 2,
+            timestamp: now_timestamp(),
+            event: SessionEvent::ToolCall {
+                call: StoredToolCall {
+                    id: "".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+        };
+        let line = encode_record(newest.id(), &invalid).unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(newest.path().unwrap())
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+        drop(file);
+        assert!(
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.id == newest.id())
+                .unwrap()
+                .has_conversation
+        );
+        assert_eq!(store.load("latest").unwrap().id(), older.id());
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(older.path().unwrap())
+            .unwrap();
+        let line = encode_record(older.id(), &invalid).unwrap();
+        writeln!(file, "{line}").unwrap();
+        drop(file);
+        let error = store.load("latest").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SessionError::InvalidEvent(_) | SessionError::InvalidLine { .. }
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -2129,6 +2187,129 @@ mod tests {
                 .events
                 .iter()
                 .any(|record| matches!(record.event, SessionEvent::TurnCancelled { .. }))
+        );
+    }
+
+    #[test]
+    fn repair_uses_shared_tracker_for_mixed_calls_and_cancelled_tail() {
+        use crate::model::{StoredContent, StoredRole};
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("work")),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::AssistantMessage {
+                    message: StoredMessage {
+                        role: StoredRole::Assistant,
+                        content: vec![
+                            StoredContent::ToolCall {
+                                id: "embedded-done".into(),
+                                name: "read".into(),
+                                arguments: serde_json::json!({"path":"done"}),
+                            },
+                            StoredContent::ToolCall {
+                                id: "embedded-pending".into(),
+                                name: "read".into(),
+                                arguments: serde_json::json!({"path":"pending"}),
+                            },
+                        ],
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolCall {
+                    call: StoredToolCall {
+                        id: "standalone".into(),
+                        name: "grep".into(),
+                        arguments: serde_json::json!({"pattern":"x"}),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolResult {
+                    tool_call_id: "embedded-done".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    tool_name: Some("read".into()),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::Error {
+                    message: "crash".into(),
+                },
+            )
+            .unwrap();
+        let mut loaded = store.open(&session.id()).unwrap();
+        assert_eq!(store.repair_incomplete_tool_calls(&mut loaded).unwrap(), 2);
+        let results = loaded
+            .events
+            .iter()
+            .filter_map(|record| match &record.event {
+                SessionEvent::ToolResult {
+                    tool_call_id,
+                    is_error: true,
+                    tool_name,
+                    ..
+                } => Some((tool_call_id.as_str(), tool_name.as_deref())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results,
+            vec![
+                ("embedded-pending", Some("read")),
+                ("standalone", Some("grep"))
+            ]
+        );
+        assert!(matches!(
+            loaded.events.last().unwrap().event,
+            SessionEvent::TurnCancelled { .. }
+        ));
+        assert_eq!(store.repair_incomplete_tool_calls(&mut loaded).unwrap(), 0);
+
+        let mut cancelled = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut cancelled,
+                SessionEvent::ToolCall {
+                    call: StoredToolCall {
+                        id: "abandoned".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut cancelled,
+                SessionEvent::TurnCancelled {
+                    reason: "stopped".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store.repair_incomplete_tool_calls(&mut cancelled).unwrap(),
+            0
         );
     }
 

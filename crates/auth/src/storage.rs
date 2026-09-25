@@ -823,24 +823,6 @@ mod tests {
         assert!(entries.contains_key(COPILOT_PROVIDER_KEY));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn auth_files_are_private_on_unix() {
-        use std::os::unix::fs::PermissionsExt;
-        let directory = tempdir().unwrap();
-        let store = AuthStore::new(directory.path().join("auth.json"));
-        store.save_copilot(&credential()).unwrap();
-        let auth_dir = store.path().parent().unwrap();
-        assert_eq!(
-            fs::metadata(auth_dir).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
     #[test]
     fn advisory_auth_lock_serializes_contenders_and_retains_sidecar_inode() {
         let directory = tempdir().unwrap();

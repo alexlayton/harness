@@ -384,12 +384,11 @@ impl ChatStreamParser {
         let index = item.get("index").and_then(as_u64).unwrap_or(fallback_index);
         let call = self.calls.entry(index).or_default();
         if let Some(id) = item.get("id").and_then(Value::as_str) {
-            // IDs normally arrive whole in the first delta; append when a
-            // fragment continues a partial ID so split transport chunks
-            // still assemble, while repeated identical IDs stay idempotent.
-            if call.id.is_empty() {
-                call.id = id.to_owned();
-            } else if id != call.id && !call.id.ends_with(id) {
+            // Some endpoints repeat the entire ID, while others stream
+            // fragments. Only an exact repeat of the assembled ID is
+            // idempotent: a matching suffix can still be a real fragment
+            // ("abc" followed by "bc" must become "abcbc").
+            if id != call.id {
                 call.id.push_str(id);
             }
         }
@@ -782,6 +781,33 @@ mod tests {
             events.iter().any(|event| matches!(event, StreamEvent::ToolCallComplete(call) if call.id == "call-1" && call.name == "read")),
             "got {events:?}"
         );
+    }
+
+    #[test]
+    fn repeated_whole_ids_and_overlapping_fragments_keep_result_pairing() {
+        for (first, second, expected) in [("call-1", "call-1", "call-1"), ("abc", "bc", "abcbc")] {
+            let mut parser = ChatStreamParser::new();
+            for (index, id) in [first, second].into_iter().enumerate() {
+                parser.parse_payload(&json!({
+                    "choices": [{ "delta": { "tool_calls": [{
+                        "index": 0, "id": id,
+                        "function": if index == 0 { json!({"name": "read", "arguments": "{}"}) } else { json!({}) }
+                    }] } }]
+                }).to_string()).unwrap();
+            }
+            let events = parser
+                .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
+                .unwrap();
+            let StreamEvent::ToolCallComplete(call) = &events[0] else {
+                panic!("missing call: {events:?}");
+            };
+            assert_eq!(call.id, expected);
+            let wire = convert_messages(&[
+                Message::assistant(vec![Content::ToolCall(call.clone())]),
+                Message::tool_result(call.id.clone(), "ok", false),
+            ]);
+            assert_eq!(wire[0]["tool_calls"][0]["id"], wire[1]["tool_call_id"]);
+        }
     }
 
     #[test]

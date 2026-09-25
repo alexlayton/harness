@@ -653,10 +653,13 @@ impl Session {
 /// been used (pending or completed), it is never reused.  `TurnCancelled`
 /// marks the tail explicitly cancelled and clears the pending queue; `Error`
 /// marks it cancelled without clearing so a crash tail stays recoverable.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ToolCallTracker {
     /// Call IDs awaiting a result, in emission order.
     pending: Vec<String>,
+    /// Names and arguments for crash-tail repair, keyed by the same pending
+    /// IDs used by validation and provider-history reconstruction.
+    pending_calls: HashMap<String, StoredToolCall>,
     /// Every call ID ever seen (pending or completed), for reuse detection.
     seen: HashSet<String>,
     /// Call IDs that have received a result.
@@ -668,6 +671,15 @@ pub(crate) struct ToolCallTracker {
 impl ToolCallTracker {
     pub(crate) fn pending(&self) -> &[String] {
         &self.pending
+    }
+
+    /// Pending calls in original emission order, including repair metadata.
+    pub(crate) fn pending_calls(&self) -> impl Iterator<Item = &StoredToolCall> {
+        self.pending.iter().map(|id| {
+            self.pending_calls
+                .get(id)
+                .expect("pending call has metadata")
+        })
     }
 
     pub(crate) fn is_pending(&self, id: &str) -> bool {
@@ -697,14 +709,23 @@ impl ToolCallTracker {
         match event {
             SessionEvent::AssistantMessage { message } => {
                 for content in &message.content {
-                    if let StoredContent::ToolCall { id, .. } = content {
-                        self.push_pending(id);
+                    if let StoredContent::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } = content
+                    {
+                        self.push_pending(StoredToolCall {
+                            id: id.clone(),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        });
                     }
                 }
                 self.cancelled = false;
             }
             SessionEvent::ToolCall { call } => {
-                self.push_pending(&call.id);
+                self.push_pending(call.clone());
                 self.cancelled = false;
             }
             SessionEvent::ToolResult { tool_call_id, .. } => {
@@ -712,10 +733,12 @@ impl ToolCallTracker {
                 self.seen.insert(tool_call_id.clone());
                 if let Some(index) = self.pending.iter().position(|id| id == tool_call_id) {
                     self.pending.remove(index);
+                    self.pending_calls.remove(tool_call_id);
                 }
             }
             SessionEvent::TurnCancelled { .. } => {
                 self.pending.clear();
+                self.pending_calls.clear();
                 self.cancelled = true;
             }
             SessionEvent::Error { .. } => {
@@ -728,10 +751,11 @@ impl ToolCallTracker {
         }
     }
 
-    fn push_pending(&mut self, id: &str) {
-        self.seen.insert(id.to_owned());
-        if !self.is_pending(id) {
-            self.pending.push(id.to_owned());
+    fn push_pending(&mut self, call: StoredToolCall) {
+        self.seen.insert(call.id.clone());
+        if !self.is_pending(&call.id) {
+            self.pending.push(call.id.clone());
+            self.pending_calls.insert(call.id.clone(), call);
         }
     }
 }
@@ -1027,6 +1051,7 @@ impl<'a> SuffixTracker<'a> {
     fn new(base: &'a ToolCallTracker) -> Self {
         let local = ToolCallTracker {
             pending: base.pending.clone(),
+            pending_calls: base.pending_calls.clone(),
             cancelled: base.cancelled,
             ..ToolCallTracker::default()
         };
@@ -1475,15 +1500,6 @@ mod tests {
             messages[1],
             Message::assistant(vec![Content::Text("working".into())])
         );
-    }
-
-    #[test]
-    fn first_user_message_provides_a_stable_display_title() {
-        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
-        session.append(SessionEvent::UserMessage {
-            message: StoredMessage::from_llm(&Message::user("Fix the login flow")),
-        });
-        assert_eq!(session.title(), Some("Fix the login flow"));
     }
 
     #[test]

@@ -5,7 +5,8 @@
 //! request fields even though it streams familiar Responses SSE events.
 use crate::dialects::openai_reasoning_effort;
 use crate::dialects::openai_responses::{
-    ResponsesParser, convert_input as base_convert_input, convert_tools,
+    ResponsesParser, assistant_text_item, convert_input as base_convert_input, convert_tools,
+    function_call_item,
 };
 use crate::http::HttpClient;
 use crate::sse::stream_response;
@@ -88,29 +89,12 @@ pub fn convert_input(messages: &[crate::Message]) -> Vec<Value> {
             Role::Assistant => {
                 // Ordered pass: text block first (matching base behavior),
                 // then each tool call / Codex opaque item in content order.
-                let text: String = message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text(text) => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if !text.is_empty() {
-                    input.push(serde_json::json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }]
-                    }));
+                if let Some(text) = assistant_text_item(message) {
+                    input.push(text);
                 }
                 for content in &message.content {
                     match content {
-                        Content::ToolCall(call) => input.push(serde_json::json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into()),
-                        })),
+                        Content::ToolCall(call) => input.push(function_call_item(call)),
                         Content::Opaque { provider, data } if provider == "openai-codex" => {
                             input.push(data.clone());
                         }

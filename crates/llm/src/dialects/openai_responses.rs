@@ -113,29 +113,12 @@ pub fn convert_input(messages: &[Message]) -> Vec<Value> {
                 }
             }
             Role::Assistant => {
-                let text: String = message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text(text) => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                if !text.is_empty() {
-                    items.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }]
-                    }));
+                if let Some(text) = assistant_text_item(message) {
+                    items.push(text);
                 }
                 for content in &message.content {
                     if let Content::ToolCall(call) = content {
-                        items.push(json!({
-                            "type": "function_call",
-                            "call_id": call.id,
-                            "name": call.name,
-                            "arguments": stringify_arguments(&call.arguments),
-                        }));
+                        items.push(function_call_item(call));
                     }
                 }
             }
@@ -163,6 +146,35 @@ pub fn convert_input(messages: &[Message]) -> Vec<Value> {
         }
     }
     items
+}
+
+/// Shared ordinary Responses item encoding. Codex uses these two items in
+/// its own ordered assistant pass, so opaque reasoning never moves past calls.
+pub(super) fn assistant_text_item(message: &Message) -> Option<Value> {
+    let text: String = message
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            Content::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then(|| {
+        json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": text }]
+        })
+    })
+}
+
+pub(super) fn function_call_item(call: &ToolCall) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call.id,
+        "name": call.name,
+        "arguments": stringify_arguments(&call.arguments),
+    })
 }
 
 fn text_parts(content: &[Content]) -> impl Iterator<Item = &str> {

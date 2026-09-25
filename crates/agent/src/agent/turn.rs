@@ -5,7 +5,6 @@ use crate::prompt::system_prompt_with_workspace_context;
 use futures_util::stream::StreamExt;
 use llm::{CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent};
 use session::{SessionEvent, usage_summary};
-use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -84,56 +83,19 @@ impl Agent {
             } else {
                 0
             };
-            let application = self.cancel.clone();
-            let mut buffered = VecDeque::new();
-            let mut input_open = self.input_open;
-            let mut interrupted = false;
-            let compacted = {
-                let mut application_open = true;
-                let compaction = self.compact_and_reload(
+            let Some(compacted) = self
+                .compact_with_turn_input(
                     events,
+                    input,
                     cancel,
                     CompactionReason::Auto,
                     user_text.len(),
                     Some(context),
-                );
-                tokio::pin!(compaction);
-                loop {
-                    tokio::select! {
-                        biased;
-                        result = &mut compaction => break result,
-                        _ = application.cancelled(), if application_open => {
-                            application_open = false;
-                            cancel.cancel();
-                        }
-                        message = input.recv(), if input_open => match message {
-                            Some(InputMessage::Interrupt) => {
-                                interrupted = true;
-                                cancel.cancel();
-                            }
-                            Some(message) => buffered.push_back(message),
-                            None => input_open = false,
-                        },
-                    }
-                }
-            };
-            self.input_open = input_open;
-            self.queued.extend(buffered);
-            let compacted = match compacted {
-                Ok(compacted) => compacted,
-                Err(TurnError::Shutdown) => {
-                    self.persist_cancelled("application shutdown", events)?;
-                    return Err(TurnError::Shutdown);
-                }
-                Err(error) => return Err(error),
-            };
-            if interrupted || cancel.is_cancelled() {
-                self.persist_cancelled("turn interrupted during compaction", events)?;
-                if application.is_cancelled() {
-                    return Err(TurnError::Shutdown);
-                }
+                )
+                .await?
+            else {
                 return Ok(());
-            }
+            };
             if compacted {
                 send(
                     events,
@@ -212,10 +174,19 @@ impl Agent {
                     // Compact the older material (keeping this turn's tail) and
                     // retry before surfacing the provider error.
                     if self
-                        .try_overflow_recovery(&error, events, cancel, &mut overflow_recoveries)
+                        .try_overflow_recovery(
+                            &error,
+                            events,
+                            input,
+                            cancel,
+                            &mut overflow_recoveries,
+                        )
                         .await?
                     {
                         continue;
+                    }
+                    if cancel.is_cancelled() {
+                        return Ok(());
                     }
                     let message = error.to_string();
                     self.persist_event(
@@ -366,10 +337,13 @@ impl Agent {
                 // A mid-stream context overflow (provider tears down an SSE
                 // request that outgrew the window) can now compact valid history.
                 if self
-                    .try_overflow_recovery(&error, events, cancel, &mut overflow_recoveries)
+                    .try_overflow_recovery(&error, events, input, cancel, &mut overflow_recoveries)
                     .await?
                 {
                     continue;
+                }
+                if cancel.is_cancelled() {
+                    return Ok(());
                 }
                 self.persist_event(
                     SessionEvent::Error {

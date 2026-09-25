@@ -539,9 +539,11 @@ fn status_for_agent_event(event: &AgentEvent) -> Option<MuxStatus> {
         | AgentEvent::ReasoningDelta(_)
         | AgentEvent::ToolCallStarted { .. }
         | AgentEvent::Retrying { .. } => Some(MuxStatus::Running),
-        AgentEvent::OperationFinished
-        | AgentEvent::TurnFinished
-        | AgentEvent::CompactionFinished { .. } => Some(MuxStatus::Idle),
+        AgentEvent::OperationFinished | AgentEvent::TurnFinished => Some(MuxStatus::Idle),
+        AgentEvent::CompactionFinished {
+            reason: agent::CompactionReason::Manual,
+            ..
+        } => Some(MuxStatus::Idle),
         _ => None,
     }
 }
@@ -630,6 +632,25 @@ mod tests {
                 auto: false,
                 reason: agent::CompactionReason::Manual,
             }),
+            Some(MuxStatus::Idle)
+        );
+        for (reason, auto) in [
+            (agent::CompactionReason::Auto, true),
+            (agent::CompactionReason::Overflow, false),
+        ] {
+            assert_eq!(
+                status_for_agent_event(&AgentEvent::CompactionFinished {
+                    compacted_through: 1,
+                    summary_bytes: 2,
+                    auto,
+                    reason,
+                }),
+                None,
+                "in-turn compaction must not make the pane idle"
+            );
+        }
+        assert_eq!(
+            status_for_agent_event(&AgentEvent::TurnFinished),
             Some(MuxStatus::Idle)
         );
         assert_eq!(

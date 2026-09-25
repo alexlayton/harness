@@ -535,12 +535,14 @@ impl Agent {
         input: &mut mpsc::UnboundedReceiver<InputMessage>,
         cancel: &CancellationToken,
     ) -> Result<(), TurnError> {
-        for batch in plan_tool_batches_with_secrets(
+        let mut batches = plan_tool_batches_with_secrets(
             tool_calls,
             &self.tools,
             Some(self.secret_masker.as_ref()),
             true,
-        ) {
+        )
+        .into_iter();
+        while let Some(batch) = batches.next() {
             let limit = if batch.concurrent() {
                 match batch.class {
                     Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
@@ -597,6 +599,35 @@ impl Agent {
             }
 
             if let Some(reason) = outcome.cancellation {
+                // The assistant already announced calls in later batches. Do
+                // not execute them, but close each call in both histories
+                // before appending the cancellation marker.
+                for pending in batches {
+                    for call in &pending.calls {
+                        let started = Instant::now();
+                        hooks.started(call, started, true);
+                        let output = ToolOutput {
+                            content: "cancelled".into(),
+                            is_error: true,
+                            summary: call_summary(&call.name, &call.arguments),
+                        };
+                        hooks.finished(
+                            call,
+                            &output,
+                            started,
+                            CallState::Cancelled { launched: false },
+                        );
+                        self.persist_tool_result(call, &output.content, true, events)?;
+                        self.history.push(Message {
+                            role: Role::Tool,
+                            content: vec![Content::ToolResult {
+                                tool_call_id: call.id.clone(),
+                                content: output.content,
+                                is_error: true,
+                            }],
+                        });
+                    }
+                }
                 // Mark the turn token so the enclosing turn returns rather
                 // than issuing a provider request after an interrupt.
                 if reason == DispatchCancellation::Explicit {

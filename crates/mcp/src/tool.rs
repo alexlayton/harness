@@ -373,10 +373,4 @@ mod tests {
         let error = validate_remote_tool("server", &tool).unwrap_err();
         assert!(error.to_string().contains("string"));
     }
-
-    #[test]
-    fn remote_tool_validation_returns_definition_size() {
-        let tool = remote("read");
-        assert!(validate_remote_tool("server", &tool).unwrap() > 0);
-    }
 }

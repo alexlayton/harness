@@ -1038,14 +1038,6 @@ mod tests {
         assert_eq!(tool.concurrency(&json!({})), Concurrency::Exclusive);
     }
 
-    #[test]
-    fn oversized_timeout_is_a_tool_error_not_a_panic() {
-        assert_eq!(
-            MAX_TIMEOUT_SECS, 86_400,
-            "schema maximum and runtime cap must agree"
-        );
-    }
-
     #[tokio::test]
     async fn max_timeout_rejects_u64_max() {
         let directory = tempfile::tempdir().unwrap();

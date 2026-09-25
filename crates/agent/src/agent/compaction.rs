@@ -1,8 +1,11 @@
 use super::persistence::usage_event;
-use super::{Agent, AgentEvent, CompactionReason, MAX_OVERFLOW_RECOVERIES, TurnError, send};
+use super::{
+    Agent, AgentEvent, CompactionReason, InputMessage, MAX_OVERFLOW_RECOVERIES, TurnError, send,
+};
 use compact::{SummaryOutcome, plan_compaction, summarize as compact_summarize};
 use llm::LlmError;
 use session::{SessionEvent, usage_summary};
+use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -207,6 +210,68 @@ impl Agent {
         Ok(true)
     }
 
+    /// Await compaction while draining turn input. `None` means the turn was
+    /// interrupted and its cancellation marker has been persisted; shutdown
+    /// and persistence failure retain their distinct error paths. Other
+    /// messages keep their arrival order for the next turn.
+    pub(crate) async fn compact_with_turn_input(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
+        cancel: &CancellationToken,
+        reason: CompactionReason,
+        extra_bytes: usize,
+        estimated_context: Option<u64>,
+    ) -> Result<Option<bool>, TurnError> {
+        let application = self.cancel.clone();
+        let mut buffered = VecDeque::new();
+        let mut input_open = self.input_open;
+        let mut interrupted = false;
+        let compacted = {
+            let mut application_open = true;
+            let compaction =
+                self.compact_and_reload(events, cancel, reason, extra_bytes, estimated_context);
+            tokio::pin!(compaction);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = application.cancelled(), if application_open => {
+                        application_open = false;
+                        cancel.cancel();
+                    }
+                    message = input.recv(), if input_open => match message {
+                        Some(InputMessage::Interrupt) => {
+                            interrupted = true;
+                            cancel.cancel();
+                        }
+                        Some(message) => buffered.push_back(message),
+                        None => input_open = false,
+                    },
+                    result = &mut compaction => break result,
+                }
+            }
+        };
+        self.input_open = input_open;
+        self.queued.extend(buffered);
+        let compacted = match compacted {
+            Ok(compacted) => compacted,
+            Err(TurnError::Shutdown) => {
+                self.persist_cancelled("application shutdown", events)?;
+                return Err(TurnError::Shutdown);
+            }
+            Err(error) => return Err(error),
+        };
+        if application.is_cancelled() {
+            self.persist_cancelled("application shutdown", events)?;
+            return Err(TurnError::Shutdown);
+        }
+        if interrupted || cancel.is_cancelled() {
+            self.persist_cancelled("turn interrupted during compaction", events)?;
+            return Ok(None);
+        }
+        Ok(Some(compacted))
+    }
+
     /// Handle a context-overflow provider error (a 400 whose body matches
     /// context-exceeded patterns) by emergency-compacting and returning
     /// whether the caller should retry the request. Bounded to
@@ -215,6 +280,7 @@ impl Agent {
         &mut self,
         error: &LlmError,
         events: &mpsc::UnboundedSender<AgentEvent>,
+        input: &mut mpsc::UnboundedReceiver<InputMessage>,
         cancel: &CancellationToken,
         attempts: &mut usize,
     ) -> Result<bool, TurnError> {
@@ -229,8 +295,9 @@ impl Agent {
         }
         *attempts += 1;
         if self
-            .compact_and_reload(events, cancel, CompactionReason::Overflow, 0, None)
+            .compact_with_turn_input(events, input, cancel, CompactionReason::Overflow, 0, None)
             .await?
+            == Some(true)
         {
             send(
                 events,

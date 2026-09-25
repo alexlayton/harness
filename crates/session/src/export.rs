@@ -4,7 +4,7 @@ use crate::codec::{encode_header, encode_record};
 use crate::error::{Result, SessionError, io_error};
 use crate::model::{Session, SessionEvent, SessionEventRecord, StoredContent, StoredMessage};
 use llm::util::truncate_utf8;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -54,20 +54,8 @@ pub fn export_jsonl(
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|source| io_error("create export directory", parent, source))?;
-    let temp = destination.with_extension(format!(
-        "{}.tmp-{}",
-        destination
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("jsonl"),
-        std::process::id()
-    ));
+    let (temp, mut file) = create_private_export_file(&destination, "jsonl", "create export file")?;
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .map_err(|source| io_error("create export file", &temp, source))?;
         // Preserve IDs and numeric fields needed to decode the export, while
         // transforming every free-text header field that may contain copied
         // credentials or workspace-specific secrets.
@@ -90,14 +78,17 @@ pub fn export_jsonl(
             .map_err(|source| io_error("replace export file", &destination, source))?;
         Ok(())
     })();
+    drop(file);
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result.map(|_| destination)
 }
 
-/// Export a readable transcript.  This is intentionally separate from the
-/// canonical JSONL interchange format.
+/// Export a readable transcript. This is intentionally separate from the
+/// canonical JSONL interchange format. Replacement uses a new private file
+/// and an atomic rename, so an existing destination's permissive mode is not
+/// inherited by the new transcript.
 pub fn export_transcript(session: &Session, destination: Option<&Path>) -> Result<PathBuf> {
     let destination = destination.map(Path::to_path_buf).unwrap_or_else(|| {
         std::env::current_dir()
@@ -175,9 +166,66 @@ pub fn export_transcript(session: &Session, destination: Option<&Path>) -> Resul
             | SessionEvent::Unknown { .. } => {}
         }
     }
-    fs::write(&destination, output)
-        .map_err(|source| io_error("write transcript", &destination, source))?;
-    Ok(destination)
+    let (temp, mut file) =
+        create_private_export_file(&destination, "txt", "create transcript file")?;
+    let result = (|| -> Result<()> {
+        file.write_all(output.as_bytes())
+            .and_then(|_| file.sync_all())
+            .map_err(|source| io_error("write transcript", &temp, source))?;
+        fs::rename(&temp, &destination)
+            .map_err(|source| io_error("replace transcript", &destination, source))?;
+        Ok(())
+    })();
+    drop(file);
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map(|_| destination)
+}
+
+/// Each export owns its random temporary name. A second export in the same
+/// process cannot remove or write through another export's pending file.
+fn create_private_export_file(
+    destination: &Path,
+    default_extension: &str,
+    operation: &'static str,
+) -> Result<(PathBuf, File)> {
+    let extension = destination
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or(default_extension);
+    for _ in 0..5 {
+        let temp = destination.with_extension(format!(
+            "{extension}.tmp-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        match create_private_file(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(io_error(operation, &temp, source)),
+        }
+    }
+    Err(io_error(
+        operation,
+        destination,
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate a unique temporary export file",
+        ),
+    ))
+}
+
+/// Apply owner-only mode at creation, before any conversation text is written.
+fn create_private_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 fn transform_record(record: &SessionEventRecord, options: &ExportOptions) -> SessionEventRecord {
@@ -538,6 +586,87 @@ mod tests {
     use llm::Message;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn exports_replace_permissive_destinations_with_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let mut session = Session::new(SessionMetadata::new(directory.path(), None, None));
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("private conversation")),
+        });
+        for (name, export) in [("export.jsonl", false), ("transcript.txt", true)] {
+            let path = directory.path().join(name);
+            fs::write(&path, "old public data").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            if export {
+                export_transcript(&session, Some(&path)).unwrap();
+            } else {
+                export_jsonl(&session, Some(&path), &ExportOptions::default()).unwrap();
+            }
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert!(
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("private conversation")
+            );
+            fs::remove_file(&path).unwrap();
+            if export {
+                export_transcript(&session, Some(&path)).unwrap();
+            } else {
+                export_jsonl(&session, Some(&path), &ExportOptions::default()).unwrap();
+            }
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_exports_to_one_destination_keep_each_temp_private() {
+        let directory = tempdir().unwrap();
+        let mut session = Session::new(SessionMetadata::new(directory.path(), None, None));
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("conversation ".repeat(16_384))),
+        });
+        for (name, transcript) in [("export.jsonl", false), ("transcript.txt", true)] {
+            let destination = directory.path().join(name);
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let tasks = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            if transcript {
+                                export_transcript(&session, Some(&destination))
+                            } else {
+                                export_jsonl(
+                                    &session,
+                                    Some(&destination),
+                                    &ExportOptions::default(),
+                                )
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for task in tasks {
+                    task.join().unwrap().unwrap();
+                }
+            });
+            let text = fs::read_to_string(&destination).unwrap();
+            if transcript {
+                assert!(text.contains("## User\nconversation "));
+            } else {
+                decode_session(&text, &destination).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn export_is_loadable_and_can_redact_tool_output() {
