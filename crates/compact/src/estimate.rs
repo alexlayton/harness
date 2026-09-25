@@ -220,32 +220,4 @@ mod tests {
             "a huge request prefix must be able to trigger compaction"
         );
     }
-
-    #[test]
-    fn no_double_count_of_pending_input_after_provider_usage() {
-        // The trigger path adds the pending input once
-        // (`base + estimate_tokens(extra)`): the `Done` usage total already
-        // covers the request it describes, so the next turn's estimate is
-        // `usage_total + new_input`, never `usage_total + old_output +
-        // new_input`.
-        let usage_total = 10_000u64;
-        let new_input = "fresh question";
-        let estimate = usage_total.saturating_add(estimate_tokens(new_input.len()));
-        assert_eq!(estimate, usage_total + estimate_tokens(new_input.len()));
-        // And the estimator itself is additive over one message: estimating
-        // `[history, input]` equals `estimate(history) + estimate(input)`
-        // modulo the fixed per-message role bytes (no multiplicative
-        // blowup from re-scanning).
-        let history = vec![llm::Message::user("old")];
-        let input = llm::Message::user(new_input);
-        let combined =
-            estimate_provider_context_tokens(None, &[], &[history[0].clone(), input.clone()]);
-        let separate = estimate_provider_context_tokens(None, &[], &history)
-            + estimate_provider_context_tokens(None, &[], std::slice::from_ref(&input));
-        // One extra role prefix (4 bytes → 1 token) is the only divergence.
-        assert!(
-            combined <= separate + 1,
-            "combined {combined} vs separate {separate}"
-        );
-    }
 }

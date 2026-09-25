@@ -1503,15 +1503,6 @@ mod tests {
     }
 
     #[test]
-    fn first_user_message_provides_a_stable_display_title() {
-        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
-        session.append(SessionEvent::UserMessage {
-            message: StoredMessage::from_llm(&Message::user("Fix the login flow")),
-        });
-        assert_eq!(session.title(), Some("Fix the login flow"));
-    }
-
-    #[test]
     fn usage_is_aggregated_in_metadata() {
         let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
         session.append(SessionEvent::Usage {

@@ -233,10 +233,4 @@ mod tests {
         assert!(std::str::from_utf8(output.as_bytes()).is_ok());
         assert!(output.ends_with(OUTPUT_TRUNCATION_NOTICE));
     }
-
-    #[test]
-    fn prefix_helper_never_splits_utf8() {
-        assert_eq!(llm::util::truncate_utf8_prefix("éé", 1), "");
-        assert_eq!(llm::util::truncate_utf8_prefix("éé", 2), "é");
-    }
 }

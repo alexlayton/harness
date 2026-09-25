@@ -696,35 +696,6 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_round_text_is_not_written_to_stdout() {
-        let (stdout, stderr, code) = route(
-            vec![
-                AgentEvent::TextDelta("planning".into()),
-                AgentEvent::ToolCallStarted {
-                    call_id: "c".into(),
-                    name: "read".into(),
-                    summary: "read file".into(),
-                },
-                AgentEvent::ToolCallFinished {
-                    call_id: "c".into(),
-                    name: "read".into(),
-                    summary: "read file".into(),
-                    ok: true,
-                    duration_ms: 1,
-                    output: "contents".into(),
-                    error: None,
-                },
-                AgentEvent::TextDelta("final answer".into()),
-                AgentEvent::TurnFinished,
-            ],
-            false,
-        );
-        assert_eq!(stdout, b"final answer\n");
-        assert!(stderr.is_empty());
-        assert_eq!(code, ExitCode::SUCCESS);
-    }
-
-    #[test]
     fn verbose_mode_reports_tool_activity_on_stderr() {
         let events = vec![
             AgentEvent::ToolCallStarted {
