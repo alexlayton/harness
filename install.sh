@@ -138,13 +138,14 @@ else
 fi
 [ "$actual" = "$expected" ] || die "checksum verification failed for $archive"
 
-# Validate every path before extraction. Release archives contain only this
-# directory and its three known files, so accepting anything else is unsafe.
+# Validate every path before extraction. v0.5.0 also contains the README
+# image; keep the allowlist limited to known release contents.
 tar -tzf "$tmp_dir/$archive" > "$tmp_dir/archive.list"
 found_binary=0
 while IFS= read -r member; do
     case "$member" in
-        "$package"|"$package/"|"$package/README.md"|"$package/LICENSE") ;;
+        "$package"|"$package/"|"$package/README.md"|"$package/LICENSE"|\
+        "$package/assets/"|"$package/assets/header.png") ;;
         "$package/harness") found_binary=$((found_binary + 1)) ;;
         *) die "unexpected archive member: $member" ;;
     esac
