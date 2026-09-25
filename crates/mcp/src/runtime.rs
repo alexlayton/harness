@@ -1,5 +1,5 @@
 use crate::client::HarnessClient;
-use crate::config::{McpServerConfig, McpTransportConfig};
+use crate::config::{MAX_CONCURRENT_MCP_STARTUPS, McpServerConfig, McpTransportConfig};
 use crate::tool::{MAX_REMOTE_DEFINITION_BYTES, MAX_REMOTE_TOOLS, McpTool, validate_remote_tool};
 use crate::{
     MCP_INITIALIZE_TIMEOUT, MCP_LIST_TIMEOUT, MCP_MAX_FRAME_BYTES, MCP_SHUTDOWN_TIMEOUT,
@@ -338,61 +338,66 @@ impl McpRuntime {
         }
         .validate()?;
         let startup_cancel = cancel.child_token();
+        let mut pending = configs.into_iter();
         let mut tasks = tokio::task::JoinSet::new();
-        for server in configs {
-            if startup_cancel.is_cancelled() {
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                return Err(McpError::operation(&server.name, "initialize", "cancelled"));
-            }
-            let workspace_root = workspace_root.to_path_buf();
-            let server_cancel = startup_cancel.clone();
-            tasks.spawn(async move {
-                connect_server(&server, &workspace_root, server_cancel)
-                    .await
-                    .map(|connected| (server.name.clone(), connected))
-            });
-        }
-
         let mut connected = Self {
-            servers: Vec::with_capacity(tasks.len()),
+            servers: Vec::with_capacity(servers.len()),
         };
         let mut failure = None;
         loop {
+            // Admit at most the configured connection bound at once. A completed
+            // attempt frees its slot before another server (or process) is
+            // started; sorting and validation happened before any launch.
+            while tasks.len() < MAX_CONCURRENT_MCP_STARTUPS && !startup_cancel.is_cancelled() {
+                let Some(server) = pending.next() else { break };
+                let workspace_root = workspace_root.to_path_buf();
+                let server_cancel = startup_cancel.clone();
+                tasks.spawn(async move {
+                    connect_server(&server, &workspace_root, server_cancel)
+                        .await
+                        .map(|connected| (server.name.clone(), connected))
+                });
+            }
+            if startup_cancel.is_cancelled() {
+                failure = Some(McpError::operation("<mcp>", "initialize", "cancelled"));
+                break;
+            }
+            if tasks.is_empty() {
+                break;
+            }
             tokio::select! {
+                biased;
                 _ = startup_cancel.cancelled() => {
                     failure = Some(McpError::operation("<mcp>", "initialize", "cancelled"));
-                    tasks.abort_all();
-                    while tasks.join_next().await.is_some() {}
-                    break;
                 }
                 result = tasks.join_next() => {
-                    let Some(result) = result else { break };
-                    match result {
+                    match result.expect("active connection task") {
                         Ok(Ok((_, server))) => connected.servers.push(server),
-                        Ok(Err(error)) => {
-                            failure = Some(error);
-                            startup_cancel.cancel();
-                            tasks.abort_all();
-                            while tasks.join_next().await.is_some() {}
-                            break;
-                        }
+                        Ok(Err(error)) => failure = Some(error),
                         Err(error) => {
                             failure = Some(McpError::operation(
                                 "<mcp>",
                                 "initialize",
                                 format!("connection task failed: {error}"),
                             ));
-                            startup_cancel.cancel();
-                            tasks.abort_all();
-                            while tasks.join_next().await.is_some() {}
-                            break;
                         }
                     }
                 }
             }
+            if failure.is_some() {
+                break;
+            }
         }
         if let Some(error) = failure {
+            startup_cancel.cancel();
+            tasks.abort_all();
+            // A task may have completed concurrently with failure. Retain
+            // those clients for the same atomic shutdown as earlier ones.
+            while let Some(result) = tasks.join_next().await {
+                if let Ok(Ok((_, server))) = result {
+                    connected.servers.push(server);
+                }
+            }
             connected.shutdown().await;
             return Err(error);
         }
@@ -781,7 +786,7 @@ mod tests {
 
     impl rmcp::ServerHandler for HttpFixture {}
 
-    async fn connect_http_fixture(json_response: bool) {
+    async fn connect_http_fixture(json_response: bool, server_count: usize) {
         use rmcp::transport::streamable_http_server::{
             StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
         };
@@ -827,20 +832,22 @@ mod tests {
                     .unwrap();
             }
         });
-        let config = McpServerConfig {
-            name: "http-fixture".into(),
-            transport: McpTransportConfig::Http {
-                url: format!("http://{address}/mcp"),
-                headers: [("X-Harness-Test".into(), "present".into())]
-                    .into_iter()
-                    .collect(),
-            },
-        };
+        let configs = (0..server_count)
+            .map(|index| McpServerConfig {
+                name: format!("http-fixture-{index}"),
+                transport: McpTransportConfig::Http {
+                    url: format!("http://{address}/mcp"),
+                    headers: [("X-Harness-Test".into(), "present".into())]
+                        .into_iter()
+                        .collect(),
+                },
+            })
+            .collect::<Vec<_>>();
 
-        let runtime = McpRuntime::connect(&[config], Path::new("/"), CancellationToken::new())
+        let runtime = McpRuntime::connect(&configs, Path::new("/"), CancellationToken::new())
             .await
-            .expect("HTTP MCP server should connect");
-        assert_eq!(runtime.servers.len(), 1);
+            .expect("HTTP MCP servers should connect");
+        assert_eq!(runtime.servers.len(), server_count);
         assert!(saw_header.load(Ordering::Acquire));
         runtime.shutdown().await;
         server_cancel.cancel();
@@ -848,13 +855,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_bounds_in_flight_servers_and_stops_on_failure() {
+        use std::collections::HashSet;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let seen = Arc::new(StdMutex::new(HashSet::<String>::new()));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let router = axum::Router::new().fallback(axum::routing::any({
+            let seen = seen.clone();
+            let release = release.clone();
+            move |request: axum::extract::Request| {
+                let seen = seen.clone();
+                let release = release.clone();
+                async move {
+                    seen.lock().unwrap().insert(request.uri().path().to_owned());
+                    release.notified().await;
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let configs = (0..MAX_CONCURRENT_MCP_STARTUPS + 3)
+            .map(|index| McpServerConfig {
+                name: format!("server-{index}"),
+                transport: McpTransportConfig::Http {
+                    url: format!("http://{address}/server-{index}"),
+                    headers: Default::default(),
+                },
+            })
+            .collect::<Vec<_>>();
+        let startup = tokio::spawn(async move {
+            McpRuntime::connect(&configs, Path::new("/"), CancellationToken::new()).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while seen.lock().unwrap().len() < MAX_CONCURRENT_MCP_STARTUPS {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("initial connection attempts did not reach the server");
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(seen.lock().unwrap().len(), MAX_CONCURRENT_MCP_STARTUPS);
+        release.notify_waiters();
+        let result = tokio::time::timeout(Duration::from_secs(5), startup)
+            .await
+            .expect("startup failure did not finish")
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(seen.lock().unwrap().len(), MAX_CONCURRENT_MCP_STARTUPS);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn streamable_http_accepts_json_responses() {
-        connect_http_fixture(true).await;
+        connect_http_fixture(true, 1).await;
     }
 
     #[tokio::test]
     async fn streamable_http_accepts_sse_responses() {
-        connect_http_fixture(false).await;
+        connect_http_fixture(false, 1).await;
+    }
+
+    #[tokio::test]
+    async fn startup_visits_servers_waiting_for_a_connection_slot() {
+        connect_http_fixture(true, MAX_CONCURRENT_MCP_STARTUPS + 1).await;
     }
 
     #[cfg(unix)]

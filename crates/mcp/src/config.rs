@@ -81,6 +81,9 @@ impl fmt::Debug for McpTransportConfig {
 }
 
 const MAX_MCP_SERVERS: usize = 64;
+/// Limit simultaneous connection attempts (including stdio process startup).
+/// All configured servers are still visited; admission waits for a slot.
+pub(crate) const MAX_CONCURRENT_MCP_STARTUPS: usize = 4;
 const MAX_MCP_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_MCP_FIELD_BYTES: usize = 64 * 1024;
 const MAX_SERVER_NAME_BYTES: usize = 256;
