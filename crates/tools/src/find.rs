@@ -28,6 +28,10 @@ const MAX_SEARCH_CANDIDATES: usize = 20_000;
 const MAX_OUTPUT_LINES: usize = 2_000;
 const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 const MAX_TRUNCATION_NOTICE_BYTES: usize = 512;
+/// Bound each copied match/context excerpt while preserving its location.
+const MAX_GREP_CONTENT_BYTES: usize = 4 * 1024;
+const MAX_GREP_RENDER_LINE_BYTES: usize = 8 * 1024;
+const GREP_LINE_TRUNCATION: &str = " … [line truncated]";
 
 /// Cadence of the scan-wait loop in [`search_sync`].  fff's `wait_for_scan`
 /// polls internally every 10 ms, so scan-completion latency is unaffected by
@@ -595,20 +599,20 @@ fn collect_grep_result(
             let line_number = m.line_number.saturating_sub((before_count - index) as u64);
             source_lines
                 .entry((path.clone(), line_number))
-                .or_insert_with(|| (line.clone(), false));
+                .or_insert_with(|| (bounded_grep_text(line), false));
         }
         source_lines
             .entry((path.clone(), m.line_number))
             .and_modify(|entry| {
-                entry.0.clone_from(&m.line_content);
+                entry.0 = bounded_grep_text(&m.line_content);
                 entry.1 = true;
             })
-            .or_insert_with(|| (m.line_content.clone(), true));
+            .or_insert_with(|| (bounded_grep_text(&m.line_content), true));
         for (index, line) in m.context_after.iter().enumerate() {
             let line_number = m.line_number + index as u64 + 1;
             source_lines
                 .entry((path.clone(), line_number))
-                .or_insert_with(|| (line.clone(), false));
+                .or_insert_with(|| (bounded_grep_text(line), false));
         }
     }
 
@@ -629,6 +633,18 @@ fn collect_grep_result(
         regex_fallback_error: result.regex_fallback_error.clone(),
         literal_fallback: result.literal_fallback,
     })
+}
+
+fn bounded_grep_text(text: &str) -> String {
+    bounded_grep_excerpt(text, MAX_GREP_CONTENT_BYTES)
+}
+
+fn bounded_grep_excerpt(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+    let prefix = truncate_utf8_prefix(text, max_bytes.saturating_sub(GREP_LINE_TRUNCATION.len()));
+    format!("{prefix}{GREP_LINE_TRUNCATION}")
 }
 
 pub struct FindTool {
@@ -818,11 +834,15 @@ pub(crate) fn format_grep_output(
     let output_budget = MAX_OUTPUT_BYTES.saturating_sub(MAX_TRUNCATION_NOTICE_BYTES);
     let mut rendered = 0usize;
     for line in &raw.lines {
-        if rendered >= MAX_OUTPUT_LINES || output.len() + line.len() + 1 > output_budget {
+        // The collector caps real search lines. Cap again here for callers
+        // with pre-collected results, so a single oversized first match
+        // still yields its path:line rather than only a limit notice.
+        let excerpt = bounded_grep_excerpt(line, MAX_GREP_RENDER_LINE_BYTES);
+        if rendered >= MAX_OUTPUT_LINES || output.len() + excerpt.len() + 1 > output_budget {
             byte_truncated = true;
             break;
         }
-        output.push_str(line);
+        output.push_str(&excerpt);
         output.push('\n');
         rendered += 1;
     }
@@ -991,6 +1011,54 @@ mod tests {
         let output = format_results("*.rs", result, 100, 500);
         assert!(output.contains("truncated"));
         assert!(output.contains("increase limit"));
+        assert!(output.len() <= MAX_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn long_match_is_bounded_while_collecting() {
+        let directory = tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("long.txt"),
+            format!("needle{}\n", "é".repeat(30_000)),
+        )
+        .unwrap();
+        let index = FileSearchIndex::new(directory.path()).unwrap();
+        let raw = index
+            .grep(
+                "needle".into(),
+                None,
+                10,
+                0,
+                GrepMode::PlainText,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw.match_count, 1);
+        assert!(raw.lines[0].starts_with("long.txt:1:needle"));
+        // FFF may apply a smaller excerpt limit before collection. In
+        // either case the location remains and copied text stays bounded.
+        assert!(raw.lines[0].len() < MAX_GREP_CONTENT_BYTES + 100);
+    }
+
+    #[test]
+    fn oversized_first_grep_match_retains_its_location() {
+        let raw = GrepRawOutput {
+            lines: vec![format!(
+                "src/long.rs:42:match{}",
+                "é".repeat(MAX_OUTPUT_BYTES)
+            )],
+            match_count: 1,
+            file_count: 1,
+            rendered_line_count: 1,
+            has_more: false,
+            regex_fallback_error: None,
+            literal_fallback: false,
+        };
+        let output = format_grep_output(raw, "match", 50, 500);
+        assert!(output.starts_with("src/long.rs:42:match"), "{output}");
+        assert!(output.contains(GREP_LINE_TRUNCATION));
+        assert!(!output.contains("output size limit reached"));
         assert!(output.len() <= MAX_OUTPUT_BYTES);
     }
 
