@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "auth"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -750,7 +750,7 @@ dependencies = [
 
 [[package]]
 name = "compact"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -1611,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "harness"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "agent",
  "agent-client-protocol",
@@ -2368,7 +2368,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "llm"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2468,7 +2468,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -4082,7 +4082,7 @@ dependencies = [
 
 [[package]]
 name = "session"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "fs2",
  "libc",
@@ -4678,7 +4678,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "tools"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "async-trait",
  "diff",
@@ -4937,7 +4937,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "anyhow",
  "crossterm",

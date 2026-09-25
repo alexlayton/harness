@@ -28,7 +28,7 @@ codegen-units = 16
 debug = "line-tables-only"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 publish = false
 
