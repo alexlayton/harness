@@ -523,14 +523,27 @@ impl SessionStore {
                     .cmp(&left.updated_at)
                     .then_with(|| right.created_at.cmp(&left.created_at))
             });
-            // Harness creates a persisted header immediately. Skip every
-            // session without provider conversation context so repeated
-            // `/new` commands cannot make `latest` select a placeholder.
-            return entries
-                .iter()
-                .find(|entry| entry.has_conversation)
-                .map(|entry| self.load_path(&entry.path))
-                .unwrap_or(Err(SessionError::NoSession));
+            // Harness creates a persisted header immediately. Skip empty
+            // placeholders, then validate conversation candidates in order:
+            // the lightweight index cannot detect all invalid event data.
+            // Preserve the first validation error if none can load. An I/O or
+            // permission error is not corrupt data and must surface at once.
+            let mut first_invalid = None;
+            for entry in entries.iter().filter(|entry| entry.has_conversation) {
+                match self.load_path(&entry.path) {
+                    Ok(session) => return Ok(session),
+                    Err(
+                        error @ (SessionError::Json { .. }
+                        | SessionError::InvalidLine { .. }
+                        | SessionError::InvalidEvent(_)
+                        | SessionError::UnsupportedVersion { .. }),
+                    ) => {
+                        first_invalid.get_or_insert(error);
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(first_invalid.unwrap_or(SessionError::NoSession));
         }
 
         let path = PathBuf::from(selector);
@@ -1652,6 +1665,77 @@ mod tests {
                 .has_conversation
         );
         assert_eq!(store.load("latest").unwrap().id(), session.id());
+    }
+
+    #[test]
+    fn latest_skips_invalid_newest_conversation_but_reports_all_invalid() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut older = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut older,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("valid")),
+                },
+            )
+            .unwrap();
+        let mut newest = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut newest,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("invalid newest")),
+                },
+            )
+            .unwrap();
+        // The index sees the valid user event and skips the call's data.
+        // Full replay alone detects its invalid blank ID.
+        let invalid = SessionEventRecord {
+            id: EventId::new(),
+            sequence: 2,
+            timestamp: now_timestamp(),
+            event: SessionEvent::ToolCall {
+                call: StoredToolCall {
+                    id: "".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({}),
+                },
+            },
+        };
+        let line = encode_record(newest.id(), &invalid).unwrap();
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(newest.path().unwrap())
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+        drop(file);
+        assert!(
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.id == newest.id())
+                .unwrap()
+                .has_conversation
+        );
+        assert_eq!(store.load("latest").unwrap().id(), older.id());
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(older.path().unwrap())
+            .unwrap();
+        let line = encode_record(older.id(), &invalid).unwrap();
+        writeln!(file, "{line}").unwrap();
+        drop(file);
+        let error = store.load("latest").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SessionError::InvalidEvent(_) | SessionError::InvalidLine { .. }
+            ),
+            "{error:?}"
+        );
     }
 
     #[test]
