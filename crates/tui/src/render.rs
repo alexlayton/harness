@@ -3,6 +3,8 @@ use ratatui_core::text::{Line, Span, Text};
 use tui_markdown::{AlertKind, Options, StyleSheet, from_str_with_options};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+mod table;
+
 /// The semantic palette used by every renderer. Keeping these roles together
 /// prevents individual widgets from slowly acquiring unrelated colours.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -771,7 +773,10 @@ pub(crate) fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Ve
 }
 
 pub(crate) fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
-    let text = owned_markdown(markdown, theme);
+    let text = table::fit_tables(
+        owned_markdown(markdown, theme),
+        message_content_width(width),
+    );
     prefix_message_lines(
         wrap_text(&text, message_content_width(width), assistant_style(theme)),
         ASSISTANT_PREFIX,
@@ -1015,6 +1020,63 @@ mod tests {
         assert!(value.contains("safe"));
         assert!(!value.contains("secret"));
         assert!(markdown.iter().all(|line| line_width(line) <= 40));
+    }
+
+    #[test]
+    fn markdown_tables_reflow_without_broken_borders() {
+        let source = "Before\n\n| Name | Detail |\n| --- | --- |\n| **你好** | several words in a long cell |\n| B | short |\n\nAfter";
+        for width in [80, 30, 18, 9, 5, 2, 1] {
+            let lines = markdown_lines(source, Theme::default(), width);
+            assert!(
+                lines.iter().all(|line| line_width(line) <= width),
+                "width {width}"
+            );
+            let values = lines.iter().map(span_contents).collect::<Vec<_>>();
+            assert!(values.iter().any(|line| line.contains("Before")) || width < 8);
+            assert!(values.iter().any(|line| line.contains("After")) || width < 7);
+            if width == 9 {
+                assert!(
+                    values.iter().any(|line| line.contains("Name:")),
+                    "{values:?}"
+                );
+                assert!(
+                    values.iter().any(|line| line.contains("Detail:")),
+                    "{values:?}"
+                );
+            }
+            if width >= 11 {
+                let borders = values
+                    .iter()
+                    .filter(|line| line.contains('┌') || line.contains('├') || line.contains('└'))
+                    .collect::<Vec<_>>();
+                assert_eq!(borders.len(), 3, "width {width}: {values:?}");
+                assert!(
+                    borders
+                        .iter()
+                        .all(|line| line.contains('┐') || line.contains('┤') || line.contains('┘'))
+                );
+                let cells = values
+                    .iter()
+                    .filter(|line| line.contains('│'))
+                    .collect::<Vec<_>>();
+                assert!(cells.iter().all(|line| line.matches('│').count() == 3));
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_table_in_list_keeps_its_marker_and_styled_cells() {
+        let source = "- | Item | Count |\n  | :--- | ---: |\n  | **long name** | 42 |";
+        let lines = markdown_lines(source, Theme::default(), 19);
+        let values = lines.iter().map(span_contents).collect::<Vec<_>>();
+        assert!(lines.iter().all(|line| line_width(line) <= 19));
+        assert!(values.iter().any(|line| line.contains("- ┌")), "{values:?}");
+        assert!(
+            values.iter().any(|line| line.contains("long")),
+            "{values:?}"
+        );
+        assert!(values.iter().any(|line| line.contains("42")), "{values:?}");
+        assert!(values.iter().any(|line| line.contains('┘')), "{values:?}");
     }
 
     #[test]
