@@ -52,6 +52,10 @@ the URL in a browser. `Ctrl+C` cancels login.
 When no provider is configured, a successful login selects GitHub Copilot as
 the default provider. It never replaces an existing provider choice. Harness
 selects an available default model at startup; use `/model` to change it.
+For example, use `/model gpt-6-astra`, `/model gpt-6-luna`, or
+`/model gpt-6-sol` if the signed-in account offers them. The picker shows
+only models available to that account; GitHub can also restrict models by plan
+or organization policy.
 
 Harness stores the short-lived Copilot access token and GitHub OAuth refresh
 token in:

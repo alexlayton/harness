@@ -90,6 +90,14 @@ pub const COPILOT_MODELS: &[CopilotModel] = &[
         max_tokens: 64_000,
     },
     CopilotModel {
+        id: "claude-opus-5.5",
+        name: "Claude Opus 5.5",
+        dialect: Dialect::AnthropicMessages,
+        context_length: 1_000_000,
+        reasoning_supported: true,
+        max_tokens: 64_000,
+    },
+    CopilotModel {
         id: "claude-sonnet-4",
         name: "Claude Sonnet 4",
         dialect: Dialect::AnthropicMessages,
@@ -130,6 +138,14 @@ pub const COPILOT_MODELS: &[CopilotModel] = &[
         max_tokens: 128_000,
     },
     CopilotModel {
+        id: "claude-fable-5.1",
+        name: "Claude Fable 5.1",
+        dialect: Dialect::OpenAiChatCompletions,
+        context_length: 1_000_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
         id: "gemini-3.1-pro-preview",
         name: "Gemini 3.1 Pro Preview",
         dialect: Dialect::OpenAiChatCompletions,
@@ -148,6 +164,22 @@ pub const COPILOT_MODELS: &[CopilotModel] = &[
     CopilotModel {
         id: "gemini-3.6-flash",
         name: "Gemini 3.6 Flash",
+        dialect: Dialect::OpenAiChatCompletions,
+        context_length: 1_000_000,
+        reasoning_supported: true,
+        max_tokens: 64_000,
+    },
+    CopilotModel {
+        id: "gemini-3.7-flash",
+        name: "Gemini 3.7 Flash",
+        dialect: Dialect::OpenAiChatCompletions,
+        context_length: 1_000_000,
+        reasoning_supported: true,
+        max_tokens: 64_000,
+    },
+    CopilotModel {
+        id: "gemini-3.8-flash",
+        name: "Gemini 3.8 Flash",
         dialect: Dialect::OpenAiChatCompletions,
         context_length: 1_000_000,
         reasoning_supported: true,
@@ -266,6 +298,30 @@ pub const COPILOT_MODELS: &[CopilotModel] = &[
         max_tokens: 128_000,
     },
     CopilotModel {
+        id: "gpt-6-astra",
+        name: "GPT-6 Astra",
+        dialect: Dialect::OpenAiResponses,
+        context_length: 1_050_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
+        id: "gpt-6-luna",
+        name: "GPT-6 Luna",
+        dialect: Dialect::OpenAiResponses,
+        context_length: 1_050_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
+        id: "gpt-6-sol",
+        name: "GPT-6 Sol",
+        dialect: Dialect::OpenAiResponses,
+        context_length: 1_050_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
         id: "grok-4.5",
         name: "Grok 4.5",
         dialect: Dialect::OpenAiResponses,
@@ -274,8 +330,32 @@ pub const COPILOT_MODELS: &[CopilotModel] = &[
         max_tokens: 128_000,
     },
     CopilotModel {
+        id: "grok-4.6",
+        name: "Grok 4.6",
+        dialect: Dialect::OpenAiResponses,
+        context_length: 500_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
+        id: "grok-4.7",
+        name: "Grok 4.7",
+        dialect: Dialect::OpenAiResponses,
+        context_length: 500_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
         id: "mai-code-1-flash-picker",
         name: "MAI-Code-1-Flash",
+        dialect: Dialect::OpenAiResponses,
+        context_length: 256_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
+        id: "mai-code-1.1-flash",
+        name: "MAI-Code-1.1-Flash",
         dialect: Dialect::OpenAiResponses,
         context_length: 256_000,
         reasoning_supported: true,
@@ -556,6 +636,9 @@ mod tests {
             dialect_for_model("claude-sonnet-4.6"),
             Some(Dialect::AnthropicMessages)
         );
+        for id in ["gpt-6-astra", "gpt-6-luna", "gpt-6-sol"] {
+            assert_eq!(dialect_for_model(id), Some(Dialect::OpenAiResponses));
+        }
         assert_eq!(dialect_for_model("gpt-5.4"), Some(Dialect::OpenAiResponses));
         assert_eq!(
             dialect_for_model("gpt-5.4-mini"),
@@ -581,6 +664,17 @@ mod tests {
     }
 
     #[test]
+    fn policy_enablement_covers_every_routable_model() {
+        for model in COPILOT_MODELS {
+            assert!(
+                auth::KNOWN_MODEL_IDS.contains(&model.id),
+                "missing policy enablement for {}",
+                model.id
+            );
+        }
+    }
+
+    #[test]
     fn dynamic_headers_mark_followups_as_agent_initiated() {
         let user = vec![Message::user("hello")];
         let user_headers = copilot_headers(&user);
@@ -598,10 +692,11 @@ mod tests {
 
     #[test]
     fn dynamic_model_merge_discards_unknown_remote_ids() {
-        let models = models_for_available_ids(["gpt-5.4", "unknown", "kimi-k3"]);
-        assert_eq!(models.len(), 2);
+        let models = models_for_available_ids(["gpt-5.4", "unknown", "kimi-k3", "gpt-6-astra"]);
+        assert_eq!(models.len(), 3);
         assert_eq!(models[0].id, "kimi-k3");
         assert_eq!(models[1].id, "gpt-5.4");
+        assert_eq!(models[2].id, "gpt-6-astra");
     }
 
     #[test]
