@@ -847,7 +847,9 @@ pub struct PromptArgs {
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct LoginArgs {
-    #[arg(value_enum)]
+    // Keep this positional ID distinct from the global --provider option:
+    // Clap stores them as different enum types and panics on a shared ID.
+    #[arg(id = "login_provider", value_name = "PROVIDER", value_enum)]
     pub provider: LoginProvider,
     /// Use RFC 8628 device authorization instead of the local browser callback.
     #[arg(long)]
@@ -1247,6 +1249,41 @@ mod tests {
         assert!(matches!(acp.command, Some(Command::Acp)));
         assert!(Cli::try_parse_from(["harness", "--acp"]).is_err());
         assert!(Cli::try_parse_from(["harness", "-p", "hello"]).is_err());
+    }
+
+    #[test]
+    fn login_provider_parses_separately_from_global_provider() {
+        for (name, expected) in [
+            ("codex", LoginProvider::OpenAiCodex),
+            ("openai-codex", LoginProvider::OpenAiCodex),
+            ("copilot", LoginProvider::GithubCopilot),
+            ("github-copilot", LoginProvider::GithubCopilot),
+        ] {
+            let cli = Cli::try_parse_from(["harness", "login", name]).unwrap();
+            assert!(matches!(
+                cli.command,
+                Some(Command::Login(LoginArgs { provider, .. })) if provider == expected
+            ));
+            assert_eq!(cli.provider, None);
+        }
+
+        let cli = Cli::try_parse_from([
+            "harness",
+            "--provider",
+            "openrouter",
+            "login",
+            "codex",
+            "--device-code",
+        ])
+        .unwrap();
+        assert_eq!(cli.provider, Some(ProviderArg::Openrouter));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Login(LoginArgs {
+                provider: LoginProvider::OpenAiCodex,
+                device_code: true,
+            }))
+        ));
     }
 
     #[test]
