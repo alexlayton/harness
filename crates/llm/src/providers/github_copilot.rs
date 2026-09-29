@@ -322,6 +322,14 @@ pub const COPILOT_MODELS: &[CopilotModel] = &[
         max_tokens: 128_000,
     },
     CopilotModel {
+        id: "gpt-6.1-sol",
+        name: "GPT-6.1 Sol",
+        dialect: Dialect::OpenAiResponses,
+        context_length: 1_050_000,
+        reasoning_supported: true,
+        max_tokens: 128_000,
+    },
+    CopilotModel {
         id: "grok-4.5",
         name: "Grok 4.5",
         dialect: Dialect::OpenAiResponses,
@@ -636,7 +644,7 @@ mod tests {
             dialect_for_model("claude-sonnet-4.6"),
             Some(Dialect::AnthropicMessages)
         );
-        for id in ["gpt-6-astra", "gpt-6-luna", "gpt-6-sol"] {
+        for id in ["gpt-6-astra", "gpt-6-luna", "gpt-6-sol", "gpt-6.1-sol"] {
             assert_eq!(dialect_for_model(id), Some(Dialect::OpenAiResponses));
         }
         assert_eq!(dialect_for_model("gpt-5.4"), Some(Dialect::OpenAiResponses));

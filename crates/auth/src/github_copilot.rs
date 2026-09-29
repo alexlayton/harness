@@ -71,6 +71,7 @@ pub const KNOWN_MODEL_IDS: &[&str] = &[
     "gpt-6-astra",
     "gpt-6-luna",
     "gpt-6-sol",
+    "gpt-6.1-sol",
     "grok-4.5",
     "grok-4.6",
     "grok-4.7",

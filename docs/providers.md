@@ -53,7 +53,7 @@ When no provider is configured, a successful login selects GitHub Copilot as
 the default provider. It never replaces an existing provider choice. Harness
 selects an available default model at startup; use `/model` to change it.
 For example, use `/model gpt-6-astra`, `/model gpt-6-luna`, or
-`/model gpt-6-sol` if the signed-in account offers them. The picker shows
+`/model gpt-6.1-sol` if the signed-in account offers them. The picker shows
 only models available to that account; GitHub can also restrict models by plan
 or organization policy.
 
@@ -110,7 +110,7 @@ Credentials are stored in the same private `auth.json` file as Copilot
 credentials. When no provider is configured, a successful login selects
 `openai-codex` without replacing any existing choice. Harness uses the
 provider's default model until you select another through `/model` or
-`config.toml`.
+`config.toml`. For example, use `/model gpt-6.1-sol` to select GPT-6.1 Sol.
 
 Codex uses a dedicated, SSE-only provider and dialect because its ChatGPT
 subscription protocol differs from the normal OpenAI API.
