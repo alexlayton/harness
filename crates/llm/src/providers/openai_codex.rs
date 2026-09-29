@@ -70,6 +70,11 @@ pub const CODEX_MODELS: &[CodexModel] = &[
         name: "GPT-6 Sol",
         context_length: 1_050_000,
     },
+    CodexModel {
+        id: "gpt-6.1-sol",
+        name: "GPT-6.1 Sol",
+        context_length: 1_050_000,
+    },
 ];
 #[derive(Clone)]
 pub struct OpenAiCodexProvider {
