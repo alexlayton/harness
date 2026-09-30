@@ -13,8 +13,6 @@
 //!
 //! Deliberately unsupported: permission gating, auth over ACP
 //! (`authenticate` answers with instructions to sign in interactively),
-//! transcript replay on `session/load` (history is intact on disk and in the
-//! agent context; the editor shows an empty transcript until the next turn),
 //! legacy SSE/MCP-over-ACP transports, mid-session model switching. ACP-provided
 //! stdio and Streamable HTTP MCP servers are supported per session. Unhandled
 //! requests fall through to the SDK default of method-not-found.
@@ -33,8 +31,9 @@ use agent_client_protocol::schema::v1::{
     ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpServer,
     NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
     SessionId, SessionInfo, SessionMode, SessionModeId, SessionModeState, SessionNotification,
-    SessionUpdate, StopReason, ToolCall as AcToolCall, ToolCallContent, ToolCallId, ToolCallStatus,
-    ToolCallUpdate, ToolCallUpdateFields, ToolKind, UsageUpdate,
+    SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    ToolCall as AcToolCall, ToolCallContent, ToolCallId, ToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind, UsageUpdate,
 };
 use agent_client_protocol::schema::{ProtocolVersion, v1};
 use agent_client_protocol::{
@@ -45,7 +44,7 @@ use anyhow::{Context as _, Result};
 use auth::CopilotAuth;
 use fs2::FileExt;
 use llm::Provider;
-use session::{SessionCreateOptions, SessionStore};
+use session::{SessionCreateOptions, SessionEvent, SessionStore, StoredContent};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,8 +56,8 @@ use tokio_util::sync::CancellationToken;
 use tools::{ToolConfig, ToolRegistry, default_registry};
 
 /// The single mode advertised for every session: harness has no permission
-/// levels to switch between (tools always run), so `set_mode` stays
-/// unsupported while the mode list still gives editors something to display.
+/// levels to switch between (tools always run). `set_mode` accepts this
+/// single mode so editors can safely select the mode we advertise.
 const MODE_ID: &str = "work";
 
 /// Everything needed to drive one live session.
@@ -128,8 +127,8 @@ impl PromptTracker {
         }
     }
 
-    /// Clear a previously observed error only when a new assistant text delta
-    /// proves the provider recovered; unrelated metadata must not do this.
+    /// Clear a previously observed error when the provider resumes producing
+    /// substantive output; unrelated metadata must not do this.
     fn clear_error(&self, session_id: &str) {
         if let Some(entry) = self.in_flight.lock().unwrap().get_mut(session_id) {
             entry.error = None;
@@ -406,6 +405,28 @@ where
         .on_receive_request(
             {
                 let state = state.clone();
+                async move |request: SetSessionModeRequest,
+                            responder: Responder<SetSessionModeResponse>,
+                            _cx: ConnectionTo<agent_client_protocol::Client>| {
+                    if !state.sessions.lock().unwrap().contains_key(request.session_id.0.as_ref()) {
+                        let _ = responder.respond_with_error(AcError::invalid_params().data(
+                            format!("unknown session `{}`", request.session_id.0),
+                        ));
+                    } else if request.mode_id.0.as_ref() != MODE_ID {
+                        let _ = responder.respond_with_error(AcError::invalid_params().data(
+                            format!("unsupported session mode `{}`", request.mode_id.0),
+                        ));
+                    } else {
+                        let _ = responder.respond(SetSessionModeResponse::new());
+                    }
+                    Ok(())
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
                 move |request: PromptRequest,
                       responder: Responder<PromptResponse>,
                       _cx: ConnectionTo<agent_client_protocol::Client>| {
@@ -463,6 +484,7 @@ fn initialize_response(_request: &InitializeRequest) -> InitializeResponse {
             AgentCapabilities::default()
                 .load_session(true)
                 .prompt_capabilities(PromptCapabilities::default().embedded_context(true))
+                .mcp_capabilities(v1::McpCapabilities::default().http(true))
                 .session_capabilities(
                     v1::SessionCapabilities::default()
                         .list(v1::SessionListCapabilities::default())
@@ -482,7 +504,7 @@ fn static_mode_state() -> SessionModeState {
 /// consumes. `Text` passes through verbatim; embedded resources are inlined
 /// as fenced context. Resource links are noted rather than fetched — the
 /// model can `read` the referenced path itself if it needs the contents.
-fn flatten_prompt(blocks: &[ContentBlock]) -> String {
+fn flatten_prompt(blocks: &[ContentBlock]) -> Result<String> {
     let mut parts: Vec<String> = Vec::new();
     for block in blocks {
         match block {
@@ -494,19 +516,95 @@ fn flatten_prompt(blocks: &[ContentBlock]) -> String {
                 v1::EmbeddedResourceResource::TextResourceContents(text) => {
                     parts.push(format!("```\n{}\n```", text.text.trim_end()));
                 }
-                v1::EmbeddedResourceResource::BlobResourceContents(blob) => {
-                    parts.push(format!(
-                        "[embedded binary resource: {} ({} bytes)]",
-                        blob.uri,
-                        blob.blob.len()
-                    ));
+                v1::EmbeddedResourceResource::BlobResourceContents(_) => {
+                    anyhow::bail!("binary embedded resources are not supported in prompts");
                 }
-                _ => {}
+                _ => anyhow::bail!("unsupported embedded resource type"),
             },
+            _ => anyhow::bail!("unsupported prompt content block"),
+        }
+    }
+    Ok(parts.join("\n"))
+}
+
+/// Reconstruct editor-visible history from durable events, not from the
+/// compacted provider context (which omits earlier turns). Most tool calls are
+/// separate events, but provider continuation messages can embed them.
+fn replay_updates(session: &session::Session) -> Vec<SessionUpdate> {
+    let mut updates = Vec::new();
+    // Provider call IDs can be reused in later turns. ACP cards must stay
+    // distinct for the full replay while each result still targets its call.
+    let mut tool_ids = HashMap::<String, ToolCallId>::new();
+    for record in &session.events {
+        match &record.event {
+            SessionEvent::UserMessage { message } | SessionEvent::AssistantMessage { message } => {
+                for content in &message.content {
+                    let update = match content {
+                        StoredContent::Text { text } if !text.is_empty() => {
+                            let chunk = ContentChunk::new(ContentBlock::from(text.as_str()));
+                            match &record.event {
+                                SessionEvent::UserMessage { .. } => {
+                                    SessionUpdate::UserMessageChunk(chunk)
+                                }
+                                _ => SessionUpdate::AgentMessageChunk(chunk),
+                            }
+                        }
+                        StoredContent::Reasoning { text } if !text.is_empty() => {
+                            SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::from(
+                                text.as_str(),
+                            )))
+                        }
+                        StoredContent::ToolCall { id, name, .. } => {
+                            let acp_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
+                            tool_ids.insert(id.clone(), acp_id.clone());
+                            SessionUpdate::ToolCall(
+                                AcToolCall::new(acp_id, name.clone()).kind(tool_kind(name)),
+                            )
+                        }
+                        _ => continue,
+                    };
+                    updates.push(update);
+                }
+            }
+            SessionEvent::Reasoning { text } => updates.push(SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(ContentBlock::from(text.as_str())),
+            )),
+            SessionEvent::Error { message } => updates.push(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(ContentBlock::from(format!("error: {message}"))),
+            )),
+            SessionEvent::ToolCall { call } => {
+                let acp_id = ToolCallId::new(uuid::Uuid::new_v4().to_string());
+                tool_ids.insert(call.id.clone(), acp_id.clone());
+                updates.push(SessionUpdate::ToolCall(
+                    AcToolCall::new(acp_id, call.name.clone()).kind(tool_kind(&call.name)),
+                ));
+            }
+            SessionEvent::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+                ..
+            } => {
+                let Some(acp_id) = tool_ids.remove(tool_call_id) else {
+                    // An imported history may contain an orphan result. Do
+                    // not emit an update to a card that was never created.
+                    continue;
+                };
+                updates.push(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    acp_id,
+                    ToolCallUpdateFields::new()
+                        .status(if *is_error {
+                            ToolCallStatus::Failed
+                        } else {
+                            ToolCallStatus::Completed
+                        })
+                        .content(vec![ToolCallContent::from(content.clone())]),
+                )));
+            }
             _ => {}
         }
     }
-    parts.join("\n")
+    updates
 }
 
 /// Map a harness tool name to the ACP tool category editors use for icons.
@@ -887,6 +985,8 @@ async fn load_session_inner(
             );
         }
     };
+    let replay = replay_updates(&session);
+    let replay_connection = connection.clone();
     match spawn_agent(
         &state,
         SessionStack {
@@ -909,10 +1009,19 @@ async fn load_session_inner(
                     anyhow::anyhow!("ACP session assembly cancelled"),
                 );
             }
+            // ACP v1 requires the complete transcript before the load reply.
+            // The agent is idle until a prompt arrives, so its forwarder does
+            // not interleave new turn updates with this replay.
+            for update in replay {
+                if let Err(error) = replay_connection.send_notification(SessionNotification::new(
+                    SessionId::from(id.clone()),
+                    update,
+                )) {
+                    shutdown_registered_session(&state, &id, owner).await;
+                    return respond_anyhow(responder, anyhow::anyhow!(error.to_string()));
+                }
+            }
             tracing::info!(session = %id, cwd = %request.cwd.display(), "ACP session loaded");
-            // Documented limitation: no transcript replay notifications. The
-            // editor renders an empty transcript until the next turn; the
-            // full history is intact on disk and in the agent's context.
             if let Err(error) =
                 responder.respond(LoadSessionResponse::default().modes(static_mode_state()))
             {
@@ -1114,6 +1223,10 @@ async fn prompt(
     state: Arc<AcpState>,
 ) -> AcResult<()> {
     let session_id = request.session_id.0.to_string();
+    let text = match flatten_prompt(&request.prompt) {
+        Ok(text) => text,
+        Err(error) => return respond_invalid_params(responder, error),
+    };
     // Exactly one prompt in flight per session: a concurrent second prompt
     // would interleave two conversations into one history. Acquire locks in
     // sessions → prompts order, matching deletion and cancellation, so a
@@ -1147,7 +1260,6 @@ async fn prompt(
     drop(in_flight);
     drop(sessions);
 
-    let text = flatten_prompt(&request.prompt);
     if text.trim().is_empty() {
         // The agent ignores blank messages; answer directly instead of
         // leaving a prompt parked forever.
@@ -1453,7 +1565,9 @@ async fn forward_events(
             AgentEvent::Error(message) => {
                 prompts.mark_error(&acp_session_id, message);
             }
-            AgentEvent::TextDelta(_) => {
+            AgentEvent::TextDelta(_)
+            | AgentEvent::ReasoningDelta(_)
+            | AgentEvent::ToolCallStarted { .. } => {
                 prompts.clear_error(&acp_session_id);
             }
             AgentEvent::UsageUpdated { cost, .. } => {
@@ -1517,7 +1631,7 @@ mod tests {
     #[test]
     fn flatten_keeps_text_verbatim_and_joins_with_newlines() {
         let blocks = vec![text_block("first"), text_block("second")];
-        assert_eq!(flatten_prompt(&blocks), "first\nsecond");
+        assert_eq!(flatten_prompt(&blocks).unwrap(), "first\nsecond");
     }
 
     #[test]
@@ -1528,7 +1642,7 @@ mod tests {
                 "file:///tmp/x.rs",
             )),
         ))];
-        assert_eq!(flatten_prompt(&blocks), "```\nlet x = 1;\n```");
+        assert_eq!(flatten_prompt(&blocks).unwrap(), "```\nlet x = 1;\n```");
     }
 
     #[test]
@@ -1537,13 +1651,20 @@ mod tests {
             "notes.txt",
             "file:///tmp/notes.txt",
         ))];
-        let flat = flatten_prompt(&blocks);
+        let flat = flatten_prompt(&blocks).unwrap();
         assert!(flat.contains("attached file"), "{flat}");
         assert!(flat.contains("file:///tmp/notes.txt"), "{flat}");
         assert!(
             !flat.contains("contents of notes"),
             "must not invent content"
         );
+    }
+
+    #[test]
+    fn unsupported_prompt_content_is_rejected_instead_of_discarded() {
+        let image = ContentBlock::Image(v1::ImageContent::new("aGVsbG8=", "image/png"));
+        let error = flatten_prompt(&[text_block("describe this"), image]).unwrap_err();
+        assert!(error.to_string().contains("unsupported prompt content"));
     }
 
     #[test]
@@ -1723,6 +1844,8 @@ mod tests {
         let response = initialize_response(&request);
         assert_eq!(response.protocol_version, ProtocolVersion::V1);
         assert!(response.agent_capabilities.load_session);
+        assert!(response.agent_capabilities.mcp_capabilities.http);
+        assert!(!response.agent_capabilities.mcp_capabilities.sse);
         assert!(
             response
                 .agent_capabilities
@@ -2401,6 +2524,10 @@ done
                             .await
                             .expect("session/new");
                         let session_id = new_session.session_id.clone();
+                        cx.send_request(SetSessionModeRequest::new(session_id.clone(), MODE_ID))
+                            .block_task()
+                            .await
+                            .expect("advertised mode is selectable");
 
                         let response = cx
                             .send_request(PromptRequest::new(
@@ -2476,7 +2603,7 @@ done
                 run_client_side(
                     ByteStreams::new(client_writer, client_reader),
                     async |cx: ConnectionTo<agent_client_protocol::Agent>,
-                           _updates: mpsc::UnboundedReceiver<SessionUpdate>| {
+                           mut updates: mpsc::UnboundedReceiver<SessionUpdate>| {
                         cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
                             .block_task()
                             .await
@@ -2488,6 +2615,18 @@ done
                         .block_task()
                         .await
                         .expect("session/load");
+                        let mut replay = Vec::new();
+                        while let Ok(update) = updates.try_recv() {
+                            replay.push(update);
+                        }
+                        assert!(replay.iter().any(|update| matches!(update,
+                            SessionUpdate::UserMessageChunk(chunk)
+                                if matches!(&chunk.content, ContentBlock::Text(t) if t.text == "say hello")
+                        )), "missing user replay: {replay:?}");
+                        assert!(replay.iter().any(|update| matches!(update,
+                            SessionUpdate::AgentMessageChunk(chunk)
+                                if matches!(&chunk.content, ContentBlock::Text(t) if t.text == "Hello world")
+                        )), "missing assistant replay: {replay:?}");
                         Ok(())
                     },
                 )
