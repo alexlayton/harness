@@ -25,7 +25,8 @@ pub async fn run(args: &LoginArgs) -> Result<ExitCode> {
         LoginProvider::OpenAiCodex => {
             let auth = OpenAiCodexAuth::from_default()?;
             if args.device_code {
-                auth.login_device(&cancel, render_event).await?;
+                auth.login_device(&cancel, render_headless_device_event)
+                    .await?;
             } else {
                 auth.login_browser(&cancel, |event| {
                     if let AuthEvent::Prompt { message } = &event {
@@ -62,6 +63,24 @@ fn render_event(event: AuthEvent) {
         AuthEvent::Started | AuthEvent::Finished => {}
     }
 }
+// Do not attempt xdg-open or open on an SSH server. The user completes
+// device authorization on another machine while this process polls.
+fn render_headless_device_event(event: AuthEvent) {
+    if let AuthEvent::DeviceCode {
+        verification_url,
+        user_code,
+        expires_in,
+        ..
+    } = event
+    {
+        eprintln!(
+            "Open {verification_url} on any device\nEnter code: {user_code}\nExpires in {expires_in}s"
+        );
+    } else {
+        render_event(event);
+    }
+}
+
 /// Opening is best-effort; the printed URL remains usable in terminals without
 /// a desktop browser.
 fn open_browser(url: &str) {

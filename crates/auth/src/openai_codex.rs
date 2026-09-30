@@ -4,7 +4,7 @@
 //! path and validates the PKCE state before exchanging a code.  It never puts
 //! tokens in the browser response or in diagnostics.
 
-use crate::device_code::{AuthEvent, cancellable_sleep, parse_device_code};
+use crate::device_code::{AuthEvent, cancellable_sleep, parse_u64};
 use crate::error::{AuthError, Result};
 use crate::storage::{AuthStore, OpenAiCodexCredential};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -27,12 +27,16 @@ use tokio_util::sync::CancellationToken;
 pub const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 pub const CALLBACK_PORT: u16 = 1455;
 pub const CALLBACK_PATH: &str = "/auth/callback";
+const CODEX_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const CODEX_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const CODEX_DEVICE_MAX_WAIT: u64 = 15 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenAiCodexEndpoints {
     pub authorize_url: String,
     pub token_url: String,
     pub device_code_url: String,
+    pub device_poll_url: String,
 }
 impl Default for OpenAiCodexEndpoints {
     fn default() -> Self {
@@ -40,8 +44,77 @@ impl Default for OpenAiCodexEndpoints {
             authorize_url: "https://auth.openai.com/oauth/authorize".into(),
             token_url: "https://auth.openai.com/oauth/token".into(),
             device_code_url: "https://auth.openai.com/api/accounts/deviceauth/usercode".into(),
+            device_poll_url: "https://auth.openai.com/api/accounts/deviceauth/token".into(),
         }
     }
+}
+
+// OpenAI's device-auth endpoint does not return an RFC 8628 device_code or
+// verification_uri. It returns an ID to poll for an authorization code, which
+// must then be exchanged with the matching code_verifier at /oauth/token.
+struct CodexDeviceCode {
+    device_auth_id: String,
+    user_code: String,
+    interval: u64,
+    expires_in: u64,
+}
+
+struct CodexAuthorizationCode {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+impl fmt::Debug for CodexAuthorizationCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CodexAuthorizationCode")
+            .field("authorization_code", &"<redacted>")
+            .field("code_verifier", &"<redacted>")
+            .finish()
+    }
+}
+
+fn codex_required(value: &Value, field: &str) -> Result<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            AuthError::OpenAiCodex(format!(
+                "invalid device authorization response: missing {field}"
+            ))
+        })
+}
+
+fn parse_codex_device_code(value: &Value) -> Result<CodexDeviceCode> {
+    let device_auth_id = codex_required(value, "device_auth_id")?;
+    let user_code = codex_required(value, "user_code")?;
+    let interval = value
+        .get("interval")
+        .map(|value| parse_u64(value, "interval"))
+        .transpose()
+        .map_err(|_| AuthError::OpenAiCodex("invalid device authorization interval".into()))?
+        .filter(|value| *value > 0)
+        .unwrap_or(5)
+        .clamp(3, 60);
+    let expires_in = value
+        .get("expires_in")
+        .map(|value| parse_u64(value, "expires_in"))
+        .transpose()
+        .map_err(|_| AuthError::OpenAiCodex("invalid device authorization expiry".into()))?
+        .unwrap_or(CODEX_DEVICE_MAX_WAIT)
+        .min(CODEX_DEVICE_MAX_WAIT);
+    if expires_in == 0 {
+        return Err(AuthError::OpenAiCodex(
+            "device authorization has expired".into(),
+        ));
+    }
+    Ok(CodexDeviceCode {
+        device_auth_id,
+        user_code,
+        interval,
+        expires_in,
+    })
 }
 
 /// PKCE values for one authorization attempt. Secrets deliberately redact.
@@ -337,9 +410,8 @@ impl OpenAiCodexAuth {
     }
 
     /// `login_device` with an injectable poll-interval sleep. Production
-    /// passes [`cancellable_sleep`]; tests record the requested waits to
-    /// prove `slow_down` backs off without sleeping the suite or fighting
-    /// Tokio's paused clock over real-socket I/O.
+    /// passes [`cancellable_sleep`]; tests record poll waits without sleeping
+    /// the suite or mixing paused Tokio clocks with real-socket I/O.
     async fn login_device_with_sleep<F, S, Fut>(
         &self,
         cancel: &CancellationToken,
@@ -361,78 +433,77 @@ impl OpenAiCodexAuth {
                 &cancel,
             )
             .await?;
-        let device = parse_device_code(&value)?;
+        let device = parse_codex_device_code(&value)?;
         emit(AuthEvent::DeviceCode {
-            verification_url: device.verification_url.clone(),
+            verification_url: CODEX_DEVICE_VERIFICATION_URL.into(),
             user_code: device.user_code.clone(),
             expires_in: device.expires_in,
             interval: device.interval,
         });
-        // Expiry deadline in the Tokio clock domain: `cancellable_sleep`
-        // and `request_token_until` both wait on Tokio time (which paused
-        // test clocks auto-advance past short expiries), so a `std`
-        // wall-clock deadline would never fire there. Conversely, expiry
-        // checks on the Tokio clock DO advance under paused time — the
-        // 900s grant below outlasts the test's ~5s of virtual sleep.
-        // `Duration::from_secs` cannot overflow for a `u64` grant on
-        // 64-bit; clamp anyway so a huge grant never wraps the deadline
-        // into the past.
-        let grant = Duration::from_secs(device.expires_in.min(3600));
+        // Sleep, poll, and token exchange share one Tokio-clock deadline.
+        // The response can omit expiry; never wait longer than 15 minutes.
+        let grant = Duration::from_secs(device.expires_in);
         let deadline = tokio::time::Instant::now() + grant;
-        let mut interval = device.interval;
+        let interval = device.interval;
         loop {
             // Check expiry before sleeping so an already-expired grant
             // fails fast, and re-check after the sleep and around the
-            // request (inside `token`) so cancellation/expiry interrupt
-            // both waits and in-flight polls.
+            // requests so cancellation/expiry interrupt both waits and
+            // in-flight polls.
             if tokio::time::Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
             }
-            sleep(interval, cancel.clone()).await?;
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => return Err(AuthError::DeviceCodeExpired),
+                result = sleep(interval, cancel.clone()) => result?,
+            }
             if tokio::time::Instant::now() >= deadline {
                 return Err(AuthError::DeviceCodeExpired);
             }
             if cancel.is_cancelled() {
                 return Err(AuthError::Cancelled);
             }
+            let Some(code) = self.poll_device_until(&device, &cancel, deadline).await? else {
+                continue;
+            };
             let value = self
-                .request_token_until(
-                    self.http
-                        .post(&self.endpoints.token_url)
-                        .form(&json!({"grant_type":"urn:ietf:params:oauth:grant-type:device_code", "device_code":device.device_code, "client_id":OPENAI_CODEX_CLIENT_ID})),
+                .token_strict_until(
+                    json!({
+                        "grant_type": "authorization_code",
+                        "code": code.authorization_code,
+                        "code_verifier": code.code_verifier,
+                        "redirect_uri": CODEX_DEVICE_REDIRECT_URI,
+                        "client_id": OPENAI_CODEX_CLIENT_ID,
+                    }),
                     &cancel,
                     Some(deadline),
                 )
                 .await?;
-            if let Some(error) = value.get("error").and_then(Value::as_str) {
-                match error {
-                    "authorization_pending" => continue,
-                    "slow_down" => {
-                        interval = interval.saturating_add(5);
-                        continue;
-                    }
-                    "expired_token" => return Err(AuthError::DeviceCodeExpired),
-                    "access_denied" => {
-                        return Err(AuthError::OpenAiCodex(
-                            "device authorization was denied".into(),
-                        ));
-                    }
-                    _ => return Err(AuthError::OpenAiCodex("device authorization failed".into())),
-                }
-            }
             let credential = credential_from_token(&value, None)?;
             self.persist(credential.clone())?;
             emit(AuthEvent::Finished);
             return Ok(credential);
         }
     }
-    /// Browser authorization exchange: strict status handling (no RFC 8628
-    /// polling semantics).  Only 2xx with a token payload succeeds; error
-    /// bodies are bounded and never echoed.
+    /// Browser and device authorization-code exchanges share strict token
+    /// status handling. Never accept a poll response as an OAuth token.
     async fn token_strict(&self, body: Value, cancel: &CancellationToken) -> Result<Value> {
-        let response = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), result = self.http.post(&self.endpoints.token_url).form(&body).send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))? };
-        let status = response.status();
-        let body = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), body = read_bounded_body(response) => body? };
+        self.token_strict_until(body, cancel, None).await
+    }
+
+    async fn token_strict_until(
+        &self,
+        body: Value,
+        cancel: &CancellationToken,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Value> {
+        let (status, body) = self
+            .request_until(
+                self.http.post(&self.endpoints.token_url).form(&body),
+                cancel,
+                deadline,
+            )
+            .await?;
         if !status.is_success() {
             return Err(AuthError::Http {
                 status: status.as_u16(),
@@ -442,27 +513,73 @@ impl OpenAiCodexAuth {
         serde_json::from_slice(&body)
             .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))
     }
-    /// Token endpoint with RFC 8628 device-polling semantics: read a bounded
-    /// response body regardless of HTTP status, then map recognized `error`
-    /// values (`authorization_pending`, `slow_down`, `expired_token`,
-    /// `access_denied`) before treating other non-success statuses as
-    /// errors.  Cancellation and expiry are checked around both sleeps and
-    /// requests; token bodies never enter errors or logs.
-    #[cfg(test)]
-    async fn request_token(
+
+    /// OpenAI returns 403/404 until the user approves the code. A successful
+    /// poll returns an authorization code and verifier, NOT an access token.
+    async fn poll_device_until(
+        &self,
+        device: &CodexDeviceCode,
+        cancel: &CancellationToken,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<CodexAuthorizationCode>> {
+        let (status, body) = self
+            .request_until(
+                self.http
+                    .post(&self.endpoints.device_poll_url)
+                    .json(&json!({
+                        "device_auth_id": device.device_auth_id,
+                        "user_code": device.user_code,
+                    })),
+                cancel,
+                Some(deadline),
+            )
+            .await?;
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::NOT_FOUND {
+            if let Ok(value) = serde_json::from_slice::<Value>(&body)
+                && value.get("error").and_then(Value::as_str) == Some("access_denied")
+            {
+                return Err(AuthError::OpenAiCodex(
+                    "device authorization was denied".into(),
+                ));
+            }
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(AuthError::Http {
+                status: status.as_u16(),
+                endpoint: "auth.openai.com".into(),
+            });
+        }
+        let value: Value = serde_json::from_slice(&body)
+            .map_err(|_| AuthError::OpenAiCodex("invalid device authorization response".into()))?;
+        Ok(Some(CodexAuthorizationCode {
+            authorization_code: codex_required(&value, "authorization_code")?,
+            code_verifier: codex_required(&value, "code_verifier")?,
+        }))
+    }
+
+    async fn request_json(
         &self,
         request: reqwest::RequestBuilder,
         cancel: &CancellationToken,
     ) -> Result<Value> {
-        self.request_token_until(request, cancel, None).await
+        let (status, body) = self.request_until(request, cancel, None).await?;
+        if !status.is_success() {
+            return Err(AuthError::Http {
+                status: status.as_u16(),
+                endpoint: "auth.openai.com".into(),
+            });
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))
     }
 
-    async fn request_token_until(
+    async fn request_until(
         &self,
         request: reqwest::RequestBuilder,
         cancel: &CancellationToken,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<Value> {
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let response = if let Some(deadline) = deadline {
             tokio::select! {
                 _ = cancel.cancelled() => return Err(AuthError::Cancelled),
@@ -488,42 +605,14 @@ impl OpenAiCodexAuth {
                 body = read_bounded_body(response) => body?,
             }
         };
-        let value: Value = serde_json::from_slice(&body)
-            .map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into()))?;
-        if status.is_success() && value.get("error").is_none() {
-            return Ok(value);
-        }
-        match value.get("error").and_then(Value::as_str) {
-            Some("authorization_pending") => Ok(value),
-            Some("slow_down") => Ok(value),
-            Some("expired_token") => Ok(value),
-            Some("access_denied") => Ok(value),
-            _ => Err(AuthError::Http {
-                status: status.as_u16(),
-                endpoint: "auth.openai.com".into(),
-            }),
-        }
-    }
-    async fn request_json(
-        &self,
-        request: reqwest::RequestBuilder,
-        cancel: &CancellationToken,
-    ) -> Result<Value> {
-        let response = tokio::select! { _ = cancel.cancelled() => return Err(AuthError::Cancelled), result = request.send() => result.map_err(|_| AuthError::OpenAiCodex("network request failed".into()))? };
-        if !response.status().is_success() {
-            return Err(AuthError::Http {
-                status: response.status().as_u16(),
-                endpoint: "auth.openai.com".into(),
-            });
-        }
-        tokio::select! { _ = cancel.cancelled() => Err(AuthError::Cancelled), value = response.json() => value.map_err(|_| AuthError::OpenAiCodex("invalid OAuth response".into())) }
+        Ok((status, body))
     }
 }
 
 /// Read at most `OAUTH_BODY_LIMIT` bytes of a token/authorize response.
 /// OAuth error payloads are small JSON objects; bounding the read keeps a
-/// malicious endpoint from filling memory before the RFC 8628 error mapping
-/// runs.  Bodies are parsed, never echoed into errors or logs.
+/// malicious endpoint from filling memory. Bodies are never echoed into errors
+/// or logs.
 const OAUTH_BODY_LIMIT: usize = 64 * 1024;
 
 async fn read_bounded_body(response: reqwest::Response) -> Result<Vec<u8>> {
@@ -841,13 +930,40 @@ mod tests {
                 let Some((status, body)) = next else {
                     return;
                 };
-                // Drain the request head so the client can finish sending.
+                // Capture the whole request body so the protocol assertions
+                // do not depend on TCP combining headers and body in one read.
+                let mut request = Vec::new();
                 let mut scratch = [0u8; 4096];
-                let _ = socket.read(&mut scratch).await;
+                loop {
+                    let Ok(count) = socket.read(&mut scratch).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&scratch[..count]);
+                    if let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..head_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.split_once(':').and_then(|(key, value)| {
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= head_end + 4 + length {
+                            break;
+                        }
+                    }
+                    assert!(request.len() < 16 * 1024, "fixture request too large");
+                }
                 seen_task
                     .lock()
                     .unwrap()
-                    .push(String::from_utf8_lossy(&scratch).into_owned());
+                    .push(String::from_utf8_lossy(&request).into_owned());
                 let reason = match status {
                     200 => "OK",
                     400 => "Bad Request",
@@ -869,6 +985,7 @@ mod tests {
             authorize_url: format!("http://{addr}/authorize"),
             token_url: format!("http://{addr}/token"),
             device_code_url: format!("http://{addr}/device"),
+            device_poll_url: format!("http://{addr}/device/poll"),
         }
     }
 
@@ -1185,6 +1302,7 @@ mod tests {
                     authorize_url: format!("http://{addr}/authorize"),
                     token_url: format!("http://{addr}/token"),
                     device_code_url: format!("http://{addr}/device"),
+                    device_poll_url: format!("http://{addr}/device/poll"),
                 },
             );
         let refresh_task = tokio::spawn({
@@ -1204,75 +1322,62 @@ mod tests {
         assert_eq!(store.openai_codex().unwrap().unwrap(), newer);
     }
 
-    #[tokio::test]
-    async fn device_poll_pending_then_success() {
-        // Superseded by `device_login_pending_then_success_persists`,
-        // which drives the same two replies through the full
-        // `login_device` loop. Kept as the helper-level contract: the
-        // polling helper surfaces `authorization_pending` instead of
-        // failing on the 400 status.
-        let dir = tempfile::tempdir().unwrap();
-        let fix = fixture(vec![
-            (400, r#"{"error":"authorization_pending"}"#.into()),
-            (200, success_token_body("refresh-1")),
-        ])
-        .await;
-        let auth = auth_with_fixture(&dir, &fix).await;
-        let cancel = CancellationToken::new();
-        let credential = auth
-            .request_token(
-                auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({"grant_type":"device_code"})),
-                &cancel,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            credential.get("error").and_then(Value::as_str),
-            Some("authorization_pending")
+    #[test]
+    fn codex_device_reply_requires_openai_fields_and_bounds_polling() {
+        let device = parse_codex_device_code(&json!({
+            "device_auth_id": "device-1",
+            "user_code": "ABCD-EFGH",
+            "interval": "2",
+        }))
+        .unwrap();
+        assert_eq!(device.interval, 3);
+        assert_eq!(device.expires_in, CODEX_DEVICE_MAX_WAIT);
+        assert!(
+            parse_codex_device_code(&json!({
+                "device_code": "rfc-8628-code",
+                "user_code": "ABCD-EFGH",
+            }))
+            .is_err()
         );
-        let credential = auth
-            .request_token(
-                auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({"grant_type":"device_code"})),
-                &cancel,
-            )
-            .await
-            .unwrap();
-        let parsed = credential_from_token(&credential, None).unwrap();
-        assert_eq!(parsed.refresh, "refresh-1");
-        // Request bodies never carry tokens into errors: a bad reply maps to
-        // a status-only error with no body echo.
-        assert_eq!(fix.seen.lock().unwrap().len(), 2);
+        assert!(
+            parse_codex_device_code(&json!({
+                "device_auth_id": "device-1",
+                "user_code": "ABCD-EFGH",
+                "expires_in": 0,
+            }))
+            .is_err()
+        );
     }
 
-    /// AUTH-1: `authorization_pending` through the full `login_device`
-    /// loop — device-code grant, one pending poll, then success — persists
-    /// the exchanged credential and finishes. The fixture's device grant
-    /// uses `interval: 0` so the loop polls immediately (no suite sleep).
+    /// OpenAI's device flow polls for a code, then exchanges it for tokens.
+    /// A pending 403 must not finish login or persist a partial credential.
     #[tokio::test]
     async fn device_login_pending_then_success_persists() {
         let dir = tempfile::tempdir().unwrap();
-        let device_body = serde_json::json!({
-            "device_code": "device-1",
+        let device_body = json!({
+            "device_auth_id": "device-1",
             "user_code": "ABCD-EFGH",
-            "verification_uri": "https://example.com/device",
-            "expires_in": 900,
-            "interval": 0,
+            "interval": "3",
         })
         .to_string();
         let fix = fixture(vec![
             (200, device_body),
-            (400, r#"{"error":"authorization_pending"}"#.into()),
+            (403, "".into()),
+            (
+                200,
+                json!({"authorization_code":"code-1","code_verifier":"verifier-1"}).to_string(),
+            ),
             (200, success_token_body("refresh-device-1")),
         ])
         .await;
         let auth = auth_with_fixture(&dir, &fix).await;
         let mut events = Vec::new();
         let credential = auth
-            .login_device(&CancellationToken::new(), |event| events.push(event))
+            .login_device_with_sleep(
+                &CancellationToken::new(),
+                |event| events.push(event),
+                |_, _| async { Ok(()) },
+            )
             .await
             .unwrap();
         assert_eq!(credential.refresh, "refresh-device-1");
@@ -1285,33 +1390,79 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.refresh, "refresh-device-1");
         assert!(events.contains(&AuthEvent::Started));
+        assert!(events.contains(&AuthEvent::DeviceCode {
+            verification_url: CODEX_DEVICE_VERIFICATION_URL.into(),
+            user_code: "ABCD-EFGH".into(),
+            expires_in: CODEX_DEVICE_MAX_WAIT,
+            interval: 3,
+        }));
         assert!(events.contains(&AuthEvent::Finished));
+        let requests = fix.seen.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("POST /device "));
+        assert!(requests[1].starts_with("POST /device/poll "));
+        assert!(requests[1].contains("\"device_auth_id\":\"device-1\""));
+        assert!(requests[1].contains("\"user_code\":\"ABCD-EFGH\""));
+        assert!(requests[2].starts_with("POST /device/poll "));
+        assert!(requests[3].starts_with("POST /token "));
+        let form =
+            url::form_urlencoded::parse(requests[3].split("\r\n\r\n").nth(1).unwrap().as_bytes())
+                .into_owned()
+                .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(form["grant_type"], "authorization_code");
+        assert_eq!(form["code"], "code-1");
+        assert_eq!(form["code_verifier"], "verifier-1");
+        assert_eq!(form["redirect_uri"], CODEX_DEVICE_REDIRECT_URI);
+        assert_eq!(form["client_id"], OPENAI_CODEX_CLIENT_ID);
+    }
+
+    #[tokio::test]
+    async fn device_login_failed_exchange_never_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let fix = fixture(vec![
+            (
+                200,
+                json!({"device_auth_id":"device-1","user_code":"ABCD-EFGH"}).to_string(),
+            ),
+            (
+                200,
+                json!({"authorization_code":"code-1","code_verifier":"verifier-1"}).to_string(),
+            ),
+            (
+                400,
+                r#"{"error":"invalid_grant","secret":"do-not-print"}"#.into(),
+            ),
+        ])
+        .await;
+        let auth = auth_with_fixture(&dir, &fix).await;
+        let error = auth
+            .login_device_with_sleep(&CancellationToken::new(), |_| {}, |_, _| async { Ok(()) })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("400"));
+        assert!(!error.to_string().contains("do-not-print"));
+        assert!(!dir.path().join("auth.json").exists());
         assert_eq!(fix.seen.lock().unwrap().len(), 3);
     }
 
-    /// AUTH-1: `slow_down` through the full `login_device` loop.
-    /// `slow_down` raises the next poll interval by exactly 5s: the
-    /// device grant's `interval: 0` is normalized to the 5s RFC 8628
-    /// default, so the test records every requested poll wait through
-    /// the injectable sleep and asserts the sequence is `[5, 10]` —
-    /// default first poll, backed-off second poll. No clock is paused
-    /// (real-socket I/O and paused clocks starve each other); the
-    /// recording sleep returns immediately so the suite never waits.
+    /// A pending 404 repeats at the server's default interval; Codex does
+    /// not use the RFC 8628 `slow_down` token response.
     #[tokio::test]
-    async fn device_login_slow_down_delays_the_next_poll() {
+    async fn device_login_pending_reuses_poll_interval() {
         use std::sync::{Arc, Mutex};
         let dir = tempfile::tempdir().unwrap();
-        let device_body = serde_json::json!({
-            "device_code": "device-1",
+        let device_body = json!({
+            "device_auth_id": "device-1",
             "user_code": "ABCD-EFGH",
-            "verification_uri": "https://example.com/device",
-            "expires_in": 900,
-            "interval": 0,
         })
         .to_string();
         let fix = fixture(vec![
             (200, device_body),
-            (400, r#"{"error":"slow_down"}"#.into()),
+            (404, "".into()),
+            (
+                200,
+                json!({"authorization_code":"code-1","code_verifier":"verifier-1"}).to_string(),
+            ),
             (200, success_token_body("refresh-slow-1")),
         ])
         .await;
@@ -1333,37 +1484,34 @@ mod tests {
         assert_eq!(credential.refresh, "refresh-slow-1");
         assert_eq!(
             *waits.lock().unwrap(),
-            vec![5, 10],
-            "slow_down must back the next poll off by exactly 5s"
+            vec![5, 5],
+            "pending polls must use the default interval"
         );
-        assert_eq!(fix.seen.lock().unwrap().len(), 3);
+        assert_eq!(fix.seen.lock().unwrap().len(), 4);
     }
 
-    /// AUTH-1: `expired_token` through the full `login_device` loop
-    /// surfaces expiry — not a generic failure — and persists nothing.
-    /// `login_device` itself emits no `Failed` event (only the Copilot
-    /// wrapper does); the terminal `DeviceCodeExpired` error is the
-    /// contract the caller matches on.
+    /// A short device grant expires before the next poll and stores nothing.
     #[tokio::test]
     async fn device_login_expired_token_fails_without_persisting() {
         let dir = tempfile::tempdir().unwrap();
-        let device_body = serde_json::json!({
-            "device_code": "device-1",
+        let device_body = json!({
+            "device_auth_id": "device-1",
             "user_code": "ABCD-EFGH",
-            "verification_uri": "https://example.com/device",
-            "expires_in": 900,
-            "interval": 0,
+            "expires_in": 1,
         })
         .to_string();
-        let fix = fixture(vec![
-            (200, device_body),
-            (400, r#"{"error":"expired_token"}"#.into()),
-        ])
-        .await;
+        let fix = fixture(vec![(200, device_body)]).await;
         let auth = auth_with_fixture(&dir, &fix).await;
         let mut events = Vec::new();
         let error = auth
-            .login_device(&CancellationToken::new(), |event| events.push(event))
+            .login_device_with_sleep(
+                &CancellationToken::new(),
+                |event| events.push(event),
+                |_, _| async {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Ok(())
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -1374,10 +1522,9 @@ mod tests {
             !dir.path().join("auth.json").exists(),
             "expired grant must persist nothing"
         );
-        // The loop emits Started + DeviceCode, then returns the terminal
-        // error with no success event; `Failed` is a wrapper-level event.
         assert!(events.contains(&AuthEvent::Started));
         assert!(!events.contains(&AuthEvent::Finished));
+        assert_eq!(fix.seen.lock().unwrap().len(), 1);
     }
 
     /// AUTH-1: `access_denied` through the full `login_device` loop
@@ -1386,25 +1533,22 @@ mod tests {
     #[tokio::test]
     async fn device_login_access_denied_is_sanitized_without_persisting() {
         let dir = tempfile::tempdir().unwrap();
-        let device_body = serde_json::json!({
-            "device_code": "device-1",
+        let device_body = json!({
+            "device_auth_id": "device-1",
             "user_code": "ABCD-EFGH",
-            "verification_uri": "https://example.com/device",
-            "expires_in": 900,
-            "interval": 0,
         })
         .to_string();
         let fix = fixture(vec![
             (200, device_body),
             (
-                400,
+                403,
                 r#"{"error":"access_denied","secret":"shh-device-secret"}"#.into(),
             ),
         ])
         .await;
         let auth = auth_with_fixture(&dir, &fix).await;
         let error = auth
-            .login_device(&CancellationToken::new(), |_| {})
+            .login_device_with_sleep(&CancellationToken::new(), |_| {}, |_, _| async { Ok(()) })
             .await
             .unwrap_err();
         let rendered = error.to_string();
@@ -1419,10 +1563,8 @@ mod tests {
         );
     }
 
-    /// AUTH-1: strict-status paths stay strict. Browser/refresh exchanges
-    /// (`token_strict`) reject a `400 authorization_pending` that the
-    /// device-polling helper accepts, mapping it to a status-only error
-    /// with no body echo.
+    /// Browser and device code exchanges reject non-success OAuth replies
+    /// without echoing the response body.
     #[tokio::test]
     async fn strict_token_exchange_rejects_polling_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -1446,17 +1588,14 @@ mod tests {
 
     /// AUTH-1: cancelling mid-poll aborts the in-flight request and the
     /// `login_device` loop surfaces `Cancelled`. The fixture holds the
-    /// token reply until the cancel fires; what matters is the outcome,
+    /// poll reply until the cancel fires; what matters is the outcome,
     /// not which `select!` branch won the race.
     #[tokio::test]
     async fn cancellation_during_device_poll_aborts_login() {
         let dir = tempfile::tempdir().unwrap();
-        let device_body = serde_json::json!({
-            "device_code": "device-1",
+        let device_body = json!({
+            "device_auth_id": "device-1",
             "user_code": "ABCD-EFGH",
-            "verification_uri": "https://example.com/device",
-            "expires_in": 900,
-            "interval": 0,
         })
         .to_string();
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1481,11 +1620,11 @@ mod tests {
                         tokio::io::AsyncWriteExt::write_all(&mut socket, device_body.as_bytes())
                             .await;
                 } else {
-                    // Token poll: hold the reply until the test cancels.
+                    // Device-auth poll: hold the reply until cancellation.
                     let _ = (&mut gate_rx).await;
-                    let body = r#"{"error":"authorization_pending"}"#;
+                    let body = "";
                     let head = format!(
-                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        "HTTP/1.1 403 Forbidden\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, head.as_bytes()).await;
@@ -1499,6 +1638,7 @@ mod tests {
                 authorize_url: format!("http://{addr}/authorize"),
                 token_url: format!("http://{addr}/token"),
                 device_code_url: format!("http://{addr}/device"),
+                device_poll_url: format!("http://{addr}/device/poll"),
             });
         let cancel = CancellationToken::new();
         let canceller = cancel.clone();
@@ -1506,7 +1646,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             canceller.cancel();
         });
-        let error = auth.login_device(&cancel, |_| {}).await.unwrap_err();
+        let error = auth
+            .login_device_with_sleep(&cancel, |_| {}, |_, _| async { Ok(()) })
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, AuthError::Cancelled),
             "in-flight cancel must surface Cancelled, got: {error:?}"
@@ -1519,85 +1662,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn device_poll_errors_map_before_status() {
+    async fn device_poll_rejects_bad_code_and_redacts_http_errors() {
         let dir = tempfile::tempdir().unwrap();
-        // `expired_token` on a 400 surface as the parsed error value (the
-        // caller maps it to expiry), not as a generic HTTP failure.
-        let fix = fixture(vec![(400, r#"{"error":"expired_token"}"#.into())]).await;
-        let auth = auth_with_fixture(&dir, &fix).await;
-        let value = auth
-            .request_token(
-                auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({"grant_type":"device_code"})),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            value.get("error").and_then(Value::as_str),
-            Some("expired_token")
-        );
-
-        // `access_denied` likewise parses so the caller can deny sanitely.
-        let fix = fixture(vec![(400, r#"{"error":"access_denied"}"#.into())]).await;
-        let auth = auth_with_fixture(&dir, &fix).await;
-        let value = auth
-            .request_token(
-                auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({"grant_type":"device_code"})),
-                &CancellationToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            value.get("error").and_then(Value::as_str),
-            Some("access_denied")
-        );
-
-        // Unrecognized errors on non-success stay generic HTTP failures with
-        // no body echo (never leak token response bodies).
-        let fix = fixture(vec![(400, r#"{"error":"weird","token":"abc"}"#.into())]).await;
+        let device = parse_codex_device_code(&json!({
+            "device_auth_id": "device-1", "user_code": "ABCD-EFGH",
+        }))
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let cancel = CancellationToken::new();
+        let fix = fixture(vec![(
+            200,
+            r#"{"authorization_code":"secret-code"}"#.into(),
+        )])
+        .await;
         let auth = auth_with_fixture(&dir, &fix).await;
         let error = auth
-            .request_token(
-                auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({"grant_type":"device_code"})),
-                &CancellationToken::new(),
-            )
+            .poll_device_until(&device, &cancel, deadline)
             .await
             .unwrap_err();
-        let rendered = error.to_string();
-        assert!(rendered.contains("400"), "unexpected: {rendered}");
-        assert!(!rendered.contains("abc"), "body leaked: {rendered}");
-    }
+        assert!(error.to_string().contains("code_verifier"));
+        assert!(!error.to_string().contains("secret-code"));
 
-    #[tokio::test]
-    async fn slow_down_increases_the_poll_interval() {
-        // Superseded by `device_login_slow_down_delays_the_next_poll`,
-        // which asserts the real `[5, 10]` wait sequence through the full
-        // loop. Kept as the unit contract for the `slow_down → +5s`
-        // mapping itself.
-        let dir = tempfile::tempdir().unwrap();
-        let fix = fixture(vec![(400, r#"{"error":"slow_down"}"#.into())]).await;
+        let fix = fixture(vec![(400, r#"{"error":"weird","secret":"abc"}"#.into())]).await;
         let auth = auth_with_fixture(&dir, &fix).await;
-        let value = auth
-            .request_token(
-                auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({"grant_type":"device_code"})),
-                &CancellationToken::new(),
-            )
+        let error = auth
+            .poll_device_until(&device, &cancel, deadline)
             .await
-            .unwrap();
-        let interval = 5u64;
-        let next = match value.get("error").and_then(Value::as_str) {
-            Some("slow_down") => interval.saturating_add(5),
-            _ => interval,
-        };
-        assert_eq!(next, 10);
+            .unwrap_err();
+        assert!(error.to_string().contains("400"));
+        assert!(!error.to_string().contains("abc"));
     }
 
     #[tokio::test]
@@ -1606,10 +1699,10 @@ mod tests {
         let fix = fixture(vec![(200, "not json".into())]).await;
         let auth = auth_with_fixture(&dir, &fix).await;
         let error = auth
-            .request_token(
+            .request_json(
                 auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({})),
+                    .post(auth.endpoints.device_code_url.clone())
+                    .json(&json!({})),
                 &CancellationToken::new(),
             )
             .await
@@ -1621,10 +1714,10 @@ mod tests {
         let fix = fixture(vec![(200, big)]).await;
         let auth = auth_with_fixture(&dir, &fix).await;
         let error = auth
-            .request_token(
+            .request_json(
                 auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({})),
+                    .post(auth.endpoints.device_code_url.clone())
+                    .json(&json!({})),
                 &CancellationToken::new(),
             )
             .await
@@ -1644,10 +1737,10 @@ mod tests {
         let fix = fixture(vec![(200, success_token_body("r"))]).await;
         let auth = auth_with_fixture(&dir, &fix).await;
         let error = auth
-            .request_token(
+            .request_json(
                 auth.http
-                    .post(auth.endpoints.token_url.clone())
-                    .form(&serde_json::json!({})),
+                    .post(auth.endpoints.device_code_url.clone())
+                    .json(&json!({})),
                 &cancel,
             )
             .await
@@ -1860,6 +1953,7 @@ mod tests {
                     authorize_url: format!("http://{addr}/authorize"),
                     token_url: format!("http://{addr}/token"),
                     device_code_url: format!("http://{addr}/device"),
+                    device_poll_url: format!("http://{addr}/device/poll"),
                 },
             );
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
