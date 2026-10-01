@@ -277,7 +277,9 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let session_store = session_store.expect("interactive mode always builds the session store");
 
     let session = if let Some(selector) = &cli.resume {
-        session_store.load(selector).with_context(|| format!("load session `{selector}`"))?
+        session_store
+            .load(selector)
+            .with_context(|| format!("load session `{selector}`"))?
     } else {
         session_store.create(SessionCreateOptions {
             provider: Some(provider_name.clone()),
@@ -315,23 +317,27 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         .with_provider_factory(provider_factory);
     let agent = builder.build().await?;
 
-    let input_reporter = herdr_reporter.as_ref().map(|(reporter, _)| reporter.clone());
-    let input_task = tokio::spawn(async move {
-        let mut input_rx = tui_input_rx;
-        loop {
-            tokio::select! {
-                _ = runtime_input_tx.closed() => break,
-                input = input_rx.recv() => {
-                    let Some(input) = input else { break };
-                    if matches!(&input, tui::InputMessage::Message(_) | tui::InputMessage::InvokeSkill { .. } | tui::InputMessage::CompactSession) {
-                        if let Some(reporter) = &input_reporter { reporter.report(herdr::State::Working, None); }
-                    }
-                    if runtime_input_tx.send(tui_adapter::into_agent_input(input)).is_err() { break; }
-                }
+    let input_reporter = herdr_reporter
+        .as_ref()
+        .map(|(reporter, _)| reporter.clone());
+    let input_task = tokio::spawn(tui_adapter::forward_inputs(
+        tui_input_rx,
+        runtime_input_tx,
+        move |input| {
+            if matches!(
+                input,
+                tui::InputMessage::Message(_)
+                    | tui::InputMessage::InvokeSkill { .. }
+                    | tui::InputMessage::CompactSession
+            ) && let Some(reporter) = &input_reporter
+            {
+                reporter.report(herdr::State::Working, None);
             }
-        }
-    });
-    let event_herdr_reporter = herdr_reporter.as_ref().map(|(reporter, _)| reporter.clone());
+        },
+    ));
+    let event_herdr_reporter = herdr_reporter
+        .as_ref()
+        .map(|(reporter, _)| reporter.clone());
     let herdr_model = config.model.clone();
     let event_task = tokio::spawn(async move {
         loop {
@@ -404,7 +410,9 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     if let Some((reporter, task)) = herdr_reporter {
         drop(reporter);
         let _ = task.await;
-        if let Some(herdr) = herdr { herdr.release().await; }
+        if let Some(herdr) = herdr {
+            herdr.release().await;
+        }
     }
     ui_result?;
     Ok(ExitCode::SUCCESS)

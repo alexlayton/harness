@@ -86,13 +86,26 @@ fn observe_herdr_events(
         let mut model = model;
         while let Some(event) = input.recv().await {
             match &event {
-                AgentEvent::ModelChanged { model: changed, .. } => { model = changed.clone(); reporter.model(changed.clone()); }
-                AgentEvent::TextDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } => reporter.report(crate::herdr::State::Working, None),
-                AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(crate::herdr::State::Idle, None),
-                AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), model.clone()),
+                AgentEvent::ModelChanged { model: changed, .. } => {
+                    model = changed.clone();
+                    reporter.model(changed.clone());
+                }
+                AgentEvent::TextDelta(_)
+                | AgentEvent::ToolCallStarted { .. }
+                | AgentEvent::Retrying { .. } => {
+                    reporter.report(crate::herdr::State::Working, None)
+                }
+                AgentEvent::TurnFinished | AgentEvent::OperationFinished => {
+                    reporter.report(crate::herdr::State::Idle, None)
+                }
+                AgentEvent::SessionChanged { id, .. } => {
+                    reporter.with_session(id.clone(), model.clone())
+                }
                 _ => {}
             }
-            if tx.send(event).is_err() { break; }
+            if tx.send(event).is_err() {
+                break;
+            }
         }
     });
     rx
@@ -484,7 +497,9 @@ async fn run_headless_resolved(
 
     let event_rx = if let Some((reporter, _)) = &herdr_reporter {
         observe_herdr_events(event_rx, reporter.clone(), config.model.clone())
-    } else { event_rx };
+    } else {
+        event_rx
+    };
     let exit_code = drive_headless_events_with_cancel(event_rx, args.verbose, Some(&cancel)).await;
     let interrupted = cancel.is_cancelled();
     cancel.cancel();
@@ -494,7 +509,9 @@ async fn run_headless_resolved(
     if let Some((reporter, task)) = herdr_reporter {
         drop(reporter);
         let _ = task.await;
-        if let Some(herdr) = herdr { herdr.release().await; }
+        if let Some(herdr) = herdr {
+            herdr.release().await;
+        }
     }
     if interrupted {
         // The agent has already persisted `TurnCancelled`; 130 mirrors the

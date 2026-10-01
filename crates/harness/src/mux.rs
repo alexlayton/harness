@@ -131,8 +131,10 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                     if let Some(slot) = slots.get(&id)
                         && slot.input.send(tui_adapter::into_agent_input(input)).is_ok()
                     {
+                        if starts_work && let Some((reporter, _)) = &herdr_reporter {
+                            reporter.report(crate::herdr::State::Working, None);
+                        }
                         if starts_work {
-                            if let Some((reporter, _)) = &herdr_reporter { reporter.report(crate::herdr::State::Working, None); }
                             let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Running });
                         }
                     }
@@ -250,7 +252,9 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
     if let Some((reporter, task)) = herdr_reporter {
         drop(reporter);
         let _ = task.await;
-        if let Some(herdr) = herdr { herdr.release().await; }
+        if let Some(herdr) = herdr {
+            herdr.release().await;
+        }
     }
     terminal_result
 }
