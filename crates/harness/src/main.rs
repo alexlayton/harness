@@ -295,19 +295,8 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
 
-    let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
-        .with_secret_masker(config.secret_masker.clone())
-        .with_reasoning(config.reasoning)
-        .with_project_context(context_bundle.rendered)
-        .with_compaction(config.compaction.clone())
-        .with_subagents(config.subagents, config.rtk)
-        .with_mcp_servers(config.mcp_servers.clone())
-        .with_session(session_store, session)
-        .with_provider_factory(provider_factory);
-    let agent = builder.build().await?;
-
-    // Construct the terminal before claiming the Herdr pane. Setup errors
-    // must not leave a report behind without a matching release.
+    // Construct the terminal before assembling the agent or claiming the
+    // Herdr pane, so setup errors leave neither running MCPs nor a report.
     let update_notice = update::check_latest().await;
     let ui = CrossTerm::new(
         &config.model,
@@ -331,6 +320,17 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         config.tui_minimal,
         workspace_root,
     )?;
+    let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+        .with_secret_masker(config.secret_masker.clone())
+        .with_reasoning(config.reasoning)
+        .with_project_context(context_bundle.rendered)
+        .with_compaction(config.compaction.clone())
+        .with_subagents(config.subagents, config.rtk)
+        .with_mcp_servers(config.mcp_servers.clone())
+        .with_session(session_store, session)
+        .with_provider_factory(provider_factory);
+    let agent = builder.build().await?;
+
     let herdr_options = herdr::ResumeOptions {
         provider: provider_name.clone(),
         model: config.model.clone(),
