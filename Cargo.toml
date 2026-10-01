@@ -5,9 +5,8 @@ default-members = ["crates/harness", "crates/agent"]
 
 # Release ships lean: symbol tables are stripped, with cross-crate DCE via fat
 # LTO and one codegen unit for inlining. These slow release builds by design —
-# never mirror them in `[profile.dev]`. Keep unwind semantics so the mux can
-# contain one agent-task panic, report the failed slot, and retain sibling
-# agents; terminal guards also get a chance to restore their modes.
+# never mirror them in `[profile.dev]`. Keep unwind semantics so terminal
+# guards can restore their modes after a panic.
 [profile.release]
 strip = "symbols"
 lto = "fat"

@@ -5,7 +5,6 @@ mod headless;
 mod herdr;
 mod login;
 mod mcp_command;
-mod mux;
 mod tui_adapter;
 mod update;
 mod worktree;
@@ -190,13 +189,6 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let workspace_root =
         std::fs::canonicalize(std::env::current_dir().with_context(|| "resolve workspace root")?)?;
     tracing::info!(stage = "workspace", elapsed_ms = since_start());
-
-    // Mux owns per-slot providers, registries, stores, MCP runtimes, and
-    // cancellation. Dispatch before assembling any single-workspace state.
-    if matches!(&cli.command, Some(Command::Mux)) {
-        mux::run(config, &cli, workspace_root).await?;
-        return Ok(ExitCode::SUCCESS);
-    }
 
     // Reuse auth handles loaded during config resolution instead of re-reading
     // auth.json. OAuth providers remain constructible without credentials so

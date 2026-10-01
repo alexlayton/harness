@@ -59,7 +59,7 @@ newer is required to consume the resume argv after `--`. Arguments are checked
 against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
 characters). Reports are coalesced, best-effort, and use a short timeout;
 failures do not affect Harness output. Outside a fully configured Herdr pane,
-no integration is activated. TUI, mux, and headless lifecycles report state and
+no integration is activated. TUI and headless lifecycles report state and
 release the pane on process exit. ACP remains independent because it multiplexes
 multiple editor sessions over a single JSON-RPC process. See [Herdr's
 integration guide](https://herdr.dev/docs/add-herdr-support/) for Herdr-side
@@ -375,7 +375,6 @@ harness acp --provider openai-codex
 |---|---|
 | `prompt [PROMPT]` | Run one prompt and print only the final answer to stdout. Reads piped stdin when the prompt is omitted. |
 | `acp` | Serve ACP over stdio (stdout carries JSON-RPC protocol traffic only). |
-| `mux` | Start the experimental multi-agent terminal frontend. |
 | `worktree <branch>` | Run in a dedicated Git worktree (see the [README](../README.md#usage-overview)). |
 | `mcp` | List, add, or delete MCP servers (see [MCP servers](#mcp-servers)). |
 | `login <provider>` | Authenticate with an OAuth provider. |
