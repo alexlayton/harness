@@ -244,6 +244,8 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
             session_store,
             prompt,
             context_bundle.rendered,
+            cli.no_context_files,
+            cli.defer_session_sync,
         )
         .await;
     }
@@ -279,12 +281,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
             ..SessionCreateOptions::default()
         })?
     };
-    let herdr = herdr::Herdr::from_env();
-    let herdr_reporter = herdr.as_ref().map(|h| h.start());
-    if let Some((reporter, _)) = &herdr_reporter {
-        reporter.with_session(session.id().to_string(), config.model.clone());
-    }
-
+    let session_id = session.id().to_string();
     let providers = ProviderArg::ALL
         .iter()
         .map(ToString::to_string)
@@ -309,68 +306,8 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         .with_provider_factory(provider_factory);
     let agent = builder.build().await?;
 
-    let input_reporter = herdr_reporter
-        .as_ref()
-        .map(|(reporter, _)| reporter.clone());
-    let input_task = tokio::spawn(tui_adapter::forward_inputs(
-        tui_input_rx,
-        runtime_input_tx,
-        move |input| {
-            if matches!(
-                input,
-                tui::InputMessage::Message(_)
-                    | tui::InputMessage::InvokeSkill { .. }
-                    | tui::InputMessage::CompactSession
-            ) && let Some(reporter) = &input_reporter
-            {
-                reporter.report(herdr::State::Working, None);
-            }
-        },
-    ));
-    let event_herdr_reporter = herdr_reporter
-        .as_ref()
-        .map(|(reporter, _)| reporter.clone());
-    let herdr_model = config.model.clone();
-    let event_task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                biased;
-                event = runtime_event_rx.recv() => {
-                    let Some(event) = event else { break };
-                    if let AgentEvent::ModelChanged { provider, model } = &event
-                        && let Err(error) = save_settings(provider, model)
-                    {
-                        tracing::warn!(error = %error, "could not persist model settings");
-                    }
-                    if let AgentEvent::ReasoningChanged { level } = &event
-                        && let Ok(reasoning) = level.parse()
-                        && let Err(error) = save_reasoning(reasoning)
-                    {
-                        tracing::warn!(error = %error, "could not persist reasoning setting");
-                    }
-                    if let Some(reporter) = &event_herdr_reporter {
-                        match &event {
-                            AgentEvent::ModelChanged { model, .. } => reporter.model(model.clone()),
-                            AgentEvent::TextDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } => reporter.report(herdr::State::Working, None),
-                            AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(herdr::State::Idle, None),
-                            AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), herdr_model.clone()),
-                            _ => {}
-                        }
-                    }
-                    if ui_event_tx.send(tui_adapter::into_ui_event(event)).is_err() {
-                        break;
-                    }
-                }
-                _ = ui_event_tx.closed() => break,
-            }
-        }
-    });
-    let agent_task = tokio::spawn(agent.run(runtime_input_rx, runtime_event_tx));
-
-    // The crossterm frontend drives the same agent as headless mode and
-    // differs only in rendering and input handling. The first paint happens
-    // inside `CrossTerm::run`, so this is the end of the startup path.
-    tracing::info!(stage = "pre-first-frame", elapsed_ms = since_start());
+    // Construct the terminal before claiming the Herdr pane. Setup errors
+    // must not leave a report behind without a matching release.
     let update_notice = update::check_latest().await;
     let ui = CrossTerm::new(
         &config.model,
@@ -394,6 +331,89 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         config.tui_minimal,
         workspace_root,
     )?;
+    let herdr_options = herdr::ResumeOptions {
+        provider: provider_name.clone(),
+        model: config.model.clone(),
+        reasoning: config.reasoning.as_str().into(),
+        no_context_files: cli.no_context_files,
+        defer_session_sync: cli.defer_session_sync,
+    };
+    let herdr = herdr::Herdr::from_env();
+    let herdr_reporter = herdr.as_ref().map(|h| h.start());
+    if let Some((reporter, _)) = &herdr_reporter {
+        reporter.with_session(session_id, &herdr_options);
+    }
+
+    let input_reporter = herdr_reporter
+        .as_ref()
+        .map(|(reporter, _)| reporter.clone());
+    let input_task = tokio::spawn(tui_adapter::forward_inputs(
+        tui_input_rx,
+        runtime_input_tx,
+        move |input| {
+            if matches!(
+                input,
+                tui::InputMessage::Message(_)
+                    | tui::InputMessage::InvokeSkill { .. }
+                    | tui::InputMessage::CompactSession
+            ) && let Some(reporter) = &input_reporter
+            {
+                reporter.report(herdr::State::Working, None);
+            }
+        },
+    ));
+    let event_herdr_reporter = herdr_reporter
+        .as_ref()
+        .map(|(reporter, _)| reporter.clone());
+    let event_task = tokio::spawn(async move {
+        let mut herdr_options = herdr_options;
+        loop {
+            tokio::select! {
+                biased;
+                event = runtime_event_rx.recv() => {
+                    let Some(event) = event else { break };
+                    if let AgentEvent::ModelChanged { provider, model } = &event
+                        && let Err(error) = save_settings(provider, model)
+                    {
+                        tracing::warn!(error = %error, "could not persist model settings");
+                    }
+                    if let AgentEvent::ReasoningChanged { level } = &event
+                        && let Ok(reasoning) = level.parse()
+                        && let Err(error) = save_reasoning(reasoning)
+                    {
+                        tracing::warn!(error = %error, "could not persist reasoning setting");
+                    }
+                    if let Some(reporter) = &event_herdr_reporter {
+                        match &event {
+                            AgentEvent::ModelChanged { provider, model } => {
+                                herdr_options.provider = provider.clone();
+                                herdr_options.model = model.clone();
+                                reporter.resume_options(&herdr_options);
+                            }
+                            AgentEvent::ReasoningChanged { level } => {
+                                herdr_options.reasoning = level.clone();
+                                reporter.resume_options(&herdr_options);
+                            }
+                            AgentEvent::TextDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } => reporter.report(herdr::State::Working, None),
+                            AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(herdr::State::Idle, None),
+                            AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), &herdr_options),
+                            _ => {}
+                        }
+                    }
+                    if ui_event_tx.send(tui_adapter::into_ui_event(event)).is_err() {
+                        break;
+                    }
+                }
+                _ = ui_event_tx.closed() => break,
+            }
+        }
+    });
+    let agent_task = tokio::spawn(agent.run(runtime_input_rx, runtime_event_tx));
+
+    // The crossterm frontend drives the same agent as headless mode and
+    // differs only in rendering and input handling. The first paint happens
+    // inside `CrossTerm::run`, so this is the end of the startup path.
+    tracing::info!(stage = "pre-first-frame", elapsed_ms = since_start());
     let ui_result = ui.run(ui_event_rx, tui_input_tx, cancel.clone()).await;
     cancel.cancel();
     let _ = input_task.await;

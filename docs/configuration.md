@@ -54,7 +54,8 @@ When `HERDR_ENV=1` and `HERDR_PANE_ID`, `HERDR_BIN_PATH`, and
 CLI at `HERDR_BIN_PATH`. Reports use the stable `harness` source and `Harness`
 agent name, report working as soon as a turn starts and idle when ready for
 input, and attach the actual agent session ID. Resume argv uses the executable
-name `harness` followed by `--model MODEL --resume-session ID`; Herdr 0.9.2 or
+name `harness` with the active provider, model, reasoning effort, session ID,
+and any `--no-context-files` or `--defer-session-sync` options. Herdr 0.9.2 or
 newer is required to consume the resume argv after `--`. Arguments are checked
 against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
 characters). Reports are coalesced, best-effort, and use a short timeout;

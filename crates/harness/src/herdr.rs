@@ -12,6 +12,39 @@ static LAST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 type ReportSnapshot = (State, Option<String>, Option<Vec<String>>);
 
+/// Settings needed to reopen a session with the same provider and runtime policy.
+#[derive(Clone)]
+pub(crate) struct ResumeOptions {
+    pub provider: String,
+    pub model: String,
+    pub reasoning: String,
+    pub no_context_files: bool,
+    pub defer_session_sync: bool,
+}
+
+impl ResumeOptions {
+    fn argv(&self, id: &str) -> Vec<String> {
+        let mut argv = vec![
+            "harness".into(),
+            "--provider".into(),
+            self.provider.clone(),
+            "--model".into(),
+            self.model.clone(),
+            "--reasoning-effort".into(),
+            self.reasoning.clone(),
+            "--resume-session".into(),
+            id.into(),
+        ];
+        if self.no_context_files {
+            argv.push("--no-context-files".into());
+        }
+        if self.defer_session_sync {
+            argv.push("--defer-session-sync".into());
+        }
+        argv
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // The current Harness tool policy has no approval gate to enter blocked state.
 pub(crate) enum State {
@@ -155,31 +188,18 @@ impl Reporter {
             let _ = self.tx.send(current.clone());
         }
     }
-    pub(crate) fn with_session(&self, id: String, model: String) {
+    pub(crate) fn with_session(&self, id: String, options: &ResumeOptions) {
         if let Ok(mut current) = self.current.lock() {
-            current.0 = State::Idle;
             current.1 = Some(id.clone());
-            current.2 = Some(vec![
-                "harness".into(),
-                "--model".into(),
-                model,
-                "--resume-session".into(),
-                id,
-            ]);
+            current.2 = Some(options.argv(&id));
             let _ = self.tx.send(current.clone());
         }
     }
-    pub(crate) fn model(&self, model: String) {
+    pub(crate) fn resume_options(&self, options: &ResumeOptions) {
         if let Ok(mut current) = self.current.lock()
             && let Some(id) = current.1.clone()
         {
-            current.2 = Some(vec![
-                "harness".into(),
-                "--model".into(),
-                model,
-                "--resume-session".into(),
-                id,
-            ]);
+            current.2 = Some(options.argv(&id));
             let _ = self.tx.send(current.clone());
         }
     }
@@ -234,19 +254,23 @@ mod tests {
             bin: "herdr".into(),
             pane: "pane-1".into(),
         };
-        let argv = vec![
-            "harness".into(),
-            "--model".into(),
-            "model-x".into(),
-            "--resume-session".into(),
-            "sess".into(),
-        ];
+        let argv = ResumeOptions {
+            provider: "openrouter".into(),
+            model: "model-x".into(),
+            reasoning: "low".into(),
+            no_context_files: false,
+            defer_session_sync: true,
+        }
+        .argv("sess");
         let args = h.report_args(&State::Working, Some("sess"), Some(&argv));
         assert!(args.windows(2).any(|w| w == ["--state", "working"]));
         assert!(args.windows(2).any(|w| w == ["--source", "harness"]));
         assert!(args.windows(2).any(|w| w == ["--agent", "Harness"]));
         assert!(args.windows(2).any(|w| w == ["--agent-session-id", "sess"]));
         assert!(args.windows(2).any(|w| w == ["--model", "model-x"]));
+        assert!(args.windows(2).any(|w| w == ["--provider", "openrouter"]));
+        assert!(args.windows(2).any(|w| w == ["--reasoning-effort", "low"]));
+        assert!(args.contains(&"--defer-session-sync".into()));
         assert!(args.ends_with(&argv));
     }
     #[test]
@@ -272,12 +296,35 @@ mod tests {
             pane: "pane".into(),
         };
         let (reporter, task) = h.start();
-        reporter.with_session("session-1".into(), "model-a".into());
+        let mut options = ResumeOptions {
+            provider: "openrouter".into(),
+            model: "model-a".into(),
+            reasoning: "high".into(),
+            no_context_files: true,
+            defer_session_sync: false,
+        };
         reporter.report(State::Working, None);
+        reporter.with_session("session-1".into(), &options);
         let current = reporter.current.lock().unwrap().clone();
         assert_eq!(current.1.as_deref(), Some("session-1"));
         assert!(current.2.as_ref().unwrap().contains(&"model-a".into()));
-        reporter.model("model-b".into());
+        assert_eq!(current.0, State::Working);
+        assert!(current.2.as_ref().unwrap().contains(&"openrouter".into()));
+        assert!(current.2.as_ref().unwrap().contains(&"high".into()));
+        assert!(
+            current
+                .2
+                .as_ref()
+                .unwrap()
+                .contains(&"--no-context-files".into())
+        );
+        options.model = "model-b".into();
+        reporter.resume_options(&options);
+        reporter.with_session("session-2".into(), &options);
+        let current = reporter.current.lock().unwrap().clone();
+        assert_eq!(current.0, State::Working);
+        assert_eq!(current.1.as_deref(), Some("session-2"));
+        assert!(current.2.as_ref().unwrap().contains(&"model-b".into()));
         assert!(
             reporter
                 .current

@@ -79,16 +79,21 @@ fn cancel_on_sigint(cancel: CancellationToken) {
 fn observe_herdr_events(
     mut input: mpsc::UnboundedReceiver<AgentEvent>,
     reporter: crate::herdr::Reporter,
-    model: String,
+    options: crate::herdr::ResumeOptions,
 ) -> mpsc::UnboundedReceiver<AgentEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let mut model = model;
+        let mut options = options;
         while let Some(event) = input.recv().await {
             match &event {
-                AgentEvent::ModelChanged { model: changed, .. } => {
-                    model = changed.clone();
-                    reporter.model(changed.clone());
+                AgentEvent::ModelChanged { provider, model } => {
+                    options.provider = provider.clone();
+                    options.model = model.clone();
+                    reporter.resume_options(&options);
+                }
+                AgentEvent::ReasoningChanged { level } => {
+                    options.reasoning = level.clone();
+                    reporter.resume_options(&options);
                 }
                 AgentEvent::TextDelta(_)
                 | AgentEvent::ToolCallStarted { .. }
@@ -99,7 +104,7 @@ fn observe_herdr_events(
                     reporter.report(crate::herdr::State::Idle, None)
                 }
                 AgentEvent::SessionChanged { id, .. } => {
-                    reporter.with_session(id.clone(), model.clone())
+                    reporter.with_session(id.clone(), &options)
                 }
                 _ => {}
             }
@@ -362,6 +367,8 @@ async fn run_headless(
         None,
         prompt,
         project_context,
+        no_context_files,
+        false,
     )
     .await
 }
@@ -369,6 +376,7 @@ async fn run_headless(
 /// Headless entry point used by the host after it has already loaded startup
 /// context and resolved the prompt. This avoids duplicate stdin/context work
 /// in the main frontend dispatcher.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_headless_with_prompt(
     config: &Config,
     args: &PromptArgs,
@@ -377,6 +385,8 @@ pub(crate) async fn run_headless_with_prompt(
     store: Option<SessionStore>,
     prompt: String,
     project_context: String,
+    no_context_files: bool,
+    defer_session_sync: bool,
 ) -> Result<ExitCode> {
     run_headless_resolved(
         config,
@@ -387,6 +397,8 @@ pub(crate) async fn run_headless_with_prompt(
         None,
         prompt,
         project_context,
+        no_context_files,
+        defer_session_sync,
     )
     .await
 }
@@ -415,6 +427,8 @@ async fn run_headless_with_cancel(
         external_cancel,
         prompt,
         project_context,
+        no_context_files,
+        false,
     )
     .await
 }
@@ -429,6 +443,8 @@ async fn run_headless_resolved(
     external_cancel: Option<CancellationToken>,
     prompt: String,
     project_context: String,
+    no_context_files: bool,
+    defer_session_sync: bool,
 ) -> Result<ExitCode> {
     let session = match (&args.resume, &store) {
         (Some(selector), Some(store)) => Some(
@@ -450,11 +466,7 @@ async fn run_headless_resolved(
         (None, None) => None,
     };
 
-    let herdr = crate::herdr::Herdr::from_env();
-    let herdr_reporter = herdr.as_ref().map(|h| h.start());
-    if let (Some((reporter, _)), Some(session)) = (&herdr_reporter, session.as_ref()) {
-        reporter.with_session(session.id().to_string(), config.model.clone());
-    }
+    let session_id = session.as_ref().map(|session| session.id().to_string());
     let install_sigint = external_cancel.is_none();
     let cancel = external_cancel.unwrap_or_default();
     let (input_tx, input_rx): (
@@ -478,6 +490,18 @@ async fn run_headless_resolved(
         builder = builder.with_session(store.clone(), session);
     }
     let agent = builder.build().await?;
+    let herdr_options = crate::herdr::ResumeOptions {
+        provider: config.provider.to_string(),
+        model: config.model.clone(),
+        reasoning: config.reasoning.as_str().into(),
+        no_context_files,
+        defer_session_sync,
+    };
+    let herdr = crate::herdr::Herdr::from_env();
+    let herdr_reporter = herdr.as_ref().map(|h| h.start());
+    if let (Some((reporter, _)), Some(id)) = (&herdr_reporter, session_id) {
+        reporter.with_session(id, &herdr_options);
+    }
 
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
@@ -486,9 +510,7 @@ async fn run_headless_resolved(
     if let Some((reporter, _)) = &herdr_reporter {
         reporter.report(crate::herdr::State::Working, None);
     }
-    input_tx
-        .send(InputMessage::Message(prompt))
-        .context("send prompt to agent")?;
+    let send_result = input_tx.send(InputMessage::Message(prompt));
     drop(input_tx);
 
     if install_sigint {
@@ -496,7 +518,7 @@ async fn run_headless_resolved(
     }
 
     let event_rx = if let Some((reporter, _)) = &herdr_reporter {
-        observe_herdr_events(event_rx, reporter.clone(), config.model.clone())
+        observe_herdr_events(event_rx, reporter.clone(), herdr_options)
     } else {
         event_rx
     };
@@ -505,7 +527,7 @@ async fn run_headless_resolved(
     cancel.cancel();
     // A closed event channel is not proof that the agent completed: preserve
     // panics and runtime task failures instead of returning a blank success.
-    agent_task.await.context("headless agent task failed")?;
+    let agent_result = agent_task.await;
     if let Some((reporter, task)) = herdr_reporter {
         drop(reporter);
         let _ = task.await;
@@ -513,6 +535,8 @@ async fn run_headless_resolved(
             herdr.release().await;
         }
     }
+    send_result.context("send prompt to agent")?;
+    agent_result.context("headless agent task failed")?;
     if interrupted {
         // The agent has already persisted `TurnCancelled`; 130 mirrors the
         // conventional SIGINT status while the session flush is awaited above.
