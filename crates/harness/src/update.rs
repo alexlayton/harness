@@ -262,10 +262,7 @@ fn validate_archive(archive: &Path, package: &str) -> Result<()> {
                 || name == format!("{package}/README.md")
                 || name == format!("{package}/LICENSE")
                 || name == format!("{package}/assets/")
-                || name == format!("{package}/assets/header.png") =>
-            {
-                ()
-            }
+                || name == format!("{package}/assets/header.png") => {}
             name if name == format!("{package}/harness") => binary_count += 1,
             _ => bail!("unexpected release archive member: {member}"),
         }
