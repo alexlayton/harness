@@ -44,6 +44,26 @@ setting is absent.
 
 The `/model` terminal command updates the saved provider and model. Harness
 preserves configuration keys that it does not know when it saves these values.
+Use `harness --resume-session ID` to reopen a persisted interactive session;
+headless runs use `harness prompt --resume ID PROMPT`.
+
+## Herdr integration
+
+When `HERDR_ENV=1` and `HERDR_PANE_ID`, `HERDR_BIN_PATH`, and
+`HERDR_SOCKET_PATH` are all set, Harness reports pane state through the Herdr
+CLI at `HERDR_BIN_PATH`. Reports use the stable `harness` source and `Harness`
+agent name, report working as soon as a turn starts and idle when ready for
+input, and attach the actual agent session ID. Resume argv uses the executable
+name `harness` followed by `--model MODEL --resume-session ID`; Herdr 0.9.2 or
+newer is required to consume the resume argv after `--`. Arguments are checked
+against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
+characters). Reports are coalesced, best-effort, and use a short timeout;
+failures do not affect Harness output. Outside a fully configured Herdr pane,
+no integration is activated. TUI, mux, and headless lifecycles report state and
+release the pane on process exit. ACP remains independent because it multiplexes
+multiple editor sessions over a single JSON-RPC process. See [Herdr's
+integration guide](https://herdr.dev/docs/add-herdr-support/) for Herdr-side
+behavior and requirements.
 
 Set `rtk = true` to let the bash tool rewrite supported commands through an
 installed `rtk` executable for smaller tool output. This feature is off by

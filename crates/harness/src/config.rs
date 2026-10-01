@@ -725,6 +725,10 @@ pub struct Cli {
     /// current turn's tail (not just the in-flight record) on power loss.
     #[arg(long = "defer-session-sync", default_value_t = false, global = true)]
     pub defer_session_sync: bool,
+
+    /// Resume a persisted interactive session by id, unique prefix, `latest`, or path.
+    #[arg(long = "resume-session", value_name = "ID|latest|PATH", global = true)]
+    pub resume: Option<String>,
 }
 
 /// Frontend and authentication commands. With no command Harness starts the
@@ -1242,6 +1246,9 @@ mod tests {
             Cli::try_parse_from(["harness", "mcp"]).unwrap().command,
             Some(Command::Mcp(McpArgs { command: None }))
         ));
+
+        let resumed = Cli::try_parse_from(["harness", "--resume-session", "session-123"]).unwrap();
+        assert_eq!(resumed.resume.as_deref(), Some("session-123"));
 
         let mux = Cli::try_parse_from(["harness", "mux", "--model", "test-model"]).unwrap();
         assert!(matches!(mux.command, Some(Command::Mux)));

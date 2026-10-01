@@ -75,6 +75,29 @@ fn cancel_on_sigint(cancel: CancellationToken) {
     });
 }
 
+/// Observe runtime lifecycle without adding any output to stdout or stderr.
+fn observe_herdr_events(
+    mut input: mpsc::UnboundedReceiver<AgentEvent>,
+    reporter: crate::herdr::Reporter,
+    model: String,
+) -> mpsc::UnboundedReceiver<AgentEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut model = model;
+        while let Some(event) = input.recv().await {
+            match &event {
+                AgentEvent::ModelChanged { model: changed, .. } => { model = changed.clone(); reporter.model(changed.clone()); }
+                AgentEvent::TextDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } => reporter.report(crate::herdr::State::Working, None),
+                AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(crate::herdr::State::Idle, None),
+                AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), model.clone()),
+                _ => {}
+            }
+            if tx.send(event).is_err() { break; }
+        }
+    });
+    rx
+}
+
 /// Headless event driver variant that knows the application cancellation
 /// token, allowing it to discard a cancelled round's buffered prose.
 async fn drive_headless_events_with_cancel(
@@ -414,6 +437,11 @@ async fn run_headless_resolved(
         (None, None) => None,
     };
 
+    let herdr = crate::herdr::Herdr::from_env();
+    let herdr_reporter = herdr.as_ref().map(|h| h.start());
+    if let (Some((reporter, _)), Some(session)) = (&herdr_reporter, session.as_ref()) {
+        reporter.with_session(session.id().to_string(), config.model.clone());
+    }
     let install_sigint = external_cancel.is_none();
     let cancel = external_cancel.unwrap_or_default();
     let (input_tx, input_rx): (
@@ -442,6 +470,9 @@ async fn run_headless_resolved(
 
     // Send the single user turn, then close the channel so the agent's run
     // loop exits after this turn has drained its tool-call rounds.
+    if let Some((reporter, _)) = &herdr_reporter {
+        reporter.report(crate::herdr::State::Working, None);
+    }
     input_tx
         .send(InputMessage::Message(prompt))
         .context("send prompt to agent")?;
@@ -451,12 +482,20 @@ async fn run_headless_resolved(
         cancel_on_sigint(cancel.clone());
     }
 
+    let event_rx = if let Some((reporter, _)) = &herdr_reporter {
+        observe_herdr_events(event_rx, reporter.clone(), config.model.clone())
+    } else { event_rx };
     let exit_code = drive_headless_events_with_cancel(event_rx, args.verbose, Some(&cancel)).await;
     let interrupted = cancel.is_cancelled();
     cancel.cancel();
     // A closed event channel is not proof that the agent completed: preserve
     // panics and runtime task failures instead of returning a blank success.
     agent_task.await.context("headless agent task failed")?;
+    if let Some((reporter, task)) = herdr_reporter {
+        drop(reporter);
+        let _ = task.await;
+        if let Some(herdr) = herdr { herdr.release().await; }
+    }
     if interrupted {
         // The agent has already persisted `TurnCancelled`; 130 mirrors the
         // conventional SIGINT status while the session flush is awaited above.

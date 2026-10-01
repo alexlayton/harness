@@ -80,6 +80,11 @@ enum RuntimeMessage {
 
 /// Run one terminal mux rooted permanently at the canonical launch directory.
 pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBuf) -> Result<()> {
+    let herdr = crate::herdr::Herdr::from_env();
+    let herdr_reporter = herdr.as_ref().map(|h| h.start());
+    if let Some((reporter, _)) = &herdr_reporter {
+        reporter.report(crate::herdr::State::Idle, None);
+    }
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
@@ -125,9 +130,11 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                     );
                     if let Some(slot) = slots.get(&id)
                         && slot.input.send(tui_adapter::into_agent_input(input)).is_ok()
-                        && starts_work
                     {
-                        let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Running });
+                        if starts_work {
+                            if let Some((reporter, _)) = &herdr_reporter { reporter.report(crate::herdr::State::Working, None); }
+                            let _ = event_tx.send(MuxEvent::Status { id, status: MuxStatus::Running });
+                        }
                     }
                 }
                     Some(MuxAction::Create { choice, inherit_from }) => {
@@ -181,6 +188,15 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
                         if let Some(status) = status_for_agent_event(&event) {
                             let _ = event_tx.send(MuxEvent::Status { id, status });
                         }
+                        if let Some((reporter, _)) = &herdr_reporter {
+                            match &event {
+                                AgentEvent::ModelChanged { model, .. } => reporter.model(model.clone()),
+                                AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), slot.settings.model.clone()),
+                                AgentEvent::TextDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } => reporter.report(crate::herdr::State::Working, None),
+                                AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(crate::herdr::State::Idle, None),
+                                                                _ => {}
+                            }
+                        }
                         let _ = event_tx.send(MuxEvent::Ui { id, event: tui_adapter::into_ui_event(event) });
                     }
                 }
@@ -230,6 +246,11 @@ pub(crate) async fn run(config: Config, cli: &crate::config::Cli, launch: PathBu
         // still retain the worktree when that closure eventually returns.
         shutdown_task.abort();
         let _ = shutdown_task.await;
+    }
+    if let Some((reporter, task)) = herdr_reporter {
+        drop(reporter);
+        let _ = task.await;
+        if let Some(herdr) = herdr { herdr.release().await; }
     }
     terminal_result
 }
