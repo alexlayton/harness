@@ -26,6 +26,10 @@ toml_edit = "0.25"
 dirs = "6"
 fs2 = "0.4"
 futures-util = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+semver = "1"
+sha2 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio.workspace = true
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }

@@ -6,6 +6,7 @@ mod login;
 mod mcp_command;
 mod mux;
 mod tui_adapter;
+mod update;
 mod worktree;
 
 use agent::assembly::AgentBuilder;
@@ -40,8 +41,12 @@ async fn main() -> ExitCode {
 async fn main_inner() -> Result<ExitCode> {
     let mut cli = Cli::parse();
 
-    // Login is credential-only and intentionally precedes config/provider
-    // resolution: a stale configured API key cannot prevent signing in.
+    // Update and login are standalone commands and intentionally precede
+    // config/provider resolution.
+    if matches!(&cli.command, Some(Command::Update)) {
+        return update::run().await.map(|()| ExitCode::SUCCESS);
+    }
+    // A stale configured API key cannot prevent signing in.
     if let Some(Command::Login(args)) = &cli.command {
         return login::run(args).await;
     }
@@ -332,6 +337,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     // differs only in rendering and input handling. The first paint happens
     // inside `CrossTerm::run`, so this is the end of the startup path.
     tracing::info!(stage = "pre-first-frame", elapsed_ms = since_start());
+    let update_notice = update::check_latest().await;
     let ui = CrossTerm::new(
         &config.model,
         &provider_name,
@@ -348,6 +354,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
                 .iter()
                 .map(|server| server.name.clone())
                 .collect(),
+            update_notice,
         },
         config.reasoning.as_str(),
         config.tui_minimal,

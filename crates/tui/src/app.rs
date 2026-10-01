@@ -404,6 +404,7 @@ pub struct CrossTerm {
     context_files: Vec<ContextFileEntry>,
     /// Configured MCP server names for the header MCP row.
     mcp_servers: Vec<String>,
+    update_notice: Option<String>,
     session_completion_requested: bool,
     /// Providers we have already asked the agent to fetch, to avoid duplicate
     /// `ListModels` requests while typing through a model token.
@@ -451,6 +452,7 @@ impl CrossTerm {
             skills,
             context_files,
             mcp_servers,
+            update_notice,
         } = startup;
         let (path_completion_tx, path_completion_rx) = mpsc::unbounded_channel();
         Self {
@@ -484,6 +486,7 @@ impl CrossTerm {
             skills,
             context_files,
             mcp_servers,
+            update_notice,
             session_completion_requested: false,
             model_list_requested: HashSet::new(),
             completion: None,
@@ -521,6 +524,9 @@ impl CrossTerm {
                 title_order: render::WelcomeTitleOrder::random(),
             });
             self.pending.push(self.metadata_entry());
+            if let Some(text) = self.update_notice.clone() {
+                self.pending.push(Entry::Notice { text });
+            }
         }
     }
 
@@ -3436,6 +3442,7 @@ impl AgentPane {
                 skills,
                 context_files,
                 mcp_servers: Vec::new(),
+                update_notice: None,
             },
             workspace_root,
             80,
@@ -4408,6 +4415,26 @@ mod tests {
         // A running tool gains a trailing `running…` marker when expanded.
         let lines = tool_lines(&record(ToolStatus::Running), true, 60, Theme::default());
         assert_eq!(row_text(lines.last().unwrap()), "  running…");
+    }
+
+    #[test]
+    fn startup_update_notice_is_rendered_after_header_metadata() {
+        let mut state = CrossTerm::base(
+            "model",
+            "provider",
+            Vec::new(),
+            StartupEntries {
+                update_notice: Some("New version available: v1.2.3 (run `harness update`)".into()),
+                ..StartupEntries::default()
+            },
+            PathBuf::from("."),
+            80,
+            24,
+        );
+        state.enqueue_welcome();
+        assert!(
+            matches!(state.pending.last(), Some(Entry::Notice { text }) if text.contains("v1.2.3"))
+        );
     }
 
     #[test]
