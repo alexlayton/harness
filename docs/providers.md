@@ -100,11 +100,16 @@ harness login openai-codex
 # `codex` is an alias
 ```
 
-Use device authorization when a local loopback callback is not available:
+On a headless server or over SSH, use device authorization instead:
 
 ```text
 harness login codex --device-code
 ```
+
+Open the printed URL on another device and enter the printed code. Harness
+waits for approval on the server, then saves the credential there. This flow
+does not need a local browser or an inbound callback port. OpenAI must permit
+device-code sign-in for the account.
 
 Credentials are stored in the same private `auth.json` file as Copilot
 credentials. When no provider is configured, a successful login selects

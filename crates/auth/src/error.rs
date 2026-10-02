@@ -37,10 +37,10 @@ pub enum AuthError {
     #[error("untrusted verification URL returned by GitHub")]
     UntrustedVerificationUrl,
 
-    #[error("GitHub device login expired before authorization completed")]
+    #[error("device login expired before authorization completed")]
     DeviceCodeExpired,
 
-    #[error("GitHub device login cancelled")]
+    #[error("device login cancelled")]
     Cancelled,
 
     #[error("GitHub device login failed: {0}")]
