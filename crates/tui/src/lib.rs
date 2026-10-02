@@ -88,6 +88,8 @@ pub struct StartupEntries {
     pub context_files: Vec<ContextFileEntry>,
     /// Configured MCP server names.
     pub mcp_servers: Vec<String>,
+    /// Optional non-blocking GitHub release update notice.
+    pub update_notice: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

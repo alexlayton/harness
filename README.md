@@ -98,7 +98,10 @@ curl -fsSL https://raw.githubusercontent.com/alexlayton/harness/main/install.sh 
 
 The script uses `curl` rather than a browser, so macOS downloads normally do
 not acquire a browser quarantine attribute. It does not invoke `sudo` or modify
-shell startup files.
+shell startup files. Once installed, run `harness update` to download and
+checksum-verify the latest compatible release and replace the running
+installation. The interactive launch header quietly checks for newer stable
+releases and suggests `harness update`; network errors do not prevent startup.
 
 Alternatively, download the archive from [GitHub Releases][releases]. Each
 archive contains the `harness` binary, this README, its header image, and the
@@ -152,7 +155,8 @@ harness mux
 
 Start the terminal UI by running `harness`. Use `/help` to list its commands.
 The main commands include session management, model selection, usage reporting,
-compaction, and discovered skills.
+compaction, and discovered skills. Run `harness update` to update from the
+latest compatible GitHub release.
 
 Start the terminal UI in a dedicated Git worktree, creating the branch from the
 current `HEAD` when it does not already exist:

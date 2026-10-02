@@ -731,6 +731,8 @@ pub struct Cli {
 /// interactive terminal UI.
 #[derive(Clone, Debug, clap::Subcommand)]
 pub enum Command {
+    /// Download and install the latest compatible GitHub release.
+    Update,
     /// Authenticate with an OAuth provider.
     Login(LoginArgs),
     /// Run one prompt and print only the final answer to stdout.
