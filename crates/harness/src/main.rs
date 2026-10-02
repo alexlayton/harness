@@ -394,7 +394,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
                                 herdr_options.reasoning = level.clone();
                                 reporter.resume_options(&herdr_options);
                             }
-                            AgentEvent::TextDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } => reporter.report(herdr::State::Working, None),
+                            AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } => reporter.report(herdr::State::Working, None),
                             AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(herdr::State::Idle, None),
                             AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), &herdr_options),
                             _ => {}

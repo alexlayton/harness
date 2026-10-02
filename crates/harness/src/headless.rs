@@ -96,6 +96,7 @@ fn observe_herdr_events(
                     reporter.resume_options(&options);
                 }
                 AgentEvent::TextDelta(_)
+                | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::ToolCallStarted { .. }
                 | AgentEvent::Retrying { .. } => {
                     reporter.report(crate::herdr::State::Working, None)

@@ -2,7 +2,7 @@
 
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
 
@@ -125,7 +125,12 @@ impl Herdr {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let _ = timeout(Duration::from_millis(750), command.status()).await;
+        match timeout(Duration::from_millis(750), command.status()).await {
+            Ok(Ok(status)) if status.success() => {}
+            Ok(Ok(status)) => tracing::warn!(%status, "Herdr command failed"),
+            Ok(Err(error)) => tracing::warn!(%error, "could not run Herdr command"),
+            Err(_) => tracing::warn!("Herdr command timed out"),
+        }
     }
 
     async fn report(&self, state: State, session: Option<String>, resume: Option<Vec<String>>) {
@@ -134,27 +139,15 @@ impl Herdr {
     }
 
     pub(crate) fn start(&self) -> (Reporter, JoinHandle<()>) {
-        let initial = (State::Idle, None, None);
-        let (tx, mut rx) = watch::channel(initial.clone());
+        let (reporter, mut rx) = Reporter::channel();
         let herdr = self.clone();
         let task = tokio::spawn(async move {
-            let mut previous: Option<ReportSnapshot> = None;
-            while rx.changed().await.is_ok() {
-                let next = rx.borrow_and_update().clone();
-                if previous.as_ref() == Some(&next) {
-                    continue;
-                }
-                previous = Some(next.clone());
-                herdr.report(next.0, next.1, next.2).await;
+            // Keep distinct transitions in order, even while a CLI call is pending.
+            while let Some((state, session, resume)) = rx.recv().await {
+                herdr.report(state, session, resume).await;
             }
         });
-        (
-            Reporter {
-                tx,
-                current: std::sync::Arc::new(std::sync::Mutex::new(initial)),
-            },
-            task,
-        )
+        (reporter, task)
     }
 
     pub(crate) async fn release(&self) {
@@ -175,33 +168,52 @@ impl Herdr {
 
 #[derive(Clone)]
 pub(crate) struct Reporter {
-    tx: watch::Sender<ReportSnapshot>,
+    tx: mpsc::UnboundedSender<ReportSnapshot>,
     current: std::sync::Arc<std::sync::Mutex<ReportSnapshot>>,
 }
 impl Reporter {
-    pub(crate) fn report(&self, state: State, session: Option<String>) {
+    fn channel() -> (Self, mpsc::UnboundedReceiver<ReportSnapshot>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                current: std::sync::Arc::new(std::sync::Mutex::new((State::Idle, None, None))),
+            },
+            rx,
+        )
+    }
+
+    fn update(&self, change: impl FnOnce(&mut ReportSnapshot)) {
         if let Ok(mut current) = self.current.lock() {
+            let previous = current.clone();
+            change(&mut current);
+            if *current != previous {
+                // Send under the lock so concurrent reporters preserve update order.
+                let _ = self.tx.send(current.clone());
+            }
+        }
+    }
+
+    pub(crate) fn report(&self, state: State, session: Option<String>) {
+        self.update(|current| {
             current.0 = state;
             if let Some(id) = session {
                 current.1 = Some(id);
             }
-            let _ = self.tx.send(current.clone());
-        }
+        });
     }
     pub(crate) fn with_session(&self, id: String, options: &ResumeOptions) {
-        if let Ok(mut current) = self.current.lock() {
+        self.update(|current| {
             current.1 = Some(id.clone());
             current.2 = Some(options.argv(&id));
-            let _ = self.tx.send(current.clone());
-        }
+        });
     }
     pub(crate) fn resume_options(&self, options: &ResumeOptions) {
-        if let Ok(mut current) = self.current.lock()
-            && let Some(id) = current.1.clone()
-        {
-            current.2 = Some(options.argv(&id));
-            let _ = self.tx.send(current.clone());
-        }
+        self.update(|current| {
+            if let Some(id) = current.1.clone() {
+                current.2 = Some(options.argv(&id));
+            }
+        });
     }
 }
 
@@ -287,6 +299,17 @@ mod tests {
             &(0..64).map(|_| "x".repeat(128)).collect::<Vec<_>>()
         ));
         assert!(sequence().parse::<u64>().unwrap() < sequence().parse::<u64>().unwrap());
+    }
+
+    #[test]
+    fn rapid_state_transitions_are_not_lost() {
+        let (reporter, mut rx) = Reporter::channel();
+        reporter.report(State::Working, None);
+        reporter.report(State::Working, None); // Repeated stream updates are coalesced.
+        reporter.report(State::Idle, None);
+        assert_eq!(rx.try_recv().unwrap().0, State::Working);
+        assert_eq!(rx.try_recv().unwrap().0, State::Idle);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

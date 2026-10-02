@@ -58,13 +58,15 @@ name `harness` with the active provider, model, reasoning effort, session ID,
 and any `--no-context-files` or `--defer-session-sync` options. Herdr 0.9.2 or
 newer is required to consume the resume argv after `--`. Arguments are checked
 against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
-characters). Reports are coalesced, best-effort, and use a short timeout;
-failures do not affect Harness output. Outside a fully configured Herdr pane,
-no integration is activated. TUI and headless lifecycles report state and
-release the pane on process exit. ACP remains independent because it multiplexes
-multiple editor sessions over a single JSON-RPC process. The bash tool and
-its optional `rtk` rewriter remove inherited Herdr pane variables from child
-processes, so a nested Harness cannot claim the parent's pane by accident.
+characters). Repeated reports are coalesced, but state transitions are sent in
+order. Reports are best-effort and use a short timeout; failures do not affect
+Harness output and are logged when `HARNESS_LOG` is set. Outside a fully
+configured Herdr pane, no integration is activated. TUI and headless lifecycles
+report state and release the pane on process exit. ACP remains independent
+because it multiplexes multiple editor sessions over a single JSON-RPC process.
+The bash tool and its optional `rtk` rewriter remove inherited Herdr pane
+variables from child processes, so a nested Harness cannot claim the parent's
+pane by accident.
 This does not prevent a command from setting those variables itself. See
 [Herdr's integration guide](https://herdr.dev/docs/add-herdr-support/) for
 Herdr-side behavior and requirements.
