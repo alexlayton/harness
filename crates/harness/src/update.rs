@@ -34,10 +34,11 @@ fn is_newer(current: &str, latest: &str) -> bool {
 }
 
 fn host_target(os: &str, arch: &str) -> Option<&'static str> {
+    // These are std::env::consts values, not uname's "Darwin"/"Linux" names.
     match (os, arch) {
-        ("Linux", "x86_64" | "amd64") => Some("x86_64-unknown-linux-gnu"),
-        ("Darwin", "arm64" | "aarch64") => Some("aarch64-apple-darwin"),
-        ("Darwin", "x86_64") => Some("x86_64-apple-darwin"),
+        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
+        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
         _ => None,
     }
 }
@@ -316,12 +317,15 @@ mod tests {
     #[test]
     fn release_assets_match_only_supported_host_targets() {
         assert_eq!(
-            host_target("Linux", "x86_64"),
+            host_target("linux", "x86_64"),
             Some("x86_64-unknown-linux-gnu")
         );
-        assert_eq!(host_target("Darwin", "arm64"), Some("aarch64-apple-darwin"));
-        assert_eq!(host_target("Darwin", "x86_64"), Some("x86_64-apple-darwin"));
-        assert_eq!(host_target("Windows", "x86_64"), None);
+        assert_eq!(
+            host_target("macos", "aarch64"),
+            Some("aarch64-apple-darwin")
+        );
+        assert_eq!(host_target("macos", "x86_64"), Some("x86_64-apple-darwin"));
+        assert_eq!(host_target("windows", "x86_64"), None);
     }
 
     #[test]
