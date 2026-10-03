@@ -1,8 +1,9 @@
 use crate::{McpError, root_uri};
 use rmcp::ClientHandler;
-use rmcp::model::{
-    ClientCapabilities, ClientConfig, Implementation, ListRootsResult, Root, RootsCapabilities,
-};
+use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, RootsCapabilities};
+// Roots are still advertised for compatibility with existing MCP servers.
+#[allow(deprecated)]
+use rmcp::model::{ListRootsResult, Root};
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 
 /// Minimal MCP client handler: only roots are offered. Sampling and elicitation
