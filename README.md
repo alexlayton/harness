@@ -54,8 +54,7 @@ advanced options.
 
 - A fast, direct-crossterm terminal UI that keeps completed output in native
   terminal scrollback.
-- An experimental terminal multiplexer for running and switching between
-  several independent agents without PTYs or split panes.
+- Herdr pane status reporting and session resume when launched from a Herdr pane.
 - Headless output for scripts and pipelines.
 - ACP support for compatible editors.
 - OpenCode Go, OpenRouter, GitHub Copilot, and OpenAI Codex subscription
@@ -93,7 +92,7 @@ To install a specific release, pass the version through to the script:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alexlayton/harness/main/install.sh \
-  | bash -s -- --version v0.5.4
+  | bash -s -- --version v0.6.0
 ```
 
 The script uses `curl` rather than a browser, so macOS downloads normally do
