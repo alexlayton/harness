@@ -1,8 +1,7 @@
 use crate::{McpError, root_uri};
 use rmcp::ClientHandler;
-#[allow(deprecated)]
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, Implementation, ListRootsResult, Root, RootsCapabilities,
+    ClientCapabilities, ClientConfig, Implementation, ListRootsResult, Root, RootsCapabilities,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 
@@ -21,10 +20,10 @@ impl HarnessClient {
 }
 
 impl ClientHandler for HarnessClient {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         let mut capabilities = ClientCapabilities::default();
         capabilities.roots = Some(RootsCapabilities::default());
-        ClientInfo::new(
+        ClientConfig::new(
             capabilities,
             Implementation::new("harness", env!("CARGO_PKG_VERSION")),
         )
