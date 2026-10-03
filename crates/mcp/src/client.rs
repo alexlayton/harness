@@ -1,9 +1,9 @@
 use crate::{McpError, root_uri};
 use rmcp::ClientHandler;
+use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, RootsCapabilities};
+// Roots are still advertised for compatibility with existing MCP servers.
 #[allow(deprecated)]
-use rmcp::model::{
-    ClientCapabilities, ClientInfo, Implementation, ListRootsResult, Root, RootsCapabilities,
-};
+use rmcp::model::{ListRootsResult, Root};
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 
 /// Minimal MCP client handler: only roots are offered. Sampling and elicitation
@@ -21,10 +21,10 @@ impl HarnessClient {
 }
 
 impl ClientHandler for HarnessClient {
-    fn get_info(&self) -> ClientInfo {
+    fn get_info(&self) -> ClientConfig {
         let mut capabilities = ClientCapabilities::default();
         capabilities.roots = Some(RootsCapabilities::default());
-        ClientInfo::new(
+        ClientConfig::new(
             capabilities,
             Implementation::new("harness", env!("CARGO_PKG_VERSION")),
         )
