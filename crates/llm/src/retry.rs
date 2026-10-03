@@ -83,7 +83,7 @@ fn retry_delay_ms(attempt: u32, error: &LlmError) -> u64 {
 ///
 /// The LCG state lives in a `OnceLock<AtomicU64>` so seeding runs exactly
 /// once (no two threads can seed independently), and every step is an atomic
-/// read-modify-write via `fetch_update`.  The state is kept non-zero with
+/// read-modify-write via `try_update`.  The state is kept non-zero with
 /// `.max(1)`, removing the old "re-seed when zero" special case and the
 /// non-atomic load/store race it papered over.
 fn jitter_ms() -> u64 {
@@ -98,7 +98,7 @@ fn jitter_ms() -> u64 {
     });
 
     let value = state
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |s| {
             Some(
                 s.wrapping_mul(6364136223846793005)
                     .wrapping_add(1442695040888963407)

@@ -51,6 +51,21 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 /// Shared deadline for draining stdout+stderr after the shell ends.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Do not give tool-launched processes the parent's Herdr pane identity.
+/// A nested Harness process would otherwise claim the same pane and release
+/// its agent status when it exits. This is not a sandbox: shell commands can
+/// still set these variables explicitly.
+fn remove_herdr_pane_env(command: &mut Command) {
+    for name in [
+        "HERDR_ENV",
+        "HERDR_PANE_ID",
+        "HERDR_SOCKET_PATH",
+        "HERDR_BIN_PATH",
+    ] {
+        command.env_remove(name);
+    }
+}
+
 /// Harness-side concurrency classification for one bash invocation.
 /// Every invocation is [`Concurrency::Exclusive`]: shell is the optimized
 /// parallel path's *escape hatch*, not a member of it — dedicated `read`,
@@ -80,6 +95,7 @@ async fn rtk_rewrite_cancellable(
         return None;
     }
     let mut process = Command::new("rtk");
+    remove_herdr_pane_env(&mut process);
     process
         .arg("rewrite")
         .arg(command)
@@ -229,6 +245,7 @@ impl Tool for BashTool {
 
         let cwd = self.cwd.clone();
         let mut command_builder = Command::new("sh");
+        remove_herdr_pane_env(&mut command_builder);
         command_builder
             .arg("-c")
             .arg(&run_command)
@@ -821,6 +838,33 @@ mod tests {
     #[cfg(unix)]
     fn shell_quote(value: &str) -> String {
         format!("'{}'", value.replace('\'', "'\\\"'\\\"'"))
+    }
+
+    #[tokio::test]
+    async fn child_commands_do_not_inherit_herdr_pane_identity() {
+        // Set these on the child command, not the process, so this test is
+        // safe even if other tests run while Harness itself is inside Herdr.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(concat!(
+                "printf '%s\\n' ",
+                "\"${HERDR_ENV-unset}\" \"${HERDR_PANE_ID-unset}\" ",
+                "\"${HERDR_SOCKET_PATH-unset}\" \"${HERDR_BIN_PATH-unset}\" ",
+                "\"${HARNESS_CHILD_ENV_TEST-unset}\"",
+            ))
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", "parent-pane")
+            .env("HERDR_SOCKET_PATH", "/tmp/parent.sock")
+            .env("HERDR_BIN_PATH", "/tmp/herdr")
+            .env("HARNESS_CHILD_ENV_TEST", "kept");
+        remove_herdr_pane_env(&mut command);
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "unset\nunset\nunset\nunset\nkept\n"
+        );
     }
 
     #[tokio::test]

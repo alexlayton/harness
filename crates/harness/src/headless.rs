@@ -75,6 +75,48 @@ fn cancel_on_sigint(cancel: CancellationToken) {
     });
 }
 
+/// Observe runtime lifecycle without adding any output to stdout or stderr.
+fn observe_herdr_events(
+    mut input: mpsc::UnboundedReceiver<AgentEvent>,
+    reporter: crate::herdr::Reporter,
+    options: crate::herdr::ResumeOptions,
+) -> mpsc::UnboundedReceiver<AgentEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut options = options;
+        while let Some(event) = input.recv().await {
+            match &event {
+                AgentEvent::ModelChanged { provider, model } => {
+                    options.provider = provider.clone();
+                    options.model = model.clone();
+                    reporter.resume_options(&options);
+                }
+                AgentEvent::ReasoningChanged { level } => {
+                    options.reasoning = level.clone();
+                    reporter.resume_options(&options);
+                }
+                AgentEvent::TextDelta(_)
+                | AgentEvent::ReasoningDelta(_)
+                | AgentEvent::ToolCallStarted { .. }
+                | AgentEvent::Retrying { .. } => {
+                    reporter.report(crate::herdr::State::Working, None)
+                }
+                AgentEvent::TurnFinished | AgentEvent::OperationFinished => {
+                    reporter.report(crate::herdr::State::Idle, None)
+                }
+                AgentEvent::SessionChanged { id, .. } => {
+                    reporter.with_session(id.clone(), &options)
+                }
+                _ => {}
+            }
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 /// Headless event driver variant that knows the application cancellation
 /// token, allowing it to discard a cancelled round's buffered prose.
 async fn drive_headless_events_with_cancel(
@@ -326,6 +368,8 @@ async fn run_headless(
         None,
         prompt,
         project_context,
+        no_context_files,
+        false,
     )
     .await
 }
@@ -333,6 +377,7 @@ async fn run_headless(
 /// Headless entry point used by the host after it has already loaded startup
 /// context and resolved the prompt. This avoids duplicate stdin/context work
 /// in the main frontend dispatcher.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_headless_with_prompt(
     config: &Config,
     args: &PromptArgs,
@@ -341,6 +386,8 @@ pub(crate) async fn run_headless_with_prompt(
     store: Option<SessionStore>,
     prompt: String,
     project_context: String,
+    no_context_files: bool,
+    defer_session_sync: bool,
 ) -> Result<ExitCode> {
     run_headless_resolved(
         config,
@@ -351,6 +398,8 @@ pub(crate) async fn run_headless_with_prompt(
         None,
         prompt,
         project_context,
+        no_context_files,
+        defer_session_sync,
     )
     .await
 }
@@ -379,6 +428,8 @@ async fn run_headless_with_cancel(
         external_cancel,
         prompt,
         project_context,
+        no_context_files,
+        false,
     )
     .await
 }
@@ -393,6 +444,8 @@ async fn run_headless_resolved(
     external_cancel: Option<CancellationToken>,
     prompt: String,
     project_context: String,
+    no_context_files: bool,
+    defer_session_sync: bool,
 ) -> Result<ExitCode> {
     let session = match (&args.resume, &store) {
         (Some(selector), Some(store)) => Some(
@@ -414,6 +467,7 @@ async fn run_headless_resolved(
         (None, None) => None,
     };
 
+    let session_id = session.as_ref().map(|session| session.id().to_string());
     let install_sigint = external_cancel.is_none();
     let cancel = external_cancel.unwrap_or_default();
     let (input_tx, input_rx): (
@@ -437,26 +491,53 @@ async fn run_headless_resolved(
         builder = builder.with_session(store.clone(), session);
     }
     let agent = builder.build().await?;
+    let herdr_options = crate::herdr::ResumeOptions {
+        provider: config.provider.to_string(),
+        model: config.model.clone(),
+        reasoning: config.reasoning.as_str().into(),
+        no_context_files,
+        defer_session_sync,
+    };
+    let herdr = crate::herdr::Herdr::from_env();
+    let herdr_reporter = herdr.as_ref().map(|h| h.start());
+    if let (Some((reporter, _)), Some(id)) = (&herdr_reporter, session_id) {
+        reporter.with_session(id, &herdr_options);
+    }
 
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     // Send the single user turn, then close the channel so the agent's run
     // loop exits after this turn has drained its tool-call rounds.
-    input_tx
-        .send(InputMessage::Message(prompt))
-        .context("send prompt to agent")?;
+    if let Some((reporter, _)) = &herdr_reporter {
+        reporter.report(crate::herdr::State::Working, None);
+    }
+    let send_result = input_tx.send(InputMessage::Message(prompt));
     drop(input_tx);
 
     if install_sigint {
         cancel_on_sigint(cancel.clone());
     }
 
+    let event_rx = if let Some((reporter, _)) = &herdr_reporter {
+        observe_herdr_events(event_rx, reporter.clone(), herdr_options)
+    } else {
+        event_rx
+    };
     let exit_code = drive_headless_events_with_cancel(event_rx, args.verbose, Some(&cancel)).await;
     let interrupted = cancel.is_cancelled();
     cancel.cancel();
     // A closed event channel is not proof that the agent completed: preserve
     // panics and runtime task failures instead of returning a blank success.
-    agent_task.await.context("headless agent task failed")?;
+    let agent_result = agent_task.await;
+    if let Some((reporter, task)) = herdr_reporter {
+        drop(reporter);
+        let _ = task.await;
+        if let Some(herdr) = herdr {
+            herdr.release().await;
+        }
+    }
+    send_result.context("send prompt to agent")?;
+    agent_result.context("headless agent task failed")?;
     if interrupted {
         // The agent has already persisted `TurnCancelled`; 130 mirrors the
         // conventional SIGINT status while the session flush is awaited above.

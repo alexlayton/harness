@@ -24,17 +24,19 @@ pub fn into_agent_input(message: tui::InputMessage) -> InputMessage {
     }
 }
 
-/// Forward terminal input until either side closes. This task must own the
-/// only runtime sender so dropping the TUI sender closes the runtime input.
+/// Forward terminal input until either side closes, invoking `before_send`
+/// before each message reaches the runtime.
 pub async fn forward_inputs(
     mut input: mpsc::UnboundedReceiver<tui::InputMessage>,
     output: mpsc::UnboundedSender<InputMessage>,
+    mut before_send: impl FnMut(&tui::InputMessage),
 ) {
     loop {
         tokio::select! {
             _ = output.closed() => break,
             message = input.recv() => {
                 let Some(message) = message else { break };
+                before_send(&message);
                 if output.send(into_agent_input(message)).is_err() {
                     break;
                 }
@@ -292,7 +294,7 @@ mod tests {
     async fn closing_tui_input_closes_runtime_input() {
         let (tui_tx, tui_rx) = mpsc::unbounded_channel();
         let (runtime_tx, mut runtime_rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(forward_inputs(tui_rx, runtime_tx));
+        let task = tokio::spawn(forward_inputs(tui_rx, runtime_tx, |_| {}));
         tui_tx
             .send(tui::InputMessage::Message("hi".into()))
             .unwrap();

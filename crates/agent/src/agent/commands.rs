@@ -254,7 +254,7 @@ impl Agent {
             return;
         };
         // Resolve against the agent's explicit workspace rather than the
-        // process cwd. This matters for multi-workspace frontends such as mux.
+        // process cwd, so embedded frontends use the correct session root.
         let destination = destination
             .map(PathBuf::from)
             .map(|path| {

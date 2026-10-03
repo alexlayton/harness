@@ -1,7 +1,7 @@
 # Architecture
 
 Harness is a terminal coding agent. It streams LLM responses, executes tools,
-renders output through a terminal, mux, headless, or ACP frontend, and stores
+renders output through a terminal, headless, or ACP frontend, and stores
 an append-only session log.
 
 This document is a map of stable boundaries and invariants. For implementation
@@ -66,13 +66,6 @@ MCP, and subagent setup has one implementation.
 
 - **TUI:** direct Crossterm UI with completed output in native terminal
   scrollback. `tui` receives only provider-independent `UiEvent`s.
-- **Mux:** `harness mux` owns one full-screen terminal and hosts several
-  retained agent panes. Each slot has an independent workspace, durable
-  session, tools, cancellation, and MCP lifecycle; the mux roster itself is
-  process-local. Mutating tool workflows are conservatively serialized across
-  all slots in that mux process, while model requests and read-only tools
-  remain concurrent. Mux-created worktrees are path-based and retained on
-  close.
 - **Headless:** `harness prompt "…"` writes only the final answer to stdout.
   Optional progress goes to stderr behind `-v`; stdout purity is an invariant.
 - **ACP:** `harness acp` serves Agent Client Protocol over stdio. Stdout is

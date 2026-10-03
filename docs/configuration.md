@@ -44,6 +44,32 @@ setting is absent.
 
 The `/model` terminal command updates the saved provider and model. Harness
 preserves configuration keys that it does not know when it saves these values.
+Use `harness --resume-session ID` to reopen a persisted interactive session;
+headless runs use `harness prompt --resume ID PROMPT`.
+
+## Herdr integration
+
+When `HERDR_ENV=1` and `HERDR_PANE_ID`, `HERDR_BIN_PATH`, and
+`HERDR_SOCKET_PATH` are all set, Harness reports pane state through the Herdr
+CLI at `HERDR_BIN_PATH`. Reports use the stable `harness` source and `Harness`
+agent name, report working as soon as a turn starts and idle when ready for
+input, and attach the actual agent session ID. Resume argv uses the executable
+name `harness` with the active provider, model, reasoning effort, session ID,
+and any `--no-context-files` or `--defer-session-sync` options. Herdr 0.9.2 or
+newer is required to consume the resume argv after `--`. Arguments are checked
+against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
+characters). Repeated reports are coalesced, but state transitions are sent in
+order. Reports are best-effort and use a short timeout; failures do not affect
+Harness output and are logged when `HARNESS_LOG` is set. Outside a fully
+configured Herdr pane, no integration is activated. TUI and headless lifecycles
+report state and release the pane on process exit. ACP remains independent
+because it multiplexes multiple editor sessions over a single JSON-RPC process.
+The bash tool and its optional `rtk` rewriter remove inherited Herdr pane
+variables from child processes, so a nested Harness cannot claim the parent's
+pane by accident.
+This does not prevent a command from setting those variables itself. See
+[Herdr's integration guide](https://herdr.dev/docs/add-herdr-support/) for
+Herdr-side behavior and requirements.
 
 Set `rtk = true` to let the bash tool rewrite supported commands through an
 installed `rtk` executable for smaller tool output. This feature is off by
@@ -355,7 +381,6 @@ harness acp --provider openai-codex
 |---|---|
 | `prompt [PROMPT]` | Run one prompt and print only the final answer to stdout. Reads piped stdin when the prompt is omitted. |
 | `acp` | Serve ACP over stdio (stdout carries JSON-RPC protocol traffic only). |
-| `mux` | Start the experimental multi-agent terminal frontend. |
 | `worktree <branch>` | Run in a dedicated Git worktree (see the [README](../README.md#usage-overview)). |
 | `mcp` | List, add, or delete MCP servers (see [MCP servers](#mcp-servers)). |
 | `login <provider>` | Authenticate with an OAuth provider. |

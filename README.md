@@ -145,12 +145,6 @@ Start the terminal UI with the same provider:
 harness
 ```
 
-To run several agents in one terminal, start the experimental mux frontend:
-
-```text
-harness mux
-```
-
 ## Usage overview
 
 Start the terminal UI by running `harness`. Use `/help` to list its commands.
@@ -189,16 +183,6 @@ harness worktree feat/new-feature prompt --no-session "Implement the change"
 Sessions remain scoped to the physical worktree path. Recreating an automatic
 worktree at its stable default path sees its previous sessions, while choosing
 a different `--dir` creates a separate session namespace.
-
-Mux starts one persisted agent in the launch directory. Press `Ctrl+Space`
-then `n` to add an agent for the current directory, another directory, or a
-new worktree. The same prefix supports `w`, `c`, and `d` to open those
-workspace forms directly, `j`/`k` and `1`–`9` for switching, `x` to close,
-and `?` for help. Mux roster ordering is process-local, while each
-conversation uses the normal durable session store. Mux-created worktrees are
-retained when an agent closes. Their creation dialog defaults to retaining
-that worktree for future runs too; toggling the policy off clears an older
-sticky marker but does not remove the worktree when the mux slot closes.
 
 Run one prompt without the terminal UI:
 
