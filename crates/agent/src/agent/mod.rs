@@ -3198,9 +3198,11 @@ mod tests {
 
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             assert!(!events.contains(&AgentEvent::OperationFinished));
-            assert!(!events
-                .iter()
-                .any(|event| matches!(event, AgentEvent::AskAnswer(_))));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::AskAnswer(_)))
+            );
         });
     }
 
@@ -3273,9 +3275,11 @@ mod tests {
             assert!(events.contains(&AgentEvent::AskAnswer(
                 "isolated {{harness-secret:TOKEN}} answer".into()
             )));
-            assert!(events
-                .iter()
-                .all(|event| !format!("{event:?}").contains("secret-value")));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !format!("{event:?}").contains("secret-value"))
+            );
             assert!(
                 !events.iter().any(|event| matches!(
                     event,
@@ -3444,14 +3448,8 @@ mod tests {
             // The summarizer request is distinguishable by its system prompt
             // and modeled as a standalone summarization, not a conversation.
             let (system, messages, _, _) = &seen[1];
-            assert!(
-                system.as_deref().unwrap_or("").contains("summarization")
-            );
-            assert_eq!(
-                messages.len(),
-                1,
-                "summarizer gets a single user prompt"
-            );
+            assert!(system.as_deref().unwrap_or("").contains("summarization"));
+            assert_eq!(messages.len(), 1, "summarizer gets a single user prompt");
 
             // The turn-2 conversation request sees the summary and a *smaller*
             // history than the turn-1 request.
