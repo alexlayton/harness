@@ -3200,7 +3200,9 @@ mod tests {
 
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             assert!(!events.contains(&AgentEvent::OperationFinished));
-            assert!(!events.iter().any(|event| matches!(event, AgentEvent::AskAnswer(_))));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::AskAnswer(_))));
         });
     }
 
@@ -3273,7 +3275,9 @@ mod tests {
             assert!(events.contains(&AgentEvent::AskAnswer(
                 "isolated {{harness-secret:TOKEN}} answer".into()
             )));
-            assert!(events.iter().all(|event| !format!("{event:?}").contains("secret-value")));
+            assert!(events
+                .iter()
+                .all(|event| !format!("{event:?}").contains("secret-value")));
             assert!(
                 !events.iter().any(|event| matches!(
                     event,

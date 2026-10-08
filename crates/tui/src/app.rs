@@ -3493,10 +3493,13 @@ mod tests {
     }
 
     fn begin_ask(ui: &mut CrossTerm) -> mpsc::UnboundedReceiver<InputMessage> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         ui.submit_command("/ASK  keep  this question", &tx).unwrap();
         assert!(ui.busy);
-        assert!(matches!(rx.try_recv(), Ok(InputMessage::Ask { question }) if question == "keep  this question"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InputMessage::Ask { question }) if question == "keep  this question"
+        ));
         rx
     }
 
