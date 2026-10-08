@@ -3162,9 +3162,7 @@ mod tests {
 
         async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
             self.started.notify_one();
-            Ok(Box::pin(
-                stream::pending::<Result<StreamEvent, LlmError>>(),
-            ))
+            Ok(Box::pin(stream::pending::<Result<StreamEvent, LlmError>>()))
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -3445,9 +3443,15 @@ mod tests {
 
             // The summarizer request is distinguishable by its system prompt
             // and modeled as a standalone summarization, not a conversation.
-            let (system, messages) = &seen[1];
-            assert!(system.as_deref().unwrap_or("").contains("summarization"));
-            assert_eq!(messages.len(), 1, "summarizer gets a single user prompt");
+            let (system, messages, _, _) = &seen[1];
+            assert!(
+                system.as_deref().unwrap_or("").contains("summarization")
+            );
+            assert_eq!(
+                messages.len(),
+                1,
+                "summarizer gets a single user prompt"
+            );
 
             // The turn-2 conversation request sees the summary and a *smaller*
             // history than the turn-1 request.
@@ -3620,9 +3624,10 @@ mod tests {
         assert!(!result.unwrap());
         assert!(turn_cancel.is_cancelled());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        assert!(
-            matches!(agent.queued.pop_front(), Some(InputMessage::Message(text)) if text == "next message")
-        );
+        assert!(matches!(
+            agent.queued.pop_front(),
+            Some(InputMessage::Message(text)) if text == "next message"
+        ));
         let loaded = store.open(&session_id).unwrap();
         assert!(!loaded.events.iter().any(|record| matches!(
             record.event,

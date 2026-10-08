@@ -3507,7 +3507,10 @@ mod tests {
         let retained = format!("{:?}{:?}", ui.transcript, ui.pending);
         assert!(!retained.contains("keep  this question"));
         assert!(!retained.contains("one-shot result"));
-        assert!(ui.transcript.iter().all(|entry| !matches!(entry, Entry::User { text } if text.contains("keep  this question"))));
+        assert!(ui.transcript.iter().all(|entry| !matches!(
+            entry,
+            Entry::User { text } if text.contains("keep  this question")
+        )));
     }
 
     #[test]
@@ -3534,7 +3537,9 @@ mod tests {
         assert_eq!(ui.ask_answer, None);
 
         ui.ask_answer = Some("answer before snapshot".into());
-        ui.apply_event(UiEvent::SessionSnapshot { entries: Vec::new() });
+        ui.apply_event(UiEvent::SessionSnapshot {
+            entries: Vec::new(),
+        });
         assert_eq!(ui.ask_answer, None);
     }
 
