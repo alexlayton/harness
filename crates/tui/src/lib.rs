@@ -22,6 +22,8 @@ pub use state::{ToolRecord, ToolStatus};
 pub enum InputMessage {
     /// Normal user text for the model.
     Message(String),
+    /// Ask a fresh one-shot question without adding it to conversation history.
+    Ask { question: String },
     /// Turn-local interrupt.
     Interrupt,
     /// Start and persist a new conversation without deleting the old one.
@@ -160,6 +162,8 @@ pub enum UiEvent {
         message: String,
     },
     TurnFinished,
+    /// Completed isolated answer; it is displayed but is not conversation history.
+    AskAnswer(String),
     /// A host-visible non-turn operation returned to the input loop.
     OperationFinished,
     Error(String),

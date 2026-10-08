@@ -5,6 +5,8 @@ use tools::SkillEntry;
 pub enum InputMessage {
     /// Normal user text for the model.
     Message(String),
+    /// Fresh one-shot request with no conversation context or persistence.
+    Ask { question: String },
     /// Turn-local interrupt.
     Interrupt,
     /// Start and persist a new conversation without deleting the old one.
@@ -63,6 +65,8 @@ pub enum AgentEvent {
         message: String,
     },
     TurnFinished,
+    /// Result of an isolated ask request, displayed outside conversation history.
+    AskAnswer(String),
     /// A non-turn operation that can be shown as running has returned to the
     /// input loop. Fatal outcomes stop the runtime instead of emitting this.
     OperationFinished,

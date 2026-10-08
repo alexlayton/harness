@@ -354,6 +354,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
             if matches!(
                 input,
                 tui::InputMessage::Message(_)
+                    | tui::InputMessage::Ask { .. }
                     | tui::InputMessage::InvokeSkill { .. }
                     | tui::InputMessage::CompactSession
             ) && let Some(reporter) = &input_reporter

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 pub fn into_agent_input(message: tui::InputMessage) -> InputMessage {
     match message {
         tui::InputMessage::Message(value) => InputMessage::Message(value),
+        tui::InputMessage::Ask { question } => InputMessage::Ask { question },
         tui::InputMessage::Interrupt => InputMessage::Interrupt,
         tui::InputMessage::NewConversation => InputMessage::NewConversation,
         tui::InputMessage::LoadSession { selector } => InputMessage::LoadSession { selector },
@@ -78,6 +79,7 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
         },
         AgentEvent::Retrying { attempt, message } => tui::UiEvent::Retrying { attempt, message },
         AgentEvent::TurnFinished => tui::UiEvent::TurnFinished,
+        AgentEvent::AskAnswer(answer) => tui::UiEvent::AskAnswer(answer),
         AgentEvent::OperationFinished => tui::UiEvent::OperationFinished,
         AgentEvent::Error(value) => tui::UiEvent::Error(value),
         AgentEvent::Notice(value) => tui::UiEvent::Notice(value),
@@ -223,6 +225,14 @@ mod tests {
                 tui::InputMessage::Message("hi".into()),
                 InputMessage::Message("hi".into()),
             ),
+            (
+                tui::InputMessage::Ask {
+                    question: "isolated".into(),
+                },
+                InputMessage::Ask {
+                    question: "isolated".into(),
+                },
+            ),
             (tui::InputMessage::Interrupt, InputMessage::Interrupt),
             (
                 tui::InputMessage::NewConversation,
@@ -334,6 +344,7 @@ mod tests {
                 message: "retry".into(),
             },
             AgentEvent::TurnFinished,
+            AgentEvent::AskAnswer("isolated answer".into()),
             AgentEvent::OperationFinished,
             AgentEvent::Error("error".into()),
             AgentEvent::Notice("notice".into()),

@@ -262,6 +262,83 @@ impl Agent {
 }
 
 impl Agent {
+    /// Answer an isolated one-shot question using the active provider/model.
+    /// The request has no transcript, session ID, or tools, so it cannot
+    /// mutate workspace state or append anything to the current session.
+    async fn answer_isolated_question(
+        &self,
+        question: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> bool {
+        use futures_util::StreamExt;
+        use llm::{CompletionRequest, Message, RetryCallback, StreamEvent};
+        use std::sync::Arc;
+
+        let retry_events = events.clone();
+        let on_retry: RetryCallback = Arc::new(move |attempt, error| {
+            send(
+                &retry_events,
+                AgentEvent::Retrying {
+                    attempt,
+                    message: error.to_string(),
+                },
+            );
+        });
+        let request = CompletionRequest {
+            model: self.model.clone(),
+            system: Some("Answer the user's question directly and concisely. This is an isolated one-shot request; do not assume prior conversation context.".into()),
+            messages: vec![Message::user(self.secret_masker.mask_text(&question))],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            reasoning: self.reasoning,
+            session_id: None,
+        };
+        let stream_result = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return false,
+            result = self.provider.stream_with_retry(&request, on_retry) => result,
+        };
+        let mut stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
+                );
+                return true;
+            }
+        };
+        let mut answer = String::new();
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return false,
+                event = stream.next() => event,
+            };
+            let Some(event) = event else { break };
+            match event {
+                Ok(StreamEvent::TextDelta(delta)) => answer.push_str(&delta),
+                Ok(StreamEvent::Done { .. }) => break,
+                Ok(StreamEvent::ReasoningDelta(_))
+                | Ok(StreamEvent::OpaqueState { .. })
+                | Ok(StreamEvent::ToolCallComplete(_)) => {}
+                Err(error) => {
+                    send(
+                        events,
+                        AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
+                    );
+                    return true;
+                }
+            }
+        }
+        send(
+            events,
+            AgentEvent::AskAnswer(self.secret_masker.mask_text(&answer)),
+        );
+        true
+    }
+
     /// Run until the input channel closes or the application cancellation
     /// token is cancelled.  Input submitted while a turn is running remains in
     /// the mpsc queue and is consumed after the current turn finishes.
@@ -370,6 +447,13 @@ impl Agent {
                         TurnControl::Quarantine => break,
                         TurnControl::Continue => {}
                     }
+                }
+                InputMessage::Ask { question } => {
+                    if !self.answer_isolated_question(question, &events).await {
+                        break;
+                    }
+                    send(&events, AgentEvent::OperationFinished);
+                    continue;
                 }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
@@ -3036,7 +3120,7 @@ mod tests {
     struct RecordingProvider {
         calls: AtomicUsize,
         scripts: Vec<Vec<ScriptStep>>,
-        seen: Mutex<Vec<(Option<String>, Vec<Message>)>>,
+        seen: Mutex<Vec<(Option<String>, Vec<Message>, usize, Option<String>)>>,
     }
 
     #[async_trait]
@@ -3047,10 +3131,12 @@ mod tests {
 
         async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
-            self.seen
-                .lock()
-                .unwrap()
-                .push((request.system.clone(), request.messages.clone()));
+            self.seen.lock().unwrap().push((
+                request.system.clone(),
+                request.messages.clone(),
+                request.tools.len(),
+                request.session_id.clone(),
+            ));
             let script = self.scripts.get(index).cloned().unwrap_or_default();
             Ok(Box::pin(stream::iter(
                 script
@@ -3062,6 +3148,140 @@ mod tests {
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
             Ok(Vec::new())
         }
+    }
+
+    struct PendingAskProvider {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Provider for PendingAskProvider {
+        fn name(&self) -> &str {
+            "pending-ask"
+        }
+
+        async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            self.started.notify_one();
+            Ok(Box::pin(
+                stream::pending::<Result<StreamEvent, LlmError>>(),
+            ))
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn cancelling_isolated_ask_exits_without_operation_finished() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let started = Arc::new(Notify::new());
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Ask {
+                    question: "wait for cancellation".into(),
+                })
+                .unwrap();
+            let agent = Agent::new(
+                Arc::new(PendingAskProvider {
+                    started: started.clone(),
+                }),
+                ToolRegistry::empty(),
+                "demo",
+                cancel.clone(),
+            );
+            let task = tokio::spawn(agent.run(input_rx, event_tx));
+            started.notified().await;
+            cancel.cancel();
+            task.await.unwrap();
+
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(!events.contains(&AgentEvent::OperationFinished));
+            assert!(!events.iter().any(|event| matches!(event, AgentEvent::AskAnswer(_))));
+        });
+    }
+
+    #[test]
+    fn ask_uses_a_fresh_tool_free_request_and_does_not_create_a_turn() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![script(vec![
+                    StreamEvent::TextDelta("isolated sec".into()),
+                    StreamEvent::TextDelta("ret-value answer".into()),
+                    StreamEvent::Done {
+                        stop_reason: None,
+                        usage: None,
+                    },
+                ])],
+                seen: Mutex::new(Vec::new()),
+            });
+            let temp = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(temp.path().join("sessions"), temp.path()).unwrap();
+            let mut session = store.create(SessionCreateOptions::default()).unwrap();
+            store
+                .append_event(
+                    &mut session,
+                    SessionEvent::UserMessage {
+                        message: StoredMessage::from_llm(&Message::user("prior conversation")),
+                    },
+                )
+                .unwrap();
+            let session_id = session.id().clone();
+            let persisted_events = session.events.len();
+
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Ask {
+                    question: "quick question".into(),
+                })
+                .unwrap();
+            drop(input_tx);
+            let masker = Arc::new(
+                crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())])
+                    .unwrap(),
+            );
+            Agent::new(
+                provider.clone(),
+                ToolRegistry::empty(),
+                "demo",
+                CancellationToken::new(),
+            )
+            .with_secret_masker(masker)
+            .with_session(store.clone(), session)
+            .unwrap()
+            .run(input_rx, event_tx)
+            .await;
+
+            assert_eq!(
+                store.open(&session_id).unwrap().events.len(),
+                persisted_events
+            );
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].1.len(), 1, "only the fresh question is sent");
+            assert_eq!(seen[0].1[0], Message::user("quick question"));
+            assert_eq!(seen[0].2, 0, "ask advertises no tools");
+            assert_eq!(seen[0].3, None, "ask has no conversation session ID");
+            drop(seen);
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.contains(&AgentEvent::AskAnswer(
+                "isolated {{harness-secret:TOKEN}} answer".into()
+            )));
+            assert!(events.iter().all(|event| !format!("{event:?}").contains("secret-value")));
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(_) | AgentEvent::TurnFinished
+                )),
+                "ask output must not enter the normal conversation turn stream"
+            );
+        });
     }
 
     fn summarizer_script() -> Vec<ScriptStep> {
