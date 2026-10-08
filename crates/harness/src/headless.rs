@@ -317,6 +317,9 @@ async fn drive_headless_events_into(
                     )?;
                 }
             }
+            // Isolated ask answers are intentionally not part of a headless
+            // prompt's final response or any session output.
+            AgentEvent::AskAnswer(_) => {}
             AgentEvent::OperationFinished
             | AgentEvent::SessionSnapshot { .. }
             | AgentEvent::SessionList { .. }

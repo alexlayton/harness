@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 pub fn into_agent_input(message: tui::InputMessage) -> InputMessage {
     match message {
         tui::InputMessage::Message(value) => InputMessage::Message(value),
+        tui::InputMessage::Ask { question } => InputMessage::Ask { question },
         tui::InputMessage::Interrupt => InputMessage::Interrupt,
         tui::InputMessage::NewConversation => InputMessage::NewConversation,
         tui::InputMessage::LoadSession { selector } => InputMessage::LoadSession { selector },
@@ -78,6 +79,7 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
         },
         AgentEvent::Retrying { attempt, message } => tui::UiEvent::Retrying { attempt, message },
         AgentEvent::TurnFinished => tui::UiEvent::TurnFinished,
+        AgentEvent::AskAnswer(answer) => tui::UiEvent::AskAnswer(answer),
         AgentEvent::OperationFinished => tui::UiEvent::OperationFinished,
         AgentEvent::Error(value) => tui::UiEvent::Error(value),
         AgentEvent::Notice(value) => tui::UiEvent::Notice(value),
@@ -223,6 +225,14 @@ mod tests {
                 tui::InputMessage::Message("hi".into()),
                 InputMessage::Message("hi".into()),
             ),
+            (
+                tui::InputMessage::Ask {
+                    question: "isolated".into(),
+                },
+                InputMessage::Ask {
+                    question: "isolated".into(),
+                },
+            ),
             (tui::InputMessage::Interrupt, InputMessage::Interrupt),
             (
                 tui::InputMessage::NewConversation,
@@ -334,6 +344,7 @@ mod tests {
                 message: "retry".into(),
             },
             AgentEvent::TurnFinished,
+            AgentEvent::AskAnswer("isolated answer".into()),
             AgentEvent::OperationFinished,
             AgentEvent::Error("error".into()),
             AgentEvent::Notice("notice".into()),
@@ -427,37 +438,41 @@ mod tests {
         ));
         assert!(matches!(converted[4], tui::UiEvent::Retrying { .. }));
         assert_eq!(converted[5], tui::UiEvent::TurnFinished);
-        assert_eq!(converted[6], tui::UiEvent::OperationFinished);
-        assert!(matches!(converted[7], tui::UiEvent::Error(_)));
-        assert!(matches!(converted[8], tui::UiEvent::Notice(_)));
-        assert!(matches!(converted[9], tui::UiEvent::ModelChanged { .. }));
+        assert_eq!(
+            converted[6],
+            tui::UiEvent::AskAnswer("isolated answer".into())
+        );
+        assert_eq!(converted[7], tui::UiEvent::OperationFinished);
+        assert!(matches!(converted[8], tui::UiEvent::Error(_)));
+        assert!(matches!(converted[9], tui::UiEvent::Notice(_)));
+        assert!(matches!(converted[10], tui::UiEvent::ModelChanged { .. }));
         assert!(matches!(
-            converted[10],
+            converted[11],
             tui::UiEvent::ReasoningChanged { .. }
         ));
-        assert!(matches!(converted[11], tui::UiEvent::ModelList { .. }));
-        assert!(matches!(converted[12], tui::UiEvent::SessionChanged { .. }));
+        assert!(matches!(converted[12], tui::UiEvent::ModelList { .. }));
+        assert!(matches!(converted[13], tui::UiEvent::SessionChanged { .. }));
         assert!(matches!(
-            converted[13],
+            converted[14],
             tui::UiEvent::SessionSnapshot { .. }
         ));
-        assert!(matches!(converted[14], tui::UiEvent::SessionList { .. }));
+        assert!(matches!(converted[15], tui::UiEvent::SessionList { .. }));
         assert!(matches!(
-            converted[15],
+            converted[16],
             tui::UiEvent::SessionExported { .. }
         ));
-        assert!(matches!(converted[16], tui::UiEvent::SkillsLoaded { .. }));
-        assert!(matches!(converted[17], tui::UiEvent::UsageUpdated { .. }));
+        assert!(matches!(converted[17], tui::UiEvent::SkillsLoaded { .. }));
+        assert!(matches!(converted[18], tui::UiEvent::UsageUpdated { .. }));
         assert!(matches!(
-            converted[18],
+            converted[19],
             tui::UiEvent::ContextUsageUpdated { .. }
         ));
         assert!(matches!(
-            converted[19],
+            converted[20],
             tui::UiEvent::SubscriptionUsageLoaded { .. }
         ));
         assert!(matches!(
-            converted[20],
+            converted[21],
             tui::UiEvent::CompactionFinished { .. }
         ));
     }

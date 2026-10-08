@@ -362,6 +362,8 @@ pub struct CrossTerm {
 
     stream: Option<StreamState>,
     stream_markdown_cache: Option<StreamMarkdownCache>,
+    /// Latest isolated answer, shown in the live region but never committed to history.
+    ask_answer: Option<String>,
     /// Currently running tool calls, keyed by harness call id and kept in
     /// launch order. Concurrent fan-out (e.g. several `subagent` calls in one
     /// response) means more than one record can be live at once; a finish
@@ -466,6 +468,7 @@ impl CrossTerm {
             pending: Vec::new(),
             stream: None,
             stream_markdown_cache: None,
+            ask_answer: None,
             running_tools: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -1492,10 +1495,13 @@ impl CrossTerm {
             ));
             return Ok(());
         }
-        // The typed command is echoed without the ⌘ glyph: the input line the
-        // user already sees carries the `› ` prefix, so the notice is the raw
-        // command text.
-        self.add_notice(input.to_owned());
+        // Ask is intentionally absent from retained UI transcript as well as
+        // session history; only its answer is shown when it arrives.
+        if !matches!(&command, ParsedCommand::Ask { .. }) {
+            // The typed command is echoed without the ⌘ glyph: the input line
+            // already carries the `› ` prefix, so the notice is the raw text.
+            self.add_notice(input.to_owned());
+        }
         let message = match command {
             ParsedCommand::Help => {
                 self.add_notice(
@@ -1509,6 +1515,7 @@ impl CrossTerm {
                 );
                 return Ok(());
             }
+            ParsedCommand::Ask { question } => InputMessage::Ask { question },
             ParsedCommand::New => InputMessage::NewConversation,
             ParsedCommand::Load { selector } => InputMessage::LoadSession { selector },
             ParsedCommand::Sessions => InputMessage::ListSessions,
@@ -1538,6 +1545,11 @@ impl CrossTerm {
                 return Ok(());
             }
         };
+        if matches!(&message, InputMessage::Ask { .. }) {
+            self.busy = true;
+            self.activity = Activity::Preparing;
+            self.spinner = 0;
+        }
         input_tx
             .send(message)
             .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
@@ -1651,6 +1663,9 @@ impl CrossTerm {
                 self.activity = Activity::Preparing;
                 self.add_error(error);
             }
+            UiEvent::AskAnswer(answer) => {
+                self.ask_answer = Some(answer);
+            }
             UiEvent::TurnFinished => {
                 self.finalize_stream();
                 self.running_tools.clear();
@@ -1701,6 +1716,7 @@ impl CrossTerm {
                 self.add_notice(format_subscription_usage(&provider, &usage));
             }
             UiEvent::SessionChanged { id, loaded, .. } => {
+                self.ask_answer = None;
                 self.finalize_stream();
                 self.running_tools.clear();
                 // The terminal keeps everything physically, but the resize
@@ -1726,6 +1742,7 @@ impl CrossTerm {
                 }
             }
             UiEvent::SessionSnapshot { entries } => {
+                self.ask_answer = None;
                 self.finalize_stream();
                 self.running_tools.clear();
                 // Same chrome retention as `SessionChanged`: the snapshot
@@ -1960,6 +1977,9 @@ impl CrossTerm {
             clip_input(input, self.height as usize, self.busy, running.rows);
 
         let mut rows: Vec<Line<'static>> = Vec::new();
+        if let Some(answer) = &self.ask_answer {
+            rows.push(Line::from(format!("/ask · {answer}")));
+        }
 
         // The streaming tail shows only its newest rows; rows that scrolled
         let mut activity_row_index: Option<usize> = None;
@@ -3470,6 +3490,77 @@ mod tests {
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum()
+    }
+
+    fn begin_ask(ui: &mut CrossTerm) -> mpsc::UnboundedReceiver<InputMessage> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.submit_command("/ASK  keep  this question", &tx).unwrap();
+        assert!(ui.busy);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(InputMessage::Ask { question }) if question == "keep  this question"
+        ));
+        rx
+    }
+
+    fn assert_ask_not_retained(ui: &CrossTerm) {
+        let retained = format!("{:?}{:?}", ui.transcript, ui.pending);
+        assert!(!retained.contains("keep  this question"));
+        assert!(!retained.contains("one-shot result"));
+        assert!(ui.transcript.iter().all(|entry| !matches!(
+            entry,
+            Entry::User { text } if text.contains("keep  this question")
+        )));
+    }
+
+    #[test]
+    fn ask_success_completes_busy_and_keeps_answer_out_of_history() {
+        let mut ui = ui(80, 24);
+        let _rx = begin_ask(&mut ui);
+        ui.apply_event(UiEvent::AskAnswer("one-shot result".into()));
+        assert!(ui.busy, "answer delivery precedes operation completion");
+        ui.apply_event(UiEvent::OperationFinished);
+        assert!(!ui.busy);
+        assert_ask_not_retained(&ui);
+        assert_eq!(ui.ask_answer.as_deref(), Some("one-shot result"));
+    }
+
+    #[test]
+    fn ask_answer_is_cleared_when_session_changes_or_snapshot_loads() {
+        let mut ui = ui(80, 24);
+        ui.ask_answer = Some("answer from prior conversation".into());
+        ui.apply_event(UiEvent::SessionChanged {
+            id: "session-123".into(),
+            title: None,
+            loaded: true,
+        });
+        assert_eq!(ui.ask_answer, None);
+
+        ui.ask_answer = Some("answer before snapshot".into());
+        ui.apply_event(UiEvent::SessionSnapshot {
+            entries: Vec::new(),
+        });
+        assert_eq!(ui.ask_answer, None);
+    }
+
+    #[test]
+    fn ask_provider_open_error_completes_busy_without_retaining_question() {
+        let mut ui = ui(80, 24);
+        let _rx = begin_ask(&mut ui);
+        ui.apply_event(UiEvent::Error("provider open failed".into()));
+        ui.apply_event(UiEvent::OperationFinished);
+        assert!(!ui.busy);
+        assert_ask_not_retained(&ui);
+    }
+
+    #[test]
+    fn ask_mid_stream_error_completes_busy_without_retaining_question_or_partial_result() {
+        let mut ui = ui(80, 24);
+        let _rx = begin_ask(&mut ui);
+        ui.apply_event(UiEvent::Error("provider stream failed".into()));
+        ui.apply_event(UiEvent::OperationFinished);
+        assert!(!ui.busy);
+        assert_ask_not_retained(&ui);
     }
 
     fn record(status: ToolStatus) -> ToolRecord {

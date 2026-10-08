@@ -33,6 +33,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::None,
     },
     CommandSpec {
+        name: "/ask",
+        description: "Ask an isolated one-shot question (not saved to this conversation)",
+        usage: "/ask <question>",
+        argument_kind: ArgumentKind::None,
+    },
+    CommandSpec {
         name: "/new",
         description: "Start a new persisted conversation",
         usage: "/new",
@@ -137,6 +143,9 @@ pub struct CompletionResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedCommand {
     Help,
+    Ask {
+        question: String,
+    },
     New,
     Load {
         selector: String,
@@ -174,7 +183,7 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
     if !is_command_input(text) {
         return Err("commands must start with / and fit on one line".into());
     }
-    let input = text.trim();
+    let input = text.trim_start();
     let mut words = input.split_whitespace();
     let command = words.next().unwrap_or("");
     match command.to_ascii_lowercase().as_str() {
@@ -183,6 +192,18 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /help".into())
             } else {
                 Ok(ParsedCommand::Help)
+            }
+        }
+        "/ask" => {
+            // Keep the original spacing and punctuation after the command;
+            // only separator whitespace is removed from the beginning.
+            let question = input[command.len()..].trim_start();
+            if question.trim().is_empty() {
+                Err("usage: /ask <question>".into())
+            } else {
+                Ok(ParsedCommand::Ask {
+                    question: question.to_owned(),
+                })
             }
         }
         "/new" => {
@@ -1242,6 +1263,27 @@ mod tests {
         let values = candidates("/model openrouter:gpt", &providers(), &lists, "opencode-go");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].value, "openrouter:openai/gpt-5.6-luna");
+    }
+
+    #[test]
+    fn ask_parses_as_a_required_free_form_question() {
+        assert_eq!(
+            parse_command("/ask what git command does this?"),
+            Ok(ParsedCommand::Ask {
+                question: "what git command does this?".into()
+            })
+        );
+        assert_eq!(
+            parse_command("/ASK  explain   rebase "),
+            Ok(ParsedCommand::Ask {
+                question: "explain   rebase ".into()
+            })
+        );
+        assert_eq!(parse_command("/ask"), Err("usage: /ask <question>".into()));
+        assert_eq!(
+            parse_command("/ask   "),
+            Err("usage: /ask <question>".into())
+        );
     }
 
     #[test]
