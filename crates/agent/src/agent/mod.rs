@@ -3113,6 +3113,10 @@ mod tests {
     // Token-aware auto-compaction tests
     // ------------------------------------------------------------------
 
+    /// Snapshot of the request details recorded by the provider test helper.
+    type RequestSnapshot = (Option<String>, Vec<Message>, usize, Option<String>);
+    type SeenRequests = Mutex<Vec<RequestSnapshot>>;
+
     /// Provider that records every request (system + messages) so tests can
     /// assert on what was actually sent, and answers from a canned script.
     /// The summarizer request shares this same provider and is recognizable by
@@ -3120,7 +3124,7 @@ mod tests {
     struct RecordingProvider {
         calls: AtomicUsize,
         scripts: Vec<Vec<ScriptStep>>,
-        seen: Mutex<Vec<(Option<String>, Vec<Message>, usize, Option<String>)>>,
+        seen: SeenRequests,
     }
 
     #[async_trait]
@@ -3233,7 +3237,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-            let session_id = session.id().clone();
+            let session_id = session.id();
             let persisted_events = session.events.len();
 
             let (input_tx, input_rx) = mpsc::unbounded_channel();
