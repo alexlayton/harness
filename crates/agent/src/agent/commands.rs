@@ -23,6 +23,14 @@ impl Agent {
     pub(crate) fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
         let Some(store) = self.session.as_ref().map(|state| state.store.clone()) else {
             self.history.clear();
+            self.last_context_tokens = None;
+            send(
+                events,
+                AgentEvent::SessionSnapshot {
+                    entries: Vec::new(),
+                },
+            );
+            send(events, self.context_usage_event());
             send(
                 events,
                 AgentEvent::Notice("Started a new conversation".into()),
@@ -272,11 +280,7 @@ impl Agent {
         match export_jsonl(&session, Some(&destination), &ExportOptions::default()) {
             Ok(path) => {
                 let path = path.display().to_string();
-                send(events, AgentEvent::SessionExported { path: path.clone() });
-                send(
-                    events,
-                    AgentEvent::Notice(format!("Exported session to {path}")),
-                );
+                send(events, AgentEvent::SessionExported { path });
             }
             Err(error) => send(
                 events,
@@ -498,16 +502,13 @@ impl Agent {
                 model: model.clone(),
             },
         );
-        send(
-            events,
-            AgentEvent::Notice(format!("Using {canonical} · {model}")),
-        );
         // A different model may have a different context window and stale
         // token counts; reset both so the next trigger re-baselines. Metadata
         // is fetched in the background so a slow catalogue cannot block the
         // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
         self.context_window = self.compaction.resolved_window(0);
+        send(events, self.context_usage_event());
         if let Some(metadata_tx) = &self.model_metadata_tx {
             spawn_model_metadata(
                 metadata_tx.clone(),
@@ -541,10 +542,6 @@ impl Agent {
                 level: reasoning.to_string(),
             },
         );
-        send(
-            events,
-            AgentEvent::Notice(format!("Reasoning effort: {reasoning}")),
-        );
     }
 
     /// Fetch subscription allowance usage from the provider active when the
@@ -554,28 +551,48 @@ impl Agent {
         let provider = self.provider.clone();
         let provider_name = self.secret_masker.mask_text(provider.name());
         let events = events.clone();
+        let cancel = self.cancel.clone();
+        let id = start_background_operation(
+            &events,
+            format!("Fetching {provider_name} subscription usage..."),
+        );
         tokio::spawn(async move {
-            match provider.subscription_usage().await {
-                Ok(Some(usage)) => send(
-                    &events,
-                    AgentEvent::SubscriptionUsageLoaded {
-                        provider: provider_name,
-                        usage,
-                    },
-                ),
-                Ok(None) => send(
-                    &events,
-                    AgentEvent::Notice(format!(
-                        "subscription usage is not available for {provider_name}"
-                    )),
-                ),
-                Err(error) => send(
-                    &events,
-                    AgentEvent::Error(format!(
-                        "could not fetch {provider_name} subscription usage: {error}"
-                    )),
-                ),
-            }
+            let result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                result = tokio::time::timeout(USAGE_FETCH_TIMEOUT, provider.subscription_usage()) => result,
+            };
+            let error = match result {
+                Ok(Ok(Some(usage))) => {
+                    send(
+                        &events,
+                        AgentEvent::SubscriptionUsageLoaded {
+                            provider: provider_name,
+                            usage,
+                        },
+                    );
+                    None
+                }
+                Ok(Ok(None)) => {
+                    send(
+                        &events,
+                        AgentEvent::Notice(format!(
+                            "subscription usage is not available for {provider_name}"
+                        )),
+                    );
+                    None
+                }
+                Ok(Err(error)) => Some(format!(
+                    "could not fetch {provider_name} subscription usage: {error}"
+                )),
+                Err(_) => Some(format!(
+                    "{provider_name} subscription usage request timed out"
+                )),
+            };
+            send(
+                &events,
+                AgentEvent::BackgroundOperationFinished { id, error },
+            );
         });
     }
 
@@ -603,10 +620,11 @@ impl Agent {
                 return;
             }
         };
-        spawn_model_list(
+        spawn_model_list_with_cancel(
             self.secret_masker.mask_text(provider.name()),
             provider,
             events.clone(),
+            self.cancel.clone(),
         );
     }
 
@@ -685,23 +703,29 @@ impl Agent {
     }
 }
 
+// Separate identities prevent overlapping lookups from clearing each other
+// or the frontend's active model turn.
+fn start_background_operation(events: &mpsc::UnboundedSender<AgentEvent>, label: String) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    send(events, AgentEvent::BackgroundOperationStarted { id, label });
+    id
+}
+
+const USAGE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Host-owned provider construction used for model selection commands.
 pub type ProviderFactory =
     Arc<dyn Fn(&str) -> anyhow::Result<Arc<dyn Provider>> + Send + Sync + 'static>;
 
-/// Fetch model metadata for the active selection on a bounded background
-/// task. The run loop consumes the result and derives both context-window and
-/// model-list updates from this one request.
-/// Bound for one model-catalogue fetch. Both metadata fetchers share it so
-/// a slow provider blocks neither the run loop (metadata) nor the command
-/// loop (`/models`) for longer than this.
+// Bound both startup metadata and `/model` completion lookups so a slow
+// catalogue cannot keep either task alive indefinitely.
 const MODEL_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Run one bounded, cancellable model-catalogue fetch. Shared by
-/// [`spawn_model_metadata`] (single request feeding both context window and
-/// UI catalogue) and [`spawn_model_list`] (explicit `/models`); only the
-/// result sink differs (CLEANUP-3). Returns `None` on timeout, cancel, or
-/// provider error.
+/// Run one bounded, cancellable model-catalogue fetch for startup and
+/// model-change metadata. These requests use a silent failure path. Returns
+/// `None` on timeout, cancellation, or provider error.
 async fn fetch_model_catalogue(
     provider: Arc<dyn Provider>,
     cancel: &CancellationToken,
@@ -728,34 +752,48 @@ pub(crate) fn spawn_model_metadata(
 }
 
 /// Fetch a provider's model list on a background task, reporting
-/// `AgentEvent::ModelList` on success and a notice on failure. Shared by the
-/// `/model` and `/models` handlers. The fetch itself is the shared
-/// [`fetch_model_catalogue`]; only this explicit-listing sink differs from
-/// the metadata path.
+/// `AgentEvent::ModelList` on success. Progress and failures use background
+/// operation events so they cannot terminate an unrelated model turn.
 pub fn spawn_model_list(
     provider_name: String,
     provider: Arc<dyn Provider>,
     events: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    // No cancel token on this path today: the timeout still bounds it, and
-    // the task only sends events (never mutates agent state).
-    let never = CancellationToken::new();
+    spawn_model_list_with_cancel(provider_name, provider, events, CancellationToken::new());
+}
+
+fn spawn_model_list_with_cancel(
+    provider_name: String,
+    provider: Arc<dyn Provider>,
+    events: mpsc::UnboundedSender<AgentEvent>,
+    cancel: CancellationToken,
+) {
+    let id = start_background_operation(&events, format!("Fetching {provider_name} models..."));
     tokio::spawn(async move {
-        match fetch_model_catalogue(provider, &never).await {
-            Some(models) => send(
-                &events,
-                AgentEvent::ModelList {
-                    provider: provider_name,
-                    models,
-                },
-            ),
-            // `fetch_model_catalogue` collapses provider errors to `None`
-            // along with timeout/cancel; the explicit-listing sink reports
-            // failure while the metadata path drops it silently.
-            None => send(
-                &events,
-                AgentEvent::Notice("could not fetch model list".into()),
-            ),
-        }
+        let result = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            result = tokio::time::timeout(MODEL_FETCH_TIMEOUT, provider.list_models()) => result,
+        };
+        let error = match result {
+            Ok(Ok(models)) => {
+                send(
+                    &events,
+                    AgentEvent::ModelList {
+                        provider: provider_name,
+                        models,
+                    },
+                );
+                None
+            }
+            Ok(Err(error)) => Some(format!(
+                "could not fetch {provider_name} model list: {error}"
+            )),
+            Err(_) => Some(format!("{provider_name} model list request timed out")),
+        };
+        send(
+            &events,
+            AgentEvent::BackgroundOperationFinished { id, error },
+        );
     });
 }
