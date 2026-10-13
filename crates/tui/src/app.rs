@@ -364,6 +364,8 @@ pub struct CrossTerm {
     stream_markdown_cache: Option<StreamMarkdownCache>,
     /// Latest isolated answer, shown in the live region but never committed to history.
     ask_answer: Option<String>,
+    /// First wrapped answer row in the transient pager.
+    ask_offset: usize,
     /// Currently running tool calls, keyed by harness call id and kept in
     /// launch order. Concurrent fan-out (e.g. several `subagent` calls in one
     /// response) means more than one record can be live at once; a finish
@@ -469,6 +471,7 @@ impl CrossTerm {
             stream: None,
             stream_markdown_cache: None,
             ask_answer: None,
+            ask_offset: 0,
             running_tools: Vec::new(),
             input: String::new(),
             cursor: 0,
@@ -820,7 +823,13 @@ impl CrossTerm {
                     self.close_completion();
                     // Skip the tail refresh: it would reopen the same list.
                     return Ok(false);
+                } else {
+                    self.dismiss_ask();
                 }
+            }
+            KeyCode::PageUp | KeyCode::PageDown if self.ask_answer.is_some() => {
+                self.scroll_ask(key.code == KeyCode::PageDown);
+                return Ok(false);
             }
             KeyCode::Enter
                 if key
@@ -1451,6 +1460,7 @@ impl CrossTerm {
         if commands::is_command_input(&text) {
             self.submit_command(&text, input_tx)?;
         } else {
+            self.dismiss_ask();
             // The typed prompt line is already on screen with the `› ` prefix;
             // committing it as a user entry below re-prints the same pixels.
             self.pending.push(Entry::User { text: text.clone() });
@@ -1495,6 +1505,9 @@ impl CrossTerm {
             ));
             return Ok(());
         }
+        // A new command dismisses the previous isolated result, including
+        // when the next ask fails before an answer arrives.
+        self.dismiss_ask();
         // Ask is intentionally absent from retained UI transcript as well as
         // session history; only its answer is shown when it arrives.
         if !matches!(&command, ParsedCommand::Ask { .. }) {
@@ -1568,6 +1581,7 @@ impl CrossTerm {
                 }
                 self.busy = true;
                 self.activity = Activity::Working;
+                self.dismiss_ask();
                 self.stream().markdown.push_str(&delta);
                 self.refresh_stream_markdown_cache();
             }
@@ -1577,6 +1591,7 @@ impl CrossTerm {
                 }
                 self.busy = true;
                 self.activity = Activity::Reasoning;
+                self.dismiss_ask();
                 self.stream().reasoning.push_str(&delta);
             }
             UiEvent::ToolCallStarted {
@@ -1586,6 +1601,7 @@ impl CrossTerm {
             } => {
                 self.busy = true;
                 self.activity = Activity::Processing;
+                self.dismiss_ask();
                 // Text streamed before the call is a complete message.
                 self.finalize_stream();
                 // Insert the new active record without disturbing existing
@@ -1663,8 +1679,15 @@ impl CrossTerm {
                 self.activity = Activity::Preparing;
                 self.add_error(error);
             }
+            UiEvent::AskStarted => {
+                self.dismiss_ask();
+                self.busy = true;
+                self.activity = Activity::Preparing;
+                self.spinner = 0;
+            }
             UiEvent::AskAnswer(answer) => {
                 self.ask_answer = Some(answer);
+                self.ask_offset = 0;
             }
             UiEvent::TurnFinished => {
                 self.finalize_stream();
@@ -1716,7 +1739,7 @@ impl CrossTerm {
                 self.add_notice(format_subscription_usage(&provider, &usage));
             }
             UiEvent::SessionChanged { id, loaded, .. } => {
-                self.ask_answer = None;
+                self.dismiss_ask();
                 self.finalize_stream();
                 self.running_tools.clear();
                 // The terminal keeps everything physically, but the resize
@@ -1742,7 +1765,7 @@ impl CrossTerm {
                 }
             }
             UiEvent::SessionSnapshot { entries } => {
-                self.ask_answer = None;
+                self.dismiss_ask();
                 self.finalize_stream();
                 self.running_tools.clear();
                 // Same chrome retention as `SessionChanged`: the snapshot
@@ -1973,34 +1996,61 @@ impl CrossTerm {
     ) -> RegionBuild {
         let theme = self.theme;
         let content = render::content_width(self.width);
-        let (input_rows, input_cursor_row) =
-            clip_input(input, self.height as usize, self.busy, running.rows);
+        // Reserve a header and at least one answer row even for a large
+        // draft. The final height guard still covers degenerate terminals.
+        let answer_reserve = usize::from(self.ask_answer.is_some()) * 2;
+        let (input_rows, input_cursor_row) = clip_input(
+            input,
+            self.height as usize,
+            self.busy,
+            running.rows + answer_reserve,
+        );
 
         let mut rows: Vec<Line<'static>> = Vec::new();
-        if let Some(answer) = &self.ask_answer {
-            rows.push(Line::from(format!("/ask · {answer}")));
-        }
-
-        // The streaming tail shows only its newest rows; rows that scrolled
         let mut activity_row_index: Option<usize> = None;
-        // out of the budget are printed in full when the message finalizes.
-        let tail = self.stream_tail_lines(content);
-        let budget = self.tail_budget(input_rows.len(), running.rows);
-        let start = tail.len().saturating_sub(budget);
-        rows.extend(tail[start..].iter().cloned());
+        // Small screens prioritize answer text over pager chrome and gaps.
+        let section_gap = if self.ask_answer.is_some() && self.height < 6 {
+            0
+        } else {
+            render::SECTION_GAP
+        };
+        if self.ask_answer.is_some() {
+            let answer = self.ask_lines(content);
+            let (header, budget) = self.ask_page_layout(input_rows.len(), running.rows);
+            let start = self.ask_offset.min(answer.len().saturating_sub(budget));
+            let end = (start + budget).min(answer.len());
+            if header {
+                rows.push(Line::from(Span::styled(
+                    format!(
+                        "/ask · {}–{end}/{} · PgUp/PgDn · Esc close",
+                        start + 1,
+                        answer.len()
+                    ),
+                    Style::default().fg(theme.dim_text),
+                )));
+            }
+            rows.extend(answer[start..end].iter().cloned());
+        } else {
+            // The streaming tail shows only its newest rows; rows that
+            // scrolled out are printed in full when the message finalizes.
+            let tail = self.stream_tail_lines(content);
+            let budget = self.tail_budget(input_rows.len(), running.rows);
+            let start = tail.len().saturating_sub(budget);
+            rows.extend(tail[start..].iter().cloned());
+        }
 
         // All active tool records render in deterministic launch order
         // (collapsed to one line each unless expanded globally); anything
         // beyond the visible cap folds into one explicit overflow row so a
         // large fan-out stays discoverable without breaking screen height.
         if !running.lines.is_empty() && !rows.is_empty() {
-            render::push_blank(&mut rows, render::SECTION_GAP);
+            render::push_blank(&mut rows, section_gap);
         }
         rows.extend(running.lines);
 
         if self.busy {
             if !rows.is_empty() {
-                render::push_blank(&mut rows, render::SECTION_GAP);
+                render::push_blank(&mut rows, section_gap);
             }
             let activity_row = rows.len();
             rows.push(activity_line(self.activity, self.spinner, theme));
@@ -2008,7 +2058,7 @@ impl CrossTerm {
         }
 
         if !rows.is_empty() {
-            render::push_blank(&mut rows, render::SECTION_GAP);
+            render::push_blank(&mut rows, section_gap);
         }
         let mut cursor_row = rows.len() + input_cursor_row;
         rows.extend(input_rows);
@@ -2074,6 +2124,51 @@ impl CrossTerm {
         }
         let rows = lines.len();
         RunningRegion { lines, rows }
+    }
+
+    fn dismiss_ask(&mut self) {
+        self.ask_answer = None;
+        self.ask_offset = 0;
+    }
+
+    /// Split and wrap sanitized source before producing terminal rows. The
+    /// complete result stays in this transient pager, never in the transcript.
+    fn ask_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let answer = render::sanitize_terminal_text(self.ask_answer.as_deref().unwrap_or(""));
+        render::wrap_text(
+            &Text::from(answer),
+            width,
+            Style::default().fg(self.theme.assistant_text),
+        )
+    }
+
+    fn ask_page_layout(&self, input_rows: usize, running_rows: usize) -> (bool, usize) {
+        let gaps = if self.height < 6 {
+            0
+        } else {
+            render::SECTION_GAP * (1 + usize::from(self.busy) + usize::from(running_rows > 0))
+        };
+        let available = (self.height as usize)
+            .saturating_sub(input_rows + running_rows + usize::from(self.busy) + gaps);
+        let header = available > 1;
+        (header, available.saturating_sub(usize::from(header)).max(1))
+    }
+
+    fn scroll_ask(&mut self, forward: bool) {
+        let input = self.input_layout();
+        let running_rows = self.running_region().rows;
+        let (input_rows, _) = clip_input(&input, self.height as usize, self.busy, running_rows + 2);
+        let (_, page) = self.ask_page_layout(input_rows.len(), running_rows);
+        let max_offset = self
+            .ask_lines(render::content_width(self.width))
+            .len()
+            .saturating_sub(page);
+        let current = self.ask_offset.min(max_offset);
+        self.ask_offset = if forward {
+            current.saturating_add(page).min(max_offset)
+        } else {
+            current.saturating_sub(page)
+        };
     }
 
     /// Rendered rows of the in-flight assistant message (reasoning block,
@@ -3526,6 +3621,116 @@ mod tests {
     }
 
     #[test]
+    fn queued_ask_start_restores_busy_so_esc_interrupts_the_request() {
+        let mut ui = ui(80, 24);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        ui.apply_event(UiEvent::AskAnswer("previous answer".into()));
+        ui.apply_event(UiEvent::OperationFinished);
+        ui.apply_event(UiEvent::AskStarted);
+        assert!(ui.busy);
+        assert!(ui.ask_answer.is_none());
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            &tx,
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(rx.try_recv().unwrap(), InputMessage::Interrupt);
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn multiline_ask_submission_never_becomes_a_conversation_message() {
+        let mut ui = ui(80, 24);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.input = "/ASK Explain this passage:\n  The moon rose over the sea.".into();
+        ui.cursor = ui.input.len();
+        ui.submit(&tx).unwrap();
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            InputMessage::Ask {
+                question: "Explain this passage:\n  The moon rose over the sea.".into(),
+            }
+        );
+        assert!(ui.busy);
+        assert!(ui.pending.is_empty());
+        assert!(ui.transcript.is_empty());
+    }
+
+    #[test]
+    fn ask_pager_wraps_all_answer_text_and_can_be_dismissed_without_history() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        for (width, height, busy) in [
+            (40, 2, false),
+            (40, 4, true),
+            (40, 8, false),
+            (80, 12, false),
+        ] {
+            let mut ui = ui(width, height);
+            ui.busy = busy;
+            let answer = (0..20)
+                .map(|row| {
+                    (0..12)
+                        .map(|word| format!("r{row}-w{word:02}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            ui.apply_event(UiEvent::AskAnswer(format!("\x1b[31m{answer}\x1b[0m")));
+            let expected = ui.ask_lines(render::content_width(width));
+            let mut visible = HashSet::new();
+            loop {
+                let build = ui.build_region(&ui.input_layout());
+                assert!(build.rows.len() <= height as usize);
+                assert!(build.cursor_row < build.rows.len());
+                for row in &build.rows {
+                    let text = row_text(row);
+                    assert!(!text.contains(['\n', '\r', '\x1b']));
+                    assert!(row_width(row) <= render::content_width(width));
+                    visible.insert(text);
+                }
+                let previous = ui.ask_offset;
+                ui.handle_input(
+                    &Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty())),
+                    &tx,
+                    &cancel,
+                )
+                .unwrap();
+                if ui.ask_offset == previous {
+                    break;
+                }
+            }
+            assert!(
+                expected.iter().all(|row| visible.contains(&row_text(row))),
+                "every wrapped answer row must be reachable"
+            );
+            let last_offset = ui.ask_offset;
+            ui.handle_input(
+                &Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty())),
+                &tx,
+                &cancel,
+            )
+            .unwrap();
+            assert!(ui.ask_offset < last_offset);
+            ui.apply_event(UiEvent::OperationFinished);
+            ui.handle_input(
+                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+                &tx,
+                &cancel,
+            )
+            .unwrap();
+            assert!(ui.ask_answer.is_none());
+            assert!(ui.pending.is_empty());
+            assert!(ui.transcript.is_empty());
+            assert!(rx.try_recv().is_err());
+            assert!(!cancel.is_cancelled());
+        }
+    }
+
+    #[test]
     fn ask_answer_is_cleared_when_session_changes_or_snapshot_loads() {
         let mut ui = ui(80, 24);
         ui.ask_answer = Some("answer from prior conversation".into());
@@ -3546,10 +3751,15 @@ mod tests {
     #[test]
     fn ask_provider_open_error_completes_busy_without_retaining_question() {
         let mut ui = ui(80, 24);
+        ui.ask_answer = Some("previous answer".into());
+        ui.ask_offset = 10;
         let _rx = begin_ask(&mut ui);
+        assert!(ui.ask_answer.is_none());
+        assert_eq!(ui.ask_offset, 0);
         ui.apply_event(UiEvent::Error("provider open failed".into()));
         ui.apply_event(UiEvent::OperationFinished);
         assert!(!ui.busy);
+        assert!(ui.ask_answer.is_none());
         assert_ask_not_retained(&ui);
     }
 

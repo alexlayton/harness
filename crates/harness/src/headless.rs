@@ -98,9 +98,8 @@ fn observe_herdr_events(
                 AgentEvent::TextDelta(_)
                 | AgentEvent::ReasoningDelta(_)
                 | AgentEvent::ToolCallStarted { .. }
-                | AgentEvent::Retrying { .. } => {
-                    reporter.report(crate::herdr::State::Working, None)
-                }
+                | AgentEvent::Retrying { .. }
+                | AgentEvent::AskStarted => reporter.report(crate::herdr::State::Working, None),
                 AgentEvent::TurnFinished | AgentEvent::OperationFinished => {
                     reporter.report(crate::herdr::State::Idle, None)
                 }
@@ -319,7 +318,7 @@ async fn drive_headless_events_into(
             }
             // Isolated ask answers are intentionally not part of a headless
             // prompt's final response or any session output.
-            AgentEvent::AskAnswer(_) => {}
+            AgentEvent::AskStarted | AgentEvent::AskAnswer(_) => {}
             AgentEvent::OperationFinished
             | AgentEvent::SessionSnapshot { .. }
             | AgentEvent::SessionList { .. }

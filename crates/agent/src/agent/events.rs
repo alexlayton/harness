@@ -65,6 +65,8 @@ pub enum AgentEvent {
         message: String,
     },
     TurnFinished,
+    /// An isolated ask request has started, including one from queued input.
+    AskStarted,
     /// Result of an isolated ask request, displayed outside conversation history.
     AskAnswer(String),
     /// A non-turn operation that can be shown as running has returned to the

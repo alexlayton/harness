@@ -162,6 +162,8 @@ pub enum UiEvent {
         message: String,
     },
     TurnFinished,
+    /// An isolated ask request has started, including one from queued input.
+    AskStarted,
     /// Completed isolated answer; it is displayed but is not conversation history.
     AskAnswer(String),
     /// A host-visible non-turn operation returned to the input loop.

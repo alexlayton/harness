@@ -173,10 +173,16 @@ pub enum ParsedCommand {
     },
 }
 
-/// A command is deliberately restricted to one line.  A multiline message
-/// beginning with `/` is ordinary user text and should still be sendable.
+/// Commands normally fit on one line. `/ask` also accepts multiline
+/// questions so pasted text cannot silently become a persisted turn.
+/// Other multiline messages beginning with `/` remain ordinary user text.
 pub fn is_command_input(text: &str) -> bool {
-    text.starts_with('/') && !text.contains(['\n', '\r'])
+    text.starts_with('/')
+        && (!text.contains(['\n', '\r'])
+            || text
+                .split_whitespace()
+                .next()
+                .is_some_and(|command| command.eq_ignore_ascii_case("/ask")))
 }
 
 pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
@@ -365,7 +371,8 @@ fn skill_entry<'a>(skills: &'a [SkillEntry], name: &str) -> Option<&'a SkillEntr
 /// The context deliberately stores byte offsets (used for Rust string
 /// slicing) and performs the char-column conversion in one place.
 pub fn completion_context(input: &str, cursor_col: usize) -> Option<CompletionContext> {
-    if !is_command_input(input) {
+    // Multiline ask input is a question, not a completion target.
+    if !is_command_input(input) || input.contains(['\n', '\r']) {
         return None;
     }
 
@@ -1279,6 +1286,15 @@ mod tests {
                 question: "explain   rebase ".into()
             })
         );
+        assert_eq!(
+            parse_command("/ASK explain this:\r\n  first line\nsecond line"),
+            Ok(ParsedCommand::Ask {
+                question: "explain this:\r\n  first line\nsecond line".into()
+            })
+        );
+        assert!(!is_command_input("/ask-more\nordinary text"));
+        assert!(!is_command_input("/help\nordinary text"));
+        assert!(completion_context("/ask explain\nthis", 17).is_none());
         assert_eq!(parse_command("/ask"), Err("usage: /ask <question>".into()));
         assert_eq!(
             parse_command("/ask   "),

@@ -79,6 +79,7 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
         },
         AgentEvent::Retrying { attempt, message } => tui::UiEvent::Retrying { attempt, message },
         AgentEvent::TurnFinished => tui::UiEvent::TurnFinished,
+        AgentEvent::AskStarted => tui::UiEvent::AskStarted,
         AgentEvent::AskAnswer(answer) => tui::UiEvent::AskAnswer(answer),
         AgentEvent::OperationFinished => tui::UiEvent::OperationFinished,
         AgentEvent::Error(value) => tui::UiEvent::Error(value),
@@ -322,6 +323,10 @@ mod tests {
 
     #[test]
     fn converts_every_event_variant() {
+        assert_eq!(
+            into_ui_event(AgentEvent::AskStarted),
+            tui::UiEvent::AskStarted
+        );
         let events = vec![
             AgentEvent::TextDelta("text".into()),
             AgentEvent::ReasoningDelta("reason".into()),

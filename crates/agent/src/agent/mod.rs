@@ -449,7 +449,31 @@ impl Agent {
                     }
                 }
                 InputMessage::Ask { question } => {
-                    if !self.answer_isolated_question(question, &events).await {
+                    send(&events, AgentEvent::AskStarted);
+                    // Poll input while the isolated request is opening or
+                    // streaming. Dropping the future on Esc stops only this
+                    // request; other messages retain their queue order.
+                    let mut buffered = VecDeque::new();
+                    let mut input_open = self.input_open;
+                    let completed = {
+                        let operation = self.answer_isolated_question(question, &events);
+                        tokio::pin!(operation);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = self.cancel.cancelled() => break false,
+                                message = input.recv(), if input_open => match message {
+                                    Some(InputMessage::Interrupt) => break true,
+                                    Some(message) => buffered.push_back(message),
+                                    None => input_open = false,
+                                },
+                                completed = &mut operation => break completed,
+                            }
+                        }
+                    };
+                    self.input_open = input_open;
+                    self.queued.extend(buffered);
+                    if !completed {
                         break;
                     }
                     send(&events, AgentEvent::OperationFinished);
@@ -3156,6 +3180,8 @@ mod tests {
 
     struct PendingAskProvider {
         started: Arc<Notify>,
+        pending_open: bool,
+        calls: AtomicUsize,
     }
 
     #[async_trait]
@@ -3165,8 +3191,21 @@ mod tests {
         }
 
         async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("next answer".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: None,
+                        usage: None,
+                    }),
+                ])));
+            }
             self.started.notify_one();
-            Ok(Box::pin(stream::pending::<Result<StreamEvent, LlmError>>()))
+            if self.pending_open {
+                futures_util::future::pending().await
+            } else {
+                Ok(Box::pin(stream::pending::<Result<StreamEvent, LlmError>>()))
+            }
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
@@ -3190,6 +3229,8 @@ mod tests {
             let agent = Agent::new(
                 Arc::new(PendingAskProvider {
                     started: started.clone(),
+                    pending_open: false,
+                    calls: AtomicUsize::new(0),
                 }),
                 ToolRegistry::empty(),
                 "demo",
@@ -3207,6 +3248,72 @@ mod tests {
                     .iter()
                     .any(|event| matches!(event, AgentEvent::AskAnswer(_)))
             );
+        });
+    }
+
+    #[test]
+    fn interrupting_isolated_ask_stops_open_or_stream_and_preserves_queued_input() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            for pending_open in [true, false] {
+                let started = Arc::new(Notify::new());
+                let cancel = CancellationToken::new();
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::Ask {
+                        question: "stop this".into(),
+                    })
+                    .unwrap();
+                let agent = Agent::new(
+                    Arc::new(PendingAskProvider {
+                        started: started.clone(),
+                        pending_open,
+                        calls: AtomicUsize::new(0),
+                    }),
+                    ToolRegistry::empty(),
+                    "demo",
+                    cancel.clone(),
+                );
+                let task = tokio::spawn(agent.run(input_rx, event_tx));
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    started.notified().await;
+                    // This message must remain queued when Esc stops the
+                    // first request, rather than being dropped with it.
+                    input_tx
+                        .send(InputMessage::Ask {
+                            question: "next question".into(),
+                        })
+                        .unwrap();
+                    input_tx.send(InputMessage::Interrupt).unwrap();
+                    drop(input_tx);
+                    task.await.unwrap();
+                })
+                .await
+                .expect("Esc must stop a pending ask");
+                assert!(!cancel.is_cancelled(), "Esc must not close Harness");
+                let results = std::iter::from_fn(|| event_rx.try_recv().ok())
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            AgentEvent::AskStarted
+                                | AgentEvent::AskAnswer(_)
+                                | AgentEvent::OperationFinished
+                                | AgentEvent::Error(_)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    results,
+                    vec![
+                        AgentEvent::AskStarted,
+                        AgentEvent::OperationFinished,
+                        AgentEvent::AskStarted,
+                        AgentEvent::AskAnswer("next answer".into()),
+                        AgentEvent::OperationFinished,
+                    ]
+                );
+            }
         });
     }
 
