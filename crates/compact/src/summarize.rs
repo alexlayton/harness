@@ -175,9 +175,13 @@ async fn model_summarize(
                     Ok(StreamEvent::TextDelta(delta)) => {
                         append_with_limit(&mut text, &delta, policy.max_summary_bytes);
                     }
-                    Ok(StreamEvent::Done { usage: Some(found), .. }) => usage = Some(found),
-                    Ok(StreamEvent::Done { .. })
-                    | Ok(StreamEvent::ReasoningDelta(_))
+                    Ok(StreamEvent::Done { usage: found, .. }) => {
+                        usage = found;
+                        // Done is the protocol boundary; do not wait for an
+                        // HTTP stream that may remain open after completion.
+                        break;
+                    }
+                    Ok(StreamEvent::ReasoningDelta(_))
                     | Ok(StreamEvent::OpaqueState { .. })
                     | Ok(StreamEvent::ToolCallComplete(_)) => {}
                     Err(error) => return Err(error),
@@ -402,6 +406,34 @@ mod tests {
             }
             other => panic!("expected model outcome, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn done_finishes_summary_without_waiting_for_stream_end() {
+        let provider = ScriptProvider {
+            events: vec![
+                Ok(StreamEvent::TextDelta("Summary is complete".into())),
+                Ok(StreamEvent::Done {
+                    stop_reason: None,
+                    usage: Some(Usage {
+                        output_tokens: 7,
+                        ..Usage::default()
+                    }),
+                }),
+                Err("transport failed after Done".into()),
+            ],
+        };
+        let outcome = runtime().block_on(summarize(
+            &provider,
+            "demo",
+            &build_plan(),
+            &CompactionPolicy::default(),
+            None,
+            &CancellationToken::new(),
+        ));
+        assert!(
+            matches!(outcome, SummaryOutcome::Model { usage: Some(usage), .. } if usage.output_tokens == 7)
+        );
     }
 
     #[test]

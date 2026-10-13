@@ -81,7 +81,14 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
         AgentEvent::TurnFinished => tui::UiEvent::TurnFinished,
         AgentEvent::AskStarted => tui::UiEvent::AskStarted,
         AgentEvent::AskAnswer(answer) => tui::UiEvent::AskAnswer(answer),
+        AgentEvent::OperationStarted { label } => tui::UiEvent::OperationStarted { label },
         AgentEvent::OperationFinished => tui::UiEvent::OperationFinished,
+        AgentEvent::BackgroundOperationStarted { id, label } => {
+            tui::UiEvent::BackgroundOperationStarted { id, label }
+        }
+        AgentEvent::BackgroundOperationFinished { id, error } => {
+            tui::UiEvent::BackgroundOperationFinished { id, error }
+        }
         AgentEvent::Error(value) => tui::UiEvent::Error(value),
         AgentEvent::Notice(value) => tui::UiEvent::Notice(value),
         AgentEvent::ModelChanged { provider, model } => {
@@ -432,6 +439,17 @@ mod tests {
                 auto: true,
                 reason: agent::CompactionReason::Auto,
             },
+            AgentEvent::OperationStarted {
+                label: "Compacting session...".into(),
+            },
+            AgentEvent::BackgroundOperationStarted {
+                id: 42,
+                label: "Fetching usage...".into(),
+            },
+            AgentEvent::BackgroundOperationFinished {
+                id: 42,
+                error: Some("request timed out".into()),
+            },
         ];
         let converted = events.into_iter().map(into_ui_event).collect::<Vec<_>>();
         assert!(matches!(converted[0], tui::UiEvent::TextDelta(_)));
@@ -480,6 +498,26 @@ mod tests {
             converted[21],
             tui::UiEvent::CompactionFinished { .. }
         ));
+        assert_eq!(
+            converted[22],
+            tui::UiEvent::OperationStarted {
+                label: "Compacting session...".into()
+            }
+        );
+        assert_eq!(
+            converted[23],
+            tui::UiEvent::BackgroundOperationStarted {
+                id: 42,
+                label: "Fetching usage...".into()
+            }
+        );
+        assert_eq!(
+            converted[24],
+            tui::UiEvent::BackgroundOperationFinished {
+                id: 42,
+                error: Some("request timed out".into())
+            }
+        );
     }
 
     #[test]

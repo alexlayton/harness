@@ -34,6 +34,8 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Activity {
     Preparing,
+    Asking,
+    Compacting,
     Working,
     Reasoning,
     Processing,
@@ -44,6 +46,8 @@ impl Activity {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Preparing => "Preparing...",
+            Self::Asking => "Answering /ask...",
+            Self::Compacting => "Compacting session...",
             Self::Working => "Working...",
             Self::Reasoning => "Reasoning...",
             Self::Processing => "Processing...",
@@ -371,6 +375,8 @@ pub struct CrossTerm {
     /// response) means more than one record can be live at once; a finish
     /// removes exactly the matching id and never disturbs its neighbors.
     running_tools: Vec<RunningTool>,
+    /// Background lookups do not own or clear the active turn's busy state.
+    background_operations: Vec<(u64, String)>,
 
     input: String,
     /// Byte offset of the editing cursor (always on a char boundary).
@@ -407,6 +413,7 @@ pub struct CrossTerm {
     mcp_servers: Vec<String>,
     update_notice: Option<String>,
     session_completion_requested: bool,
+    session_list_display_requested: bool,
     /// Providers we have already asked the agent to fetch, to avoid duplicate
     /// `ListModels` requests while typing through a model token.
     model_list_requested: HashSet<String>,
@@ -419,6 +426,7 @@ pub struct CrossTerm {
 
     busy: bool,
     activity: Activity,
+    operation_label: Option<String>,
     spinner: usize,
 
     /// Rows we believe are painted on screen and may rewrite in place.
@@ -473,6 +481,7 @@ impl CrossTerm {
             ask_answer: None,
             ask_offset: 0,
             running_tools: Vec::new(),
+            background_operations: Vec::new(),
             input: String::new(),
             cursor: 0,
             history: Vec::new(),
@@ -490,6 +499,7 @@ impl CrossTerm {
             mcp_servers,
             update_notice,
             session_completion_requested: false,
+            session_list_display_requested: false,
             model_list_requested: HashSet::new(),
             completion: None,
             path_completion_tx,
@@ -499,6 +509,7 @@ impl CrossTerm {
             path_completion_cancel: None,
             busy: false,
             activity: Activity::Preparing,
+            operation_label: None,
             spinner: 0,
             region: Vec::new(),
             cursor_row: 0,
@@ -699,7 +710,7 @@ impl CrossTerm {
                     // live-region serialization five times per second; fall
                     // back to the normal frame when the row cannot be
                     // located.
-                    if !self.busy {
+                    if !self.busy && self.background_operations.is_empty() {
                         continue;
                     }
                     self.spinner = self.spinner.wrapping_add(1);
@@ -720,6 +731,10 @@ impl CrossTerm {
     /// second. Returns `false` when the activity row's position is unknown
     /// (caller falls back to a full [`Self::paint`]).
     fn repaint_activity_only(&mut self) -> Result<bool> {
+        // Background rows also animate, and can coexist with the turn row.
+        if !self.background_operations.is_empty() {
+            return Ok(false);
+        }
         let Some(row) = self.activity_region_row else {
             return Ok(false);
         };
@@ -728,7 +743,13 @@ impl CrossTerm {
         }
         let theme = self.theme;
         let gutter = render::horizontal_pad(self.width) as usize;
-        let line = activity_line(self.activity, self.spinner, theme);
+        let line = activity_line_with_label(
+            self.operation_label
+                .as_deref()
+                .unwrap_or(self.activity.label()),
+            self.spinner,
+            theme,
+        );
         let mut buffer = String::new();
         let up = self.cursor_row.saturating_sub(row);
         if up > 0 {
@@ -1513,7 +1534,13 @@ impl CrossTerm {
         if !matches!(&command, ParsedCommand::Ask { .. }) {
             // The typed command is echoed without the ⌘ glyph: the input line
             // already carries the `› ` prefix, so the notice is the raw text.
-            self.add_notice(input.to_owned());
+            let echo = match &command {
+                ParsedCommand::InvokeSkill { name, alias: true } => {
+                    format!("{input} · skill: {name}")
+                }
+                _ => input.to_owned(),
+            };
+            self.add_notice(echo);
         }
         let message = match command {
             ParsedCommand::Help => {
@@ -1531,7 +1558,10 @@ impl CrossTerm {
             ParsedCommand::Ask { question } => InputMessage::Ask { question },
             ParsedCommand::New => InputMessage::NewConversation,
             ParsedCommand::Load { selector } => InputMessage::LoadSession { selector },
-            ParsedCommand::Sessions => InputMessage::ListSessions,
+            ParsedCommand::Sessions => {
+                self.session_list_display_requested = true;
+                InputMessage::ListSessions
+            }
             ParsedCommand::Export { destination } => InputMessage::ExportSession { destination },
             ParsedCommand::Compact => InputMessage::CompactSession,
             ParsedCommand::SetModel { provider, model } => {
@@ -1542,14 +1572,7 @@ impl CrossTerm {
             }
             ParsedCommand::SetReasoning { level: None } => unreachable!("handled above"),
             ParsedCommand::Usage => InputMessage::SubscriptionUsage,
-            ParsedCommand::InvokeSkill { name, alias } => {
-                // The echo already shows what was typed; label the alias form
-                // so it is clear which skill will run.
-                if alias {
-                    self.add_notice(format!("{input} · skill: {name}"));
-                }
-                InputMessage::InvokeSkill { name }
-            }
+            ParsedCommand::InvokeSkill { name, .. } => InputMessage::InvokeSkill { name },
             ParsedCommand::Skills => {
                 // Filled asynchronously by the agent's SkillsLoaded event.
                 input_tx
@@ -1558,9 +1581,17 @@ impl CrossTerm {
                 return Ok(());
             }
         };
-        if matches!(&message, InputMessage::Ask { .. }) {
+        let activity = match &message {
+            InputMessage::Ask { .. } => Some(Activity::Asking),
+            InputMessage::CompactSession => Some(Activity::Compacting),
+            InputMessage::InvokeSkill { .. } => Some(Activity::Preparing),
+            _ => None,
+        };
+        if !self.busy
+            && let Some(activity) = activity
+        {
             self.busy = true;
-            self.activity = Activity::Preparing;
+            self.activity = activity;
             self.spinner = 0;
         }
         input_tx
@@ -1581,6 +1612,7 @@ impl CrossTerm {
                 }
                 self.busy = true;
                 self.activity = Activity::Working;
+                self.operation_label = None;
                 self.dismiss_ask();
                 self.stream().markdown.push_str(&delta);
                 self.refresh_stream_markdown_cache();
@@ -1591,6 +1623,7 @@ impl CrossTerm {
                 }
                 self.busy = true;
                 self.activity = Activity::Reasoning;
+                self.operation_label = None;
                 self.dismiss_ask();
                 self.stream().reasoning.push_str(&delta);
             }
@@ -1601,6 +1634,7 @@ impl CrossTerm {
             } => {
                 self.busy = true;
                 self.activity = Activity::Processing;
+                self.operation_label = None;
                 self.dismiss_ask();
                 // Text streamed before the call is a complete message.
                 self.finalize_stream();
@@ -1636,6 +1670,7 @@ impl CrossTerm {
             } => {
                 self.busy = true;
                 self.activity = Activity::Working;
+                self.operation_label = None;
                 // Remove exactly the matching start; unrelated running tools
                 // stay live and keep rendering in the region below.
                 if let Some(position) = self
@@ -1663,6 +1698,7 @@ impl CrossTerm {
             UiEvent::Retrying { .. } => {
                 self.busy = true;
                 self.activity = Activity::Retrying;
+                self.operation_label = None;
             }
             UiEvent::Error(error) => {
                 self.finalize_stream();
@@ -1677,12 +1713,14 @@ impl CrossTerm {
                 }
                 self.busy = false;
                 self.activity = Activity::Preparing;
+                self.operation_label = None;
                 self.add_error(error);
             }
             UiEvent::AskStarted => {
                 self.dismiss_ask();
                 self.busy = true;
-                self.activity = Activity::Preparing;
+                self.activity = Activity::Asking;
+                self.operation_label = None;
                 self.spinner = 0;
             }
             UiEvent::AskAnswer(answer) => {
@@ -1694,21 +1732,47 @@ impl CrossTerm {
                 self.running_tools.clear();
                 self.busy = false;
                 self.activity = Activity::Preparing;
+                self.operation_label = None;
+            }
+            UiEvent::OperationStarted { label } => {
+                self.busy = true;
+                self.operation_label = Some(label);
+                self.spinner = 0;
             }
             UiEvent::OperationFinished => {
                 self.busy = false;
                 self.activity = Activity::Preparing;
+                self.operation_label = None;
+            }
+            UiEvent::BackgroundOperationStarted { id, label } => {
+                if let Some((_, current)) = self
+                    .background_operations
+                    .iter_mut()
+                    .find(|(key, _)| *key == id)
+                {
+                    *current = label;
+                } else {
+                    self.background_operations.push((id, label));
+                }
+            }
+            UiEvent::BackgroundOperationFinished { id, error } => {
+                self.background_operations.retain(|(key, _)| *key != id);
+                if let Some(error) = error {
+                    // A lookup failure must not finalize streamed text or tools.
+                    self.add_error(error);
+                }
             }
             UiEvent::Notice(notice) => self.add_notice(notice),
             UiEvent::ModelChanged { provider, model } => {
                 self.provider = provider;
                 self.model = model;
-                // The startup header is immutable scrollback; surface the new
-                // model as a fresh metadata line instead.
-                self.pending.push(self.metadata_entry());
+                // A model change needs one short confirmation, not a second
+                // copy of all startup metadata.
+                self.add_notice(format!("Using {} · {}", self.provider, self.model));
             }
             UiEvent::ReasoningChanged { level } => {
                 self.reasoning = level;
+                self.add_notice(format!("Reasoning effort: {}", self.reasoning));
             }
             UiEvent::ModelList { provider, models } => {
                 self.model_lists.insert(provider, models);
@@ -1809,7 +1873,8 @@ impl CrossTerm {
             UiEvent::SessionList { sessions } => {
                 self.session_candidates = sessions.clone();
                 self.session_completion_requested = false;
-                let notice = if sessions.is_empty() {
+                let total = sessions.len();
+                let mut notice = if sessions.is_empty() {
                     "No sessions for this workspace".to_owned()
                 } else {
                     sessions
@@ -1822,7 +1887,15 @@ impl CrossTerm {
                         .collect::<Vec<_>>()
                         .join("\n")
                 };
-                self.add_notice(notice);
+                if total > 12 {
+                    notice.push_str(&format!(
+                        "\nShowing 12 of {total} sessions. Use /load and Tab to find a session."
+                    ));
+                }
+                // Completion fetches fill the cache without printing a list.
+                if std::mem::take(&mut self.session_list_display_requested) {
+                    self.add_notice(notice);
+                }
                 if commands::is_command_input(&self.input) {
                     self.refresh_completion();
                 }
@@ -1835,17 +1908,15 @@ impl CrossTerm {
                 diagnostics,
                 empty,
             } => {
-                if empty {
-                    self.add_notice(
-                        "no skills discovered\nlooked in .harness/skills and .agents/skills (project and ~)",
-                    );
-                    return;
-                }
-                let mut text = skills
-                    .iter()
-                    .map(|skill| format!("{:<16} {}", skill.name, skill.description))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut text = if empty {
+                    "no skills discovered\nlooked in .harness/skills and .agents/skills (project and ~)".to_owned()
+                } else {
+                    skills
+                        .iter()
+                        .map(|skill| format!("{:<16} {}", skill.name, skill.description))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 if !diagnostics.is_empty() {
                     text.push_str("\n\ndiagnostics:\n");
                     text.push_str(&diagnostics.join("\n"));
@@ -2053,7 +2124,13 @@ impl CrossTerm {
                 render::push_blank(&mut rows, section_gap);
             }
             let activity_row = rows.len();
-            rows.push(activity_line(self.activity, self.spinner, theme));
+            rows.push(activity_line_with_label(
+                self.operation_label
+                    .as_deref()
+                    .unwrap_or(self.activity.label()),
+                self.spinner,
+                theme,
+            ));
             activity_row_index = Some(activity_row);
         }
 
@@ -2120,6 +2197,22 @@ impl CrossTerm {
                 Style::default()
                     .fg(theme.dim_text)
                     .add_modifier(Modifier::DIM),
+            )));
+        }
+        for (_, label) in self
+            .background_operations
+            .iter()
+            .take(MAX_VISIBLE_RUNNING_TOOLS)
+        {
+            lines.push(activity_line_with_label(label, self.spinner, theme));
+        }
+        let hidden_lookups = self
+            .background_operations
+            .len()
+            .saturating_sub(MAX_VISIBLE_RUNNING_TOOLS);
+        if hidden_lookups > 0 {
+            lines.push(Line::from(format!(
+                "… {hidden_lookups} more lookups running"
             )));
         }
         let rows = lines.len();
@@ -2842,12 +2935,12 @@ fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'static> {
 }
 
 /// The busy indicator row: an animated marker plus the activity label.
-fn activity_line(activity: Activity, spinner: usize, theme: Theme) -> Line<'static> {
+fn activity_line_with_label(label: &str, spinner: usize, theme: Theme) -> Line<'static> {
     let marker = render::ACTIVITY_FRAMES[spinner % render::ACTIVITY_FRAMES.len()];
     Line::from(vec![
         Span::styled(format!("{marker} "), Style::default().fg(theme.accent)),
         Span::styled(
-            activity.label(),
+            label.to_owned(),
             Style::default()
                 .fg(theme.dim_text)
                 .add_modifier(Modifier::DIM),
@@ -4041,6 +4134,112 @@ mod tests {
         assert_eq!(
             rx.try_recv().unwrap(),
             InputMessage::Message("first line\n".into())
+        );
+    }
+
+    #[test]
+    fn slash_background_results_do_not_finish_an_active_turn() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::TextDelta("partial answer".into()));
+        ui.apply_event(start("tool", "reading file"));
+        ui.apply_event(UiEvent::TextDelta("more answer".into()));
+        for id in [1, 2] {
+            ui.apply_event(UiEvent::BackgroundOperationStarted {
+                id,
+                label: format!("Lookup {id}..."),
+            });
+        }
+        ui.apply_event(UiEvent::BackgroundOperationFinished {
+            id: 1,
+            error: Some("usage request failed".into()),
+        });
+        assert!(ui.busy);
+        assert_eq!(ui.stream.as_ref().unwrap().markdown, "more answer");
+        assert_eq!(ui.running_tools.len(), 1);
+        assert_eq!(ui.background_operations.len(), 1);
+        assert_eq!(ui.background_operations[0].0, 2);
+        assert!(
+            ui.running_region()
+                .lines
+                .iter()
+                .any(|line| row_text(line).contains("Lookup 2"))
+        );
+        ui.apply_event(UiEvent::TurnFinished);
+        assert!(!ui.busy);
+        assert_eq!(ui.background_operations.len(), 1);
+        ui.apply_event(UiEvent::BackgroundOperationFinished { id: 2, error: None });
+        assert!(ui.background_operations.is_empty());
+    }
+
+    #[test]
+    fn slash_compact_and_skill_show_activity_before_output() {
+        for command in ["/compact", "/skill review"] {
+            let mut ui = ui(80, 24);
+            ui.skills.push(SkillEntry {
+                name: "review".into(),
+                description: "Review code".into(),
+            });
+            let (tx, _rx) = mpsc::unbounded_channel();
+            ui.submit_command(command, &tx).unwrap();
+            assert!(ui.busy);
+            ui.apply_event(UiEvent::OperationFinished);
+            assert!(!ui.busy);
+            // A command queued during another turn gets fresh progress at dispatch.
+            ui.apply_event(UiEvent::OperationStarted {
+                label: "Compacting session...".into(),
+            });
+            let region = ui.build_region(&ui.input_layout());
+            assert!(
+                region
+                    .rows
+                    .iter()
+                    .any(|line| row_text(line).contains("Compacting session"))
+            );
+            ui.apply_event(UiEvent::OperationFinished);
+            assert!(!ui.busy);
+        }
+    }
+
+    #[test]
+    fn slash_session_completion_is_silent_but_sessions_command_reports_empty_list() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::SessionList {
+            sessions: Vec::new(),
+        });
+        assert!(ui.pending.is_empty());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ui.submit_command("/sessions", &tx).unwrap();
+        ui.apply_event(UiEvent::SessionList {
+            sessions: Vec::new(),
+        });
+        assert!(ui.pending.iter().any(|entry| matches!(entry, Entry::Notice { text } if text == "No sessions for this workspace")));
+    }
+
+    #[test]
+    fn slash_empty_skills_still_show_discovery_errors() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::SkillsLoaded {
+            skills: Vec::new(),
+            diagnostics: vec!["review/SKILL.md: invalid frontmatter".into()],
+            empty: true,
+        });
+        assert!(
+            matches!(&ui.pending[0], Entry::Notice { text } if text.contains("no skills discovered") && text.contains("invalid frontmatter"))
+        );
+    }
+
+    #[test]
+    fn slash_skill_alias_is_echoed_once() {
+        let mut ui = ui(80, 24);
+        ui.skills.push(SkillEntry {
+            name: "review".into(),
+            description: "Review code".into(),
+        });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ui.submit_command("/review", &tx).unwrap();
+        assert_eq!(ui.pending.len(), 1);
+        assert!(
+            matches!(&ui.pending[0], Entry::Notice { text } if text == "/review · skill: review")
         );
     }
 

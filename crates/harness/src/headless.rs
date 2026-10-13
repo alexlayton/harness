@@ -226,6 +226,22 @@ async fn drive_headless_events_into(
                     writeln!(stderr, "retry #{attempt}: {message}")?;
                 }
             }
+            AgentEvent::SessionExported { path } => {
+                if verbose {
+                    writeln!(stderr, "Exported session to {path}")?;
+                }
+            }
+            AgentEvent::OperationStarted { label }
+            | AgentEvent::BackgroundOperationStarted { label, .. } => {
+                if verbose {
+                    writeln!(stderr, "{label}")?;
+                }
+            }
+            AgentEvent::BackgroundOperationFinished { error, .. } => {
+                if let Some(error) = error {
+                    writeln!(stderr, "error: {error}")?;
+                }
+            }
             AgentEvent::Notice(message) => {
                 if verbose {
                     writeln!(stderr, "{message}")?;
@@ -325,8 +341,7 @@ async fn drive_headless_events_into(
             | AgentEvent::ModelList { .. }
             | AgentEvent::ContextUsageUpdated { .. }
             // `/skills` is a TUI command; headless stdout stays answer-only.
-            | AgentEvent::SkillsLoaded { .. }
-            | AgentEvent::SessionExported { .. } => {}
+            | AgentEvent::SkillsLoaded { .. } => {}
         }
     }
 
