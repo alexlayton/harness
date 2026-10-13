@@ -262,6 +262,83 @@ impl Agent {
 }
 
 impl Agent {
+    /// Answer an isolated one-shot question using the active provider/model.
+    /// The request has no transcript, session ID, or tools, so it cannot
+    /// mutate workspace state or append anything to the current session.
+    async fn answer_isolated_question(
+        &self,
+        question: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> bool {
+        use futures_util::StreamExt;
+        use llm::{CompletionRequest, Message, RetryCallback, StreamEvent};
+        use std::sync::Arc;
+
+        let retry_events = events.clone();
+        let on_retry: RetryCallback = Arc::new(move |attempt, error| {
+            send(
+                &retry_events,
+                AgentEvent::Retrying {
+                    attempt,
+                    message: error.to_string(),
+                },
+            );
+        });
+        let request = CompletionRequest {
+            model: self.model.clone(),
+            system: Some("Answer the user's question directly and concisely. This is an isolated one-shot request; do not assume prior conversation context.".into()),
+            messages: vec![Message::user(self.secret_masker.mask_text(&question))],
+            tools: Vec::new(),
+            max_tokens: None,
+            temperature: None,
+            reasoning: self.reasoning,
+            session_id: None,
+        };
+        let stream_result = tokio::select! {
+            biased;
+            _ = self.cancel.cancelled() => return false,
+            result = self.provider.stream_with_retry(&request, on_retry) => result,
+        };
+        let mut stream = match stream_result {
+            Ok(stream) => stream,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
+                );
+                return true;
+            }
+        };
+        let mut answer = String::new();
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return false,
+                event = stream.next() => event,
+            };
+            let Some(event) = event else { break };
+            match event {
+                Ok(StreamEvent::TextDelta(delta)) => answer.push_str(&delta),
+                Ok(StreamEvent::Done { .. }) => break,
+                Ok(StreamEvent::ReasoningDelta(_))
+                | Ok(StreamEvent::OpaqueState { .. })
+                | Ok(StreamEvent::ToolCallComplete(_)) => {}
+                Err(error) => {
+                    send(
+                        events,
+                        AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
+                    );
+                    return true;
+                }
+            }
+        }
+        send(
+            events,
+            AgentEvent::AskAnswer(self.secret_masker.mask_text(&answer)),
+        );
+        true
+    }
+
     /// Run until the input channel closes or the application cancellation
     /// token is cancelled.  Input submitted while a turn is running remains in
     /// the mpsc queue and is consumed after the current turn finishes.
@@ -370,6 +447,37 @@ impl Agent {
                         TurnControl::Quarantine => break,
                         TurnControl::Continue => {}
                     }
+                }
+                InputMessage::Ask { question } => {
+                    send(&events, AgentEvent::AskStarted);
+                    // Poll input while the isolated request is opening or
+                    // streaming. Dropping the future on Esc stops only this
+                    // request; other messages retain their queue order.
+                    let mut buffered = VecDeque::new();
+                    let mut input_open = self.input_open;
+                    let completed = {
+                        let operation = self.answer_isolated_question(question, &events);
+                        tokio::pin!(operation);
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = self.cancel.cancelled() => break false,
+                                message = input.recv(), if input_open => match message {
+                                    Some(InputMessage::Interrupt) => break true,
+                                    Some(message) => buffered.push_back(message),
+                                    None => input_open = false,
+                                },
+                                completed = &mut operation => break completed,
+                            }
+                        }
+                    };
+                    self.input_open = input_open;
+                    self.queued.extend(buffered);
+                    if !completed {
+                        break;
+                    }
+                    send(&events, AgentEvent::OperationFinished);
+                    continue;
                 }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
@@ -3029,6 +3137,10 @@ mod tests {
     // Token-aware auto-compaction tests
     // ------------------------------------------------------------------
 
+    /// Snapshot of the request details recorded by the provider test helper.
+    type RequestSnapshot = (Option<String>, Vec<Message>, usize, Option<String>);
+    type SeenRequests = Mutex<Vec<RequestSnapshot>>;
+
     /// Provider that records every request (system + messages) so tests can
     /// assert on what was actually sent, and answers from a canned script.
     /// The summarizer request shares this same provider and is recognizable by
@@ -3036,7 +3148,7 @@ mod tests {
     struct RecordingProvider {
         calls: AtomicUsize,
         scripts: Vec<Vec<ScriptStep>>,
-        seen: Mutex<Vec<(Option<String>, Vec<Message>)>>,
+        seen: SeenRequests,
     }
 
     #[async_trait]
@@ -3047,10 +3159,12 @@ mod tests {
 
         async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
             let index = self.calls.fetch_add(1, Ordering::SeqCst);
-            self.seen
-                .lock()
-                .unwrap()
-                .push((request.system.clone(), request.messages.clone()));
+            self.seen.lock().unwrap().push((
+                request.system.clone(),
+                request.messages.clone(),
+                request.tools.len(),
+                request.session_id.clone(),
+            ));
             let script = self.scripts.get(index).cloned().unwrap_or_default();
             Ok(Box::pin(stream::iter(
                 script
@@ -3062,6 +3176,229 @@ mod tests {
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
             Ok(Vec::new())
         }
+    }
+
+    struct PendingAskProvider {
+        started: Arc<Notify>,
+        pending_open: bool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for PendingAskProvider {
+        fn name(&self) -> &str {
+            "pending-ask"
+        }
+
+        async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(StreamEvent::TextDelta("next answer".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: None,
+                        usage: None,
+                    }),
+                ])));
+            }
+            self.started.notify_one();
+            if self.pending_open {
+                futures_util::future::pending().await
+            } else {
+                Ok(Box::pin(stream::pending::<Result<StreamEvent, LlmError>>()))
+            }
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn cancelling_isolated_ask_exits_without_operation_finished() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let started = Arc::new(Notify::new());
+            let cancel = CancellationToken::new();
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Ask {
+                    question: "wait for cancellation".into(),
+                })
+                .unwrap();
+            let agent = Agent::new(
+                Arc::new(PendingAskProvider {
+                    started: started.clone(),
+                    pending_open: false,
+                    calls: AtomicUsize::new(0),
+                }),
+                ToolRegistry::empty(),
+                "demo",
+                cancel.clone(),
+            );
+            let task = tokio::spawn(agent.run(input_rx, event_tx));
+            started.notified().await;
+            cancel.cancel();
+            task.await.unwrap();
+
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(!events.contains(&AgentEvent::OperationFinished));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::AskAnswer(_)))
+            );
+        });
+    }
+
+    #[test]
+    fn interrupting_isolated_ask_stops_open_or_stream_and_preserves_queued_input() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            for pending_open in [true, false] {
+                let started = Arc::new(Notify::new());
+                let cancel = CancellationToken::new();
+                let (input_tx, input_rx) = mpsc::unbounded_channel();
+                let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+                input_tx
+                    .send(InputMessage::Ask {
+                        question: "stop this".into(),
+                    })
+                    .unwrap();
+                let agent = Agent::new(
+                    Arc::new(PendingAskProvider {
+                        started: started.clone(),
+                        pending_open,
+                        calls: AtomicUsize::new(0),
+                    }),
+                    ToolRegistry::empty(),
+                    "demo",
+                    cancel.clone(),
+                );
+                let task = tokio::spawn(agent.run(input_rx, event_tx));
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    started.notified().await;
+                    // This message must remain queued when Esc stops the
+                    // first request, rather than being dropped with it.
+                    input_tx
+                        .send(InputMessage::Ask {
+                            question: "next question".into(),
+                        })
+                        .unwrap();
+                    input_tx.send(InputMessage::Interrupt).unwrap();
+                    drop(input_tx);
+                    task.await.unwrap();
+                })
+                .await
+                .expect("Esc must stop a pending ask");
+                assert!(!cancel.is_cancelled(), "Esc must not close Harness");
+                let results = std::iter::from_fn(|| event_rx.try_recv().ok())
+                    .filter(|event| {
+                        matches!(
+                            event,
+                            AgentEvent::AskStarted
+                                | AgentEvent::AskAnswer(_)
+                                | AgentEvent::OperationFinished
+                                | AgentEvent::Error(_)
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    results,
+                    vec![
+                        AgentEvent::AskStarted,
+                        AgentEvent::OperationFinished,
+                        AgentEvent::AskStarted,
+                        AgentEvent::AskAnswer("next answer".into()),
+                        AgentEvent::OperationFinished,
+                    ]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn ask_uses_a_fresh_tool_free_request_and_does_not_create_a_turn() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![script(vec![
+                    StreamEvent::TextDelta("isolated sec".into()),
+                    StreamEvent::TextDelta("ret-value answer".into()),
+                    StreamEvent::Done {
+                        stop_reason: None,
+                        usage: None,
+                    },
+                ])],
+                seen: Mutex::new(Vec::new()),
+            });
+            let temp = tempfile::tempdir().unwrap();
+            let store = SessionStore::new(temp.path().join("sessions"), temp.path()).unwrap();
+            let mut session = store.create(SessionCreateOptions::default()).unwrap();
+            store
+                .append_event(
+                    &mut session,
+                    SessionEvent::UserMessage {
+                        message: StoredMessage::from_llm(&Message::user("prior conversation")),
+                    },
+                )
+                .unwrap();
+            let session_id = session.id();
+            let persisted_events = session.events.len();
+
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Ask {
+                    question: "quick question".into(),
+                })
+                .unwrap();
+            drop(input_tx);
+            let masker = Arc::new(
+                crate::secrets::SecretMasker::new([("TOKEN".into(), "secret-value".into())])
+                    .unwrap(),
+            );
+            Agent::new(
+                provider.clone(),
+                ToolRegistry::empty(),
+                "demo",
+                CancellationToken::new(),
+            )
+            .with_secret_masker(masker)
+            .with_session(store.clone(), session)
+            .unwrap()
+            .run(input_rx, event_tx)
+            .await;
+
+            assert_eq!(
+                store.open(&session_id).unwrap().events.len(),
+                persisted_events
+            );
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].1.len(), 1, "only the fresh question is sent");
+            assert_eq!(seen[0].1[0], Message::user("quick question"));
+            assert_eq!(seen[0].2, 0, "ask advertises no tools");
+            assert_eq!(seen[0].3, None, "ask has no conversation session ID");
+            drop(seen);
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.contains(&AgentEvent::AskAnswer(
+                "isolated {{harness-secret:TOKEN}} answer".into()
+            )));
+            assert!(
+                events
+                    .iter()
+                    .all(|event| !format!("{event:?}").contains("secret-value"))
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::TextDelta(_) | AgentEvent::TurnFinished
+                )),
+                "ask output must not enter the normal conversation turn stream"
+            );
+        });
     }
 
     fn summarizer_script() -> Vec<ScriptStep> {
@@ -3221,7 +3558,7 @@ mod tests {
 
             // The summarizer request is distinguishable by its system prompt
             // and modeled as a standalone summarization, not a conversation.
-            let (system, messages) = &seen[1];
+            let (system, messages, _, _) = &seen[1];
             assert!(system.as_deref().unwrap_or("").contains("summarization"));
             assert_eq!(messages.len(), 1, "summarizer gets a single user prompt");
 
@@ -3396,9 +3733,10 @@ mod tests {
         assert!(!result.unwrap());
         assert!(turn_cancel.is_cancelled());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        assert!(
-            matches!(agent.queued.pop_front(), Some(InputMessage::Message(text)) if text == "next message")
-        );
+        assert!(matches!(
+            agent.queued.pop_front(),
+            Some(InputMessage::Message(text)) if text == "next message"
+        ));
         let loaded = store.open(&session_id).unwrap();
         assert!(!loaded.events.iter().any(|record| matches!(
             record.event,

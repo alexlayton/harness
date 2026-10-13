@@ -33,6 +33,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::None,
     },
     CommandSpec {
+        name: "/ask",
+        description: "Ask an isolated one-shot question (not saved to this conversation)",
+        usage: "/ask <question>",
+        argument_kind: ArgumentKind::None,
+    },
+    CommandSpec {
         name: "/new",
         description: "Start a new persisted conversation",
         usage: "/new",
@@ -137,6 +143,9 @@ pub struct CompletionResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParsedCommand {
     Help,
+    Ask {
+        question: String,
+    },
     New,
     Load {
         selector: String,
@@ -164,17 +173,23 @@ pub enum ParsedCommand {
     },
 }
 
-/// A command is deliberately restricted to one line.  A multiline message
-/// beginning with `/` is ordinary user text and should still be sendable.
+/// Commands normally fit on one line. `/ask` also accepts multiline
+/// questions so pasted text cannot silently become a persisted turn.
+/// Other multiline messages beginning with `/` remain ordinary user text.
 pub fn is_command_input(text: &str) -> bool {
-    text.starts_with('/') && !text.contains(['\n', '\r'])
+    text.starts_with('/')
+        && (!text.contains(['\n', '\r'])
+            || text
+                .split_whitespace()
+                .next()
+                .is_some_and(|command| command.eq_ignore_ascii_case("/ask")))
 }
 
 pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
     if !is_command_input(text) {
         return Err("commands must start with / and fit on one line".into());
     }
-    let input = text.trim();
+    let input = text.trim_start();
     let mut words = input.split_whitespace();
     let command = words.next().unwrap_or("");
     match command.to_ascii_lowercase().as_str() {
@@ -183,6 +198,18 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /help".into())
             } else {
                 Ok(ParsedCommand::Help)
+            }
+        }
+        "/ask" => {
+            // Keep the original spacing and punctuation after the command;
+            // only separator whitespace is removed from the beginning.
+            let question = input[command.len()..].trim_start();
+            if question.trim().is_empty() {
+                Err("usage: /ask <question>".into())
+            } else {
+                Ok(ParsedCommand::Ask {
+                    question: question.to_owned(),
+                })
             }
         }
         "/new" => {
@@ -344,7 +371,8 @@ fn skill_entry<'a>(skills: &'a [SkillEntry], name: &str) -> Option<&'a SkillEntr
 /// The context deliberately stores byte offsets (used for Rust string
 /// slicing) and performs the char-column conversion in one place.
 pub fn completion_context(input: &str, cursor_col: usize) -> Option<CompletionContext> {
-    if !is_command_input(input) {
+    // Multiline ask input is a question, not a completion target.
+    if !is_command_input(input) || input.contains(['\n', '\r']) {
         return None;
     }
 
@@ -1242,6 +1270,36 @@ mod tests {
         let values = candidates("/model openrouter:gpt", &providers(), &lists, "opencode-go");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].value, "openrouter:openai/gpt-5.6-luna");
+    }
+
+    #[test]
+    fn ask_parses_as_a_required_free_form_question() {
+        assert_eq!(
+            parse_command("/ask what git command does this?"),
+            Ok(ParsedCommand::Ask {
+                question: "what git command does this?".into()
+            })
+        );
+        assert_eq!(
+            parse_command("/ASK  explain   rebase "),
+            Ok(ParsedCommand::Ask {
+                question: "explain   rebase ".into()
+            })
+        );
+        assert_eq!(
+            parse_command("/ASK explain this:\r\n  first line\nsecond line"),
+            Ok(ParsedCommand::Ask {
+                question: "explain this:\r\n  first line\nsecond line".into()
+            })
+        );
+        assert!(!is_command_input("/ask-more\nordinary text"));
+        assert!(!is_command_input("/help\nordinary text"));
+        assert!(completion_context("/ask explain\nthis", 17).is_none());
+        assert_eq!(parse_command("/ask"), Err("usage: /ask <question>".into()));
+        assert_eq!(
+            parse_command("/ask   "),
+            Err("usage: /ask <question>".into())
+        );
     }
 
     #[test]
