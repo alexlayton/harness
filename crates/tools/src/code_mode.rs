@@ -94,12 +94,28 @@ impl CodeMode {
             definition: ToolDefinition {
                 name: "run_code".into(),
                 description: format!(
-                    "Execute Python orchestration in Monty with selected Harness tools as functions. Call tools[\"name\"](**keyword_arguments), for example text = tools[\"read\"](path=\"README.md\", offset=1, limit=80). Calls are synchronous and sequential; do not await them or use asyncio.gather. Return only relevant data with the final expression; print() is supplementary output. Tools with structured JSON return that JSON as Python dict/list/scalars; other tools return display text as str. Do not assume text results are JSON. Failed tools raise RuntimeError. Only the listed functions are allowed. No direct filesystem, environment, network, clock, or OS access. No shell, subagents, recursive code execution, third-party packages, or state between calls. Limits: 32 KiB code, 50 nested calls, 50 KiB arguments/results/output, 5 seconds total interpreter execution, 120 seconds elapsed time. On failure inspect the started-call summary before retrying: completed changes are not rolled back. Execution is in-process, not crash-isolated or a memory security boundary. Available functions and their original JSON schemas:\n{catalog}"
+                    concat!(
+                        "Execute Python orchestration in Monty with selected Harness tools as functions. ",
+                        "Prefer ONE run_code call for a complete, self-contained task when it fits the limits. ",
+                        "Plan the workflow before calling: put required preflight checks, repeated lookups, dependent calls, and result filtering in the SAME snippet. ",
+                        "Use loops for multiple inputs and variables/conditionals to use earlier results in later calls; do not return to the model between steps that Python can handle. ",
+                        "Do not add unnecessary service checks or split a task merely to inspect a successful check. ",
+                        "Split only when results need model reasoning or a user decision, an unexpected failure needs inspection, or the workflow would exceed limits. Never guess arguments or continue unsafe work just to keep one call. ",
+                        "Call tools[\"name\"](**keyword_arguments), using names and arguments from the catalogue below. Calls are synchronous and sequential; do not await them or use asyncio.gather. ",
+                        "Return a concise combined result with only the facts needed for the answer. Extract relevant fields or text inside Python instead of printing complete reports, debug logs, or successful preflight output. ",
+                        "The final expression is returned; print() is supplementary output and also enters model context. Once the result is sufficient, answer the user directly. ",
+                        "Tools with structured JSON return that JSON as Python dict/list/scalars; other tools return display text as str. Do not assume text results are JSON. Failed tools raise RuntimeError. ",
+                        "Only the listed functions are allowed. No direct filesystem, environment, network, clock, or OS access. No built-in shell, subagents, recursive code execution, third-party packages, or state between calls. ",
+                        "Limits: 32 KiB code, 50 nested calls, 50 KiB arguments/results/output, 5 seconds total interpreter execution, 120 seconds elapsed time. ",
+                        "On failure inspect the started-call summary before retrying: completed changes are not rolled back. Execution is in-process, not crash-isolated or a memory security boundary. ",
+                        "Available functions and their original JSON schemas:\n{}"
+                    ),
+                    catalog
                 ),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "code": {"type": "string", "description": "Python source. Access tool functions through the tools dictionary. The final expression is returned."},
+                        "code": {"type": "string", "description": "Python source for the complete task: combine required checks, loops, dependent tool calls, and filtering in one snippet when safe and within limits. Access tool functions through the tools dictionary. Return a concise combined final expression, not complete raw reports."},
                         "description": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Short, single-line action label describing the purpose."}
                     },
                     "required": ["code", "description"],
@@ -109,8 +125,9 @@ impl CodeMode {
             prompt: ToolPrompt::new(
                 "Orchestrate selected tools with sequential Python function calls",
                 [
-                    "Use run_code for dependent tool calls and local filtering. Use tools[\"name\"](**kwargs); nested calls run sequentially and return JSON when available, otherwise text.",
-                    "Code-mode state is fresh for each call. Return only useful results. On errors or interruption, do not blindly replay a snippet: earlier tool calls can already have changed files or external state.",
+                    "Prefer one run_code call per complete, self-contained task within the execution limits. Include required preflight checks, loops over multiple inputs, dependent calls, and filtering in the same snippet; do not add unnecessary checks or return to the model between steps Python can handle. Split when results need model reasoning, user input, failure inspection, or more execution budget, not merely because tools depend on each other.",
+                    "Use tools[\"name\"](**kwargs); nested calls run sequentially and return JSON when available, otherwise text. Return only a concise combined result needed for the answer. Printed text also enters model context: do not print complete reports or successful preflight output unless needed. Once the result is sufficient, answer directly.",
+                    "Code-mode state is fresh for each call. On errors or interruption, do not blindly replay a snippet: earlier tool calls can already have changed files or external state. Never continue unsafe work just to keep a single call.",
                 ],
             ),
         };
