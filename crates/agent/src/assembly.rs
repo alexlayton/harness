@@ -1,9 +1,12 @@
 //! Shared construction contract for the TUI, headless, and ACP frontends.
 //!
 //! Frontends decide where a workspace/session comes from; this builder makes
-//! the resulting agent policy identical once those inputs have been resolved.
+//! common runtime policy consistent once those inputs have been resolved.
+//! Hosts also select stream recovery to match incremental or final-only output.
 
-use crate::agent::{Agent, AgentEvent, InputMessage, ProviderFactory, SubagentLimits};
+use crate::agent::{
+    Agent, AgentEvent, InputMessage, ProviderFactory, StreamRecovery, SubagentLimits,
+};
 use crate::secrets::SecretMasker;
 use crate::subagent::SubagentRunnerImpl;
 use anyhow::{Context, Result};
@@ -40,6 +43,7 @@ pub struct AgentBuilder {
     provider: Arc<dyn Provider>,
     model: String,
     reasoning: ReasoningPolicy,
+    stream_recovery: StreamRecovery,
     tools: ToolRegistry,
     cancel: CancellationToken,
     project_context: String,
@@ -65,6 +69,7 @@ impl AgentBuilder {
             provider,
             model: model.into(),
             reasoning: ReasoningPolicy::Auto,
+            stream_recovery: StreamRecovery::default(),
             tools,
             cancel,
             project_context: String::new(),
@@ -82,6 +87,12 @@ impl AgentBuilder {
     /// Configure reasoning policy for parent and nested model requests.
     pub fn with_reasoning(mut self, reasoning: ReasoningPolicy) -> Self {
         self.reasoning = reasoning;
+        self
+    }
+
+    /// Match automatic stream recovery to the host's output contract.
+    pub fn with_stream_recovery(mut self, mode: StreamRecovery) -> Self {
+        self.stream_recovery = mode;
         self
     }
 
@@ -235,6 +246,7 @@ impl AgentBuilder {
         let mut agent = Agent::new(self.provider, self.tools, self.model, self.cancel)
             .with_secret_masker(self.secret_masker)
             .with_reasoning(self.reasoning)
+            .with_stream_recovery(self.stream_recovery)
             .with_project_context(self.project_context)
             .with_compaction(self.compaction)
             .with_subagent_limits(SubagentLimits {

@@ -20,9 +20,11 @@ or disabled per call. It does not yet expose every runtime setting directly.
 | Python metadata could retain an old release version | Maturin now takes the version from the Rust workspace; the example lockfile no longer fixes a separate Python version. |
 | Full MIT notice was not explicitly included in Python artifacts | Added `python/LICENSE` and the package `license-files` declaration; checked the built archive and installed distribution. |
 | Cargo-only CI did not test the Python install path | Added package jobs that build an sdist, install it into a fresh environment, check version/license/import, and run the existing Python tests. |
-| Retry instructions requested only a continuation, while final-answer collectors discarded failed-round text | Recovery now requests a complete replacement final answer and warns against repeating completed tool actions. A mock-provider test checks the request and the SDK result; a headless check verifies replacement output is not duplicated. |
+| Retry instructions requested only a continuation, while final-answer collectors discarded failed-round text | Python/headless explicitly select replacement recovery and request a complete final answer. Incremental TUI/ACP output keeps continuation recovery, avoiding duplicate text. A mock-provider test checks both contracts through shared assembly; a headless check verifies replacement output is not duplicated. |
 
-The packaging fixes are in `6ed3cca`; the recovery fix is in `b9a15b5`.
+The packaging fixes are in `6ed3cca`; the recovery fix starts in `b9a15b5`.
+Recovery policy is explicit through `agent::StreamRecovery`: streaming hosts
+keep the default `Continue`, while final-only hosts select `Replace`.
 
 ## Local validation
 

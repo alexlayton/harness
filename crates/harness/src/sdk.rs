@@ -3,7 +3,7 @@
 use crate::config::{Cli, Config, ProviderArg, build_provider_with_auths, provider_factory};
 use crate::context::project_context_for;
 use agent::assembly::AgentBuilder;
-use agent::{AgentEvent, InputMessage};
+use agent::{AgentEvent, InputMessage, StreamRecovery};
 use anyhow::{Context, Result, anyhow, ensure};
 use llm::ReasoningPolicy;
 use serde::Deserialize;
@@ -145,6 +145,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         cancel.clone(),
     )
     .with_reasoning(config.reasoning)
+    .with_stream_recovery(StreamRecovery::Replace)
     .with_secret_masker(config.secret_masker.clone())
     .with_compaction(config.compaction.clone())
     .with_subagents(config.subagents, config.rtk)
@@ -274,12 +275,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_recovery_requests_and_returns_a_complete_replacement() {
+    async fn stream_recovery_matches_complete_or_incremental_output() {
         use llm::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider, StreamEvent};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        struct InterruptedProvider(AtomicUsize);
+        struct InterruptedProvider {
+            calls: AtomicUsize,
+            mode: StreamRecovery,
+        }
 
         #[async_trait::async_trait]
         impl Provider for InterruptedProvider {
@@ -288,7 +292,7 @@ mod tests {
             }
 
             async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
-                let steps = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                let steps = if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     vec![
                         Ok(StreamEvent::TextDelta("The result is ".into())),
                         Err(LlmError::Http {
@@ -298,14 +302,20 @@ mod tests {
                         }),
                     ]
                 } else {
+                    let instruction = match self.mode {
+                        StreamRecovery::Replace => "complete final answer from the beginning",
+                        StreamRecovery::Continue => "continue from where you left off",
+                    };
                     assert!(request.messages.iter().any(|message| {
                         message.content.iter().any(|content| {
-                            matches!(content, llm::Content::Text(text)
-                                if text.contains("complete final answer from the beginning")
-                                    && text.contains("Do not repeat tool actions"))
+                            matches!(content, llm::Content::Text(text) if text.contains(instruction))
                         })
                     }));
-                    vec![Ok(StreamEvent::TextDelta("The result is 42.".into()))]
+                    let text = match self.mode {
+                        StreamRecovery::Replace => "The result is 42.",
+                        StreamRecovery::Continue => "42.",
+                    };
+                    vec![Ok(StreamEvent::TextDelta(text.into()))]
                 };
                 Ok(Box::pin(futures_util::stream::iter(steps)))
             }
@@ -315,27 +325,51 @@ mod tests {
             }
         }
 
-        let provider = Arc::new(InterruptedProvider(AtomicUsize::new(0)));
-        let (input_tx, input_rx) = mpsc::unbounded_channel();
-        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        input_tx
-            .send(InputMessage::Message("compute".into()))
-            .unwrap();
-        drop(input_tx);
-        agent::Agent::new(
-            provider.clone(),
-            tools::ToolRegistry::empty(),
-            "demo",
-            CancellationToken::new(),
-        )
-        .run(input_rx, event_tx)
-        .await;
-        let mut answer = FinalAnswer::default();
-        while let Some(event) = event_rx.recv().await {
-            answer.observe(event);
+        assert_eq!(StreamRecovery::default(), StreamRecovery::Continue);
+        for mode in [StreamRecovery::Replace, StreamRecovery::Continue] {
+            let provider = Arc::new(InterruptedProvider {
+                calls: AtomicUsize::new(0),
+                mode,
+            });
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("compute".into()))
+                .unwrap();
+            drop(input_tx);
+            let mut builder = AgentBuilder::new(
+                provider.clone(),
+                "demo",
+                tools::ToolRegistry::empty(),
+                CancellationToken::new(),
+            )
+            .with_subagents(
+                agent::assembly::SubagentPolicy {
+                    max_turns: 0,
+                    ..Default::default()
+                },
+                false,
+            );
+            if mode == StreamRecovery::Replace {
+                builder = builder.with_stream_recovery(mode);
+            }
+            builder.build().await.unwrap().run(input_rx, event_tx).await;
+            let mut answer = FinalAnswer::default();
+            let mut streamed_text = String::new();
+            while let Some(event) = event_rx.recv().await {
+                if let AgentEvent::TextDelta(text) = &event {
+                    streamed_text.push_str(text);
+                }
+                answer.observe(event);
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            match mode {
+                StreamRecovery::Replace => {
+                    assert_eq!(answer.finish().unwrap(), "The result is 42.")
+                }
+                StreamRecovery::Continue => assert_eq!(streamed_text, "The result is 42."),
+            }
         }
-        assert_eq!(provider.0.load(Ordering::SeqCst), 2);
-        assert_eq!(answer.finish().unwrap(), "The result is 42.");
     }
 
     #[test]

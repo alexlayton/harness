@@ -64,7 +64,10 @@ session events.
 ## Frontends
 
 All frontends use `agent::assembly::AgentBuilder`, so provider, tool, session,
-MCP, and subagent setup has one implementation.
+MCP, and subagent setup has one implementation. Stream recovery follows the
+host's output contract: TUI/ACP keep the default continuation policy, while
+headless/Python select replacement answers because they discard failed-round
+text from their final result.
 
 - **TUI:** direct Crossterm UI with completed output in native terminal
   scrollback. `tui` receives only provider-independent `UiEvent`s.

@@ -11,7 +11,7 @@ use crate::config::{Config, PromptArgs, provider_factory};
 #[cfg(test)]
 use crate::context::project_context_for;
 use agent::assembly::AgentBuilder;
-use agent::{AgentEvent, InputMessage};
+use agent::{AgentEvent, InputMessage, StreamRecovery};
 use anyhow::{Context, Result, anyhow};
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
@@ -496,6 +496,7 @@ async fn run_headless_resolved(
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)
+        .with_stream_recovery(StreamRecovery::Replace)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())
