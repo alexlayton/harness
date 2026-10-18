@@ -4,7 +4,7 @@ Guidance for coding agents (and humans) working in this repository.
 
 ## What this is
 
-Harness is a terminal coding-agent harness written in Rust: a workspace of 9
+Harness is a terminal coding-agent harness written in Rust: a workspace of 10
 crates that streams LLM responses, runs workspace-scoped tools, and persists
 durable sessions. Before a non-trivial change, use
 [ARCHITECTURE.md](./ARCHITECTURE.md) as an index: read the crate map and only
