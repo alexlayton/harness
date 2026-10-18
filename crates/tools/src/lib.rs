@@ -1,4 +1,5 @@
 mod bash;
+mod code_mode;
 pub mod context_files;
 mod edit;
 pub mod file_mutation;
@@ -15,6 +16,7 @@ pub mod vfs;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
+pub use code_mode::{CodeModeEvent, CodeModeExecutor};
 pub use context_files::{
     display_path, format_context_files, load_context_files, load_context_files_with,
 };
@@ -528,6 +530,7 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             .map(|command| format!("bash: {}", first_line(command)))
             .unwrap_or_else(|| "bash".into()),
         "python" => python::summary(args),
+        "run_code" => code_mode::summary(args),
         "find" => {
             let query = args.get("query").and_then(Value::as_str);
             let path = args.get("path").and_then(Value::as_str);
