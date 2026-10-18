@@ -287,6 +287,34 @@ mod tests {
             assert!(output.is_error);
         }
         assert_eq!(received.lock().unwrap().len(), 2);
+        let event = executor.mask_event(CodeModeEvent::Started {
+            call_id: "nested".into(),
+            name: "tool-secret-value".into(),
+            arguments: json!({"value": "secret-value"}),
+        });
+        let CodeModeEvent::Started {
+            name, arguments, ..
+        } = event
+        else {
+            unreachable!()
+        };
+        assert_eq!(name, format!("tool-{placeholder}"));
+        assert_eq!(arguments["value"], placeholder);
+        let event = executor.mask_event(CodeModeEvent::Finished {
+            call_id: "nested".into(),
+            name: "tool-secret-value".into(),
+            output: ToolOutput {
+                content: "secret-value".into(),
+                summary: "secret-value".into(),
+                is_error: false,
+            },
+        });
+        let CodeModeEvent::Finished { name, output, .. } = event else {
+            unreachable!()
+        };
+        assert_eq!(name, format!("tool-{placeholder}"));
+        assert_eq!(output.content, placeholder);
+        assert_eq!(output.summary, placeholder);
     }
 
     #[tokio::test]
