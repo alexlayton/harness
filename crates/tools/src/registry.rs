@@ -169,15 +169,11 @@ impl ToolRegistry {
                 return Err(error(format!("tool is unavailable or excluded: {name}")));
             }
         }
-        let tools: Vec<_> = self
+        let tools = self
             .tools
             .iter()
             .filter(|tool| eligible(&tool.name) && (names.is_empty() || names.contains(&tool.name)))
-            .map(|tool| (tool.spec.clone(), tool.tool.output_schema()))
-            .collect();
-        if tools.is_empty() {
-            return Err(error("no eligible tools selected".into()));
-        }
+            .map(|tool| (&tool.spec, tool.tool.output_schema()));
         self.code_mode = Some(super::code_mode::CodeMode::new(tools).map_err(error)?);
         Ok(())
     }

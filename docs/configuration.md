@@ -121,8 +121,10 @@ Subagents keep their existing tool sets, including standalone `python` for
 workspace children; they do not receive code mode or the parent's MCP tools.
 
 Selected tools are removed from the model-facing native tool list. Their
-schemas and descriptions instead form the `run_code` catalogue. Inside a
-snippet, each function is available through `tools["name"]`. This dictionary
+schemas and descriptions instead form the `run_code` catalogue. Catalogue
+construction stops if its serialized JSON exceeds 512 KiB; select fewer tools
+if startup reports this limit. Inside a snippet, each function is available
+through `tools["name"]`. This dictionary
 preserves MCP names that contain characters which are not valid in Python
 identifiers. Use keyword arguments, including `**{"class": value}` when a
 parameter name is a Python keyword.

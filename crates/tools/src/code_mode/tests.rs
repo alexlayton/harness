@@ -309,6 +309,65 @@ async fn representations_and_printed_text_cannot_hide_errors_or_exceed_limits() 
 }
 
 #[test]
+fn oversized_catalogue_stops_before_requesting_more_schemas() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SchemaTool {
+        name: &'static str,
+        requests: Arc<AtomicUsize>,
+        oversized: bool,
+    }
+
+    #[async_trait]
+    impl Tool for SchemaTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                definition: ToolDefinition {
+                    name: self.name.into(),
+                    description: "Return structured data".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                prompt: ToolPrompt::default(),
+            }
+        }
+
+        fn output_schema(&self) -> Option<Value> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            // Escaping alone exceeds the budget; raw string length does not.
+            Some(json!({
+                "type": "object",
+                "description": if self.oversized { "\"".repeat(MAX_CATALOG_BYTES / 2) } else { String::new() },
+            }))
+        }
+
+        async fn execute(&self, _: Value, _: CancellationToken) -> ToolOutput {
+            unreachable!("catalogue construction must not execute tools")
+        }
+    }
+
+    let requests = Arc::new(AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new(vec![
+        Box::new(SchemaTool {
+            name: "oversized",
+            requests: requests.clone(),
+            oversized: true,
+        }),
+        Box::new(SchemaTool {
+            name: "later",
+            requests: requests.clone(),
+            oversized: false,
+        }),
+    ]);
+    let native = registry.snapshot();
+    assert!(registry.enable_code_mode(&[]).is_err());
+    // Reject while serializing the first tool, not after materializing all
+    // output schemas or exposing a partial run_code catalogue.
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(!registry.code_mode_enabled());
+    assert_eq!(registry.snapshot(), native);
+}
+
+#[test]
 fn selections_and_json_conversion_reject_unsupported_values() {
     let (mut registry, _) = registry("echo");
     assert!(registry.enable_code_mode(&[]).is_err());

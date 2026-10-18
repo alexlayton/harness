@@ -9,8 +9,11 @@ use monty_types::{
     CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, NameLookupResult,
     ObjectRef, PrintWriter, ResourceLimits, ResourceTracker, SleepMode,
 };
+use serde::Serialize;
+use serde::ser::{SerializeSeq, Serializer};
 use serde_json::{Map, Value, json};
 use std::fmt::Write;
+use std::io;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -69,27 +72,62 @@ pub(crate) struct CodeMode {
     spec: ToolSpec,
 }
 
-impl CodeMode {
-    pub(crate) fn new(tools: Vec<(ToolSpec, Option<Value>)>) -> Result<Self, String> {
-        let names = tools
-            .iter()
-            .map(|(spec, _)| spec.definition.name.clone())
-            .collect();
-        let catalog: Vec<_> = tools
-            .iter()
-            .map(|(spec, output_schema)| {
-                json!({
-                    "name": spec.definition.name,
-                    "description": spec.definition.description,
-                    "parameters": spec.definition.parameters,
-                    "output_schema": output_schema,
-                })
-            })
-            .collect();
-        let catalog = serde_json::to_string_pretty(&catalog).map_err(|err| err.to_string())?;
-        if catalog.len() > MAX_CATALOG_BYTES {
-            return Err("code-mode catalogue exceeds 512 KiB; select fewer tools".into());
+#[derive(Serialize)]
+struct CatalogEntry<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+    output_schema: Option<Value>,
+}
+
+// Stop serialization on overflow, not after constructing an arbitrarily large
+// JSON string. Tool specs are borrowed and output schemas are obtained lazily,
+// so rejection also avoids copying the rest of the selected catalogue.
+struct CatalogWriter(Vec<u8>);
+
+impl io::Write for CatalogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_CATALOG_BYTES.saturating_sub(self.0.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "code-mode catalogue exceeds 512 KiB; select fewer tools",
+            ));
         }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CodeMode {
+    pub(crate) fn new<'a>(
+        tools: impl IntoIterator<Item = (&'a ToolSpec, Option<Value>)>,
+    ) -> Result<Self, String> {
+        let mut writer = CatalogWriter(Vec::new());
+        let mut serializer = serde_json::Serializer::pretty(&mut writer);
+        let mut catalog = serializer
+            .serialize_seq(None)
+            .map_err(|err| err.to_string())?;
+        let mut names = Vec::new();
+        for (spec, output_schema) in tools {
+            catalog
+                .serialize_element(&CatalogEntry {
+                    name: &spec.definition.name,
+                    description: &spec.definition.description,
+                    parameters: &spec.definition.parameters,
+                    output_schema,
+                })
+                .map_err(|err| err.to_string())?;
+            names.push(spec.definition.name.clone());
+        }
+        if names.is_empty() {
+            return Err("no eligible tools selected".into());
+        }
+        catalog.end().map_err(|err| err.to_string())?;
+        let catalog = String::from_utf8(writer.0).map_err(|err| err.to_string())?;
         let spec = ToolSpec {
             definition: ToolDefinition {
                 name: "run_code".into(),
