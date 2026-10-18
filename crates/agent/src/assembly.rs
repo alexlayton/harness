@@ -50,6 +50,7 @@ pub struct AgentBuilder {
     provider_factory: Option<ProviderFactory>,
     secret_masker: Arc<SecretMasker>,
     mcp_servers: Vec<mcp::McpServerConfig>,
+    code_mode: Option<Vec<String>>,
 }
 
 impl AgentBuilder {
@@ -74,6 +75,7 @@ impl AgentBuilder {
             provider_factory: None,
             secret_masker: Arc::new(SecretMasker::default()),
             mcp_servers: Vec::new(),
+            code_mode: None,
         }
     }
 
@@ -124,6 +126,14 @@ impl AgentBuilder {
     /// deliberately retain their built-in-only registries.
     pub fn with_mcp_servers(mut self, servers: Vec<mcp::McpServerConfig>) -> Self {
         self.mcp_servers = servers;
+        self
+    }
+
+    /// Expose selected parent tools through `run_code` instead of direct calls.
+    /// An empty list selects every eligible tool. Nested agents keep their
+    /// ordinary registries; code mode is enabled after all parent registration.
+    pub fn with_code_mode(mut self, tools: Vec<String>) -> Self {
+        self.code_mode = Some(tools);
         self
     }
 
@@ -205,6 +215,18 @@ impl AgentBuilder {
         } else {
             None
         };
+
+        if let Some(names) = self.code_mode
+            && let Err(error) = self.tools.enable_code_mode(&names)
+        {
+            if let Some(mcp) = mcp {
+                mcp.shutdown().await;
+            }
+            return Err(anyhow::anyhow!(
+                self.secret_masker.mask_text(&error.to_string())
+            ))
+            .context("enable code mode");
+        }
 
         let assembly_cancel = self.cancel.clone();
         let mut agent = Agent::new(self.provider, self.tools, self.model, self.cancel)

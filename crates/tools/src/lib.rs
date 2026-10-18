@@ -1,4 +1,5 @@
 mod bash;
+mod code_mode;
 pub mod context_files;
 mod edit;
 pub mod file_mutation;
@@ -15,6 +16,7 @@ pub mod vfs;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
+pub use code_mode::{CodeModeEvent, CodeModeExecutor};
 pub use context_files::{
     display_path, format_context_files, load_context_files, load_context_files_with,
 };
@@ -140,7 +142,22 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Return the JSON schema for structured results, when available.
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput;
+
+    /// Execute once and return display output plus an optional structured result.
+    /// Tools without structured results use their existing executor unchanged.
+    async fn execute_structured(
+        &self,
+        args: Value,
+        cancel: CancellationToken,
+    ) -> (ToolOutput, Option<Value>) {
+        (self.execute(args, cancel).await, None)
+    }
 }
 
 /// Runtime settings shared by all built-in tools in a registry.
@@ -513,6 +530,7 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             .map(|command| format!("bash: {}", first_line(command)))
             .unwrap_or_else(|| "bash".into()),
         "python" => python::summary(args),
+        "run_code" => code_mode::summary(args),
         "find" => {
             let query = args.get("query").and_then(Value::as_str);
             let path = args.get("path").and_then(Value::as_str);

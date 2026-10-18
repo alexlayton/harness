@@ -980,6 +980,9 @@ while IFS= read -r line; do
                 list-chunked)
                     chunked_huge "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"fixture\",\"description\":\"" "\",\"inputSchema\":{\"type\":\"object\"}}]}}"
                     ;;
+                code-mode-structured)
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"numeric-step","inputSchema":{"type":"object","properties":{"value":{"type":"integer","minimum":0}},"required":["value"],"additionalProperties":false},"outputSchema":{"title":"Fixture numeric step","type":"object","properties":{"next_value":{"type":"integer","minimum":1}},"required":["next_value"],"additionalProperties":false}}]}}\n' "$id"
+                    ;;
                 paged)
                     case "$line" in
                         *'"cursor":"page-2"'*)
@@ -997,6 +1000,10 @@ while IFS= read -r line; do
             ;;
         *'"method":"tools/call"'*)
             case "$MCP_TEST_MODE" in
+                code-mode-structured)
+                    value=$(printf '%s\n' "$line" | sed -n 's/.*"value":\([0-9][0-9]*\).*/\1/p')
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"display must not be parsed"}],"structuredContent":{"next_value":%s}}}\n' "$id" "$((value * 3 + 1))"
+                    ;;
                 call-text-single)
                     single_huge "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" "\"}]}}"
                     ;;
@@ -1093,6 +1100,80 @@ done
             assert_eq!(names[0], crate::normalized_tool_name("fixture", "first"));
             assert_eq!(names[1], crate::normalized_tool_name("fixture", "second"));
             runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn code_mode_preserves_remote_output_schema_and_dependent_structured_calls() {
+            let runtime = tokio::time::timeout(
+                Duration::from_secs(15),
+                connect_fixture("code-mode-structured"),
+            )
+            .await
+            .expect("fixture connection must finish promptly")
+            .expect("fixture should connect");
+            let mut registry = ToolRegistry::empty();
+            runtime
+                .register_into(&mut registry)
+                .expect("fixture tool should register");
+            registry
+                .enable_code_mode(&[])
+                .expect("remote tool should support code mode");
+            let definitions = registry.definitions();
+            let name = crate::normalized_tool_name("fixture", "numeric-step");
+            // Both results must be JSON, not the deliberately non-JSON display
+            // text. The second remote result also checks its dependent argument.
+            let code = format!(
+                "first = tools[\"{name}\"](value=4)\n\
+                 second = tools[\"{name}\"](value=first['next_value'] + 2)\n\
+                 second['next_value']"
+            );
+            let output = tokio::time::timeout(
+                Duration::from_secs(15),
+                registry.execute(
+                    "run_code",
+                    serde_json::json!({
+                        "code": code,
+                        "description": "Compute two dependent remote numeric steps"
+                    }),
+                    CancellationToken::new(),
+                ),
+            )
+            .await;
+            // Reap the fixture before assertions, including timeout failures.
+            runtime.shutdown().await;
+
+            let description = &definitions
+                .iter()
+                .find(|definition| definition.name == "run_code")
+                .expect("code mode should expose run_code")
+                .description;
+            // Read a JSON entry without depending on catalogue prose, layout,
+            // or whether entries are in an array or a compact JSON stream.
+            let entry = description
+                .match_indices('{')
+                .find_map(|(offset, _)| {
+                    let entry = serde_json::Deserializer::from_str(&description[offset..])
+                        .into_iter::<serde_json::Value>()
+                        .next()?
+                        .ok()?;
+                    (entry["name"] == name).then_some(entry)
+                })
+                .expect("catalogue should contain the discovered remote tool");
+            assert_eq!(
+                entry["output_schema"],
+                serde_json::json!({
+                    "title": "Fixture numeric step",
+                    "type": "object",
+                    "properties": {"next_value": {"type": "integer", "minimum": 1}},
+                    "required": ["next_value"],
+                    "additionalProperties": false
+                })
+            );
+            let output = output.expect("dependent remote calls must finish promptly");
+            assert!(!output.is_error, "{}", output.content);
+            // 4 -> 13, then (13 + 2) -> 46. A fixed or lost argument cannot pass.
+            assert!(output.content.contains("Result: 46"), "{}", output.content);
+            assert!(!output.content.contains("display must not be parsed"));
         }
 
         #[tokio::test]

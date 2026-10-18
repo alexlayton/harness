@@ -47,6 +47,13 @@ third-party packages, or host callbacks. It runs in the Harness process, so it
 is **not** a security sandbox for untrusted code; use the file tools for files
 and the shell for commands, builds, and tests.
 
+Opt-in **code mode** lets the model call selected built-in and MCP tools as
+Python functions inside one `run_code` request. It can use loops and conditions,
+filter intermediate results, and return only useful data. Calls are sequential
+and each request starts with fresh state. Set `enabled = true` under
+`[code_mode]` in `config.toml`; see [Code mode](docs/configuration.md#code-mode)
+for selection, limits, and safety details.
+
 See [Configuration][configuration] for tool limits, the RTK setting, and other
 advanced options.
 

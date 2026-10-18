@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod assembly;
+mod code_mode;
 pub mod prompt;
 pub mod secrets;
 pub mod subagent;

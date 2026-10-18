@@ -1,18 +1,20 @@
 use super::InputMessage;
-use super::{Agent, AgentEvent, TurnError, send};
+use super::{Agent, AgentEvent, AgentSessionState, TurnError, send};
+use crate::code_mode::{AgentCodeModeExecutor, NestedEventSink, NestedNotification};
 use crate::secrets::SecretMasker;
 use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use futures_util::task::noop_waker_ref;
 use llm::{Content, Message, Role, ToolCall};
-use std::collections::VecDeque;
+use session::SessionEvent;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tools::{Concurrency, ToolOutput, ToolRegistry, call_summary};
+use tools::{CodeModeEvent, Concurrency, ToolOutput, ToolRegistry, call_summary};
 
 /// Upper bound on read-only tool calls running at once.  Read tools are
 /// cheap, but the shared `FileSearchIndex` already gates its own concurrency
@@ -116,7 +118,11 @@ fn execution_arguments(
     call: &ToolCall,
 ) -> ExecutionArguments {
     match secrets {
-        Some(masker) if restore_secrets && registry.accepts_restored_secrets(&call.name) => {
+        Some(masker)
+            if restore_secrets
+                && call.name != "run_code"
+                && registry.accepts_restored_secrets(&call.name) =>
+        {
             let (value, rejected_key) = masker.restore_json_for_execution(&call.arguments);
             ExecutionArguments {
                 value,
@@ -158,10 +164,13 @@ pub(crate) struct CallOutcome {
 pub(crate) struct BatchOutcome {
     pub(crate) outcomes: Vec<CallOutcome>,
     pub(crate) cancellation: Option<DispatchCancellation>,
+    /// A nested lifecycle event could not be recorded. The parent must abort
+    /// the turn rather than return an ordinary tool failure to the provider.
+    pub(crate) nested_error: Option<String>,
 }
 
-/// UI-only hooks for the shared executor. Hooks never persist or mutate an
-/// [`Agent`], which keeps the registry borrow independent of caller state.
+/// Lifecycle hooks for shared execution. Nested events may borrow session
+/// state separately from the registry, without borrowing the whole agent.
 pub(crate) trait ToolDispatchHooks {
     fn started(&mut self, call: &ToolCall, started: Instant, synthetic: bool);
 
@@ -172,16 +181,55 @@ pub(crate) trait ToolDispatchHooks {
         started: Instant,
         state: CallState,
     );
+
+    /// Acknowledge a nested event before the workflow can continue. In
+    /// particular, a start must be durable before tool side effects begin.
+    fn nested(&mut self, _parent: &str, _event: CodeModeEvent) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Parent hook translating shared lifecycle callbacks into agent events.
 struct AgentToolDispatchHooks<'a> {
     events: &'a mpsc::UnboundedSender<AgentEvent>,
+    session: Option<&'a mut AgentSessionState>,
+    secrets: &'a SecretMasker,
+    nested_starts: HashMap<String, (String, Instant)>,
 }
 
 impl<'a> AgentToolDispatchHooks<'a> {
-    fn new(events: &'a mpsc::UnboundedSender<AgentEvent>) -> Self {
-        Self { events }
+    fn new(
+        events: &'a mpsc::UnboundedSender<AgentEvent>,
+        session: Option<&'a mut AgentSessionState>,
+        secrets: &'a SecretMasker,
+    ) -> Self {
+        Self {
+            events,
+            session,
+            secrets,
+            nested_starts: HashMap::new(),
+        }
+    }
+}
+
+impl Drop for AgentToolDispatchHooks<'_> {
+    fn drop(&mut self) {
+        // A cancelled or dropped workflow cannot promise a final tool result.
+        // Close live UI entries without inventing a durable completion record.
+        for (call_id, (name, started)) in self.nested_starts.drain() {
+            send(
+                self.events,
+                AgentEvent::ToolCallFinished {
+                    call_id,
+                    name,
+                    summary: "cancelled; execution status unknown".into(),
+                    ok: false,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    output: String::new(),
+                    error: Some("cancelled; execution status unknown".into()),
+                },
+            );
+        }
     }
 }
 
@@ -214,6 +262,100 @@ impl ToolDispatchHooks for AgentToolDispatchHooks<'_> {
                 },
             ),
         }
+    }
+
+    fn nested(&mut self, parent: &str, event: CodeModeEvent) -> Result<(), String> {
+        // Unknown events are durable audit records, not provider messages.
+        // Only the parent run_code call/result enters model history.
+        let durable = match &event {
+            CodeModeEvent::Started {
+                call_id,
+                name,
+                arguments,
+            } => SessionEvent::Unknown {
+                kind: "code_mode_call".into(),
+                data: serde_json::json!({
+                    "parent_call_id": parent,
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments,
+                }),
+            },
+            CodeModeEvent::Finished {
+                call_id,
+                name,
+                output,
+            } => SessionEvent::Unknown {
+                kind: "code_mode_result".into(),
+                data: serde_json::json!({
+                    "parent_call_id": parent,
+                    "call_id": call_id,
+                    "name": name,
+                    "content": output.content,
+                    "is_error": output.is_error,
+                }),
+            },
+        };
+        if let Some(state) = self.session.as_mut() {
+            state
+                .store
+                .append_event(&mut state.session, durable)
+                .and_then(|_| {
+                    // A deferred-sync session still needs a durable admission
+                    // before a nested tool can apply external side effects.
+                    if state.store.deferred_sync() {
+                        state.store.sync_session(&state.session)?;
+                    }
+                    Ok(())
+                })
+                .map_err(|error| {
+                    let message = self
+                        .secrets
+                        .mask_text(&format!("session persistence failed: {error}"));
+                    send(self.events, AgentEvent::Error(message.clone()));
+                    message
+                })?;
+        }
+        match event {
+            CodeModeEvent::Started {
+                call_id,
+                name,
+                arguments,
+            } => {
+                self.nested_starts
+                    .insert(call_id.clone(), (name.clone(), Instant::now()));
+                send_started(
+                    self.events,
+                    &ToolCall {
+                        id: call_id,
+                        name,
+                        arguments,
+                    },
+                );
+            }
+            CodeModeEvent::Finished {
+                call_id,
+                name,
+                output,
+            } => {
+                let started = self
+                    .nested_starts
+                    .remove(&call_id)
+                    .map(|(_, started)| started)
+                    .unwrap_or_else(Instant::now);
+                send_finished(
+                    self.events,
+                    &ToolCall {
+                        id: call_id,
+                        name,
+                        arguments: serde_json::Value::Null,
+                    },
+                    &output,
+                    started,
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -362,8 +504,9 @@ async fn execute_with_secret_policy(
     registry: &ToolRegistry,
     name: &str,
     arguments: ExecutionArguments,
-    cancel: CancellationToken,
     secrets: Option<&SecretMasker>,
+    restore_secrets: bool,
+    notifications: NestedEventSink,
 ) -> ToolOutput {
     let output = if arguments.rejected_key {
         ToolOutput {
@@ -371,8 +514,17 @@ async fn execute_with_secret_policy(
             is_error: true,
             summary: "rejected secret-bearing argument key".into(),
         }
+    } else if name == "run_code" && registry.code_mode_enabled() {
+        let cancel = notifications.cancel.clone();
+        let executor =
+            AgentCodeModeExecutor::new(registry, secrets, restore_secrets, notifications);
+        registry
+            .execute_code_mode(arguments.value, cancel, &executor)
+            .await
     } else {
-        registry.execute(name, arguments.value, cancel).await
+        registry
+            .execute(name, arguments.value, notifications.cancel)
+            .await
     };
     match secrets {
         Some(masker) => masker.mask_tool_output(output),
@@ -396,6 +548,15 @@ where
 {
     let launch_limit = launch_limit.max(1);
     let batch_cancel = CancellationToken::new();
+    // Also cancel callbacks when the owning future is dropped, not only when
+    // the control branch wins. Receivers/acks are dropped with the batch.
+    let _cancel_on_drop = batch_cancel.clone().drop_guard();
+    // Close nested admission before polling ready results on interruption.
+    // Draining must never consume a start ack and launch a new mutation.
+    let nested_admission = CancellationToken::new();
+    let _admission_on_drop = nested_admission.clone().drop_guard();
+    let (nested_sender, mut nested_receiver) = mpsc::channel::<NestedNotification>(16);
+    let mut nested_error = None;
     let mut futures: FuturesUnordered<ToolRun<'_>> = FuturesUnordered::new();
     let mut starts: Vec<Option<Instant>> = (0..batch.calls.len()).map(|_| None).collect();
     let mut slots: Vec<Option<CallOutcome>> = (0..batch.calls.len()).map(|_| None).collect();
@@ -411,10 +572,22 @@ where
         let name = call.name.clone();
         let arguments = execution_arguments(registry, secrets, restore_secrets, call);
         let index = next_launch;
-        let cancel = batch_cancel.clone();
+        let notifications = NestedEventSink {
+            parent_call_id: call.id.clone(),
+            sender: nested_sender.clone(),
+            cancel: batch_cancel.clone(),
+            admission: nested_admission.clone(),
+        };
         futures.push(Box::pin(async move {
-            let output =
-                execute_with_secret_policy(registry, &name, arguments, cancel, secrets).await;
+            let output = execute_with_secret_policy(
+                registry,
+                &name,
+                arguments,
+                secrets,
+                restore_secrets,
+                notifications,
+            )
+            .await;
             (index, output, started)
         }));
         next_launch += 1;
@@ -425,6 +598,16 @@ where
             biased;
             reason = &mut *control => {
                 cancellation = Some(reason);
+            }
+            Some(notification) = nested_receiver.recv() => {
+                let result = hooks.nested(&notification.parent_call_id, notification.event);
+                if let Err(error) = &result {
+                    nested_error = Some(error.clone());
+                    cancellation = Some(DispatchCancellation::Explicit);
+                    // Stop all callbacks before returning the failed ack.
+                    batch_cancel.cancel();
+                }
+                let _ = notification.ack.send(result);
             }
             item = futures.next() => match item {
                 Some((index, output, started)) => {
@@ -448,10 +631,15 @@ where
                         let name = call.name.clone();
                         let arguments = execution_arguments(registry, secrets, restore_secrets, call);
                         let index = next_launch;
-                        let cancel = batch_cancel.clone();
+                        let notifications = NestedEventSink {
+                            parent_call_id: call.id.clone(),
+                            sender: nested_sender.clone(),
+                            cancel: batch_cancel.clone(),
+                            admission: nested_admission.clone(),
+                        };
                         futures.push(Box::pin(async move {
                             let output = execute_with_secret_policy(
-                                registry, &name, arguments, cancel, secrets,
+                                registry, &name, arguments, secrets, restore_secrets, notifications,
                             )
                             .await;
                             (index, output, started)
@@ -465,9 +653,10 @@ where
     }
 
     if cancellation.is_some() {
-        // Harvest work that completed before cancellation was broadcast. The
-        // local token is cancelled only after this non-blocking drain, so a
-        // ready mutation result is never relabelled as unknown cancellation.
+        nested_admission.cancel();
+        // Harvest work that completed before user cancellation was broadcast.
+        // Except after a persistence failure, cancel only after this drain so
+        // a ready mutation result is not relabelled as unknown cancellation.
         while let Some(Some((index, output, started))) = futures.next().now_or_never() {
             hooks.finished(&batch.calls[index], &output, started, CallState::Completed);
             slots[index] = Some(CallOutcome { output });
@@ -505,6 +694,7 @@ where
     BatchOutcome {
         outcomes,
         cancellation,
+        nested_error,
     }
 }
 
@@ -568,7 +758,11 @@ impl Agent {
                 &self.cancel,
                 cancel,
             );
-            let mut hooks = AgentToolDispatchHooks::new(events);
+            let mut hooks = AgentToolDispatchHooks::new(
+                events,
+                self.session.as_mut(),
+                self.secret_masker.as_ref(),
+            );
             let outcome = execute_tool_batch_with_secrets(
                 &self.tools,
                 &batch,
@@ -580,6 +774,10 @@ impl Agent {
             )
             .await;
             drop(control);
+            drop(hooks);
+            if let Some(error) = outcome.nested_error {
+                return Err(TurnError::Persist(error));
+            }
 
             for (call, call_outcome) in batch.calls.iter().zip(outcome.outcomes) {
                 self.persist_tool_result(
@@ -605,6 +803,8 @@ impl Agent {
                 for pending in batches {
                     for call in &pending.calls {
                         let started = Instant::now();
+                        let mut hooks =
+                            AgentToolDispatchHooks::new(events, None, self.secret_masker.as_ref());
                         hooks.started(call, started, true);
                         let output = ToolOutput {
                             content: "cancelled".into(),
@@ -617,6 +817,7 @@ impl Agent {
                             started,
                             CallState::Cancelled { launched: false },
                         );
+                        drop(hooks);
                         self.persist_tool_result(call, &output.content, true, events)?;
                         self.history.push(Message {
                             role: Role::Tool,
@@ -680,6 +881,9 @@ fn send_finished(
         },
     );
 }
+
+#[cfg(test)]
+mod code_mode_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,12 +1,12 @@
 use crate::MCP_CALL_TIMEOUT;
-use crate::output::flatten;
+use crate::output::{MAX_OUTPUT_BYTES, flatten};
 use crate::{McpError, normalized_tool_name};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use rmcp::Peer;
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CancelledNotification, CancelledNotificationParam,
-    ClientRequest, ServerResult, Tool as RemoteTool,
+    CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotification,
+    CancelledNotificationParam, ClientRequest, ServerResult, Tool as RemoteTool,
 };
 use rmcp::service::{PeerRequestOptions, RoleClient};
 use serde_json::{Map, Value};
@@ -187,6 +187,7 @@ pub(crate) struct McpTool {
     original_name: String,
     description: String,
     parameters: Value,
+    output_schema: Option<Value>,
     peer: Peer<RoleClient>,
 }
 
@@ -206,6 +207,9 @@ impl McpTool {
             });
         }
         let parameters = Value::Object((*remote.input_schema).clone());
+        let output_schema = remote
+            .output_schema
+            .map(|schema| Value::Object((*schema).clone()));
         let description = remote
             .description
             .map(|description| description.to_string())
@@ -216,6 +220,7 @@ impl McpTool {
             original_name,
             description: truncate(&description, 4 * 1024),
             parameters,
+            output_schema,
             peer,
         })
     }
@@ -242,42 +247,54 @@ impl Tool for McpTool {
         }
     }
 
+    fn output_schema(&self) -> Option<Value> {
+        self.output_schema.clone()
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
+        self.execute_structured(args, cancel).await.0
+    }
+
+    async fn execute_structured(
+        &self,
+        args: Value,
+        cancel: CancellationToken,
+    ) -> (ToolOutput, Option<Value>) {
         let arguments = match args {
             Value::Object(arguments) => arguments,
-            _ => return self.error("MCP tool arguments must be a JSON object"),
+            _ => return (self.error("MCP tool arguments must be a JSON object"), None),
         };
         let params =
             CallToolRequestParams::new(self.original_name.clone()).with_arguments(arguments);
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
         let deadline = tokio::time::Instant::now().checked_add(MCP_CALL_TIMEOUT);
         let Some(deadline) = deadline else {
-            return self.error("MCP tool call deadline overflow");
+            return (self.error("MCP tool call deadline overflow"), None);
         };
         let mut handle = tokio::select! {
-            _ = cancel.cancelled() => return self.error("MCP tool call cancelled"),
+            _ = cancel.cancelled() => return (self.error("MCP tool call cancelled"), None),
             result = tokio::time::timeout_at(
                 deadline,
                 self.peer.send_cancellable_request(request, PeerRequestOptions::no_options()),
             ) => match result {
                 Ok(Ok(handle)) => handle,
-                Ok(Err(error)) => return self.error(format_args!("MCP tools/call failed: {error}")),
-                Err(_) => return self.error("MCP tools/call request timed out"),
+                Ok(Err(error)) => return (self.error(format_args!("MCP tools/call failed: {error}")), None),
+                Err(_) => return (self.error("MCP tools/call request timed out"), None),
             }
         };
         tokio::select! {
             _ = cancel.cancelled() => {
                 self.cancel_request_bounded(&handle).await;
-                self.error("MCP tool call cancelled")
+                (self.error("MCP tool call cancelled"), None)
             }
             result = tokio::time::timeout_at(deadline, &mut handle.rx) => match result {
-                Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => ToolOutput { content: flatten(&result), is_error: result.is_error.unwrap_or(false), summary: self.summary() },
-                Ok(Ok(Ok(_))) => self.error("MCP tools/call returned an unsupported non-final response"),
-                Ok(Ok(Err(error))) => self.error(format_args!("MCP tools/call failed: {error}")),
-                Ok(Err(_)) => self.error("MCP tools/call connection closed before a response"),
+                Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => execution_output(result, self.summary()),
+                Ok(Ok(Ok(_))) => (self.error("MCP tools/call returned an unsupported non-final response"), None),
+                Ok(Ok(Err(error))) => (self.error(format_args!("MCP tools/call failed: {error}")), None),
+                Ok(Err(_)) => (self.error("MCP tools/call connection closed before a response"), None),
                 Err(_) => {
                     self.cancel_request_bounded(&handle).await;
-                    self.error("MCP tool call timed out")
+                    (self.error("MCP tool call timed out"), None)
                 }
             }
         }
@@ -317,6 +334,21 @@ impl McpTool {
     }
 }
 
+fn execution_output(result: CallToolResult, summary: String) -> (ToolOutput, Option<Value>) {
+    let output = ToolOutput {
+        content: flatten(&result),
+        is_error: result.is_error.unwrap_or(false),
+        summary,
+    };
+    let structured = result.structured_content.filter(|value| {
+        // Check compact JSON size with a fixed sink. Oversized values are
+        // discarded whole, never truncated or reconstructed from display text.
+        let mut buffer = [0u8; MAX_OUTPUT_BYTES];
+        serde_json::to_writer(&mut buffer[..], value).is_ok()
+    });
+    (output, structured)
+}
+
 fn truncate(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         value.into()
@@ -339,6 +371,38 @@ mod tests {
         tool.name = Cow::Owned(name.to_owned());
         tool.input_schema = Arc::new(Map::new());
         tool
+    }
+
+    #[test]
+    fn structured_results_preserve_json_and_errors_within_output_limit() {
+        let structured = serde_json::json!({
+            "nested": {"answer": 42, "missing": null},
+            "items": [true, "é", 1.5]
+        });
+        let mut result = CallToolResult::error(vec![rmcp::model::ContentBlock::text(
+            "Display text is not the structured result.",
+        )]);
+        result.structured_content = Some(structured.clone());
+        let expected_display = flatten(&result);
+        let (output, value) = execution_output(result, "server:tool".into());
+        assert_eq!(value, Some(structured));
+        assert_eq!(output.content, expected_display);
+        assert_eq!(output.summary, "server:tool");
+        assert!(output.is_error);
+
+        // Include JSON quotes and escaping in the byte budget.
+        for (payload, retained) in [
+            ("x".repeat(MAX_OUTPUT_BYTES - 2), true),
+            ("x".repeat(MAX_OUTPUT_BYTES - 1), false),
+            ("\"".repeat(MAX_OUTPUT_BYTES / 2), false),
+        ] {
+            let mut result = CallToolResult::error(Vec::new());
+            result.structured_content = Some(Value::String(payload));
+            let (output, value) = execution_output(result, "server:tool".into());
+            assert_eq!(value.is_some(), retained);
+            assert!(output.is_error);
+            assert!(output.content.len() <= MAX_OUTPUT_BYTES);
+        }
     }
 
     #[test]

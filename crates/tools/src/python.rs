@@ -96,7 +96,7 @@ impl Tool for PythonTool {
     }
 }
 
-fn description(args: &Value) -> Option<&str> {
+pub(crate) fn description(args: &Value) -> Option<&str> {
     let description = args.get("description")?.as_str()?.trim();
     (!description.is_empty()
         && description.chars().count() <= 80
@@ -166,20 +166,20 @@ fn run_code(code: String) -> ToolOutput {
     }
 }
 
-struct BoundedOutput {
+pub(crate) struct BoundedOutput {
     text: String,
     truncated: bool,
 }
 
 impl BoundedOutput {
-    fn new(text: String) -> Self {
+    pub(crate) fn new(text: String) -> Self {
         Self {
             text,
             truncated: false,
         }
     }
 
-    fn finish(mut self) -> String {
+    pub(crate) fn finish(mut self) -> String {
         if self.truncated {
             self.text.push_str("\n[output truncated]");
         }
@@ -194,6 +194,10 @@ impl Write for BoundedOutput {
             let boundary = s.floor_char_boundary(remaining);
             self.text.push_str(&s[..boundary]);
             self.truncated = true;
+            // Stop the formatter as well as retaining bounded text. Otherwise
+            // a compact shared graph can have an exponential representation
+            // that keeps walking long after the output buffer is full.
+            return Err(fmt::Error);
         } else {
             self.text.push_str(s);
         }
