@@ -1,0 +1,12 @@
+[project]
+name = "harness-python-example"
+version = "0.1.0"
+description = "Local example of the native Harness Python API"
+requires-python = ">=3.10"
+dependencies = ["harness-agent"]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+harness-agent = { path = "../python" }
