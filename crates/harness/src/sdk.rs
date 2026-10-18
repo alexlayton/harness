@@ -155,6 +155,9 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         config.copilot_auth.clone(),
         config.codex_auth.clone(),
     ));
+    if let Some(tools) = &config.code_mode {
+        builder = builder.with_code_mode(tools.clone());
+    }
     if !options.no_session {
         let store = SessionStore::default_for_workspace(&workspace)?;
         let session = match options.resume {

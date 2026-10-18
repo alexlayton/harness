@@ -98,8 +98,8 @@ Without options, `harness.run` reads the same configuration as the CLI:
 - Otherwise, `~/.config/harness/config.toml`.
 
 There is no separate Python configuration file. The configured provider,
-model, reasoning, RTK, compaction, subagents, MCP servers, and secret policy
-apply. A provider must be selected in the configuration or call options.
+model, reasoning, RTK, compaction, subagents, MCP servers, code mode, and secret
+policy apply. A provider must be selected in the configuration or call options.
 Missing configuration does not select a provider automatically.
 
 OAuth credentials use the normal `auth.json`. Sign in with the CLI first:
