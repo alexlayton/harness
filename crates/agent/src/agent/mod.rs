@@ -497,6 +497,12 @@ impl Agent {
                     continue;
                 }
                 InputMessage::CompactSession => {
+                    send(
+                        &events,
+                        AgentEvent::OperationStarted {
+                            label: "Compacting session...".into(),
+                        },
+                    );
                     // Manual compaction shares the boundary policy: persist
                     // failures quarantine with exactly one terminal event.
                     match self
@@ -538,6 +544,12 @@ impl Agent {
                     continue;
                 }
                 InputMessage::InvokeSkill { name } => {
+                    send(
+                        &events,
+                        AgentEvent::OperationStarted {
+                            label: format!("Starting skill {name}..."),
+                        },
+                    );
                     // Skill turns run through the same executor: shutdown
                     // propagates and persistence failures quarantine instead
                     // of being swallowed, with deferred sync flushed at the
@@ -3249,6 +3261,37 @@ mod tests {
                     .any(|event| matches!(event, AgentEvent::AskAnswer(_)))
             );
         });
+    }
+
+    #[test]
+    fn export_emits_one_success_event() {
+        let temp = tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("sessions"), temp.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let agent = Agent::new(
+            Arc::new(PendingAskProvider {
+                started: Arc::new(Notify::new()),
+                pending_open: false,
+                calls: AtomicUsize::new(0),
+            }),
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_session(store, session)
+        .unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let path = temp.path().join("export.jsonl");
+        agent.handle_export_session(Some(path.display().to_string()), &tx);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            AgentEvent::SessionExported { .. }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the result event is the only export confirmation"
+        );
+        assert!(path.is_file());
     }
 
     #[test]

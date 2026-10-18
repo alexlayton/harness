@@ -35,7 +35,7 @@ pub enum InputMessage {
     /// Export the current session to JSONL. `None` means the current directory
     /// and a generated filename.
     ExportSession { destination: Option<String> },
-    /// Run the deterministic local compactor.
+    /// Compact session context with model assistance and a local fallback.
     CompactSession,
     /// Switch model, and provider when `provider` is present.
     SetModel {
@@ -166,8 +166,22 @@ pub enum UiEvent {
     AskStarted,
     /// Completed isolated answer; it is displayed but is not conversation history.
     AskAnswer(String),
+    /// A foreground command is executing, even if it was queued during a turn.
+    OperationStarted {
+        label: String,
+    },
     /// A host-visible non-turn operation returned to the input loop.
     OperationFinished,
+    /// A background lookup started, independently of the active model turn.
+    BackgroundOperationStarted {
+        id: u64,
+        label: String,
+    },
+    /// Remove only the matching lookup and display any failure.
+    BackgroundOperationFinished {
+        id: u64,
+        error: Option<String>,
+    },
     Error(String),
     /// Informational command feedback committed to the retained transcript.
     Notice(String),

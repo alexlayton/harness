@@ -69,9 +69,23 @@ pub enum AgentEvent {
     AskStarted,
     /// Result of an isolated ask request, displayed outside conversation history.
     AskAnswer(String),
+    /// A foreground command is now executing, including commands queued during a turn.
+    OperationStarted {
+        label: String,
+    },
     /// A non-turn operation that can be shown as running has returned to the
     /// input loop. Fatal outcomes stop the runtime instead of emitting this.
     OperationFinished,
+    /// A background lookup started. Its id is independent of the active turn.
+    BackgroundOperationStarted {
+        id: u64,
+        label: String,
+    },
+    /// A background lookup completed; failure must not terminate a model turn.
+    BackgroundOperationFinished {
+        id: u64,
+        error: Option<String>,
+    },
     Error(String),
     Notice(String),
     ModelChanged {
