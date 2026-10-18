@@ -49,25 +49,28 @@ A separate uv consumer project installed the committed feature through a pinned
 Git dependency with `subdirectory = "python"`; native import reported version
 0.6.1. No standalone Harness executable or wheel host was required.
 
-The requested live run selected only the `weather` MCP entry from
-`~/.config/harness/config.toml`, provider `openai-codex`, and model
-`gpt-6.1-luna`. The MCP startup completed, but model validation stopped the
-turn with:
+The first attempt used the requested `gpt-6.1-luna` ID and stopped at local
+catalog validation. The user corrected the model to `gpt-6-luna`; the repeated
+live check **passed** without any catalog change or model fallback.
 
-```text
-OpenAI Codex model `gpt-6.1-luna` is not in the supported model catalog
-```
+The successful run used:
 
-The current local catalog includes `gpt-6-luna` and `gpt-6.1-sol`, but not the
-requested ID. No fallback model was used, and no weather tool call was recorded.
-The Codex request did not reach the provider endpoint. This does not establish
-whether the remote account supports the requested model.
+- Git-installed package version 0.6.1 at revision `99dabbe0dfab`.
+- Provider `openai-codex`, model `gpt-6-luna`, and the normal stored credentials.
+- Only the `weather` MCP entry from `~/.config/harness/config.toml`.
+- A prompt asking for current weather in Tokyo, Japan.
+
+The audit recorded a successful call to
+`mcp__weather__get_current_conditions__f526200c` with `is_error: false`, followed
+by a final text answer. The call completed in 5.39 seconds. No other tools were
+called. This verifies native Git installation, provider authentication, model
+execution, MCP discovery/dispatch, and final-answer delivery together.
 
 The system config was unchanged. Audit events were stored in an isolated
 temporary session directory, not the user's normal session store. No credential
-values were printed or added to the repository. The live-provider release gate
-below remains incomplete: update/verify model support or agree on an alternate
-supported model before repeating the request.
+values were printed or added to the repository. Live session resume,
+cancellation, explicit skills, and token-refresh behavior remain separate
+checks; this smoke test does not establish them.
 
 ## Before merging
 
@@ -78,11 +81,11 @@ supported model before repeating the request.
 
 ## Before a public Python package release
 
-- [ ] Run a small live-provider smoke check with authorized test credentials:
-      a successful prompt, a tool call, session resume, and cancellation. Include
-      a real MCP server and an explicit skill directory. Check the affected
-      providers' login/refresh behavior as appropriate. Do not store credentials
-      in test fixtures or logs.
+- [x] Run a successful live Codex prompt and real weather MCP tool call through
+      the Git-installed Python package.
+- [ ] Complete live checks for session resume, cancellation, and an explicit
+      skill directory. Check other affected providers' login/refresh behavior
+      as appropriate. Do not store credentials in test fixtures or logs.
 - [ ] Confirm ownership and availability of the `harness-agent` distribution
       name, the release version policy, and PyPI publishing permissions.
 - [ ] If distributing wheels, build and smoke-test every advertised OS/CPU
