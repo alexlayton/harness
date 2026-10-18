@@ -320,7 +320,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         config.tui_minimal,
         workspace_root,
     )?;
-    let builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
+    let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)
         .with_project_context(context_bundle.rendered)
@@ -329,6 +329,9 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         .with_mcp_servers(config.mcp_servers.clone())
         .with_session(session_store, session)
         .with_provider_factory(provider_factory);
+    if let Some(tools) = &config.code_mode {
+        builder = builder.with_code_mode(tools.clone());
+    }
     let agent = builder.build().await?;
 
     let herdr_options = herdr::ResumeOptions {

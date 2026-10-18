@@ -1488,7 +1488,7 @@ async fn spawn_agent(
     let project_context = project_context_for(tools.workspace_root(), state.no_context_files);
     assembly_cancelled(&cancel)?;
 
-    let builder = AgentBuilder::new(
+    let mut builder = AgentBuilder::new(
         state.provider.clone(),
         state.config.model.clone(),
         tools,
@@ -1505,6 +1505,9 @@ async fn spawn_agent(
         state.copilot_auth.clone(),
         state.config.codex_auth.clone(),
     ));
+    if let Some(tools) = &state.config.code_mode {
+        builder = builder.with_code_mode(tools.clone());
+    }
     let agent = build_agent_with_timeout(builder, &cancel, SESSION_ASSEMBLY_TIMEOUT).await?;
     if cancel.is_cancelled() {
         agent.shutdown().await;

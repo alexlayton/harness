@@ -123,6 +123,17 @@ pub struct SubagentConfig {
     pub max_concurrent: Option<usize>,
 }
 
+/// Opt-in code mode settings parsed from `[code_mode]`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodeModeConfig {
+    /// Expose selected tools through `run_code` only when explicitly enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Tool names to expose; an empty list selects all eligible tools.
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
 /// Terminal UI presentation settings parsed from `[tui]`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TuiConfig {
@@ -267,6 +278,9 @@ pub struct FileConfig {
     /// `compaction`: absent from disk when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<SubagentConfig>,
+    /// Opt-in code mode settings (`[code_mode]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<CodeModeConfig>,
     /// Exact-value secret masking configured under `[secrets]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<SecretsConfig>,
@@ -291,6 +305,7 @@ impl PartialEq for FileConfig {
             && self.rtk == other.rtk
             && self.compaction == other.compaction
             && self.subagents == other.subagents
+            && self.code_mode == other.code_mode
             && self.secrets == other.secrets
             && self.mcp == other.mcp
             && self.tui == other.tui
@@ -877,6 +892,8 @@ pub struct Config {
     pub compaction: CompactionPolicy,
     /// Resolved subagent bounds (file `[subagents]` over defaults).
     pub subagents: SubagentPolicy,
+    /// Selected code mode tools, present only when code mode is enabled.
+    pub code_mode: Option<Vec<String>>,
     /// Resolved once at startup. Its `Debug` implementation omits values.
     pub secret_masker: Arc<SecretMasker>,
     /// MCP servers after deterministic validation and `${ENV_VAR}` expansion.
@@ -1049,6 +1066,11 @@ impl Config {
                 .as_ref()
                 .map(resolve_subagents)
                 .unwrap_or_default(),
+            code_mode: file
+                .code_mode
+                .as_ref()
+                .filter(|config| config.enabled)
+                .map(|config| config.tools.clone()),
             secret_masker,
             mcp_servers: mcp_servers.unwrap_or_default(),
             tui_minimal: file.tui.as_ref().is_some_and(|tui| tui.minimal),
@@ -1466,6 +1488,7 @@ mod tests {
                 max_turns: Some(10),
                 max_concurrent: Some(2),
             }),
+            code_mode: None,
             secrets: None,
             mcp: None,
             tui: Some(TuiConfig { minimal: true }),
@@ -1501,6 +1524,39 @@ mod tests {
             saved.extra.get("future"),
             Some(&toml::Value::String("kept".into()))
         );
+    }
+
+    #[test]
+    fn code_mode_requires_explicit_opt_in_and_preserves_tool_selection() {
+        let path = PathBuf::from("config.toml");
+        let absent: FileConfig = toml::from_str("").unwrap();
+        assert_eq!(absent.code_mode, None);
+        assert!(!toml::to_string(&absent).unwrap().contains("code_mode"));
+
+        for (table, expected) in [
+            ("", None),
+            ("[code_mode]", None),
+            ("[code_mode]\ntools = ['read']", None),
+            ("[code_mode]\nenabled = false\ntools = ['read']", None),
+            ("[code_mode]\nenabled = true", Some(Vec::new())),
+            (
+                "[code_mode]\nenabled = true\ntools = ['read', 'grep']",
+                Some(vec!["read".to_owned(), "grep".to_owned()]),
+            ),
+        ] {
+            let file =
+                parse_file_config(&format!("provider = 'opencode-go'\n{table}"), &path).unwrap();
+            if table == "[code_mode]" {
+                assert_eq!(file.code_mode, Some(CodeModeConfig::default()));
+            }
+            let resolved = Config::resolve_from_file(&Cli::default(), &file, path.clone(), |_| {
+                Some("test-key".into())
+            })
+            .unwrap();
+            assert_eq!(resolved.code_mode, expected, "{table}");
+            let saved = toml::to_string(&file).unwrap();
+            assert_eq!(toml::from_str::<FileConfig>(&saved).unwrap(), file);
+        }
     }
 
     #[test]

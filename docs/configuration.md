@@ -90,6 +90,94 @@ builds, and tests. Monty runs in the Harness process and is **not** a security
 boundary or crash-isolated sandbox. No configuration is needed to enable these
 tools.
 
+## Code mode
+
+Code mode lets the model write one Python program that calls selected tools and
+filters their results. Enable it in `config.toml`:
+
+```toml
+[code_mode]
+enabled = true
+```
+
+It is off by default. The setting applies to the terminal UI, headless mode,
+and ACP. Restart Harness to change the selection. With no `tools` list, all
+eligible built-in and connected MCP tools are selected. To select fewer tools:
+
+```toml
+[code_mode]
+enabled = true
+tools = ["read", "find", "grep", "outline"]
+```
+
+Use the registered, namespaced names for MCP tools. Unknown or excluded names
+stop startup with an error. `bash`, `python`, `subagent`, and `run_code` cannot
+be selected. These tools stay available as normal model calls. Other tools not
+in an explicit selection also remain normal model calls. Subagents keep their
+existing tool sets; they do not receive code mode or the parent's MCP tools.
+
+Selected tools are removed from the model-facing native tool list. Their
+schemas and descriptions instead form the `run_code` catalogue. Inside a
+snippet, each function is available through `tools["name"]`. This dictionary
+preserves MCP names that contain characters which are not valid in Python
+identifiers. Use keyword arguments, including `**{"class": value}` when a
+parameter name is a Python keyword.
+
+For example, the model can send this source in `run_code`, with a short
+`description` label:
+
+```python
+notes = {}
+for path in ["README.md", "ARCHITECTURE.md"]:
+    text = tools["read"](path=path, offset=1, limit=80)
+    notes[path] = [line for line in text.splitlines() if "tool" in line.lower()][:5]
+notes
+```
+
+Calls are **synchronous and sequential**, including MCP calls. Do not use
+`await` or `asyncio.gather` for tool functions in this version. The last
+expression is the result; printed text is supplementary output. Each snippet
+starts with fresh state. There is no persistent REPL.
+
+MCP structured results reach Python as dictionaries, lists, or scalar values.
+MCP output schemas are included when the server supplies them. Structured MCP
+results larger than 20 KiB are omitted and the function returns bounded display
+text instead. Tools without structured results return strings; do not assume
+that display text is JSON. Arguments must use JSON-compatible values, finite
+numbers, string dictionary keys, and signed 64-bit integers. Values are limited
+to 64 levels of nesting. A failed tool raises `RuntimeError` at its call site.
+
+Each snippet has these fixed limits:
+
+- 32 KiB of Python source.
+- 50 started nested tool calls and 1,000 interpreter suspensions.
+- 50 KiB for each argument object, result, and combined displayed output,
+  plus a short truncation marker where needed.
+- Five seconds of interpreter execution, excluding tool wait time.
+- 120 seconds of elapsed time for the complete workflow.
+
+The complete workflow is exclusive. Nested calls use the existing workspace
+and tool restrictions without acquiring the same execution lock twice. Secret
+placeholders are restored only in eligible local-tool arguments, never in the
+complete Python source or in external MCP arguments. Results and nested audit
+records are masked before use.
+
+Nested calls produce live tool events and separate `code_mode_call` /
+`code_mode_result` session audit records. These records do not enter model
+history. A nested start is persisted before execution; if persistence fails,
+the callback does not run. Deferred-sync sessions also sync these records
+before acknowledgement. An unfinished start means **execution status unknown**.
+On failure, the result reports started calls and their known statuses. Earlier
+changes are not rolled back. Inspect partial results before repeating code,
+especially after interruption or timeout.
+
+Python has no direct filesystem, environment, network, or host-clock access;
+file access goes through the selected tools. As with `python`, Monty runs in
+process: it is not crash-isolated, and there is no enforced memory sandbox.
+A cancelled interpreter step can finish computing up to its execution limit,
+but it cannot start host tools. MCP servers retain their normal external
+access; code mode does not make those servers a security sandbox.
+
 ## Secret masking
 
 Harness can replace explicitly configured environment-variable values before
