@@ -17,7 +17,7 @@ or disabled per call. It does not yet expose every runtime setting directly.
 | Finding | Change |
 |---|---|
 | Uncommitted MCP and skill work | Saved in `abbeac3` (`feat(python): configure MCP servers and skill directories per call`). |
-| Python metadata could retain an old release version | Maturin now takes the version from the Rust workspace; the example lockfile no longer fixes a separate Python version. |
+| Python metadata could retain an old release version | Maturin now takes the version from the Rust workspace; Python metadata and the root uv lockfile do not fix a separate release version. |
 | Full MIT notice was not explicitly included in Python artifacts | Added an explicit `license-files` declaration; root package metadata now uses the repository's `LICENSE` directly. Checked the built archive and installed distribution. |
 | Cargo-only CI did not test the Python install path | Added package jobs that build an sdist, install it into a fresh environment, check version/license/import, and run the existing Python tests. |
 | Retry instructions requested only a continuation, while final-answer collectors discarded failed-round text | Python/headless explicitly select replacement recovery and request a complete final answer. Incremental TUI/ACP output keeps continuation recovery, avoiding duplicate text. A mock-provider test checks both contracts through shared assembly; a headless check verifies replacement output is not duplicated. |
@@ -78,14 +78,15 @@ checks; this smoke test does not establish them.
 
 The root `pyproject.toml` now defines the Python package next to the virtual
 Cargo workspace. Python sources and tests remain in `python/`, and the Rust
-extension remains in `crates/python`. The example depends on `..`, not on a
-separate Python subproject. Root and example uv lockfiles track those layouts.
-Root editable builds ignore generated native extensions in the source tree.
+extension remains in `crates/python`. The root uv lockfile tracks the Python
+project. Scratch consumer projects used for local validation are not shipped
+with the repository. Root editable builds ignore generated native extensions
+in the source tree.
 
-Local root installation, the five Python API checks, and the nested example's
-installation/import were checked after the move. A fresh uv consumer also
-installed root Git revision `a7b8ae0a1a2e` with no subdirectory fragment; import
-and all five Python API tests passed from that Git-installed package.
+Local root installation, the five Python API checks, and a separate local
+consumer's installation/import were checked after the move. A fresh uv consumer
+also installed root Git revision `a7b8ae0a1a2e` with no subdirectory fragment;
+import and all five Python API tests passed from that Git-installed package.
 
 The root source archive was inspected for workspace manifests, Python sources,
 README, and the root license. It contains neither the local virtual environment
