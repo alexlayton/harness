@@ -140,7 +140,22 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Return the JSON schema for structured results, when available.
+    fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput;
+
+    /// Execute once and return display output plus an optional structured result.
+    /// Tools without structured results use their existing executor unchanged.
+    async fn execute_structured(
+        &self,
+        args: Value,
+        cancel: CancellationToken,
+    ) -> (ToolOutput, Option<Value>) {
+        (self.execute(args, cancel).await, None)
+    }
 }
 
 /// Runtime settings shared by all built-in tools in a registry.
