@@ -35,6 +35,29 @@ If you want to create a uv project, first run `uv init` in your script's
 project directory. An activated virtual environment alone is not a uv project;
 `uv add` still requires a `pyproject.toml`.
 
+### Install directly from Git
+
+A uv project can depend on the repository without a PyPI release or a hosted
+Harness executable:
+
+```sh
+CARGO_BUILD_JOBS=1 uv add \
+  "harness-agent @ git+https://github.com/alexlayton/harness.git@YOUR_COMMIT_SHA#subdirectory=python"
+```
+
+Replace `YOUR_COMMIT_SHA` with the full hash of a **pushed commit that contains
+this package**. A branch or tag also works, but a commit gives a reproducible
+version. Unpushed worktree commits are not available through GitHub; push the
+branch or merge it before another machine installs that revision.
+
+The `#subdirectory=python` fragment selects this package while uv checks out
+the full repository, including the Rust workspace. Maturin builds the native
+extension during installation. There is no separate Harness executable to
+host or install. Consumers need Rust and the platform's native build tools.
+To remove that build requirement later, distribute prebuilt Python wheels,
+not the CLI binary. Git installation and import were checked with a pinned
+local Git revision through `uv add` and `uv run`.
+
 The MVP requires Python 3.10 or newer and a current stable Rust toolchain for
 source installation. It targets the same macOS and Linux systems as Harness.
 No prebuilt Python wheels or PyPI release are provided yet. The first install

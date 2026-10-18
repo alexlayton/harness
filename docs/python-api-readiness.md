@@ -43,6 +43,32 @@ CI responsibilities. The tests use mock providers, temporary configuration,
 and short-lived test MCP processes; they do not prove live OAuth refresh or
 real provider/MCP interoperability.
 
+## Requested Tokyo weather smoke check
+
+A separate uv consumer project installed the committed feature through a pinned
+Git dependency with `subdirectory = "python"`; native import reported version
+0.6.1. No standalone Harness executable or wheel host was required.
+
+The requested live run selected only the `weather` MCP entry from
+`~/.config/harness/config.toml`, provider `openai-codex`, and model
+`gpt-6.1-luna`. The MCP startup completed, but model validation stopped the
+turn with:
+
+```text
+OpenAI Codex model `gpt-6.1-luna` is not in the supported model catalog
+```
+
+The current local catalog includes `gpt-6-luna` and `gpt-6.1-sol`, but not the
+requested ID. No fallback model was used, and no weather tool call was recorded.
+The Codex request did not reach the provider endpoint. This does not establish
+whether the remote account supports the requested model.
+
+The system config was unchanged. Audit events were stored in an isolated
+temporary session directory, not the user's normal session store. No credential
+values were printed or added to the repository. The live-provider release gate
+below remains incomplete: update/verify model support or agree on an alternate
+supported model before repeating the request.
+
 ## Before merging
 
 - [ ] All existing Rust CI and the new Python package jobs pass.
