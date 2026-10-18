@@ -40,6 +40,11 @@ source installation. It targets the same macOS and Linux systems as Harness.
 No prebuilt Python wheels or PyPI release are provided yet. The first install
 compiles the Rust dependencies. Later installs can reuse Cargo's build cache.
 Local installs use the development profile to avoid expensive release LTO.
+The Python version is taken from the Rust workspace version. Source archives
+include the required local Rust crates and the full MIT license notice; copying
+only the `python/` directory is not sufficient for a source build. CI builds a
+source archive, installs it into a fresh environment, and checks the native API
+on Linux/Python 3.10 and macOS/Python 3.14.
 
 For binding development, use an editable install:
 

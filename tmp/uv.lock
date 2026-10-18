@@ -4,7 +4,6 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "harness-agent"
-version = "0.6.0"
 source = { directory = "../python" }
 
 [[package]]
