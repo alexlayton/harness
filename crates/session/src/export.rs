@@ -279,10 +279,25 @@ fn transform_record(record: &SessionEventRecord, options: &ExportOptions) -> Ses
         SessionEvent::Error { message } => SessionEvent::Error {
             message: transform_diagnostic(message, options),
         },
-        SessionEvent::Unknown { kind, data } => SessionEvent::Unknown {
-            kind: kind.clone(),
-            data: transform_unknown(data, options),
-        },
+        SessionEvent::Unknown { kind, data } => {
+            // Transform content from the original payload, then replace that
+            // field in the redacted object. Heuristic redaction is not
+            // idempotent, so the content must not pass through it twice.
+            let output = (kind == "code_mode_result")
+                .then(|| data.get("content").and_then(serde_json::Value::as_str))
+                .flatten()
+                .map(|content| transform_output(content, options));
+            let mut data = transform_unknown(data, options);
+            if let Some(output) = output
+                && let Some(content) = data.get_mut("content")
+            {
+                *content = serde_json::Value::String(output);
+            }
+            SessionEvent::Unknown {
+                kind: kind.clone(),
+                data,
+            }
+        }
         event => event.clone(),
     };
     transformed
@@ -714,6 +729,74 @@ mod tests {
         let loaded = decode_session(&content, &destination).unwrap();
         assert_eq!(loaded.metadata.usage.input_tokens, 4);
         assert_eq!(loaded.metadata.provider.as_deref(), Some("mock"));
+    }
+
+    #[test]
+    fn code_mode_results_apply_output_policy_and_preserve_unknown_records() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        for (kind, data) in [
+            (
+                "code_mode_call",
+                json!({
+                    "parent_call_id": "parent-1", "call_id": "nested-1", "name": "read",
+                    "arguments": {"token": "private"}
+                }),
+            ),
+            (
+                "code_mode_result",
+                json!({
+                    "parent_call_id": "parent-1", "call_id": "nested-1", "name": "read",
+                    "content": "abcdefgh token=private", "is_error": false,
+                    "metadata": {"token": "private"}
+                }),
+            ),
+            ("code_mode_result", json!({"content": 42})),
+            ("code_mode_result", json!(["unchanged"])),
+            ("future_event", json!({"content": "unchanged"})),
+        ] {
+            session.append(SessionEvent::Unknown {
+                kind: kind.into(),
+                data,
+            });
+        }
+        for (include_tool_output, max_tool_output_bytes, redact_secrets, expected_content) in [
+            (true, None, false, "abcdefgh token=private"),
+            (false, None, true, "[tool output omitted from export]"),
+            (true, Some(4), true, "a…"),
+            (true, None, true, "abcdefgh token=[REDACTED]"),
+        ] {
+            let options = ExportOptions {
+                include_tool_output,
+                max_tool_output_bytes,
+                redact_secrets,
+                ..ExportOptions::default()
+            };
+            let transformed = session
+                .events
+                .iter()
+                .map(|record| transform_record(record, &options))
+                .collect::<Vec<_>>();
+            let mut expected = session.events.clone();
+            if let SessionEvent::Unknown { data, .. } = &mut expected[1].event {
+                data["content"] = json!(expected_content);
+                if redact_secrets {
+                    data["metadata"]["token"] = json!("[REDACTED]");
+                }
+            }
+            if redact_secrets && let SessionEvent::Unknown { data, .. } = &mut expected[0].event {
+                data["arguments"]["token"] = json!("[REDACTED]");
+            }
+            // Full equality checks the envelope, pairing IDs, and all other fields.
+            assert_eq!(transformed, expected);
+            let mut lines = vec![encode_header(session.header_metadata()).unwrap()];
+            lines.extend(
+                transformed
+                    .iter()
+                    .map(|record| encode_record(session.id(), record).unwrap()),
+            );
+            let loaded = decode_session(&lines.join("\n"), Path::new("export.jsonl")).unwrap();
+            assert_eq!(loaded.events, expected);
+        }
     }
 
     /// A unique sentinel in every supported header/event field must vanish

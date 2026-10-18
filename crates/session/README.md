@@ -41,9 +41,19 @@ Unknown event types are retained and exported, but are excluded from provider
 context until a reader understands them. IDs and sequence numbers make
 ordering and tool-call pairing inspectable.
 
+Code mode uses history-only `code_mode_call` and `code_mode_result` audit events,
+retained as unknown payloads by this crate. Both carry `parent_call_id`,
+`call_id`, and `name`. Starts add `arguments`; results add `content` and
+`is_error`. Only the outer `run_code` call/result enters provider context.
+A start is acknowledged before nested execution, including an explicit sync
+in deferred-sync sessions. A start without a result means execution status is
+unknown; changes may already have occurred. Export output omission and byte
+limits also apply to nested result content.
+
 By default, writes append one complete newline-terminated record, flush it,
 and call `sync_all` before returning. With `--defer-session-sync`, syncs occur
-at turn boundaries instead. A retained sidecar file with an advisory exclusive
+at turn boundaries instead, except for code-mode admission/result audit records,
+which are synced before acknowledgement. A retained sidecar file with an advisory exclusive
 lock prevents concurrent Harness writers from interleaving records. Metadata
 changes are events rather than rewrites, preserving the append-only history.
 The header is the initial metadata snapshot; current title, model, compaction,
