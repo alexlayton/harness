@@ -888,18 +888,20 @@ mod tests {
     fn error_followed_by_recovery_exits_0() {
         // The agent emits Error, then re-streams and produces output: the turn
         // recovered and must not fail the run.
-        let (_, stderr, code) = route(
+        let (stdout, stderr, code) = route(
             vec![
+                AgentEvent::TextDelta("The result is ".into()),
                 AgentEvent::Error("http 500".into()),
                 AgentEvent::Retrying {
                     attempt: 1,
                     message: "transient".into(),
                 },
-                AgentEvent::TextDelta("recovered".into()),
+                AgentEvent::TextDelta("The result is 42.".into()),
                 AgentEvent::TurnFinished,
             ],
             false,
         );
+        assert_eq!(String::from_utf8(stdout).unwrap(), "The result is 42.\n");
         assert!(
             String::from_utf8(stderr)
                 .unwrap()

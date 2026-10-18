@@ -227,7 +227,9 @@ to the current call and do not modify the process environment or global config.
 
 `run` is synchronous and returns a `str` with the final answer, without an
 added newline. It excludes intermediate model text from tool-bearing rounds.
-A successful tool-only turn can return an empty string.
+A successful tool-only turn can return an empty string. After a retryable
+stream failure, the agent requests a complete replacement final answer rather
+than only the missing suffix; failed-round partial text is not returned.
 
 - Invalid inputs raise `TypeError` or `ValueError`.
 - Configuration, authentication, provider, tool-initialization, session, and

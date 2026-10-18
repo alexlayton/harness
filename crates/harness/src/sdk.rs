@@ -273,6 +273,71 @@ mod tests {
         assert!(FinalAnswer::default().finish().is_err());
     }
 
+    #[tokio::test]
+    async fn stream_recovery_requests_and_returns_a_complete_replacement() {
+        use llm::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider, StreamEvent};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct InterruptedProvider(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl Provider for InterruptedProvider {
+            fn name(&self) -> &str {
+                "interrupted-test"
+            }
+
+            async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
+                let steps = if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    vec![
+                        Ok(StreamEvent::TextDelta("The result is ".into())),
+                        Err(LlmError::Http {
+                            status: 500,
+                            body: "interrupted test stream".into(),
+                            retry_after_secs: None,
+                        }),
+                    ]
+                } else {
+                    assert!(request.messages.iter().any(|message| {
+                        message.content.iter().any(|content| {
+                            matches!(content, llm::Content::Text(text)
+                                if text.contains("complete final answer from the beginning")
+                                    && text.contains("Do not repeat tool actions"))
+                        })
+                    }));
+                    vec![Ok(StreamEvent::TextDelta("The result is 42.".into()))]
+                };
+                Ok(Box::pin(futures_util::stream::iter(steps)))
+            }
+
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let provider = Arc::new(InterruptedProvider(AtomicUsize::new(0)));
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("compute".into()))
+            .unwrap();
+        drop(input_tx);
+        agent::Agent::new(
+            provider.clone(),
+            tools::ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .run(input_rx, event_tx)
+        .await;
+        let mut answer = FinalAnswer::default();
+        while let Some(event) = event_rx.recv().await {
+            answer.observe(event);
+        }
+        assert_eq!(provider.0.load(Ordering::SeqCst), 2);
+        assert_eq!(answer.finish().unwrap(), "The result is 42.");
+    }
+
     #[test]
     fn skill_directory_overrides_replace_defaults_and_keep_list_order() {
         let directory = tempfile::tempdir().unwrap();

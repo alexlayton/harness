@@ -372,16 +372,19 @@ impl Agent {
                     }
                 } else if error.is_retryable() {
                     // Transient mid-stream failures (connection drops, decode
-                    // errors) are worth an automatic re-stream: the partial
-                    // content is already persisted, and the model can continue
-                    // from where it left off.
+                    // errors) are worth an automatic re-stream. Partial content
+                    // remains durable, but final-answer consumers discard the
+                    // broken round on Error. Ask for a complete replacement,
+                    // not a suffix that would silently truncate their answer.
                     if recoveries < MAX_TURN_RECOVERIES {
                         recoveries += 1;
                         push_recovery_note(
                             &mut self.history,
                             format!(
                                 "[system note: your response stream was interrupted \
-                                 ({message}); continue from where you left off.]"
+                                 ({message}). Continue the task, but provide the complete \
+                                 final answer from the beginning, not only the missing suffix. \
+                                 Do not repeat tool actions that already completed.]"
                             ),
                         );
                         retried = true;
