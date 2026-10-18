@@ -11,7 +11,7 @@ use crate::config::{Config, PromptArgs, provider_factory};
 #[cfg(test)]
 use crate::context::project_context_for;
 use agent::assembly::AgentBuilder;
-use agent::{AgentEvent, InputMessage};
+use agent::{AgentEvent, InputMessage, StreamRecovery};
 use anyhow::{Context, Result, anyhow};
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
@@ -496,6 +496,7 @@ async fn run_headless_resolved(
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)
+        .with_stream_recovery(StreamRecovery::Replace)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())
@@ -888,18 +889,20 @@ mod tests {
     fn error_followed_by_recovery_exits_0() {
         // The agent emits Error, then re-streams and produces output: the turn
         // recovered and must not fail the run.
-        let (_, stderr, code) = route(
+        let (stdout, stderr, code) = route(
             vec![
+                AgentEvent::TextDelta("The result is ".into()),
                 AgentEvent::Error("http 500".into()),
                 AgentEvent::Retrying {
                     attempt: 1,
                     message: "transient".into(),
                 },
-                AgentEvent::TextDelta("recovered".into()),
+                AgentEvent::TextDelta("The result is 42.".into()),
                 AgentEvent::TurnFinished,
             ],
             false,
         );
+        assert_eq!(String::from_utf8(stdout).unwrap(), "The result is 42.\n");
         assert!(
             String::from_utf8(stderr)
                 .unwrap()

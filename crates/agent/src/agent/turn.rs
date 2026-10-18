@@ -1,6 +1,8 @@
 use super::InputMessage;
 use super::persistence::usage_event;
-use super::{Agent, AgentEvent, CompactionReason, MAX_TURN_RECOVERIES, TurnError, send};
+use super::{
+    Agent, AgentEvent, CompactionReason, MAX_TURN_RECOVERIES, StreamRecovery, TurnError, send,
+};
 use crate::prompt::system_prompt_with_workspace_context;
 use futures_util::stream::StreamExt;
 use llm::{CompletionRequest, Content, LlmError, Message, RetryCallback, Role, StreamEvent};
@@ -371,17 +373,25 @@ impl Agent {
                         retried = true;
                     }
                 } else if error.is_retryable() {
-                    // Transient mid-stream failures (connection drops, decode
-                    // errors) are worth an automatic re-stream: the partial
-                    // content is already persisted, and the model can continue
-                    // from where it left off.
+                    // Incremental frontends keep the prefix; final-answer-only
+                    // frontends discard failed rounds. Match the recovery note
+                    // to that contract so retries neither truncate one-shot
+                    // answers nor duplicate already-streamed TUI/ACP text.
                     if recoveries < MAX_TURN_RECOVERIES {
                         recoveries += 1;
+                        let instruction = match self.stream_recovery {
+                            StreamRecovery::Continue => "continue from where you left off.",
+                            StreamRecovery::Replace => {
+                                "Continue the task, but provide the complete final answer from \
+                                 the beginning, not only the missing suffix. Do not repeat tool \
+                                 actions that already completed."
+                            }
+                        };
                         push_recovery_note(
                             &mut self.history,
                             format!(
                                 "[system note: your response stream was interrupted \
-                                 ({message}); continue from where you left off.]"
+                                 ({message}); {instruction}]"
                             ),
                         );
                         retried = true;

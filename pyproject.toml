@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "harness-agent"
+dynamic = ["version"]
+description = "Run the Harness coding agent directly from Python"
+readme = "python/README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
+
+[tool.maturin]
+manifest-path = "crates/python/Cargo.toml"
+python-source = "python/src"
+module-name = "harness._native"
+features = ["pyo3/extension-module"]
+# Source installs avoid costly release LTO unless the caller opts in.
+profile = "dev"

@@ -49,8 +49,8 @@ use std::sync::RwLock;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tools::{
-    FileSearchIndex, SubagentMode, SubagentRunner, ToolConfig, ToolExecutionGate, ToolRegistry,
-    default_registry_with_index, read_only_registry_with_index,
+    FileSearchIndex, SkillCatalog, SubagentMode, SubagentRunner, ToolConfig, ToolExecutionGate,
+    ToolRegistry, default_registry_with_index, read_only_registry_with_index,
 };
 
 /// Upper bound on the final report handed back to the parent conversation:
@@ -136,6 +136,8 @@ pub struct SubagentRunnerImpl {
     /// workflow; its child registry therefore must not reacquire it.
     execution_gate: Option<ToolExecutionGate>,
     rtk: bool,
+    /// Parent-selected skill snapshot; an empty catalog must not rediscover defaults.
+    skills: Option<SkillCatalog>,
     project_context: String,
     /// Resolved delegation bounds (`max_turns`; `0` disables subagents).
     config: SubagentPolicy,
@@ -198,6 +200,7 @@ impl SubagentRunnerImpl {
             search_index,
             execution_gate: None,
             rtk,
+            skills: None,
             project_context: project_context.into(),
             config,
             store,
@@ -218,6 +221,12 @@ impl SubagentRunnerImpl {
     /// parent index before the runner can be shared or used.
     pub fn with_file_search_index(mut self, index: Arc<FileSearchIndex>) -> Self {
         self.search_index = index;
+        self
+    }
+
+    /// Share the parent's selected skills with both child registry modes.
+    pub fn with_skills(mut self, skills: SkillCatalog) -> Self {
+        self.skills = Some(skills);
         self
     }
 
@@ -303,14 +312,13 @@ impl SubagentRunnerImpl {
             tracing::debug!(mode = mode.as_str(), "building child tool registry");
             #[cfg(test)]
             builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut config = ToolConfig::new(&workspace_root, rtk);
+            if let Some(skills) = &self.skills {
+                config = config.with_skills(skills.clone());
+            }
             let result = match mode {
-                SubagentMode::Workspace => {
-                    default_registry_with_index(ToolConfig::new(&workspace_root, rtk), search_index)
-                }
-                SubagentMode::ReadOnly => read_only_registry_with_index(
-                    ToolConfig::new(&workspace_root, rtk),
-                    search_index,
-                ),
+                SubagentMode::Workspace => default_registry_with_index(config, search_index),
+                SubagentMode::ReadOnly => read_only_registry_with_index(config, search_index),
             };
             result
                 .map(Arc::new)
@@ -1196,6 +1204,44 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn child_registries_inherit_selected_skills_including_empty_catalogs() {
+        let workspace = tempfile::tempdir().unwrap();
+        let defaults = workspace.path().join(".harness/skills");
+        std::fs::create_dir_all(&defaults).unwrap();
+        std::fs::write(
+            defaults.join("default.md"),
+            "---\nname: default\ndescription: Default skill\n---\nDefault instructions\n",
+        )
+        .unwrap();
+        let selected = tempfile::tempdir().unwrap();
+        std::fs::write(
+            selected.path().join("custom.md"),
+            "---\nname: custom\ndescription: Selected skill\n---\nSelected instructions\n",
+        )
+        .unwrap();
+        let catalog =
+            tools::discover(&[(selected.path().to_path_buf(), tools::SkillMode::Harness)]);
+        assert_eq!(catalog.skills.len(), 1);
+        for catalog in [catalog, tools::discover(&[])] {
+            let runner = SubagentRunnerImpl::new(
+                Arc::new(ScriptProvider::new(Vec::new())),
+                "demo",
+                workspace.path(),
+                false,
+                "",
+                SubagentPolicy::default(),
+                None,
+                None,
+            )
+            .with_skills(catalog.clone());
+            for mode in [SubagentMode::ReadOnly, SubagentMode::Workspace] {
+                let registry = runner.registry(mode).unwrap();
+                assert_eq!(registry.skills(), Some(&catalog));
+            }
+        }
     }
 
     #[test]

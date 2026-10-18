@@ -1645,6 +1645,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harness-python"
+version = "0.6.1"
+dependencies = [
+ "harness",
+ "pyo3",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "hash32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

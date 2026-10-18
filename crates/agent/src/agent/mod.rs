@@ -50,6 +50,16 @@ const MAX_TURN_RECOVERIES: usize = 3;
 /// retried request, so it is bounded separately from `MAX_TURN_RECOVERIES`.
 const MAX_OVERFLOW_RECOVERIES: usize = 2;
 
+/// How a retryable stream failure is presented to the model on recovery.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StreamRecovery {
+    /// Keep the streamed prefix and request only its continuation (TUI/ACP).
+    #[default]
+    Continue,
+    /// Discard the failed round and request a complete final answer (one-shot).
+    Replace,
+}
+
 /// Stateful orchestrator for provider turns, tools, and optional sessions.
 ///
 /// `history` remains public for compatibility. Mutating it while `session` is
@@ -61,6 +71,7 @@ pub struct Agent {
     pub model: String,
     /// Reasoning policy applied to normal parent requests.
     pub reasoning: llm::ReasoningPolicy,
+    stream_recovery: StreamRecovery,
     /// Kept public as a short-term compatibility path for existing callers.
     /// When a durable session is attached it is rebuilt from the session
     /// events whenever a session is loaded or created.
@@ -119,6 +130,7 @@ impl Agent {
             tools,
             model: model.into(),
             reasoning: llm::ReasoningPolicy::Auto,
+            stream_recovery: StreamRecovery::default(),
             history: Vec::new(),
             cancel,
             session: None,
@@ -139,6 +151,12 @@ impl Agent {
     /// Configure reasoning for subsequent normal requests.
     pub fn with_reasoning(mut self, reasoning: llm::ReasoningPolicy) -> Self {
         self.reasoning = reasoning;
+        self
+    }
+
+    /// Select continuation for incremental output or replacement for final-only output.
+    pub fn with_stream_recovery(mut self, mode: StreamRecovery) -> Self {
+        self.stream_recovery = mode;
         self
     }
 

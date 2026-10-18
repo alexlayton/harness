@@ -86,6 +86,66 @@ jobs:
           restore-keys: ${{ runner.os }}-build-
       - run: cargo build --workspace --locked
 
+  python:
+    name: Python (${{ matrix.os }}, ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            python: "3.10"
+          - os: macos-latest
+            python: "3.14"
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: "2"
+      # Reuse registry builds when maturin compiles the extracted source archive.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Select stable Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-python-${{ matrix.python }}-${{ hashFiles('Cargo.lock', 'pyproject.toml') }}
+          restore-keys: ${{ runner.os }}-python-${{ matrix.python }}-
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Build source distribution
+        run: uv build --sdist --out-dir dist/python .
+      - name: Install from source archive
+        run: |
+          # A bare "python" resolves to this repository's python/ directory.
+          uv venv --python "${{ steps.python.outputs.python-path }}" .venv
+          uv pip install --python .venv/bin/python dist/python/*.tar.gz
+      - name: Verify installed version and license
+        shell: bash
+        run: |
+          expected="$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "harness-python") | .version')"
+          .venv/bin/python - "$expected" <<'PY'
+          from importlib.metadata import distribution
+          import sys
+          import harness
+
+          package = distribution("harness-agent")
+          assert package.version == sys.argv[1], (package.version, sys.argv[1])
+          licenses = [p for p in package.files if ".dist-info/licenses/" in str(p)]
+          assert any("MIT License" in package.locate_file(p).read_text() for p in licenses)
+          assert callable(harness.run)
+          PY
+      - name: Test Python API without model requests
+        run: .venv/bin/python -m unittest discover -s python/tests -v
+
   macos-test:
     name: Test (macOS)
     runs-on: macos-latest

@@ -1,3 +1,10 @@
 debug
 target
 plans
+.venv/
+__pycache__/
+*.pyc
+/dist/
+/tmp/
+/python/src/harness/*.so
+/python/src/harness/*.pyd

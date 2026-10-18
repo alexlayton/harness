@@ -7,5 +7,5 @@ pub mod subagent;
 
 pub use agent::{
     Agent, AgentEvent, CompactionReason, InputMessage, ProviderFactory, SessionListItem,
-    SessionSnapshotEntry, SubagentLimits, TurnError, spawn_model_list,
+    SessionSnapshotEntry, StreamRecovery, SubagentLimits, TurnError, spawn_model_list,
 };
