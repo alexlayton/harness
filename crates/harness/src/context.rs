@@ -4,13 +4,15 @@ use std::path::Path;
 /// display paths come from the same file snapshot, so the TUI does not repeat
 /// discovery merely to show which instructions were injected.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ContextBundle {
+pub struct ContextBundle {
+    /// Instruction block passed to the model.
     pub rendered: String,
+    /// Paths suitable for display in a frontend.
     pub display_paths: Vec<String>,
 }
 
 /// Discover and render project instructions once for a workspace.
-pub(crate) fn load_context_bundle(
+pub fn load_context_bundle(
     workspace_root: &Path,
     disabled: bool,
     include_display_paths: bool,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent", "crates/auth", "crates/compact", "crates/harness", "crates/llm", "crates/mcp", "crates/session", "crates/tui", "crates/tools"]
+members = ["crates/agent", "crates/auth", "crates/compact", "crates/harness", "crates/llm", "crates/mcp", "crates/python", "crates/session", "crates/tui", "crates/tools"]
 default-members = ["crates/harness", "crates/agent"]
 
 # Release ships lean: symbol tables are stripped, with cross-crate DCE via fat

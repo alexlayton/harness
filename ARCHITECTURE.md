@@ -1,8 +1,8 @@
 # Architecture
 
 Harness is a terminal coding agent. It streams LLM responses, executes tools,
-renders output through a terminal, headless, or ACP frontend, and stores
-an append-only session log.
+returns output through terminal, headless, ACP, or native Python frontends, and
+stores an append-only session log.
 
 This document is a map of stable boundaries and invariants. For implementation
 detail, read the linked module or focused documentation for the subsystem you
@@ -10,21 +10,23 @@ are changing.
 
 ## Crate map
 
-Harness is a Cargo workspace of nine crates. `harness` builds the only binary;
-all other crates are libraries.
+Harness is a Cargo workspace of ten crates. `harness` builds the only binary
+and also exposes a native library. `harness-python` builds a CPython extension;
+the remaining crates are Rust libraries.
 
 ```text
-harness ──┬── agent ──┬── compact ── llm, session
-          │           ├── session ── llm
-          │           ├── mcp ────── tools, llm
-          │           ├── tools ──── llm
-          │           └── llm ────── auth
-          └── tui
+harness-python ── harness ──┬── agent ──┬── compact ── llm, session
+                           │           ├── session ── llm
+                           │           ├── mcp ────── tools, llm
+                           │           ├── tools ──── llm
+                           │           └── llm ────── auth
+                           └── tui
 ```
 
 | Crate | Responsibility |
 |---|---|
-| `harness` | CLI, configuration, authentication UX, logging, frontend adapters, and process orchestration. |
+| `harness` | CLI, shared configuration, native one-shot SDK, authentication UX, logging, frontend adapters, and process orchestration. |
+| `harness-python` | PyO3 binding, process-lifetime Tokio runtime, Python signal handling, and result/error conversion. |
 | `agent` | Frontend-independent runtime assembly, agent loop, events, retries, tool dispatch, persistence integration, MCP lifecycle, and subagents. |
 | `tui` | Terminal rendering, input, slash commands, and path completion. It must not depend on `agent`. |
 | `compact` | Token estimation, compaction policy and planning, and summary generation. |
@@ -71,16 +73,22 @@ MCP, and subagent setup has one implementation.
 - **ACP:** `harness acp` serves Agent Client Protocol over stdio. Stdout is
   JSON-RPC only and tracing remains file-only. Each ACP session owns an agent,
   registry, and session store rooted at the editor workspace.
+- **Python:** `harness.run(prompt=..., options=...)` uses the native library SDK.
+  It reads the normal configuration and returns the final answer as text. The
+  extension releases the GIL during waits and requests native cancellation on
+  Python signals before waiting for cleanup. It does not change cwd, install
+  signal handlers, initialize global logging, or report Herdr state.
 
 `harness worktree BRANCH` is a launch mode around the TUI or a nested `prompt`
-command, not a fourth frontend. It enters a dedicated Git worktree before
+command, not a separate frontend. It enters a dedicated Git worktree before
 workspace-scoped setup and restores the original directory before conservative
 cleanup. Worktree process leases and sticky-retention markers live in Git's
 common directory; automatic destinations live under the Harness state root.
 
 See `crates/harness/src/headless.rs`, `crates/harness/src/acp.rs`, and
 [`docs/editor-integration.md`](./docs/editor-integration.md) for frontend
-protocol detail.
+protocol detail. See [Python library](./python/README.md),
+`crates/harness/src/sdk.rs`, and `crates/python/src/lib.rs` for native execution.
 
 ## Providers and authentication
 

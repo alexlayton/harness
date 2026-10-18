@@ -1,6 +1,4 @@
 mod acp;
-mod config;
-mod context;
 mod headless;
 mod herdr;
 mod login;
@@ -17,6 +15,7 @@ use config::{
     Cli, Command, Config, ProviderArg, WorktreeCommand, build_provider_with_auths, init_logging,
     provider_factory, save_reasoning, save_settings,
 };
+use harness::{config, context};
 use headless::run_headless_with_prompt;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};

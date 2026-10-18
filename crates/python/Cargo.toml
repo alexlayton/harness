@@ -1,0 +1,16 @@
+[package]
+name = "harness-python"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+harness = { path = "../harness" }
+pyo3 = { version = "0.29.2", features = ["abi3-py310"] }
+serde_json = "1"
+tokio.workspace = true
+tokio-util = "0.7"

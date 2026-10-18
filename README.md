@@ -83,6 +83,7 @@ for pipelines and editor transports.
 - [Providers and authentication][providers]
 - [Configuration][configuration]
 - [Editor integration (ACP)][editor-integration]
+- [Python library (native MVP)](./python/README.md)
 - [Architecture and contributor guide][architecture]
 - [Session format][session-format]
 
@@ -204,6 +205,27 @@ harness acp
 
 For provider selection, sign-in commands, configuration paths, MCP setup, and
 advanced settings, use the documentation links above.
+
+## Python library
+
+The native Python MVP runs the agent in your Python process. Install it from a
+local checkout with uv (a Rust toolchain is required for the first build):
+
+```sh
+CARGO_BUILD_JOBS=1 uv add /absolute/path/to/harness/python
+```
+
+```python
+import harness
+
+answer = harness.run(prompt="Summarize this workspace.")
+print(answer)
+```
+
+Omitted options use the normal `config.toml` and credentials. Pass a dictionary
+for per-call overrides, such as `options={"workspace": "/path/to/project",
+"no_session": True}`. See the [Python guide](./python/README.md) for supported
+options and limitations. No prebuilt Python wheels are provided yet.
 
 ## Development
 

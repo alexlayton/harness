@@ -1,0 +1,25 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "harness-agent"
+version = "0.6.0"
+description = "Run the Harness coding agent directly from Python"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+]
+
+[tool.maturin]
+manifest-path = "../crates/python/Cargo.toml"
+python-source = "src"
+module-name = "harness._native"
+features = ["pyo3/extension-module"]
+# Local uv installs should not use the workspace's costly release LTO profile.
+profile = "dev"

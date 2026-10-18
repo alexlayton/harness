@@ -1,3 +1,6 @@
 debug
 target
 plans
+.venv/
+__pycache__/
+*.pyc
