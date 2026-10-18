@@ -83,9 +83,16 @@ separate Python subproject. Root and example uv lockfiles track those layouts.
 Root editable builds ignore generated native extensions in the source tree.
 
 Local root installation, the five Python API checks, and the nested example's
-installation/import were checked after the move. CI builds source archives
-from the repository root. The active [Python guide](../python/README.md)
-shows the Git and `requirements.txt` syntax without a subdirectory selector.
+installation/import were checked after the move. A fresh uv consumer also
+installed root Git revision `a7b8ae0a1a2e` with no subdirectory fragment; import
+and all five Python API tests passed from that Git-installed package.
+
+The root source archive was inspected for workspace manifests, Python sources,
+README, and the root license. It contains neither the local virtual environment
+nor the editable build's native binaries. CI installs source archives from the
+repository root; that archive-install check still needs to pass for the new
+layout. The active [Python guide](../python/README.md) shows the root Git and
+`requirements.txt` syntax.
 
 ## Before merging
 
