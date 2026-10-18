@@ -193,6 +193,14 @@ impl ToolRegistry {
             .is_some_and(|mode| mode.contains(name))
     }
 
+    fn replaced_by_code_mode(&self, name: &str) -> bool {
+        self.code_mode_enabled() && name == "python"
+    }
+
+    fn hidden_from_native_catalogue(&self, name: &str) -> bool {
+        self.hidden_by_code_mode(name) || self.replaced_by_code_mode(name)
+    }
+
     /// Execute a selected nested tool without reacquiring the workflow gate.
     /// Only call from a code-mode executor while `execute_code_mode` owns the
     /// workflow. This entry point never admits shell or recursive code calls.
@@ -268,7 +276,7 @@ impl ToolRegistry {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .iter()
-            .filter(|tool| !self.hidden_by_code_mode(&tool.name))
+            .filter(|tool| !self.hidden_from_native_catalogue(&tool.name))
             .map(|tool| tool.spec.definition.clone())
             .chain(
                 self.code_mode
@@ -282,10 +290,15 @@ impl ToolRegistry {
         let mut snippets = Vec::new();
         let mut guidelines = Vec::new();
         for tool in &self.tools {
+            // Unlike folded tools, standalone Python is replaced, not exposed
+            // inside run_code. Do not retain its competing prompt guidelines.
+            if self.replaced_by_code_mode(&tool.name) {
+                continue;
+            }
             let prompt = tool.spec.prompt.clone();
             if let Some(snippet) = prompt
                 .snippet
-                .filter(|_| !self.hidden_by_code_mode(&tool.name))
+                .filter(|_| !self.hidden_from_native_catalogue(&tool.name))
             {
                 snippets.push(ToolPromptEntry {
                     name: tool.name.clone(),
@@ -318,6 +331,13 @@ impl ToolRegistry {
             return self
                 .execute_code_mode(args, cancel, &RegistryCodeModeExecutor(self))
                 .await;
+        }
+        if self.replaced_by_code_mode(name) {
+            return ToolOutput {
+                content: "python is replaced by run_code while code mode is enabled; run calculations directly in run_code".into(),
+                is_error: true,
+                summary: name.into(),
+            };
         }
         if self.hidden_by_code_mode(name) {
             return ToolOutput {

@@ -97,6 +97,96 @@ async fn structured_dependent_calls_preserve_names_and_hold_gate_once() {
 }
 
 #[tokio::test]
+async fn python_is_replaced_only_in_the_registry_with_code_mode_enabled() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new(vec![
+        Box::new(Echo {
+            name: "echo",
+            calls: calls.clone(),
+            started: None,
+        }),
+        Box::new(Echo {
+            name: "other",
+            calls,
+            started: None,
+        }),
+        Box::new(crate::PythonTool),
+        Box::new(crate::BashTool::with_workspace_root(".")),
+    ]);
+    let python_prompt = crate::PythonTool.spec().prompt;
+    let native = registry.snapshot();
+    assert!(native.definitions.iter().any(|tool| tool.name == "python"));
+    assert!(
+        native
+            .prompt_context
+            .snippets
+            .iter()
+            .any(|tool| tool.name == "python")
+    );
+    for guideline in &python_prompt.guidelines {
+        assert!(native.prompt_context.guidelines.contains(guideline));
+    }
+
+    // Standalone Python is replaced even with only some tools folded in.
+    registry.enable_code_mode(&["echo".into()]).unwrap();
+    let code_mode = registry.snapshot();
+    let names: Vec<_> = code_mode
+        .definitions
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert_eq!(names, ["other", "bash", "run_code"]);
+    assert!(
+        !code_mode
+            .prompt_context
+            .snippets
+            .iter()
+            .any(|tool| tool.name == "python")
+    );
+    for guideline in &python_prompt.guidelines {
+        assert!(!code_mode.prompt_context.guidelines.contains(guideline));
+    }
+    assert!(
+        registry
+            .execute("python", snippet("6 * 7"), CancellationToken::new())
+            .await
+            .is_error
+    );
+    // Hidden from the native catalogue must not mean admitted as a callback.
+    assert!(
+        registry
+            .execute_code_mode_tool("python", snippet("6 * 7"), CancellationToken::new())
+            .await
+            .0
+            .is_error
+    );
+    assert!(
+        registry
+            .execute(
+                "run_code",
+                snippet("tools['python'](code='6 * 7', description='Calculate')"),
+                CancellationToken::new()
+            )
+            .await
+            .is_error
+    );
+    let output = registry
+        .execute("run_code", snippet("6 * 7"), CancellationToken::new())
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(output.content.contains("Result: 42"));
+
+    // A separate registry, such as a workspace child, retains its own policy.
+    let child = ToolRegistry::new(vec![Box::new(crate::PythonTool)]);
+    assert_eq!(child.definitions()[0].name, "python");
+    let output = child
+        .execute("python", snippet("6 * 7"), CancellationToken::new())
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(output.content.contains("Result: 42"));
+}
+
+#[tokio::test]
 async fn tool_budget_and_host_access_fail_closed_without_replaying_calls() {
     let (registry, calls) = registry("echo");
     let output = registry

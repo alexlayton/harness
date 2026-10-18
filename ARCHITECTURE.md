@@ -118,7 +118,11 @@ bash for commands, builds, and tests.
 Opt-in `[code_mode]` folds selected parent tools into one generated `run_code`
 catalogue from that same registry. Monty calls functions through a `tools`
 dictionary; calls are synchronous and sequential, with fresh state per snippet.
-Shell, calculation-only Python, subagents, and recursive code calls are excluded.
+Shell, calculation-only Python, subagents, and recursive code calls are excluded
+from nested execution. When code mode is enabled, standalone `python` is also
+hidden from native definitions and prompt guidance; `run_code` handles pure
+calculations without tool calls. Registries without code mode, including
+workspace subagents, retain standalone `python` unchanged.
 The workflow holds the shared execution gate once; admitted nested calls use an
 ungated, selection-checked entry point. Interpreter steps run on blocking threads
 without host authority. The async driver owns callback admission, limits, and

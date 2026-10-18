@@ -95,7 +95,8 @@ impl CodeMode {
                 name: "run_code".into(),
                 description: format!(
                     concat!(
-                        "Execute Python orchestration in Monty with selected Harness tools as functions. ",
+                        "Execute Python calculations and tool orchestration in Monty with selected Harness tools as functions. ",
+                        "Tool calls are optional: calculations and data transformations can use ordinary Python without accessing tools. Prefer run_code over bash for Python computation. ",
                         "Prefer ONE run_code call for a complete, self-contained task when it fits the limits. ",
                         "Plan the workflow before calling: put required preflight checks, repeated lookups, dependent calls, and result filtering in the SAME snippet. ",
                         "Use loops for multiple inputs and variables/conditionals to use earlier results in later calls; do not return to the model between steps that Python can handle. ",
@@ -123,8 +124,9 @@ impl CodeMode {
                 }),
             },
             prompt: ToolPrompt::new(
-                "Orchestrate selected tools with sequential Python function calls",
+                "Run Python calculations and orchestrate selected tools with sequential function calls",
                 [
+                    "Use run_code for standalone Python calculations and data transformations instead of launching Python with bash. No tool calls are required for pure computation.",
                     "Prefer one run_code call per complete, self-contained task within the execution limits. Include required preflight checks, loops over multiple inputs, dependent calls, and filtering in the same snippet; do not add unnecessary checks or return to the model between steps Python can handle. Split when results need model reasoning, user input, failure inspection, or more execution budget, not merely because tools depend on each other.",
                     "Use tools[\"name\"](**kwargs); nested calls run sequentially and return JSON when available, otherwise text. Return only a concise combined result needed for the answer. Printed text also enters model context: do not print complete reports or successful preflight output unless needed. Once the result is sufficient, answer directly.",
                     "Code-mode state is fresh for each call. On errors or interruption, do not blindly replay a snippet: earlier tool calls can already have changed files or external state. Never continue unsafe work just to keep a single call.",

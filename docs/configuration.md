@@ -112,9 +112,13 @@ tools = ["read", "find", "grep", "outline"]
 
 Use the registered, namespaced names for MCP tools. Unknown or excluded names
 stop startup with an error. `bash`, `python`, `subagent`, and `run_code` cannot
-be selected. These tools stay available as normal model calls. Other tools not
-in an explicit selection also remain normal model calls. Subagents keep their
-existing tool sets; they do not receive code mode or the parent's MCP tools.
+be selected. `bash` and `subagent` stay available as normal model calls when
+registered. Code mode replaces the standalone `python` tool: its definition and
+prompt guidance are hidden, and calculations run directly in `run_code` without
+calling any tools. With code mode disabled, `python` remains available normally.
+Other tools not in an explicit selection also remain normal model calls.
+Subagents keep their existing tool sets, including standalone `python` for
+workspace children; they do not receive code mode or the parent's MCP tools.
 
 Selected tools are removed from the model-facing native tool list. Their
 schemas and descriptions instead form the `run_code` catalogue. Inside a
