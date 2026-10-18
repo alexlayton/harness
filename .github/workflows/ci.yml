@@ -104,6 +104,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        id: python
         with:
           python-version: ${{ matrix.python }}
       - name: Select stable Rust
@@ -124,7 +125,8 @@ jobs:
         run: uv build --sdist --out-dir dist/python .
       - name: Install from source archive
         run: |
-          uv venv --python python .venv
+          # A bare "python" resolves to this repository's python/ directory.
+          uv venv --python "${{ steps.python.outputs.python-path }}" .venv
           uv pip install --python .venv/bin/python dist/python/*.tar.gz
       - name: Verify installed version and license
         shell: bash
