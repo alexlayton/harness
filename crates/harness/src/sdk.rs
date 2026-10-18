@@ -8,10 +8,10 @@ use anyhow::{Context, Result, anyhow, ensure};
 use llm::ReasoningPolicy;
 use serde::Deserialize;
 use session::{SessionCreateOptions, SessionStore};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tools::{ToolConfig, default_registry};
+use tools::{SkillCatalog, SkillMode, ToolConfig, default_registry, discover};
 
 /// Per-call overrides. Unset settings use the normal Harness configuration.
 ///
@@ -34,6 +34,11 @@ pub struct RunOptions {
     pub resume: Option<String>,
     /// Disable instruction-file injection for this call.
     pub no_context_files: bool,
+    /// Replace configured MCP servers; `None` inherits and `Some([])` disables.
+    pub mcp_servers: Option<Vec<mcp::McpServerConfig>>,
+    /// Replace all skill discovery roots; relative paths use the workspace.
+    /// `None` inherits normal discovery and `Some([])` disables skills.
+    pub skill_dirs: Option<Vec<PathBuf>>,
 }
 
 impl RunOptions {
@@ -52,7 +57,43 @@ impl RunOptions {
             ensure!(!resume.trim().is_empty(), "resume must not be blank");
             ensure!(!self.no_session, "resume cannot be used with no_session");
         }
+        if let Some(servers) = &self.mcp_servers {
+            mcp::McpConfig {
+                servers: servers.clone(),
+            }
+            .validate()?;
+        }
+        if let Some(dirs) = &self.skill_dirs {
+            for dir in dirs {
+                ensure!(
+                    !dir.as_os_str().is_empty() && !dir.to_string_lossy().contains('\0'),
+                    "skill_dirs entries must be non-empty paths without NUL"
+                );
+            }
+        }
         Ok(())
+    }
+
+    // Discover once for the parent and pass its catalog to children. Explicit
+    // roots never merge with project, global, or environment-discovered roots.
+    fn skill_catalog(&self, workspace: &Path) -> Result<Option<SkillCatalog>> {
+        let Some(dirs) = &self.skill_dirs else {
+            return Ok(None);
+        };
+        let roots = dirs
+            .iter()
+            .map(|dir| {
+                let path = workspace.join(tools::expand_tilde(dir));
+                let path = std::fs::canonicalize(&path)
+                    .with_context(|| format!("resolve skill directory {}", path.display()))?;
+                std::fs::read_dir(&path)
+                    .with_context(|| format!("open skill directory {}", path.display()))?;
+                // Harness mode accepts SKILL.md trees and loose root-level
+                // Markdown skills. The caller's list determines precedence.
+                Ok((path, SkillMode::Harness))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(discover(&roots)))
     }
 }
 
@@ -76,7 +117,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         reasoning_effort: options.reasoning_effort,
         ..Cli::default()
     };
-    let config = Config::resolve(&cli)?;
+    let config = Config::resolve_with_mcp(&cli, options.mcp_servers.as_deref())?;
     let workspace = options
         .workspace
         .clone()
@@ -92,7 +133,11 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         config.codex_auth.clone(),
     )?;
     let context = project_context_for(&workspace, options.no_context_files);
-    let tools = default_registry(ToolConfig::new(&workspace, config.rtk))?;
+    let mut tool_config = ToolConfig::new(&workspace, config.rtk);
+    if let Some(skills) = options.skill_catalog(&workspace)? {
+        tool_config = tool_config.with_skills(skills);
+    }
+    let tools = default_registry(tool_config)?;
     let mut builder = AgentBuilder::new(
         provider.clone(),
         config.model.clone(),
@@ -229,11 +274,72 @@ mod tests {
     }
 
     #[test]
+    fn skill_directory_overrides_replace_defaults_and_keep_list_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir_all(workspace.join(".harness/skills")).unwrap();
+        for (root, body) in [(&first, "first wins"), (&second, "second loses")] {
+            std::fs::create_dir_all(root.join("review")).unwrap();
+            std::fs::write(
+                root.join("review/SKILL.md"),
+                format!("---\nname: review\ndescription: Review code\n---\n{body}\n"),
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            workspace.join(".harness/skills/default.md"),
+            "---\nname: default\ndescription: A default skill\n---\ndefault instructions\n",
+        )
+        .unwrap();
+        assert!(
+            RunOptions::default()
+                .skill_catalog(&workspace)
+                .unwrap()
+                .is_none()
+        );
+        let mut options = RunOptions {
+            skill_dirs: Some(vec![PathBuf::from("../first"), second]),
+            ..RunOptions::default()
+        };
+        let catalog = options.skill_catalog(&workspace).unwrap().unwrap();
+        assert_eq!(catalog.skills.len(), 1);
+        assert_eq!(catalog.skills[0].name, "review");
+        assert!(catalog.skills[0].instructions.contains("first wins"));
+        assert!(
+            catalog
+                .read_paths
+                .contains(&std::fs::canonicalize(first.join("review")).unwrap())
+        );
+        assert_eq!(catalog.diagnostics.len(), 1); // Duplicate name in the later root.
+
+        options.skill_dirs = Some(Vec::new());
+        assert!(
+            options
+                .skill_catalog(&workspace)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        options.skill_dirs = Some(vec![workspace.join("missing")]);
+        assert!(options.skill_catalog(&workspace).is_err());
+        options.skill_dirs = Some(vec![workspace.join(".harness/skills/default.md")]);
+        assert!(options.skill_catalog(&workspace).is_err());
+    }
+
+    #[test]
     fn overrides_default_to_config_and_reject_unknown_or_conflicting_options() {
         let defaults: RunOptions = serde_json::from_str("{}").unwrap();
         assert!(defaults.provider.is_none());
         assert!(defaults.model.is_none());
         assert!(defaults.reasoning_effort.is_none());
+        assert!(defaults.mcp_servers.is_none());
+        assert!(defaults.skill_dirs.is_none());
+        let disabled: RunOptions =
+            serde_json::from_str(r#"{"mcp_servers":[],"skill_dirs":[]}"#).unwrap();
+        assert_eq!(disabled.mcp_servers, Some(Vec::new()));
+        assert_eq!(disabled.skill_dirs, Some(Vec::new()));
         assert!(!defaults.no_session);
         assert!(serde_json::from_str::<RunOptions>(r#"{"modle":"typo"}"#).is_err());
         let conflicting = RunOptions {

@@ -77,7 +77,10 @@ MCP, and subagent setup has one implementation.
   It reads the normal configuration and returns the final answer as text. The
   extension releases the GIL during waits and requests native cancellation on
   Python signals before waiting for cleanup. It does not change cwd, install
-  signal handlers, initialize global logging, or report Herdr state.
+  signal handlers, initialize global logging, or report Herdr state. Per-call
+  `mcp_servers` and `skill_dirs` lists replace defaults; omitted lists inherit
+  them and empty lists disable the corresponding source. MCP overrides apply
+  before persisted server validation and environment expansion.
 
 `harness worktree BRANCH` is a launch mode around the TUI or a nested `prompt`
 command, not a separate frontend. It enters a dedicated Git worktree before
@@ -206,6 +209,10 @@ and can be disabled with `--no-context-files` or
 Skills are discovered from project `.harness/skills/` and `.agents/skills/`
 roots plus their global equivalents. Only skill name, description, and path are
 put in the system prompt. The model reads a skill body only when needed.
+Native callers can replace discovery roots with ordered `skill_dirs`; relative
+roots use the workspace. Explicit catalogs and read paths are passed to both
+child registry modes so a disabled or replaced skill set cannot revert to
+default discovery in subagents.
 
 The system prompt is rebuilt on every turn and remains outside session history.
 Therefore project instructions and the skill catalogue survive compaction,

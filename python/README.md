@@ -71,8 +71,10 @@ harness login github-copilot
 # Or: harness login openai-codex
 ```
 
-API-key providers read the usual environment variables. No credentials are
-accepted through the options dictionary. See the repository's
+Provider API keys use the usual environment variables; provider credentials
+are not accepted through the options dictionary. MCP server settings can use
+server-specific environment values or HTTP headers; prefer `${ENV_VAR}`
+references rather than literal credentials. See the repository's
 [provider guide](../docs/providers.md) and
 [configuration guide](../docs/configuration.md).
 
@@ -109,10 +111,112 @@ answer = harness.run(
 | `no_session` | `bool` | `False`; create and persist a new session. |
 | `resume` | `str` | Resume by ID, unique prefix, `latest`, or path instead of creating a session. |
 | `no_context_files` | `bool` | `False`; use normal instruction-file discovery and its environment overrides. |
+| `mcp_servers` | list of server dictionaries, or `None` | Omitted/`None`: use configured MCP servers. A list replaces them; `[]` disables MCP. |
+| `skill_dirs` | list of text paths, or `None` | Omitted/`None`: use normal skill discovery. A list replaces all skill roots; `[]` disables skill discovery. |
 
-Unknown keys and invalid option values are rejected. `resume` and
+Unknown top-level option keys and invalid option values are rejected. `resume` and
 `no_session=True` cannot be combined. `harness.RunOptions` is a `TypedDict`
 for editors and type checkers; normal dictionaries also work.
+
+## MCP servers for one call
+
+Use `mcp_servers` to replace the configured server list. The dictionaries use
+the same fields as `[[mcp.servers]]` in `config.toml`:
+
+```python
+answer = harness.run(
+    prompt="Use the available project tools to inspect this workspace.",
+    options={
+        "workspace": Path("/path/to/project"),
+        "mcp_servers": [
+            {
+                "name": "local",
+                "transport": "stdio",
+                "command": Path("/absolute/path/to/mcp-server"),
+                "args": ["--root", "."],
+                "env": {"TOKEN": "${MCP_TOKEN}"},
+            },
+            {
+                "name": "remote",
+                "transport": "http",
+                "url": "https://example.com/mcp",
+                "headers": {"Authorization": "Bearer ${MCP_TOKEN}"},
+            },
+        ],
+    },
+)
+```
+
+Stdio servers run directly, not through a shell, with the workspace as their
+working directory. A command name uses normal executable lookup; a relative
+command path is relative to the workspace. Use an absolute `Path` when you
+want to select an executable by its full path. Streamable HTTP is supported;
+the deprecated HTTP+SSE transport is not. `${ENV_VAR}` expansion, validation,
+limits, tool namespacing, and shutdown follow the normal MCP runtime. Missing
+referenced environment variables fail the call.
+
+A supplied list is **not merged** with system servers. Even an empty list is
+applied before validation or environment expansion of the old MCP section,
+so disabled servers do not require their old credentials. Other system
+configuration still applies and must be valid. No settings are written back.
+To disable all MCP servers for one call:
+
+```python
+answer = harness.run(prompt="Explain this project.", options={"mcp_servers": []})
+```
+
+`harness.StdioMcpServer` and `harness.HttpMcpServer` provide `TypedDict` hints.
+Normal dictionaries work without constructing those types. MCP tools remain
+unavailable to subagents, as in the CLI.
+
+## Skill directories for one call
+
+```python
+answer = harness.run(
+    prompt="Use the review skill to inspect this project.",
+    options={
+        "workspace": Path("/path/to/project"),
+        "skill_dirs": [Path("./team-skills"), Path("/path/to/shared-skills")],
+    },
+)
+```
+
+A supplied `skill_dirs` list replaces project, global, and environment-selected
+skill roots. Relative paths use the selected **workspace**, not the directory
+that contains your Python script. `~` is expanded. A missing, unreadable, or
+non-directory root fails the call rather than falling back to default skills.
+An existing directory with no valid skills produces an empty catalog.
+
+Directories can contain nested skill directories with `SKILL.md`, or can point
+directly to a directory containing `SKILL.md`. Harness-style root-level `.md`
+skills are also accepted. For example:
+
+```text
+team-skills/
+  review/
+    SKILL.md
+    references/
+```
+
+```markdown
+---
+name: review
+description: Review code and report the main risks.
+---
+Read the relevant files. Report risks without changing files.
+```
+
+The first directory wins when skill names collide. Existing skill validation,
+ignore rules, and contained-path checks still apply. The selected catalog and
+skill read paths also apply to both read-only and workspace subagents. Only
+skill metadata enters the prompt; the model reads skill content when needed.
+
+Use `skill_dirs=[]` to disable skill discovery. This does not disable project
+instruction files (`no_context_files` controls those), restrict file access,
+or remove skill text already present in a resumed conversation.
+
+Omit `skill_dirs`, or pass `None`, to keep normal discovery. Changes apply only
+to the current call and do not modify the process environment or global config.
 
 ## Results, errors, and lifecycle
 
@@ -158,5 +262,5 @@ uv run --project /path/to/your/python/project \
 ```
 
 These tests do not call a model or read real credentials. They check native
-input validation, normal configuration paths, Ctrl-C during MCP startup, and
-safe rejection after fork. All test state uses temporary directories.
+input validation, normal configuration paths, per-call MCP replacement,
+Ctrl-C during inherited and overridden MCP startup, and safe rejection after fork. All test state uses temporary directories.

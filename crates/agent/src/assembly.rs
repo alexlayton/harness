@@ -198,6 +198,9 @@ impl AgentBuilder {
                 parent_session,
             )
             .with_reasoning(self.reasoning);
+            if let Some(skills) = self.tools.skills() {
+                runner = runner.with_skills(skills.clone());
+            }
             if let Some(index) = search_index {
                 runner = runner.with_file_search_index(index);
             }

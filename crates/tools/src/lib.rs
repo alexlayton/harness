@@ -165,6 +165,8 @@ pub trait Tool: Send + Sync {
 pub struct ToolConfig {
     pub cwd: PathBuf,
     pub rtk: bool,
+    /// Optional resolved skill catalog, including an explicitly empty catalog.
+    pub skills: Option<SkillCatalog>,
 }
 
 impl ToolConfig {
@@ -172,7 +174,14 @@ impl ToolConfig {
         Self {
             cwd: cwd.into(),
             rtk,
+            skills: None,
         }
+    }
+
+    /// Replace default skill discovery with a host-owned catalog.
+    pub fn with_skills(mut self, skills: SkillCatalog) -> Self {
+        self.skills = Some(skills);
+        self
     }
 }
 
@@ -193,9 +202,10 @@ pub enum ToolInitError {
 /// once here and shared by every `find` call; it is never initialized per
 /// request.
 ///
-/// Skills are discovered from the project walk + global roots; the
-/// discovered skill paths are handed to `ReadTool` so the model can load a
-/// skill body via `read` on its absolute `<location>`, and the catalog is
+/// Unless a host-owned catalog is supplied, skills are discovered from the
+/// project walk + global roots. The selected skill paths are handed to
+/// `ReadTool` so the model can load a skill body via `read` on its absolute
+/// `<location>`, and the catalog is
 /// stored on the registry for the prompt builder.
 ///
 /// The generic argument accepts the workspace-aware [`ToolConfig`].
@@ -221,7 +231,9 @@ pub fn default_registry_with_index(
             "search index workspace does not match registry".into(),
         ));
     }
-    let skills = discover_skills_for_config(&workspace_root);
+    let skills = config
+        .skills
+        .unwrap_or_else(|| discover_skills_for_config(&workspace_root));
     let read_paths = skills.read_paths.clone();
     let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
         ToolInitError::Workspace {
@@ -287,7 +299,9 @@ pub fn read_only_registry_with_index(
             "search index workspace does not match registry".into(),
         ));
     }
-    let skills = discover_skills_for_config(&workspace_root);
+    let skills = config
+        .skills
+        .unwrap_or_else(|| discover_skills_for_config(&workspace_root));
     let read_paths = skills.read_paths.clone();
     let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
         ToolInitError::Workspace {

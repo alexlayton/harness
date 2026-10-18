@@ -30,6 +30,21 @@ class RunTests(unittest.TestCase):
             harness.run(prompt="hello", options={"provider": "invalid"})
         with self.assertRaises(ValueError):
             harness.run(prompt="hello", options={"resume": "latest", "no_session": True})
+        for options in (
+            {"skill_dirs": "not-a-list"},
+            {"skill_dirs": [b"not-a-text-path"]},
+            {"mcp_servers": {}},
+            {"mcp_servers": ["not-a-mapping"]},
+        ):
+            with self.subTest(options=options), self.assertRaises(TypeError):
+                harness.run(prompt="hello", options=options)
+        for options in (
+            {"skill_dirs": [""]},
+            {"mcp_servers": [{"name": "missing-transport"}]},
+            {"mcp_servers": [{"name": "bad-url", "transport": "http", "url": "invalid"}]},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                harness.run(prompt="hello", options=options)
 
     def test_omitted_options_load_system_config(self):
         with tempfile.TemporaryDirectory() as root:
@@ -37,7 +52,19 @@ class RunTests(unittest.TestCase):
             config = directory / "config.toml"
             config.write_text('provider = "invalid-test-provider"\n', encoding="utf-8")
             with patch.dict(os.environ, {"HARNESS_CONFIG_DIR": root}):
-                for options in (None, {}, {"workspace": directory}):
+                for options in (
+                    None,
+                    {},
+                    {"workspace": directory},
+                    {"mcp_servers": None, "skill_dirs": None},
+                    {"mcp_servers": [], "skill_dirs": []},
+                    {
+                        "skill_dirs": [directory],
+                        "mcp_servers": [{
+                            "name": "python", "transport": "stdio", "command": Path(sys.executable),
+                        }],
+                    },
+                ):
                     with self.subTest(options=options):
                         with self.assertRaisesRegex(RuntimeError, "invalid-test-provider"):
                             harness.run(prompt="hello", options=options)
@@ -47,6 +74,34 @@ class RunTests(unittest.TestCase):
                     'provider = "invalid-test-provider"\n',
                 )
                 self.assertEqual(sorted(path.name for path in directory.iterdir()), ["config.toml"])
+
+    def test_mcp_overrides_skip_stale_servers_and_validate_skill_directories(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            contents = (
+                'provider = "opencode-go"\n[[mcp.servers]]\n'
+                'name = "stale"\ntransport = "obsolete"\n'
+            )
+            config = directory / "config.toml"
+            config.write_text(contents, encoding="utf-8")
+            options = {
+                "workspace": directory,
+                "skill_dirs": [Path("missing")],
+                "no_context_files": True,
+                "no_session": True,
+            }
+            with patch.dict(os.environ, {
+                "HARNESS_CONFIG_DIR": root, "OPENCODE_GO_API_KEY": "unused-test-key",
+            }):
+                with self.assertRaisesRegex(RuntimeError, "parse config file"):
+                    harness.run(prompt="hello", options=options)
+                for servers in ([], [{
+                    "name": "replacement", "transport": "http", "url": "https://example.test/mcp",
+                }]):
+                    with self.subTest(servers=servers):
+                        with self.assertRaisesRegex(RuntimeError, "resolve skill directory"):
+                            harness.run(prompt="hello", options={**options, "mcp_servers": servers})
+            self.assertEqual(config.read_text(encoding="utf-8"), contents)
 
     @unittest.skipUnless(os.name == "posix", "requires Unix signals")
     def test_ctrl_c_cancels_native_startup_without_model_request(self):
@@ -70,6 +125,7 @@ from pathlib import Path
 import signal
 import threading
 import time
+import sys
 import harness
 
 ready = Path(os.environ["HARNESS_CONFIG_DIR"]) / "mcp-started"
@@ -80,35 +136,52 @@ def interrupt():
     os.kill(os.getpid(), signal.SIGINT)
 
 threading.Thread(target=interrupt, daemon=True).start()
+options = {"workspace": ready.parent, "no_session": True, "no_context_files": True}
+if os.environ["HARNESS_TEST_OVERRIDE_MCP"] == "1":
+    options["mcp_servers"] = [{
+        "name": "override-server", "transport": "stdio", "command": Path(sys.executable),
+        "args": ["-c", os.environ["HARNESS_TEST_MCP_SERVER"]],
+    }]
+    options["skill_dirs"] = []
 try:
-    harness.run(prompt="must cancel before any model request", options={
-        "workspace": ready.parent, "no_session": True, "no_context_files": True,
-    })
+    harness.run(prompt="must cancel before any model request", options=options)
 except KeyboardInterrupt:
     assert ready.exists(), "MCP server did not start"
     print("interrupted")
 else:
     raise AssertionError("expected KeyboardInterrupt")
 """
-            result = subprocess.run(
-                [sys.executable, "-c", script],
-                env={
-                    **os.environ,
-                    "HOME": root,
-                    "HARNESS_CONFIG_DIR": root,
-                    "HARNESS_STATE_DIR": str(directory / "state"),
-                    "HARNESS_SESSION_DIR": str(directory / "sessions"),
-                    "HARNESS_SKILLS_DIR": str(directory / "skills"),
-                    "OPENCODE_GO_API_KEY": "unused-test-key",
-                },
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), "interrupted")
-            self.assertFalse(directory.joinpath("sessions").exists())
+            for override in (False, True):
+                with self.subTest(override=override):
+                    if override:
+                        ready.unlink()
+                        # An explicit list must replace even stale config entries.
+                        directory.joinpath("config.toml").write_text(
+                            'provider = "opencode-go"\n[[mcp.servers]]\n'
+                            'name = "stale"\ntransport = "obsolete"\n',
+                            encoding="utf-8",
+                        )
+                    result = subprocess.run(
+                        [sys.executable, "-c", script],
+                        env={
+                            **os.environ,
+                            "HOME": root,
+                            "HARNESS_CONFIG_DIR": root,
+                            "HARNESS_STATE_DIR": str(directory / "state"),
+                            "HARNESS_SESSION_DIR": str(directory / "sessions"),
+                            "HARNESS_SKILLS_DIR": str(directory / "skills"),
+                            "OPENCODE_GO_API_KEY": "unused-test-key",
+                            "HARNESS_TEST_OVERRIDE_MCP": "1" if override else "0",
+                            "HARNESS_TEST_MCP_SERVER": server,
+                        },
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "interrupted")
+                    self.assertFalse(directory.joinpath("sessions").exists())
 
     @unittest.skipUnless(hasattr(os, "fork"), "requires fork")
     def test_forked_child_is_rejected_instead_of_hanging(self):

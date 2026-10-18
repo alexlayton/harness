@@ -25,6 +25,18 @@ Use another workspace or disable session persistence:
 uv run main.py --workspace .. --no-session "Summarize this workspace without changing files."
 ```
 
+Try only the example skill directory, without configured MCP servers:
+
+```sh
+uv run main.py --skill-dir skills --no-mcp --no-session "Use the python-example skill to explain this example."
+```
+
+Skill directory paths are relative to the selected workspace. Repeat
+`--skill-dir` to supply more directories; the first one wins for duplicate
+skill names. Use `--no-skills` instead to disable all skill discovery. Edit
+`options["mcp_servers"]` in `main.py` to supply stdio or HTTP MCP servers; the
+[Python guide](../python/README.md) includes server dictionary examples.
+
 With no overrides, the script calls `harness.run` with `options=None`. It uses
 your normal system `config.toml`, credentials, current directory, and session
 settings. Edit `main.py` to try other call options. The full API is documented

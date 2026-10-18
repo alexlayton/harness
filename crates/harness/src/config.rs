@@ -345,16 +345,39 @@ fn non_empty_env_path(name: &str) -> Option<PathBuf> {
 
 /// Load a TOML configuration.  A missing file is the same as an empty config.
 pub fn load_file_config(path: &Path) -> Result<FileConfig> {
+    load_file_config_with_mcp(path, None)
+}
+
+// Replace the entire persisted MCP section before deserialization, validation,
+// and environment expansion. An explicit empty list must be able to disable
+// stale servers, including entries whose credentials are no longer available.
+fn load_file_config_with_mcp(
+    path: &Path,
+    servers: Option<&[mcp::McpServerConfig]>,
+) -> Result<FileConfig> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(FileConfig::default());
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => {
             return Err(error).with_context(|| format!("read config file {}", path.display()));
         }
     };
-    parse_file_config(&contents, path)
+    let Some(servers) = servers else {
+        return parse_file_config(&contents, path);
+    };
+    let mut document: toml::Table = toml::from_str(&contents)
+        .with_context(|| format!("parse config file {}", path.display()))?;
+    document.insert(
+        "mcp".into(),
+        toml::Value::try_from(mcp::McpConfig {
+            servers: servers.to_vec(),
+        })?,
+    );
+    let config: FileConfig = document
+        .try_into()
+        .with_context(|| format!("parse config file {}", path.display()))?;
+    config.validate()?;
+    Ok(config)
 }
 
 fn parse_file_config(contents: &str, path: &Path) -> Result<FileConfig> {
@@ -910,8 +933,16 @@ pub struct Config {
 
 impl Config {
     pub fn resolve(cli: &Cli) -> Result<Self> {
+        Self::resolve_with_mcp(cli, None)
+    }
+
+    /// Resolve normal configuration with an optional replacement MCP list.
+    ///
+    /// `None` inherits the file; `Some(&[])` disables MCP. Overrides are applied
+    /// before validating or expanding the persisted MCP section and never saved.
+    pub fn resolve_with_mcp(cli: &Cli, servers: Option<&[mcp::McpServerConfig]>) -> Result<Self> {
         let path = config_path();
-        let file = load_file_config(&path)?;
+        let file = load_file_config_with_mcp(&path, servers)?;
         // One credential read serves both the entitled-model default below
         // and the provider/agent construction in `main`. Loaded only when the
         // *effective* provider (CLI override wins) is Copilot, matching the
@@ -1857,6 +1888,39 @@ future_server_key = "keep"
             .to_string();
             assert!(error.contains("[secrets].env"), "{error}");
         }
+    }
+
+    #[test]
+    fn mcp_call_overrides_replace_persisted_servers_before_validation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let contents =
+            "provider = 'opencode-go'\n[[mcp.servers]]\nname = 'stale'\ntransport = 'obsolete'\n";
+        fs::write(&path, contents).unwrap();
+        assert!(load_file_config(&path).is_err());
+
+        let disabled = load_file_config_with_mcp(&path, Some(&[])).unwrap();
+        let resolved = Config::resolve_from_file(&Cli::default(), &disabled, path.clone(), |_| {
+            Some("unused-test-key".into())
+        })
+        .unwrap();
+        assert!(resolved.mcp_servers.is_empty());
+
+        let servers = vec![mcp::McpServerConfig {
+            name: "replacement".into(),
+            transport: mcp::McpTransportConfig::Http {
+                url: "https://example.test/mcp".into(),
+                headers: BTreeMap::new(),
+            },
+        }];
+        let replaced = load_file_config_with_mcp(&path, Some(&servers)).unwrap();
+        assert_eq!(replaced.mcp.unwrap().servers, servers);
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+
+        let missing = directory.path().join("missing.toml");
+        let standalone = load_file_config_with_mcp(&missing, Some(&servers)).unwrap();
+        assert_eq!(standalone.mcp.unwrap().servers, servers);
+        assert!(!missing.exists());
     }
 
     #[test]
