@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "harness-agent"
-source = { directory = "../python" }
+source = { directory = "../" }
 
 [[package]]
 name = "harness-python-example"
@@ -15,4 +15,4 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "harness-agent", directory = "../python" }]
+requires-dist = [{ name = "harness-agent", directory = "../" }]

@@ -1,8 +1,8 @@
 # Local Harness Python example
 
-This uv project uses the native package in `../python`. It does not need the
-`harness` executable to run prompts. The existing `.python-version` selects
-Python 3.14.
+This uv project uses the native package at the repository root (`..`). It
+does not need the `harness` executable to run prompts. The existing
+`.python-version` selects Python 3.14.
 
 ## Run
 

@@ -4,3 +4,6 @@ plans
 .venv/
 __pycache__/
 *.pyc
+/dist/
+/python/src/harness/*.so
+/python/src/harness/*.pyd

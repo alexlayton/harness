@@ -9,4 +9,4 @@ dependencies = ["harness-agent"]
 package = false
 
 [tool.uv.sources]
-harness-agent = { path = "../python" }
+harness-agent = { path = ".." }

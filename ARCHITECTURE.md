@@ -12,7 +12,9 @@ are changing.
 
 Harness is a Cargo workspace of ten crates. `harness` builds the only binary
 and also exposes a native library. `harness-python` builds a CPython extension;
-the remaining crates are Rust libraries.
+the remaining crates are Rust libraries. Python packaging lives in root
+`pyproject.toml` beside `Cargo.toml`; its sources stay in `python/src/harness`.
+Git dependencies therefore need no subdirectory selector.
 
 ```text
 harness-python ── harness ──┬── agent ──┬── compact ── llm, session

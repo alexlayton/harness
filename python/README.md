@@ -19,7 +19,7 @@ For an existing virtual environment, activate it and install from a local
 Harness checkout. This does not require a `pyproject.toml`:
 
 ```sh
-CARGO_BUILD_JOBS=1 uv pip install /absolute/path/to/harness/python
+CARGO_BUILD_JOBS=1 uv pip install /absolute/path/to/harness
 python script.py
 ```
 
@@ -27,7 +27,7 @@ For a uv-managed project, use `uv add` from the directory that contains its
 `pyproject.toml`:
 
 ```sh
-CARGO_BUILD_JOBS=1 uv add /absolute/path/to/harness/python
+CARGO_BUILD_JOBS=1 uv add /absolute/path/to/harness
 uv run script.py
 ```
 
@@ -42,7 +42,7 @@ Harness executable:
 
 ```sh
 CARGO_BUILD_JOBS=1 uv add \
-  "harness-agent @ git+https://github.com/alexlayton/harness.git@YOUR_COMMIT_SHA#subdirectory=python"
+  "harness-agent @ git+https://github.com/alexlayton/harness.git@YOUR_COMMIT_SHA"
 ```
 
 Replace `YOUR_COMMIT_SHA` with the full hash of a **pushed commit that contains
@@ -50,30 +50,40 @@ this package**. A branch or tag also works, but a commit gives a reproducible
 version. Unpushed worktree commits are not available through GitHub; push the
 branch or merge it before another machine installs that revision.
 
-The `#subdirectory=python` fragment selects this package while uv checks out
-the full repository, including the Rust workspace. Maturin builds the native
-extension during installation. There is no separate Harness executable to
-host or install. Consumers need Rust and the platform's native build tools.
-To remove that build requirement later, distribute prebuilt Python wheels,
-not the CLI binary. Git installation and import were checked with a pinned
-local Git revision through `uv add` and `uv run`.
+Python packaging is defined by `pyproject.toml` at the repository root, next
+to `Cargo.toml`. No `#subdirectory` fragment is needed. Python sources remain
+in `python/src/harness`; maturin builds the Rust extension from `crates/python`.
+
+After this feature is merged into `main`, a `requirements.txt` can simply use:
+
+```text
+harness-agent @ git+https://github.com/alexlayton/harness.git@main
+```
+
+Install it with `uv pip install -r requirements.txt`. For a stable application,
+pin a release tag or full commit instead of `main`.
+
+There is no separate Harness executable to host or install. Consumers need
+Rust and the platform's native build tools. To remove that build requirement
+later, distribute prebuilt Python wheels, not the CLI binary.
 
 The MVP requires Python 3.10 or newer and a current stable Rust toolchain for
 source installation. It targets the same macOS and Linux systems as Harness.
 No prebuilt Python wheels or PyPI release are provided yet. The first install
 compiles the Rust dependencies. Later installs can reuse Cargo's build cache.
-Local installs use the development profile to avoid expensive release LTO.
+Source installs use the development profile to avoid expensive release LTO.
 The Python version is taken from the Rust workspace version. Source archives
-include the required local Rust crates and the full MIT license notice; copying
-only the `python/` directory is not sufficient for a source build. CI builds a
-source archive, installs it into a fresh environment, and checks the native API
-on Linux/Python 3.10 and macOS/Python 3.14.
+include the required local Rust crates and the full MIT license notice. Use
+the repository root for local installs; `python/` contains source and docs,
+not a separate installable project. CI builds a source archive, installs it
+into a fresh environment, and checks the native API on Linux/Python 3.10 and
+macOS/Python 3.14.
 
 For binding development, use an editable install:
 
 ```sh
 CARGO_BUILD_JOBS=1 uv pip install --python /path/to/project/.venv/bin/python \
-  --editable /absolute/path/to/harness/python
+  --editable /absolute/path/to/harness
 ```
 
 Rebuild the editable install after Rust changes. For an optimized wheel, run

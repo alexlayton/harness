@@ -18,7 +18,7 @@ or disabled per call. It does not yet expose every runtime setting directly.
 |---|---|
 | Uncommitted MCP and skill work | Saved in `abbeac3` (`feat(python): configure MCP servers and skill directories per call`). |
 | Python metadata could retain an old release version | Maturin now takes the version from the Rust workspace; the example lockfile no longer fixes a separate Python version. |
-| Full MIT notice was not explicitly included in Python artifacts | Added `python/LICENSE` and the package `license-files` declaration; checked the built archive and installed distribution. |
+| Full MIT notice was not explicitly included in Python artifacts | Added an explicit `license-files` declaration; root package metadata now uses the repository's `LICENSE` directly. Checked the built archive and installed distribution. |
 | Cargo-only CI did not test the Python install path | Added package jobs that build an sdist, install it into a fresh environment, check version/license/import, and run the existing Python tests. |
 | Retry instructions requested only a continuation, while final-answer collectors discarded failed-round text | Python/headless explicitly select replacement recovery and request a complete final answer. Incremental TUI/ACP output keeps continuation recovery, avoiding duplicate text. A mock-provider test checks both contracts through shared assembly; a headless check verifies replacement output is not duplicated. |
 
@@ -45,9 +45,11 @@ real provider/MCP interoperability.
 
 ## Requested Tokyo weather smoke check
 
-A separate uv consumer project installed the committed feature through a pinned
-Git dependency with `subdirectory = "python"`; native import reported version
-0.6.1. No standalone Harness executable or wheel host was required.
+Before the move to root-level Python metadata, a separate uv consumer project
+installed the committed feature through a pinned Git dependency with
+`subdirectory = "python"`; native import reported version 0.6.1. This is a
+historical install format: new installs use the repository root, without a
+subdirectory fragment. No standalone Harness executable or wheel host is required.
 
 The first attempt used the requested `gpt-6.1-luna` ID and stopped at local
 catalog validation. The user corrected the model to `gpt-6-luna`; the repeated
@@ -71,6 +73,19 @@ temporary session directory, not the user's normal session store. No credential
 values were printed or added to the repository. Live session resume,
 cancellation, explicit skills, and token-refresh behavior remain separate
 checks; this smoke test does not establish them.
+
+## Root-level Python package
+
+The root `pyproject.toml` now defines the Python package next to the virtual
+Cargo workspace. Python sources and tests remain in `python/`, and the Rust
+extension remains in `crates/python`. The example depends on `..`, not on a
+separate Python subproject. Root and example uv lockfiles track those layouts.
+Root editable builds ignore generated native extensions in the source tree.
+
+Local root installation, the five Python API checks, and the nested example's
+installation/import were checked after the move. CI builds source archives
+from the repository root. The active [Python guide](../python/README.md)
+shows the Git and `requirements.txt` syntax without a subdirectory selector.
 
 ## Before merging
 

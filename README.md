@@ -212,7 +212,14 @@ The native Python MVP runs the agent in your Python process. Install it from a
 local checkout with uv (a Rust toolchain is required for the first build):
 
 ```sh
-CARGO_BUILD_JOBS=1 uv add /absolute/path/to/harness/python
+CARGO_BUILD_JOBS=1 uv add /absolute/path/to/harness
+```
+
+Once the feature is merged, a Git dependency in `requirements.txt` needs no
+subdirectory setting:
+
+```text
+harness-agent @ git+https://github.com/alexlayton/harness.git@main
 ```
 
 ```python
