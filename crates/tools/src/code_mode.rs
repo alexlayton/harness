@@ -167,7 +167,7 @@ impl CodeMode {
         let render = tokio::task::spawn_blocking(move || {
             let mut output = super::python::BoundedOutput::new(String::new());
             if value != MontyObject::none() {
-                let _ = write!(output, "Result: {value}\n");
+                let _ = writeln!(output, "Result: {value}");
             }
             let _ = output.write_str(&printed);
             output.finish()

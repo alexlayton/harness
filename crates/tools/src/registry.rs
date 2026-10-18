@@ -202,10 +202,11 @@ impl ToolRegistry {
         args: Value,
         cancel: CancellationToken,
     ) -> (ToolOutput, Option<Value>) {
-        if !cancel.is_cancelled() && self.hidden_by_code_mode(name) {
-            if let Some(tool) = self.tools.iter().find(|tool| tool.name == name) {
-                return tool.tool.execute_structured(args, cancel).await;
-            }
+        if !cancel.is_cancelled()
+            && self.hidden_by_code_mode(name)
+            && let Some(tool) = self.tools.iter().find(|tool| tool.name == name)
+        {
+            return tool.tool.execute_structured(args, cancel).await;
         }
         (
             ToolOutput {

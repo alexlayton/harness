@@ -216,16 +216,16 @@ impl AgentBuilder {
             None
         };
 
-        if let Some(names) = self.code_mode {
-            if let Err(error) = self.tools.enable_code_mode(&names) {
-                if let Some(mcp) = mcp {
-                    mcp.shutdown().await;
-                }
-                return Err(anyhow::anyhow!(
-                    self.secret_masker.mask_text(&error.to_string())
-                ))
-                .context("enable code mode");
+        if let Some(names) = self.code_mode
+            && let Err(error) = self.tools.enable_code_mode(&names)
+        {
+            if let Some(mcp) = mcp {
+                mcp.shutdown().await;
             }
+            return Err(anyhow::anyhow!(
+                self.secret_masker.mask_text(&error.to_string())
+            ))
+            .context("enable code mode");
         }
 
         let assembly_cancel = self.cancel.clone();
