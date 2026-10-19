@@ -100,7 +100,7 @@ To install a specific release, pass the version through to the script:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alexlayton/harness/main/install.sh \
-  | bash -s -- --version v0.6.1
+  | bash -s -- --version v0.7.0
 ```
 
 The script uses `curl` rather than a browser, so macOS downloads normally do
@@ -215,11 +215,11 @@ local checkout with uv (a Rust toolchain is required for the first build):
 CARGO_BUILD_JOBS=1 uv add /absolute/path/to/harness
 ```
 
-Once the feature is merged, a Git dependency in `requirements.txt` needs no
-subdirectory setting:
+To install the 0.7.0 Python MVP, use this Git dependency in `requirements.txt`.
+No subdirectory setting is needed:
 
 ```text
-harness-agent @ git+https://github.com/alexlayton/harness.git@main
+harness-agent @ git+https://github.com/alexlayton/harness.git@v0.7.0
 ```
 
 ```python

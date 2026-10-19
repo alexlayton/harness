@@ -54,14 +54,14 @@ Python packaging is defined by `pyproject.toml` at the repository root, next
 to `Cargo.toml`. No `#subdirectory` fragment is needed. Python sources remain
 in `python/src/harness`; maturin builds the Rust extension from `crates/python`.
 
-After this feature is merged into `main`, a `requirements.txt` can simply use:
+For the 0.7.0 MVP, a `requirements.txt` can use the release tag:
 
 ```text
-harness-agent @ git+https://github.com/alexlayton/harness.git@main
+harness-agent @ git+https://github.com/alexlayton/harness.git@v0.7.0
 ```
 
 Install it with `uv pip install -r requirements.txt`. For a stable application,
-pin a release tag or full commit instead of `main`.
+pin a release tag or full commit instead of a branch.
 
 There is no separate Harness executable to host or install. Consumers need
 Rust and the platform's native build tools. To remove that build requirement

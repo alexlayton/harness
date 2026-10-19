@@ -2,10 +2,12 @@
 
 ## Decision
 
-The branch is ready for PR review as a **source-installed native MVP**, subject
-to green CI. This is not approval to publish platform wheels or a PyPI release.
-The new Linux/Python 3.10 and macOS/Python 3.14 package jobs must run in CI;
-local checks covered macOS with Python 3.14 only.
+The **source-installed native MVP** is merged into `main` for Harness 0.7.0.
+[CI passed](https://github.com/alexlayton/harness/actions/runs/39177672451) for
+merge commit `ef4866a6f3fc2f77d267a38826bb73154a1a11d3`, including Rust checks
+and the Linux/Python 3.10 and macOS/Python 3.14 source-package jobs. The release
+preparation commit must also pass CI before publication. This is not approval
+to publish platform wheels or a PyPI release.
 
 The API is synchronous `harness.run(prompt=..., options=...)`, returning final
 answer text. It uses normal configuration and credentials unless supported
@@ -91,18 +93,18 @@ import and all five Python API tests passed from that Git-installed package.
 The root source archive was inspected for workspace manifests, Python sources,
 README, and the root license. It contains neither the local virtual environment
 nor the editable build's native binaries. CI installs source archives from the
-repository root; that archive-install check still needs to pass for the new
-layout. The active [Python guide](../python/README.md) shows the root Git and
-`requirements.txt` syntax.
+repository root; that archive-install check passed on Linux and macOS in the
+merge commit's CI run. The active [Python guide](../python/README.md) shows the
+root Git and `requirements.txt` syntax.
 
 ## Before merging
 
-- [ ] All existing Rust CI and the new Python package jobs pass.
+- [x] All existing Rust CI and the new Python package jobs pass on the merge commit.
 - [ ] Review the public option names and replacement rules. In particular,
       omitted/`None` lists inherit; supplied lists replace; empty lists disable.
 - [ ] Confirm source-only MVP scope and the documented platform/lifecycle limits.
 
-## Before a public Python package release
+## Before PyPI or wheel publication
 
 - [x] Run a successful live Codex prompt and real weather MCP tool call through
       the Git-installed Python package.
@@ -118,8 +120,9 @@ layout. The active [Python guide](../python/README.md) shows the root Git and
 - [ ] Add deliberate Python artifact publication/release automation. The current
       GitHub release workflow still publishes CLI artifacts only; this review
       does not publish packages or add upload credentials.
-- [ ] Write release notes that state this is an MVP, list supported platforms,
-      and separate Python source installation from CLI installation.
+- [x] Write [0.7.0 release notes](releases/0.7.0.md) that state this is an MVP,
+      list supported platforms, and separate Python source installation from
+      CLI installation.
 
 ## Documented limits, not additional MVP requirements
 
