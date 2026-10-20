@@ -1,6 +1,6 @@
 # Providers and authentication
 
-Harness supports four providers. Select one with `--provider`, in
+Harness supports five providers. Select one with `--provider`, in
 `config.toml`, or with `/model` in the terminal UI. If none is selected,
 Harness prints setup instructions instead of assuming an API-key provider.
 
@@ -10,6 +10,7 @@ Harness prints setup instructions instead of assuming an API-key provider.
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
 | GitHub Copilot | `github-copilot` (`copilot`) | Device login |
 | OpenAI Codex | `openai-codex` (`codex`) | Browser or device login |
+| Anthropic Claude | `anthropic-claude` (`claude`) | Browser login |
 
 API keys are environment-only secrets. Harness does not write them to
 `config.toml` or session files. Without an explicit model, the configured
@@ -119,6 +120,30 @@ provider's default model until you select another through `/model` or
 
 Codex uses a dedicated, SSE-only provider and dialect because its ChatGPT
 subscription protocol differs from the normal OpenAI API.
+
+## Anthropic Claude
+
+Use your Claude subscription with browser login:
+
+```text
+harness login anthropic-claude
+harness --provider anthropic-claude
+```
+
+This is an unofficial subscription protocol. It can violate provider terms
+and put your account at risk. Harness does not fall back to API-key billing.
+The default model is `claude-sonnet-4-6`.
+
+A saved Claude login makes the local model catalog available in `/model`,
+even when another provider is active. For example:
+
+```text
+/model anthropic-claude:claude-sonnet-4-6
+```
+
+The catalog does not confirm account access or live model availability.
+The older names `anthropic-subscription` and `claude-sub` remain valid aliases.
+Existing saved credentials still work; you do not need to log in again.
 
 ## Reasoning effort
 

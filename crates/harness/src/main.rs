@@ -299,6 +299,28 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
     let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
 
+    // This catalog is local metadata, so a saved Claude login can populate
+    // /model even when another provider is active. Do not refresh tokens or
+    // make a network request just to display these suggestions.
+    if let Ok(auth) = auth::AnthropicSubscriptionAuth::from_default()
+        && auth.credential().ok().flatten().is_some()
+    {
+        let provider = llm::providers::AnthropicSubscriptionProvider::new(Arc::new(auth));
+        if let Ok(models) = provider.list_models().await {
+            let _ = ui_event_tx.send(tui::UiEvent::ModelList {
+                provider: provider.name().into(),
+                models: models
+                    .into_iter()
+                    .map(|model| tui::ModelEntry {
+                        id: model.id,
+                        name: model.name,
+                        context_length: model.context_length,
+                    })
+                    .collect(),
+            });
+        }
+    }
+
     // Construct the terminal before assembling the agent or claiming the
     // Herdr pane, so setup errors leave neither running MCPs nor a report.
     let update_notice = update::check_latest().await;

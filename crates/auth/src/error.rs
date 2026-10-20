@@ -69,9 +69,7 @@ pub enum AuthError {
     #[error("Anthropic subscription OAuth failed: {0}")]
     AnthropicSubscription(String),
 
-    #[error(
-        "Anthropic subscription is not authenticated; run `harness login anthropic-subscription`"
-    )]
+    #[error("Anthropic subscription is not authenticated; run `harness login anthropic-claude`")]
     AnthropicSubscriptionNotAuthenticated,
 
     #[error("could not acquire auth file lock {}", .0.display())]

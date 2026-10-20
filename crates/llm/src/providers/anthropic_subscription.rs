@@ -90,7 +90,7 @@ fn headers(thinking: bool, agent: bool) -> HeaderMap {
 #[async_trait::async_trait]
 impl Provider for AnthropicSubscriptionProvider {
     fn name(&self) -> &'static str {
-        wire::TAG
+        "anthropic-claude"
     }
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         Ok(MODELS

@@ -32,7 +32,7 @@ pub enum ProviderArg {
     GithubCopilot,
     #[value(name = "openai-codex", alias = "codex")]
     OpenAiCodex,
-    #[value(name = "anthropic-subscription", alias = "claude-sub")]
+    #[value(name = "anthropic-claude", aliases = ["anthropic-subscription", "claude-sub", "claude"])]
     AnthropicSubscription,
 }
 
@@ -52,7 +52,9 @@ impl ProviderArg {
             "opencode-go" => Some(Self::OpencodeGo),
             "openrouter" => Some(Self::Openrouter),
             "github-copilot" | "githubcopilot" | "copilot" => Some(Self::GithubCopilot),
-            "anthropic-subscription" | "claude-sub" => Some(Self::AnthropicSubscription),
+            "anthropic-claude" | "anthropic-subscription" | "claude-sub" | "claude" => {
+                Some(Self::AnthropicSubscription)
+            }
             "openai-codex" | "codex" => Some(Self::OpenAiCodex),
             _ => None,
         }
@@ -93,7 +95,7 @@ impl fmt::Display for ProviderArg {
             Self::Openrouter => "openrouter",
             Self::GithubCopilot => "github-copilot",
             Self::OpenAiCodex => "openai-codex",
-            Self::AnthropicSubscription => "anthropic-subscription",
+            Self::AnthropicSubscription => "anthropic-claude",
         })
     }
 }
@@ -911,7 +913,7 @@ pub enum LoginProvider {
     GithubCopilot,
     #[value(name = "openai-codex", alias = "codex")]
     OpenAiCodex,
-    #[value(name = "anthropic-subscription", alias = "claude-sub")]
+    #[value(name = "anthropic-claude", aliases = ["anthropic-subscription", "claude-sub", "claude"])]
     AnthropicSubscription,
 }
 
@@ -1033,7 +1035,7 @@ impl Config {
         };
         let provider = cli.provider.or(file_provider).ok_or_else(|| {
             anyhow!(
-                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go      OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter       OpenRouter; set OPENROUTER_API_KEY\n  github-copilot   GitHub Copilot; run `harness login github-copilot`\n  openai-codex     OpenAI Codex; run `harness login openai-codex`\n  anthropic-subscription  Unofficial Claude subscription; run `harness login anthropic-subscription`",
+                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go      OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter       OpenRouter; set OPENROUTER_API_KEY\n  github-copilot   GitHub Copilot; run `harness login github-copilot`\n  openai-codex     OpenAI Codex; run `harness login openai-codex`\n  anthropic-claude  Unofficial Claude subscription; run `harness login anthropic-claude`",
                 path.display()
             )
         })?;
@@ -1349,6 +1351,8 @@ mod tests {
                 "anthropic-subscription",
                 LoginProvider::AnthropicSubscription,
             ),
+            ("anthropic-claude", LoginProvider::AnthropicSubscription),
+            ("claude", LoginProvider::AnthropicSubscription),
             ("claude-sub", LoginProvider::AnthropicSubscription),
             ("codex", LoginProvider::OpenAiCodex),
             ("openai-codex", LoginProvider::OpenAiCodex),
@@ -1417,7 +1421,12 @@ mod tests {
 
     #[test]
     fn subscription_alias_defaults_and_login_selection() {
-        for name in ["anthropic-subscription", "claude-sub"] {
+        for name in [
+            "anthropic-claude",
+            "anthropic-subscription",
+            "claude-sub",
+            "claude",
+        ] {
             let cli = Cli::try_parse_from(["harness", "--provider", name]).unwrap();
             let config = Config::resolve_from_file(
                 &cli,
@@ -1435,9 +1444,39 @@ mod tests {
         assert!(select_provider_after_login_at(&path, ProviderArg::AnthropicSubscription).unwrap());
         assert_eq!(
             load_file_config(&path).unwrap().provider.as_deref(),
-            Some("anthropic-subscription")
+            Some("anthropic-claude")
         );
         assert!(!select_provider_after_login_at(&path, ProviderArg::OpenAiCodex).unwrap());
+    }
+
+    #[tokio::test]
+    async fn claude_aliases_return_catalog_with_canonical_provider_name() {
+        let directory = tempdir().unwrap();
+        let store = auth::AuthStore::new(directory.path().join("auth.json"));
+        store
+            .save_anthropic_subscription(&auth::AnthropicSubscriptionCredential::new(
+                "saved-access",
+                "saved-refresh",
+                u64::MAX,
+                "account",
+            ))
+            .unwrap();
+        let auth = Arc::new(AnthropicSubscriptionAuth::new(store).unwrap());
+        let factory = provider_factory(None, None, Some(auth));
+        for name in [
+            "anthropic-claude",
+            "anthropic-subscription",
+            "claude-sub",
+            "claude",
+        ] {
+            let provider = factory(name).unwrap();
+            assert_eq!(
+                provider.name(),
+                ProviderArg::AnthropicSubscription.to_string()
+            );
+            let models = provider.list_models().await.unwrap();
+            assert!(models.iter().any(|model| model.id == "claude-sonnet-4-6"));
+        }
     }
 
     #[test]

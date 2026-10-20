@@ -264,7 +264,7 @@ impl AnthropicSubscriptionAuth {
                 .map_err(|_| fail("token request failed"))?;
             if !response.status().is_success() {
                 return Err(fail(
-                    "token exchange rejected; run harness login anthropic-subscription again",
+                    "token exchange rejected; run harness login anthropic-claude again",
                 ));
             }
             let mut bytes = Vec::new();
