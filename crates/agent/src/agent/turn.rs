@@ -356,18 +356,20 @@ impl Agent {
                 send(events, AgentEvent::Error(message.clone()));
                 let mut retried = false;
                 if let LlmError::Parse(parse_message) = &error {
-                    // A tool call whose arguments failed to parse (usually
-                    // truncated JSON) never became durable, so the turn can
-                    // retry without leaving dangling state. Nudge the model
-                    // and re-stream instead of dead-ending the turn.
+                    // Parse errors also include provider protocol and content
+                    // validation failures, not only malformed tool arguments.
+                    // Calls from this interrupted round were closed above;
+                    // do not blame or repeat calls from completed rounds.
                     if recoveries < MAX_TURN_RECOVERIES {
                         recoveries += 1;
                         push_recovery_note(
                             &mut self.history,
                             format!(
-                                "[system note: your previous tool call had malformed JSON \
-                                 arguments and was not executed: {parse_message}. Re-issue the \
-                                 tool call with valid arguments.]"
+                                "[system note: the provider response could not be parsed \
+                                 ({parse_message}). Continue the task. Check the tool results \
+                                 already in the conversation and do not repeat actions that \
+                                 completed. If a tool call is still needed, issue it with \
+                                 valid arguments.]"
                             ),
                         );
                         retried = true;
