@@ -6,8 +6,8 @@ use auth::AnthropicSubscriptionAuth;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::sync::Arc;
 
-/// Supported metadata, not proof of entitlement or live availability. Context
-/// is conservatively limited to 200K; OAuth does not advertise the 1M beta.
+/// Supported model IDs, not proof of entitlement or live availability.
+/// Context limits are model-specific; see `context_length` below.
 pub const MODELS: &[&str] = &[
     "claude-sonnet-4-6",
     "claude-opus-4-6",
@@ -15,6 +15,19 @@ pub const MODELS: &[&str] = &[
     "claude-sonnet-4-5",
     "claude-haiku-4-5",
 ];
+// Keep model capacity separate from account entitlement. The overlapping
+// entries match the Claude capacities in the Copilot catalog. Do not guess
+// limits for experimental IDs that have no verified metadata here.
+fn context_length(model: &str) -> Option<u64> {
+    match model {
+        "claude-opus-5-5" | "claude-fable-5-1" | "claude-opus-5" | "claude-sonnet-5"
+        | "claude-fable-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-4-6"
+        | "claude-opus-4-6" => Some(1_000_000),
+        "claude-opus-4-5" | "claude-sonnet-4-5" | "claude-haiku-4-5" => Some(200_000),
+        _ => None,
+    }
+}
+
 /// Separate provider identity keeps existing Anthropic routes unchanged.
 #[derive(Clone)]
 pub struct AnthropicSubscriptionProvider {
@@ -98,7 +111,7 @@ impl Provider for AnthropicSubscriptionProvider {
             .map(|id| ModelInfo {
                 id: (*id).into(),
                 name: Some((*id).into()),
-                context_length: Some(200000),
+                context_length: context_length(id),
             })
             .collect())
     }

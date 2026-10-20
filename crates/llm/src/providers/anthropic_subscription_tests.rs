@@ -69,6 +69,37 @@ fn provider(store: AuthStore, endpoint: String) -> AnthropicSubscriptionProvider
 }
 
 #[tokio::test]
+async fn catalog_reports_model_specific_context_limits_without_network() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = provider(
+        AuthStore::new(dir.path().join("auth.json")),
+        "http://unused.invalid".into(),
+    );
+    let models = p.list_models().await.unwrap();
+    let expected = [
+        ("claude-opus-5-5", Some(1_000_000)),
+        ("claude-sonnet-5-5", None),
+        ("claude-haiku-5-5", None),
+        ("claude-fable-5-1", Some(1_000_000)),
+        ("claude-opus-5", Some(1_000_000)),
+        ("claude-sonnet-5", Some(1_000_000)),
+        ("claude-fable-5", Some(1_000_000)),
+        ("claude-opus-4-8", Some(1_000_000)),
+        ("claude-opus-4-7", Some(1_000_000)),
+        ("claude-sonnet-4-6", Some(1_000_000)),
+        ("claude-opus-4-6", Some(1_000_000)),
+        ("claude-opus-4-5", Some(200_000)),
+        ("claude-sonnet-4-5", Some(200_000)),
+        ("claude-haiku-4-5", Some(200_000)),
+    ];
+    assert_eq!(models.len(), MODELS.len());
+    for model in models {
+        let (_, limit) = expected.iter().find(|(id, _)| *id == model.id).unwrap();
+        assert_eq!(model.context_length, *limit, "{}", model.id);
+    }
+}
+
+#[tokio::test]
 async fn mock_posts_exact_agent_request_without_tools_and_parses_sse() {
     let body = [json!({"type":"message_start","message":{"usage":{"input_tokens":2}}}), json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}), json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}), json!({"type":"content_block_stop","index":0}), json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}), json!({"type":"message_stop"})].iter().map(|v| format!("data: {v}\n\n")).collect::<String>();
     let (endpoint, task) = fixture(200, body).await;
@@ -76,7 +107,7 @@ async fn mock_posts_exact_agent_request_without_tools_and_parses_sse() {
     let p = provider(AuthStore::new(dir.path().join("auth.json")), endpoint);
     let models = p.list_models().await.unwrap();
     assert_eq!(models.len(), MODELS.len());
-    assert!(models.iter().all(|m| m.context_length == Some(200000)));
+    assert_eq!(models[0].context_length, Some(1_000_000));
     let mut stream = p.stream(&request()).await.unwrap();
     let mut events = Vec::new();
     while let Some(event) = stream.next().await {
