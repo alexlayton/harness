@@ -230,6 +230,53 @@ fn malformed_and_truncated_streams_never_release_tools() {
 }
 
 #[test]
+fn invalid_block_diagnostics_identify_fields_without_exposing_payloads() {
+    for (block, expected) in [
+        (
+            json!({"type":"tool_use","id":"c","name":"private-name","input":{}}),
+            "tool block name is not registered",
+        ),
+        (
+            json!({"type":"tool_use","id":"c","name":"__read","input":"private-input"}),
+            "tool block input must be an object",
+        ),
+        (
+            json!({"type":"tool_use","id":"","name":"__read","input":{}}),
+            "tool block requires a nonempty id",
+        ),
+        (
+            json!({"type":"text","text":null}),
+            "text block requires string text",
+        ),
+        (
+            json!({"type":"thinking","thinking":null}),
+            "thinking block requires string thinking",
+        ),
+        (
+            json!({"type":"redacted_thinking","data":""}),
+            "redacted thinking block requires nonempty data",
+        ),
+        (
+            json!({"type":"private-unknown-type","data":"private-data"}),
+            "unsupported or missing block type",
+        ),
+    ] {
+        let mut parser = SubscriptionParser::new(&request());
+        start(&mut parser);
+        let error = feed(
+            &mut parser,
+            json!({"type":"content_block_start","index":3,"content_block":block}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("parse: Anthropic subscription: invalid content block at index 3: {expected}")
+        );
+        assert!(!error.to_string().contains("private-"));
+    }
+}
+
+#[test]
 fn thinking_validation_and_unsigned_state() {
     let mut req = request();
     req.reasoning = ReasoningPolicy::Off;

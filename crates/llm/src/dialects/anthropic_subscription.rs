@@ -302,23 +302,41 @@ impl StreamParser for SubscriptionParser {
                     return Err(invalid("overlapping or duplicate block"));
                 }
                 let block = &v["content_block"];
-                let valid = match block["type"].as_str() {
-                    Some("text") => block["text"].is_string(),
-                    Some("thinking") => block["thinking"].is_string(),
-                    Some("redacted_thinking") => {
-                        block["data"].as_str().is_some_and(|s| !s.is_empty())
+                // Report the failing field, not the block payload: thinking,
+                // tool input, and unknown names can contain private data.
+                let problem = match block["type"].as_str() {
+                    Some("text") if !block["text"].is_string() => {
+                        Some("text block requires string text")
+                    }
+                    Some("thinking") if !block["thinking"].is_string() => {
+                        Some("thinking block requires string thinking")
+                    }
+                    Some("redacted_thinking")
+                        if !block["data"].as_str().is_some_and(|s| !s.is_empty()) =>
+                    {
+                        Some("redacted thinking block requires nonempty data")
                     }
                     Some("tool_use") => {
-                        block["id"].as_str().is_some_and(|s| !s.is_empty())
-                            && block["name"]
-                                .as_str()
-                                .is_some_and(|s| self.names.contains_key(s))
-                            && block["input"].is_object()
+                        if !block["id"].as_str().is_some_and(|s| !s.is_empty()) {
+                            Some("tool block requires a nonempty id")
+                        } else if !block["name"]
+                            .as_str()
+                            .is_some_and(|s| self.names.contains_key(s))
+                        {
+                            Some("tool block name is not registered")
+                        } else if !block["input"].is_object() {
+                            Some("tool block input must be an object")
+                        } else {
+                            None
+                        }
                     }
-                    _ => false,
+                    Some("text" | "thinking" | "redacted_thinking") => None,
+                    _ => Some("unsupported or missing block type"),
                 };
-                if !valid {
-                    return Err(invalid("invalid content block"));
+                if let Some(problem) = problem {
+                    return Err(invalid(&format!(
+                        "invalid content block at index {index}: {problem}"
+                    )));
                 }
                 self.open = Some(index);
                 self.blocks.insert(index, block.clone());
