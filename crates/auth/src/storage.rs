@@ -18,6 +18,8 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 pub const COPILOT_PROVIDER_KEY: &str = "github-copilot";
+/// Isolated subscription credential namespace.
+pub const ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY: &str = "anthropic-subscription";
 /// Provider key used by ChatGPT/Codex OAuth credentials.
 pub const OPENAI_CODEX_PROVIDER_KEY: &str = "openai-codex";
 const LOCK_WAIT: Duration = Duration::from_millis(10);
@@ -157,6 +159,96 @@ impl fmt::Debug for CopilotCredential {
 
 /// OAuth credentials used by the ChatGPT Codex subscription endpoint.
 /// Expiration is a Unix timestamp in milliseconds.
+/// Private Anthropic subscription OAuth tokens and optional login identity.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnthropicSubscriptionCredential {
+    #[serde(rename = "type")]
+    pub credential_type: String,
+    pub access: String,
+    pub refresh: String,
+    pub expires: u64,
+    #[serde(rename = "accountId")]
+    pub account_id: String,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
+    #[serde(default)]
+    pub org_name: Option<String>,
+}
+
+impl AnthropicSubscriptionCredential {
+    pub fn new(
+        access: impl Into<String>,
+        refresh: impl Into<String>,
+        expires: u64,
+        account_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            credential_type: "oauth".into(),
+            access: access.into(),
+            refresh: refresh.into(),
+            expires,
+            account_id: account_id.into(),
+            email: None,
+            org_id: None,
+            org_name: None,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.credential_type == "oauth"
+            && !self.access.trim().is_empty()
+            && !self.refresh.trim().is_empty()
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.expires == 0 || self.expires <= unix_millis().saturating_add(60_000)
+    }
+
+    /// Returns whether two credentials describe the same persisted Anthropic subscription
+    /// generation. Token values, expiry, and account identity all belong to
+    /// the generation; the credential type is validated separately.
+    pub fn has_same_generation(&self, other: &Self) -> bool {
+        self.access == other.access
+            && self.refresh == other.refresh
+            && self.expires == other.expires
+            && self.account_id == other.account_id
+            && self.email == other.email
+            && self.org_id == other.org_id
+            && self.org_name == other.org_name
+    }
+
+    /// Whether this is a valid generation newer than `previous`.
+    ///
+    /// There is no sequence number in the on-disk format, so a token or
+    /// account change is treated as a new generation. For an otherwise
+    /// identical credential, only an extended expiry is newer; retaining a
+    /// locally cached credential with a later expiry avoids adopting an older
+    /// disk write. Callers still require the persisted value to be complete
+    /// before using this comparison.
+    pub fn is_newer_generation_than(&self, previous: &Self) -> bool {
+        self.is_complete()
+            && !self.is_expired()
+            && (self.access != previous.access
+                || self.refresh != previous.refresh
+                || self.account_id != previous.account_id
+                || self.expires > previous.expires)
+    }
+}
+
+impl fmt::Debug for AnthropicSubscriptionCredential {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnthropicSubscriptionCredential")
+            .field("credential_type", &self.credential_type)
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("expires", &self.expires)
+            .field("account_id", &self.account_id)
+            .finish()
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenAiCodexCredential {
     #[serde(rename = "type")]
@@ -302,6 +394,71 @@ impl AuthStore {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn anthropic_subscription(&self) -> Result<Option<AnthropicSubscriptionCredential>> {
+        let entries = self.load_unlocked()?;
+        let Some(value) = entries.get(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY) else {
+            return Ok(None);
+        };
+        // Serde type errors can quote the offending value (including tokens).
+        let credential = serde_json::from_value::<AnthropicSubscriptionCredential>(value.clone())
+            .map_err(|_| {
+            AuthError::InvalidCredential(
+                "Anthropic subscription credential has invalid OAuth fields".into(),
+            )
+        })?;
+        if !credential.is_complete() {
+            return Err(AuthError::InvalidCredential(
+                "Anthropic subscription credential is missing OAuth fields".into(),
+            ));
+        }
+        Ok(Some(credential))
+    }
+
+    pub fn save_anthropic_subscription(
+        &self,
+        credential: &AnthropicSubscriptionCredential,
+    ) -> Result<()> {
+        if !credential.is_complete() {
+            return Err(AuthError::InvalidCredential(
+                "Anthropic subscription credential is missing OAuth fields".into(),
+            ));
+        }
+        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.save_provider_value(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value)
+    }
+
+    /// Replace a subscription credential only if the persisted generation is still
+    /// the one used for the exchange. This compare-and-save runs under the
+    /// same auth-file lock as ordinary updates, preventing a delayed refresh
+    /// in another process from overwriting a newer token or expiry generation.
+    pub fn save_anthropic_subscription_if_current(
+        &self,
+        expected: &AnthropicSubscriptionCredential,
+        credential: &AnthropicSubscriptionCredential,
+    ) -> Result<bool> {
+        if !credential.is_complete() {
+            return Err(AuthError::InvalidCredential(
+                "Anthropic subscription credential is missing OAuth fields".into(),
+            ));
+        }
+        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.save_provider_value_if_current(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value, |current| {
+            current
+                .and_then(|value| {
+                    serde_json::from_value::<AnthropicSubscriptionCredential>(value.clone()).ok()
+                })
+                .is_some_and(|current| {
+                    current.is_complete() && current.has_same_generation(expected)
+                })
+        })
     }
 
     pub fn openai_codex(&self) -> Result<Option<OpenAiCodexCredential>> {
@@ -537,7 +694,7 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{}-{sequence}", std::process::id()))
 }
 
-fn unix_millis() -> u64 {
+pub(crate) fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)

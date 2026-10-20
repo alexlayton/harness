@@ -131,6 +131,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         &config.provider.to_string(),
         config.copilot_auth.clone(),
         config.codex_auth.clone(),
+        config.anthropic_auth.clone(),
     )?;
     let context = project_context_for(&workspace, options.no_context_files);
     let mut tool_config = ToolConfig::new(&workspace, config.rtk);
@@ -154,6 +155,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     .with_provider_factory(provider_factory(
         config.copilot_auth.clone(),
         config.codex_auth.clone(),
+        config.anthropic_auth.clone(),
     ));
     if let Some(tools) = &config.code_mode {
         builder = builder.with_code_mode(tools.clone());

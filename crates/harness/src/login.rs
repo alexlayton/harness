@@ -16,6 +16,23 @@ pub async fn run(args: &LoginArgs) -> Result<ExitCode> {
         signal.cancel();
     });
     let provider = match args.provider {
+        LoginProvider::AnthropicSubscription => {
+            eprintln!(
+                "WARNING: unofficial Anthropic subscription protocol, not an official API. It may violate provider terms and risk account restrictions or bans. No API-key billing fallback is used."
+            );
+            let auth = auth::AnthropicSubscriptionAuth::from_default()?;
+            auth.login_browser(&cancel, |event| {
+                if let AuthEvent::Prompt { message } = &event {
+                    eprintln!("Open this URL to sign in:\n{message}");
+                    open_browser(message);
+                } else {
+                    render_event(event);
+                }
+            })
+            .await?;
+            eprintln!("Anthropic subscription login complete.");
+            ProviderArg::AnthropicSubscription
+        }
         LoginProvider::GithubCopilot => {
             let auth = CopilotAuth::from_default()?;
             auth.login_with_events(None, &cancel, render_event).await?;

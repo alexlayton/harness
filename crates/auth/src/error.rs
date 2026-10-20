@@ -66,6 +66,14 @@ pub enum AuthError {
     )]
     CallbackBind,
 
+    #[error("Anthropic subscription OAuth failed: {0}")]
+    AnthropicSubscription(String),
+
+    #[error(
+        "Anthropic subscription is not authenticated; run `harness login anthropic-subscription`"
+    )]
+    AnthropicSubscriptionNotAuthenticated,
+
     #[error("could not acquire auth file lock {}", .0.display())]
     LockUnavailable(PathBuf),
 }

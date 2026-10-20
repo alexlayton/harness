@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod anthropic_subscription;
 pub mod openai_chat;
 pub mod openai_codex_responses;
 pub mod openai_responses;

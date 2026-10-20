@@ -1,14 +1,15 @@
 use agent::assembly::SubagentPolicy;
 use agent::secrets::SecretMasker;
 use anyhow::{Context, Result, anyhow};
-use auth::OpenAiCodexAuth;
+use auth::{AnthropicSubscriptionAuth, OpenAiCodexAuth};
 use auth::{CopilotAuth, sku_from_proxy_token};
 use clap::{Parser, ValueEnum};
 use compact::policy::CompactionPolicy;
 use fs2::FileExt;
 use llm::providers::github_copilot::default_model_for;
 use llm::providers::{
-    GithubCopilotProvider, OpenAiCodexProvider, OpenCodeGoProvider, OpenRouterProvider,
+    AnthropicSubscriptionProvider, GithubCopilotProvider, OpenAiCodexProvider, OpenCodeGoProvider,
+    OpenRouterProvider,
 };
 use llm::{Provider, ReasoningPolicy};
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,8 @@ pub enum ProviderArg {
     GithubCopilot,
     #[value(name = "openai-codex", alias = "codex")]
     OpenAiCodex,
+    #[value(name = "anthropic-subscription", alias = "claude-sub")]
+    AnthropicSubscription,
 }
 
 impl ProviderArg {
@@ -41,6 +44,7 @@ impl ProviderArg {
         Self::Openrouter,
         Self::GithubCopilot,
         Self::OpenAiCodex,
+        Self::AnthropicSubscription,
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
@@ -48,6 +52,7 @@ impl ProviderArg {
             "opencode-go" => Some(Self::OpencodeGo),
             "openrouter" => Some(Self::Openrouter),
             "github-copilot" | "githubcopilot" | "copilot" => Some(Self::GithubCopilot),
+            "anthropic-subscription" | "claude-sub" => Some(Self::AnthropicSubscription),
             "openai-codex" | "codex" => Some(Self::OpenAiCodex),
             _ => None,
         }
@@ -66,7 +71,7 @@ impl ProviderArg {
             // compatibility hint for embedders that display provider help;
             // resolution itself does not require it.
             Self::GithubCopilot => &["COPILOT_GITHUB_TOKEN"],
-            Self::OpenAiCodex => &[],
+            Self::OpenAiCodex | Self::AnthropicSubscription => &[],
         }
     }
 
@@ -76,6 +81,7 @@ impl ProviderArg {
             Self::Openrouter => "openai/gpt-5.6-luna",
             Self::GithubCopilot => "gpt-5.4",
             Self::OpenAiCodex => "gpt-5.5",
+            Self::AnthropicSubscription => "claude-sonnet-4-6",
         }
     }
 }
@@ -87,6 +93,7 @@ impl fmt::Display for ProviderArg {
             Self::Openrouter => "openrouter",
             Self::GithubCopilot => "github-copilot",
             Self::OpenAiCodex => "openai-codex",
+            Self::AnthropicSubscription => "anthropic-subscription",
         })
     }
 }
@@ -904,6 +911,8 @@ pub enum LoginProvider {
     GithubCopilot,
     #[value(name = "openai-codex", alias = "codex")]
     OpenAiCodex,
+    #[value(name = "anthropic-subscription", alias = "claude-sub")]
+    AnthropicSubscription,
 }
 
 #[derive(Clone, Debug)]
@@ -929,6 +938,8 @@ pub struct Config {
     /// decrypting auth.json both times. `None` for non-Copilot providers.
     pub copilot_auth: Option<Arc<CopilotAuth>>,
     pub codex_auth: Option<Arc<OpenAiCodexAuth>>,
+    /// Shared subscription credential lifecycle (loaded only for this provider).
+    pub anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
 }
 
 impl Config {
@@ -960,6 +971,9 @@ impl Config {
         let mut config = Self::resolve_from_file(cli, &file, path, env_api_key)?;
         config.copilot_auth = copilot_auth;
         config.codex_auth = codex_auth;
+        config.anthropic_auth = (effective_provider == Some(ProviderArg::AnthropicSubscription))
+            .then(|| AnthropicSubscriptionAuth::from_default().map(Arc::new))
+            .transpose()?;
         // The static Copilot fallback model may not be entitled to this
         // account.  When no model was chosen explicitly, prefer the first
         // catalog model the signed-in account can actually use; the choice
@@ -987,7 +1001,9 @@ impl Config {
         Self::resolve_from_file(cli, &file, path, |provider| match provider {
             ProviderArg::OpencodeGo => opencode_go_key.or(opencode_key).map(str::to_owned),
             ProviderArg::Openrouter => openrouter_key.map(str::to_owned),
-            ProviderArg::GithubCopilot | ProviderArg::OpenAiCodex => None,
+            ProviderArg::GithubCopilot
+            | ProviderArg::OpenAiCodex
+            | ProviderArg::AnthropicSubscription => None,
         })
     }
 
@@ -1017,7 +1033,7 @@ impl Config {
         };
         let provider = cli.provider.or(file_provider).ok_or_else(|| {
             anyhow!(
-                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go      OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter       OpenRouter; set OPENROUTER_API_KEY\n  github-copilot   GitHub Copilot; run `harness login github-copilot`\n  openai-codex     OpenAI Codex; run `harness login openai-codex`",
+                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go      OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter       OpenRouter; set OPENROUTER_API_KEY\n  github-copilot   GitHub Copilot; run `harness login github-copilot`\n  openai-codex     OpenAI Codex; run `harness login openai-codex`\n  anthropic-subscription  Unofficial Claude subscription; run `harness login anthropic-subscription`",
                 path.display()
             )
         })?;
@@ -1029,7 +1045,9 @@ impl Config {
             .unwrap_or_default();
         if !matches!(
             provider,
-            ProviderArg::GithubCopilot | ProviderArg::OpenAiCodex
+            ProviderArg::GithubCopilot
+                | ProviderArg::OpenAiCodex
+                | ProviderArg::AnthropicSubscription
         ) && api_key.is_empty()
         {
             return Err(anyhow!(
@@ -1109,6 +1127,7 @@ impl Config {
             // the testable forms never touch auth.json.
             copilot_auth: None,
             codex_auth: None,
+            anthropic_auth: None,
         })
     }
 }
@@ -1137,6 +1156,7 @@ pub fn build_provider_with_auths(
     name: &str,
     copilot_auth: Option<Arc<CopilotAuth>>,
     codex_auth: Option<Arc<OpenAiCodexAuth>>,
+    anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
 ) -> Result<Arc<dyn Provider>> {
     let provider = ProviderArg::from_name(name).ok_or_else(|| {
         let expected = ProviderArg::ALL
@@ -1166,6 +1186,13 @@ pub fn build_provider_with_auths(
             };
             Arc::new(GithubCopilotProvider::new(auth)) as Arc<dyn Provider>
         }
+        ProviderArg::AnthropicSubscription => {
+            let auth = match anthropic_auth {
+                Some(auth) => auth,
+                None => Arc::new(AnthropicSubscriptionAuth::from_default()?),
+            };
+            Arc::new(AnthropicSubscriptionProvider::new(auth)) as Arc<dyn Provider>
+        }
         ProviderArg::OpenAiCodex => {
             let auth = match codex_auth {
                 Some(auth) => auth,
@@ -1180,8 +1207,16 @@ pub fn build_provider_with_auths(
 pub fn provider_factory(
     copilot_auth: Option<Arc<CopilotAuth>>,
     codex_auth: Option<Arc<OpenAiCodexAuth>>,
+    anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
 ) -> agent::ProviderFactory {
-    Arc::new(move |name| build_provider_with_auths(name, copilot_auth.clone(), codex_auth.clone()))
+    Arc::new(move |name| {
+        build_provider_with_auths(
+            name,
+            copilot_auth.clone(),
+            codex_auth.clone(),
+            anthropic_auth.clone(),
+        )
+    })
 }
 
 /// Install file-only tracing when requested. stdout is intentionally left
@@ -1310,6 +1345,11 @@ mod tests {
     #[test]
     fn login_provider_parses_separately_from_global_provider() {
         for (name, expected) in [
+            (
+                "anthropic-subscription",
+                LoginProvider::AnthropicSubscription,
+            ),
+            ("claude-sub", LoginProvider::AnthropicSubscription),
             ("codex", LoginProvider::OpenAiCodex),
             ("openai-codex", LoginProvider::OpenAiCodex),
             ("copilot", LoginProvider::GithubCopilot),
@@ -1376,6 +1416,31 @@ mod tests {
     }
 
     #[test]
+    fn subscription_alias_defaults_and_login_selection() {
+        for name in ["anthropic-subscription", "claude-sub"] {
+            let cli = Cli::try_parse_from(["harness", "--provider", name]).unwrap();
+            let config = Config::resolve_from_file(
+                &cli,
+                &FileConfig::default(),
+                PathBuf::from("/tmp/config.toml"),
+                |_| None,
+            )
+            .unwrap();
+            assert_eq!(config.provider, ProviderArg::AnthropicSubscription);
+            assert_eq!(config.model, "claude-sonnet-4-6");
+            assert_eq!(ProviderArg::from_name(name), Some(config.provider));
+        }
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        assert!(select_provider_after_login_at(&path, ProviderArg::AnthropicSubscription).unwrap());
+        assert_eq!(
+            load_file_config(&path).unwrap().provider.as_deref(),
+            Some("anthropic-subscription")
+        );
+        assert!(!select_provider_after_login_at(&path, ProviderArg::OpenAiCodex).unwrap());
+    }
+
+    #[test]
     fn copilot_resolves_without_an_api_key() {
         let cli = Cli {
             provider: Some(ProviderArg::GithubCopilot),
@@ -1408,9 +1473,10 @@ mod tests {
             PathBuf::from("/tmp/harness-config.toml"),
             |provider| match provider {
                 ProviderArg::Openrouter => Some("secret".into()),
-                ProviderArg::OpencodeGo | ProviderArg::GithubCopilot | ProviderArg::OpenAiCodex => {
-                    None
-                }
+                ProviderArg::OpencodeGo
+                | ProviderArg::GithubCopilot
+                | ProviderArg::OpenAiCodex
+                | ProviderArg::AnthropicSubscription => None,
             },
         )
         .unwrap();

@@ -193,11 +193,16 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     // auth.json. OAuth providers remain constructible without credentials so
     // their local model catalogs work before login.
     let copilot_auth = config.copilot_auth.clone();
-    let provider_factory = provider_factory(copilot_auth.clone(), config.codex_auth.clone());
+    let provider_factory = provider_factory(
+        copilot_auth.clone(),
+        config.codex_auth.clone(),
+        config.anthropic_auth.clone(),
+    );
     let provider: Arc<dyn Provider> = build_provider_with_auths(
         &config.provider.to_string(),
         copilot_auth.clone(),
         config.codex_auth.clone(),
+        config.anthropic_auth.clone(),
     )?;
     let provider_name = provider.name().to_owned();
 
