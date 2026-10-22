@@ -113,14 +113,16 @@ impl Agent {
         let mut overflow_recoveries = 0;
         loop {
             let tool_snapshot = self.tools.snapshot();
+            let mut system = system_prompt_with_workspace_context(
+                &self.tools.workspace_root().display().to_string(),
+                &tool_snapshot.prompt_context,
+                self.tools.skills(),
+                &self.project_context,
+            );
+            system.push_str(self.prewalk_prompt_suffix());
             let request = CompletionRequest {
                 model: self.model.clone(),
-                system: Some(system_prompt_with_workspace_context(
-                    &self.tools.workspace_root().display().to_string(),
-                    &tool_snapshot.prompt_context,
-                    self.tools.skills(),
-                    &self.project_context,
-                )),
+                system: Some(system),
                 messages: self.history.clone(),
                 tools: tool_snapshot.definitions,
                 max_tokens: None,
@@ -420,7 +422,8 @@ impl Agent {
                 return Ok(());
             }
 
-            self.dispatch_tool_batches(tool_calls, events, input, cancel)
+            let handoff = self
+                .dispatch_tool_batches(tool_calls, events, input, cancel)
                 .await?;
             // The dispatcher marks the turn-scoped token when tool
             // execution is interrupted. Do not issue another provider
@@ -432,6 +435,11 @@ impl Agent {
             // observed. That exact snapshot no longer describes the next
             // request, so use the complete-history estimator instead.
             self.last_context_tokens = None;
+            // The tool round is durable, so the next request can come from
+            // the prewalk target without splitting a call from its result.
+            if handoff {
+                self.prewalk_handoff(events).await?;
+            }
         }
     }
 }

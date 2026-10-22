@@ -70,8 +70,9 @@ use crate::paths::{self, AtPrefix};
 use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
 use crate::{
-    ContextFileEntry, InputMessage, ModelEntry, SessionListEntry, SessionSnapshotEntry, SkillEntry,
-    StartupEntries, SubscriptionUsage, SubscriptionUsageWindow, UiEvent,
+    ContextFileEntry, InputMessage, ModelEntry, PrewalkChange, SessionListEntry,
+    SessionSnapshotEntry, SkillEntry, StartupEntries, SubscriptionUsage, SubscriptionUsageWindow,
+    UiEvent,
 };
 use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
@@ -348,6 +349,12 @@ pub struct CrossTerm {
     model: String,
     provider: String,
     reasoning: String,
+    /// Whether this conversation has a pending prewalk handoff.
+    prewalk_armed: bool,
+    /// Prewalk target as `[<provider>:]<model>`, once the agent reports one.
+    prewalk_target: Option<String>,
+    /// Prewalk target reasoning; `None` keeps the active level.
+    prewalk_reasoning: Option<String>,
     environment: EnvironmentInfo,
     /// Skip the welcome banner and metadata while retaining normal turn UI.
     minimal: bool,
@@ -470,6 +477,9 @@ impl CrossTerm {
             model: model.to_owned(),
             provider: provider.to_owned(),
             reasoning: "auto".to_owned(),
+            prewalk_armed: false,
+            prewalk_target: None,
+            prewalk_reasoning: None,
             environment,
             minimal: false,
             width,
@@ -1495,6 +1505,25 @@ impl CrossTerm {
         Ok(())
     }
 
+    /// Show a prewalk model switch; it is not a user selection.
+    fn apply_prewalk_switch(
+        &mut self,
+        label: &str,
+        provider: String,
+        model: String,
+        reasoning: Option<String>,
+    ) {
+        self.provider = provider;
+        self.model = model;
+        if let Some(reasoning) = reasoning {
+            self.reasoning = reasoning;
+        }
+        self.add_notice(format!(
+            "{label} → {} · {} · reasoning {}",
+            self.provider, self.model, self.reasoning
+        ));
+    }
+
     fn submit_command(
         &mut self,
         input: &str,
@@ -1516,6 +1545,38 @@ impl CrossTerm {
             self.add_notice(format!(
                 "usage: /model [<provider>:]<model> (current: {} · {})",
                 self.provider, self.model
+            ));
+            return Ok(());
+        }
+        if matches!(&command, ParsedCommand::SetPrewalk { enabled: None }) {
+            let reasoning = self
+                .prewalk_reasoning
+                .as_deref()
+                .unwrap_or(commands::PREWALK_INHERIT);
+            let state = match (self.prewalk_armed, &self.prewalk_target) {
+                (true, Some(target)) => format!("on → {target} · reasoning {reasoning}"),
+                (_, Some(target)) => format!("off, target {target} · reasoning {reasoning}"),
+                (_, None) => "off, no target".to_owned(),
+            };
+            self.add_notice(format!("usage: /prewalk [on|off] (current: {state})"));
+            return Ok(());
+        }
+        if matches!(&command, ParsedCommand::SetPrewalkReasoning { level: None }) {
+            self.add_notice(format!(
+                "usage: /prewalk-reasoning [inherit|auto|off|minimal|low|medium|high|maximum] (current: {})",
+                self.prewalk_reasoning.as_deref().unwrap_or(commands::PREWALK_INHERIT)
+            ));
+            return Ok(());
+        }
+        if let ParsedCommand::SetPrewalkModel {
+            provider: None,
+            model,
+        } = &command
+            && model.is_empty()
+        {
+            self.add_notice(format!(
+                "usage: /prewalk-model [<provider>:]<model> (current: {})",
+                self.prewalk_target.as_deref().unwrap_or("none")
             ));
             return Ok(());
         }
@@ -1548,7 +1609,7 @@ impl CrossTerm {
                     commands::COMMANDS
                         .iter()
                         .map(|spec| {
-                            format!("{:<10} {}  ({})", spec.name, spec.description, spec.usage)
+                            format!("{:<18} {}  ({})", spec.name, spec.description, spec.usage)
                         })
                         .collect::<Vec<_>>()
                         .join("\n"),
@@ -1571,6 +1632,34 @@ impl CrossTerm {
                 InputMessage::SetReasoning { level }
             }
             ParsedCommand::SetReasoning { level: None } => unreachable!("handled above"),
+            ParsedCommand::SetPrewalk {
+                enabled: Some(enabled),
+            } => InputMessage::SetPrewalk { enabled },
+            ParsedCommand::SetPrewalk { enabled: None } => unreachable!("handled above"),
+            ParsedCommand::SetPrewalkModel { provider, model } => {
+                // Match the config rule: a prefix is a provider only when it
+                // is known, so `vendor/model:free` stays one model id.
+                match provider {
+                    Some(provider)
+                        if !self
+                            .providers
+                            .iter()
+                            .any(|known| known.eq_ignore_ascii_case(&provider)) =>
+                    {
+                        InputMessage::SetPrewalkModel {
+                            provider: None,
+                            model: format!("{provider}:{model}"),
+                        }
+                    }
+                    provider => InputMessage::SetPrewalkModel { provider, model },
+                }
+            }
+            ParsedCommand::SetPrewalkReasoning { level: Some(level) } => {
+                InputMessage::SetPrewalkReasoning {
+                    level: (level != commands::PREWALK_INHERIT).then_some(level),
+                }
+            }
+            ParsedCommand::SetPrewalkReasoning { level: None } => unreachable!("handled above"),
             ParsedCommand::Usage => InputMessage::SubscriptionUsage,
             ParsedCommand::InvokeSkill { name, .. } => InputMessage::InvokeSkill { name },
             ParsedCommand::Skills => {
@@ -1773,6 +1862,53 @@ impl CrossTerm {
             UiEvent::ReasoningChanged { level } => {
                 self.reasoning = level;
                 self.add_notice(format!("Reasoning effort: {}", self.reasoning));
+            }
+            UiEvent::PrewalkChanged {
+                armed,
+                target,
+                reasoning,
+                change,
+            } => {
+                let was_armed = std::mem::replace(&mut self.prewalk_armed, armed);
+                self.prewalk_target = target;
+                self.prewalk_reasoning = reasoning;
+                let target = self.prewalk_target.as_deref().unwrap_or("none");
+                let notice = match change {
+                    PrewalkChange::Enabled if armed => Some(format!("Prewalk on → {target}")),
+                    PrewalkChange::Enabled => Some("Prewalk off".to_owned()),
+                    PrewalkChange::Target if armed => {
+                        Some(format!("Prewalk target: {target} (armed)"))
+                    }
+                    PrewalkChange::Target => Some(format!("Prewalk target: {target}")),
+                    PrewalkChange::Reasoning => Some(format!(
+                        "Prewalk reasoning effort: {}",
+                        self.prewalk_reasoning
+                            .as_deref()
+                            .unwrap_or(commands::PREWALK_INHERIT)
+                    )),
+                    // Startup reports a configured target without a notice.
+                    PrewalkChange::Session if armed == was_armed => None,
+                    PrewalkChange::Session if armed => Some(format!("Prewalk armed → {target}")),
+                    PrewalkChange::Session => Some("Prewalk disarmed".to_owned()),
+                };
+                if let Some(notice) = notice {
+                    self.add_notice(notice);
+                }
+            }
+            UiEvent::PrewalkHandoff {
+                provider,
+                model,
+                reasoning,
+            } => {
+                self.prewalk_armed = false;
+                self.apply_prewalk_switch("Prewalk handoff", provider, model, reasoning);
+            }
+            UiEvent::PrewalkRestored {
+                provider,
+                model,
+                reasoning,
+            } => {
+                self.apply_prewalk_switch("Prewalk planning model", provider, model, reasoning);
             }
             UiEvent::ModelList { provider, models } => {
                 self.model_lists.insert(provider, models);

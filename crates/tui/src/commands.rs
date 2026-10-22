@@ -12,6 +12,10 @@ pub enum ArgumentKind {
     None,
     Model,
     Reasoning,
+    /// `on` or `off`.
+    Toggle,
+    /// `inherit` or a reasoning level.
+    PrewalkReasoning,
     Session,
     Path,
     Skill,
@@ -81,6 +85,24 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::Reasoning,
     },
     CommandSpec {
+        name: "/prewalk",
+        description: "Hand off to the prewalk model after the first edit",
+        usage: "/prewalk [on|off]",
+        argument_kind: ArgumentKind::Toggle,
+    },
+    CommandSpec {
+        name: "/prewalk-model",
+        description: "Set the model that prewalk hands off to",
+        usage: "/prewalk-model [<provider>:]<model>",
+        argument_kind: ArgumentKind::Model,
+    },
+    CommandSpec {
+        name: "/prewalk-reasoning",
+        description: "Set the reasoning effort that prewalk hands off with",
+        usage: "/prewalk-reasoning [inherit|auto|off|minimal|low|medium|high|maximum]",
+        argument_kind: ArgumentKind::PrewalkReasoning,
+    },
+    CommandSpec {
         name: "/usage",
         description: "Show active subscription allowance usage",
         usage: "/usage",
@@ -99,6 +121,9 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::None,
     },
 ];
+
+/// `/prewalk-reasoning` value that keeps the active reasoning at handoff.
+pub const PREWALK_INHERIT: &str = "inherit";
 
 /// Canonical portable reasoning policies, in suggestion order.
 pub const REASONING_LEVELS: &[&str] =
@@ -160,6 +185,19 @@ pub enum ParsedCommand {
         model: String,
     },
     SetReasoning {
+        level: Option<String>,
+    },
+    /// `None` is the bare command, which only reports the current state.
+    SetPrewalk {
+        enabled: Option<bool>,
+    },
+    /// An empty model is the bare command, which only reports the target.
+    SetPrewalkModel {
+        provider: Option<String>,
+        model: String,
+    },
+    /// `None` is the bare command; `inherit` keeps the active level.
+    SetPrewalkReasoning {
         level: Option<String>,
     },
     Usage,
@@ -275,34 +313,61 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 _ => Err(usage.to_owned()),
             }
         }
-        "/model" => {
-            let Some(token) = words.next() else {
-                // A bare command is represented explicitly so the TUI can
-                // provide a useful hint without sending anything to the agent.
-                return Ok(ParsedCommand::SetModel {
-                    provider: None,
-                    model: String::new(),
-                });
-            };
-            if words.next().is_some() {
-                return Err("usage: /model [<provider>:]<model>".into());
-            }
-            if let Some((provider, model)) = token.split_once(':') {
-                if provider.is_empty() || model.is_empty() {
-                    return Err("usage: /model [<provider>:]<model>".into());
-                }
-                Ok(ParsedCommand::SetModel {
-                    provider: Some(provider.to_owned()),
-                    model: model.to_owned(),
-                })
-            } else {
-                Ok(ParsedCommand::SetModel {
-                    provider: None,
-                    model: token.to_owned(),
-                })
+        "/model" => parse_model_argument(words, "usage: /model [<provider>:]<model>")
+            .map(|(provider, model)| ParsedCommand::SetModel { provider, model }),
+        "/prewalk" => {
+            let values = words.collect::<Vec<_>>();
+            match values.as_slice() {
+                [] => Ok(ParsedCommand::SetPrewalk { enabled: None }),
+                [value] if value.eq_ignore_ascii_case("on") => Ok(ParsedCommand::SetPrewalk {
+                    enabled: Some(true),
+                }),
+                [value] if value.eq_ignore_ascii_case("off") => Ok(ParsedCommand::SetPrewalk {
+                    enabled: Some(false),
+                }),
+                _ => Err("usage: /prewalk [on|off]".into()),
             }
         }
+        "/prewalk-reasoning" => {
+            let values = words.collect::<Vec<_>>();
+            let usage =
+                "usage: /prewalk-reasoning [inherit|auto|off|minimal|low|medium|high|maximum]";
+            match values.as_slice() {
+                [] => Ok(ParsedCommand::SetPrewalkReasoning { level: None }),
+                [level] => std::iter::once(&PREWALK_INHERIT)
+                    .chain(REASONING_LEVELS)
+                    .find(|candidate| candidate.eq_ignore_ascii_case(level))
+                    .map(|level| ParsedCommand::SetPrewalkReasoning {
+                        level: Some((*level).to_owned()),
+                    })
+                    .ok_or_else(|| usage.to_owned()),
+                _ => Err(usage.to_owned()),
+            }
+        }
+        "/prewalk-model" => {
+            parse_model_argument(words, "usage: /prewalk-model [<provider>:]<model>")
+                .map(|(provider, model)| ParsedCommand::SetPrewalkModel { provider, model })
+        }
         _ => Err(format!("unknown command: {command}")),
+    }
+}
+
+/// Parse one `[<provider>:]<model>` token. A missing token yields an empty
+/// model, so the TUI can show a hint without sending anything to the agent.
+fn parse_model_argument<'a>(
+    mut words: impl Iterator<Item = &'a str>,
+    usage: &str,
+) -> Result<(Option<String>, String), String> {
+    let Some(token) = words.next() else {
+        return Ok((None, String::new()));
+    };
+    if words.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    match token.split_once(':') {
+        Some((provider, model)) if provider.is_empty() || model.is_empty() => Err(usage.to_owned()),
+        Some((provider, model)) => Ok((Some(provider.to_owned()), model.to_owned())),
+        None => Ok((None, token.to_owned())),
     }
 }
 
@@ -445,6 +510,19 @@ pub fn candidates_at_cursor(
             model_candidates(query, providers, model_lists, current_provider)
         }
         CompletionTarget::Argument(ArgumentKind::Reasoning) => reasoning_candidates(query),
+        CompletionTarget::Argument(ArgumentKind::Toggle) => toggle_candidates(query),
+        CompletionTarget::Argument(ArgumentKind::PrewalkReasoning) => {
+            let mut candidates = Vec::new();
+            if PREWALK_INHERIT.starts_with(&query.to_ascii_lowercase()) {
+                candidates.push(Candidate {
+                    value: PREWALK_INHERIT.to_owned(),
+                    description: "Keep the active reasoning effort".to_owned(),
+                    kind: CandidateKind::Slash,
+                });
+            }
+            candidates.extend(reasoning_candidates(query));
+            candidates
+        }
         CompletionTarget::Argument(ArgumentKind::Session) => session_candidates(query, sessions),
         CompletionTarget::Argument(ArgumentKind::Skill) => skill_candidates(query, skills),
         CompletionTarget::Argument(ArgumentKind::Path)
@@ -559,6 +637,25 @@ fn command_candidates(query: &str, skills: &[SkillEntry]) -> Vec<Candidate> {
         });
     }
     candidates
+}
+
+fn toggle_candidates(query: &str) -> Vec<Candidate> {
+    let query = query.to_ascii_lowercase();
+    [
+        ("on", "Arm the handoff and enable it for new conversations"),
+        (
+            "off",
+            "Cancel the handoff and disable it for new conversations",
+        ),
+    ]
+    .into_iter()
+    .filter(|(value, _)| value.starts_with(&query))
+    .map(|(value, description)| Candidate {
+        value: value.to_owned(),
+        description: description.to_owned(),
+        kind: CandidateKind::Slash,
+    })
+    .collect()
 }
 
 fn reasoning_candidates(query: &str) -> Vec<Candidate> {
@@ -1027,6 +1124,11 @@ mod tests {
         assert!(values.contains(&"opencode-go:".into()));
         assert!(values.contains(&"openrouter:".into()));
         assert!(values.contains(&"opencode-go:gpt-5.6-luna".into()));
+        // The prewalk target uses the same provider and model completion.
+        assert_eq!(
+            candidates("/prewalk-model ", &providers(), &lists, "opencode-go"),
+            candidates("/model ", &providers(), &lists, "opencode-go")
+        );
     }
 
     #[test]
@@ -1453,6 +1555,35 @@ mod tests {
         assert_eq!(
             parse_command("/model one two"),
             Err("usage: /model [<provider>:]<model>".into())
+        );
+        assert_eq!(
+            parse_command("/prewalk OFF"),
+            Ok(ParsedCommand::SetPrewalk {
+                enabled: Some(false)
+            })
+        );
+        assert_eq!(
+            parse_command("/prewalk maybe"),
+            Err("usage: /prewalk [on|off]".into())
+        );
+        assert_eq!(
+            parse_command("/prewalk-reasoning Inherit"),
+            Ok(ParsedCommand::SetPrewalkReasoning {
+                level: Some("inherit".into())
+            })
+        );
+        assert_eq!(
+            parse_command("/prewalk-reasoning LOW"),
+            Ok(ParsedCommand::SetPrewalkReasoning {
+                level: Some("low".into())
+            })
+        );
+        assert_eq!(
+            parse_command("/prewalk-model openrouter:openai/demo:free"),
+            Ok(ParsedCommand::SetPrewalkModel {
+                provider: Some("openrouter".into()),
+                model: "openai/demo:free".into()
+            })
         );
         assert_eq!(parse_command("/foo"), Err("unknown command: /foo".into()));
     }

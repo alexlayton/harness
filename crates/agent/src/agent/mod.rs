@@ -21,6 +21,7 @@ mod commands;
 mod compaction;
 mod events;
 mod persistence;
+mod prewalk;
 mod tool_dispatch;
 mod turn;
 
@@ -31,6 +32,8 @@ pub use events::{
 };
 pub use persistence::AgentSessionState;
 use persistence::{ui_snapshot_entries, usage_event};
+use prewalk::PrewalkState;
+pub use prewalk::{PrewalkChange, PrewalkSettings, PrewalkTarget};
 pub use tool_dispatch::SubagentLimits;
 pub(crate) use tool_dispatch::{
     CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
@@ -114,6 +117,8 @@ pub struct Agent {
     /// on the agent lets model changes remain non-blocking while the run loop
     /// applies ready results at every operation boundary.
     model_metadata_tx: Option<mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>>,
+    /// One-shot planning-to-implementation model handoff.
+    prewalk: PrewalkState,
 }
 
 impl Agent {
@@ -145,6 +150,7 @@ impl Agent {
             subagent_limits: SubagentLimits::default(),
             subagent_runner: None,
             model_metadata_tx: None,
+            prewalk: PrewalkState::default(),
         }
     }
 
@@ -398,6 +404,9 @@ impl Agent {
             self.context_window = self.compaction.resolved_window(0);
         }
         send(&events, self.context_usage_event());
+        if self.prewalk.is_configured() {
+            self.send_prewalk_state(PrewalkChange::Session, &events);
+        }
         // Begin one model metadata request without placing it on the
         // first-turn critical path. The same result supplies both the model
         // catalogue and the selected model's context window; model switches
@@ -499,11 +508,19 @@ impl Agent {
                 }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
+                    // After a handoff, a new prewalk cycle starts again from
+                    // the planning model unless the user chose another one.
+                    match self.restore_prewalk_for_new_session(&events).await {
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
+                    }
                     self.handle_new_session(&events);
+                    self.rearm_prewalk_for_new_session(&events);
                     continue;
                 }
                 InputMessage::LoadSession { selector } => {
                     self.handle_load_session(selector, &events);
+                    self.disarm_prewalk_for_loaded_session(&events);
                     continue;
                 }
                 InputMessage::ListSessions => {
@@ -533,6 +550,7 @@ impl Agent {
                     continue;
                 }
                 InputMessage::SetModel { provider, model } => {
+                    self.prewalk.forget_restore();
                     // Model changes persist first and commit atomically;
                     // failures leave parent and subagent selection unchanged
                     // and surface one terminal event via quarantine.
@@ -546,7 +564,23 @@ impl Agent {
                     continue;
                 }
                 InputMessage::SetReasoning { level } => {
+                    self.prewalk.forget_restore();
                     self.handle_set_reasoning(level, &events);
+                    continue;
+                }
+                InputMessage::SetPrewalkReasoning { level } => {
+                    self.handle_set_prewalk_reasoning(level, &events);
+                    continue;
+                }
+                InputMessage::SetPrewalk { enabled } => {
+                    match self.handle_set_prewalk(enabled, &events).await {
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
+                    }
+                    continue;
+                }
+                InputMessage::SetPrewalkModel { provider, model } => {
+                    self.handle_set_prewalk_model(provider, model, &events);
                     continue;
                 }
                 InputMessage::ListModels { provider } => {

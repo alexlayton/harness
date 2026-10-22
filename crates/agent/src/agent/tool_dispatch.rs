@@ -1,4 +1,5 @@
 use super::InputMessage;
+use super::prewalk::triggers_handoff;
 use super::{Agent, AgentEvent, AgentSessionState, TurnError, send};
 use crate::code_mode::{AgentCodeModeExecutor, NestedEventSink, NestedNotification};
 use crate::secrets::SecretMasker;
@@ -195,6 +196,8 @@ struct AgentToolDispatchHooks<'a> {
     session: Option<&'a mut AgentSessionState>,
     secrets: &'a SecretMasker,
     nested_starts: HashMap<String, (String, Instant)>,
+    /// A nested code-mode call that ends the prewalk planning phase.
+    nested_handoff: bool,
 }
 
 impl<'a> AgentToolDispatchHooks<'a> {
@@ -208,6 +211,7 @@ impl<'a> AgentToolDispatchHooks<'a> {
             session,
             secrets,
             nested_starts: HashMap::new(),
+            nested_handoff: false,
         }
     }
 }
@@ -322,6 +326,7 @@ impl ToolDispatchHooks for AgentToolDispatchHooks<'_> {
                 name,
                 arguments,
             } => {
+                self.nested_handoff |= triggers_handoff(&name);
                 self.nested_starts
                     .insert(call_id.clone(), (name.clone(), Instant::now()));
                 send_started(
@@ -718,13 +723,17 @@ impl Agent {
     /// synthetic start + cancelled finish pair so every frontend sees a
     /// balanced lifecycle; all of them still receive failed tool results in
     /// parent history so provider history stays valid.
+    ///
+    /// Returns whether the round called a tool that ends the prewalk
+    /// planning phase, directly or through code mode.
     pub(crate) async fn dispatch_tool_batches(
         &mut self,
         tool_calls: Vec<ToolCall>,
         events: &mpsc::UnboundedSender<AgentEvent>,
         input: &mut mpsc::UnboundedReceiver<InputMessage>,
         cancel: &CancellationToken,
-    ) -> Result<(), TurnError> {
+    ) -> Result<bool, TurnError> {
+        let mut handoff = tool_calls.iter().any(|call| triggers_handoff(&call.name));
         let mut batches = plan_tool_batches_with_secrets(
             tool_calls,
             &self.tools,
@@ -774,6 +783,7 @@ impl Agent {
             )
             .await;
             drop(control);
+            handoff |= hooks.nested_handoff;
             drop(hooks);
             if let Some(error) = outcome.nested_error {
                 return Err(TurnError::Persist(error));
@@ -844,10 +854,10 @@ impl Agent {
                 if reason == DispatchCancellation::Shutdown {
                     return Err(TurnError::Shutdown);
                 }
-                return Ok(());
+                return Ok(handoff);
             }
         }
-        Ok(())
+        Ok(handoff)
     }
 }
 

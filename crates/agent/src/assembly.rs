@@ -5,7 +5,8 @@
 //! Hosts also select stream recovery to match incremental or final-only output.
 
 use crate::agent::{
-    Agent, AgentEvent, InputMessage, ProviderFactory, StreamRecovery, SubagentLimits,
+    Agent, AgentEvent, InputMessage, PrewalkSettings, ProviderFactory, StreamRecovery,
+    SubagentLimits,
 };
 use crate::secrets::SecretMasker;
 use crate::subagent::SubagentRunnerImpl;
@@ -55,6 +56,7 @@ pub struct AgentBuilder {
     secret_masker: Arc<SecretMasker>,
     mcp_servers: Vec<mcp::McpServerConfig>,
     code_mode: Option<Vec<String>>,
+    prewalk: PrewalkSettings,
 }
 
 impl AgentBuilder {
@@ -81,6 +83,7 @@ impl AgentBuilder {
             secret_masker: Arc::new(SecretMasker::default()),
             mcp_servers: Vec::new(),
             code_mode: None,
+            prewalk: PrewalkSettings::default(),
         }
     }
 
@@ -124,6 +127,12 @@ impl AgentBuilder {
     /// Attach the resolved exact-value secret policy.
     pub fn with_secret_masker(mut self, secret_masker: Arc<SecretMasker>) -> Self {
         self.secret_masker = secret_masker;
+        self
+    }
+
+    /// Configure the one-shot prewalk handoff for this agent.
+    pub fn with_prewalk(mut self, settings: PrewalkSettings) -> Self {
+        self.prewalk = settings;
         self
     }
 
@@ -251,7 +260,8 @@ impl AgentBuilder {
             .with_compaction(self.compaction)
             .with_subagent_limits(SubagentLimits {
                 max_concurrent: self.subagents.max_concurrent,
-            });
+            })
+            .with_prewalk(self.prewalk);
         if let Some(factory) = self.provider_factory {
             agent = agent.with_provider_factory(factory);
         }

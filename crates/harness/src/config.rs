@@ -1,5 +1,6 @@
 use agent::assembly::SubagentPolicy;
 use agent::secrets::SecretMasker;
+use agent::{PrewalkSettings, PrewalkTarget};
 use anyhow::{Context, Result, anyhow};
 use auth::OpenAiCodexAuth;
 use auth::{CopilotAuth, sku_from_proxy_token};
@@ -132,6 +133,90 @@ pub struct CodeModeConfig {
     /// Tool names to expose; an empty list selects all eligible tools.
     #[serde(default)]
     pub tools: Vec<String>,
+}
+
+/// One-shot planning-to-implementation handoff settings parsed from `[prewalk]`.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrewalkConfig {
+    /// Arm prewalk for each new conversation. Resumed sessions stay unarmed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Handoff target as `[<provider>:]<model>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Target reasoning effort; absent keeps the active policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningPolicy>,
+}
+
+impl PrewalkConfig {
+    fn validate(&self) -> Result<()> {
+        match &self.model {
+            Some(model) => {
+                parse_prewalk_target(model).context("[prewalk].model")?;
+            }
+            None if self.enabled => {
+                return Err(anyhow!("[prewalk].enabled requires [prewalk].model"));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+}
+
+/// Parse `[<provider>:]<model>`. A prefix is a provider only when Harness
+/// knows it, so model ids such as `vendor/model:free` keep their colon.
+pub fn parse_prewalk_target(value: &str) -> Result<PrewalkTarget> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("prewalk model must not be blank"));
+    }
+    if let Some((provider, model)) = value.split_once(':')
+        && let Some(provider) = ProviderArg::from_name(provider)
+    {
+        if model.is_empty() {
+            return Err(anyhow!("prewalk model must not be blank"));
+        }
+        return Ok(PrewalkTarget {
+            provider: Some(provider.to_string()),
+            model: model.to_owned(),
+        });
+    }
+    Ok(PrewalkTarget {
+        provider: None,
+        model: value.to_owned(),
+    })
+}
+
+/// Resolved prewalk preference plus any explicit startup request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PrewalkPolicy {
+    /// Persisted preference for new conversations.
+    pub enabled: bool,
+    pub target: Option<PrewalkTarget>,
+    /// Target reasoning; `None` keeps the active policy.
+    pub reasoning: Option<ReasoningPolicy>,
+    /// Explicit `--prewalk[=BOOL]` or `--prewalk-model` request.
+    pub requested: Option<bool>,
+}
+
+impl PrewalkPolicy {
+    /// Agent settings for the startup conversation. The preference arms new
+    /// sessions only; an explicit request also arms a resumed one.
+    pub fn settings(&self, resumed: bool) -> Result<PrewalkSettings> {
+        let armed = self.requested.unwrap_or(self.enabled && !resumed);
+        if armed && self.target.is_none() {
+            return Err(anyhow!(
+                "prewalk requires a target model: set [prewalk].model or pass --prewalk-model"
+            ));
+        }
+        Ok(PrewalkSettings {
+            enabled: self.enabled,
+            target: self.target.clone(),
+            armed,
+            reasoning: self.reasoning,
+        })
+    }
 }
 
 /// Terminal UI presentation settings parsed from `[tui]`.
@@ -290,6 +375,9 @@ pub struct FileConfig {
     /// Terminal UI presentation settings (`[tui]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<TuiConfig>,
+    /// Prewalk handoff settings (`[prewalk]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prewalk: Option<PrewalkConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -309,6 +397,7 @@ impl PartialEq for FileConfig {
             && self.secrets == other.secrets
             && self.mcp == other.mcp
             && self.tui == other.tui
+            && self.prewalk == other.prewalk
             && self.extra == other.extra
     }
 }
@@ -398,6 +487,9 @@ impl FileConfig {
         }
         if let Some(mcp) = &self.mcp {
             mcp.validate().map_err(|error| anyhow!(error))?;
+        }
+        if let Some(prewalk) = &self.prewalk {
+            prewalk.validate()?;
         }
         Ok(())
     }
@@ -583,6 +675,74 @@ pub fn save_reasoning_at(path: &Path, reasoning: ReasoningPolicy) -> Result<()> 
     })
 }
 
+/// Persist `/prewalk on|off` while retaining other settings. `fallback_model`
+/// is written only when no model is saved, so enabling keeps the config valid
+/// without replacing a saved target with a process-only `--prewalk-model`.
+pub fn save_prewalk_enabled(enabled: bool, fallback_model: Option<&str>) -> Result<()> {
+    save_prewalk_enabled_at(&config_path(), enabled, fallback_model)
+}
+
+/// Path-injectable form of [`save_prewalk_enabled`].
+pub fn save_prewalk_enabled_at(
+    path: &Path,
+    enabled: bool,
+    fallback_model: Option<&str>,
+) -> Result<()> {
+    update_prewalk_table(path, |table| {
+        if let Some(model) = fallback_model
+            && !table.contains_key("model")
+        {
+            table.insert("model", toml_edit::value(model));
+        }
+        table.insert("enabled", toml_edit::value(enabled));
+    })
+}
+
+/// Persist `/prewalk-model` while retaining other settings.
+pub fn save_prewalk_model(model: &str) -> Result<()> {
+    save_prewalk_model_at(&config_path(), model)
+}
+
+/// Path-injectable form of [`save_prewalk_model`].
+pub fn save_prewalk_model_at(path: &Path, model: &str) -> Result<()> {
+    update_prewalk_table(path, |table| {
+        table.insert("model", toml_edit::value(model));
+    })
+}
+
+fn update_prewalk_table(
+    path: &Path,
+    update: impl FnOnce(&mut dyn toml_edit::TableLike),
+) -> Result<()> {
+    update_config_document(path, |document| {
+        let table = document
+            .entry("prewalk")
+            .or_insert_with(toml_edit::table)
+            .as_table_like_mut()
+            .ok_or_else(|| anyhow!("[prewalk] in config is not a table"))?;
+        update(table);
+        Ok(())
+    })
+}
+
+/// Persist `/prewalk-reasoning`; `None` removes the key so the handoff keeps
+/// the active reasoning policy.
+pub fn save_prewalk_reasoning(reasoning: Option<ReasoningPolicy>) -> Result<()> {
+    save_prewalk_reasoning_at(&config_path(), reasoning)
+}
+
+/// Path-injectable prewalk reasoning save used by tests.
+pub fn save_prewalk_reasoning_at(path: &Path, reasoning: Option<ReasoningPolicy>) -> Result<()> {
+    update_prewalk_table(path, |table| match reasoning {
+        Some(reasoning) => {
+            table.insert("reasoning_effort", toml_edit::value(reasoning.as_str()));
+        }
+        None => {
+            table.remove("reasoning_effort");
+        }
+    })
+}
+
 /// Select an OAuth provider after login when the user has not already made a
 /// choice. Login must never unexpectedly replace an existing provider.
 pub fn select_provider_after_login(provider: ProviderArg) -> Result<bool> {
@@ -754,6 +914,25 @@ pub struct Cli {
     #[arg(long = "reasoning-effort", value_name = "LEVEL", global = true)]
     pub reasoning_effort: Option<ReasoningPolicy>,
 
+    /// Arm prewalk for the startup conversation; `--prewalk=false` keeps it off.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        global = true
+    )]
+    pub prewalk: Option<bool>,
+
+    /// Prewalk target as `[<provider>:]<model>`; also arms the startup conversation.
+    #[arg(long = "prewalk-model", value_name = "MODEL", global = true)]
+    pub prewalk_model: Option<String>,
+
+    /// Override the reasoning effort that prewalk hands off with.
+    #[arg(long = "prewalk-reasoning-effort", value_name = "LEVEL", global = true)]
+    pub prewalk_reasoning_effort: Option<ReasoningPolicy>,
+
     /// Disable AGENTS.md / CLAUDE.md project-context injection.
     #[arg(long = "no-context-files", default_value_t = false, global = true)]
     pub no_context_files: bool,
@@ -923,6 +1102,8 @@ pub struct Config {
     pub mcp_servers: Vec<mcp::McpServerConfig>,
     /// Whether the interactive frontend skips its welcome header.
     pub tui_minimal: bool,
+    /// Prewalk preference, target, and explicit startup request.
+    pub prewalk: PrewalkPolicy,
     /// The Copilot credential handle loaded once during resolution. Startup
     /// used to construct `CopilotAuth::from_default()` twice — once for the
     /// entitled-model default inside `resolve`, again in `main` — reading and
@@ -1073,6 +1254,26 @@ impl Config {
                 "provider and model names cannot contain a configured secret"
             ));
         }
+        let prewalk = PrewalkPolicy {
+            enabled: file.prewalk.as_ref().is_some_and(|prewalk| prewalk.enabled),
+            target: cli
+                .prewalk_model
+                .as_deref()
+                .or_else(|| file.prewalk.as_ref()?.model.as_deref())
+                .map(parse_prewalk_target)
+                .transpose()?,
+            reasoning: cli
+                .prewalk_reasoning_effort
+                .or_else(|| file.prewalk.as_ref()?.reasoning_effort),
+            requested: cli
+                .prewalk
+                .or_else(|| cli.prewalk_model.as_ref().map(|_| true)),
+        };
+        if let Some(target) = &prewalk.target
+            && secret_masker.mask_text(&target.to_string()) != target.to_string()
+        {
+            return Err(anyhow!("prewalk model cannot contain a configured secret"));
+        }
         let mcp_servers = file
             .mcp
             .as_ref()
@@ -1105,6 +1306,7 @@ impl Config {
             secret_masker,
             mcp_servers: mcp_servers.unwrap_or_default(),
             tui_minimal: file.tui.as_ref().is_some_and(|tui| tui.minimal),
+            prewalk,
             // Only the process-wide [`Config::resolve`] loads credentials;
             // the testable forms never touch auth.json.
             copilot_auth: None,
@@ -1305,6 +1507,13 @@ mod tests {
         assert!(matches!(acp.command, Some(Command::Acp)));
         assert!(Cli::try_parse_from(["harness", "--acp"]).is_err());
         assert!(Cli::try_parse_from(["harness", "-p", "hello"]).is_err());
+
+        // A bare `--prewalk` must not consume the following subcommand.
+        let prewalk = Cli::try_parse_from(["harness", "--prewalk", "prompt", "hi"]).unwrap();
+        assert_eq!(prewalk.prewalk, Some(true));
+        assert!(matches!(prewalk.command, Some(Command::Prompt(_))));
+        let off = Cli::try_parse_from(["harness", "--prewalk=false"]).unwrap();
+        assert_eq!(off.prewalk, Some(false));
     }
 
     #[test]
@@ -1523,6 +1732,7 @@ mod tests {
             secrets: None,
             mcp: None,
             tui: Some(TuiConfig { minimal: true }),
+            prewalk: None,
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),
@@ -1555,6 +1765,42 @@ mod tests {
             saved.extra.get("future"),
             Some(&toml::Value::String("kept".into()))
         );
+
+        // Enabling without a target would make the config invalid.
+        assert!(save_prewalk_enabled_at(&path, true, None).is_err());
+        save_prewalk_model_at(&path, "openrouter:vendor/model:free").unwrap();
+        // A process-only target never replaces the saved one.
+        save_prewalk_enabled_at(&path, true, Some("openrouter:other")).unwrap();
+        save_prewalk_enabled_at(&path, false, None).unwrap();
+        save_prewalk_reasoning_at(&path, Some(ReasoningPolicy::Off)).unwrap();
+        let saved = load_file_config(&path).unwrap();
+        assert_eq!(
+            saved.prewalk,
+            Some(PrewalkConfig {
+                enabled: false,
+                model: Some("openrouter:vendor/model:free".into()),
+                reasoning_effort: Some(ReasoningPolicy::Off),
+            })
+        );
+        save_prewalk_reasoning_at(&path, None).unwrap();
+        let saved = load_file_config(&path).unwrap();
+        assert_eq!(
+            saved.prewalk.and_then(|prewalk| prewalk.reasoning_effort),
+            None
+        );
+        assert_eq!(saved.model.as_deref(), Some("router/demo"));
+    }
+
+    #[test]
+    fn prewalk_target_prefix_is_a_provider_only_when_known() {
+        let target = parse_prewalk_target("openrouter:vendor/model:free").unwrap();
+        assert_eq!(target.provider.as_deref(), Some("openrouter"));
+        assert_eq!(target.model, "vendor/model:free");
+        let target = parse_prewalk_target("vendor/model:free").unwrap();
+        assert_eq!(target.provider, None);
+        assert_eq!(target.model, "vendor/model:free");
+        assert!(parse_prewalk_target("openrouter:").is_err());
+        assert!(parse_prewalk_target("  ").is_err());
     }
 
     #[test]

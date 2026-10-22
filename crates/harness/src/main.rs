@@ -13,7 +13,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use config::{
     Cli, Command, Config, ProviderArg, WorktreeCommand, build_provider_with_auths, init_logging,
-    provider_factory, save_reasoning, save_settings,
+    provider_factory, save_prewalk_enabled, save_prewalk_model, save_prewalk_reasoning,
+    save_reasoning, save_settings,
 };
 use harness::{config, context};
 use headless::run_headless_with_prompt;
@@ -327,6 +328,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())
         .with_session(session_store, session)
+        .with_prewalk(config.prewalk.settings(cli.resume.is_some())?)
         .with_provider_factory(provider_factory);
     if let Some(tools) = &config.code_mode {
         builder = builder.with_code_mode(tools.clone());
@@ -385,6 +387,28 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
                         && let Err(error) = save_reasoning(reasoning)
                     {
                         tracing::warn!(error = %error, "could not persist reasoning setting");
+                    }
+                    // Only commands change preferences. `on` saves the target
+                    // only when none is saved, so the config stays valid.
+                    if let AgentEvent::PrewalkChanged { armed, target, reasoning, change } = &event {
+                        let saved = match change {
+                            agent::PrewalkChange::Enabled => {
+                                save_prewalk_enabled(*armed, target.as_deref())
+                            }
+                            agent::PrewalkChange::Target => target
+                                .as_deref()
+                                .map_or(Ok(()), save_prewalk_model),
+                            agent::PrewalkChange::Reasoning => reasoning
+                                .as_deref()
+                                .map(str::parse)
+                                .transpose()
+                                .map_err(|error: String| anyhow::anyhow!(error))
+                                .and_then(save_prewalk_reasoning),
+                            agent::PrewalkChange::Session => Ok(()),
+                        };
+                        if let Err(error) = saved {
+                            tracing::warn!(error = %error, "could not persist prewalk setting");
+                        }
                     }
                     if let Some(reporter) = &event_herdr_reporter {
                         match &event {

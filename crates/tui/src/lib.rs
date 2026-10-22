@@ -44,6 +44,15 @@ pub enum InputMessage {
     },
     /// Set reasoning effort for subsequent requests.
     SetReasoning { level: String },
+    /// Arm or cancel the prewalk handoff and set its preference.
+    SetPrewalk { enabled: bool },
+    /// Set the prewalk target, and provider when `provider` is present.
+    SetPrewalkModel {
+        provider: Option<String>,
+        model: String,
+    },
+    /// Set the prewalk target reasoning; `None` keeps the active level.
+    SetPrewalkReasoning { level: Option<String> },
     /// Ask the agent to fetch a provider's model list for completion.
     ListModels { provider: String },
     /// Start a turn from a discovered skill's instructions.
@@ -52,6 +61,19 @@ pub enum InputMessage {
     SubscriptionUsage,
     /// Ask the agent for the discovered-skill view (see [`UiEvent::SkillsLoaded`]).
     ListSkills,
+}
+
+/// What a [`UiEvent::PrewalkChanged`] reports, for its confirmation notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrewalkChange {
+    /// Startup or a session boundary changed the live arm state.
+    Session,
+    /// `/prewalk on|off` was applied.
+    Enabled,
+    /// `/prewalk-model` was applied.
+    Target,
+    /// `/prewalk-reasoning` was applied.
+    Reasoning,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +215,27 @@ pub enum UiEvent {
     /// Confirmed portable reasoning policy.
     ReasoningChanged {
         level: String,
+    },
+    /// Prewalk arm state and `[<provider>:]<model>` target.
+    PrewalkChanged {
+        armed: bool,
+        target: Option<String>,
+        /// Target reasoning; `None` keeps the active level.
+        reasoning: Option<String>,
+        change: PrewalkChange,
+    },
+    /// Prewalk switched the active model, and reasoning when present; this
+    /// also consumes the arm.
+    PrewalkHandoff {
+        provider: String,
+        model: String,
+        reasoning: Option<String>,
+    },
+    /// Prewalk returned to the planning model, and reasoning when present.
+    PrewalkRestored {
+        provider: String,
+        model: String,
+        reasoning: Option<String>,
     },
     /// Cached completion models for a provider.
     ModelList {
