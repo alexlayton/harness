@@ -37,6 +37,28 @@ fn block(p: &mut SubscriptionParser, index: u64, b: Value) {
 }
 
 #[test]
+fn latest_opus_models_use_adaptive_max_effort() {
+    for model in [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1",
+        "claude-opus-5",
+        "claude-sonnet-5",
+        "claude-fable-5",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+    ] {
+        let mut req = request();
+        req.model = model.into();
+        req.reasoning = ReasoningPolicy::Effort(crate::ReasoningEffort::Maximum);
+        let body: Value = serde_json::from_slice(&serialize(&req).unwrap()).unwrap();
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+}
+
+#[test]
 fn billing_matches_upstream_utf16_vectors() {
     // Generated with /root/code/pi-sub-anthropic/fingerprint.ts createClaudeBillingHeader.
     for (text, suffix) in [

@@ -9,6 +9,15 @@ use std::sync::Arc;
 /// Supported model IDs, not proof of entitlement or live availability.
 /// Context limits are model-specific; see `context_length` below.
 pub const MODELS: &[&str] = &[
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-opus-4-5",
