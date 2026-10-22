@@ -6,6 +6,7 @@ pub mod secrets;
 pub mod subagent;
 
 pub use agent::{
-    Agent, AgentEvent, CompactionReason, InputMessage, ProviderFactory, SessionListItem,
-    SessionSnapshotEntry, StreamRecovery, SubagentLimits, TurnError, spawn_model_list,
+    Agent, AgentEvent, CompactionReason, InputMessage, PrewalkChange, PrewalkSettings,
+    PrewalkTarget, ProviderFactory, SessionListItem, SessionSnapshotEntry, StreamRecovery,
+    SubagentLimits, TurnError, spawn_model_list,
 };

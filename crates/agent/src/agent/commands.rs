@@ -12,6 +12,14 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tools::SkillEntry;
 
+/// Who requested a model change. A prewalk handoff announces the model and
+/// reasoning together, so hosts do not persist it as the user's selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelChangeSource {
+    User,
+    Prewalk,
+}
+
 struct PendingModelChange {
     provider: Arc<dyn Provider>,
     canonical: String,
@@ -407,8 +415,29 @@ impl Agent {
             }
         }
 
-        self.commit_model_change(pending, events);
+        self.commit_model_change(pending, ModelChangeSource::User, events);
         TurnControl::Continue
+    }
+
+    /// Switch models inside a turn for a prewalk handoff. Returns `false`
+    /// when the switch was rejected and already reported; persistence
+    /// failures abort the turn like other durable appends.
+    pub(crate) async fn switch_model_for_prewalk(
+        &mut self,
+        provider: Option<String>,
+        model: String,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<bool, TurnError> {
+        let Some(pending) = self.handle_set_model(provider, model, events).await? else {
+            return Ok(false);
+        };
+        if let (Some(staged), Some(state)) =
+            (pending.staged_session.as_ref(), self.session.as_ref())
+        {
+            self.flush_deferred_sync_session(&state.store, staged, events)?;
+        }
+        self.commit_model_change(pending, ModelChangeSource::Prewalk, events);
+        Ok(true)
     }
 
     async fn handle_set_model(
@@ -472,6 +501,7 @@ impl Agent {
     fn commit_model_change(
         &mut self,
         pending: PendingModelChange,
+        source: ModelChangeSource,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
         let PendingModelChange {
@@ -495,13 +525,15 @@ impl Agent {
         if let Some(runner) = &self.subagent_runner {
             runner.update_model(self.provider.clone(), self.model.clone());
         }
-        send(
-            events,
-            AgentEvent::ModelChanged {
-                provider: canonical.clone(),
-                model: model.clone(),
-            },
-        );
+        if source == ModelChangeSource::User {
+            send(
+                events,
+                AgentEvent::ModelChanged {
+                    provider: canonical.clone(),
+                    model,
+                },
+            );
+        }
         // A different model may have a different context window and stale
         // token counts; reset both so the next trigger re-baselines. Metadata
         // is fetched in the background so a slow catalogue cannot block the
@@ -532,16 +564,30 @@ impl Agent {
                 return;
             }
         };
-        self.reasoning = reasoning;
-        if let Some(runner) = &self.subagent_runner {
-            runner.update_reasoning(reasoning);
-        }
+        self.apply_reasoning(reasoning, events);
+    }
+
+    /// Set and announce a user reasoning selection.
+    pub(crate) fn apply_reasoning(
+        &mut self,
+        reasoning: llm::ReasoningPolicy,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        self.set_reasoning_policy(reasoning);
         send(
             events,
             AgentEvent::ReasoningChanged {
                 level: reasoning.to_string(),
             },
         );
+    }
+
+    /// Set reasoning for the parent and future subagents without an event.
+    pub(crate) fn set_reasoning_policy(&mut self, reasoning: llm::ReasoningPolicy) {
+        self.reasoning = reasoning;
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_reasoning(reasoning);
+        }
     }
 
     /// Fetch subscription allowance usage from the provider active when the

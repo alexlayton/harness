@@ -239,6 +239,52 @@ minimal = true
 
 Turn activity, usage, completion, and session output are unchanged.
 
+## Prewalk
+
+Prewalk is a one-shot handoff from the active (planning) model to a faster or
+cheaper target model. The planning model investigates the workspace, writes a
+short numbered plan in its visible reply, and makes the first change. After the
+first tool round that calls `edit` or `write` (also inside `run_code`, and also
+when the call fails), Harness switches to the target model and tells it to
+continue the plan. Other tools, including `bash`, do not end the planning phase.
+
+```toml
+[prewalk]
+enabled = false
+model = "openrouter:openai/<small-model>"
+reasoning_effort = "low"
+```
+
+`model` is `[<provider>:]<model>`, in the config, on the command line, and with
+`/prewalk-model`. A prefix is a provider only when Harness knows it, so a model
+id such as `vendor/model:free` keeps its colon. Without a provider, the handoff
+keeps the active provider. `enabled = true` requires
+`model`. `reasoning_effort` accepts the same values as the top-level setting;
+without it, the target keeps the active reasoning effort. A handoff to the same
+model still applies a different reasoning effort.
+
+The preference arms each new conversation, not resumed sessions. The handoff
+records a normal session model change, but it does not replace the saved
+`/model` or `/reasoning` choice. While prewalk is enabled, `/new` after a
+handoff returns to the planning model and reasoning effort and arms again.
+`/prewalk on` after a handoff does the same in the current conversation. Both
+skip the return when you used `/model` or `/reasoning` after the handoff, and
+the return does not change the saved choice either. Subagents started after
+the handoff use the target model.
+
+| Command | Effect |
+|---|---|
+| `/prewalk` | Show the current state and target. |
+| `/prewalk on` | Arm the handoff for this conversation and save `enabled = true`. After a handoff, first return to the planning model. Saves the target only when none is saved. |
+| `/prewalk off` | Cancel a pending handoff and save `enabled = false`. It does not switch back after a handoff. |
+| `/prewalk-model [<provider>:]<model>` | Set and save the target, with the same completion as `/model`. A pending handoff uses the new target. |
+| `/prewalk-reasoning [inherit\|<level>]` | Set and save the target reasoning effort. `inherit` removes it, so the handoff keeps the active effort. |
+
+Use prewalk for tasks where the hard work is finding the approach and the rest
+is bounded. Keep it off for tasks that need strong reasoning during
+implementation, such as subtle concurrency or lifecycle changes. ACP sessions
+do not arm prewalk.
+
 ## Compaction
 
 Harness automatically summarizes older context when token pressure reaches a
@@ -481,6 +527,9 @@ harness acp --provider openai-codex
 | `--provider <provider>` | Override the configured provider. |
 | `--model <model>` | Override the configured model. |
 | `--reasoning-effort <level>` | Override reasoning (`auto`, `off`, `minimal`, `low`, `medium`, `high`, or `maximum`). |
+| `--prewalk[=BOOL]` | Arm (or with `=false`, suppress) [prewalk](#prewalk) for the startup conversation, also when resumed. |
+| `--prewalk-model <model>` | Override the prewalk target for this process and arm the startup conversation. |
+| `--prewalk-reasoning-effort <level>` | Override the reasoning effort that prewalk hands off with. |
 | `-v`, `--verbose` | In prompt mode, write reasoning and tool progress to stderr. |
 | `--resume <selector>` | Resume a session by ID, unique prefix, `latest`, or path in prompt mode. |
 | `--no-session` | Do not persist a prompt-mode run. |

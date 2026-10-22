@@ -1,4 +1,4 @@
-use agent::{AgentEvent, InputMessage, SessionSnapshotEntry};
+use agent::{AgentEvent, InputMessage, PrewalkChange, SessionSnapshotEntry};
 use tokio::sync::mpsc;
 
 /// Convert the terminal UI's independent input protocol into runtime input.
@@ -18,6 +18,13 @@ pub fn into_agent_input(message: tui::InputMessage) -> InputMessage {
             InputMessage::SetModel { provider, model }
         }
         tui::InputMessage::SetReasoning { level } => InputMessage::SetReasoning { level },
+        tui::InputMessage::SetPrewalk { enabled } => InputMessage::SetPrewalk { enabled },
+        tui::InputMessage::SetPrewalkModel { provider, model } => {
+            InputMessage::SetPrewalkModel { provider, model }
+        }
+        tui::InputMessage::SetPrewalkReasoning { level } => {
+            InputMessage::SetPrewalkReasoning { level }
+        }
         tui::InputMessage::ListModels { provider } => InputMessage::ListModels { provider },
         tui::InputMessage::InvokeSkill { name } => InputMessage::InvokeSkill { name },
         tui::InputMessage::SubscriptionUsage => InputMessage::SubscriptionUsage,
@@ -95,6 +102,40 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
             tui::UiEvent::ModelChanged { provider, model }
         }
         AgentEvent::ReasoningChanged { level } => tui::UiEvent::ReasoningChanged { level },
+        AgentEvent::PrewalkChanged {
+            armed,
+            target,
+            reasoning,
+            change,
+        } => tui::UiEvent::PrewalkChanged {
+            armed,
+            target,
+            reasoning,
+            change: match change {
+                PrewalkChange::Session => tui::PrewalkChange::Session,
+                PrewalkChange::Enabled => tui::PrewalkChange::Enabled,
+                PrewalkChange::Target => tui::PrewalkChange::Target,
+                PrewalkChange::Reasoning => tui::PrewalkChange::Reasoning,
+            },
+        },
+        AgentEvent::PrewalkHandoff {
+            provider,
+            model,
+            reasoning,
+        } => tui::UiEvent::PrewalkHandoff {
+            provider,
+            model,
+            reasoning,
+        },
+        AgentEvent::PrewalkRestored {
+            provider,
+            model,
+            reasoning,
+        } => tui::UiEvent::PrewalkRestored {
+            provider,
+            model,
+            reasoning,
+        },
         AgentEvent::ModelList { provider, models } => tui::UiEvent::ModelList {
             provider,
             models: models

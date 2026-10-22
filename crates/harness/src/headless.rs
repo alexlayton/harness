@@ -318,6 +318,37 @@ async fn drive_headless_events_into(
                     writeln!(stderr, "reasoning → {level}")?;
                 }
             }
+            AgentEvent::PrewalkChanged { armed, target, .. } => {
+                if verbose
+                    && *armed
+                    && let Some(target) = target
+                {
+                    writeln!(stderr, "prewalk armed → {target}")?;
+                }
+            }
+            AgentEvent::PrewalkHandoff {
+                provider,
+                model,
+                reasoning,
+            }
+            | AgentEvent::PrewalkRestored {
+                provider,
+                model,
+                reasoning,
+            } => {
+                if verbose {
+                    let label = if matches!(event, AgentEvent::PrewalkHandoff { .. }) {
+                        "prewalk handoff"
+                    } else {
+                        "prewalk planning model"
+                    };
+                    write!(stderr, "{label} → {provider} · {model}")?;
+                    match reasoning {
+                        Some(reasoning) => writeln!(stderr, " · reasoning {reasoning}")?,
+                        None => writeln!(stderr)?,
+                    }
+                }
+            }
             AgentEvent::CompactionFinished {
                 compacted_through,
                 summary_bytes,
@@ -501,6 +532,7 @@ async fn run_headless_resolved(
         .with_subagents(config.subagents, config.rtk)
         .with_mcp_servers(config.mcp_servers.clone())
         .with_project_context(project_context)
+        .with_prewalk(config.prewalk.settings(args.resume.is_some())?)
         .with_provider_factory(provider_factory(
             config.copilot_auth.clone(),
             config.codex_auth.clone(),

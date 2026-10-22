@@ -26,6 +26,14 @@ pub struct RunOptions {
     pub model: Option<String>,
     /// Portable reasoning preference for this call.
     pub reasoning_effort: Option<ReasoningPolicy>,
+    /// Arm (`true`) or suppress (`false`) prewalk for this call. `None`
+    /// follows `[prewalk].enabled` for new sessions.
+    pub prewalk: Option<bool>,
+    /// Prewalk target as `[<provider>:]<model>`; also arms prewalk unless
+    /// `prewalk` is `false`.
+    pub prewalk_model: Option<String>,
+    /// Reasoning that prewalk hands off with; `None` follows the config.
+    pub prewalk_reasoning_effort: Option<ReasoningPolicy>,
     /// Workspace directory; defaults to the caller's current directory.
     pub workspace: Option<PathBuf>,
     /// Disable durable session creation and automatic session compaction.
@@ -52,6 +60,9 @@ impl RunOptions {
         }
         if let Some(model) = &self.model {
             ensure!(!model.trim().is_empty(), "model must not be blank");
+        }
+        if let Some(model) = &self.prewalk_model {
+            crate::config::parse_prewalk_target(model)?;
         }
         if let Some(resume) = &self.resume {
             ensure!(!resume.trim().is_empty(), "resume must not be blank");
@@ -115,6 +126,9 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         provider: options.provider.as_deref().and_then(ProviderArg::from_name),
         model: options.model.clone(),
         reasoning_effort: options.reasoning_effort,
+        prewalk: options.prewalk,
+        prewalk_model: options.prewalk_model.clone(),
+        prewalk_reasoning_effort: options.prewalk_reasoning_effort,
         ..Cli::default()
     };
     let config = Config::resolve_with_mcp(&cli, options.mcp_servers.as_deref())?;
@@ -152,6 +166,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     .with_subagents(config.subagents, config.rtk)
     .with_mcp_servers(config.mcp_servers.clone())
     .with_project_context(context)
+    .with_prewalk(config.prewalk.settings(options.resume.is_some())?)
     .with_provider_factory(provider_factory(
         config.copilot_auth.clone(),
         config.codex_auth.clone(),

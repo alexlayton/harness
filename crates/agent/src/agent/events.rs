@@ -1,3 +1,4 @@
+use super::prewalk::PrewalkChange;
 use tools::SkillEntry;
 
 /// Frontend-neutral input commands consumed by the agent runtime.
@@ -26,6 +27,16 @@ pub enum InputMessage {
     },
     /// Set reasoning effort for subsequent parent and subagent requests.
     SetReasoning { level: String },
+    /// Enable or disable prewalk: arm or cancel this conversation's handoff
+    /// and set the preference for new conversations.
+    SetPrewalk { enabled: bool },
+    /// Set the prewalk handoff target, and provider when present.
+    SetPrewalkModel {
+        provider: Option<String>,
+        model: String,
+    },
+    /// Set the target reasoning policy; `None` keeps the active policy.
+    SetPrewalkReasoning { level: Option<String> },
     /// Fetch a provider's model list.
     ListModels { provider: String },
     /// Start a turn from a discovered skill's instructions.
@@ -95,6 +106,31 @@ pub enum AgentEvent {
     /// Confirmed portable reasoning policy.
     ReasoningChanged {
         level: String,
+    },
+    /// Prewalk arm state and target. `change` tells hosts which preference,
+    /// if any, a command changed and may be persisted.
+    PrewalkChanged {
+        armed: bool,
+        target: Option<String>,
+        /// Target reasoning; `None` keeps the active policy.
+        reasoning: Option<String>,
+        change: PrewalkChange,
+    },
+    /// Prewalk switched the active model and, when `reasoning` is present,
+    /// the reasoning policy. Unlike [`AgentEvent::ModelChanged`] and
+    /// [`AgentEvent::ReasoningChanged`], this is not a user selection.
+    PrewalkHandoff {
+        provider: String,
+        model: String,
+        reasoning: Option<String>,
+    },
+    /// Prewalk returned to the planning model and, when `reasoning` is
+    /// present, its reasoning policy, before a new cycle. Like a handoff,
+    /// this is not a user selection.
+    PrewalkRestored {
+        provider: String,
+        model: String,
+        reasoning: Option<String>,
     },
     ModelList {
         provider: String,

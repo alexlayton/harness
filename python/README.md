@@ -145,6 +145,9 @@ answer = harness.run(
 | `provider` | `str` | Configured provider; supports normal CLI aliases. |
 | `model` | `str` | Configured model, or the normal provider default. |
 | `reasoning_effort` | `str` | Configured preference; `auto`, `off`, `minimal`, `low`, `medium`, `high`, or `maximum`. |
+| `prewalk` | `bool` | `[prewalk].enabled` for new sessions; resumed sessions stay unarmed. `True` arms the handoff and `False` suppresses it. |
+| `prewalk_model` | `str` | `[prewalk].model`; a `[<provider>:]<model>` handoff target. Setting it also arms prewalk unless `prewalk` is `False`. |
+| `prewalk_reasoning_effort` | `str` | `[prewalk].reasoning_effort`, or keep the active level; same values as `reasoning_effort`. |
 | `workspace` | `str` or text `PathLike` | Current directory; relative paths use the caller's current directory. |
 | `no_session` | `bool` | `False`; create and persist a new session. |
 | `resume` | `str` | Resume by ID, unique prefix, `latest`, or path instead of creating a session. |
