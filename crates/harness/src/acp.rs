@@ -1504,6 +1504,7 @@ async fn spawn_agent(
     .with_provider_factory(provider_factory(
         state.copilot_auth.clone(),
         state.config.codex_auth.clone(),
+        state.config.anthropic_auth.clone(),
     ));
     if let Some(tools) = &state.config.code_mode {
         builder = builder.with_code_mode(tools.clone());

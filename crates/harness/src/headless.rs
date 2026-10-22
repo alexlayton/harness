@@ -504,6 +504,7 @@ async fn run_headless_resolved(
         .with_provider_factory(provider_factory(
             config.copilot_auth.clone(),
             config.codex_auth.clone(),
+            config.anthropic_auth.clone(),
         ));
     if let Some(tools) = &config.code_mode {
         builder = builder.with_code_mode(tools.clone());

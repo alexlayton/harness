@@ -27,3 +27,8 @@ pub use storage::{
     AuthEntries, AuthStore, COPILOT_PROVIDER_KEY, CopilotCredential, OPENAI_CODEX_PROVIDER_KEY,
     OpenAiCodexCredential, RedactedCredential, auth_path, config_dir,
 };
+
+/// Unofficial Anthropic subscription OAuth.
+pub mod anthropic_subscription;
+pub use anthropic_subscription::{AnthropicSubscriptionAuth, AnthropicSubscriptionEndpoints};
+pub use storage::AnthropicSubscriptionCredential;

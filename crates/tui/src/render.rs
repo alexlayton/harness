@@ -768,6 +768,12 @@ fn message_content_width(width: usize) -> usize {
 }
 
 pub(crate) fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    // Providers can end thinking with blank lines. Let the UI own spacing
+    // between blocks without changing signed state or internal paragraphs.
+    let reasoning = reasoning.trim_end_matches(['\r', '\n']);
+    if reasoning.is_empty() {
+        return Vec::new();
+    }
     let text = plain_text(reasoning, muted_style(theme).add_modifier(Modifier::ITALIC));
     wrap_text(&text, width, Style::default())
 }
@@ -900,6 +906,28 @@ pub(crate) fn output_tail(output: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn reasoning_rendering_trims_only_trailing_newlines() {
+        let theme = Theme::default();
+        let reasoning = "First paragraph.\n\nSecond paragraph.";
+        let expected = reasoning_lines(reasoning, theme, 80);
+        assert_eq!(expected.len(), 3, "keep the internal paragraph break");
+        for suffix in ["\n", "\n\n", "\r\n\r\n"] {
+            assert_eq!(
+                reasoning_lines(&format!("{reasoning}{suffix}"), theme, 80),
+                expected
+            );
+        }
+        for empty in ["", "\n", "\n\n", "\r\n"] {
+            assert!(reasoning_lines(empty, theme, 80).is_empty());
+        }
+        // Leading newlines and trailing spaces are not block separators.
+        assert_eq!(
+            reasoning_lines("\nFirst paragraph.  \n\n", theme, 80),
+            reasoning_lines("\nFirst paragraph.  ", theme, 80)
+        );
+    }
 
     #[test]
     fn output_tail_keeps_only_the_bounded_suffix() {
