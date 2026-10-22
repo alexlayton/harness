@@ -59,6 +59,10 @@ compaction.
    response.
 5. A text-only response completes the turn.
 
+An armed prewalk (`crates/agent/src/agent/prewalk.rs`) can switch the active
+model once inside a turn, only after a persisted tool round that called `edit`
+or `write`, so a tool call and its result never span two models.
+
 Compaction can run before a request or after a context-overflow response. It
 appends a summary event and rebuilds provider history; it never rewrites old
 session events.
