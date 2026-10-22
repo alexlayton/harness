@@ -210,6 +210,102 @@ fn signed_and_redacted_thinking_roundtrip_without_display_duplication() {
 }
 
 #[test]
+fn registered_tool_spellings_roundtrip_with_one_wire_prefix() {
+    for registered in ["read", "_read", "run_code"] {
+        for response_name in [registered.to_owned(), format!("_{registered}")] {
+            let mut req = request();
+            req.tools[0].name = registered.into();
+            let mut parser = SubscriptionParser::new(&req);
+            start(&mut parser);
+            block(
+                &mut parser,
+                0,
+                json!({"type":"tool_use","id":"call-1","name":response_name,"input":{}}),
+            );
+            let events = feed(&mut parser, json!({"type":"message_stop"})).unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event, StreamEvent::ToolCallComplete(call) if call.name == registered
+            )));
+            let data = events
+                .into_iter()
+                .find_map(|event| match event {
+                    StreamEvent::OpaqueState { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(data["blocks"][0]["name"], registered);
+            req.messages.push(Message::assistant(vec![Content::Opaque {
+                provider: TAG.into(),
+                data,
+            }]));
+            req.messages
+                .push(Message::tool_result("call-1", "ok", false));
+            let body: Value = serde_json::from_slice(&serialize(&req).unwrap()).unwrap();
+            assert_eq!(
+                body["messages"][3]["content"][0]["name"],
+                format!("_{registered}")
+            );
+            assert_eq!(
+                body["messages"][3]["content"][0]["id"],
+                body["messages"][4]["content"][0]["tool_use_id"]
+            );
+        }
+    }
+}
+
+#[test]
+fn exact_wire_names_take_precedence_over_original_name_aliases() {
+    let mut req = request();
+    let mut tool = req.tools[0].clone();
+    tool.name = "read".into();
+    req.tools.push(tool);
+    for (response_name, expected) in [("read", "read"), ("_read", "read"), ("__read", "_read")] {
+        let mut parser = SubscriptionParser::new(&req);
+        start(&mut parser);
+        block(
+            &mut parser,
+            0,
+            json!({"type":"tool_use","id":"c","name":response_name,"input":{}}),
+        );
+        let events = feed(&mut parser, json!({"type":"message_stop"})).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event, StreamEvent::ToolCallComplete(call) if call.name == expected
+        )));
+    }
+}
+
+#[test]
+fn name_aliases_do_not_expose_folded_or_unregistered_tools() {
+    let mut req = request();
+    req.tools[0].name = "run_code".into();
+    req.tools[0].description = "Available functions: read, write, python".into();
+    for name in [
+        "read",
+        "_read",
+        "write",
+        "_write",
+        "python",
+        "_python",
+        "__run_code",
+    ] {
+        let mut parser = SubscriptionParser::new(&req);
+        start(&mut parser);
+        let error = feed(
+            &mut parser,
+            json!({"type":"content_block_start","index":0,"content_block":{
+                "type":"tool_use","id":"c","name":name,"input":{}
+            }}),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tool block name is not registered")
+        );
+    }
+}
+
+#[test]
 fn malformed_and_truncated_streams_never_release_tools() {
     let req = request();
     for payload in [
