@@ -43,6 +43,9 @@ class RunOptions(TypedDict, total=False):
     provider: str
     model: str
     reasoning_effort: str
+    prewalk: bool
+    prewalk_model: str
+    prewalk_reasoning_effort: str
     workspace: str | os.PathLike[str]
     no_session: bool
     resume: str
