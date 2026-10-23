@@ -74,8 +74,11 @@ case "$os:$arch" in
     Linux:x86_64|Linux:amd64)
         target="x86_64-unknown-linux-gnu"
         ;;
+    Linux:aarch64|Linux:arm64)
+        target="aarch64-unknown-linux-gnu"
+        ;;
     *)
-        die "unsupported platform $os/$arch (supported: macOS arm64/x86_64, Linux x86_64)"
+        die "unsupported platform $os/$arch (supported: macOS arm64/x86_64, Linux arm64/x86_64)"
         ;;
 esac
 

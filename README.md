@@ -84,6 +84,7 @@ for pipelines and editor transports.
 - [Configuration][configuration]
 - [Editor integration (ACP)][editor-integration]
 - [Python library (native MVP)](./python/README.md)
+- [OpenShell and container images](docs/openshell.md)
 - [Architecture and contributor guide][architecture]
 - [Session format][session-format]
 
@@ -120,9 +121,17 @@ Initial releases provide these builds:
 - macOS on Apple silicon (`aarch64-apple-darwin`)
 - macOS on Intel (`x86_64-apple-darwin`)
 - Linux x86-64 with glibc 2.35 or newer (`x86_64-unknown-linux-gnu`)
+- Linux ARM64 with glibc 2.39 or newer (`aarch64-unknown-linux-gnu`)
 
-The GNU Linux artifact is built on Ubuntu 22.04 to keep that minimum runtime
-baseline stable. Windows is not supported in the initial release.
+The Linux x86-64 artifact is built on Ubuntu 22.04; ARM64 is built on the native
+Ubuntu 24.04 ARM runner. These keep each minimum runtime baseline explicit.
+Windows is not supported in the initial release.
+
+Published releases also produce a multi-platform image at
+`ghcr.io/alexlayton/harness:v<VERSION>` (Linux AMD64 and ARM64). Stable releases
+update `ghcr.io/alexlayton/harness:latest`. See the
+[OpenShell guide](docs/openshell.md) for image contents, provider setup, and
+publication requirements.
 
 Homebrew users can install the source formula:
 

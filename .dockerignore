@@ -1,0 +1,9 @@
+# The image uses release binaries, not source or local credentials.
+**
+!LICENSE
+!dist/
+!dist/linux/
+!dist/linux/amd64/
+!dist/linux/amd64/harness
+!dist/linux/arm64/
+!dist/linux/arm64/harness

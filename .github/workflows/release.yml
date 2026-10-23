@@ -65,6 +65,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: harness-${{ needs.checks.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
             smoke: true
+          # GitHub has no Ubuntu 22.04 ARM runner. ARM64 therefore has
+          # its own glibc 2.39 minimum, supplied by Ubuntu 24.04.
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: harness-${{ needs.checks.outputs.tag }}-aarch64-unknown-linux-gnu.tar.gz
+            smoke: true
           - os: macos-14
             target: aarch64-apple-darwin
             archive: harness-${{ needs.checks.outputs.tag }}-aarch64-apple-darwin.tar.gz

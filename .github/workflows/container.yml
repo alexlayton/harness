@@ -1,0 +1,103 @@
+name: Container
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag (must contain both Linux archives)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish multi-platform image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Validate release tag
+        id: release
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a version tag, got: $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.release.outputs.tag }}
+      - name: Download and verify published Linux binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+        shell: bash
+        run: |
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false
+          mkdir -p dist/download
+          gh release download "$TAG" --dir dist/download \
+            --pattern SHA256SUMS \
+            --pattern "harness-$TAG-x86_64-unknown-linux-gnu.tar.gz" \
+            --pattern "harness-$TAG-aarch64-unknown-linux-gnu.tar.gz"
+          for pair in amd64:x86_64 arm64:aarch64; do
+            arch="${pair%%:*}"
+            target="${pair#*:}-unknown-linux-gnu"
+            archive="harness-$TAG-$target.tar.gz"
+            # Check only the selected asset; require exactly one checksum.
+            awk -v file="$archive" '$2 == file { print }' \
+              dist/download/SHA256SUMS > dist/download/selected.sha256
+            test "$(wc -l < dist/download/selected.sha256)" -eq 1
+            (cd dist/download && sha256sum --check selected.sha256)
+            mkdir -p "dist/linux/$arch"
+            tar -xOzf "dist/download/$archive" "harness-$TAG-$target/harness" \
+              > "dist/linux/$arch/harness"
+            chmod 755 "dist/linux/$arch/harness"
+          done
+      - name: Select image tags
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          # Manual runs only publish the requested version, never move latest.
+          STABLE_RELEASE: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
+        shell: bash
+        run: |
+          image="ghcr.io/${REPOSITORY,,}"
+          echo 'tags<<EOF' >> "$GITHUB_OUTPUT"
+          echo "$image:$TAG" >> "$GITHUB_OUTPUT"
+          if [[ "$STABLE_RELEASE" == true ]]; then
+            echo "$image:latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo EOF >> "$GITHUB_OUTPUT"
+      # Only package installation and the CLI smoke check use emulation.
+      # The expensive Rust builds already ran on native release runners.
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.tags }}
+          build-args: VERSION=${{ steps.release.outputs.version }}
