@@ -9,10 +9,11 @@ use compact::policy::CompactionPolicy;
 use fs2::FileExt;
 use llm::providers::github_copilot::default_model_for;
 use llm::providers::{
-    AnthropicSubscriptionProvider, GithubCopilotProvider, OpenAiCodexProvider, OpenCodeGoProvider,
-    OpenRouterProvider,
+    AnthropicSubscriptionProvider, GithubCopilotProvider, OpenAiCodexProvider,
+    OpenAiCompatibleProvider, OpenCodeGoProvider, OpenRouterProvider,
 };
 use llm::{Provider, ReasoningPolicy};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -99,6 +100,226 @@ impl fmt::Display for ProviderArg {
             Self::AnthropicSubscription => "anthropic-claude",
         })
     }
+}
+
+/// The provider selected for this process: a built-in integration or a
+/// user-defined `[providers.<name>]` endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderChoice {
+    Builtin(ProviderArg),
+    Custom(String),
+}
+
+impl ProviderChoice {
+    /// The built-in integration, or `None` for a user-defined provider.
+    pub fn builtin(&self) -> Option<ProviderArg> {
+        match self {
+            Self::Builtin(provider) => Some(*provider),
+            Self::Custom(_) => None,
+        }
+    }
+}
+
+/// Lets callers ask "is this Copilot?" without unwrapping the choice.
+impl PartialEq<ProviderArg> for ProviderChoice {
+    fn eq(&self, other: &ProviderArg) -> bool {
+        self.builtin() == Some(*other)
+    }
+}
+
+impl fmt::Display for ProviderChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Builtin(provider) => provider.fmt(formatter),
+            Self::Custom(name) => formatter.write_str(name),
+        }
+    }
+}
+
+/// A user-defined provider under `[providers.<name>]`, selected with
+/// `provider = "<name>"`.
+///
+/// Secrets stay out of `config.toml`, matching the built-in providers:
+/// `api_key_env` and `env_headers` name environment variables, and only
+/// `headers` holds literal (non-secret) values.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomProviderConfig {
+    #[serde(rename = "type")]
+    pub kind: CustomProviderKind,
+    /// API root including any version segment, e.g.
+    /// `http://localhost:1234/v1`; `/chat/completions` and `/models` are
+    /// appended to it.
+    pub base_url: String,
+    /// Environment variable holding the bearer token. Unset means no
+    /// `Authorization` header is sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Model used when neither `--model` nor `model` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// Context window for models whose `/models` entry reports none. Local
+    /// servers rarely report one, and the global fallback is very large, so
+    /// without this compaction could start too late.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Literal headers sent with every request.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    /// Header name to the environment variable holding its value.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env_headers: BTreeMap<String, String>,
+}
+
+/// Wire protocol of a user-defined provider.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CustomProviderKind {
+    /// OpenAI Chat Completions (LM Studio, Ollama, vLLM, gateways, ...).
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible,
+}
+
+/// User-defined providers keyed by name, shared with the provider factory so
+/// model switches can rebuild them.
+pub type CustomProviders = Arc<BTreeMap<String, CustomProviderConfig>>;
+
+impl CustomProviderConfig {
+    /// Check everything that does not need the environment, so mistakes fail
+    /// at load time instead of on the first request.
+    fn validate(&self, name: &str) -> Result<()> {
+        let valid_name = !name.is_empty()
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character));
+        if !valid_name {
+            return Err(anyhow!(
+                "[providers.{name}]: provider names may contain only ASCII letters, digits, `-`, `_` and `.`"
+            ));
+        }
+        if ProviderArg::from_name(name).is_some() {
+            return Err(anyhow!(
+                "[providers.{name}]: `{name}` is a built-in provider name; choose another name"
+            ));
+        }
+        let url = reqwest::Url::parse(&self.base_url)
+            .map_err(|error| anyhow!("[providers.{name}].base_url is not a valid URL: {error}"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(anyhow!(
+                "[providers.{name}].base_url must be an http:// or https:// URL with a host"
+            ));
+        }
+        if let Some(variable) = &self.api_key_env
+            && !is_env_var_name(variable)
+        {
+            return Err(anyhow!(
+                "[providers.{name}].api_key_env is not a valid environment variable name: `{variable}`"
+            ));
+        }
+        if self
+            .default_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(anyhow!(
+                "[providers.{name}].default_model must not be blank"
+            ));
+        }
+        if self.context_window == Some(0) {
+            return Err(anyhow!(
+                "[providers.{name}].context_window must be greater than zero"
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        let headers = self.headers.keys().chain(self.env_headers.keys());
+        for header in headers {
+            let parsed = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                anyhow!("[providers.{name}]: `{header}` is not a valid HTTP header name")
+            })?;
+            if parsed == reqwest::header::CONTENT_TYPE {
+                return Err(anyhow!(
+                    "[providers.{name}]: the `{header}` header is set by harness"
+                ));
+            }
+            if parsed == reqwest::header::AUTHORIZATION && self.api_key_env.is_some() {
+                return Err(anyhow!(
+                    "[providers.{name}]: set either `api_key_env` or an `{header}` header, not both"
+                ));
+            }
+            if !seen.insert(parsed) {
+                return Err(anyhow!(
+                    "[providers.{name}]: header `{header}` is configured more than once"
+                ));
+            }
+        }
+        for (header, value) in &self.headers {
+            HeaderValue::from_str(value).map_err(|_| {
+                anyhow!("[providers.{name}].headers: `{header}` has an invalid header value")
+            })?;
+        }
+        for (header, variable) in &self.env_headers {
+            if !is_env_var_name(variable) {
+                return Err(anyhow!(
+                    "[providers.{name}].env_headers: `{header}` names an invalid environment variable `{variable}`"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Construct a user-defined provider, reading its secrets from the
+/// environment. Errors name variables and headers but never values.
+fn build_custom_provider(name: &str, config: &CustomProviderConfig) -> Result<Arc<dyn Provider>> {
+    let read = |variable: &str| {
+        std::env::var(variable)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "provider `{name}` requires environment variable `{variable}`, which is not set"
+                )
+            })
+    };
+    let api_key = config
+        .api_key_env
+        .as_deref()
+        .map(read)
+        .transpose()?
+        .unwrap_or_default();
+    let mut headers = HeaderMap::new();
+    for (header, value) in &config.headers {
+        let header = HeaderName::from_bytes(header.as_bytes())
+            .map_err(|_| anyhow!("provider `{name}`: invalid header name `{header}`"))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| anyhow!("provider `{name}`: invalid value for header `{header}`"))?;
+        headers.insert(header, value);
+    }
+    for (header, variable) in &config.env_headers {
+        let header = HeaderName::from_bytes(header.as_bytes())
+            .map_err(|_| anyhow!("provider `{name}`: invalid header name `{header}`"))?;
+        let mut value = HeaderValue::from_str(&read(variable)?).map_err(|_| {
+            anyhow!("provider `{name}`: `{variable}` is not a valid value for header `{header}`")
+        })?;
+        value.set_sensitive(true);
+        headers.insert(header, value);
+    }
+    Ok(match config.kind {
+        CustomProviderKind::OpenAiCompatible => Arc::new(OpenAiCompatibleProvider::new(
+            name,
+            &config.base_url,
+            api_key,
+            headers,
+            config.context_window,
+        )),
+    })
+}
+
+/// Shell-style environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_env_var_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 /// Per-key compaction settings parsed from `[compaction]` in `config.toml`.
@@ -248,14 +469,7 @@ impl SecretsConfig {
     fn validate(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for name in &self.env {
-            let mut characters = name.chars();
-            let valid_first = characters
-                .next()
-                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
-            if !valid_first
-                || !characters
-                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
-            {
+            if !is_env_var_name(name) {
                 return Err(anyhow!(
                     "[secrets].env contains invalid environment variable name `{name}`"
                 ));
@@ -387,6 +601,9 @@ pub struct FileConfig {
     /// Prewalk handoff settings (`[prewalk]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewalk: Option<PrewalkConfig>,
+    /// User-defined providers (`[providers.<name>]`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, CustomProviderConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -407,6 +624,7 @@ impl PartialEq for FileConfig {
             && self.mcp == other.mcp
             && self.tui == other.tui
             && self.prewalk == other.prewalk
+            && self.providers == other.providers
             && self.extra == other.extra
     }
 }
@@ -500,7 +718,21 @@ impl FileConfig {
         if let Some(prewalk) = &self.prewalk {
             prewalk.validate()?;
         }
+        for (name, provider) in &self.providers {
+            provider.validate(name)?;
+        }
         Ok(())
+    }
+
+    /// Resolve a provider name against the built-ins, then `[providers]`.
+    pub fn provider_choice(&self, name: &str) -> Option<ProviderChoice> {
+        ProviderArg::from_name(name)
+            .map(ProviderChoice::Builtin)
+            .or_else(|| {
+                self.providers
+                    .contains_key(name)
+                    .then(|| ProviderChoice::Custom(name.to_owned()))
+            })
     }
 }
 
@@ -911,9 +1143,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Override the configured provider for this process.
-    #[arg(long, value_enum, global = true)]
-    pub provider: Option<ProviderArg>,
+    /// Override the configured provider for this process: a built-in name
+    /// or a `[providers.<name>]` entry from the config file.
+    #[arg(long, value_name = "PROVIDER", global = true)]
+    pub provider: Option<String>,
 
     /// Override the configured model for this process.
     #[arg(long, global = true)]
@@ -1098,7 +1331,9 @@ pub enum LoginProvider {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub provider: ProviderArg,
+    pub provider: ProviderChoice,
+    /// User-defined providers, needed again whenever the provider changes.
+    pub custom_providers: CustomProviders,
     pub model: String,
     pub reasoning: ReasoningPolicy,
     pub rtk: bool,
@@ -1144,7 +1379,9 @@ impl Config {
         // an unrelated `--provider` override.
         let effective_provider = cli
             .provider
-            .or_else(|| file.provider.as_deref().and_then(ProviderArg::from_name));
+            .as_deref()
+            .or(file.provider.as_deref())
+            .and_then(ProviderArg::from_name);
         let copilot_auth = (effective_provider == Some(ProviderArg::GithubCopilot))
             .then(|| CopilotAuth::from_default().map(Arc::new))
             .transpose()?;
@@ -1206,7 +1443,7 @@ impl Config {
         // Validate the persisted name even when a CLI override is present;
         // otherwise a typo could remain hidden until a later launch.
         let file_provider = match file.provider.as_deref() {
-            Some(name) => Some(ProviderArg::from_name(name).ok_or_else(|| {
+            Some(name) => Some(file.provider_choice(name).ok_or_else(|| {
                 anyhow!(
                     "unknown provider `{name}` in config file {}",
                     path.display()
@@ -1214,36 +1451,55 @@ impl Config {
             })?),
             None => None,
         };
-        let provider = cli.provider.or(file_provider).ok_or_else(|| {
+        let cli_provider = match cli.provider.as_deref() {
+            Some(name) => Some(file.provider_choice(name).ok_or_else(|| {
+                anyhow!(
+                    "unknown provider `{name}`: use a built-in provider or define `[providers.{name}]` in {}",
+                    path.display()
+                )
+            })?),
+            None => None,
+        };
+        let provider = cli_provider.or(file_provider).ok_or_else(|| {
             anyhow!(
-                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go      OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter       OpenRouter; set OPENROUTER_API_KEY\n  github-copilot   GitHub Copilot; run `harness login github-copilot`\n  openai-codex     OpenAI Codex; run `harness login openai-codex`\n  anthropic-claude  Unofficial Claude subscription; run `harness login anthropic-claude`",
+                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go       OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter        OpenRouter; set OPENROUTER_API_KEY\n  github-copilot    GitHub Copilot; run `harness login github-copilot`\n  openai-codex      OpenAI Codex; run `harness login openai-codex`\n  anthropic-claude  Unofficial Claude subscription; run `harness login anthropic-claude`\n  <name>            a `[providers.<name>]` table with `type = \"openai-compatible\"` and `base_url`",
                 path.display()
             )
         })?;
         // GitHub Copilot authenticates through the private auth store and is
         // intentionally constructible before the first login.  Existing API
         // key providers retain their old environment-only requirement.
-        let api_key = key_for(provider)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_default();
-        if !matches!(
-            provider,
-            ProviderArg::GithubCopilot
-                | ProviderArg::OpenAiCodex
-                | ProviderArg::AnthropicSubscription
-        ) && api_key.is_empty()
+        // User-defined providers read their optional key when constructed.
+        if let Some(builtin) = provider.builtin()
+            && !matches!(
+                builtin,
+                ProviderArg::GithubCopilot
+                    | ProviderArg::OpenAiCodex
+                    | ProviderArg::AnthropicSubscription
+            )
+            && key_for(builtin).is_none_or(|value| value.trim().is_empty())
         {
             return Err(anyhow!(
                 "missing API key: set {}",
-                provider.env_vars().join(" or ")
+                builtin.env_vars().join(" or ")
             ));
         }
+        let default_model = match &provider {
+            ProviderChoice::Builtin(builtin) => Some(builtin.default_model().to_owned()),
+            ProviderChoice::Custom(name) => file.providers[name].default_model.clone(),
+        };
         let model = cli
             .model
             .clone()
             .or_else(|| file.model.clone())
-            .unwrap_or_else(|| provider.default_model().to_owned());
-        let secret_entries = file
+            .or(default_model)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no model configured for provider `{provider}`: pass --model, or set `model` or `[providers.{provider}].default_model` in {}",
+                    path.display()
+                )
+            })?;
+        let mut secret_entries = file
             .secrets
             .as_ref()
             .map(|secrets| {
@@ -1265,6 +1521,23 @@ impl Config {
             })
             .transpose()?
             .unwrap_or_default();
+        // Credentials of user-defined providers are masked like `[secrets]`
+        // so tool output (e.g. `env`) cannot show them to the model. Unset or
+        // short values are skipped: a missing key fails only when that
+        // provider is built, and the masker rejects very short values.
+        for config in file.providers.values() {
+            let variables = config.api_key_env.iter().chain(config.env_headers.values());
+            for variable in variables {
+                if secret_entries.iter().any(|(name, _)| name == variable) {
+                    continue;
+                }
+                if let Ok(value) = std::env::var(variable)
+                    && value.len() >= agent::secrets::MIN_SECRET_BYTES
+                {
+                    secret_entries.push((variable.clone(), value));
+                }
+            }
+        }
         let secret_masker =
             Arc::new(SecretMasker::new(secret_entries).map_err(|error| anyhow!(error))?);
         if secret_masker.mask_text(&model) != model
@@ -1302,6 +1575,7 @@ impl Config {
             .map_err(|error| anyhow!(error))?;
         Ok(Self {
             provider,
+            custom_providers: Arc::new(file.providers.clone()),
             model,
             reasoning: cli
                 .reasoning_effort
@@ -1356,20 +1630,28 @@ fn entitled_copilot_default(auth: Option<&Arc<CopilotAuth>>) -> Option<String> {
 
 /// Construct a provider with shared OAuth handles. Keeping refresh state in
 /// the provider-owned handles avoids reloading credentials on model switches.
+/// Built-in names win; `custom_providers` supplies `[providers.<name>]`.
 pub fn build_provider_with_auths(
     name: &str,
+    custom_providers: &BTreeMap<String, CustomProviderConfig>,
     copilot_auth: Option<Arc<CopilotAuth>>,
     codex_auth: Option<Arc<OpenAiCodexAuth>>,
     anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
 ) -> Result<Arc<dyn Provider>> {
-    let provider = ProviderArg::from_name(name).ok_or_else(|| {
+    let Some(provider) = ProviderArg::from_name(name) else {
+        if let Some(config) = custom_providers.get(name) {
+            return build_custom_provider(name, config);
+        }
         let expected = ProviderArg::ALL
             .iter()
             .map(ToString::to_string)
+            .chain(custom_providers.keys().cloned())
             .collect::<Vec<_>>()
             .join(", ");
-        anyhow!("unknown provider: {name} (expected one of: {expected})")
-    })?;
+        return Err(anyhow!(
+            "unknown provider: {name} (expected one of: {expected})"
+        ));
+    };
     Ok(match provider {
         ProviderArg::OpencodeGo => {
             let api_key = env_api_key(provider).ok_or_else(|| {
@@ -1409,6 +1691,7 @@ pub fn build_provider_with_auths(
 
 /// Build the runtime's provider factory while retaining shared OAuth state.
 pub fn provider_factory(
+    custom_providers: CustomProviders,
     copilot_auth: Option<Arc<CopilotAuth>>,
     codex_auth: Option<Arc<OpenAiCodexAuth>>,
     anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
@@ -1416,6 +1699,7 @@ pub fn provider_factory(
     Arc::new(move |name| {
         build_provider_with_auths(
             name,
+            &custom_providers,
             copilot_auth.clone(),
             codex_auth.clone(),
             anthropic_auth.clone(),
@@ -1447,7 +1731,7 @@ mod tests {
         let prompt =
             Cli::try_parse_from(["harness", "prompt", "--provider", "openai-codex", "hello"])
                 .unwrap();
-        assert_eq!(prompt.provider, Some(ProviderArg::OpenAiCodex));
+        assert_eq!(prompt.provider.as_deref(), Some("openai-codex"));
         assert!(matches!(
             prompt.command,
             Some(Command::Prompt(PromptArgs { prompt, .. })) if prompt == ["hello"]
@@ -1585,7 +1869,7 @@ mod tests {
             "--device-code",
         ])
         .unwrap();
-        assert_eq!(cli.provider, Some(ProviderArg::Openrouter));
+        assert_eq!(cli.provider.as_deref(), Some("openrouter"));
         assert!(matches!(
             cli.command,
             Some(Command::Login(LoginArgs {
@@ -1612,7 +1896,7 @@ mod tests {
         }
 
         let cli = Cli {
-            provider: Some(ProviderArg::Openrouter),
+            provider: Some("openrouter".into()),
             model: Some("anthropic/demo".into()),
             ..Cli::default()
         };
@@ -1646,7 +1930,7 @@ mod tests {
             .unwrap();
             assert_eq!(config.provider, ProviderArg::AnthropicSubscription);
             assert_eq!(config.model, "claude-sonnet-4-6");
-            assert_eq!(ProviderArg::from_name(name), Some(config.provider));
+            assert_eq!(ProviderArg::from_name(name), config.provider.builtin());
         }
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -1671,7 +1955,7 @@ mod tests {
             ))
             .unwrap();
         let auth = Arc::new(AnthropicSubscriptionAuth::new(store).unwrap());
-        let factory = provider_factory(None, None, Some(auth));
+        let factory = provider_factory(Default::default(), None, None, Some(auth));
         for name in [
             "anthropic-claude",
             "anthropic-subscription",
@@ -1691,7 +1975,7 @@ mod tests {
     #[test]
     fn copilot_resolves_without_an_api_key() {
         let cli = Cli {
-            provider: Some(ProviderArg::GithubCopilot),
+            provider: Some("github-copilot".into()),
             model: None,
             ..Cli::default()
         };
@@ -1736,7 +2020,7 @@ mod tests {
         );
 
         let cli = Cli {
-            provider: Some(ProviderArg::OpencodeGo),
+            provider: Some("opencode-go".into()),
             model: Some("cli-model".into()),
             reasoning_effort: Some(ReasoningPolicy::Off),
             ..Cli::default()
@@ -1767,6 +2051,74 @@ mod tests {
     }
 
     #[test]
+    fn custom_providers_resolve_by_name_and_reject_invalid_tables() {
+        let file: FileConfig = toml::from_str(
+            r#"
+provider = "lmstudio"
+
+[providers.lmstudio]
+type = "openai-compatible"
+base_url = "http://localhost:1234/v1"
+default_model = "qwen3-coder"
+
+[providers.lmstudio.headers]
+X-Client = "harness"
+"#,
+        )
+        .unwrap();
+        let path = PathBuf::from("/tmp/harness-config.toml");
+        // No key is needed, and the provider default fills in the model.
+        let config =
+            Config::resolve_from_file(&Cli::default(), &file, path.clone(), |_| None).unwrap();
+        assert_eq!(config.provider, ProviderChoice::Custom("lmstudio".into()));
+        assert_eq!(config.model, "qwen3-coder");
+        assert!(config.custom_providers.contains_key("lmstudio"));
+
+        // The CLI may select a custom name; unknown names still fail.
+        let cli = Cli {
+            provider: Some("lmstudio".into()),
+            model: Some("other".into()),
+            ..Cli::default()
+        };
+        let config = Config::resolve_from_file(&cli, &file, path.clone(), |_| None).unwrap();
+        assert_eq!(config.model, "other");
+        let cli = Cli {
+            provider: Some("missing".into()),
+            ..Cli::default()
+        };
+        assert!(Config::resolve_from_file(&cli, &file, path.clone(), |_| None).is_err());
+
+        for (table, expected) in [
+            (
+                "[providers.openrouter]\ntype = \"openai-compatible\"\nbase_url = \"http://x\"",
+                "built-in provider name",
+            ),
+            (
+                "[providers.x]\ntype = \"openai-compatible\"\nbase_url = \"localhost:1234\"",
+                "base_url",
+            ),
+            (
+                "[providers.x]\ntype = \"openai-compatible\"\nbase_url = \"http://x\"\napi_key_env = \"K\"\nheaders = { authorization = \"y\" }",
+                "not both",
+            ),
+            (
+                "[providers.x]\ntype = \"openai-compatible\"\nbase_url = \"http://x\"\nenv_headers = { X-Token = \"bad-name\" }",
+                "invalid environment variable",
+            ),
+        ] {
+            let file: FileConfig = toml::from_str(table).unwrap();
+            let error = file.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{table}: {error}");
+        }
+        assert!(
+            toml::from_str::<FileConfig>(
+                "[providers.x]\ntype = \"other\"\nbase_url = \"http://x\""
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn login_selects_only_when_provider_is_unset() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -1786,7 +2138,7 @@ mod tests {
     #[test]
     fn supports_legacy_opencode_key_name() {
         let cli = Cli {
-            provider: Some(ProviderArg::OpencodeGo),
+            provider: Some("opencode-go".into()),
             ..Cli::default()
         };
         let config =
@@ -1797,7 +2149,7 @@ mod tests {
     #[test]
     fn missing_key_names_environment_variables() {
         let cli = Cli {
-            provider: Some(ProviderArg::Openrouter),
+            provider: Some("openrouter".into()),
             ..Cli::default()
         };
         let error = Config::resolve_with_key_values(&cli, None, None, None)
@@ -1806,7 +2158,7 @@ mod tests {
         assert!(error.to_string().contains("OPENROUTER_API_KEY"));
 
         let cli = Cli {
-            provider: Some(ProviderArg::OpencodeGo),
+            provider: Some("opencode-go".into()),
             ..Cli::default()
         };
         let error = Config::resolve_with_key_values(&cli, None, None, None)
@@ -1838,6 +2190,19 @@ mod tests {
             mcp: None,
             tui: Some(TuiConfig { minimal: true }),
             prewalk: None,
+            providers: [(
+                "lmstudio".to_owned(),
+                CustomProviderConfig {
+                    kind: CustomProviderKind::OpenAiCompatible,
+                    base_url: "http://localhost:1234/v1".into(),
+                    api_key_env: Some("LMSTUDIO_API_KEY".into()),
+                    default_model: None,
+                    context_window: Some(32_768),
+                    headers: [("X-Client".to_owned(), "harness".to_owned())].into(),
+                    env_headers: [("X-Token".to_owned(), "LMSTUDIO_TOKEN".to_owned())].into(),
+                },
+            )]
+            .into(),
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),

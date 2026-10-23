@@ -534,6 +534,7 @@ async fn run_headless_resolved(
         .with_project_context(project_context)
         .with_prewalk(config.prewalk.settings(args.resume.is_some())?)
         .with_provider_factory(provider_factory(
+            config.custom_providers.clone(),
             config.copilot_auth.clone(),
             config.codex_auth.clone(),
             config.anthropic_auth.clone(),
