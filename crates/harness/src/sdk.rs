@@ -1,6 +1,6 @@
 //! One-shot agent execution without terminal or process-global frontend setup.
 
-use crate::config::{Cli, Config, ProviderArg, build_provider_with_auths, provider_factory};
+use crate::config::{Cli, Config, build_provider_with_auths, provider_factory};
 use crate::context::project_context_for;
 use agent::assembly::AgentBuilder;
 use agent::{AgentEvent, InputMessage, StreamRecovery};
@@ -52,11 +52,10 @@ pub struct RunOptions {
 impl RunOptions {
     /// Check overrides before opening sessions or connecting providers/tools.
     pub fn validate(&self) -> Result<()> {
+        // Names are checked against the built-ins and `[providers]` once the
+        // config file is loaded.
         if let Some(provider) = &self.provider {
-            ensure!(
-                ProviderArg::from_name(provider).is_some(),
-                "unknown provider `{provider}`"
-            );
+            ensure!(!provider.trim().is_empty(), "provider must not be blank");
         }
         if let Some(model) = &self.model {
             ensure!(!model.trim().is_empty(), "model must not be blank");
@@ -123,7 +122,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     options.validate()?;
     let _cancel_on_drop = cancel.clone().drop_guard();
     let cli = Cli {
-        provider: options.provider.as_deref().and_then(ProviderArg::from_name),
+        provider: options.provider.clone(),
         model: options.model.clone(),
         reasoning_effort: options.reasoning_effort,
         prewalk: options.prewalk,
@@ -143,6 +142,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     ensure!(!cancel.is_cancelled(), "Harness run cancelled");
     let provider = build_provider_with_auths(
         &config.provider.to_string(),
+        &config.custom_providers,
         config.copilot_auth.clone(),
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
@@ -168,6 +168,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     .with_project_context(context)
     .with_prewalk(config.prewalk.settings(options.resume.is_some())?)
     .with_provider_factory(provider_factory(
+        config.custom_providers.clone(),
         config.copilot_auth.clone(),
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
