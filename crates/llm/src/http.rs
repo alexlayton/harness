@@ -95,9 +95,14 @@ impl HttpClient {
     }
 
     /// Standard bearer + JSON headers for OpenAI-compatible endpoints.
+    ///
+    /// An empty key sends no `Authorization` header: keyless local servers
+    /// need nothing, and a caller-supplied extra header must stay intact.
     pub fn headers(&self) -> HeaderMap {
         let mut headers = self.extra_headers.clone();
-        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.api_key)) {
+        if !self.api_key.is_empty()
+            && let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", self.api_key))
+        {
             headers.insert(AUTHORIZATION, value);
         }
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));

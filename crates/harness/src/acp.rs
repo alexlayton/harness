@@ -1457,6 +1457,7 @@ async fn spawn_agent(
     .with_project_context(project_context)
     .with_session(store, session)
     .with_provider_factory(provider_factory(
+        state.config.custom_providers.clone(),
         state.copilot_auth.clone(),
         state.config.codex_auth.clone(),
         state.config.anthropic_auth.clone(),
