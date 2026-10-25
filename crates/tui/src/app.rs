@@ -1754,6 +1754,7 @@ impl CrossTerm {
                     ok: false,
                     duration_ms: 0,
                     output: String::new(),
+                    omitted_lines: 0,
                     error: None,
                     status: ToolStatus::Running,
                 };
@@ -1787,19 +1788,7 @@ impl CrossTerm {
                 {
                     self.running_tools.remove(position);
                 }
-                let record = ToolRecord {
-                    name,
-                    summary,
-                    ok,
-                    duration_ms,
-                    output,
-                    error,
-                    status: if ok {
-                        ToolStatus::Success
-                    } else {
-                        ToolStatus::Failure
-                    },
-                };
+                let record = ToolRecord::finished(name, summary, ok, duration_ms, output, error);
                 self.pending.push(Entry::Tool { record });
             }
             UiEvent::Retrying { .. } => {
@@ -2007,19 +1996,14 @@ impl CrossTerm {
                             output,
                             error,
                         } => Entry::Tool {
-                            record: ToolRecord {
+                            record: ToolRecord::finished(
                                 name,
                                 summary,
                                 ok,
                                 duration_ms,
                                 output,
                                 error,
-                                status: if ok {
-                                    ToolStatus::Success
-                                } else {
-                                    ToolStatus::Failure
-                                },
-                            },
+                            ),
                         },
                     });
                 }
@@ -2992,7 +2976,7 @@ fn tool_lines(
         .add_modifier(Modifier::DIM);
     let mut lines = summary_lines;
     if !record.output.is_empty() {
-        for tail in render::output_tail(&record.output) {
+        for tail in render::output_tail_after(&record.output, record.omitted_lines) {
             push_detail_line(&mut lines, &tail, dim_style, width);
         }
     }
@@ -4070,6 +4054,7 @@ mod tests {
             ok: !matches!(status, ToolStatus::Failure),
             duration_ms: 1_200,
             output: String::new(),
+            omitted_lines: 0,
             error: matches!(status, ToolStatus::Failure).then(|| "boom\ntrace".into()),
             status,
         }

@@ -853,6 +853,12 @@ pub(crate) fn duration_text(duration_ms: u64) -> String {
 /// an exact `… N lines above` count. Pinned by
 /// `output_tail_scales_with_the_tail_not_the_output`.
 pub(crate) fn output_tail(output: &str) -> Vec<String> {
+    output_tail_after(output, 0)
+}
+
+/// [`output_tail`] for output whose first `omitted_before` lines were already
+/// dropped (see `ToolRecord::omitted_lines`); they are added to the count.
+pub(crate) fn output_tail_after(output: &str, omitted_before: usize) -> Vec<String> {
     let mut tail_start = 0usize;
     let mut tail_lines = 0usize;
     let mut cursor = output.len();
@@ -892,7 +898,8 @@ pub(crate) fn output_tail(output: &str) -> Vec<String> {
         0
     } else {
         count_newlines(head.as_bytes())
-    };
+    }
+    .saturating_add(omitted_before);
     let mut result = if omitted > 0 {
         vec![format!("… {omitted} lines above")]
     } else {
