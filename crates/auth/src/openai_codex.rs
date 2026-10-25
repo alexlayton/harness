@@ -292,7 +292,12 @@ impl OpenAiCodexAuth {
         // network.  Never hold the blocking cache mutex across the network;
         // the async guard is released before any `.await` on the mutex.
         let _guard = self.refresh_lock.lock().await;
-        // Reload: another waiter (or process) may have already refreshed.
+        // Serialize the single-use refresh-token exchange across processes,
+        // then reload: another process may have refreshed while we waited.
+        let _lease = self
+            .store
+            .acquire_refresh_lease(crate::storage::OPENAI_CODEX_PROVIDER_KEY)
+            .await?;
         let mut expired_stored = None;
         if let Ok(Some(current)) = self.store.openai_codex() {
             let cached = self
@@ -340,12 +345,23 @@ impl OpenAiCodexAuth {
         let old_refresh = old.refresh.clone();
         // Refresh exchanges use strict status handling like the browser
         // flow: only 2xx with a token payload succeeds.
-        let value = self
+        let value = match self
             .token_strict(
                 json!({"grant_type":"refresh_token", "refresh_token":old.refresh, "client_id": OPENAI_CODEX_CLIENT_ID} ),
                 &CancellationToken::new(),
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                // A writer without the lease (an older Harness, or a login)
+                // may have stored a newer generation; prefer it to failing.
+                if let Some(current) = self.adopt_newer_on_disk(&old)? {
+                    return Ok(current);
+                }
+                return Err(error);
+            }
+        };
         let credential = credential_from_token(&value, Some(&old_refresh))?;
         // Compare and save under the auth-file lock. A separate process may
         // have rotated the credential while this exchange was in flight; in
@@ -1173,32 +1189,28 @@ mod tests {
         assert_eq!(second, newer);
     }
 
-    /// Separate handles can reach the token endpoint concurrently because
-    /// their async single-flight locks are process-local. Both completions
-    /// are allowed to succeed here, but the compare-and-save winner must be
-    /// the credential returned by both handles and persisted to disk.
+    /// Separate handles have process-local single-flight locks, like two
+    /// Harness processes. The cross-process refresh lease must serialize
+    /// them: the rotating refresh token is exchanged once, and both handles
+    /// return the one generation persisted to disk.
     #[tokio::test]
-    async fn independent_codex_refresh_race_adopts_one_persisted_generation() {
+    async fn independent_codex_refresh_race_exchanges_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let exchanges = Arc::new(AtomicUsize::new(0));
-        let responses = Arc::new(tokio::sync::Barrier::new(2));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let exchanges_task = exchanges.clone();
-        let responses_task = responses.clone();
         let server = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
                 let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
-                let responses = responses_task.clone();
                 tokio::spawn(async move {
                     let mut scratch = [0u8; 8192];
                     let _ = socket.read(&mut scratch).await;
-                    responses.wait().await;
                     let payload = URL_SAFE_NO_PAD
                         .encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
                     let access = format!("head-{n}.{payload}.sig");
@@ -1254,7 +1266,7 @@ mod tests {
         server.abort();
         let _ = server.await;
 
-        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
         assert_eq!(first, second);
         assert_eq!(AuthStore::new(path).openai_codex().unwrap().unwrap(), first);
     }

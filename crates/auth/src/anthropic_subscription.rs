@@ -133,7 +133,12 @@ impl AnthropicSubscriptionAuth {
         // network.  Never hold the blocking cache mutex across the network;
         // the async guard is released before any `.await` on the mutex.
         let _guard = self.refresh_lock.lock().await;
-        // Reload: another waiter (or process) may have already refreshed.
+        // Serialize the single-use refresh-token exchange across processes,
+        // then reload: another process may have refreshed while we waited.
+        let _lease = self
+            .store
+            .acquire_refresh_lease(crate::storage::ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY)
+            .await?;
         let mut expired_stored = None;
         if let Ok(Some(current)) = self.store.anthropic_subscription() {
             let cached = self

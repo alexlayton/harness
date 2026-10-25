@@ -24,6 +24,11 @@ pub const ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY: &str = "anthropic-subscription";
 pub const OPENAI_CODEX_PROVIDER_KEY: &str = "openai-codex";
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
+/// Longest wait for another process's refresh exchange. One exchange is
+/// bounded by the 30-second OAuth client timeout, so this covers a full
+/// exchange plus its compare-and-save.
+const REFRESH_LEASE_WAIT: Duration = Duration::from_secs(45);
+const REFRESH_LEASE_POLL: Duration = Duration::from_millis(25);
 
 // Test-only fault injection for fail-closed hardening (SESSION-4).
 //
@@ -846,6 +851,61 @@ fn sync_parent(path: &Path) -> Result<()> {
     }
 }
 
+/// Cross-process lease held across one provider's refresh-token exchange.
+///
+/// Rotating providers (Codex, Anthropic) accept each refresh token once and
+/// can revoke the whole grant when a used token is presented again. Per-handle
+/// mutexes do not serialize separate processes, so every refresh takes this
+/// lease, reloads the stored credential, and only then exchanges. The main
+/// auth-file lock is never held across the network request. The lease is
+/// released on drop, including when the refresh future is cancelled.
+#[derive(Debug)]
+pub struct RefreshLease {
+    file: fs::File,
+}
+
+impl Drop for RefreshLease {
+    fn drop(&mut self) {
+        // Retain the sidecar inode, as for the auth-file lock.
+        let _ = self.file.unlock();
+    }
+}
+
+impl AuthStore {
+    /// Acquire the refresh lease for `provider`, waiting asynchronously (up
+    /// to a bound) while another process holds it.
+    pub async fn acquire_refresh_lease(&self, provider: &str) -> Result<RefreshLease> {
+        let path = self
+            .path
+            .with_extension(format!("json.{provider}.refresh.lock"));
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&path)
+        }
+        .map_err(|source| io_error("open refresh lease", &path, source))?;
+        ensure_private_file(&path)?;
+        let deadline = tokio::time::Instant::now() + REFRESH_LEASE_WAIT;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(RefreshLease { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(AuthError::LockUnavailable(path));
+                    }
+                    tokio::time::sleep(REFRESH_LEASE_POLL).await;
+                }
+                Err(source) => return Err(io_error("lock refresh lease", &path, source)),
+            }
+        }
+    }
+}
+
 struct AuthFileLock {
     file: fs::File,
 }
@@ -916,6 +976,27 @@ mod tests {
             None,
             vec!["gpt-5.4".into()],
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_lease_is_exclusive_bounded_and_released_on_drop() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let owner = store.acquire_refresh_lease("openai-codex").await.unwrap();
+        // A contender waits, then fails after the bound instead of hanging.
+        assert!(matches!(
+            store.acquire_refresh_lease("openai-codex").await,
+            Err(AuthError::LockUnavailable(_))
+        ));
+        // Leases are per provider.
+        drop(
+            store
+                .acquire_refresh_lease("anthropic-subscription")
+                .await
+                .unwrap(),
+        );
+        drop(owner);
+        store.acquire_refresh_lease("openai-codex").await.unwrap();
     }
 
     #[test]

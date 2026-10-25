@@ -25,7 +25,7 @@ pub use openai_codex::{
 };
 pub use storage::{
     AuthEntries, AuthStore, COPILOT_PROVIDER_KEY, CopilotCredential, OPENAI_CODEX_PROVIDER_KEY,
-    OpenAiCodexCredential, RedactedCredential, auth_path, config_dir,
+    OpenAiCodexCredential, RedactedCredential, RefreshLease, auth_path, config_dir,
 };
 
 /// Unofficial Anthropic subscription OAuth.
