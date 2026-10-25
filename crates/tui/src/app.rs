@@ -93,7 +93,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -583,7 +583,7 @@ impl CrossTerm {
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
         ui.enqueue_welcome();
-        install_panic_hook(ui.terminal.clone());
+        install_panic_hook(&ui.terminal);
         ui.setup_terminal()?;
         Ok(ui)
     }
@@ -594,7 +594,7 @@ impl CrossTerm {
     /// unsupported terminals report that operation as an error.
     fn setup_terminal(&mut self) -> Result<()> {
         let raw_result = {
-            let mut terminal = self.terminal.lock().unwrap();
+            let mut terminal = lock_terminal(&self.terminal);
             terminal
                 .backend
                 .enable_raw_mode()
@@ -603,10 +603,10 @@ impl CrossTerm {
         if let Err(error) = raw_result {
             return self.setup_failed(error);
         }
-        self.terminal.lock().unwrap().modes.raw_mode = true;
+        lock_terminal(&self.terminal).modes.raw_mode = true;
 
         let bracketed_result = {
-            let mut terminal = self.terminal.lock().unwrap();
+            let mut terminal = lock_terminal(&self.terminal);
             terminal
                 .backend
                 .enable_bracketed_paste(&mut self.out)
@@ -615,22 +615,19 @@ impl CrossTerm {
         if let Err(error) = bracketed_result {
             return self.setup_failed(error);
         }
-        self.terminal.lock().unwrap().modes.bracketed_paste = true;
+        lock_terminal(&self.terminal).modes.bracketed_paste = true;
 
         // The kitty keyboard protocol makes Shift+Enter report as `Enter` with
         // the SHIFT modifier, which the input handler already maps to a newline
         // (works on Ghostty; iTerm/Terminal.app do not support it). Only
         // `DISAMBIGUATE_ESCAPE_CODES` is pushed — `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
         // would swallow plain characters. Popped in `restore` and the panic hook.
-        if self
-            .terminal
-            .lock()
-            .unwrap()
+        if lock_terminal(&self.terminal)
             .backend
             .push_keyboard_flags(&mut self.out)
             .is_ok()
         {
-            self.terminal.lock().unwrap().modes.keyboard_flags = true;
+            lock_terminal(&self.terminal).modes.keyboard_flags = true;
         }
         // The cursor stays visible: it *is* the input caret, sitting right
         // after the `› ` prefix. No hide, no fake cell.
@@ -2620,7 +2617,7 @@ impl CrossTerm {
     }
 
     fn restore(&mut self) -> Result<()> {
-        let mut terminal = self.terminal.lock().unwrap();
+        let mut terminal = lock_terminal(&self.terminal);
         restore_terminal(&mut terminal, &mut self.out)
     }
 }
@@ -2720,14 +2717,43 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     });
 }
 
-fn install_panic_hook(terminal: Arc<Mutex<TerminalState>>) {
+/// Lock the shared terminal state. A panic while the lock was held must not
+/// stop later restoration, so a poisoned lock is recovered: the state only
+/// records which modes still need to be undone.
+fn lock_terminal(terminal: &Mutex<TerminalState>) -> MutexGuard<'_, TerminalState> {
+    terminal.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Restore the terminal when the UI thread panics.
+///
+/// The hook is process-global, but only a panic on the thread that owns the
+/// UI may restore it. Tokio catches panics in spawned tasks (for example the
+/// agent task) and the UI keeps running; restoring cooked mode there would
+/// break the live TUI. The hook holds a `Weak` reference, so it does nothing
+/// after the UI is dropped, and it uses `try_lock` because the panic can
+/// happen while the UI thread holds the terminal lock.
+fn install_panic_hook(terminal: &Arc<Mutex<TerminalState>>) {
+    let terminal = Arc::downgrade(terminal);
+    let ui_thread = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
-        let mut stdout = io::stdout();
-        // Panic hooks cannot report a cleanup error without obscuring the
-        // original panic, but they still use the same best-effort operation
-        // layer. A caught panic or a later Drop can retry anything that failed.
-        let _ = restore_terminal(&mut terminal.lock().unwrap(), &mut stdout);
+        if std::thread::current().id() == ui_thread
+            && let Some(terminal) = terminal.upgrade()
+        {
+            let guard = match terminal.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(mut guard) = guard {
+                let mut stdout = io::stdout();
+                // Panic hooks cannot report a cleanup error without obscuring
+                // the original panic, but they still use the same best-effort
+                // operation layer. A caught panic or a later Drop can retry
+                // anything that failed.
+                let _ = restore_terminal(&mut guard, &mut stdout);
+            }
+        }
         previous(panic);
     }));
 }
@@ -4186,7 +4212,21 @@ mod tests {
 
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        install_panic_hook(ui.terminal.clone());
+        install_panic_hook(&ui.terminal);
+        // A panic on another thread (for example a Tokio task whose panic is
+        // caught) must leave the live UI's terminal modes alone.
+        let worker = std::thread::spawn(|| panic!("simulated worker panic"));
+        assert!(worker.join().is_err());
+        assert!(
+            backend.calls().iter().all(|called| !matches!(
+                called,
+                TerminalOperation::DisableRaw
+                    | TerminalOperation::DisableBracketed
+                    | TerminalOperation::PopKeyboard
+                    | TerminalOperation::Newline
+            )),
+            "a worker-thread panic restored the UI terminal"
+        );
         let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             panic!("simulated terminal panic");
         }));
