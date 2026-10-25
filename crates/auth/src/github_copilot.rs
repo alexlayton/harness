@@ -210,8 +210,14 @@ impl GithubCopilotClient {
         // Idempotent: rustls rejects double installs and we ignore the error.
         let _ = rustls::crypto::ring::default_provider().install_default();
         Ok(Self {
+            // Bound every request: Copilot refresh holds the single-flight
+            // lock while it waits. Never follow redirects, so the GitHub
+            // token is never replayed to another host.
             http: Client::builder()
                 .user_agent(COPILOT_USER_AGENT)
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| AuthError::Network {
                     endpoint: "GitHub".into(),

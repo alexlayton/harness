@@ -174,7 +174,14 @@ impl OpenAiCodexAuth {
     pub fn new(store: AuthStore) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let credential = store.openai_codex()?;
+        // Bound every OAuth request: refresh holds the single-flight lock
+        // while it waits, so a stalled endpoint would block every caller.
+        // Never follow redirects: a 307/308 would replay the refresh token
+        // or PKCE verifier to another host.
         let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| AuthError::OpenAiCodex("could not create HTTP client".into()))?;
         Ok(Self {
