@@ -187,6 +187,13 @@ struct RunningTool {
 /// visible as a count rather than silently clipped.
 const MAX_VISIBLE_RUNNING_TOOLS: usize = 4;
 
+/// Upper bounds for one coalesced event drain. A producer that keeps the
+/// channel non-empty (a fast stream, a large snapshot replay) must not keep
+/// the loop away from terminal input, so Esc and Ctrl+C get a turn after at
+/// most this much work.
+const EVENT_DRAIN_MAX_EVENTS: usize = 256;
+const EVENT_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
 /// The visual rows of the input line plus the cursor's position within them.
 struct InputLayout {
     rows: Vec<Line<'static>>,
@@ -675,21 +682,9 @@ impl CrossTerm {
 
         loop {
             tokio::select! {
-                maybe_event = events.recv() => {
-                    let Some(event) = maybe_event else { return Ok(()) };
-                    self.apply_event(event);
-                    // Coalesced painting: an agent burst (streaming deltas,
-                    // tool start/finish pairs, notices) arrives as many
-                    // channel events within a few milliseconds. Drain
-                    // everything already queued and paint once per wake so
-                    // the per-delta repaint tax stays off the streaming
-                    // path. `try_recv` never blocks, so this only ever
-                    // consumes what has already been sent — no added latency.
-                    while let Ok(event) = events.try_recv() {
-                        self.apply_event(event);
-                    }
-                    self.paint()?;
-                }
+                // Terminal input is polled first: after a bounded event
+                // drain, a pending Esc or Ctrl+C always wins the next wake.
+                biased;
                 maybe_input = input_events.next() => {
                     let event = match maybe_input {
                         Some(Ok(event)) => event,
@@ -703,6 +698,12 @@ impl CrossTerm {
                     if self.handle_input(&event, &input_tx, &cancel)? {
                         return Ok(());
                     }
+                    self.paint()?;
+                }
+                maybe_event = events.recv() => {
+                    let Some(event) = maybe_event else { return Ok(()) };
+                    self.apply_event(event);
+                    self.drain_queued_events(events);
                     self.paint()?;
                 }
                 maybe_path = self.path_completion_rx.recv() => {
@@ -730,6 +731,26 @@ impl CrossTerm {
                 }
             }
         }
+    }
+
+    /// Coalesced painting: an agent burst (streaming deltas, tool start/finish
+    /// pairs, notices) arrives as many channel events within a few
+    /// milliseconds. Apply what is already queued so one paint covers the
+    /// burst, but stop after [`EVENT_DRAIN_MAX_EVENTS`] events or
+    /// [`EVENT_DRAIN_BUDGET`], so a producer that never lets the queue empty
+    /// cannot starve input. `try_recv` never blocks, so this adds no latency.
+    /// Returns the number of events applied.
+    fn drain_queued_events(&mut self, events: &mut mpsc::UnboundedReceiver<UiEvent>) -> usize {
+        let started = std::time::Instant::now();
+        let mut applied = 0;
+        while applied < EVENT_DRAIN_MAX_EVENTS && started.elapsed() < EVENT_DRAIN_BUDGET {
+            let Ok(event) = events.try_recv() else {
+                break;
+            };
+            self.apply_event(event);
+            applied += 1;
+        }
+        applied
     }
 
     /// Rewrite only the activity row in place, leaving the rest of the live
@@ -3840,6 +3861,20 @@ mod tests {
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum()
+    }
+
+    #[test]
+    fn event_drain_is_bounded_while_the_queue_stays_full() {
+        // A producer that keeps the channel non-empty must not hold the loop
+        // away from terminal input for longer than one bounded drain.
+        let mut ui = ui(80, 24);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..(EVENT_DRAIN_MAX_EVENTS * 4) {
+            tx.send(UiEvent::TextDelta("x".into())).unwrap();
+        }
+        let applied = ui.drain_queued_events(&mut rx);
+        assert!(applied <= EVENT_DRAIN_MAX_EVENTS);
+        assert!(rx.try_recv().is_ok(), "the drain must leave work queued");
     }
 
     fn begin_ask(ui: &mut CrossTerm) -> mpsc::UnboundedReceiver<InputMessage> {
