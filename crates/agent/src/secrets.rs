@@ -130,6 +130,15 @@ impl SecretMasker {
         }
     }
 
+    /// Leftmost complete secret value in `text`, using the same tie rule as
+    /// `mask_text` (entries are sorted longest-first).
+    fn first_match<'a>(&'a self, text: &str) -> Option<(usize, &'a SecretEntry)> {
+        self.entries
+            .iter()
+            .filter_map(|entry| text.find(&entry.value).map(|offset| (offset, entry)))
+            .min_by_key(|(offset, _)| *offset)
+    }
+
     fn replace_entries(&self, text: &str, restore: bool) -> String {
         let mut output = String::with_capacity(text.len());
         let mut cursor = 0;
@@ -341,8 +350,15 @@ impl SecretMasker {
     }
 }
 
-/// Incremental exact-value masker for provider deltas. It retains only a
-/// suffix that could become a secret after the next delta arrives.
+/// Incremental exact-value masker for provider deltas.
+///
+/// It emits text only where the result is final: up to the earliest position
+/// at which a secret could still start (the pending tail is a proper prefix
+/// of a value), and it replaces every complete match as a whole. It never
+/// holds a complete match back as a "suffix": for a self-overlapping value
+/// such as `aaaaaaaa`, doing so let each later one-character delta emit one
+/// unmasked character, and the concatenated events contained the secret.
+/// The emitted concatenation equals `mask_text` of the full input.
 struct StreamingMasker {
     masker: Arc<SecretMasker>,
     pending: String,
@@ -358,11 +374,29 @@ impl StreamingMasker {
 
     fn push(&mut self, delta: &str) -> String {
         self.pending.push_str(delta);
-        let retained = self.retained_suffix_len();
-        let emit_len = self.pending.len().saturating_sub(retained);
-        let emitted = self.masker.mask_text(&self.pending[..emit_len]);
-        self.pending.drain(..emit_len);
-        emitted
+        let mut output = String::new();
+        let mut cursor = 0;
+        loop {
+            let rest = &self.pending[cursor..];
+            let complete = self.masker.first_match(rest);
+            let partial = self.partial_start(rest);
+            // A complete match wins unless a value could still start at or
+            // before it (a longer or earlier match is still possible).
+            if let Some((offset, entry)) = complete
+                && partial.is_none_or(|start| start > offset)
+            {
+                output.push_str(&rest[..offset]);
+                output.push_str(&entry.placeholder);
+                cursor += offset + entry.value.len();
+                continue;
+            }
+            let emit = partial.unwrap_or(rest.len());
+            output.push_str(&rest[..emit]);
+            cursor += emit;
+            break;
+        }
+        self.pending.drain(..cursor);
+        output
     }
 
     fn finish(&mut self) -> String {
@@ -370,22 +404,26 @@ impl StreamingMasker {
             .mask_text(std::mem::take(&mut self.pending).as_str())
     }
 
-    fn retained_suffix_len(&self) -> usize {
-        let mut retained = 0;
-        for entry in self.masker.entries.iter() {
-            let prefix_lengths = entry
-                .value
-                .char_indices()
-                .skip(1)
-                .map(|(index, _)| index)
-                .chain(std::iter::once(entry.value.len()));
-            for prefix_len in prefix_lengths {
-                if self.pending.ends_with(&entry.value[..prefix_len]) {
-                    retained = retained.max(prefix_len);
-                }
-            }
-        }
-        retained
+    /// Earliest offset in `text` whose tail is a proper prefix of a secret
+    /// value, so more input could complete a match there.
+    fn partial_start(&self, text: &str) -> Option<usize> {
+        let longest = self
+            .masker
+            .entries
+            .iter()
+            .map(|entry| entry.value.len())
+            .max()?;
+        let first = text.len().saturating_sub(longest - 1);
+        text.char_indices()
+            .map(|(index, _)| index)
+            .filter(|&index| index >= first)
+            .find(|&index| {
+                let tail = &text[index..];
+                self.masker
+                    .entries
+                    .iter()
+                    .any(|entry| entry.value.len() > tail.len() && entry.value.starts_with(tail))
+            })
     }
 }
 
@@ -658,6 +696,36 @@ mod tests {
             let last = stream.finish();
             let output = format!("{first}{second}{last}");
             assert_eq!(output, "{{harness-secret:LONG}}", "split {split}");
+        }
+    }
+
+    #[test]
+    fn streaming_masker_never_emits_a_self_overlapping_secret() {
+        // A complete match must never be held back as a suffix: with
+        // `aaaaaaaa`, each later one-character delta then emitted one
+        // unmasked character and the concatenation contained the secret.
+        let masker = Arc::new(
+            SecretMasker::new([
+                ("REPEAT".to_owned(), "aaaaaaaa".to_owned()),
+                ("PAIR".to_owned(), "abababab".to_owned()),
+            ])
+            .unwrap(),
+        );
+        for input in [
+            "aaaaaaaaaaaaaaaaaaaaa",
+            "xaaaaaaaaaaaaaaaay",
+            "abababababababab-aaaaaaaa",
+            "aaaaaaa-abababa-",
+        ] {
+            let mut stream = StreamingMasker::new(masker.clone());
+            let mut output = String::new();
+            for character in input.chars() {
+                output.push_str(&stream.push(&character.to_string()));
+            }
+            output.push_str(&stream.finish());
+            assert_eq!(output, masker.mask_text(input), "input {input}");
+            assert!(!output.contains("aaaaaaaa"), "{output}");
+            assert!(!output.contains("abababab"), "{output}");
         }
     }
 
