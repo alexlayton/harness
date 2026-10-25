@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 /// different workflow; bounded reads also protect against concurrent growth.
 const MAX_EDIT_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 80;
-const MAX_DIFF_INPUT_LINES: usize = 10_000;
+/// Largest LCS table (old lines × new lines of the changed middle) that the
+/// preview computes; the diff crate allocates one cell per pair.
+const MAX_DIFF_CELLS: usize = 1_000_000;
 const DIFF_CONTEXT_LINES: usize = 2;
 const MAX_DIFF_LINE_BYTES: usize = 400;
 const MAX_DIFF_OUTPUT_BYTES: usize = 12 * 1024;
@@ -211,10 +213,23 @@ impl Tool for EditTool {
         };
         match edit_result {
             Ok(result) => {
-                let diff = generate_diff(&result.base_content, &result.new_content);
+                // The LCS preview is CPU work; keep it off the async worker.
+                let EditResult {
+                    base_content,
+                    new_content,
+                    replacement_count,
+                } = result;
+                let diff =
+                    tokio::task::spawn_blocking(move || generate_diff(&base_content, &new_content))
+                        .await
+                        .unwrap_or_else(|_| DiffSummary {
+                            text: String::new(),
+                            added_lines: 0,
+                            removed_lines: 0,
+                        });
                 let mut content = format!(
                     "Successfully replaced {} block(s) in {path} (+{} / -{} lines).",
-                    result.replacement_count, diff.added_lines, diff.removed_lines,
+                    replacement_count, diff.added_lines, diff.removed_lines,
                 );
                 if !diff.text.is_empty() {
                     content.push('\n');
@@ -571,14 +586,27 @@ fn apply_replacements(content: &str, replacements: &[MatchedEdit]) -> String {
     result
 }
 
+/// Every start position of `old_text` in `content`, including overlapping
+/// occurrences (they make an edit ambiguous too). Each step is a substring
+/// search from just after the previous match, so the cost is linear in the
+/// content for a unique match instead of O(content × old_text).
 fn match_positions(content: &str, old_text: &str) -> Vec<usize> {
     if old_text.is_empty() {
         return Vec::new();
     }
-    content
-        .char_indices()
-        .filter_map(|(index, _)| content[index..].starts_with(old_text).then_some(index))
-        .collect()
+    let mut positions = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = content[from..].find(old_text) {
+        let position = from + offset;
+        positions.push(position);
+        // Continue at the next character boundary after this match start.
+        let step = content[position..].chars().next().map_or(1, char::len_utf8);
+        from = position + step;
+        if from > content.len() {
+            break;
+        }
+    }
+    positions
 }
 
 fn strip_bom(content: &str) -> (&str, &str) {
@@ -620,17 +648,39 @@ fn no_change_error(path: &str, total: usize) -> String {
 }
 
 fn generate_diff(old_content: &str, new_content: &str) -> DiffSummary {
-    let old_line_count = old_content.split('\n').count();
-    let new_line_count = new_content.split('\n').count();
-    if old_line_count + new_line_count > MAX_DIFF_INPUT_LINES {
+    // Only the changed middle needs an LCS. Strip the common leading and
+    // trailing lines first (keeping the context lines next to the change),
+    // so an edit in a large file no longer builds a table for every line.
+    let old_lines = old_content.split('\n').collect::<Vec<_>>();
+    let new_lines = new_content.split('\n').collect::<Vec<_>>();
+    let mut prefix = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let limit = old_lines.len().min(new_lines.len()) - prefix;
+    let mut suffix = old_lines
+        .iter()
+        .rev()
+        .zip(new_lines.iter().rev())
+        .take(limit)
+        .take_while(|(old, new)| old == new)
+        .count();
+    prefix = prefix.saturating_sub(DIFF_CONTEXT_LINES);
+    suffix = suffix.saturating_sub(DIFF_CONTEXT_LINES);
+    let old_middle = &old_lines[prefix..old_lines.len() - suffix];
+    let new_middle = &new_lines[prefix..new_lines.len() - suffix];
+    if old_middle.len().saturating_mul(new_middle.len()) > MAX_DIFF_CELLS {
         return DiffSummary {
-            text: "[diff omitted: file is too large for a bounded preview]".into(),
-            added_lines: new_line_count.saturating_sub(old_line_count),
-            removed_lines: old_line_count.saturating_sub(new_line_count),
+            text: "[diff omitted: the change is too large for a bounded preview]".into(),
+            added_lines: new_lines.len().saturating_sub(old_lines.len()),
+            removed_lines: old_lines.len().saturating_sub(new_lines.len()),
         };
     }
 
-    let parts = diff::lines(old_content, new_content);
+    let old_middle = old_middle.join("\n");
+    let new_middle = new_middle.join("\n");
+    let parts = diff::lines(&old_middle, &new_middle);
     let mut entries = Vec::with_capacity(parts.len());
     let mut added_lines = 0;
     let mut removed_lines = 0;
@@ -760,6 +810,29 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn matching_counts_overlapping_occurrences() {
+        assert_eq!(match_positions("aaaa", "aa"), vec![0, 1, 2]);
+        assert_eq!(match_positions("é-é-é", "é"), vec![0, 3, 6]);
+        assert_eq!(match_positions("abc", "d"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn large_file_edit_still_gets_a_bounded_diff() {
+        // The whole-file LCS was skipped (or built a ~100 MB table); the
+        // changed middle alone is small.
+        let old = (0..50_000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replace("line 25000\n", "changed\n");
+        let diff = generate_diff(&old, &new);
+        assert!(diff.text.contains("- line 25000"), "{}", diff.text);
+        assert!(diff.text.contains("+ changed"), "{}", diff.text);
+        assert!(diff.text.contains("  line 24999"), "{}", diff.text);
+        assert_eq!((diff.added_lines, diff.removed_lines), (1, 1));
+    }
 
     #[cfg(unix)]
     fn create_fifo(path: &std::path::Path) {
