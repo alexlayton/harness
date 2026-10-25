@@ -1093,6 +1093,16 @@ mod tests {
     }
 
     #[test]
+    fn centered_emoji_table_column_at_narrow_width_does_not_panic() {
+        // `❤️` (VS16) measured wider as a string than as characters; the
+        // padding arithmetic underflowed and panicked.
+        let source = "| A | Mood |\n| :---: | :---: |\n| x | ❤️❤️❤️❤️ ok ❤️ |\n";
+        for width in [80, 24, 16, 12, 10, 8] {
+            let _ = markdown_lines(source, Theme::default(), width);
+        }
+    }
+
+    #[test]
     fn markdown_table_in_list_keeps_its_marker_and_styled_cells() {
         let source = "- | Item | Count |\n  | :--- | ---: |\n  | **long name** | 42 |";
         let lines = markdown_lines(source, Theme::default(), 19);
