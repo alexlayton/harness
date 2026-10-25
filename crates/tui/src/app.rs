@@ -2530,12 +2530,21 @@ impl CrossTerm {
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
-        commit_to_transcript(&mut self.transcript, &mut self.pending);
+        let build = self.stage_full_repaint();
+        self.write_frame(build, true)
+    }
+
+    /// Prepare a full repaint. A stream prefix committed here must reach the
+    /// transcript before the frame is built: the full repaint prints only
+    /// `transcript`, and the frame bookkeeping then moves `pending` into it
+    /// without printing, so a prefix committed after the move was lost from
+    /// the screen on resize or Ctrl+O.
+    fn stage_full_repaint(&mut self) -> RegionBuild {
         let input = self.input_layout();
         let running = self.running_region();
         self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
-        let build = self.build_region_with_running(&input, running);
-        self.write_frame(build, true)
+        commit_to_transcript(&mut self.transcript, &mut self.pending);
+        self.build_region_with_running(&input, running)
     }
 
     /// Emit one frame. In incremental mode the frame is [pending entries] +
@@ -5258,6 +5267,26 @@ mod tests {
             Entry::Assistant { markdown, .. } => assert_eq!(markdown, &tall),
             other => panic!("expected assistant prefix entry, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn full_repaint_prints_a_stream_prefix_committed_during_the_repaint() {
+        // A full repaint prints only `transcript`. A prefix committed after
+        // pending entries moved there was never printed.
+        let mut ui = ui(80, 8);
+        let tall = format!("{}\n\n", "word ".repeat(100));
+        ui.stream = Some(StreamState {
+            reasoning: String::new(),
+            markdown: tall.clone() + &"second ".repeat(30),
+        });
+        let _build = ui.stage_full_repaint();
+        assert!(ui.pending.is_empty());
+        let prefixes = ui
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Assistant { markdown, .. } if *markdown == tall))
+            .count();
+        assert_eq!(prefixes, 1);
     }
 
     #[test]
