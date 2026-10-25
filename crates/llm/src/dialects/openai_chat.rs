@@ -255,6 +255,10 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelInfo>, LlmError> {
 pub struct ChatStreamParser {
     calls: BTreeMap<u64, PartialToolCall>,
     stop_reason: Option<String>,
+    /// Latest usage seen.  Some endpoints attach cumulative usage to every
+    /// chunk, so usage alone does not end the response; it is reported on
+    /// the terminal event.
+    usage: Option<Usage>,
     done: bool,
     calls_flushed: bool,
     /// Call IDs already emitted in this response.  IDs are unique per
@@ -290,8 +294,9 @@ impl ChatStreamParser {
         if payload.trim() == "[DONE]" {
             // The documented Chat terminator has no usage of its own.  It is
             // nevertheless a complete protocol terminal: validate and emit
-            // every pending call before recording one usage-less Done event.
-            return self.complete(None);
+            // every pending call before recording one Done event with the
+            // latest usage seen (if any).
+            return self.complete();
         }
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| LlmError::Parse(format!("chat SSE payload: {error}")))?;
@@ -315,7 +320,8 @@ impl ChatStreamParser {
             ));
         }
 
-        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        let choices = value.get("choices").and_then(Value::as_array);
+        if let Some(choices) = choices {
             for (choice_index, choice) in choices.iter().enumerate() {
                 if choice_index > 0 {
                     break; // v1 requests one completion
@@ -352,7 +358,14 @@ impl ChatStreamParser {
         if let Some(usage_value) = value.get("usage")
             && !usage_value.is_null()
         {
-            output.extend(self.complete(Some(parse_usage(usage_value)?))?);
+            self.usage = Some(parse_usage(usage_value)?);
+            // Usage ends the response only as the dedicated usage chunk
+            // (no choices) or after a finish_reason.  Endpoints that attach
+            // usage to every content chunk must keep streaming.
+            let usage_only = choices.is_none_or(|choices| choices.is_empty());
+            if usage_only || self.stop_reason.is_some() {
+                output.extend(self.complete()?);
+            }
         }
         Ok(output)
     }
@@ -368,15 +381,15 @@ impl ChatStreamParser {
         // manufacture `Done` and never finalize unfinished tool calls here.
         self.done = true;
         Err(super::truncated_stream(
-            "chat stream ended without a terminal event (expected [DONE], a finish_reason, or a usage chunk)",
+            "chat stream ended without a terminal event (expected [DONE] or a final usage chunk)",
         ))
     }
 
-    fn complete(&mut self, usage: Option<Usage>) -> Result<Vec<StreamEvent>, LlmError> {
+    fn complete(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         let mut output = self.flush_calls()?;
         output.push(StreamEvent::Done {
             stop_reason: self.stop_reason.clone(),
-            usage,
+            usage: self.usage.take(),
         });
         self.done = true;
         Ok(output)
@@ -588,6 +601,35 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(StreamEvent::Done { usage: Some(_), .. })
+        ));
+    }
+
+    #[test]
+    fn usage_on_every_chunk_does_not_end_the_answer_early() {
+        // Some endpoints attach cumulative usage to every content chunk.
+        // Only [DONE] (or usage after finish_reason) ends the response.
+        let mut parser = ChatStreamParser::new();
+        let mut events = parser
+            .parse_payload(r#"{"choices":[{"delta":{"content":"hel"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}"#)
+            .unwrap();
+        events.extend(
+            parser
+                .parse_payload(r#"{"choices":[{"delta":{"content":"lo"}}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#)
+                .unwrap(),
+        );
+        assert!(!parser.done);
+        events.extend(parser.parse_payload("[DONE]").unwrap());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hello");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { usage: Some(usage), .. }) if usage.output_tokens == 2
         ));
     }
 
