@@ -121,6 +121,10 @@ impl RunOptions {
 pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken) -> Result<String> {
     ensure!(!prompt.trim().is_empty(), "prompt must not be blank");
     options.validate()?;
+    // Guard a child token, not the caller's: the guard fires on every
+    // return, and cancelling the caller's token would also cancel unrelated
+    // work that shares it. The child still follows the caller's cancel.
+    let cancel = cancel.child_token();
     let _cancel_on_drop = cancel.clone().drop_guard();
     let cli = Cli {
         provider: options.provider.as_deref().and_then(ProviderArg::from_name),
