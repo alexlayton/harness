@@ -1,5 +1,6 @@
 use crate::client::HarnessClient;
 use crate::config::{MAX_CONCURRENT_MCP_STARTUPS, McpServerConfig, McpTransportConfig};
+use crate::http_client::BoundedHttpClient;
 use crate::tool::{MAX_REMOTE_DEFINITION_BYTES, MAX_REMOTE_TOOLS, McpTool, validate_remote_tool};
 use crate::{
     MCP_INITIALIZE_TIMEOUT, MCP_LIST_TIMEOUT, MCP_MAX_FRAME_BYTES, MCP_SHUTDOWN_TIMEOUT,
@@ -494,11 +495,16 @@ async fn connect_server(
                     Ok((name, value))
                 })
                 .collect::<Result<HashMap<_, _>, McpError>>()?;
+            // rmcp's reqwest client reads JSON and error bodies without a
+            // byte cap; the bounded client applies the frame limit to every
+            // response body before parsing.
+            let client = BoundedHttpClient::new(MCP_MAX_FRAME_BYTES)
+                .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
             let make_transport = || {
                 let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
                     .custom_headers(headers.clone())
                     .max_sse_event_size(MCP_MAX_FRAME_BYTES);
-                StreamableHttpClientTransport::from_config(config)
+                StreamableHttpClientTransport::with_client(client.clone(), config)
             };
             let result = connect_transport(
                 server,

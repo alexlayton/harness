@@ -5,6 +5,7 @@
 
 mod client;
 mod config;
+mod http_client;
 mod names;
 mod output;
 mod runtime;
