@@ -281,7 +281,8 @@ impl SessionStore {
     ///
     /// Plain loads and exports do not require this lease. Any runtime that can
     /// append conversation events must hold it so independent in-memory model
-    /// histories cannot write to the same durable log.
+    /// histories cannot write to the same durable log. To attach a session
+    /// that was loaded earlier, use [`Self::acquire_active_and_reload`].
     pub fn acquire_active(&self, session: &Session) -> Result<SessionActiveLease> {
         let Some(session_path) = session.path() else {
             return Ok(SessionActiveLease { file: None });
@@ -319,6 +320,27 @@ impl SessionStore {
             }
             Err(source) => Err(io_error("lock active session lease", &path, source)),
         }
+    }
+
+    /// Acquire the active lease, then reload the session from disk.
+    ///
+    /// A session loaded before the lease can be stale: the previous owner may
+    /// have appended events between the load and the moment it released the
+    /// lease. Every path that attaches an existing session to a runtime must
+    /// use this method before it repairs the session or builds model context,
+    /// so the new owner continues from the complete durable history.
+    pub fn acquire_active_and_reload(&self, session: &mut Session) -> Result<SessionActiveLease> {
+        let lease = self.acquire_active(session)?;
+        if let Some(path) = session.path().cloned() {
+            let reloaded = self.load_path(&path)?;
+            if reloaded.id() != session.id() {
+                return Err(SessionError::InvalidEvent(
+                    "session file changed identity while it was being activated".into(),
+                ));
+            }
+            *session = reloaded;
+        }
+        Ok(lease)
     }
 
     /// Create and immediately persist a new session header.
@@ -2429,6 +2451,33 @@ mod tests {
         ));
         drop(owner);
         store.acquire_active(&session).unwrap();
+    }
+
+    #[test]
+    fn lease_then_reload_includes_the_previous_owners_final_events() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut owner_session = store.create(SessionCreateOptions::default()).unwrap();
+        let owner = store.acquire_active(&owner_session).unwrap();
+        // A second runtime loads while the first still owns the session.
+        let mut stale = store.load_path(owner_session.path().unwrap()).unwrap();
+        store
+            .append_event(
+                &mut owner_session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("final words")),
+                },
+            )
+            .unwrap();
+        drop(owner);
+
+        let _lease = store.acquire_active_and_reload(&mut stale).unwrap();
+        assert_eq!(stale.events.len(), owner_session.events.len());
+        assert!(matches!(
+            stale.events.last().map(|record| &record.event),
+            Some(SessionEvent::UserMessage { .. })
+        ));
     }
 
     #[test]

@@ -150,7 +150,9 @@ impl Agent {
         let new_active_lease = if reuses_active_lease {
             None
         } else {
-            match store.acquire_active(&session) {
+            // Reload under the lease: the previous owner may have appended
+            // after `load` read the file.
+            match store.acquire_active_and_reload(&mut session) {
                 Ok(lease) => Some(lease),
                 Err(error) => {
                     send(

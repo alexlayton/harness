@@ -242,7 +242,9 @@ impl Agent {
         store: SessionStore,
         mut session: Session,
     ) -> session::Result<Self> {
-        let active_lease = store.acquire_active(&session)?;
+        // Reload under the lease so events appended by a previous owner after
+        // the caller loaded `session` are part of the model context.
+        let active_lease = store.acquire_active_and_reload(&mut session)?;
         store.repair_incomplete_tool_calls(&mut session)?;
         self.history = session
             .context_messages()
@@ -2083,7 +2085,6 @@ mod tests {
             let store = SessionStore::new(root.path(), workspace.path()).unwrap();
             let session = store.create(SessionCreateOptions::default()).unwrap();
             let path = session.file_path().unwrap().to_path_buf();
-            std::fs::remove_file(&path).unwrap();
             let provider = Arc::new(MockProvider {
                 calls: AtomicUsize::new(0),
                 scripts: vec![],
@@ -2096,16 +2097,18 @@ mod tests {
                 .unwrap();
             drop(input_tx);
 
-            Agent::new(
+            let agent = Agent::new(
                 provider.clone(),
                 ToolRegistry::empty(),
                 "demo",
                 CancellationToken::new(),
             )
             .with_session(store, session)
-            .unwrap()
-            .run(input_rx, event_tx)
-            .await;
+            .unwrap();
+            // Delete the file after attachment (which reloads it) so the
+            // first persist fails.
+            std::fs::remove_file(&path).unwrap();
+            agent.run(input_rx, event_tx).await;
 
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -2679,9 +2682,7 @@ mod tests {
                 scripts: vec![],
                 error_kind: MockErrorKind::Stream,
             });
-            // Delete the session file so the first persist fails.
             let path = session.file_path().unwrap().to_path_buf();
-            std::fs::remove_file(&path).unwrap();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
             let (event_tx, mut event_rx) = mpsc::unbounded_channel();
             input_tx
@@ -2696,11 +2697,13 @@ mod tests {
             // Keep `session` (with its path) for the agent; the store still
             // points at the deleted file.
             let _ = &mut session;
-            Agent::new(provider.clone(), registry, "demo", CancellationToken::new())
+            let agent = Agent::new(provider.clone(), registry, "demo", CancellationToken::new())
                 .with_session(store, session)
-                .unwrap()
-                .run(input_rx, event_tx)
-                .await;
+                .unwrap();
+            // Delete the session file after attachment (which reloads it)
+            // so the first persist fails.
+            std::fs::remove_file(&path).unwrap();
+            agent.run(input_rx, event_tx).await;
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             // One terminal Error at the failure source; the run loop
             // quarantines with exactly one TurnFinished — never a successful
@@ -4316,9 +4319,7 @@ mod tests {
             None,
         ));
         let runner_model = || runner.model_for_test();
-        // Delete the session file so the `ModelChange` persist fails.
         let path = session.file_path().unwrap().to_path_buf();
-        std::fs::remove_file(&path).unwrap();
         let cancel = CancellationToken::new();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -4334,6 +4335,9 @@ mod tests {
             .with_subagent_runner(runner.clone())
             .with_session(store.clone(), session)
             .unwrap();
+        // Delete the session file after attachment (which reloads it) so the
+        // `ModelChange` persist fails.
+        std::fs::remove_file(&path).unwrap();
         // Drive one step manually: the boundary quarantines on the failed
         // persist instead of committing.
         agent
