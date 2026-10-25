@@ -99,21 +99,11 @@ fn load_context_files_impl(
     if let Some(global) = global_dir {
         dirs.push(global);
     }
-    // Walk from cwd up to the git repo root (care: `walk` is cwd-first;
-    // reversed below so parents precede deeper/cwd dirs, matching the
-    // design doc's "forward from root, nearest last").
-    let mut walk = Vec::new();
-    let mut dir = cwd.to_path_buf();
-    loop {
-        walk.push(dir.clone());
-        if dir.join(".git").exists() {
-            break;
-        }
-        match dir.parent() {
-            Some(parent) if parent != dir => dir = parent.to_path_buf(),
-            _ => break,
-        }
-    }
+    // Walk from cwd up to the git repo root, or only cwd outside a repo
+    // (care: the walk is cwd-first; reversed below so parents precede
+    // deeper/cwd dirs, matching the design doc's "forward from root,
+    // nearest last").
+    let mut walk = crate::project_context_dirs(cwd);
     walk.reverse();
     dirs.extend(walk);
 
@@ -399,6 +389,31 @@ mod tests {
         assert!(
             !paths.contains(&above),
             "walk must stop at the git root: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn without_a_git_root_only_cwd_is_searched() {
+        // Outside a repository, a parent such as `/tmp` can hold an
+        // AGENTS.md written by another user; it must not become trusted
+        // instructions.
+        let root = tempdir().unwrap();
+        let nested = root.path().join("scratch");
+        fs::create_dir_all(&nested).unwrap();
+        let above = write(&root.path().join("AGENTS.md"), "# planted\n");
+        let inside = write(&nested.join("AGENTS.md"), "# cwd\n");
+        let global = tempdir().unwrap();
+        let files = load_context_files_impl(
+            &nested,
+            &ContextFileConfig::default(),
+            true,
+            Some(global.path().to_path_buf()),
+        );
+        let paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
+        assert!(paths.contains(&inside));
+        assert!(
+            !paths.contains(&above),
+            "parent loaded outside git: {paths:?}"
         );
     }
 

@@ -336,22 +336,33 @@ fn resolve_registry_workspace(cwd: &Path) -> Result<PathBuf, ToolInitError> {
     })
 }
 
-pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
-    // Project roots: cwd up to git repo root (or filesystem root).
-    let mut roots: Vec<(PathBuf, SkillMode)> = Vec::new();
-    let mut dir = workspace_root.to_path_buf();
+/// Directories searched for project context (instructions and skills),
+/// nearest first: `start` and each ancestor up to and including the git
+/// repository root.  Without a git root only `start` is returned: walking to
+/// `/` would treat files such as `/tmp/AGENTS.md`, written by any local user,
+/// as trusted project instructions.
+pub(crate) fn project_context_dirs(start: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut dir = start.to_path_buf();
     loop {
-        roots.push((dir.join(".harness/skills"), SkillMode::Harness));
-        roots.push((dir.join(".agents/skills"), SkillMode::Agents));
-        // Stop at the git repo root.
+        dirs.push(dir.clone());
         if dir.join(".git").exists() {
-            break;
+            return dirs;
         }
-        let parent = dir.parent().map(Path::to_path_buf);
-        match parent {
-            Some(parent) if parent != dir => dir = parent,
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
             _ => break,
         }
+    }
+    vec![start.to_path_buf()]
+}
+
+pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
+    // Project roots: cwd up to the git repo root (only cwd outside a repo).
+    let mut roots: Vec<(PathBuf, SkillMode)> = Vec::new();
+    for dir in project_context_dirs(workspace_root) {
+        roots.push((dir.join(".harness/skills"), SkillMode::Harness));
+        roots.push((dir.join(".agents/skills"), SkillMode::Agents));
     }
     // Global: ~/.harness/skills (or $HARNESS_SKILLS_DIR).
     let global = std::env::var_os("HARNESS_SKILLS_DIR")
