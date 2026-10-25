@@ -42,6 +42,7 @@ use agent_client_protocol::{
 };
 use anyhow::{Context as _, Result};
 use auth::CopilotAuth;
+#[cfg(test)]
 use fs2::FileExt;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionEvent, SessionStore, StoredContent};
@@ -802,9 +803,10 @@ impl Drop for CreatedSessionFile {
         if !self.armed {
             return;
         }
-        // Coordinate cleanup with any process that discovered the new file,
-        // and retain the sidecar inode for future contenders.
-        let _ = remove_session_file_locked(&self.path);
+        // Coordinate cleanup with any process that discovered the new file
+        // (never delete a session another runtime now owns), and retain the
+        // sidecar inodes for future contenders.
+        let _ = session::delete_session_file(&self.path);
     }
 }
 
@@ -1085,7 +1087,12 @@ async fn delete_session(
     responder: Responder<DeleteSessionResponse>,
     state: Arc<AcpState>,
 ) -> AcResult<()> {
-    let id = request.session_id.0.to_string();
+    // Canonicalize first so in-process maps and the file name agree.
+    let parsed_id = match session::SessionId::parse(&request.session_id.0) {
+        Ok(id) => id,
+        Err(error) => return respond_invalid_params(responder, anyhow::Error::new(error)),
+    };
+    let id = parsed_id.to_string();
     if state.loading_sessions.lock().unwrap().contains(&id) {
         let _ = responder.respond_with_error(
             AcError::invalid_request()
@@ -1109,8 +1116,25 @@ async fn delete_session(
     if let Some(handle) = handle {
         shutdown_session(handle).await;
     }
-    if let Err(error) = delete_session_everywhere(&id, &state.session_root) {
-        return respond_anyhow(responder, error);
+    // The session crate refuses a session whose active lease another runtime
+    // holds (in any process) and bounds its wait for the append lock. Run the
+    // blocking work off the dispatch executor and await it to completion: a
+    // deletion that outlived an error response would delete late.
+    let root = state.session_root.clone();
+    let deleted = tokio::task::spawn_blocking(move || session::delete_session(&root, &parsed_id))
+        .await
+        .map_err(|error| anyhow::anyhow!("session deletion task failed: {error}"));
+    match deleted {
+        Ok(Ok(_)) => {}
+        Ok(Err(session::SessionError::AlreadyActive(_))) => {
+            let _ = responder.respond_with_error(
+                AcError::invalid_request()
+                    .data("cannot delete a session that another agent is using".to_owned()),
+            );
+            return Ok(());
+        }
+        Ok(Err(error)) => return respond_anyhow(responder, error.into()),
+        Err(error) => return respond_anyhow(responder, error),
     }
     tracing::info!(session = %id, "ACP session deleted");
     let _ = responder.respond(DeleteSessionResponse::new());
@@ -1141,79 +1165,6 @@ async fn shutdown_session(handle: SessionHandle) {
         forwarder_task.abort();
         let _ = agent_task.await;
         let _ = forwarder_task.await;
-    }
-}
-
-/// `session/delete` supplies only an id, not a cwd, so scan every workspace
-/// group under the session root. A missing file counts as success.
-fn delete_session_everywhere(id: &str, session_root: &std::path::Path) -> Result<()> {
-    let parsed = session::SessionId::parse(id).map_err(anyhow::Error::msg)?;
-    let file_name = format!("{parsed}.jsonl");
-    let entries = match std::fs::read_dir(session_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(anyhow::Error::new(error).context("list session root")),
-    };
-    for entry in entries {
-        let entry = entry.context("read session root entry")?;
-        let workspace_dir = entry.path();
-        let metadata = match std::fs::metadata(&workspace_dir) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(anyhow::Error::new(error)
-                    .context(format!("inspect `{}`", workspace_dir.display())));
-            }
-        };
-        if !metadata.is_dir() {
-            continue;
-        }
-        let path = workspace_dir.join(&file_name);
-        match std::fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {
-                remove_session_file_locked(&path)?;
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(
-                    anyhow::Error::new(error).context(format!("inspect `{}`", path.display()))
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Remove one session while holding the same retained advisory sidecar used
-/// by appenders. The sidecar is never unlinked: waiters that opened it before
-/// deletion must continue coordinating on the same inode.
-fn remove_session_file_locked(path: &std::path::Path) -> Result<()> {
-    let lock_path = path.with_extension("jsonl.lock");
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let lock = options
-        .open(&lock_path)
-        .with_context(|| format!("open session lock `{}`", lock_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("secure session lock `{}`", lock_path.display()))?;
-    }
-    lock.lock_exclusive()
-        .with_context(|| format!("lock session `{}`", path.display()))?;
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(anyhow::Error::new(error).context(format!("delete `{}`", path.display())))
-        }
     }
 }
 
@@ -2257,8 +2208,8 @@ done
         assert!(state.sessions.lock().unwrap().is_empty());
     }
 
-    /// Deletion waits for current appenders and never removes the coordination
-    /// inode from beneath already-open or future contenders.
+    /// Deletion waits (bounded) for current appenders and never removes the
+    /// coordination inode from beneath already-open or future contenders.
     #[test]
     fn deletion_coordinates_on_retained_sidecar_inode() {
         let directory = tempdir().unwrap();
@@ -2276,7 +2227,7 @@ done
 
         let deleting = std::thread::spawn({
             let path = path.clone();
-            move || remove_session_file_locked(&path)
+            move || session::delete_session_file(&path)
         });
         std::thread::sleep(Duration::from_millis(50));
         assert!(path.exists(), "delete bypassed the held session lock");
