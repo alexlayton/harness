@@ -1978,7 +1978,18 @@ impl CrossTerm {
                 // Same chrome retention as `SessionChanged`: the snapshot
                 // replaces the conversation, not the header.
                 retain_chrome(&mut self.transcript);
-                for snapshot in entries {
+                // A long session must not load (and print) every entry at
+                // once: keep the newest entries within the transcript budget.
+                let entries = newest_snapshot_entries(entries, TRANSCRIPT_BUDGET_BYTES);
+                if entries.dropped > 0 {
+                    self.pending.push(Entry::Notice {
+                        text: format!(
+                            "{} earlier entries are not shown; export the session to see them",
+                            entries.dropped
+                        ),
+                    });
+                }
+                for snapshot in entries.kept {
                     self.pending.push(match snapshot {
                         SessionSnapshotEntry::User { text } => Entry::User { text },
                         SessionSnapshotEntry::Assistant {
@@ -2519,7 +2530,7 @@ impl CrossTerm {
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
-        self.transcript.append(&mut self.pending);
+        commit_to_transcript(&mut self.transcript, &mut self.pending);
         let input = self.input_layout();
         let running = self.running_region();
         self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
@@ -2610,7 +2621,7 @@ impl CrossTerm {
         self.out.flush().context("flush frame")?;
 
         // Bookkeeping: the printed `above` rows are now immutable scrollback.
-        self.transcript.append(&mut self.pending);
+        commit_to_transcript(&mut self.transcript, &mut self.pending);
         self.region = build.rows;
         self.cursor_row = build.cursor_row;
         self.cursor_col = build.cursor_col;
@@ -2737,6 +2748,133 @@ fn lock_terminal(terminal: &Mutex<TerminalState>) -> MutexGuard<'_, TerminalStat
 /// break the live TUI. The hook holds a `Weak` reference, so it does nothing
 /// after the UI is dropped, and it uses `try_lock` because the panic can
 /// happen while the UI thread holds the terminal lock.
+/// Byte budget for `transcript`. It is only the source for resize and Ctrl+O
+/// repaints, which show one screen of history; older entries are already in
+/// terminal scrollback. Without a bound a long session keeps every message
+/// and tool result in memory.
+const TRANSCRIPT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Approximate retained bytes of one entry.
+fn entry_bytes(entry: &Entry) -> usize {
+    match entry {
+        Entry::Banner { .. } => 0,
+        Entry::Metadata {
+            cwd,
+            branch,
+            provider,
+            model,
+            context_files,
+            mcp_servers,
+            skills,
+        } => {
+            cwd.len()
+                + branch.as_ref().map_or(0, String::len)
+                + provider.len()
+                + model.len()
+                + context_files
+                    .iter()
+                    .chain(mcp_servers)
+                    .chain(skills)
+                    .map(String::len)
+                    .sum::<usize>()
+        }
+        Entry::User { text } | Entry::Notice { text } | Entry::Error { text } => text.len(),
+        Entry::Assistant {
+            markdown,
+            reasoning,
+        } => markdown.len() + reasoning.len(),
+        Entry::Tool { record } => {
+            record.name.len()
+                + record.summary.len()
+                + record.output.len()
+                + record.error.as_ref().map_or(0, String::len)
+        }
+        Entry::Separator { label } => label.len(),
+    }
+}
+
+/// Move printed entries into the transcript, then drop the oldest
+/// conversation entries while it exceeds [`TRANSCRIPT_BUDGET_BYTES`]. The
+/// banner, metadata, and the newest entry are always kept.
+fn commit_to_transcript(transcript: &mut Vec<Entry>, pending: &mut Vec<Entry>) {
+    if pending.is_empty() {
+        return;
+    }
+    transcript.append(pending);
+    trim_transcript(transcript, TRANSCRIPT_BUDGET_BYTES);
+}
+
+fn trim_transcript(transcript: &mut Vec<Entry>, budget: usize) {
+    let mut total = transcript.iter().map(entry_bytes).sum::<usize>();
+    if total <= budget {
+        return;
+    }
+    let last = transcript.len().saturating_sub(1);
+    let mut index = 0usize;
+    transcript.retain(|entry| {
+        let keep = total <= budget
+            || index == last
+            || matches!(entry, Entry::Banner { .. } | Entry::Metadata { .. });
+        if !keep {
+            total = total.saturating_sub(entry_bytes(entry));
+        }
+        index += 1;
+        keep
+    });
+}
+
+/// Snapshot entries that fit the budget, newest last.
+struct SnapshotWindow {
+    kept: Vec<SessionSnapshotEntry>,
+    dropped: usize,
+}
+
+fn snapshot_entry_bytes(entry: &SessionSnapshotEntry) -> usize {
+    match entry {
+        SessionSnapshotEntry::User { text } => text.len(),
+        SessionSnapshotEntry::Assistant {
+            markdown,
+            reasoning,
+        } => markdown.len() + reasoning.len(),
+        SessionSnapshotEntry::Tool {
+            name,
+            summary,
+            output,
+            error,
+            ..
+        } => {
+            name.len()
+                + summary.len()
+                + output
+                    .len()
+                    .min(crate::state::MAX_RETAINED_TOOL_OUTPUT_BYTES)
+                + error.as_ref().map_or(0, |error| {
+                    error.len().min(crate::state::MAX_RETAINED_TOOL_ERROR_BYTES)
+                })
+        }
+    }
+}
+
+/// Keep the newest snapshot entries whose retained size fits `budget` (at
+/// least one entry), in their original order.
+fn newest_snapshot_entries(entries: Vec<SessionSnapshotEntry>, budget: usize) -> SnapshotWindow {
+    let mut total = 0usize;
+    let mut start = entries.len();
+    while start > 0 {
+        let bytes = snapshot_entry_bytes(&entries[start - 1]);
+        if start < entries.len() && total.saturating_add(bytes) > budget {
+            break;
+        }
+        total = total.saturating_add(bytes);
+        start -= 1;
+    }
+    let dropped = start;
+    SnapshotWindow {
+        kept: entries.into_iter().skip(dropped).collect(),
+        dropped,
+    }
+}
+
 fn install_panic_hook(terminal: &Arc<Mutex<TerminalState>>) {
     let terminal = Arc::downgrade(terminal);
     let ui_thread = std::thread::current().id();
@@ -3845,6 +3983,44 @@ mod tests {
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
             .sum()
+    }
+
+    #[test]
+    fn transcript_and_snapshot_keep_newest_entries_within_budget() {
+        let big = "z".repeat(TRANSCRIPT_BUDGET_BYTES / 3);
+        let mut transcript = vec![Entry::Banner {
+            title_order: render::WelcomeTitleOrder::random(),
+        }];
+        let mut pending = (0..6)
+            .map(|index| Entry::User {
+                text: format!("{index}{big}"),
+            })
+            .collect::<Vec<_>>();
+        commit_to_transcript(&mut transcript, &mut pending);
+        assert!(transcript.iter().map(entry_bytes).sum::<usize>() <= TRANSCRIPT_BUDGET_BYTES);
+        assert!(matches!(transcript[0], Entry::Banner { .. }));
+        assert!(matches!(transcript.last(), Some(Entry::User { text }) if text.starts_with('5')));
+
+        let entries = (0..6)
+            .map(|index| SessionSnapshotEntry::User {
+                text: format!("{index}{big}"),
+            })
+            .collect::<Vec<_>>();
+        let window = newest_snapshot_entries(entries, TRANSCRIPT_BUDGET_BYTES);
+        assert!(window.dropped > 0);
+        assert_eq!(window.dropped + window.kept.len(), 6);
+        assert!(matches!(
+            window.kept.last(),
+            Some(SessionSnapshotEntry::User { text }) if text.starts_with('5')
+        ));
+        // A single entry larger than the budget is still shown.
+        let window = newest_snapshot_entries(
+            vec![SessionSnapshotEntry::User {
+                text: "w".repeat(TRANSCRIPT_BUDGET_BYTES + 1),
+            }],
+            TRANSCRIPT_BUDGET_BYTES,
+        );
+        assert_eq!((window.kept.len(), window.dropped), (1, 0));
     }
 
     #[test]

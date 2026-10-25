@@ -852,6 +852,7 @@ pub(crate) fn duration_text(duration_ms: u64) -> String {
 /// resolutions in release); the remaining head byte scan is the floor for
 /// an exact `… N lines above` count. Pinned by
 /// `output_tail_scales_with_the_tail_not_the_output`.
+#[cfg(test)]
 pub(crate) fn output_tail(output: &str) -> Vec<String> {
     output_tail_after(output, 0)
 }
