@@ -114,19 +114,24 @@ fn load_context_files_impl(
     // symlink escape and is silently skipped (no contents in diagnostics).
     // Unreadable files are skipped silently; a missing global path is the
     // normal case and never an error.
-    let mut found: Vec<(PathBuf, String)> = Vec::new();
+    // Each file is read only up to the per-file cap: a huge AGENTS.md must
+    // not be allocated in full before the budget applies.
+    let read_limit = config.max_file_bytes.min(config.max_total_bytes);
+    let mut found: Vec<(PathBuf, String, usize)> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for dir in dirs {
         let Some(path) = first_candidate(&dir) else {
             continue;
         };
-        let Some((canonical, display, raw)) = read_contained_candidate(&dir, &path) else {
+        let Some((canonical, display, raw, total)) =
+            read_contained_candidate(&dir, &path, read_limit)
+        else {
             continue;
         };
         if !seen.insert(canonical) {
             continue;
         }
-        found.push((display, raw));
+        found.push((display, raw, total));
     }
 
     // Spend the budget from highest priority (cwd/nearest) to lowest, then
@@ -134,13 +139,12 @@ fn load_context_files_impl(
     // Thus a large global file can never evict local instructions.
     let mut result = Vec::new();
     let mut remaining = config.max_total_bytes;
-    for (path, raw) in found.into_iter().rev() {
+    for (path, raw, original_len) in found.into_iter().rev() {
         if remaining == 0 {
             break;
         }
         let cap = remaining.min(config.max_file_bytes);
-        let original_len = raw.len();
-        let (content, truncated) = cap_content(&raw, cap);
+        let (content, truncated) = cap_content(&raw, original_len, cap);
         remaining = remaining.saturating_sub(content.len());
         result.push(ContextFile {
             path,
@@ -152,11 +156,13 @@ fn load_context_files_impl(
     result
 }
 
-fn cap_content(content: &str, cap: usize) -> (String, bool) {
-    if content.len() <= cap {
+/// Cap `content` (a prefix of a file of `total` bytes) to `cap` bytes,
+/// including a truncation notice when anything is left out.
+fn cap_content(content: &str, total: usize, cap: usize) -> (String, bool) {
+    if total <= cap && content.len() == total {
         return (content.to_owned(), false);
     }
-    let notice = format!("\n[…] (truncated, {} bytes total)", content.len());
+    let notice = format!("\n[…] (truncated, {total} bytes total)");
     if notice.len() >= cap {
         return (llm::truncate_utf8_prefix(&notice, cap).to_owned(), true);
     }
@@ -210,7 +216,13 @@ fn first_candidate(dir: &Path) -> Option<PathBuf> {
 /// capability. Canonicalization is used only for the containment decision;
 /// the final read is handle-relative and rejects a symlink swapped in after
 /// that decision.
-fn read_contained_candidate(dir: &Path, candidate: &Path) -> Option<(PathBuf, PathBuf, String)> {
+/// Returns the canonical path, display path, the first `limit` bytes (cut to
+/// a UTF-8 boundary), and the file's total size.
+fn read_contained_candidate(
+    dir: &Path,
+    candidate: &Path,
+    limit: usize,
+) -> Option<(PathBuf, PathBuf, String, usize)> {
     let workspace = super::vfs::WorkspaceFs::open_root(dir).ok()?;
     let canonical_dir = workspace.root().to_path_buf();
     let canonical = fs::canonicalize(candidate).ok()?;
@@ -223,10 +235,25 @@ fn read_contained_candidate(dir: &Path, candidate: &Path) -> Option<(PathBuf, Pa
     let raw = {
         use std::io::Read;
         let fd = super::vfs::unix::open_file_relative(&workspace, &components).ok()?;
-        let mut file = std::fs::File::from(fd);
-        let mut raw = String::new();
-        file.read_to_string(&mut raw).ok()?;
-        raw
+        let file = std::fs::File::from(fd);
+        let total = usize::try_from(file.metadata().ok()?.len()).unwrap_or(usize::MAX);
+        let mut bytes = Vec::new();
+        file.take(limit as u64).read_to_end(&mut bytes).ok()?;
+        // A cut can split the last character; anything else invalid means
+        // the file is not UTF-8 text and is skipped, as before.
+        let raw = match String::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(error) if bytes_cut(&error, limit) => {
+                let valid = error.utf8_error().valid_up_to();
+                let mut bytes = error.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).ok()?
+            }
+            Err(_) => return None,
+        };
+        // The file can grow between the size check and the read.
+        let total = total.max(raw.len());
+        (raw, total)
     };
     #[cfg(not(unix))]
     {
@@ -236,7 +263,16 @@ fn read_contained_candidate(dir: &Path, candidate: &Path) -> Option<(PathBuf, Pa
         return None;
     }
     #[cfg(unix)]
-    Some((canonical, candidate.to_path_buf(), raw))
+    {
+        let (raw, total) = raw;
+        Some((canonical, candidate.to_path_buf(), raw, total))
+    }
+}
+
+/// Whether a UTF-8 error is only a character split by the read limit.
+#[cfg(unix)]
+fn bytes_cut(error: &std::string::FromUtf8Error, limit: usize) -> bool {
+    error.as_bytes().len() == limit && error.utf8_error().error_len().is_none()
 }
 
 /// Render loaded context files as a `<project_context>` block. Returns an
