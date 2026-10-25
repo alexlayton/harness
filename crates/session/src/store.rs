@@ -476,6 +476,12 @@ impl SessionStore {
                 "session object does not match its file".into(),
             ));
         }
+        // Another writer may only have appended. A file that no longer starts
+        // with the cached events (same id, but replaced or rewritten) must not
+        // be adopted silently: the model context was built from the cache.
+        if !is_event_prefix(&session.events, &disk_session.events) {
+            return Err(SessionError::HistoryDiverged(path.clone()));
+        }
         if recovery.recovered {
             // Repair the incomplete crash tail before appending: truncate to
             // the last valid record so the fragment never becomes a
@@ -954,6 +960,15 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     file.read_to_end(&mut contents)
         .map_err(|source| io_error("read session", path, source))?;
     Ok(contents)
+}
+
+/// Whether `cached` is a prefix of `disk`, by event id and sequence.
+fn is_event_prefix(cached: &[SessionEventRecord], disk: &[SessionEventRecord]) -> bool {
+    cached.len() <= disk.len()
+        && cached
+            .iter()
+            .zip(disk)
+            .all(|(cached, disk)| cached.id == disk.id && cached.sequence == disk.sequence)
 }
 
 fn file_identity(path: &Path) -> Result<(u64, u64)> {
@@ -2260,7 +2275,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_to_valid_boundary_is_reconciled_before_append() {
+    fn truncation_of_cached_records_is_refused_until_reload() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
         let store = SessionStore::new(root.path(), workspace.path()).unwrap();
@@ -2286,9 +2301,21 @@ mod tests {
             .unwrap();
         fs::write(&path, &raw[..first_event_end]).unwrap();
         assert!(first_event_end > header_end);
+        // The stale handle holds "second", which the file no longer has; its
+        // model context would not match the log.
+        assert!(matches!(
+            store.append_event(
+                &mut stale,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("replacement")),
+                },
+            ),
+            Err(SessionError::HistoryDiverged(_))
+        ));
+        let mut reloaded = store.open(&session.id()).unwrap();
         store
             .append_event(
-                &mut stale,
+                &mut reloaded,
                 SessionEvent::UserMessage {
                     message: StoredMessage::from_llm(&Message::user("replacement")),
                 },
@@ -2781,6 +2808,40 @@ mod tests {
             "failed append must not grow the session file"
         );
         assert!(store.open(&session.id()).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn append_refuses_a_rewritten_file_with_the_same_id() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        let path = session.path().unwrap().clone();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        store
+            .append_event(&mut session, message("original"))
+            .unwrap();
+        // Rewrite the file: same header and id, different history.
+        let header = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, format!("{header}\n")).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let mut other = store.load_path(&path).unwrap();
+        store
+            .append_event(&mut other, message("rewritten"))
+            .unwrap();
+
+        assert!(matches!(
+            store.append_event(&mut session, message("next")),
+            Err(SessionError::HistoryDiverged(_))
+        ));
     }
 
     #[test]

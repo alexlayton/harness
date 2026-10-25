@@ -60,6 +60,12 @@ pub enum SessionError {
     #[error("invalid session event: {0}")]
     InvalidEvent(String),
 
+    /// The file no longer starts with the events this handle already holds:
+    /// it was replaced or rewritten. Appending would build on history the
+    /// runtime has not seen, so the append is refused.
+    #[error("session file {} was replaced or rewritten; reload the session", .0.display())]
+    HistoryDiverged(PathBuf),
+
     #[error("cannot export a session over its source file: {}", .0.display())]
     ExportWouldOverwrite(PathBuf),
 
