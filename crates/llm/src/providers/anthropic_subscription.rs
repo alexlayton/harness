@@ -139,7 +139,10 @@ impl Provider for AnthropicSubscriptionProvider {
             .ensure_valid()
             .await
             .map_err(|e| LlmError::Auth(e.to_string()))?;
-        // Transport details must not leak bearer values via reqwest errors.
+        // Connect and timeout failures must stay `Network` so `with_retry`
+        // repeats them. A reqwest error carries the URL but never request
+        // headers, so the bearer value cannot leak through it; the URL is
+        // still removed because the endpoint can be user-configured.
         let response = crate::http::streaming_client()
             .post(format!("{}/v1/messages", self.endpoint))
             .headers(headers(thinking, true))
@@ -147,9 +150,7 @@ impl Provider for AnthropicSubscriptionProvider {
             .body(bytes)
             .send()
             .await
-            .map_err(|_| {
-                LlmError::Stream("Anthropic subscription network request failed".into())
-            })?;
+            .map_err(|error| LlmError::Network(error.without_url()))?;
         let response = crate::http::check_status_with_secret(response, &c.access).await?;
         Ok(crate::dialects::drive_parser_stream(
             crate::sse::stream_response(response),
