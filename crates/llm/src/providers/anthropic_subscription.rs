@@ -139,6 +139,30 @@ impl Provider for AnthropicSubscriptionProvider {
             .ensure_valid()
             .await
             .map_err(|e| LlmError::Auth(e.to_string()))?;
+        match self.stream_with(req, &bytes, thinking, &c).await {
+            // An unexpired token can still be revoked server-side. Refresh
+            // once (single-flight across handles) and repeat the request.
+            Err(LlmError::Http { status: 401, .. }) => {
+                let c = self
+                    .auth
+                    .refresh_rejected(&c.access)
+                    .await
+                    .map_err(|e| LlmError::Auth(e.to_string()))?;
+                self.stream_with(req, &bytes, thinking, &c).await
+            }
+            result => result,
+        }
+    }
+}
+
+impl AnthropicSubscriptionProvider {
+    async fn stream_with(
+        &self,
+        req: &CompletionRequest,
+        bytes: &[u8],
+        thinking: bool,
+        c: &auth::AnthropicSubscriptionCredential,
+    ) -> Result<EventStream, LlmError> {
         // Connect and timeout failures must stay `Network` so `with_retry`
         // repeats them. A reqwest error carries the URL but never request
         // headers, so the bearer value cannot leak through it; the URL is
@@ -147,7 +171,7 @@ impl Provider for AnthropicSubscriptionProvider {
             .post(format!("{}/v1/messages", self.endpoint))
             .headers(headers(thinking, true))
             .bearer_auth(&c.access)
-            .body(bytes)
+            .body(bytes.to_vec())
             .send()
             .await
             .map_err(|error| LlmError::Network(error.without_url()))?;

@@ -101,6 +101,25 @@ impl OpenAiCodexProvider {
         self
     }
 }
+impl OpenAiCodexProvider {
+    async fn stream_with(
+        &self,
+        request: &CompletionRequest,
+        credential: &auth::OpenAiCodexCredential,
+    ) -> Result<EventStream, LlmError> {
+        let mut headers = codex_headers(&credential.account_id)?;
+        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
+        headers.insert(
+            HeaderName::from_static("openai-beta"),
+            HeaderValue::from_static("responses=experimental"),
+        );
+        OpenAiCodexResponsesClient::with_headers(&self.endpoint, credential.access.clone(), headers)
+            .stream(request)
+            .await
+            .map_err(|error| redact(error, &credential.access))
+    }
+}
+
 #[async_trait::async_trait]
 impl Provider for OpenAiCodexProvider {
     fn name(&self) -> &'static str {
@@ -118,16 +137,19 @@ impl Provider for OpenAiCodexProvider {
             .ensure_valid()
             .await
             .map_err(|error| LlmError::Auth(error.to_string()))?;
-        let mut headers = codex_headers(&credential.account_id)?;
-        headers.insert(ACCEPT, HeaderValue::from_static("text/event-stream"));
-        headers.insert(
-            HeaderName::from_static("openai-beta"),
-            HeaderValue::from_static("responses=experimental"),
-        );
-        OpenAiCodexResponsesClient::with_headers(&self.endpoint, credential.access.clone(), headers)
-            .stream(request)
-            .await
-            .map_err(|error| redact(error, &credential.access))
+        match self.stream_with(request, &credential).await {
+            // An unexpired token can still be revoked server-side. Refresh
+            // once (single-flight across handles) and repeat the request.
+            Err(LlmError::Http { status: 401, .. }) => {
+                let credential = self
+                    .auth
+                    .refresh_rejected(&credential.access)
+                    .await
+                    .map_err(|error| LlmError::Auth(error.to_string()))?;
+                self.stream_with(request, &credential).await
+            }
+            result => result,
+        }
     }
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         Ok(CODEX_MODELS

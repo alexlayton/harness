@@ -543,28 +543,14 @@ impl GithubCopilotProvider {
     }
 }
 
-#[async_trait::async_trait]
-impl Provider for GithubCopilotProvider {
-    fn name(&self) -> &'static str {
-        PROVIDER_NAME
-    }
-
-    async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        let model = model_metadata(&req.model).ok_or_else(|| {
-            LlmError::Parse(format!(
-                "GitHub Copilot model `{}` is not in the supported model catalog",
-                req.model
-            ))
-        })?;
-        if matches!(req.reasoning, ReasoningPolicy::Effort(_))
-            && model.dialect != Dialect::OpenAiResponses
-        {
-            return Err(LlmError::Parse(format!(
-                "GitHub Copilot model `{}` does not expose portable reasoning effort on its {:?} endpoint; use `auto` or `off`",
-                req.model, model.dialect
-            )));
-        }
-        let credential = self.auth.ensure_valid().await.map_err(auth_error)?;
+impl GithubCopilotProvider {
+    /// One request with `credential`; the caller retries once after a 401.
+    async fn stream_with(
+        &self,
+        req: &CompletionRequest,
+        model: &'static CopilotModel,
+        credential: auth::CopilotCredential,
+    ) -> Result<EventStream, LlmError> {
         let sku = auth::sku_from_proxy_token(&credential.access).map(str::to_owned);
         let sku = sku.as_deref();
         if let Some(error) = entitlement_error_for(&req.model, &credential.available_model_ids, sku)
@@ -610,6 +596,44 @@ impl Provider for GithubCopilotProvider {
                 plan_gate_error(error, &req.model, &credential.available_model_ids, sku)
             })
             .map_err(|error| redact_error(error, &access))
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for GithubCopilotProvider {
+    fn name(&self) -> &'static str {
+        PROVIDER_NAME
+    }
+
+    async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
+        let model = model_metadata(&req.model).ok_or_else(|| {
+            LlmError::Parse(format!(
+                "GitHub Copilot model `{}` is not in the supported model catalog",
+                req.model
+            ))
+        })?;
+        if matches!(req.reasoning, ReasoningPolicy::Effort(_))
+            && model.dialect != Dialect::OpenAiResponses
+        {
+            return Err(LlmError::Parse(format!(
+                "GitHub Copilot model `{}` does not expose portable reasoning effort on its {:?} endpoint; use `auto` or `off`",
+                req.model, model.dialect
+            )));
+        }
+        let credential = self.auth.ensure_valid().await.map_err(auth_error)?;
+        match self.stream_with(req, model, credential.clone()).await {
+            // An unexpired token can still be revoked server-side. Refresh
+            // once (single-flight across handles) and repeat the request.
+            Err(LlmError::Http { status: 401, .. }) => {
+                let credential = self
+                    .auth
+                    .refresh_rejected(&credential.access)
+                    .await
+                    .map_err(auth_error)?;
+                self.stream_with(req, model, credential).await
+            }
+            result => result,
+        }
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
