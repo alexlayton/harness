@@ -647,15 +647,72 @@ impl SessionStore {
         {
             return Ok(source.clone());
         }
+        if normalize_workspace(source.metadata.workspace_root.clone())? != self.workspace_root {
+            return Err(SessionError::WorkspaceMismatch {
+                stored: source.metadata.workspace_root.clone(),
+                requested: self.workspace_root.clone(),
+            });
+        }
+        private_dir_all(&self.workspace_dir)?;
+        self.ensure_path_in_root(&self.workspace_dir)?;
         let target = self.workspace_dir.join(format!("{}.jsonl", source.id()));
         if target.exists() {
-            return self.open(&source.id());
+            return self.open_adopted(&target, source);
         }
-        let mut adopted = self.create_with_metadata(source.header_metadata.clone())?;
-        for record in &source.events {
-            self.append_event(&mut adopted, record.event.clone())?;
+        // Build and validate the complete copy in a private temporary file,
+        // then publish it with a hard link, which fails if the name exists.
+        // Appending event by event to the final name left a partial copy
+        // after a failure, and a later adopt reused it as complete.
+        let temp =
+            self.workspace_dir
+                .join(format!(".{}.{}.adopt.tmp", source.id(), Uuid::new_v4()));
+        let published = (|| -> Result<bool> {
+            let mut file = private_file(&temp)?;
+            let mut contents = encode_header(&source.header_metadata)?;
+            contents.push('\n');
+            for record in &source.events {
+                contents.push_str(&encode_record(source.id(), record)?);
+                contents.push('\n');
+            }
+            file.write_all(contents.as_bytes())
+                .and_then(|_| file.sync_all())
+                .map_err(|source| io_error("write adopted session", &temp, source))?;
+            drop(file);
+            // Full validation of the copy before anyone can see it.
+            load_session_file(&temp)?;
+            match fs::hard_link(&temp, &target) {
+                Ok(()) => {
+                    sync_parent(&target)?;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(source) => Err(io_error("publish adopted session", &target, source)),
+            }
+        })();
+        let _ = fs::remove_file(&temp);
+        if published? {
+            self.load_path(&target)
+        } else {
+            self.open_adopted(&target, source)
         }
-        Ok(adopted)
+    }
+
+    /// Open an existing session with the same id as `source`. It is used
+    /// only when it already holds all of `source`'s events (it may have
+    /// continued since); a different or partial history is a conflict, not
+    /// a silent substitute.
+    fn open_adopted(&self, target: &Path, source: &Session) -> Result<Session> {
+        let existing = self.load_path(target)?;
+        let contains_source = existing.events.len() >= source.events.len()
+            && existing
+                .events
+                .iter()
+                .zip(&source.events)
+                .all(|(existing, source)| existing.event == source.event);
+        if !contains_source {
+            return Err(SessionError::AlreadyExists(target.to_path_buf()));
+        }
+        Ok(existing)
     }
 
     fn ensure_path_in_root(&self, path: &Path) -> Result<()> {
@@ -671,10 +728,6 @@ impl SessionStore {
     }
 }
 
-/// Canonicalize the longest existing prefix, preserving any missing suffix.
-/// This matters on macOS where temporary paths use `/var` while canonicalized
-/// ancestors use `/private/var`; a deliberately removed session file must
-/// still compare in the same path namespace as its store root.
 /// Take the active lease sidecar for `session_path` without waiting.
 fn try_lock_active(session_path: &Path) -> Result<SessionActiveLease> {
     let path = session_path.with_extension("jsonl.active.lock");
@@ -773,6 +826,10 @@ pub fn delete_session_file(path: &Path) -> Result<bool> {
     }
 }
 
+/// Canonicalize the longest existing prefix, preserving any missing suffix.
+/// This matters on macOS where temporary paths use `/var` while canonicalized
+/// ancestors use `/private/var`; a deliberately removed session file must
+/// still compare in the same path namespace as its store root.
 fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut missing = Vec::new();
@@ -2841,6 +2898,49 @@ mod tests {
         assert!(matches!(
             store.append_event(&mut session, message("next")),
             Err(SessionError::HistoryDiverged(_))
+        ));
+    }
+
+    #[test]
+    fn adopt_publishes_a_complete_copy_and_refuses_a_different_one() {
+        let external_root = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let external = SessionStore::new(external_root.path(), workspace.path()).unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        let mut source = external.create(SessionCreateOptions::default()).unwrap();
+        for text in ["one", "two"] {
+            external.append_event(&mut source, message(text)).unwrap();
+        }
+        let source = external.load_path(source.path().unwrap()).unwrap();
+
+        let adopted = store.adopt(&source).unwrap();
+        assert_eq!(adopted.events, source.events);
+        // Adopting again reuses the complete copy.
+        assert_eq!(store.adopt(&source).unwrap().events, source.events);
+        let leftovers = fs::read_dir(store.workspace_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        // A same-id file with other history is a conflict, not a substitute.
+        let mut longer = source.clone();
+        longer.append(message("three"));
+        let mut different = source.clone();
+        different.events.pop();
+        different.append(message("other"));
+        assert!(matches!(
+            store.adopt(&different),
+            Err(SessionError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            store.adopt(&longer),
+            Err(SessionError::AlreadyExists(_))
         ));
     }
 
