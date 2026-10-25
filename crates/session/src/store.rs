@@ -1334,36 +1334,43 @@ fn resolve_salt(root: &Path) -> Result<u64> {
     persist_salt(root, salt)
 }
 
+/// Publish a new salt atomically. The complete value is written and synced
+/// to a private temporary file, then hard-linked to `.salt`; linking fails
+/// if the name exists, so exactly one initializer wins and no process can
+/// read a partially written salt (which made a racing process fall back to
+/// the legacy salt 0 and a different workspace directory).
 fn persist_salt(root: &Path, salt: u64) -> Result<u64> {
     let salt_path = root.join(SALT_FILE);
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&salt_path)
-    {
-        Ok(mut file) => {
-            writeln!(file, "{salt}")
-                .and_then(|_| file.sync_all())
-                .map_err(|source| io_error("write store salt", &salt_path, source))?;
-            drop(file);
-            ensure_private_file(&salt_path)?;
-            sync_parent(&salt_path)?;
-            Ok(salt)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another process won the race.  Adopt its salt (retrying briefly
-            // in case it has not finished writing) so both processes resolve
-            // the same workspace directory.
-            for _ in 0..20 {
-                if let Some(winner) = read_salt(root) {
-                    return Ok(winner);
-                }
-                thread::sleep(Duration::from_millis(1));
+    let temp_path = root.join(format!(".salt.{}.tmp", Uuid::new_v4()));
+    let published = (|| -> Result<bool> {
+        let mut file = private_file(&temp_path)?;
+        writeln!(file, "{salt}")
+            .and_then(|_| file.sync_all())
+            .map_err(|source| io_error("write store salt", &temp_path, source))?;
+        drop(file);
+        match fs::hard_link(&temp_path, &salt_path) {
+            Ok(()) => {
+                sync_parent(&salt_path)?;
+                Ok(true)
             }
-            Ok(0)
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(source) => Err(io_error("publish store salt", &salt_path, source)),
         }
-        Err(source) => Err(io_error("create store salt", &salt_path, source)),
+    })();
+    let _ = fs::remove_file(&temp_path);
+    if published? {
+        return Ok(salt);
     }
+    // Another process won. Its salt is complete when the name appears. An
+    // older Harness may still be writing in place, so retry briefly; an
+    // unparsable salt then resolves exactly as `resolve_salt` resolves it.
+    for _ in 0..200 {
+        if let Some(winner) = read_salt(root) {
+            return Ok(winner);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(0)
 }
 
 fn read_salt(root: &Path) -> Option<u64> {
@@ -2754,6 +2761,40 @@ mod tests {
         let store = SessionStore::new(root.path(), &workspace).unwrap();
         assert_eq!(store.workspace_dir(), legacy_dir.as_path());
         assert!(!root.path().join(SALT_FILE).exists());
+    }
+
+    #[test]
+    fn concurrent_salt_initializers_agree() {
+        // A partially written salt made a racing process use the legacy
+        // salt 0 and a different workspace directory.
+        for _ in 0..20 {
+            let root = tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads = (0..8)
+                .map(|_| {
+                    let root = root.path().join("store");
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        resolve_salt(&root).unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let salts = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                salts.iter().all(|salt| *salt == salts[0] && *salt != 0),
+                "{salts:?}"
+            );
+            let leftovers = fs::read_dir(root.path().join("store"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count();
+            assert_eq!(leftovers, 0);
+        }
     }
 
     #[test]
