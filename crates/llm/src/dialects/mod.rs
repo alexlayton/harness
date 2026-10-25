@@ -27,7 +27,7 @@ pub(crate) trait StreamParser {
 
 /// Drive any [`StreamParser`] over a shared [`SseStream`], yielding parsed
 /// events until the parser reports its protocol terminal (or EOF without
-/// one, which the parser surfaces as `LlmError::Stream`).  The returned
+/// one, which the parser surfaces as `LlmError::StreamInterrupted`).  The returned
 /// boundary redacts the active credential from both transport and parser
 /// errors, which are produced after the async request has already returned.
 pub(crate) fn drive_parser_stream(
@@ -53,6 +53,58 @@ pub(crate) fn drive_parser_stream(
         }
     });
     crate::provider::redact_stream(stream, secret)
+}
+
+/// Build the error for a clean transport EOF that arrived before the
+/// dialect's protocol terminal event.  The answer is incomplete, but a new
+/// request can succeed, so it is a transient [`crate::LlmError::StreamInterrupted`].
+pub(crate) fn truncated_stream(message: &str) -> crate::LlmError {
+    crate::LlmError::StreamInterrupted(message.to_owned())
+}
+
+/// Classify an in-band provider error payload.  Overload and server faults
+/// are transient (a new request can succeed) and become
+/// [`crate::LlmError::StreamInterrupted`]; all other errors, such as invalid
+/// requests or context overflow, stay a permanent [`crate::LlmError::Stream`]
+/// so they are reported and not repeated.
+///
+/// `payloads` are the JSON objects that can carry a `type` or `code` field
+/// (dialects nest the error object at different depths).
+pub(crate) fn in_band_error(
+    payloads: &[Option<&serde_json::Value>],
+    message: String,
+) -> crate::LlmError {
+    if payloads
+        .iter()
+        .flatten()
+        .any(|payload| is_transient_error_payload(payload))
+    {
+        crate::LlmError::StreamInterrupted(message)
+    } else {
+        crate::LlmError::Stream(message)
+    }
+}
+
+fn is_transient_error_payload(payload: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    const TRANSIENT: &[&str] = &[
+        "overloaded_error",
+        "overloaded",
+        "api_error",
+        "server_error",
+        "internal_error",
+        "internal_server_error",
+        "service_unavailable",
+        "timeout",
+        "timeout_error",
+    ];
+    ["type", "code"].iter().any(|key| match payload.get(key) {
+        Some(Value::String(code)) => TRANSIENT.contains(&code.as_str()),
+        Some(Value::Number(code)) => code
+            .as_u64()
+            .is_some_and(|code| (500..=599).contains(&code)),
+        _ => false,
+    })
 }
 
 /// OpenAI-compatible wire spelling for a portable explicit effort.

@@ -10,8 +10,20 @@ pub enum LlmError {
     },
     #[error("network: {0}")]
     Network(#[from] reqwest::Error),
+    /// A response stream failed for a reason that repeating the request
+    /// cannot fix: a provider protocol violation, an oversized event, or an
+    /// in-band error that the provider reports as permanent (for example an
+    /// invalid request).  Never retryable.
     #[error("stream: {0}")]
     Stream(String),
+    /// A response stream stopped before its protocol terminal event for a
+    /// reason that a new request can fix: the transport closed early, or the
+    /// provider sent an in-band overload or server error.  Callers that
+    /// consume streams (the agent turn loop) re-stream these within their own
+    /// recovery bound.  Tool calls that were not complete when the stream
+    /// stopped are never emitted, so a retry cannot run a partial call.
+    #[error("stream interrupted: {0}")]
+    StreamInterrupted(String),
     #[error("parse: {0}")]
     Parse(String),
     /// Missing or expired credentials (e.g. GitHub Copilot).  Callers can use
@@ -23,7 +35,9 @@ pub enum LlmError {
 }
 
 impl LlmError {
-    /// Whether it is safe for the caller to repeat the initial request.
+    /// Whether it is safe for the caller to repeat the request.  `with_retry`
+    /// uses this for the initial request; the agent turn loop uses it for
+    /// errors that a stream yields after the request succeeded.
     pub fn is_retryable(&self) -> bool {
         match self {
             // Network errors cover connect failures, timeouts, and — since
@@ -32,7 +46,7 @@ impl LlmError {
             // in all of those cases: nothing was charged against a partially
             // consumed stream, and the agent's mid-stream recovery relies on
             // this classification to re-stream automatically.
-            Self::Network(_) => true,
+            Self::Network(_) | Self::StreamInterrupted(_) => true,
             Self::Http { status, .. } => *status == 429 || (500..=599).contains(status),
             Self::Auth(_) | Self::Stream(_) | Self::Parse(_) => false,
         }
@@ -108,6 +122,9 @@ impl LlmError {
                 retry_after_secs,
             },
             Self::Stream(message) => Self::Stream(message.replace(secret, "[redacted]")),
+            Self::StreamInterrupted(message) => {
+                Self::StreamInterrupted(message.replace(secret, "[redacted]"))
+            }
             Self::Parse(message) => Self::Parse(message.replace(secret, "[redacted]")),
             Self::Auth(message) => Self::Auth(message.replace(secret, "[redacted]")),
             other => other,
@@ -172,6 +189,7 @@ mod tests {
         assert!(!LlmError::Auth("harness login github-copilot".into()).is_retryable());
         assert!(!LlmError::Parse("bad".into()).is_retryable());
         assert!(!LlmError::Stream("gone".into()).is_retryable());
+        assert!(LlmError::StreamInterrupted("truncated".into()).is_retryable());
         assert!(LlmError::http(429, "rate limited").is_retryable());
         assert!(LlmError::http(500, "server error").is_retryable());
         assert!(!LlmError::http(401, "unauthorized").is_retryable());

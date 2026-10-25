@@ -301,15 +301,18 @@ impl ChatStreamParser {
             && !error_value.is_null()
         {
             // A mid-stream provider error payload (e.g. `{"error": ...}`)
-            // is a terminal failure, not a silent empty chunk: surface it
-            // as `LlmError::Stream` so partial output stays an error and
-            // the agent's recovery path handles it.
+            // is a terminal failure, not a silent empty chunk. Overload and
+            // server faults are transient (the agent re-streams); other
+            // errors are permanent and are reported.
             let detail = error_value
                 .get("message")
                 .and_then(Value::as_str)
                 .or_else(|| error_value.as_str())
                 .unwrap_or("provider error");
-            return Err(LlmError::Stream(format!("chat error: {detail}")));
+            return Err(super::in_band_error(
+                &[Some(error_value)],
+                format!("chat error: {detail}"),
+            ));
         }
 
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
@@ -359,14 +362,13 @@ impl ChatStreamParser {
             return Ok(Vec::new());
         }
         // Clean transport EOF without a protocol terminal event is a
-        // truncated stream, not a successful turn: surface it as
-        // `LlmError::Stream` so the agent's recovery path (persist partial
-        // text, emit a diagnostic, retry or fail loudly) handles it.  Never
+        // truncated stream, not a successful turn: surface it as the
+        // transient `LlmError::StreamInterrupted` so the agent persists the
+        // partial text and re-streams within its recovery bound.  Never
         // manufacture `Done` and never finalize unfinished tool calls here.
         self.done = true;
-        Err(LlmError::Stream(
-            "chat stream ended without a terminal event (expected [DONE], a finish_reason, or a usage chunk)"
-                .into(),
+        Err(super::truncated_stream(
+            "chat stream ended without a terminal event (expected [DONE], a finish_reason, or a usage chunk)",
         ))
     }
 
@@ -633,13 +635,16 @@ mod tests {
     #[test]
     fn text_then_eof_without_terminator_fails() {
         // Text followed by clean EOF with no `[DONE]`, finish_reason, or
-        // usage chunk is a truncated stream: `finish` is a `Stream` error.
+        // usage chunk is a truncated stream: `finish` is a transient error.
         let mut parser = ChatStreamParser::new();
         parser
             .parse_payload(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
             .unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
     }
 
     #[test]
@@ -651,7 +656,10 @@ mod tests {
             )
             .unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
         assert!(parser.seen_ids.is_empty());
     }
 
@@ -813,8 +821,8 @@ mod tests {
     #[test]
     fn stream_error_after_partial_output_remains_an_error() {
         // Partial text followed by a mid-stream provider error payload is
-        // a failure, not a truncated-but-usable turn: the error surfaces
-        // as `LlmError::Stream` (agent recovery path) instead of an empty
+        // a failure, not a truncated-but-usable turn: a server fault surfaces
+        // as transient `LlmError::StreamInterrupted` instead of an empty
         // `Ok` that a later EOF would turn into a confusing truncation.
         let mut parser = ChatStreamParser::new();
         let events = parser
@@ -824,7 +832,10 @@ mod tests {
         let error = parser
             .parse_payload(r#"{"error":{"message":"boom","type":"server_error"}}"#)
             .unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
     }
 
     #[test]

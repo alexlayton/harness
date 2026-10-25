@@ -443,7 +443,10 @@ impl AnthropicParser {
                 });
                 Ok(output)
             }
-            "error" => Err(LlmError::Stream(error_message(&value, "Anthropic error"))),
+            "error" => Err(super::in_band_error(
+                &[value.get("error")],
+                error_message(&value, "Anthropic error"),
+            )),
             "ping" => Ok(Vec::new()),
             _ => {
                 tracing::trace!(event_type = kind, "ignored Anthropic SSE event");
@@ -499,16 +502,16 @@ impl AnthropicParser {
     }
 
     /// Clean transport EOF without `message_stop` is a truncated stream,
-    /// not a successful turn: surface it as `LlmError::Stream` so the
-    /// agent's recovery path handles it.  Never manufacture `Done` and
-    /// never finalize unfinished tool calls here.
+    /// not a successful turn: surface it as the transient
+    /// `LlmError::StreamInterrupted` so the agent re-streams.  Never
+    /// manufacture `Done` and never finalize unfinished tool calls here.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         if self.done {
             return Ok(Vec::new());
         }
         self.done = true;
-        Err(LlmError::Stream(
-            "Anthropic stream ended without a terminal event (expected message_stop)".into(),
+        Err(super::truncated_stream(
+            "Anthropic stream ended without a terminal event (expected message_stop)",
         ))
     }
 }
@@ -806,7 +809,10 @@ mod tests {
 
         assert!(!parser.is_done());
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
         assert!(parser.is_done());
         assert!(parser.finish().unwrap().is_empty());
     }
@@ -817,14 +823,17 @@ mod tests {
         parser.parse_payload(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read","input":{}}}"#).unwrap();
         parser.parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#).unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
     }
 
     #[test]
     fn stream_error_after_partial_output_remains_an_error() {
         // Partial text followed by a provider `error` payload stays an
-        // error: it surfaces `LlmError::Stream` (agent recovery path) and
-        // never reaches a terminal `Done`.
+        // error: it surfaces the permanent `LlmError::Stream` and never
+        // reaches a terminal `Done`.
         let mut parser = AnthropicParser::new();
         let events = parser
             .parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#)
@@ -835,6 +844,29 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
         assert!(!parser.is_done());
+    }
+
+    #[test]
+    fn overloaded_in_band_error_is_transient() {
+        // Anthropic reports overload mid-stream as an `error` event. A new
+        // request can succeed, so the agent must be able to re-stream it.
+        let mut parser = AnthropicParser::new();
+        let error = parser
+            .parse_payload(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
+        assert!(error.is_retryable());
+        let error = AnthropicParser::new()
+            .parse_payload(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+            )
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
     }
 
     #[test]
