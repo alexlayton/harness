@@ -513,7 +513,7 @@ async fn execute_with_secret_policy(
     restore_secrets: bool,
     notifications: NestedEventSink,
 ) -> ToolOutput {
-    let output = if arguments.rejected_key {
+    let output = if arguments.rejected_key || name == crate::secrets::REJECTED_TOOL_CALL_NAME {
         ToolOutput {
             content: "tool arguments were rejected because secret values and placeholders are not supported in JSON object keys".into(),
             is_error: true,

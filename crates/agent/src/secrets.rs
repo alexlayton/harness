@@ -24,6 +24,12 @@ use std::task::{Context, Poll};
 pub const MIN_SECRET_BYTES: usize = 8;
 
 const REJECTED_JSON_KEY_FIELD: &str = "__harness_secret_key_error";
+
+/// Name given to a tool call whose argument keys contained a secret.  It is
+/// a valid provider tool name (`[a-zA-Z0-9_-]`), so the call can be replayed
+/// in later requests, and dispatch always refuses it, even if a tool with
+/// this name were registered.  An empty name was rejected by providers.
+pub const REJECTED_TOOL_CALL_NAME: &str = "harness_rejected_tool_call";
 const REJECTED_JSON_KEY_MESSAGE: &str =
     "secret values and placeholders are not supported in JSON object keys";
 
@@ -279,10 +285,11 @@ impl SecretMasker {
         let (arguments, rejected_key) = self.transform_json(&call.arguments, false);
         ToolCall {
             id: self.mask_text(&call.id),
-            // An empty name cannot match a registered tool. This safely
-            // rejects raw secrets in keys without an in-band JSON sentinel.
+            // The sentinel name is never executed (see tool dispatch). This
+            // safely rejects raw secrets in keys without an in-band JSON
+            // sentinel, and keeps the call valid for provider replay.
             name: if rejected_key {
-                String::new()
+                REJECTED_TOOL_CALL_NAME.to_owned()
             } else {
                 self.mask_text(&call.name)
             },
@@ -620,6 +627,25 @@ mod tests {
         }));
         assert!(rejected);
         assert_eq!(restored.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejected_tool_call_keeps_a_provider_valid_name() {
+        // Later requests replay this call; providers reject an empty name.
+        let masker = masker();
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"abcdefgh": "raw key"}),
+        };
+        let masked = masker.mask_tool_call(&call);
+        assert_eq!(masked.name, REJECTED_TOOL_CALL_NAME);
+        assert!(
+            masked
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        );
     }
 
     #[test]
