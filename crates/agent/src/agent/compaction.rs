@@ -2,7 +2,9 @@ use super::persistence::usage_event;
 use super::{
     Agent, AgentEvent, CompactionReason, InputMessage, MAX_OVERFLOW_RECOVERIES, TurnError, send,
 };
-use compact::{SummaryOutcome, plan_compaction, summarize as compact_summarize};
+use compact::{
+    SummaryOutcome, plan_compaction, plan_overflow_compaction, summarize as compact_summarize,
+};
 use llm::LlmError;
 use session::{SessionEvent, usage_summary};
 use std::collections::VecDeque;
@@ -128,8 +130,20 @@ impl Agent {
         // so one pre-turn scans the live range once (PERF-1).
         let estimated =
             estimated_context.unwrap_or_else(|| self.context_tokens_estimate(extra_bytes));
-        let Some(plan) = plan_compaction(&session, &self.compaction, estimated) else {
-            send(events, AgentEvent::Notice("nothing to compact yet".into()));
+        // Overflow recovery may summarize the whole live region when the
+        // newest unit alone is too large to retain.
+        let plan = if reason == CompactionReason::Overflow {
+            plan_overflow_compaction(&session, &self.compaction, estimated)
+        } else {
+            plan_compaction(&session, &self.compaction, estimated)
+        };
+        let Some(plan) = plan else {
+            let notice = if reason == CompactionReason::Overflow {
+                "context overflow: no older material can be compacted"
+            } else {
+                "nothing to compact yet"
+            };
+            send(events, AgentEvent::Notice(notice.into()));
             return Ok(false);
         };
 

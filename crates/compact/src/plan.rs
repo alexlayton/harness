@@ -52,20 +52,7 @@ pub fn plan_compaction(
         return None;
     }
 
-    let (previous_boundary, previous_summary) = match latest_compaction_boundary(&session.events) {
-        Some((sequence, boundary)) => {
-            let summary = session
-                .events
-                .iter()
-                .find(|record| record.sequence == sequence)
-                .and_then(|record| match &record.event {
-                    SessionEvent::CompactionSummary { summary, .. } => Some(summary.clone()),
-                    _ => None,
-                });
-            (boundary, summary)
-        }
-        None => (0, None),
-    };
+    let (previous_boundary, previous_summary) = previous_compaction(session);
 
     // The live region = events kept since the most recent compaction boundary
     // (the summary event itself plus everything after it in the same region).
@@ -86,6 +73,77 @@ pub fn plan_compaction(
         return None;
     }
 
+    build_plan(session, previous_boundary, previous_summary, boundary)
+}
+
+/// Plan a compaction to recover from a context-overflow rejection.
+///
+/// [`plan_compaction`] always retains a tail that starts at a valid cut. When
+/// the newest unit alone (for example a huge tool result and its call) is
+/// larger than `keep_recent_tokens`, that tail keeps the oversized material,
+/// so every retried request overflowed again and recovery failed every turn.
+/// In that case, or when no cut exists, summarize the whole live region
+/// instead, provided every tool call in it has a result. Serialization caps
+/// tool results, so the summary fits where the raw unit did not. The next
+/// request then starts from the summary alone.
+pub fn plan_overflow_compaction(
+    session: &Session,
+    policy: &CompactionPolicy,
+    estimated_context_tokens: u64,
+) -> Option<CompactionPlan> {
+    let active = events_after_latest_compaction(&session.events);
+    let live: Vec<&SessionEventRecord> = active
+        .iter()
+        .copied()
+        .filter(|record| !is_compaction(record))
+        .collect();
+    if let Some(plan) = plan_compaction(session, policy, estimated_context_tokens) {
+        let tail_tokens = live
+            .iter()
+            .filter(|record| record.sequence > plan.boundary)
+            .map(|record| event_tokens(record))
+            .fold(0u64, u64::saturating_add);
+        if tail_tokens <= policy.keep_recent_tokens {
+            return Some(plan);
+        }
+    }
+    let (_, resolved) = scan_cut_points(&live);
+    if !resolved {
+        return None;
+    }
+    let boundary = live.last()?.sequence;
+    let (previous_boundary, previous_summary) = previous_compaction(session);
+    if boundary <= previous_boundary {
+        return None;
+    }
+    build_plan(session, previous_boundary, previous_summary, boundary)
+}
+
+/// The previous compaction's boundary and summary, if any.
+fn previous_compaction(session: &Session) -> (u64, Option<String>) {
+    match latest_compaction_boundary(&session.events) {
+        Some((sequence, boundary)) => {
+            let summary = session
+                .events
+                .iter()
+                .find(|record| record.sequence == sequence)
+                .and_then(|record| match &record.event {
+                    SessionEvent::CompactionSummary { summary, .. } => Some(summary.clone()),
+                    _ => None,
+                });
+            (boundary, summary)
+        }
+        None => (0, None),
+    }
+}
+
+/// Collect the events between the previous boundary and `boundary`.
+fn build_plan(
+    session: &Session,
+    previous_boundary: u64,
+    previous_summary: Option<String>,
+    boundary: u64,
+) -> Option<CompactionPlan> {
     let to_summarize: Vec<SessionEventRecord> = session
         .events
         .iter()
@@ -99,7 +157,6 @@ pub fn plan_compaction(
     if to_summarize.is_empty() {
         return None;
     }
-
     Some(CompactionPlan {
         boundary,
         to_summarize,
@@ -131,6 +188,12 @@ fn is_cut_point(record: &SessionEventRecord) -> bool {
 /// would leave the first call in the summarized prefix while retaining its
 /// result in the live tail.
 fn valid_cut_points(live: &[&SessionEventRecord]) -> Vec<usize> {
+    scan_cut_points(live).0
+}
+
+/// Valid cut points, plus whether every tool call in `live` has a result
+/// (so the whole region can be summarized without splitting a call).
+fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
     let mut pending = Vec::<String>::new();
     let mut cut_points = Vec::new();
     for (index, record) in live.iter().enumerate() {
@@ -162,7 +225,8 @@ fn valid_cut_points(live: &[&SessionEventRecord]) -> Vec<usize> {
             | SessionEvent::Unknown { .. } => {}
         }
     }
-    cut_points
+    let resolved = pending.is_empty();
+    (cut_points, resolved)
 }
 
 /// Estimated provider-context tokens represented by a live event.
@@ -413,6 +477,28 @@ mod tests {
             "boundary {} is not a valid cut point",
             plan.boundary
         );
+    }
+
+    #[test]
+    fn overflow_plan_summarizes_an_oversized_newest_unit() {
+        // The newest call/result pair alone exceeds the keep budget, so any
+        // normal cut keeps it and the retried request overflows again.
+        let mut session = new_session();
+        push_user(&mut session, "older");
+        push_assistant(&mut session, "old answer");
+        push_user(&mut session, "read the log");
+        push_tool_call(&mut session, "big-call", "read");
+        push_tool_result(&mut session, "big-call", &"y".repeat(400_000));
+        let policy = CompactionPolicy {
+            keep_recent_turns: 1,
+            keep_recent_tokens: 20_000,
+            ..CompactionPolicy::default()
+        };
+        let plan = plan_overflow_compaction(&session, &policy, 500_000).unwrap();
+        assert_eq!(plan.boundary, session.events.last().unwrap().sequence);
+        // An unresolved newest call cannot be summarized away.
+        push_tool_call(&mut session, "open-call", "read");
+        assert!(plan_overflow_compaction(&session, &policy, 500_000).is_none());
     }
 
     #[test]
