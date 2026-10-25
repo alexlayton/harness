@@ -404,39 +404,44 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
                 biased;
                 event = runtime_event_rx.recv() => {
                     let Some(event) = event else { break };
-                    if let AgentEvent::ModelChanged { provider, model } = &event
-                        && let Err(error) = save_settings(provider, model)
-                    {
-                        tracing::warn!(error = %error, "could not persist model settings");
-                    }
-                    if let AgentEvent::ReasoningChanged { level } = &event
-                        && let Ok(reasoning) = level.parse()
-                        && let Err(error) = save_reasoning(reasoning)
-                    {
-                        tracing::warn!(error = %error, "could not persist reasoning setting");
-                    }
-                    // Only commands change preferences. `on` saves the target
-                    // only when none is saved, so the config stays valid.
-                    if let AgentEvent::PrewalkChanged { armed, target, reasoning, change } = &event {
-                        let saved = match change {
-                            agent::PrewalkChange::Enabled => {
-                                save_prewalk_enabled(*armed, target.as_deref())
-                            }
-                            agent::PrewalkChange::Target => target
-                                .as_deref()
-                                .map_or(Ok(()), save_prewalk_model),
-                            agent::PrewalkChange::Reasoning => reasoning
-                                .as_deref()
-                                .map(str::parse)
-                                .transpose()
-                                .map_err(|error: String| anyhow::anyhow!(error))
-                                .and_then(save_prewalk_reasoning),
-                            agent::PrewalkChange::Session => Ok(()),
-                        };
-                        if let Err(error) = saved {
-                            tracing::warn!(error = %error, "could not persist prewalk setting");
+                    // Config saves write and fsync a file. This task also
+                    // forwards every UI event, so keep the disk wait off the
+                    // async worker (main runs the multi-thread runtime).
+                    tokio::task::block_in_place(|| {
+                        if let AgentEvent::ModelChanged { provider, model } = &event
+                            && let Err(error) = save_settings(provider, model)
+                        {
+                            tracing::warn!(error = %error, "could not persist model settings");
                         }
-                    }
+                        if let AgentEvent::ReasoningChanged { level } = &event
+                            && let Ok(reasoning) = level.parse()
+                            && let Err(error) = save_reasoning(reasoning)
+                        {
+                            tracing::warn!(error = %error, "could not persist reasoning setting");
+                        }
+                        // Only commands change preferences. `on` saves the target
+                        // only when none is saved, so the config stays valid.
+                        if let AgentEvent::PrewalkChanged { armed, target, reasoning, change } = &event {
+                            let saved = match change {
+                                agent::PrewalkChange::Enabled => {
+                                    save_prewalk_enabled(*armed, target.as_deref())
+                                }
+                                agent::PrewalkChange::Target => target
+                                    .as_deref()
+                                    .map_or(Ok(()), save_prewalk_model),
+                                agent::PrewalkChange::Reasoning => reasoning
+                                    .as_deref()
+                                    .map(str::parse)
+                                    .transpose()
+                                    .map_err(|error: String| anyhow::anyhow!(error))
+                                    .and_then(save_prewalk_reasoning),
+                                agent::PrewalkChange::Session => Ok(()),
+                            };
+                            if let Err(error) = saved {
+                                tracing::warn!(error = %error, "could not persist prewalk setting");
+                            }
+                        }
+                    });
                     if let Some(reporter) = &event_herdr_reporter {
                         match &event {
                             AgentEvent::ModelChanged { provider, model } => {
