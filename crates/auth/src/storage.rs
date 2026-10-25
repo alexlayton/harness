@@ -430,10 +430,8 @@ impl AuthStore {
                 "Anthropic subscription credential is missing OAuth fields".into(),
             ));
         }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let value = serde_json::to_value(credential)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         self.save_provider_value(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value)
     }
 
@@ -451,10 +449,8 @@ impl AuthStore {
                 "Anthropic subscription credential is missing OAuth fields".into(),
             ));
         }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let value = serde_json::to_value(credential)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         self.save_provider_value_if_current(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value, |current| {
             current
                 .and_then(|value| {
@@ -471,13 +467,8 @@ impl AuthStore {
         let Some(value) = entries.get(OPENAI_CODEX_PROVIDER_KEY) else {
             return Ok(None);
         };
-        let credential =
-            serde_json::from_value::<OpenAiCodexCredential>(value.clone()).map_err(|source| {
-                AuthError::Json {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
+        let credential = serde_json::from_value::<OpenAiCodexCredential>(value.clone())
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         if !credential.is_complete() {
             return Err(AuthError::InvalidCredential(
                 "OpenAI Codex credential is missing OAuth fields".into(),
@@ -492,10 +483,8 @@ impl AuthStore {
                 "OpenAI Codex credential is missing OAuth fields".into(),
             ));
         }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let value = serde_json::to_value(credential)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         self.save_provider_value(OPENAI_CODEX_PROVIDER_KEY, value)
     }
 
@@ -513,10 +502,8 @@ impl AuthStore {
                 "OpenAI Codex credential is missing OAuth fields".into(),
             ));
         }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let value = serde_json::to_value(credential)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         self.save_provider_value_if_current(OPENAI_CODEX_PROVIDER_KEY, value, |current| {
             current
                 .and_then(|value| {
@@ -533,13 +520,8 @@ impl AuthStore {
         let Some(value) = entries.get(COPILOT_PROVIDER_KEY) else {
             return Ok(None);
         };
-        let credential =
-            serde_json::from_value::<CopilotCredential>(value.clone()).map_err(|source| {
-                AuthError::Json {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
+        let credential = serde_json::from_value::<CopilotCredential>(value.clone())
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         if !credential.is_complete() {
             return Err(AuthError::InvalidCredential(
                 "credential is missing its OAuth token fields".into(),
@@ -574,10 +556,8 @@ impl AuthStore {
                 "credential is missing its OAuth token fields".into(),
             ));
         }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let value = serde_json::to_value(credential)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         self.save_provider_value(COPILOT_PROVIDER_KEY, value)
     }
 
@@ -593,10 +573,8 @@ impl AuthStore {
                 "credential is missing its OAuth token fields".into(),
             ));
         }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let value = serde_json::to_value(credential)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         self.save_provider_value_if_current(COPILOT_PROVIDER_KEY, value, |current| {
             current
                 .and_then(|value| serde_json::from_value::<CopilotCredential>(value.clone()).ok())
@@ -652,20 +630,15 @@ impl AuthStore {
         if contents.trim().is_empty() {
             return Ok(BTreeMap::new());
         }
-        serde_json::from_str(&contents).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })
+        serde_json::from_str(&contents).map_err(|source| AuthError::json(&self.path, &source))
     }
 
     fn write_unlocked(&self, entries: &AuthEntries) -> Result<()> {
         let parent = self.parent_dir();
         private_dir_all(&parent)?;
         ensure_private_directory(&parent)?;
-        let contents = serde_json::to_string_pretty(entries).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let contents = serde_json::to_string_pretty(entries)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         let temp = temporary_path(&self.path);
         let result = (|| -> Result<()> {
             let mut file = private_file(&temp)?;
@@ -997,6 +970,29 @@ mod tests {
         );
         drop(owner);
         store.acquire_refresh_lease("openai-codex").await.unwrap();
+    }
+
+    #[test]
+    fn invalid_stored_credentials_never_quote_token_values() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        // A token in a numeric field makes serde quote it in its message.
+        fs::write(
+            &path,
+            r#"{"github-copilot":{"type":"oauth","access":"a","refresh":"r","expires":"token-sentinel-value"},
+               "openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":"token-sentinel-value"}}"#,
+        )
+        .unwrap();
+        let store = AuthStore::new(&path);
+        for error in [
+            store.copilot().unwrap_err().to_string(),
+            store.openai_codex().unwrap_err().to_string(),
+        ] {
+            assert!(!error.contains("token-sentinel-value"), "{error}");
+        }
+        fs::write(&path, r#""token-sentinel-value""#).unwrap();
+        let error = AuthStore::new(&path).copilot().unwrap_err().to_string();
+        assert!(!error.contains("token-sentinel-value"), "{error}");
     }
 
     #[test]

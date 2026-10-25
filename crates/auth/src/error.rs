@@ -18,11 +18,15 @@ pub enum AuthError {
         source: io::Error,
     },
 
-    #[error("invalid auth JSON in {}: {source}", path.display())]
+    /// Serde messages can quote the offending value, which in the auth file
+    /// is often a token. Only the error category and position are kept; the
+    /// serde error is deliberately not retained as a source.
+    #[error("invalid auth JSON in {}: {category} error at line {line} column {column}", path.display())]
     Json {
         path: PathBuf,
-        #[source]
-        source: serde_json::Error,
+        category: &'static str,
+        line: usize,
+        column: usize,
     },
 
     #[error("invalid GitHub Copilot credential: {0}")]
@@ -101,6 +105,24 @@ impl From<reqwest::Error> for AuthError {
                 .status()
                 .map(|status| format!("HTTP status {}", status.as_u16()))
                 .unwrap_or_else(|| "request failed".into()),
+        }
+    }
+}
+
+impl AuthError {
+    /// Build [`AuthError::Json`] without any text from the serde error.
+    pub(crate) fn json(path: &std::path::Path, error: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        Self::Json {
+            path: path.to_path_buf(),
+            category: match error.classify() {
+                Category::Io => "I/O",
+                Category::Syntax => "syntax",
+                Category::Data => "data",
+                Category::Eof => "end-of-file",
+            },
+            line: error.line(),
+            column: error.column(),
         }
     }
 }
