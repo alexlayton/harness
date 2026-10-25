@@ -24,7 +24,12 @@ url = "2"
 tools.workspace = true
 llm.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Process-group signals for stdio MCP servers and their descendants.
+libc = "0.2"
+
 [dev-dependencies]
 axum = "0.8"
+tempfile = "3"
 rmcp = { version = "3.1.4", default-features = false, features = ["server", "transport-streamable-http-server"] }
 tokio = { workspace = true, features = ["net"] }
