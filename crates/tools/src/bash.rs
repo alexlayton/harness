@@ -82,7 +82,8 @@ pub fn command_concurrency(_command: &str) -> Concurrency {
 /// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
 /// signals support by printing the rewritten command on stdout; unsupported
 /// commands, a missing rtk binary, and timeouts all degrade to `None`, in
-/// which case the caller runs the original command unchanged.  The exit code
+/// which case the caller runs the original command unchanged.  Cancellation
+/// also returns `None`; the caller must check the token before it spawns.  The exit code
 /// is only authoritative for versions known to implement the documented
 /// semantics: relying on stdout alone would misread a future version that
 /// prints diagnostics but exits non-zero on error.
@@ -242,6 +243,12 @@ impl Tool for BashTool {
         } else {
             command.clone()
         };
+        // The rewrite returns `None` both for "unsupported" and for
+        // "interrupted". Check cancellation again so an interrupt during the
+        // rewrite never falls through to spawning the original command.
+        if cancel.is_cancelled() {
+            return error(&format!("bash: {}", first_line(&command)), "cancelled");
+        }
 
         let cwd = self.cwd.clone();
         let mut command_builder = Command::new("sh");
