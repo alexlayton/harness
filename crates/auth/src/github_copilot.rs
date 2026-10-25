@@ -273,7 +273,7 @@ impl GithubCopilotClient {
         }
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| {
+            value = read_json_bounded(response) => value.map_err(|_| {
                 AuthError::InvalidDeviceCode("response is not valid JSON".into())
             })?,
         };
@@ -286,8 +286,16 @@ impl GithubCopilotClient {
         device: &DeviceCode,
         cancel: &CancellationToken,
     ) -> Result<String> {
-        let deadline = Instant::now() + Duration::from_secs(device.expires_in);
-        let mut interval = device.interval.max(5);
+        // `DeviceCode` fields are public, so clamp again here: a caller-built
+        // value must not overflow the deadline or the interval arithmetic.
+        let lifetime = Duration::from_secs(
+            device
+                .expires_in
+                .min(crate::device_code::MAX_DEVICE_CODE_LIFETIME_SECS),
+        );
+        let start = Instant::now();
+        let deadline = start.checked_add(lifetime).unwrap_or(start);
+        let mut interval = crate::device_code::clamp_poll_interval(device.interval);
         // RFC 8628 waits before the first poll.
         loop {
             if Instant::now() >= deadline {
@@ -308,9 +316,10 @@ impl GithubCopilotClient {
                 PollResult::SlowDown {
                     interval: new_interval,
                 } => {
-                    interval = new_interval
-                        .unwrap_or(interval.saturating_add(5))
-                        .max(interval + 5);
+                    // RFC 8628: slow_down adds at least 5 seconds.
+                    interval = crate::device_code::clamp_poll_interval(
+                        new_interval.unwrap_or(0).max(interval.saturating_add(5)),
+                    );
                 }
             }
         }
@@ -344,7 +353,7 @@ impl GithubCopilotClient {
         let status = response.status();
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid token response".into()))?,
+            value = read_json_bounded(response) => value.map_err(|_| AuthError::DeviceFlowFailed("invalid token response".into()))?,
         };
         if !status.is_success() && value.get("error").is_none() {
             return Err(AuthError::Http {
@@ -438,7 +447,7 @@ impl GithubCopilotClient {
         }
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot token response".into()))?,
+            value = read_json_bounded(response) => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot token response".into()))?,
         };
         parse_copilot_token(&value, bearer_token, domain)
     }
@@ -480,7 +489,7 @@ impl GithubCopilotClient {
         }
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot models response".into()))?,
+            value = read_json_bounded(response) => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot models response".into()))?,
         };
         let fallback = base_url == "https://api.individual.githubcopilot.com";
         parse_available_model_ids_value(&value, fallback)
@@ -1124,6 +1133,24 @@ fn copilot_headers() -> HeaderMap {
 
 fn bearer(token: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("Bearer {token}")).ok()
+}
+
+/// Largest GitHub/Copilot auth response accepted.  Token and device-code
+/// payloads are small; the model catalogue is the largest.  Bounding the
+/// read keeps a hostile or broken endpoint from filling memory.
+const AUTH_BODY_LIMIT: usize = 1024 * 1024;
+
+/// Read a JSON response body of at most [`AUTH_BODY_LIMIT`] bytes.  Callers
+/// map the error to their own message; the body is never echoed.
+async fn read_json_bounded(mut response: reqwest::Response) -> std::result::Result<Value, ()> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        if chunk.len() > AUTH_BODY_LIMIT.saturating_sub(body.len()) {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| ())
 }
 
 fn network_error(endpoint: &str, error: reqwest::Error) -> AuthError {
