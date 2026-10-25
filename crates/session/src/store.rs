@@ -288,38 +288,7 @@ impl SessionStore {
             return Ok(SessionActiveLease { file: None });
         };
         self.ensure_path_in_root(session_path)?;
-        let path = session_path.with_extension("jsonl.active.lock");
-        let file = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .mode(0o600)
-                    .open(&path)
-            }
-            #[cfg(not(unix))]
-            {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)
-            }
-        }
-        .map_err(|source| io_error("open active session lease", &path, source))?;
-        ensure_private_file(&path)?;
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(SessionError::AlreadyActive(session_path.to_path_buf()))
-            }
-            Err(source) => Err(io_error("lock active session lease", &path, source)),
-        }
+        try_lock_active(session_path)
     }
 
     /// Acquire the active lease, then reload the session from disk.
@@ -688,6 +657,104 @@ impl SessionStore {
 /// This matters on macOS where temporary paths use `/var` while canonicalized
 /// ancestors use `/private/var`; a deliberately removed session file must
 /// still compare in the same path namespace as its store root.
+/// Take the active lease sidecar for `session_path` without waiting.
+fn try_lock_active(session_path: &Path) -> Result<SessionActiveLease> {
+    let path = session_path.with_extension("jsonl.active.lock");
+    let file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&path)
+        }
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        }
+    }
+    .map_err(|source| io_error("open active session lease", &path, source))?;
+    ensure_private_file(&path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(SessionError::AlreadyActive(session_path.to_path_buf()))
+        }
+        Err(source) => Err(io_error("lock active session lease", &path, source)),
+    }
+}
+
+/// Delete the session `id` from every workspace group under `root`.
+///
+/// Returns whether a file was removed; a missing session counts as success.
+/// The caller supplies only an id, so every group is scanned. Each removal:
+///
+/// 1. takes the session's active lease without waiting, so a session that a
+///    runtime owns in this or another process is refused with
+///    [`SessionError::AlreadyActive`] instead of losing history between two
+///    of its appends;
+/// 2. takes the append lock with the normal bounded wait, so the call cannot
+///    block forever;
+/// 3. removes the file and syncs its directory.
+///
+/// Both lock sidecars are retained: contenders that opened them before the
+/// deletion must keep coordinating on the same inodes. A runtime that later
+/// acquires the lease and reloads finds the file gone. This function does
+/// blocking I/O; async callers should run it off the executor and await it to
+/// completion (never detach it after a timeout, or it can delete late).
+pub fn delete_session(root: &Path, id: &SessionId) -> Result<bool> {
+    let file_name = format!("{id}.jsonl");
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io_error("list session root", root, source)),
+    };
+    let mut deleted = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error("read session root entry", root, source))?;
+        let workspace_dir = entry.path();
+        match fs::metadata(&workspace_dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error("inspect session group", &workspace_dir, source)),
+        }
+        let path = workspace_dir.join(&file_name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => deleted |= delete_session_file(&path)?,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error("inspect session", &path, source)),
+        }
+    }
+    Ok(deleted)
+}
+
+/// Delete one session file with the same safety rules as [`delete_session`]:
+/// refused while the active lease is held, bounded wait for the append lock,
+/// lock sidecars retained. Returns whether the file was removed.
+pub fn delete_session_file(path: &Path) -> Result<bool> {
+    let _active = try_lock_active(path)?;
+    let _append = SessionLock::acquire(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_parent(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("delete session", path, source)),
+    }
+}
+
 fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
     let mut existing = path;
     let mut missing = Vec::new();
@@ -2478,6 +2545,29 @@ mod tests {
             stale.events.last().map(|record| &record.event),
             Some(SessionEvent::UserMessage { .. })
         ));
+    }
+
+    #[test]
+    fn delete_refuses_an_active_session_and_succeeds_after_release() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let path = session.path().unwrap().clone();
+
+        let owner = store.acquire_active(&session).unwrap();
+        assert!(matches!(
+            delete_session(root.path(), &session.id()),
+            Err(SessionError::AlreadyActive(_))
+        ));
+        assert!(path.exists(), "an owned session must not be deleted");
+        drop(owner);
+
+        assert!(delete_session(root.path(), &session.id()).unwrap());
+        assert!(!path.exists());
+        // Lock sidecars stay so contenders keep the same inodes.
+        assert!(path.with_extension("jsonl.active.lock").exists());
+        assert!(!delete_session(root.path(), &session.id()).unwrap());
     }
 
     #[test]

@@ -35,4 +35,5 @@ pub use model::{
 pub use store::SyncSessionFaultGuard;
 pub use store::{
     SessionActiveLease, SessionCreateOptions, SessionIndexEntry, SessionStore, default_session_dir,
+    delete_session, delete_session_file,
 };
