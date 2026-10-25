@@ -194,21 +194,29 @@ fn choose_cut(live: &[&SessionEventRecord], policy: &CompactionPolicy) -> Option
     // --- Phase 1: turn-count primary -------------------------------------
     // Walk backward from the newest event until we have keep_recent_turns
     // complete user turns. The oldest kept event at that point is a user
-    // message, so the cut is a normal turn boundary.
+    // message, so the cut is normally a turn boundary. Zero means "no turn
+    // rule": skip this phase and let the token backstop choose. A user
+    // message that is not a valid cut point (for example inside an open tool
+    // call) is never returned, because a cut there would split a call from
+    // its result and the session would reject the summary.
     let mut turn_cut: Option<usize> = None;
-    let mut turns = 0usize;
-    for i in (0..live.len()).rev() {
-        if matches!(live[i].event, SessionEvent::UserMessage { .. }) {
-            turns = turns.saturating_add(1);
-        }
-        if turns >= policy.keep_recent_turns {
-            turn_cut = Some(i);
-            break;
+    if policy.keep_recent_turns > 0 {
+        let mut turns = 0usize;
+        for i in (0..live.len()).rev() {
+            if matches!(live[i].event, SessionEvent::UserMessage { .. }) {
+                turns = turns.saturating_add(1);
+            }
+            if turns >= policy.keep_recent_turns {
+                turn_cut = Some(i);
+                break;
+            }
         }
     }
 
     if let Some(turn_index) = turn_cut {
-        if suffix[turn_index] <= policy.keep_recent_tokens {
+        if suffix[turn_index] <= policy.keep_recent_tokens
+            && cut_points.binary_search(&turn_index).is_ok()
+        {
             return Some(turn_index);
         }
     } else if suffix[0] <= policy.keep_recent_tokens {
@@ -380,6 +388,31 @@ mod tests {
             .count();
         assert_eq!(kept_turns, 2);
         assert!(!plan.to_summarize.is_empty());
+    }
+
+    #[test]
+    fn zero_recent_turns_never_cuts_between_a_call_and_its_result() {
+        // `keep_recent_turns = 0` is a documented valid setting. The newest
+        // event is a tool result, so a cut directly before it would split
+        // the call from its result and the summary append would be rejected.
+        let session = grow_session(6, 2_000);
+        let policy = CompactionPolicy {
+            keep_recent_turns: 0,
+            keep_recent_tokens: 1_000,
+            ..CompactionPolicy::default()
+        };
+        let plan = plan_compaction(&session, &policy, 60_000).unwrap();
+        let live = session.events.iter().collect::<Vec<_>>();
+        let cut_points = valid_cut_points(&live);
+        let first_kept = live
+            .iter()
+            .position(|record| record.sequence == plan.boundary + 1)
+            .unwrap();
+        assert!(
+            cut_points.contains(&first_kept),
+            "boundary {} is not a valid cut point",
+            plan.boundary
+        );
     }
 
     #[test]
