@@ -1,4 +1,5 @@
 use crate::client::HarnessClient;
+use crate::config::Redactions;
 use crate::config::{MAX_CONCURRENT_MCP_STARTUPS, McpServerConfig, McpTransportConfig};
 use crate::http_client::BoundedHttpClient;
 use crate::tool::{MAX_REMOTE_DEFINITION_BYTES, MAX_REMOTE_TOOLS, McpTool, validate_remote_tool};
@@ -352,6 +353,8 @@ struct ConnectedServer {
     client: RunningService<RoleClient, HarnessClient>,
     tools: Vec<RemoteTool>,
     stderr_task: Option<StderrTask>,
+    /// Configured secret values removed from this server's tool errors.
+    redactions: Redactions,
 }
 
 impl McpRuntime {
@@ -385,9 +388,14 @@ impl McpRuntime {
                 let workspace_root = workspace_root.to_path_buf();
                 let server_cancel = startup_cancel.clone();
                 tasks.spawn(async move {
+                    let redactions = Redactions::for_server(&server);
                     connect_server(&server, &workspace_root, server_cancel)
                         .await
-                        .map(|connected| (server.name.clone(), connected))
+                        .map(|mut connected| {
+                            connected.redactions = redactions.clone();
+                            (server.name.clone(), connected)
+                        })
+                        .map_err(|error| error.redact(&redactions))
                 });
             }
             if startup_cancel.is_cancelled() {
@@ -448,6 +456,7 @@ impl McpRuntime {
                     &server.name,
                     remote.clone(),
                     server.client.peer().clone(),
+                    server.redactions.clone(),
                 )?))?;
             }
         }
@@ -655,6 +664,7 @@ where
         client,
         tools,
         stderr_task,
+        redactions: Redactions::default(),
     })
 }
 

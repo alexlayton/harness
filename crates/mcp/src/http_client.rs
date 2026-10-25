@@ -129,6 +129,19 @@ fn challenge(response: &reqwest::Response) -> Result<Option<String>, HttpError> 
         .transpose()
 }
 
+/// Wrap a reqwest error without its URL: an endpoint URL can carry tokens in
+/// its query or userinfo, and the server name already identifies it.
+fn client_error(error: reqwest::Error) -> HttpError {
+    StreamableHttpError::Client(error.without_url())
+}
+
+fn strip_url(error: HttpError) -> HttpError {
+    match error {
+        StreamableHttpError::Client(error) => client_error(error),
+        other => other,
+    }
+}
+
 fn excerpt(body: &[u8]) -> String {
     let text = String::from_utf8_lossy(body);
     let mut end = text.len().min(ERROR_EXCERPT_BYTES);
@@ -184,6 +197,7 @@ impl StreamableHttpClient for BoundedHttpClient {
                 max_sse_event_size,
             )
             .await
+            .map_err(strip_url)
     }
 
     async fn delete_session(
@@ -197,6 +211,7 @@ impl StreamableHttpClient for BoundedHttpClient {
         self.inner
             .delete_session(uri, session_id, auth_header, custom_headers)
             .await
+            .map_err(strip_url)
     }
 
     async fn post_message(
@@ -241,11 +256,7 @@ impl StreamableHttpClient for BoundedHttpClient {
         if let Some(session_id) = session_id {
             request = request.header(HEADER_SESSION_ID, session_id.as_ref());
         }
-        let response = request
-            .body(body)
-            .send()
-            .await
-            .map_err(StreamableHttpError::Client)?;
+        let response = request.body(body).send().await.map_err(client_error)?;
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED
             && let Some(header) = challenge(&response)?
@@ -298,7 +309,7 @@ impl StreamableHttpClient for BoundedHttpClient {
         if !status.is_success() {
             let body = match read_bounded(response, self.max_body_bytes)
                 .await
-                .map_err(StreamableHttpError::Client)?
+                .map_err(client_error)?
             {
                 BoundedBody::Complete(body) => body,
                 BoundedBody::TooLarge => {
@@ -340,7 +351,7 @@ impl StreamableHttpClient for BoundedHttpClient {
             Some(_) if is_json => {
                 let body = match read_bounded(response, self.max_body_bytes)
                     .await
-                    .map_err(StreamableHttpError::Client)?
+                    .map_err(client_error)?
                 {
                     BoundedBody::Complete(body) => body,
                     BoundedBody::TooLarge => {

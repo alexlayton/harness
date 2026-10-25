@@ -203,6 +203,7 @@ pub(crate) struct McpTool {
     parameters: Value,
     output_schema: Option<Value>,
     peer: Peer<RoleClient>,
+    redactions: crate::config::Redactions,
 }
 
 impl McpTool {
@@ -210,6 +211,7 @@ impl McpTool {
         server: &str,
         remote: RemoteTool,
         peer: Peer<RoleClient>,
+        redactions: crate::config::Redactions,
     ) -> Result<Self, McpError> {
         let original_name = remote.name.to_string();
         validate_remote_tool(server, &remote)?;
@@ -236,6 +238,7 @@ impl McpTool {
             parameters,
             output_schema,
             peer,
+            redactions,
         })
     }
 }
@@ -340,8 +343,9 @@ impl McpTool {
     }
 
     fn error(&self, message: impl fmt::Display) -> ToolOutput {
+        // Transport errors can echo configured headers or URL tokens.
         ToolOutput {
-            content: crate::output::cap_display(message),
+            content: crate::output::cap_display(self.redactions.apply(&message.to_string())),
             is_error: true,
             summary: self.summary(),
         }

@@ -262,6 +262,58 @@ fn field_too_large(server: &McpServerConfig, field: &str) -> McpError {
     }
 }
 
+/// Configured values that must never appear in diagnostics for one server:
+/// HTTP header values, URL credentials, query values and fragment, and stdio
+/// environment values. Servers and HTTP clients can echo these back in error
+/// bodies or URLs; every MCP error and tool-call error passes through
+/// [`Redactions::apply`] before it reaches the UI, logs, or the model.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Redactions(std::sync::Arc<[String]>);
+
+/// Shorter values (such as `1` or `true`) would redact ordinary text.
+const MIN_REDACTED_BYTES: usize = 6;
+
+impl Redactions {
+    pub(crate) fn for_server(server: &McpServerConfig) -> Self {
+        let mut values = Vec::new();
+        match &server.transport {
+            McpTransportConfig::Stdio { env, .. } => values.extend(env.values().cloned()),
+            McpTransportConfig::Http { url, headers } => {
+                for value in headers.values() {
+                    values.push(value.clone());
+                    // `Authorization: Bearer <token>` can be echoed without
+                    // its scheme.
+                    if let Some((_, token)) = value.split_once(' ') {
+                        values.push(token.to_owned());
+                    }
+                }
+                if let Ok(url) = url::Url::parse(url) {
+                    values.push(url.username().to_owned());
+                    values.extend(url.password().map(str::to_owned));
+                    values.extend(url.query().map(str::to_owned));
+                    values.extend(url.fragment().map(str::to_owned));
+                    values.extend(url.query_pairs().map(|(_, value)| value.into_owned()));
+                }
+            }
+        }
+        values.retain(|value| value.trim().len() >= MIN_REDACTED_BYTES);
+        // Longest first, so a value that contains another is replaced whole.
+        values.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        values.dedup();
+        Self(values.into())
+    }
+
+    pub(crate) fn apply(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        for value in self.0.iter() {
+            if text.contains(value.as_str()) {
+                text = text.replace(value.as_str(), "[redacted]");
+            }
+        }
+        text
+    }
+}
+
 fn redact_url(value: &str) -> String {
     let Ok(mut url) = url::Url::parse(value) else {
         return "<redacted URL>".into();
@@ -572,6 +624,33 @@ mod tests {
         assert!(!debug.contains("password"));
         assert!(!debug.contains("resolved-secret"));
         assert!(!debug.contains("fragment"));
+    }
+
+    #[test]
+    fn diagnostics_redact_configured_header_and_url_secrets() {
+        let config = McpServerConfig {
+            name: "remote".into(),
+            transport: McpTransportConfig::Http {
+                url: "https://user:password@example.test/path?token=resolved-secret".into(),
+                headers: BTreeMap::from([(
+                    "Authorization".into(),
+                    "Bearer header-secret-value".into(),
+                )]),
+            },
+        };
+        let redactions = Redactions::for_server(&config);
+        let error = McpError::operation(
+            "remote",
+            "initialize",
+            "HTTP 401: invalid token header-secret-value for \
+             https://user:password@example.test/path?token=resolved-secret",
+        )
+        .redact(&redactions)
+        .to_string();
+        for secret in ["header-secret-value", "password", "resolved-secret"] {
+            assert!(!error.contains(secret), "{secret} leaked: {error}");
+        }
+        assert!(error.contains("[redacted]"));
     }
 
     #[test]
