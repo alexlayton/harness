@@ -37,20 +37,8 @@ pub fn export_jsonl(
 ) -> Result<PathBuf> {
     let destination = destination
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| default_export_path(session));
-    let destination = if destination.is_absolute() {
-        destination
-    } else {
-        std::env::current_dir()
-            .map_err(|source| io_error("resolve export directory", ".", source))?
-            .join(destination)
-    };
-    if session
-        .path()
-        .is_some_and(|path| same_file_path(path, &destination))
-    {
-        return Err(SessionError::ExportWouldOverwrite(destination));
-    }
+        .unwrap_or_else(|| default_export_path(session, "jsonl"));
+    let destination = checked_export_destination(session, destination, "resolve export directory")?;
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|source| io_error("create export directory", parent, source))?;
@@ -90,18 +78,11 @@ pub fn export_jsonl(
 /// and an atomic rename, so an existing destination's permissive mode is not
 /// inherited by the new transcript.
 pub fn export_transcript(session: &Session, destination: Option<&Path>) -> Result<PathBuf> {
-    let destination = destination.map(Path::to_path_buf).unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(format!("harness-session-{}.txt", session.id()))
-    });
-    let destination = if destination.is_absolute() {
-        destination
-    } else {
-        std::env::current_dir()
-            .map_err(|source| io_error("resolve transcript directory", ".", source))?
-            .join(destination)
-    };
+    let destination = destination
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_export_path(session, "txt"));
+    let destination =
+        checked_export_destination(session, destination, "resolve transcript directory")?;
     let parent = destination.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|source| io_error("create transcript directory", parent, source))?;
@@ -583,14 +564,46 @@ fn message_text(message: &StoredMessage) -> String {
         .join("\n")
 }
 
-fn default_export_path(session: &Session) -> PathBuf {
+fn default_export_path(session: &Session, extension: &str) -> PathBuf {
     std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join(format!("harness-session-{}.jsonl", session.id()))
+        .join(format!("harness-session-{}.{extension}", session.id()))
+}
+
+/// Make an export destination absolute and refuse the session's own log.
+/// Every export format shares this check: the atomic rename would otherwise
+/// replace the append-only session file with the export.
+fn checked_export_destination(
+    session: &Session,
+    destination: PathBuf,
+    context: &'static str,
+) -> Result<PathBuf> {
+    let destination = if destination.is_absolute() {
+        destination
+    } else {
+        std::env::current_dir()
+            .map_err(|source| io_error(context, ".", source))?
+            .join(destination)
+    };
+    if session
+        .path()
+        .is_some_and(|path| same_file_path(path, &destination))
+    {
+        return Err(SessionError::ExportWouldOverwrite(destination));
+    }
+    Ok(destination)
 }
 
 fn same_file_path(left: &Path, right: &Path) -> bool {
-    left.canonicalize().ok() == right.canonicalize().ok() || left == right
+    if left == right {
+        return true;
+    }
+    // Two paths that cannot both be resolved are not proven to be the same
+    // file; `None == None` must not count as a match.
+    matches!(
+        (left.canonicalize(), right.canonicalize()),
+        (Ok(left), Ok(right)) if left == right
+    )
 }
 
 #[cfg(test)]
@@ -641,6 +654,24 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn exports_never_replace_the_session_log() {
+        let directory = tempdir().unwrap();
+        let log = directory.path().join("session.jsonl");
+        fs::write(&log, "original log\n").unwrap();
+        let mut session = Session::new(SessionMetadata::new(directory.path(), None, None));
+        session.path = Some(log.clone());
+        assert!(matches!(
+            export_transcript(&session, Some(&log)),
+            Err(SessionError::ExportWouldOverwrite(_))
+        ));
+        assert!(matches!(
+            export_jsonl(&session, Some(&log), &ExportOptions::default()),
+            Err(SessionError::ExportWouldOverwrite(_))
+        ));
+        assert_eq!(fs::read_to_string(&log).unwrap(), "original log\n");
     }
 
     #[test]
