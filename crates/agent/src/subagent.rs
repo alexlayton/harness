@@ -455,7 +455,7 @@ impl SubagentRunnerImpl {
         );
         if let Some(child) = session.as_ref()
             && let Some(store) = self.store.as_ref()
-            && let Err(error) = store.sync_session(child)
+            && let Err(error) = crate::blocking::blocking_io(|| store.sync_session(child))
         {
             // Deferred-sync stores flush at the parent's turn boundary
             // anyway; a failed explicit sync here only loses durability of
@@ -474,7 +474,7 @@ impl SubagentRunnerImpl {
         event: session::SessionEvent,
     ) {
         if let (Some(store), Some(child)) = (store, session)
-            && let Err(error) = store.append_event(child, event)
+            && let Err(error) = crate::blocking::blocking_io(|| store.append_event(child, event))
         {
             tracing::warn!(error = %error, "subagent session persist failed");
         }

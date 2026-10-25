@@ -36,9 +36,7 @@ impl Agent {
         let Some(state) = self.session.as_mut() else {
             return Ok(());
         };
-        state
-            .store
-            .append_event(&mut state.session, event)
+        crate::blocking::blocking_io(|| state.store.append_event(&mut state.session, event))
             .map(|_| ())
             .map_err(|error| {
                 let message = format!("session persistence failed: {error}");
@@ -78,15 +76,17 @@ impl Agent {
             return Ok(None);
         };
         let mut staged = state.session.clone();
-        state
-            .store
-            .append_event(&mut staged, SessionEvent::ModelChange { provider, model })
-            .map(|_| Some(staged))
-            .map_err(|error| {
-                let message = format!("session persistence failed: {error}");
-                send(events, AgentEvent::Error(message.clone()));
-                TurnError::Persist(message)
-            })
+        crate::blocking::blocking_io(|| {
+            state
+                .store
+                .append_event(&mut staged, SessionEvent::ModelChange { provider, model })
+        })
+        .map(|_| Some(staged))
+        .map_err(|error| {
+            let message = format!("session persistence failed: {error}");
+            send(events, AgentEvent::Error(message.clone()));
+            TurnError::Persist(message)
+        })
     }
 
     /// Flush one session clone at the deferred-sync boundary. Model changes
@@ -101,7 +101,7 @@ impl Agent {
         if !store.deferred_sync() {
             return Ok(());
         }
-        if let Err(error) = store.sync_session(session) {
+        if let Err(error) = crate::blocking::blocking_io(|| store.sync_session(session)) {
             let message = format!("session persistence failed during sync: {error}");
             send(events, AgentEvent::Error(message.clone()));
             return Err(TurnError::Persist(message));

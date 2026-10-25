@@ -301,24 +301,27 @@ impl ToolDispatchHooks for AgentToolDispatchHooks<'_> {
             },
         };
         if let Some(state) = self.session.as_mut() {
-            state
-                .store
-                .append_event(&mut state.session, durable)
-                .and_then(|_| {
-                    // A deferred-sync session still needs a durable admission
-                    // before a nested tool can apply external side effects.
-                    if state.store.deferred_sync() {
-                        state.store.sync_session(&state.session)?;
-                    }
-                    Ok(())
-                })
-                .map_err(|error| {
-                    let message = self
-                        .secrets
-                        .mask_text(&format!("session persistence failed: {error}"));
-                    send(self.events, AgentEvent::Error(message.clone()));
-                    message
-                })?;
+            crate::blocking::blocking_io(|| {
+                state
+                    .store
+                    .append_event(&mut state.session, durable)
+                    .and_then(|_| {
+                        // A deferred-sync session still needs a durable
+                        // admission before a nested tool can apply external
+                        // side effects.
+                        if state.store.deferred_sync() {
+                            state.store.sync_session(&state.session)?;
+                        }
+                        Ok(())
+                    })
+            })
+            .map_err(|error| {
+                let message = self
+                    .secrets
+                    .mask_text(&format!("session persistence failed: {error}"));
+                send(self.events, AgentEvent::Error(message.clone()));
+                message
+            })?;
         }
         match event {
             CodeModeEvent::Started {

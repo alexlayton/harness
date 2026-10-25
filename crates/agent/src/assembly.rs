@@ -168,15 +168,16 @@ impl AgentBuilder {
         let active_lease = self
             .session
             .as_mut()
-            .map(|(store, session)| store.acquire_active_and_reload(session))
+            .map(|(store, session)| {
+                crate::blocking::blocking_io(|| store.acquire_active_and_reload(session))
+            })
             .transpose()
             .context("acquire active session")?;
         // Repair a loaded crash tail before starting MCP servers or exposing a
         // live agent. Failing here is preferable to reporting a successful
         // load that predictably quarantines on its first append.
         if let Some((store, session)) = self.session.as_mut() {
-            store
-                .repair_incomplete_tool_calls(session)
+            crate::blocking::blocking_io(|| store.repair_incomplete_tool_calls(session))
                 .context("repair incomplete session tool calls")?;
         }
         let mcp = if self.mcp_servers.is_empty() {
