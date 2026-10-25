@@ -615,8 +615,10 @@ impl AuthStore {
         let mut file = match fs::File::open(&self.path) {
             Ok(file) => {
                 // Reading an auth file is also an opportunity to repair a
-                // permissive mode left by an older Harness version.
-                ensure_private_file(&self.path)?;
+                // permissive mode left by an older Harness version. Reads
+                // happen on every provider request, so no chmod or
+                // directory fsync is paid when the mode is already private.
+                secure_open_file(&file, &self.path)?;
                 file
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -762,6 +764,34 @@ fn private_file(path: &Path) -> Result<fs::File> {
     }
 }
 
+/// Repair an open file's mode only when it is not already 0600, through its
+/// handle, and without a parent-directory sync (a mode change creates no
+/// directory entry). Used on read and lock paths, which run per request.
+fn secure_open_file(file: &fs::File, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if injected_secure_file_failure() {
+        return Err(io_error(
+            "secure auth file",
+            path,
+            std::io::Error::other("injected file permission failure"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error("stat auth file", path, source))?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| io_error("secure auth file", path, source))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
+}
+
 fn ensure_private_file(path: &Path) -> Result<()> {
     // Fail-closed test hook: simulate an OS permission failure before any
     // repair so tests prove lock acquisition/saves propagate instead of
@@ -862,7 +892,7 @@ impl AuthStore {
             options.open(&path)
         }
         .map_err(|source| io_error("open refresh lease", &path, source))?;
-        ensure_private_file(&path)?;
+        secure_open_file(&file, &path)?;
         let deadline = tokio::time::Instant::now() + REFRESH_LEASE_WAIT;
         loop {
             match file.try_lock_exclusive() {
@@ -913,7 +943,7 @@ impl AuthFileLock {
             }
         }
         .map_err(|source| io_error("open auth lock", &path, source))?;
-        ensure_private_file(&path)?;
+        secure_open_file(&file, &path)?;
 
         for _ in 0..LOCK_ATTEMPTS {
             match file.try_lock_exclusive() {
