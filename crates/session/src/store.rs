@@ -51,6 +51,15 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static INJECT_SYNC_PARENT_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static INJECT_APPEND_SYNC_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether an append should fail after its bytes were written (as a failed
+/// `fsync` does). Test-only.
+#[cfg(test)]
+fn injected_append_sync_failure() -> bool {
+    INJECT_APPEND_SYNC_FAILURE.with(|flag| flag.get())
 }
 
 /// Whether directory permission repair should fail. Test-only.
@@ -402,10 +411,10 @@ impl SessionStore {
         };
         self.ensure_path_in_root(&path)?;
         let lock = SessionLock::acquire(&path)?;
-        let file_size = fs::metadata(&path)
-            .map_err(|source| io_error("stat session for append", &path, source))?
-            .len();
-        let current_identity = file_identity(&path)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|source| io_error("stat session for append", &path, source))?;
+        let file_size = metadata.len();
+        let current_identity = identity_from_metadata(&metadata);
         if session.validated_bytes > 0
             && session.file_identity == Some(current_identity)
             && usize::try_from(file_size).ok() == Some(session.validated_bytes)
@@ -423,7 +432,7 @@ impl SessionStore {
             };
             validate_next_event(session, &record)?;
             let line = encode_record(session.id(), &record)?;
-            let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
+            let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
             drop(lock);
@@ -451,7 +460,7 @@ impl SessionStore {
             };
             validate_next_event(session, &record)?;
             let line = encode_record(session.id(), &record)?;
-            let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
+            let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
             drop(lock);
@@ -485,7 +494,10 @@ impl SessionStore {
         };
         validate_next_event(&disk_session, &record)?;
         let line = encode_record(disk_session.id(), &record)?;
-        let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
+        let current_size = fs::metadata(&path)
+            .map_err(|source| io_error("stat session for append", &path, source))?
+            .len();
+        let new_size = append_encoded_record(&path, &line, self.deferred_sync(), current_size)?;
         disk_session.append_record(record.clone());
         disk_session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
         *session = disk_session;
@@ -683,7 +695,7 @@ fn try_lock_active(session_path: &Path) -> Result<SessionActiveLease> {
         }
     }
     .map_err(|source| io_error("open active session lease", &path, source))?;
-    ensure_private_file(&path)?;
+    secure_lock_file(&file, &path)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -880,48 +892,60 @@ fn reconcile_external_tail(session: &mut Session, path: &Path, file_size: usize)
 }
 
 /// Append one canonical record, inserting a separator when the preceding
-/// valid record ended without a newline. Returns the resulting file length.
-fn append_encoded_record(path: &Path, line: &str, deferred_sync: bool) -> Result<u64> {
-    let file_size = fs::metadata(path)
-        .map_err(|source| io_error("stat session for append", path, source))?
-        .len();
-    let needs_separator = file_size > 0 && !file_ends_with_newline(path, file_size)?;
+/// valid record ended without a newline. `file_size` is the size observed
+/// under the session lock. Returns the resulting file length.
+///
+/// One handle serves both the tail check and the write. A failed write or
+/// sync truncates the file back to `file_size`: a partial or unsynced record
+/// left in place was later reconciled as a valid external record, so a
+/// retry of the same event appended it twice.
+fn append_encoded_record(
+    path: &Path,
+    line: &str,
+    deferred_sync: bool,
+    file_size: u64,
+) -> Result<u64> {
     let mut file = OpenOptions::new()
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|source| io_error("open session for append", path, source))?;
+    let needs_separator = if file_size == 0 {
+        false
+    } else {
+        // Reads honour the seek position; append-mode writes always go to
+        // the end of the file.
+        let mut byte = [0u8; 1];
+        file.seek(SeekFrom::Start(file_size - 1))
+            .and_then(|_| file.read_exact(&mut byte))
+            .map_err(|source| io_error("read session tail", path, source))?;
+        byte[0] != b'\n'
+    };
     let write_result = (|| -> std::io::Result<()> {
         if needs_separator {
             file.write_all(b"\n")?;
         }
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")?;
-        file.flush()
+        file.flush()?;
+        #[cfg(test)]
+        if injected_append_sync_failure() {
+            return Err(std::io::Error::other("injected append sync failure"));
+        }
+        if !deferred_sync {
+            file.sync_all()?;
+        }
+        Ok(())
     })();
-    let write_result = if write_result.is_err() || !deferred_sync {
-        write_result.and_then(|_| file.sync_all())
-    } else {
-        write_result
-    };
-    write_result.map_err(|source| io_error("append session event", path, source))?;
+    if let Err(source) = write_result {
+        // Roll back so no partial or unsynced bytes become a record later.
+        let _ = file.set_len(file_size).and_then(|_| file.sync_all());
+        return Err(io_error("append session event", path, source));
+    }
     Ok(file_size
         .saturating_add(u64::from(needs_separator))
         .saturating_add(line.len() as u64)
         .saturating_add(1))
-}
-
-fn file_ends_with_newline(path: &Path, file_size: u64) -> Result<bool> {
-    if file_size == 0 {
-        return Ok(true);
-    }
-    let mut file =
-        File::open(path).map_err(|source| io_error("open session tail", path, source))?;
-    file.seek(SeekFrom::End(-1))
-        .map_err(|source| io_error("seek session tail", path, source))?;
-    let mut byte = [0u8; 1];
-    file.read_exact(&mut byte)
-        .map_err(|source| io_error("read session tail", path, source))?;
-    Ok(byte[0] == b'\n')
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
@@ -934,10 +958,14 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
 
 fn file_identity(path: &Path) -> Result<(u64, u64)> {
     let metadata = fs::metadata(path).map_err(|source| io_error("stat session", path, source))?;
+    Ok(identity_from_metadata(&metadata))
+}
+
+fn identity_from_metadata(metadata: &fs::Metadata) -> (u64, u64) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok((metadata.dev(), metadata.ino()))
+        (metadata.dev(), metadata.ino())
     }
     #[cfg(not(unix))]
     {
@@ -946,7 +974,7 @@ fn file_identity(path: &Path) -> Result<(u64, u64)> {
             .ok()
             .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_nanos() as u64);
-        Ok((metadata.len(), modified))
+        (metadata.len(), modified)
     }
 }
 
@@ -1461,6 +1489,36 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 }
 
 /// Fail-closed permission repair for files.
+/// Secure a lock sidecar through its open handle. New sidecars are created
+/// with mode 0600; only older, permissive ones are repaired. Unlike
+/// [`ensure_private_file`] this does no `chmod` when the mode is already
+/// private and no parent-directory `fsync` (a lock file holds no data), so
+/// an append no longer pays a `chmod` and a directory sync per event.
+fn secure_lock_file(file: &File, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if injected_secure_file_failure() {
+        return Err(io_error(
+            "secure file permissions",
+            path,
+            std::io::Error::other("injected file permission failure"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error("stat private file", path, source))?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| io_error("secure file permissions", path, source))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
+}
+
 fn ensure_private_file(path: &Path) -> Result<()> {
     // Fail-closed test hook: simulate an OS permission failure before any
     // repair so tests prove append/create propagates instead of continuing
@@ -1618,7 +1676,7 @@ impl SessionLock {
         .map_err(|source| io_error("open session lock", &path, source))?;
         // Existing sidecars from older versions are secured before any lock
         // metadata or session bytes are written. Failure is fail-closed.
-        ensure_private_file(&path)?;
+        secure_lock_file(&file, &path)?;
 
         for _ in 0..LOCK_ATTEMPTS {
             match file.try_lock_exclusive() {
@@ -2723,6 +2781,30 @@ mod tests {
             "failed append must not grow the session file"
         );
         assert!(store.open(&session.id()).unwrap().events.is_empty());
+    }
+
+    #[test]
+    fn failed_append_is_rolled_back_and_never_reappears() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        let path = session.path().unwrap().clone();
+        let bytes_before = fs::metadata(&path).unwrap().len();
+        let event = || SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("once")),
+        };
+        INJECT_APPEND_SYNC_FAILURE.with(|flag| flag.set(true));
+        let failed = store.append_event(&mut session, event());
+        INJECT_APPEND_SYNC_FAILURE.with(|flag| flag.set(false));
+        assert!(failed.is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), bytes_before);
+
+        // A retry from a fresh handle (as after a restart) records it once.
+        let mut reloaded = store.load_path(&path).unwrap();
+        store.append_event(&mut reloaded, event()).unwrap();
+        let events = store.load_path(&path).unwrap().events;
+        assert_eq!(events.len(), 1);
     }
 
     /// SESSION-4: a parent-sync failure must fail the whole create instead
