@@ -964,6 +964,21 @@ impl CopilotAuth {
     }
 
     pub async fn refresh(&self) -> Result<CopilotCredential> {
+        self.refresh_inner(None).await
+    }
+
+    /// Refresh because the provider rejected `rejected_access` (HTTP 401)
+    /// although it had not expired, for example after a server-side
+    /// revocation. If another handle or process already replaced that token,
+    /// the newer credential is returned without a new exchange.
+    pub async fn refresh_rejected(&self, rejected_access: &str) -> Result<CopilotCredential> {
+        self.refresh_inner(Some(rejected_access)).await
+    }
+
+    async fn refresh_inner(&self, rejected: Option<&str>) -> Result<CopilotCredential> {
+        let usable = |credential: &CopilotCredential| {
+            !credential.is_expired() && rejected != Some(credential.access.as_str())
+        };
         // Single-flight: concurrent refreshers queue on the async guard,
         // then recheck before hitting the network.  The blocking cache
         // mutex is never held across network work.
@@ -972,13 +987,11 @@ impl CopilotAuth {
         // propagate: they must not turn into a refresh of an obsolete cache.
         let current = self.store.copilot()?.ok_or(AuthError::NotAuthenticated)?;
         let cached = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
-        if !current.is_expired()
-            && (cached.is_expired() || copilot_newer_generation(&current, &cached))
-        {
+        if usable(&current) && (!usable(&cached) || copilot_newer_generation(&current, &cached)) {
             self.cache_credential(&current)?;
             return Ok(current);
         }
-        if !cached.is_expired() {
+        if usable(&cached) {
             return Ok(cached);
         }
         // If both are expired, use the persisted refresh token even if it

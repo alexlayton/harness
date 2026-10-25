@@ -287,6 +287,21 @@ impl OpenAiCodexAuth {
     }
 
     pub async fn refresh(&self) -> Result<OpenAiCodexCredential> {
+        self.refresh_inner(None).await
+    }
+
+    /// Refresh because the provider rejected `rejected_access` (HTTP 401)
+    /// although it had not expired, for example after a server-side
+    /// revocation. If another handle or process already replaced that token,
+    /// the newer credential is returned without a new exchange.
+    pub async fn refresh_rejected(&self, rejected_access: &str) -> Result<OpenAiCodexCredential> {
+        self.refresh_inner(Some(rejected_access)).await
+    }
+
+    async fn refresh_inner(&self, rejected: Option<&str>) -> Result<OpenAiCodexCredential> {
+        let usable = |credential: &OpenAiCodexCredential| {
+            !credential.is_expired() && rejected != Some(credential.access.as_str())
+        };
         // Single-flight: concurrent refreshers queue here, then recheck the
         // credential before refreshing so only the first waiter hits the
         // network.  Never hold the blocking cache mutex across the network;
@@ -312,7 +327,9 @@ impl OpenAiCodexAuth {
             // The comparison also prevents an older cached expiry from
             // forcing an unnecessary exchange.
             if let Some(cached) = cached {
-                if current.is_newer_generation_than(&cached) {
+                if current.is_newer_generation_than(&cached)
+                    && rejected != Some(current.access.as_str())
+                {
                     *self
                         .credential
                         .lock()
@@ -320,10 +337,10 @@ impl OpenAiCodexAuth {
                         Some(current.clone());
                     return Ok(current);
                 }
-                if !cached.is_expired() {
+                if usable(&cached) {
                     return Ok(cached);
                 }
-            } else if !current.is_expired() {
+            } else if usable(&current) {
                 *self
                     .credential
                     .lock()
