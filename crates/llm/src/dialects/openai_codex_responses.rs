@@ -61,15 +61,13 @@ pub fn build_request_body(request: &CompletionRequest) -> Value {
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
     }
-    if let Some(system) = &request.system {
-        body["instructions"] = Value::String(system.clone());
+    if let Some(instructions) = super::openai_responses::request_instructions(request) {
+        body["instructions"] = Value::String(instructions);
     }
-    if let Some(max) = request.max_tokens {
-        body["max_output_tokens"] = json!(max);
-    }
-    if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
-    }
+    // The ChatGPT Codex backend rejects `max_output_tokens` and
+    // `temperature` as unsupported parameters, which failed every request
+    // that set them (for example the compaction summarizer, which always
+    // fell back to the deterministic summary). They are not sent.
     body
 }
 
@@ -256,6 +254,16 @@ mod tests {
             reasoning,
             session_id: None,
         }
+    }
+
+    #[test]
+    fn codex_body_omits_unsupported_sampling_parameters() {
+        let mut req = request(ReasoningPolicy::Off);
+        req.max_tokens = Some(4096);
+        req.temperature = Some(0.2);
+        let body = build_request_body(&req);
+        assert!(body.get("max_output_tokens").is_none());
+        assert!(body.get("temperature").is_none());
     }
 
     #[test]
