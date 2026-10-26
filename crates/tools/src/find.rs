@@ -355,10 +355,35 @@ impl FileSearchIndex {
             .strip_prefix(&self.root)
             .map_err(|_| format!("search path {scope} is outside the workspace"))?
             .to_string_lossy()
-            .replace('\\', "/")
+            .slash_separators()
             .trim_matches('/')
             .to_owned();
         Ok(relative)
+    }
+}
+
+/// Bounded echo of a user query in a no-result message.
+fn echo(query: &str) -> String {
+    const MAX_ECHO_BYTES: usize = 200;
+    if query.len() <= MAX_ECHO_BYTES {
+        return query.to_owned();
+    }
+    format!("{}…", truncate_utf8_prefix(query, MAX_ECHO_BYTES))
+}
+
+/// Display paths with `/`. Only Windows uses `\` as a separator; on Unix a
+/// backslash is a literal file-name character and must be kept.
+trait SlashSeparators {
+    fn slash_separators(&self) -> String;
+}
+
+impl<T: AsRef<str> + ?Sized> SlashSeparators for T {
+    fn slash_separators(&self) -> String {
+        if cfg!(windows) {
+            self.as_ref().replace('\\', "/")
+        } else {
+            self.as_ref().to_owned()
+        }
     }
 }
 
@@ -467,7 +492,7 @@ fn search_sync(
             MixedItemRef::File(file) => (file.relative_path(picker), false),
             MixedItemRef::Dir(directory) => (directory.relative_path(picker), true),
         };
-        let path = path.replace('\\', "/");
+        let path = path.slash_separators();
         if let Some(prefix) = scope_prefix.as_deref()
             && path != scope.unwrap_or_default()
             && !path.starts_with(prefix)
@@ -595,7 +620,7 @@ fn collect_grep_result(
         }
         let path = result.files[m.file_index]
             .relative_path(picker)
-            .replace('\\', "/");
+            .slash_separators();
         if let Some(prefix) = scope_prefix.as_deref()
             && path != scope.unwrap_or_default()
             && !path.starts_with(prefix)
@@ -784,7 +809,7 @@ fn format_results(
     max_limit: usize,
 ) -> String {
     if result.paths.is_empty() {
-        return format!("No files found for query `{query}`.");
+        return format!("No files found for query `{}`.", echo(query));
     }
 
     let total = result.total_matched.max(result.paths.len());
@@ -843,12 +868,13 @@ pub(crate) fn format_grep_output(
         };
         if raw.incomplete {
             return format!(
-                "No matches for pattern `{pattern}`{fallback} in the files searched before the \
+                "No matches for pattern `{}`{fallback} in the files searched before the \
                  search time budget ran out; the pattern can still be present. Narrow the path \
-                 or the pattern and search again."
+                 or the pattern and search again.",
+                echo(pattern)
             );
         }
-        return format!("No matches for pattern `{pattern}`{fallback}.");
+        return format!("No matches for pattern `{}`{fallback}.", echo(pattern));
     }
 
     let mut output = String::new();

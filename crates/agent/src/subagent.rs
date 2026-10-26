@@ -368,8 +368,23 @@ impl SubagentRunnerImpl {
         parent_session: Option<session::SessionId>,
     ) -> Option<session::Session> {
         let store = store.as_ref()?;
+        // A session title is one line in listings; the model-written
+        // description can contain newlines and other control characters.
+        let title = description
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         match store.create(SessionCreateOptions {
-            title: Some(description.to_owned()),
+            title: Some(title),
             provider: Some(provider.to_owned()),
             model: Some(model.to_owned()),
             parent_session,
