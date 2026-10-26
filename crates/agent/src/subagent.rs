@@ -467,16 +467,23 @@ impl SubagentRunnerImpl {
 
     /// Persist one event to the child session when both a store and a child
     /// exist. Failures are logged, never fatal: an unpersisted delegation
-    /// still completed its real work.
+    /// still completed its real work. After the first failure the child
+    /// session is detached and nothing more is recorded: later events (a
+    /// result whose call was not written, for example) would make the
+    /// durable transcript invalid.
     fn persist(
         store: &Option<SessionStore>,
         session: &mut Option<session::Session>,
         event: session::SessionEvent,
     ) {
-        if let (Some(store), Some(child)) = (store, session)
+        if let (Some(store), Some(child)) = (store, session.as_mut())
             && let Err(error) = crate::blocking::blocking_io(|| store.append_event(child, event))
         {
-            tracing::warn!(error = %error, "subagent session persist failed");
+            tracing::warn!(
+                error = %error,
+                "subagent session persist failed; recording stopped for this run"
+            );
+            *session = None;
         }
     }
 
