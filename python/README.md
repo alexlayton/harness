@@ -295,11 +295,10 @@ start method for Python multiprocessing.
 > Bash has the operating-system access of your Python process. Native
 > execution also shares memory and failure risk with your script.
 
-## PR and release checks
+## Publishing
 
-See the [readiness review](../docs/python-api-readiness.md) for completed checks
-and the remaining CI and public-release gates. The current release workflow
-ships CLI archives only; Python package publication is not configured.
+The release workflow ships CLI archives only. Python package publication is
+not configured; install from source as shown above.
 
 ## Small local checks
 
