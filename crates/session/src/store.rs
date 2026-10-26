@@ -1337,27 +1337,47 @@ fn list_directory(directory: &Path, workspace: Option<&Path>) -> Result<Vec<Sess
     let mut result = Vec::new();
     let entries =
         fs::read_dir(directory).map_err(|source| io_error("list sessions", directory, source))?;
+    // One unreadable or corrupt file must not hide every other session, and
+    // a skipped file must be visible in the log rather than vanish silently.
     for entry in entries {
-        let entry = entry.map_err(|source| io_error("read session entry", directory, source))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(directory = %directory.display(), %error, "skipping unreadable session entry");
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
         }
-        match index_file(&path, workspace)? {
+        let indexed = match index_file(&path, workspace) {
+            Ok(indexed) => indexed,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "skipping unreadable session file");
+                continue;
+            }
+        };
+        match indexed {
             Some(entry) => result.push(entry),
             None => {
                 // A torn final JSONL line is recoverable for reads even
                 // though the metadata-only scanner cannot parse that line.
                 // Fall back to the recovery-aware loader; terminated or
                 // middle-file corruption still remains excluded.
-                if let Ok(session) = load_session_file(&path)
-                    && workspace.is_none_or(|workspace| {
-                        normalize_workspace(session.metadata.workspace_root.clone())
-                            .ok()
-                            .is_some_and(|root| root == workspace)
-                    })
-                {
-                    result.push(index_from_session(&session, &path));
+                match load_session_file(&path) {
+                    Ok(session) => {
+                        if workspace.is_none_or(|workspace| {
+                            normalize_workspace(session.metadata.workspace_root.clone())
+                                .ok()
+                                .is_some_and(|root| root == workspace)
+                        }) {
+                            result.push(index_from_session(&session, &path));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "skipping corrupt session file");
+                    }
                 }
             }
         }
@@ -3008,6 +3028,27 @@ mod tests {
             error.to_string().contains("unresolved tool call"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_unreadable_session_does_not_fail_the_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let good = store.create(SessionCreateOptions::default()).unwrap();
+        let bad = store.create(SessionCreateOptions::default()).unwrap();
+        let bad_path = bad.path().unwrap().clone();
+        fs::set_permissions(&bad_path, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&bad_path).is_ok() {
+            // Running as root: permissions do not block reads.
+            return;
+        }
+        let listed = store.list().unwrap();
+        fs::set_permissions(&bad_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, good.id());
     }
 
     #[test]
