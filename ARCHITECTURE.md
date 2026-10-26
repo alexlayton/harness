@@ -50,14 +50,17 @@ separate events, persistence, tool scheduling, turn streaming, commands, and
 compaction.
 
 1. A frontend sends an `InputMessage`.
-2. The agent reconstructs provider history from the current `Session` and
-   builds a `CompletionRequest` with the system prompt and tool definitions.
+2. The agent appends the message to its live provider history. That history
+   is rebuilt from the `Session` only when a session is attached or after
+   compaction. Each request builds the system prompt and tool definitions
+   from one fresh `ToolRegistry` snapshot.
 3. The provider streams text, reasoning, tool calls, and usage. Bounded retry
    logic handles recoverable stream and tool-argument failures.
 4. The registry schedules tool calls by their declared concurrency class. Tool
    events and results are persisted, then the loop requests the next model
    response.
-5. A text-only response completes the turn.
+5. A text-only response completes the turn. An empty response gets a bounded
+   recovery request, and a turn stops with an error after 200 tool rounds.
 
 An armed prewalk (`crates/agent/src/agent/prewalk.rs`) can switch the active
 model once inside a turn, only after a persisted tool round that called `edit`

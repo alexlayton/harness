@@ -17,6 +17,10 @@ use std::io;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// Name of the code-mode tool. Shared so the registry, dispatch, and
+/// summaries cannot drift apart.
+pub const CODE_MODE_TOOL_NAME: &str = "run_code";
+
 const MAX_CODE_BYTES: usize = 32 * 1024;
 const MAX_VALUE_BYTES: usize = 50 * 1024;
 const MAX_TOOL_CALLS: usize = 50;
@@ -130,7 +134,7 @@ impl CodeMode {
         let catalog = String::from_utf8(writer.0).map_err(|err| err.to_string())?;
         let spec = ToolSpec {
             definition: ToolDefinition {
-                name: "run_code".into(),
+                name: CODE_MODE_TOOL_NAME.into(),
                 description: format!(
                     concat!(
                         "Execute Python calculations and tool orchestration in Monty with selected Harness tools as functions. ",
@@ -413,8 +417,10 @@ impl CodeMode {
 
 /// Purpose label shared by live execution and session replay.
 pub(crate) fn summary(args: &Value) -> String {
-    super::python::description(args)
-        .map_or_else(|| "run_code".into(), |label| format!("run_code {label}"))
+    super::python::description(args).map_or_else(
+        || CODE_MODE_TOOL_NAME.into(),
+        |label| format!("{CODE_MODE_TOOL_NAME} {label}"),
+    )
 }
 
 fn format_error(error: &str, audit: &[String], printed: &str) -> String {

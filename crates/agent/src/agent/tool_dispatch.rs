@@ -15,7 +15,9 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tools::{CodeModeEvent, Concurrency, ToolOutput, ToolRegistry, call_summary};
+use tools::{
+    CODE_MODE_TOOL_NAME, CodeModeEvent, Concurrency, ToolOutput, ToolRegistry, call_summary,
+};
 
 /// Upper bound on read-only tool calls running at once.  Read tools are
 /// cheap, but the shared `FileSearchIndex` already gates its own concurrency
@@ -26,12 +28,13 @@ pub(crate) const MAX_CONCURRENT_READ_ONLY_TOOLS: usize = 8;
 /// Upper bound on concurrent potentially mutating fan-out calls.
 pub(crate) const MAX_CONCURRENT_PARALLEL_TOOLS: usize = 4;
 
-/// Upper bound on concurrent `Parallel` tool calls (subagents) and the
-/// per-subagent turn budget.  Each parallel slot is an entire nested agent
-/// loop, so this is deliberately separate from (and smaller than) the
-/// read-only cap.
+/// Fan-out bounds for `Parallel` tool calls (subagents).  Each parallel slot
+/// is an entire nested agent loop, so this is deliberately separate from (and
+/// smaller than) the read-only cap.
 #[derive(Clone, Copy, Debug)]
 pub struct SubagentLimits {
+    /// Upper bound on `Parallel` calls of one batch running at once.
+    /// [`Agent::with_subagent_limits`] clamps it to at least 1.
     pub max_concurrent: usize,
 }
 
@@ -121,7 +124,7 @@ fn execution_arguments(
     match secrets {
         Some(masker)
             if restore_secrets
-                && call.name != "run_code"
+                && call.name != CODE_MODE_TOOL_NAME
                 && registry.accepts_restored_secrets(&call.name) =>
         {
             let (value, rejected_key) = masker.restore_json_for_execution(&call.arguments);
@@ -522,7 +525,7 @@ async fn execute_with_secret_policy(
             is_error: true,
             summary: "rejected secret-bearing argument key".into(),
         }
-    } else if name == "run_code" && registry.code_mode_enabled() {
+    } else if name == CODE_MODE_TOOL_NAME && registry.code_mode_enabled() {
         let cancel = notifications.cancel.clone();
         let executor =
             AgentCodeModeExecutor::new(registry, secrets, restore_secrets, notifications);
@@ -572,21 +575,19 @@ where
     let mut finished = 0usize;
     let mut cancellation = poll_control_now(control);
 
-    while cancellation.is_none() && next_launch < batch.calls.len().min(launch_limit) {
-        let call = &batch.calls[next_launch];
-        let started = Instant::now();
-        starts[next_launch] = Some(started);
-        hooks.started(call, started, false);
+    // Build the future for one call. The initial fill and the refill after a
+    // completion must launch calls identically, so both go through here.
+    let launch = |index: usize, started: Instant| -> ToolRun<'_> {
+        let call = &batch.calls[index];
         let name = call.name.clone();
         let arguments = execution_arguments(registry, secrets, restore_secrets, call);
-        let index = next_launch;
         let notifications = NestedEventSink {
             parent_call_id: call.id.clone(),
             sender: nested_sender.clone(),
             cancel: batch_cancel.clone(),
             admission: nested_admission.clone(),
         };
-        futures.push(Box::pin(async move {
+        Box::pin(async move {
             let output = execute_with_secret_policy(
                 registry,
                 &name,
@@ -597,7 +598,14 @@ where
             )
             .await;
             (index, output, started)
-        }));
+        })
+    };
+
+    while cancellation.is_none() && next_launch < batch.calls.len().min(launch_limit) {
+        let started = Instant::now();
+        starts[next_launch] = Some(started);
+        hooks.started(&batch.calls[next_launch], started, false);
+        futures.push(launch(next_launch, started));
         next_launch += 1;
     }
 
@@ -632,26 +640,10 @@ where
                         break;
                     }
                     if next_launch < batch.calls.len() {
-                        let call = &batch.calls[next_launch];
                         let started = Instant::now();
                         starts[next_launch] = Some(started);
-                        hooks.started(call, started, false);
-                        let name = call.name.clone();
-                        let arguments = execution_arguments(registry, secrets, restore_secrets, call);
-                        let index = next_launch;
-                        let notifications = NestedEventSink {
-                            parent_call_id: call.id.clone(),
-                            sender: nested_sender.clone(),
-                            cancel: batch_cancel.clone(),
-                            admission: nested_admission.clone(),
-                        };
-                        futures.push(Box::pin(async move {
-                            let output = execute_with_secret_policy(
-                                registry, &name, arguments, secrets, restore_secrets, notifications,
-                            )
-                            .await;
-                            (index, output, started)
-                        }));
+                        hooks.started(&batch.calls[next_launch], started, false);
+                        futures.push(launch(next_launch, started));
                         next_launch += 1;
                     }
                 }

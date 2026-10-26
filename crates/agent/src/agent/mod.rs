@@ -75,8 +75,13 @@ pub enum StreamRecovery {
 /// attached can break the live-history/durable-session relationship and should
 /// be avoided outside migration code.
 pub struct Agent {
+    /// Active provider for parent requests. `/model` replaces it, and
+    /// `with_secret_masker` wraps it so provider traffic is masked too.
     pub provider: Arc<dyn Provider>,
+    /// Tools offered to the model. A fresh snapshot of this registry builds
+    /// both the tool definitions and the system prompt for every request.
     pub tools: ToolRegistry,
+    /// Active model identifier sent with every parent request.
     pub model: String,
     /// Reasoning policy applied to normal parent requests.
     pub reasoning: llm::ReasoningPolicy,
@@ -85,7 +90,11 @@ pub struct Agent {
     /// When a durable session is attached it is rebuilt from the session
     /// events whenever a session is loaded or created.
     pub history: Vec<Message>,
+    /// Application-level shutdown token. Each turn runs under a child token,
+    /// so an interrupt stops only that turn while this stops the run loop.
     pub cancel: CancellationToken,
+    /// Attached durable session, if any. `None` keeps the agent in-memory
+    /// only; attach one with `with_session` so the active lease is held.
     pub session: Option<AgentSessionState>,
     /// Exact-value masking shared by provider, persistence, and tool dispatch.
     pub(crate) secret_masker: Arc<SecretMasker>,
@@ -243,29 +252,12 @@ impl Agent {
     /// Attach a loaded/new durable session after claiming exclusive ownership.
     /// Active provider/model selection remains the caller's choice; saved
     /// metadata is informational only.
-    pub fn with_session(
-        mut self,
-        store: SessionStore,
-        mut session: Session,
-    ) -> session::Result<Self> {
+    pub fn with_session(self, store: SessionStore, mut session: Session) -> session::Result<Self> {
         // Reload under the lease so events appended by a previous owner after
         // the caller loaded `session` are part of the model context.
         let active_lease = store.acquire_active_and_reload(&mut session)?;
         store.repair_incomplete_tool_calls(&mut session)?;
-        self.history = session
-            .context_messages()
-            .iter()
-            .map(|message| self.secret_masker.mask_message(message))
-            .collect();
-        if let Some(runner) = &self.subagent_runner {
-            runner.update_parent_session(Some(session.id()));
-        }
-        self.session = Some(AgentSessionState {
-            store,
-            session,
-            active_lease: Some(active_lease),
-        });
-        Ok(self)
+        Ok(self.with_leased_session(store, session, active_lease))
     }
 
     /// Attach a durable session whose exclusive active lease was acquired by
@@ -420,6 +412,8 @@ impl Agent {
         // first-turn critical path. The same result supplies both the model
         // catalogue and the selected model's context window; model switches
         // enqueue through this channel instead of issuing a second request.
+        // `self` owns a sender for the whole loop, so `metadata_rx` never
+        // observes a closed channel and needs no closed-channel handling.
         let (metadata_tx, mut metadata_rx) = mpsc::unbounded_channel();
         self.model_metadata_tx = Some(metadata_tx.clone());
         spawn_model_metadata(
@@ -437,9 +431,6 @@ impl Agent {
             while let Ok((provider, model, models)) = metadata_rx.try_recv() {
                 self.apply_model_metadata(provider, model, models, &events);
             }
-            if metadata_rx.is_closed() {
-                self.model_metadata_tx = None;
-            }
             let next_message = if let Some(message) = self.queued.pop_front() {
                 Some(message)
             } else if !self.input_open {
@@ -452,12 +443,8 @@ impl Agent {
                         }
                         message
                     }
-                    metadata = metadata_rx.recv() => {
-                        if let Some((provider, model, models)) = metadata {
-                            self.apply_model_metadata(provider, model, models, &events);
-                        } else {
-                            self.model_metadata_tx = None;
-                        }
+                    Some((provider, model, models)) = metadata_rx.recv() => {
+                        self.apply_model_metadata(provider, model, models, &events);
                         continue;
                     }
                     _ = self.cancel.cancelled() => None,
