@@ -573,6 +573,7 @@ impl SubagentRunnerImpl {
             // when the next request is rebuilt.
             let mut items = Vec::<Content>::new();
             let mut stream_error = None;
+            let mut saw_done = false;
             loop {
                 tokio::select! {
                     next = stream.next() => match next {
@@ -588,19 +589,31 @@ impl SubagentRunnerImpl {
                         // parent totals never double-count delegated work.
                         Some(Ok(StreamEvent::Done {
                             usage: Some(usage),..
-                        })) => Self::persist(
-                            &self.store,
-                            session,
-                            session::SessionEvent::Usage {
-                                usage: usage_summary(&usage),
-                            },
-                        ),
-                        Some(Ok(StreamEvent::Done { .. })) => {}
+                        })) => {
+                            saw_done = true;
+                            Self::persist(
+                                &self.store,
+                                session,
+                                session::SessionEvent::Usage {
+                                    usage: usage_summary(&usage),
+                                },
+                            );
+                        }
+                        Some(Ok(StreamEvent::Done { .. })) => saw_done = true,
                         Some(Err(error)) => {
                             stream_error = Some(error);
                             break;
                         }
-                        None => break,
+                        None => {
+                            // A stream that ends without its terminal event
+                            // is truncated: its text is not a complete report.
+                            if !saw_done {
+                                stream_error = Some(llm::LlmError::StreamInterrupted(
+                                    "subagent stream ended without a terminal event".into(),
+                                ));
+                            }
+                            break;
+                        }
                     },
                     _ = cancel.cancelled() => return Err("cancelled by user".into()),
                 }
@@ -990,6 +1003,24 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(order, ["o1", "ca", "o2", "cb"]);
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_not_a_successful_report() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![Ok(StreamEvent::TextDelta(
+            "partial fin".into(),
+        ))]]));
+        let runner = runner_with(provider);
+        let error = runner
+            .run(
+                "audit",
+                "go",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("without a terminal event"), "{error}");
     }
 
     #[tokio::test]
