@@ -64,11 +64,30 @@ impl OpenAiResponsesClient {
     }
 }
 
+/// Request instructions: the system prompt plus any message-level system
+/// text. Responses has no system role in `input` (`convert_input` skips
+/// those messages), so their text would otherwise be dropped.
+pub(crate) fn request_instructions(req: &CompletionRequest) -> Option<String> {
+    let instructions = req
+        .system
+        .iter()
+        .cloned()
+        .chain(
+            req.messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .flat_map(|message| text_parts(&message.content).map(str::to_owned)),
+        )
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    (!instructions.is_empty()).then(|| instructions.join("\n\n"))
+}
+
 pub fn build_request_body(req: &CompletionRequest, reasoning: ReasoningPolicy) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(req.model.clone()));
-    if let Some(system) = &req.system {
-        body.insert("instructions".into(), Value::String(system.clone()));
+    if let Some(instructions) = request_instructions(req) {
+        body.insert("instructions".into(), Value::String(instructions));
     }
     body.insert("input".into(), Value::Array(convert_input(&req.messages)));
     if !req.tools.is_empty() {
@@ -437,6 +456,21 @@ mod tests {
             reasoning,
             session_id: None,
         }
+    }
+
+    #[test]
+    fn message_level_system_text_joins_instructions() {
+        let mut req = request(ReasoningPolicy::Off);
+        req.system = Some("base".into());
+        req.messages.insert(
+            0,
+            Message {
+                role: Role::System,
+                content: vec![Content::Text("extra".into())],
+            },
+        );
+        let body = build_request_body(&req, ReasoningPolicy::Off);
+        assert_eq!(body["instructions"], "base\n\nextra");
     }
 
     #[test]
