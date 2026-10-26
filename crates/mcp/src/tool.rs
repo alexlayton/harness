@@ -66,6 +66,17 @@ pub(crate) fn validate_remote_tool(server: &str, remote: &RemoteTool) -> Result<
             message: "tool description is too long".into(),
         });
     }
+    // Providers require function parameters to be an object schema; one tool
+    // with another type makes every request with the tool list fail.
+    if let Some(kind) = remote.input_schema.get("type")
+        && kind != "object"
+    {
+        return Err(McpError::Tool {
+            server: server.into(),
+            tool: name.to_owned(),
+            message: "input schema type must be \"object\"".into(),
+        });
+    }
     let mut stats = SchemaStats::default();
     visit_schema_object(&remote.input_schema, 0, &mut stats).map_err(|message| McpError::Tool {
         server: server.into(),
@@ -90,10 +101,13 @@ pub(crate) fn validate_remote_tool(server: &str, remote: &RemoteTool) -> Result<
             .filter(|description| !description.is_empty())
             .map_or(String::new(), |description| format!(" {description}"))
     );
+    // The output schema is part of the catalogue too (code mode shows it),
+    // so it counts toward the aggregate budget.
     let definition = serde_json::json!({
         "name": normalized_tool_name(server, name),
         "description": generated_description,
         "parameters": *remote.input_schema,
+        "output_schema": remote.output_schema.as_deref(),
     });
     serde_json::to_vec(&definition)
         .map(|bytes| bytes.len())
@@ -222,7 +236,13 @@ impl McpTool {
                 message: "tool name is empty".into(),
             });
         }
-        let parameters = Value::Object((*remote.input_schema).clone());
+        let mut parameters = (*remote.input_schema).clone();
+        // MCP input schemas are objects; some servers omit the explicit type,
+        // which strict providers reject.
+        parameters
+            .entry("type")
+            .or_insert_with(|| Value::String("object".into()));
+        let parameters = Value::Object(parameters);
         let output_schema = remote
             .output_schema
             .map(|schema| Value::Object((*schema).clone()));
@@ -443,6 +463,29 @@ mod tests {
             sanitize_description(tool.description.as_deref().unwrap()),
             "Line one.\nLine two.\n\tIndented [2Jtext"
         );
+    }
+
+    #[test]
+    fn input_schema_must_be_an_object_and_output_schema_counts() {
+        let mut tool = remote("typed");
+        tool.input_schema = Arc::new(
+            serde_json::json!({"type": "string"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(validate_remote_tool("server", &tool).is_err());
+
+        let plain = remote("sized");
+        let base = validate_remote_tool("server", &plain).unwrap();
+        let mut with_output = remote("sized");
+        with_output.output_schema = Some(Arc::new(
+            serde_json::json!({"type": "object", "description": "x".repeat(1000)})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        assert!(validate_remote_tool("server", &with_output).unwrap() > base + 1000);
     }
 
     #[test]
