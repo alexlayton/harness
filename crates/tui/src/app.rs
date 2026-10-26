@@ -63,7 +63,7 @@ use crate::commands::{
     self, ArgumentKind, Candidate, CandidateKind, CompletionContext, CompletionResult,
     CompletionTarget, ParsedCommand,
 };
-use crate::commit::stable_block_split_offset;
+use crate::commit::SplitScanner;
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
 use crate::paths::{self, AtPrefix};
@@ -158,6 +158,21 @@ enum Entry {
 struct StreamState {
     reasoning: String,
     markdown: String,
+    /// Incremental stable-split scan over `markdown`; reset when it is
+    /// drained.
+    split: SplitScanner,
+    /// Wrapped reasoning rows for the last paint. Reasoning only grows
+    /// during a stream, so its length (with width and theme) identifies the
+    /// rendering; re-wrapping it on every frame was O(n) per paint.
+    reasoning_render: std::cell::RefCell<Option<ReasoningRender>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReasoningRender {
+    width: usize,
+    theme: Theme,
+    len: usize,
+    lines: Vec<Line<'static>>,
 }
 
 /// Cached rendering for completed markdown blocks in the live stream. The
@@ -2138,10 +2153,11 @@ impl CrossTerm {
     /// unfinished suffix is intentionally left out of the cache because its
     /// Markdown meaning can still change with the next delta.
     fn refresh_stream_markdown_cache(&mut self) {
-        let Some(stream) = self.stream.as_ref() else {
+        let Some(stream) = self.stream.as_mut() else {
             return;
         };
-        let stable_offset = stable_block_split_offset(&stream.markdown).unwrap_or(0);
+        let stable_offset = stream.split.split_offset(&stream.markdown).unwrap_or(0);
+        let stream = &*stream;
         let width = render::content_width(self.width);
         let theme = self.theme;
         let reusable = self.stream_markdown_cache.as_ref().is_some_and(|cache| {
@@ -2467,11 +2483,23 @@ impl CrossTerm {
         };
         let mut lines = Vec::new();
         if !stream.reasoning.is_empty() {
-            lines.extend(render::reasoning_lines(
-                &stream.reasoning,
-                self.theme,
-                width,
-            ));
+            let mut cache = stream.reasoning_render.borrow_mut();
+            let fresh = cache.as_ref().is_some_and(|cached| {
+                cached.width == width
+                    && cached.theme == self.theme
+                    && cached.len == stream.reasoning.len()
+            });
+            if !fresh {
+                *cache = Some(ReasoningRender {
+                    width,
+                    theme: self.theme,
+                    len: stream.reasoning.len(),
+                    lines: render::reasoning_lines(&stream.reasoning, self.theme, width),
+                });
+            }
+            if let Some(cached) = cache.as_ref() {
+                lines.extend(cached.lines.iter().cloned());
+            }
         }
         if !stream.markdown.is_empty() {
             if !lines.is_empty() {
@@ -2530,7 +2558,7 @@ impl CrossTerm {
         if stream.markdown.is_empty() {
             return;
         }
-        let Some(offset) = stable_block_split_offset(&stream.markdown) else {
+        let Some(offset) = stream.split.split_offset(&stream.markdown) else {
             return;
         };
         if offset == 0 {
@@ -2547,6 +2575,7 @@ impl CrossTerm {
         self.pending.push(prefix);
         stream.reasoning.clear();
         stream.markdown.drain(..offset);
+        stream.split = SplitScanner::default();
         // The source origin moved; cached offsets are no longer meaningful.
         self.stream_markdown_cache = None;
     }
@@ -5288,6 +5317,7 @@ mod tests {
             // the only bound. The full text prints when the message
             // finalizes.
             markdown: (0..60).map(|i| format!("line {i}\n")).collect(),
+            ..StreamState::default()
         });
         let input = ui.input_layout();
         let build = ui.build_region(&input);
@@ -5332,6 +5362,7 @@ mod tests {
         ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: tall.clone() + &"second ".repeat(30),
+            ..StreamState::default()
         });
         let input = ui.input_layout();
         ui.commit_stream_prefix(input.rows.len());
@@ -5357,6 +5388,7 @@ mod tests {
         ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: tall.clone() + &"second ".repeat(30),
+            ..StreamState::default()
         });
         let _build = ui.stage_full_repaint();
         assert!(ui.pending.is_empty());
@@ -5374,6 +5406,7 @@ mod tests {
         ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: "short\n\nanswer".into(),
+            ..StreamState::default()
         });
         let input = ui.input_layout();
         ui.commit_stream_prefix(input.rows.len());
@@ -5390,6 +5423,7 @@ mod tests {
         live.stream = Some(StreamState {
             reasoning: "thinking".into(),
             markdown: "answer".into(),
+            ..StreamState::default()
         });
         live.finalize_stream();
         assert!(live.stream.is_none());
@@ -5420,6 +5454,7 @@ mod tests {
         loaded_ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: "live".into(),
+            ..StreamState::default()
         });
         loaded_ui.apply_event(UiEvent::SessionChanged {
             id: "abcd1234efgh".into(),
