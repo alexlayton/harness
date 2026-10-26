@@ -102,6 +102,12 @@ pub async fn atomic_write(
         .ok()
         .map(|metadata| metadata.permissions());
     let (temporary_path, mut temporary_file) = create_temporary_file(parent).await?;
+    // Removes the temporary file if this future is dropped (for example an
+    // aborted tool call) before the rename; `result.is_err()` cleanup below
+    // does not run in that case.
+    let mut guard = TemporaryPathGuard {
+        path: Some(temporary_path.clone()),
+    };
 
     let result = async {
         for chunk in contents.chunks(64 * 1024) {
@@ -117,10 +123,15 @@ pub async fn atomic_write(
         }
         check_cancelled(cancel)?;
         fs::rename(&temporary_path, path).await?;
+        guard.path = None;
         // Persist the directory entry as well as the file contents so a
-        // successful atomic write survives a crash after rename.
+        // successful atomic write survives a crash after rename. The write
+        // is already committed: a failed directory sync is logged, never
+        // reported as a failed write the caller might retry.
         #[cfg(unix)]
-        fs::File::open(parent).await?.sync_all().await?;
+        if let Err(error) = async { fs::File::open(parent).await?.sync_all().await }.await {
+            tracing::warn!(%error, "directory sync failed after a committed write");
+        }
         Ok(())
     }
     .await;
@@ -129,6 +140,19 @@ pub async fn atomic_write(
         let _ = fs::remove_file(&temporary_path).await;
     }
     result
+}
+
+/// Removes a path-based temporary file on drop unless it was committed.
+struct TemporaryPathGuard {
+    path: Option<PathBuf>,
+}
+
+impl Drop for TemporaryPathGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// Write `contents` to `name` inside the validated parent directory `parent_fd`
@@ -148,7 +172,20 @@ pub async fn atomic_write_at(
     use std::os::fd::AsFd;
 
     check_cancelled(cancel)?;
-    let (tmp, temporary_name) = create_temporary_file_at(parent_fd)?;
+    // A new file gets the usual 0666-minus-umask mode (the kernel applies the
+    // umask at creation). Replacing an existing file starts private and then
+    // takes the existing mode, so its new contents are never more exposed.
+    let create_mode = if existing_permissions.is_none() {
+        rustix::fs::Mode::from_raw_mode(0o666)
+    } else {
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR
+    };
+    let (tmp, temporary_name) = create_temporary_file_at(parent_fd, create_mode)?;
+    // Unlinks the temporary file if this future is dropped before commit.
+    let mut guard = TemporaryAtGuard {
+        parent: parent_fd.as_fd(),
+        name: Some(temporary_name.clone()),
+    };
     let result = async {
         write_all_chunks(&tmp, contents, cancel).await?;
         rustix::fs::fsync(&tmp).map_err(io::Error::from)?;
@@ -185,10 +222,14 @@ pub async fn atomic_write_at(
         check_cancelled(cancel)?;
         rustix::fs::renameat(parent_fd.as_fd(), &temporary_name, parent_fd.as_fd(), name)
             .map_err(io::Error::from)?;
+        guard.name = None;
 
-        // Cancellation after rename must not turn a committed mutation into a
-        // reported failure. The caller can no longer safely retry it.
-        rustix::fs::fsync(parent_fd.as_fd()).map_err(io::Error::from)?;
+        // Cancellation or a failed directory sync after rename must not turn
+        // a committed mutation into a reported failure: the caller can no
+        // longer safely retry it.
+        if let Err(error) = rustix::fs::fsync(parent_fd.as_fd()) {
+            tracing::warn!(%error, "directory sync failed after a committed write");
+        }
         Ok(existed)
     }
     .await;
@@ -205,9 +246,26 @@ pub async fn atomic_write_at(
     result
 }
 
+/// Unlinks a handle-relative temporary file on drop unless it was committed.
+#[cfg(unix)]
+struct TemporaryAtGuard<'a> {
+    parent: std::os::fd::BorrowedFd<'a>,
+    name: Option<String>,
+}
+
+#[cfg(unix)]
+impl Drop for TemporaryAtGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(name) = self.name.take() {
+            let _ = rustix::fs::unlinkat(self.parent, name.as_str(), rustix::fs::AtFlags::empty());
+        }
+    }
+}
+
 #[cfg(unix)]
 fn create_temporary_file_at(
     parent_fd: &std::os::fd::OwnedFd,
+    mode: rustix::fs::Mode,
 ) -> io::Result<(std::os::fd::OwnedFd, String)> {
     use std::os::fd::AsFd;
     for _ in 0..100 {
@@ -220,7 +278,7 @@ fn create_temporary_file_at(
                 | rustix::fs::OFlags::EXCL
                 | rustix::fs::OFlags::NOFOLLOW
                 | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            mode,
         ) {
             Ok(file) => return Ok((file, name)),
             Err(error) if error == rustix::io::Errno::EXIST => continue,
@@ -311,5 +369,105 @@ fn check_cancelled(cancel: &CancellationToken) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn open_directory(path: &Path) -> std::os::fd::OwnedFd {
+        rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    fn leftovers(directory: &Path) -> usize {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".harness-edit-")
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn new_files_follow_the_umask_and_existing_modes_are_kept() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = open_directory(directory.path());
+        let cancel = CancellationToken::new();
+        atomic_write_at(&parent, "new.txt", b"new", None, &cancel)
+            .await
+            .unwrap();
+        // The kernel applies the process umask to 0666; it must not be the
+        // private 0600 used for temporary files of existing files.
+        let mode = std::fs::metadata(directory.path().join("new.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let umask = libc_umask_probe();
+        assert_eq!(mode, 0o666 & !umask);
+
+        let existing = directory.path().join("existing.txt");
+        std::fs::write(&existing, "old").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_write_at(
+            &parent,
+            "existing.txt",
+            b"new",
+            Some(std::fs::Permissions::from_mode(0o640)),
+            &cancel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(leftovers(directory.path()), 0);
+    }
+
+    /// Read the umask without changing it for other threads for long:
+    /// `umask(2)` can only be read by setting it, so restore immediately.
+    fn libc_umask_probe() -> u32 {
+        let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
+        rustix::process::umask(previous);
+        previous.bits() as u32
+    }
+
+    #[tokio::test]
+    async fn dropped_write_leaves_no_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = open_directory(directory.path());
+        let cancel = CancellationToken::new();
+        let contents = vec![b'x'; 8 * 1024 * 1024];
+        {
+            let write = atomic_write_at(&parent, "big.txt", &contents, None, &cancel);
+            tokio::pin!(write);
+            // Poll once so the temporary file exists, then drop the future.
+            let _ = futures_poll_once(write.as_mut()).await;
+        }
+        assert_eq!(leftovers(directory.path()), 0);
+        assert!(!directory.path().join("big.txt").exists());
+    }
+
+    async fn futures_poll_once<F: std::future::Future + Unpin>(future: F) {
+        let mut future = Some(future);
+        std::future::poll_fn(|context| {
+            if let Some(future) = future.as_mut() {
+                let _ = std::pin::Pin::new(future).poll(context);
+            }
+            std::task::Poll::Ready(())
+        })
+        .await;
     }
 }
