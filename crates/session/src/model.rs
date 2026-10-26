@@ -967,6 +967,7 @@ pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord
         &session.tracker,
         session.compaction_boundary,
     )?;
+    validate_new_assistant_order(record, &session.tracker)?;
     if let SessionEvent::CompactionSummary {
         compacted_through, ..
     } = &record.event
@@ -1001,6 +1002,7 @@ pub(crate) fn validate_event_suffix(
             )));
         }
         validate_record(record, expected, &ids, &tracker, boundary)?;
+        validate_new_assistant_order(record, &tracker)?;
         ids.insert(record.id);
         if let SessionEvent::CompactionSummary {
             compacted_through, ..
@@ -1079,6 +1081,26 @@ impl ToolValidationState for SuffixTracker<'_> {
     fn is_cancelled(&self) -> bool {
         self.local.is_cancelled()
     }
+}
+
+/// Rule for newly written events only: a new assistant message may not
+/// arrive while earlier tool calls still wait for results. Providers need
+/// each result directly after the response that made the call, so
+/// call → assistant text → result is not valid provider history. It is not
+/// applied when an existing file is loaded, so older logs stay readable.
+fn validate_new_assistant_order<T: ToolValidationState>(
+    record: &SessionEventRecord,
+    tracker: &T,
+) -> Result<()> {
+    if matches!(record.event, SessionEvent::AssistantMessage { .. })
+        && !tracker.pending().is_empty()
+        && !tracker.is_cancelled()
+    {
+        return Err(SessionError::InvalidEvent(
+            "assistant message follows an unresolved tool call".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_record<T: ToolValidationState>(

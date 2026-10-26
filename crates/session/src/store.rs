@@ -2969,6 +2969,48 @@ mod tests {
     }
 
     #[test]
+    fn assistant_message_cannot_separate_a_call_from_its_result() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("go")),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolCall {
+                    call: StoredToolCall {
+                        id: "call-1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+            )
+            .unwrap();
+        let error = store
+            .append_event(
+                &mut session,
+                SessionEvent::AssistantMessage {
+                    message: StoredMessage::from_llm(&Message::assistant(vec![
+                        llm::Content::Text("meanwhile".into()),
+                    ])),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unresolved tool call"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn failed_append_is_rolled_back_and_never_reappears() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
