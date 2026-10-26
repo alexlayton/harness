@@ -7,6 +7,7 @@
 
 use crate::error::{AuthError, Result, io_error};
 use fs2::FileExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -162,9 +163,8 @@ impl fmt::Debug for CopilotCredential {
     }
 }
 
-/// OAuth credentials used by the ChatGPT Codex subscription endpoint.
-/// Expiration is a Unix timestamp in milliseconds.
 /// Private Anthropic subscription OAuth tokens and optional login identity.
+/// Expiration is a Unix timestamp in milliseconds.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnthropicSubscriptionCredential {
     #[serde(rename = "type")]
@@ -254,6 +254,8 @@ impl fmt::Debug for AnthropicSubscriptionCredential {
     }
 }
 
+/// OAuth credentials used by the ChatGPT Codex subscription endpoint.
+/// Expiration is a Unix timestamp in milliseconds.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenAiCodexCredential {
     #[serde(rename = "type")]
@@ -349,6 +351,90 @@ impl fmt::Debug for RedactedCredential<'_> {
     }
 }
 
+/// Per-provider policy for the shared load/save paths in [`AuthStore`].
+///
+/// Every provider shares the same locking, private-permission, and
+/// read-modify-write mechanics; only the key, the error text, and the
+/// compare-and-save rule differ, so those are the only things captured here.
+trait StoredCredential: Serialize + DeserializeOwned {
+    /// Entry name in `auth.json`.
+    const PROVIDER_KEY: &'static str;
+
+    /// Whether the credential carries every field a provider request needs.
+    fn has_oauth_fields(&self) -> bool;
+
+    /// Error returned when a stored or to-be-saved credential is incomplete.
+    fn missing_fields() -> AuthError;
+
+    /// Map a decode failure without ever quoting serde's message, which can
+    /// contain stored token values.
+    fn decode_error(path: &Path, error: &serde_json::Error) -> AuthError {
+        AuthError::json(path, error)
+    }
+
+    /// Whether the persisted `stored` value is still the generation a refresh
+    /// started from, so its result may replace it.
+    fn is_current(stored: &Self, expected: &Self) -> bool;
+}
+
+impl StoredCredential for CopilotCredential {
+    const PROVIDER_KEY: &'static str = COPILOT_PROVIDER_KEY;
+
+    fn has_oauth_fields(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn missing_fields() -> AuthError {
+        AuthError::InvalidCredential("credential is missing its OAuth token fields".into())
+    }
+
+    /// Copilot compares only the token pair, not expiry or enrichment such
+    /// as `available_model_ids`.
+    fn is_current(stored: &Self, expected: &Self) -> bool {
+        stored.access == expected.access && stored.refresh == expected.refresh
+    }
+}
+
+impl StoredCredential for AnthropicSubscriptionCredential {
+    const PROVIDER_KEY: &'static str = ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY;
+
+    fn has_oauth_fields(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn missing_fields() -> AuthError {
+        AuthError::InvalidCredential(
+            "Anthropic subscription credential is missing OAuth fields".into(),
+        )
+    }
+
+    fn decode_error(_path: &Path, _error: &serde_json::Error) -> AuthError {
+        AuthError::InvalidCredential(
+            "Anthropic subscription credential has invalid OAuth fields".into(),
+        )
+    }
+
+    fn is_current(stored: &Self, expected: &Self) -> bool {
+        stored.is_complete() && stored.has_same_generation(expected)
+    }
+}
+
+impl StoredCredential for OpenAiCodexCredential {
+    const PROVIDER_KEY: &'static str = OPENAI_CODEX_PROVIDER_KEY;
+
+    fn has_oauth_fields(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn missing_fields() -> AuthError {
+        AuthError::InvalidCredential("OpenAI Codex credential is missing OAuth fields".into())
+    }
+
+    fn is_current(stored: &Self, expected: &Self) -> bool {
+        stored.is_complete() && stored.has_same_generation(expected)
+    }
+}
+
 /// Provider-keyed values from `auth.json`.  Unknown providers are kept as raw
 /// JSON so a Harness update cannot erase credentials written by another tool.
 pub type AuthEntries = BTreeMap<String, serde_json::Value>;
@@ -402,37 +488,14 @@ impl AuthStore {
     }
 
     pub fn anthropic_subscription(&self) -> Result<Option<AnthropicSubscriptionCredential>> {
-        let entries = self.load_unlocked()?;
-        let Some(value) = entries.get(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY) else {
-            return Ok(None);
-        };
-        // Serde type errors can quote the offending value (including tokens).
-        let credential = serde_json::from_value::<AnthropicSubscriptionCredential>(value.clone())
-            .map_err(|_| {
-            AuthError::InvalidCredential(
-                "Anthropic subscription credential has invalid OAuth fields".into(),
-            )
-        })?;
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "Anthropic subscription credential is missing OAuth fields".into(),
-            ));
-        }
-        Ok(Some(credential))
+        self.load_provider()
     }
 
     pub fn save_anthropic_subscription(
         &self,
         credential: &AnthropicSubscriptionCredential,
     ) -> Result<()> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "Anthropic subscription credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential)
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        self.save_provider_value(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value)
+        self.save_provider(credential)
     }
 
     /// Replace a subscription credential only if the persisted generation is still
@@ -444,48 +507,15 @@ impl AuthStore {
         expected: &AnthropicSubscriptionCredential,
         credential: &AnthropicSubscriptionCredential,
     ) -> Result<bool> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "Anthropic subscription credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential)
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        self.save_provider_value_if_current(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value, |current| {
-            current
-                .and_then(|value| {
-                    serde_json::from_value::<AnthropicSubscriptionCredential>(value.clone()).ok()
-                })
-                .is_some_and(|current| {
-                    current.is_complete() && current.has_same_generation(expected)
-                })
-        })
+        self.save_provider_if_current(expected, credential)
     }
 
     pub fn openai_codex(&self) -> Result<Option<OpenAiCodexCredential>> {
-        let entries = self.load_unlocked()?;
-        let Some(value) = entries.get(OPENAI_CODEX_PROVIDER_KEY) else {
-            return Ok(None);
-        };
-        let credential = serde_json::from_value::<OpenAiCodexCredential>(value.clone())
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "OpenAI Codex credential is missing OAuth fields".into(),
-            ));
-        }
-        Ok(Some(credential))
+        self.load_provider()
     }
 
     pub fn save_openai_codex(&self, credential: &OpenAiCodexCredential) -> Result<()> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "OpenAI Codex credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential)
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        self.save_provider_value(OPENAI_CODEX_PROVIDER_KEY, value)
+        self.save_provider(credential)
     }
 
     /// Replace a Codex credential only if the persisted generation is still
@@ -497,37 +527,11 @@ impl AuthStore {
         expected: &OpenAiCodexCredential,
         credential: &OpenAiCodexCredential,
     ) -> Result<bool> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "OpenAI Codex credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential)
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        self.save_provider_value_if_current(OPENAI_CODEX_PROVIDER_KEY, value, |current| {
-            current
-                .and_then(|value| {
-                    serde_json::from_value::<OpenAiCodexCredential>(value.clone()).ok()
-                })
-                .is_some_and(|current| {
-                    current.is_complete() && current.has_same_generation(expected)
-                })
-        })
+        self.save_provider_if_current(expected, credential)
     }
 
     pub fn copilot(&self) -> Result<Option<CopilotCredential>> {
-        let entries = self.load_unlocked()?;
-        let Some(value) = entries.get(COPILOT_PROVIDER_KEY) else {
-            return Ok(None);
-        };
-        let credential = serde_json::from_value::<CopilotCredential>(value.clone())
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "credential is missing its OAuth token fields".into(),
-            ));
-        }
-        Ok(Some(credential))
+        self.load_provider()
     }
 
     /// Update one provider while retaining all unrelated entries.  The lock is
@@ -551,14 +555,7 @@ impl AuthStore {
     }
 
     pub fn save_copilot(&self, credential: &CopilotCredential) -> Result<()> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "credential is missing its OAuth token fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential)
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        self.save_provider_value(COPILOT_PROVIDER_KEY, value)
+        self.save_provider(credential)
     }
 
     /// Compare-and-save the result of a Copilot refresh under the auth-file
@@ -568,19 +565,53 @@ impl AuthStore {
         expected: &CopilotCredential,
         credential: &CopilotCredential,
     ) -> Result<bool> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "credential is missing its OAuth token fields".into(),
-            ));
+        self.save_provider_if_current(expected, credential)
+    }
+
+    /// Read and validate one provider's credential. Absence is `Ok(None)`;
+    /// a present but undecodable or incomplete entry is an error rather than
+    /// a silent logout, so a damaged file is surfaced instead of overwritten.
+    fn load_provider<T: StoredCredential>(&self) -> Result<Option<T>> {
+        let entries = self.load_unlocked()?;
+        let Some(value) = entries.get(T::PROVIDER_KEY) else {
+            return Ok(None);
+        };
+        let credential = serde_json::from_value::<T>(value.clone())
+            .map_err(|source| T::decode_error(&self.path, &source))?;
+        if !credential.has_oauth_fields() {
+            return Err(T::missing_fields());
         }
-        let value = serde_json::to_value(credential)
-            .map_err(|source| AuthError::json(&self.path, &source))?;
-        self.save_provider_value_if_current(COPILOT_PROVIDER_KEY, value, |current| {
+        Ok(Some(credential))
+    }
+
+    /// Validate and serialize a credential before any disk work, so an
+    /// incomplete credential is never written over a usable one.
+    fn encode_provider<T: StoredCredential>(&self, credential: &T) -> Result<serde_json::Value> {
+        if !credential.has_oauth_fields() {
+            return Err(T::missing_fields());
+        }
+        serde_json::to_value(credential).map_err(|source| AuthError::json(&self.path, &source))
+    }
+
+    /// Unconditionally replace one provider's credential under the file lock.
+    fn save_provider<T: StoredCredential>(&self, credential: &T) -> Result<()> {
+        let value = self.encode_provider(credential)?;
+        self.save_provider_value(T::PROVIDER_KEY, value)
+    }
+
+    /// Replace one provider's credential only while the stored entry still
+    /// matches `expected` per [`StoredCredential::is_current`]. An entry that
+    /// no longer decodes counts as changed, so the refresh result is dropped.
+    fn save_provider_if_current<T: StoredCredential>(
+        &self,
+        expected: &T,
+        credential: &T,
+    ) -> Result<bool> {
+        let value = self.encode_provider(credential)?;
+        self.save_provider_value_if_current(T::PROVIDER_KEY, value, |current| {
             current
-                .and_then(|value| serde_json::from_value::<CopilotCredential>(value.clone()).ok())
-                .is_some_and(|current| {
-                    current.access == expected.access && current.refresh == expected.refresh
-                })
+                .and_then(|value| serde_json::from_value::<T>(value.clone()).ok())
+                .is_some_and(|current| T::is_current(&current, expected))
         })
     }
 
