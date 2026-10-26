@@ -366,6 +366,15 @@ impl Agent {
                     // do not blame or repeat calls from completed rounds.
                     if recoveries < MAX_TURN_RECOVERIES {
                         recoveries += 1;
+                        // Final-answer-only frontends discard the failed
+                        // round, so its text must be given again in full.
+                        let answer = match self.stream_recovery {
+                            StreamRecovery::Continue => "",
+                            StreamRecovery::Replace => {
+                                " Give the complete final answer from the beginning, not \
+                                 only the missing part."
+                            }
+                        };
                         push_recovery_note(
                             &mut self.history,
                             format!(
@@ -373,7 +382,7 @@ impl Agent {
                                  ({parse_message}). Continue the task. Check the tool results \
                                  already in the conversation and do not repeat actions that \
                                  completed. If a tool call is still needed, issue it with \
-                                 valid arguments.]"
+                                 valid arguments.{answer}]"
                             ),
                         );
                         retried = true;
