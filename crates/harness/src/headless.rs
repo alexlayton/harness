@@ -518,6 +518,12 @@ async fn run_headless_resolved(
     let session_id = session.as_ref().map(|session| session.id().to_string());
     let install_sigint = external_cancel.is_none();
     let cancel = external_cancel.unwrap_or_default();
+    // Install the handler before assembly: MCP startup can take many
+    // seconds, and stdio servers run in their own process groups, so a
+    // default-disposition SIGINT there would exit without stopping them.
+    if install_sigint {
+        cancel_on_sigint(cancel.clone());
+    }
     let (input_tx, input_rx): (
         mpsc::UnboundedSender<InputMessage>,
         mpsc::UnboundedReceiver<InputMessage>,
@@ -544,7 +550,12 @@ async fn run_headless_resolved(
     if let (Some(store), Some(session)) = (&store, session) {
         builder = builder.with_session(store.clone(), session);
     }
-    let agent = builder.build().await?;
+    let agent = match builder.build().await {
+        Ok(agent) => agent,
+        // Interrupted during assembly: MCP servers were already shut down.
+        Err(_) if cancel.is_cancelled() => return Ok(ExitCode::from(130)),
+        Err(error) => return Err(error),
+    };
     let herdr_options = crate::herdr::ResumeOptions {
         provider: config.provider.to_string(),
         model: config.model.clone(),
@@ -567,10 +578,6 @@ async fn run_headless_resolved(
     }
     let send_result = input_tx.send(InputMessage::Message(prompt));
     drop(input_tx);
-
-    if install_sigint {
-        cancel_on_sigint(cancel.clone());
-    }
 
     let event_rx = if let Some((reporter, _)) = &herdr_reporter {
         observe_herdr_events(event_rx, reporter.clone(), herdr_options)
