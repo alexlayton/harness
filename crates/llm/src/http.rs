@@ -131,16 +131,17 @@ impl HttpClient {
     }
 }
 
-/// Map a non-success HTTP status to `LlmError::Http` with a bounded body.
+/// Map a non-success HTTP status to `LlmError::Http` with a bounded body,
+/// redacting `secret` (the active API key/token) before the error becomes
+/// visible.  Providers holding a secret must use this so echoed bodies can
+/// never leak credentials.
+///
 /// `LlmError::http` is the single constructor that enforces the truncation
 /// invariant, so every status-mapped error (OpenAI dialects and Anthropic
 /// alike) is bounded here.  The body is streamed as a bounded prefix — never
 /// an unbounded `response.text()` — and the final error stays within the
 /// byte cap as valid UTF-8.  A 429 `Retry-After` hint is preserved (bounded)
 /// so `retry.rs` can honor `max(backoff+jitter, retry_after)`.
-/// Map an error while redacting the active API key/token before the
-/// error becomes visible.  Providers holding a secret must use this so
-/// echoed bodies can never leak credentials.
 pub(crate) async fn check_status_with_secret(
     response: reqwest::Response,
     secret: &str,
@@ -229,12 +230,6 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::json;
 
-    /// Regression test for the "harness hangs mid-turn" bug: a provider whose
-    /// SSE connection stalls (response headers arrive, then nothing — the
-    /// socket stays open) used to hang `stream.next()` forever because the
-    /// reqwest client had no timeouts.  With `read_timeout` set, the stalled
-    /// body read must surface as an error so the agent loop can recover
-    /// instead of waiting for a user interrupt.
     #[tokio::test]
     async fn shared_http_errors_redact_keys_and_preserve_retry_headers() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -315,6 +310,12 @@ mod tests {
         assert!(rendered.is_char_boundary(rendered.len()));
     }
 
+    /// Regression test for the "harness hangs mid-turn" bug: a provider whose
+    /// SSE connection stalls (response headers arrive, then nothing — the
+    /// socket stays open) used to hang `stream.next()` forever because the
+    /// reqwest client had no timeouts.  With `read_timeout` set, the stalled
+    /// body read must surface as an error so the agent loop can recover
+    /// instead of waiting for a user interrupt.
     #[tokio::test]
     async fn stalled_response_body_times_out_instead_of_hanging() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

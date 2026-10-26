@@ -14,8 +14,8 @@ pub struct SseEvent {
 }
 
 /// Incremental SSE decoder.  It is deliberately small, but implements the
-/// parts of the SSE wire format used by all three providers: comments, event
-/// names, multiple data lines, CRLF, and dispatch on an empty line.
+/// parts of the SSE wire format that the provider dialects use: comments,
+/// event names, multiple data lines, CRLF, and dispatch on an empty line.
 ///
 /// Records with no `data` lines are never dispatched, even when they carry
 /// an `event` name: an event-only frame (`event: ping`) is a keep-alive,

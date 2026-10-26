@@ -12,14 +12,14 @@ pub use openai_responses::OpenAiResponsesClient;
 /// any real model answer; it only stops runaway or hostile streams.
 const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
 
-/// One SSE transport loop shared by every dialect adapter (CLEANUP-3).
+/// One SSE transport loop shared by every dialect adapter.
 ///
-/// The four `event_stream` adapters duplicated this exact shape and diverged
-/// only in parser type, the done predicate, and (for Codex) an opaque-state
-/// side channel. `Parser` captures the common contract so transport
-/// adaptation stays shared while payload parsing remains per-dialect: each
-/// adapter implements `parse_event`/`is_done`/`finish` on its own parser
-/// and delegates the loop here.
+/// The per-dialect stream adapters differ only in how they parse payloads
+/// and detect their protocol terminal (Codex additionally holds opaque
+/// replay items until the terminal). This trait captures that contract so
+/// transport adaptation stays shared while payload parsing remains
+/// per-dialect: each adapter implements `parse_event`/`is_done`/`finish` on
+/// its own parser and delegates the loop to [`drive_parser_stream`].
 pub(crate) trait StreamParser {
     fn parse_event(
         &mut self,
