@@ -115,10 +115,20 @@ pub fn build_request_body(req: &CompletionRequest) -> Value {
             }]),
         );
     }
-    body.insert(
-        "messages".into(),
-        Value::Array(convert_messages(&req.messages)),
-    );
+    let mut messages = convert_messages(&req.messages);
+    // Third breakpoint (of four allowed): the end of the conversation, so
+    // the next turn reads the whole prior history from cache instead of
+    // paying for it again. Thinking blocks cannot carry cache_control.
+    if let Some(block) = messages
+        .last_mut()
+        .and_then(|message| message["content"].as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+        && block["type"] != "thinking"
+        && block["type"] != "redacted_thinking"
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+    body.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
         // Breakpoint on the last tool covers every tool definition (they sit
         // before the system block in the effective prompt prefix).
@@ -589,6 +599,15 @@ mod tests {
 
         let tools = body.get("tools").unwrap().as_array().unwrap();
         assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+
+        // The end of the conversation is a breakpoint too.
+        let messages = body["messages"].as_array().unwrap();
+        let last_block = messages.last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
 
         // No tools: only the system breakpoint exists.
         let bare = CompletionRequest {
