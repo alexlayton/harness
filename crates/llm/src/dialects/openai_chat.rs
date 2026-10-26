@@ -70,7 +70,8 @@ impl OpenAiChatClient {
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         let response = self.http.get("/models").await?;
-        let body = response.text().await.map_err(LlmError::Network)?;
+        let body =
+            crate::http::read_bounded_text(response, crate::http::MAX_METADATA_BODY_BYTES).await?;
         parse_models_body(&body).map_err(|error| error.redacted(self.api_key()))
     }
 }

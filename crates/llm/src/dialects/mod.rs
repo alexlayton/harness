@@ -8,6 +8,10 @@ pub use anthropic::AnthropicMessagesClient;
 pub use openai_chat::OpenAiChatClient;
 pub use openai_responses::OpenAiResponsesClient;
 
+/// Largest total SSE payload accepted for one response (64 MiB). Far above
+/// any real model answer; it only stops runaway or hostile streams.
+const MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+
 /// One SSE transport loop shared by every dialect adapter (CLEANUP-3).
 ///
 /// The four `event_stream` adapters duplicated this exact shape and diverged
@@ -37,8 +41,19 @@ pub(crate) fn drive_parser_stream(
 ) -> crate::EventStream {
     use futures_util::StreamExt;
     let stream: crate::EventStream = Box::pin(async_stream::try_stream! {
+        let mut received = 0usize;
         while let Some(event) = sse.next().await {
             let event = event?;
+            // Each SSE event is bounded, but parsers retain state across
+            // events (tool arguments, pending calls, opaque items). Bound the
+            // whole response so many small events cannot grow it without
+            // limit.
+            received = received.saturating_add(event.data.len());
+            if received > MAX_STREAM_BYTES {
+                Err(crate::LlmError::Stream(format!(
+                    "response stream exceeds {MAX_STREAM_BYTES} bytes"
+                )))?;
+            }
             for item in parser.parse_event(&event)? {
                 yield item;
             }

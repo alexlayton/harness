@@ -174,10 +174,8 @@ impl Provider for OpenAiCodexProvider {
             .get("/usage")
             .await
             .map_err(|error| redact(error, &credential.access))?;
-        let body = response
-            .text()
+        let body = crate::http::read_bounded_text(response, crate::http::MAX_METADATA_BODY_BYTES)
             .await
-            .map_err(LlmError::Network)
             .map_err(|error| redact(error, &credential.access))?;
         parse_usage_body(&body).map(Some)
     }

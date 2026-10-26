@@ -163,6 +163,41 @@ pub(crate) async fn check_status_with_secret(
     ))
 }
 
+/// Largest successful metadata body (model catalogues, usage) read into
+/// memory. Large public catalogues are a few MiB; a hostile or broken
+/// endpoint must not make the client buffer an unbounded body.
+pub(crate) const MAX_METADATA_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read a successful response body as text, failing once it exceeds
+/// `limit` bytes (counted per received chunk, so a body without
+/// `Content-Length` is bounded too).
+pub(crate) async fn read_bounded_text(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<String, LlmError> {
+    use futures_util::StreamExt;
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(LlmError::Parse(format!(
+            "response body exceeds {limit} bytes"
+        )));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(LlmError::Network)?;
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(LlmError::Parse(format!(
+                "response body exceeds {limit} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| LlmError::Parse("response body is not UTF-8".into()))
+}
+
 /// Maximum bytes read from a non-success response body.  Multi-megabyte or
 /// chunked error bodies stay bounded in memory and output.
 const MAX_ERROR_BODY_BYTES: usize = 16 * 1024;
