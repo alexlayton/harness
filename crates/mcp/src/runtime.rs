@@ -10,8 +10,8 @@ use crate::{
 use futures_util::future::join_all;
 use rmcp::ClientLifecycleMode;
 use rmcp::model::{
-    ErrorData, JsonRpcMessage, PaginatedRequestParams, ProtocolVersion, RequestId,
-    Tool as RemoteTool,
+    ClientNotification, ErrorData, JsonRpcMessage, PaginatedRequestParams, ProtocolVersion,
+    RequestId, Tool as RemoteTool,
 };
 use rmcp::service::{
     RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage,
@@ -269,6 +269,22 @@ impl Transport<RoleClient> for BoundedStdioTransport {
                 .lock()
                 .expect("pending MCP requests lock")
                 .push_back(id.clone());
+        }
+        // A cancelled (or timed-out, then cancelled) request may never get a
+        // response. Forget its id now: otherwise every cancelled call leaked
+        // an entry, and a later frame failure could be reported against the
+        // stale id instead of the request that actually failed.
+        if let JsonRpcMessage::Notification(notification) = &item
+            && let ClientNotification::CancelledNotification(cancelled) = &notification.notification
+            && let Some(id) = &cancelled.params.request_id
+        {
+            let mut pending = self
+                .pending_requests
+                .lock()
+                .expect("pending MCP requests lock");
+            if let Some(index) = pending.iter().position(|pending_id| pending_id == id) {
+                pending.remove(index);
+            }
         }
         let pending_requests = self.pending_requests.clone();
         let send = self.transport.send(item);
@@ -1045,6 +1061,45 @@ mod tests {
     #[cfg(unix)]
     mod stdio_server_tests {
         use super::*;
+
+        /// A cancelled request may never get a response; its pending id
+        /// must not stay behind.
+        #[tokio::test]
+        async fn cancelled_requests_leave_no_pending_id() {
+            use rmcp::model::{
+                CancelledNotification, CancelledNotificationParam, ClientRequest, PingRequest,
+            };
+            let mut child = tokio::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            #[cfg(target_os = "linux")]
+            let scope = None;
+            #[cfg(not(target_os = "linux"))]
+            let scope = ();
+            let mut transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
+            transport
+                .send(JsonRpcMessage::request(
+                    ClientRequest::PingRequest(PingRequest::default()),
+                    RequestId::Number(7),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(transport.pending_requests.lock().unwrap().len(), 1);
+            transport
+                .send(JsonRpcMessage::notification(
+                    ClientNotification::CancelledNotification(CancelledNotification::new(
+                        CancelledNotificationParam::new(Some(RequestId::Number(7)), None),
+                    )),
+                ))
+                .await
+                .unwrap();
+            assert!(transport.pending_requests.lock().unwrap().is_empty());
+        }
         use std::collections::BTreeMap;
 
         // The fixture deliberately writes both one large printf and many small
