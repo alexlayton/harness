@@ -370,16 +370,48 @@ fn transform_reasoning(text: &str, options: &ExportOptions) -> String {
 
 /// Compaction summaries: reasoning lines omitted unless included, then the
 /// surviving summary is redacted.
+/// Apply the omit options to a generated summary. Deterministic summaries
+/// embed a serialized transcript whose records start with headers such as
+/// `[Assistant reasoning]:` and `[Tool result ok]:`, and a record can span
+/// several lines; each header starts a section that is kept or dropped as a
+/// whole until the next header. (The old filter looked for a `Reasoning:`
+/// prefix that the summarizer never writes, so nothing was omitted.)
+/// Free-form model summaries contain no headers and are kept.
 fn transform_summary(summary: &str, options: &ExportOptions) -> String {
-    let kept = if options.include_reasoning {
-        summary.to_owned()
-    } else {
-        summary
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("Reasoning:"))
-            .collect::<Vec<_>>()
-            .join("\n")
+    #[derive(Clone, Copy, PartialEq)]
+    enum Section {
+        Keep,
+        Reasoning,
+        ToolOutput,
+    }
+    let section_of = |line: &str| -> Option<Section> {
+        let line = line.trim_start();
+        if line.starts_with("[Assistant reasoning]:") || line.starts_with("Reasoning:") {
+            Some(Section::Reasoning)
+        } else if line.starts_with("[Tool result ") {
+            Some(Section::ToolOutput)
+        } else if line.starts_with('[') || line.starts_with('<') {
+            // Any other record header or structural marker.
+            Some(Section::Keep)
+        } else {
+            None
+        }
     };
+    let mut section = Section::Keep;
+    let kept = summary
+        .lines()
+        .filter(|line| {
+            if let Some(next) = section_of(line) {
+                section = next;
+            }
+            match section {
+                Section::Keep => true,
+                Section::Reasoning => options.include_reasoning,
+                Section::ToolOutput => options.include_tool_output,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     if options.redact_secrets {
         redact_text(&kept)
     } else {
@@ -654,6 +686,32 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn summary_omit_options_drop_reasoning_and_tool_output_sections() {
+        let summary = "This is generated context.\n[User]: hi\n[Assistant reasoning]: secret plan\nsecond plan line\n[Assistant]: answer\n[Tool result ok]: (c1) big output\nmore output\n[User]: next";
+        let options = ExportOptions {
+            include_reasoning: false,
+            include_tool_output: false,
+            ..ExportOptions::default()
+        };
+        let kept = transform_summary(summary, &options);
+        for dropped in [
+            "secret plan",
+            "second plan line",
+            "big output",
+            "more output",
+        ] {
+            assert!(!kept.contains(dropped), "{dropped} kept: {kept}");
+        }
+        for present in ["[User]: hi", "[Assistant]: answer", "[User]: next"] {
+            assert!(kept.contains(present), "{present} missing: {kept}");
+        }
+        assert_eq!(
+            transform_summary(summary, &ExportOptions::default()),
+            summary
+        );
     }
 
     #[test]
