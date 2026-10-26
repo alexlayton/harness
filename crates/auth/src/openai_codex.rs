@@ -709,8 +709,9 @@ async fn wait_for_callback_with_idle(
             _ = tokio::time::sleep(remaining) => return Err(AuthError::OpenAiCodex("browser login timed out; use `harness login openai-codex --device-code`".into())),
             value = accept => value.map_err(|_| AuthError::OpenAiCodex("callback listener failed".into()))?
         };
-        let request = match read_callback_head(&stream, cancel, idle_timeout).await {
+        let request = match read_callback_head(&stream, cancel, idle_timeout, deadline).await {
             Ok(request) => request,
+            Err(AuthError::Cancelled) => return Err(AuthError::Cancelled),
             // Idle/slow senders time out per-connection without blocking a
             // later valid callback; malformed heads are answered as failure.
             Err(_) => {
@@ -738,10 +739,16 @@ async fn wait_for_callback_with_idle(
 /// Read one HTTP request head incrementally through the `\r\n\r\n`
 /// terminator under [`CALLBACK_HEAD_LIMIT`], timing out idle connections so
 /// one hanging sender cannot block later callbacks.
+///
+/// Each read waits at most `idle_timeout`, and never past the overall login
+/// `deadline`: a sender trickling bytes cannot keep the flow alive beyond
+/// it. Readiness can be spurious, so `WouldBlock` waits again instead of
+/// rejecting a valid callback.
 async fn read_callback_head(
     stream: &tokio::net::TcpStream,
     cancel: &CancellationToken,
     idle_timeout: Duration,
+    deadline: std::time::Instant,
 ) -> Result<String> {
     let mut head: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 512];
@@ -752,6 +759,7 @@ async fn read_callback_head(
         if head.windows(4).any(|window| window == b"\r\n\r\n") {
             break;
         }
+        let wait = idle_timeout.min(deadline.saturating_duration_since(std::time::Instant::now()));
         let read = async {
             stream
                 .readable()
@@ -760,8 +768,12 @@ async fn read_callback_head(
         };
         let size = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            _ = tokio::time::sleep(idle_timeout) => return Err(AuthError::OpenAiCodex("callback read timed out".into())),
-            value = read => value.map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))?,
+            _ = tokio::time::sleep(wait) => return Err(AuthError::OpenAiCodex("callback read timed out".into())),
+            value = read => match value {
+                Ok(size) => size,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => return Err(AuthError::OpenAiCodex("callback read failed".into())),
+            },
         };
         if size == 0 {
             break;
