@@ -23,17 +23,23 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Provider aliases, shared by `ProviderArg` (CLI, config file, `/model`) and
+// `LoginProvider`, so every entry point accepts the same names.
+const COPILOT_ALIASES: [&str; 2] = ["copilot", "githubcopilot"];
+const CODEX_ALIASES: [&str; 1] = ["codex"];
+const CLAUDE_ALIASES: [&str; 3] = ["anthropic-subscription", "claude-sub", "claude"];
+
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ProviderArg {
     #[value(name = "opencode-go")]
     OpencodeGo,
     #[value(name = "openrouter")]
     Openrouter,
-    #[value(name = "github-copilot", alias = "copilot")]
+    #[value(name = "github-copilot", aliases = COPILOT_ALIASES)]
     GithubCopilot,
-    #[value(name = "openai-codex", alias = "codex")]
+    #[value(name = "openai-codex", aliases = CODEX_ALIASES)]
     OpenAiCodex,
-    #[value(name = "anthropic-claude", aliases = ["anthropic-subscription", "claude-sub", "claude"])]
+    #[value(name = "anthropic-claude", aliases = CLAUDE_ALIASES)]
     AnthropicSubscription,
 }
 
@@ -48,21 +54,11 @@ impl ProviderArg {
         Self::AnthropicSubscription,
     ];
 
+    /// Parse a provider name or alias exactly as the command line does.
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "opencode-go" => Some(Self::OpencodeGo),
-            "openrouter" => Some(Self::Openrouter),
-            "github-copilot" | "githubcopilot" | "copilot" => Some(Self::GithubCopilot),
-            "anthropic-claude" | "anthropic-subscription" | "claude-sub" | "claude" => {
-                Some(Self::AnthropicSubscription)
-            }
-            "openai-codex" | "codex" => Some(Self::OpenAiCodex),
-            _ => None,
-        }
+        <Self as ValueEnum>::from_str(name, false).ok()
     }
 
-    /// The first name is the preferred one. The additional OpenCode name is
-    /// supported for compatibility with existing OpenCode installations.
     /// The first name is the preferred one. The additional OpenCode name is
     /// supported for compatibility with existing OpenCode installations.
     pub fn env_vars(&self) -> &'static [&'static str] {
@@ -510,8 +506,10 @@ impl FileConfig {
 /// The advisory lock covers the complete write, including the rename. The
 /// settings-specific helpers below use the same lock while editing the raw
 /// document, so concurrent read-modify-write operations cannot lose a field.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
+/// Only tests write a whole `FileConfig`; production edits go through the
+/// field-level helpers below, which edit the raw document.
+#[cfg(test)]
+fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
     let _lock = lock_config(path)?;
     config.validate()?;
     let contents = toml::to_string_pretty(config).context("serialize config")?;
@@ -1088,11 +1086,11 @@ pub struct LoginArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum LoginProvider {
-    #[value(name = "github-copilot", alias = "copilot")]
+    #[value(name = "github-copilot", aliases = COPILOT_ALIASES)]
     GithubCopilot,
-    #[value(name = "openai-codex", alias = "codex")]
+    #[value(name = "openai-codex", aliases = CODEX_ALIASES)]
     OpenAiCodex,
-    #[value(name = "anthropic-claude", aliases = ["anthropic-subscription", "claude-sub", "claude"])]
+    #[value(name = "anthropic-claude", aliases = CLAUDE_ALIASES)]
     AnthropicSubscription,
 }
 

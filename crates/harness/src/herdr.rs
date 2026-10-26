@@ -215,6 +215,33 @@ impl Reporter {
             }
         });
     }
+
+    /// Map one agent event to a Herdr state or resume-command update. The
+    /// TUI and headless frontends share this so their reports cannot drift.
+    pub(crate) fn observe(&self, event: &agent::AgentEvent, options: &mut ResumeOptions) {
+        use agent::AgentEvent;
+        match event {
+            AgentEvent::ModelChanged { provider, model } => {
+                options.provider = provider.clone();
+                options.model = model.clone();
+                self.resume_options(options);
+            }
+            AgentEvent::ReasoningChanged { level } => {
+                options.reasoning = level.clone();
+                self.resume_options(options);
+            }
+            AgentEvent::TextDelta(_)
+            | AgentEvent::ReasoningDelta(_)
+            | AgentEvent::ToolCallStarted { .. }
+            | AgentEvent::Retrying { .. }
+            | AgentEvent::AskStarted => self.report(State::Working, None),
+            AgentEvent::TurnFinished | AgentEvent::OperationFinished => {
+                self.report(State::Idle, None)
+            }
+            AgentEvent::SessionChanged { id, .. } => self.with_session(id.clone(), options),
+            _ => {}
+        }
+    }
 }
 
 fn sequence() -> String {

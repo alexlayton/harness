@@ -85,29 +85,7 @@ fn observe_herdr_events(
     tokio::spawn(async move {
         let mut options = options;
         while let Some(event) = input.recv().await {
-            match &event {
-                AgentEvent::ModelChanged { provider, model } => {
-                    options.provider = provider.clone();
-                    options.model = model.clone();
-                    reporter.resume_options(&options);
-                }
-                AgentEvent::ReasoningChanged { level } => {
-                    options.reasoning = level.clone();
-                    reporter.resume_options(&options);
-                }
-                AgentEvent::TextDelta(_)
-                | AgentEvent::ReasoningDelta(_)
-                | AgentEvent::ToolCallStarted { .. }
-                | AgentEvent::Retrying { .. }
-                | AgentEvent::AskStarted => reporter.report(crate::herdr::State::Working, None),
-                AgentEvent::TurnFinished | AgentEvent::OperationFinished => {
-                    reporter.report(crate::herdr::State::Idle, None)
-                }
-                AgentEvent::SessionChanged { id, .. } => {
-                    reporter.with_session(id.clone(), &options)
-                }
-                _ => {}
-            }
+            reporter.observe(&event, &mut options);
             if tx.send(event).is_err() {
                 break;
             }
@@ -125,18 +103,8 @@ async fn drive_headless_events_with_cancel(
 ) -> ExitCode {
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
     let mut stderr = std::io::stderr();
-    // A terminal wants per-delta flushes so the answer streams visibly; pipes
-    // (CI, scripting) are better served by flushing on line boundaries.
-    let interactive_stdout = std::io::stdout().is_terminal();
-    let result = drive_headless_events_into(
-        event_rx,
-        verbose,
-        &mut stdout,
-        &mut stderr,
-        interactive_stdout,
-        cancellation,
-    )
-    .await;
+    let result =
+        drive_headless_events_into(event_rx, verbose, &mut stdout, &mut stderr, cancellation).await;
     if stdout.flush().is_err() {
         return ExitCode::from(1);
     }
@@ -150,12 +118,12 @@ async fn drive_headless_events_into(
     verbose: bool,
     stdout: &mut (impl Write + Unpin),
     stderr: &mut (impl Write + Unpin),
-    interactive_stdout: bool,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ExitCode> {
     // Text is held until the model round is known to be text-only. Prose
     // emitted before a tool call is an intermediate thought, not the answer a
-    // shell pipeline should consume.
+    // shell pipeline should consume. Stdout therefore never streams: the
+    // answer is written and flushed once, when the turn finishes.
     let mut pending_text = String::new();
     let mut active_tools = 0usize;
     let mut reasoning_open = false;
@@ -170,9 +138,6 @@ async fn drive_headless_events_into(
                 // metadata, retries, and tool lifecycle events do not clear
                 // the failure state.
                 error_pending = false;
-                if interactive_stdout && active_tools == 0 {
-                    stdout.flush()?;
-                }
             }
             AgentEvent::ReasoningDelta(delta) => {
                 if verbose {
@@ -682,11 +647,9 @@ mod tests {
             drop(tx);
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            // Piped mode: flushes only on newlines, like CI consumers see.
-            let code =
-                drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, false, None)
-                    .await
-                    .unwrap();
+            let code = drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, None)
+                .await
+                .unwrap();
             (stdout, stderr, code)
         })
     }
@@ -705,8 +668,7 @@ mod tests {
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             let code =
-                drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, false, None)
-                    .await?;
+                drive_headless_events_into(rx, verbose, &mut stdout, &mut stderr, None).await?;
             Ok((stdout, stderr, code))
         })
     }
@@ -737,16 +699,10 @@ mod tests {
             cancel.cancel();
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
-            let code = drive_headless_events_into(
-                rx,
-                false,
-                &mut stdout,
-                &mut stderr,
-                false,
-                Some(&cancel),
-            )
-            .await
-            .unwrap();
+            let code =
+                drive_headless_events_into(rx, false, &mut stdout, &mut stderr, Some(&cancel))
+                    .await
+                    .unwrap();
             (stdout, code)
         });
         assert!(stdout.is_empty());
@@ -979,7 +935,7 @@ mod tests {
             drop(tx);
             let mut stdout = FailingWriter;
             let mut stderr = Vec::new();
-            drive_headless_events_into(rx, false, &mut stdout, &mut stderr, false, None).await
+            drive_headless_events_into(rx, false, &mut stdout, &mut stderr, None).await
         });
         assert!(error.is_err());
     }

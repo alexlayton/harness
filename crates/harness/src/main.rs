@@ -533,21 +533,7 @@ async fn run_application(
                         }
                     });
                     if let Some(reporter) = &event_herdr_reporter {
-                        match &event {
-                            AgentEvent::ModelChanged { provider, model } => {
-                                herdr_options.provider = provider.clone();
-                                herdr_options.model = model.clone();
-                                reporter.resume_options(&herdr_options);
-                            }
-                            AgentEvent::ReasoningChanged { level } => {
-                                herdr_options.reasoning = level.clone();
-                                reporter.resume_options(&herdr_options);
-                            }
-                            AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } | AgentEvent::AskStarted => reporter.report(herdr::State::Working, None),
-                            AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(herdr::State::Idle, None),
-                            AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), &herdr_options),
-                            _ => {}
-                        }
+                        reporter.observe(&event, &mut herdr_options);
                     }
                     pending.push(tui_adapter::into_ui_event(event));
                     if !pending.flush_ready(&ui_event_tx) {
