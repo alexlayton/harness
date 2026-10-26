@@ -686,12 +686,15 @@ impl SubagentRunnerImpl {
 
             if tool_calls.is_empty() {
                 if text.trim().is_empty() {
-                    // Treat an empty reply like any other stall: nudge once
-                    // by appending a user note and continuing within budget.
-                    history.push(Message::user(
+                    // Treat an empty reply like any other stall: nudge and
+                    // continue within budget. An empty reply adds no
+                    // assistant message, so fold the note into a trailing
+                    // user message instead of creating two adjacent ones.
+                    push_request_note(
+                        history,
                         "[system note: your previous response produced no output; continue \
                          and complete the task.]",
-                    ));
+                    );
                     continue;
                 }
                 // Text-only reply: this *is* the report.
@@ -1086,6 +1089,34 @@ mod tests {
         assert_eq!(child_context_budget(1_000_000), unknown);
         let small = child_context_budget(32_000);
         assert!(small > 0 && small < 24_000, "{small}");
+    }
+
+    #[tokio::test]
+    async fn empty_reply_nudge_keeps_roles_alternating() {
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![ScriptProvider::done("stop")],
+            vec![
+                Ok(StreamEvent::TextDelta("report".into())),
+                ScriptProvider::done("stop"),
+            ],
+        ]));
+        let runner = runner_with(provider.clone());
+        runner
+            .run(
+                "audit",
+                "go",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (_, _, messages) = &provider.seen.lock().unwrap()[1];
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| !(pair[0].role == Role::User && pair[1].role == Role::User)),
+            "{messages:?}"
+        );
     }
 
     #[tokio::test]
