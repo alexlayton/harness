@@ -48,6 +48,11 @@ pub(crate) use turn::TurnControl;
 /// looping forever.
 const MAX_TURN_RECOVERIES: usize = 3;
 
+/// Maximum tool rounds (model response with tool calls, then their
+/// results) in one parent turn. A model that never stops calling tools
+/// would otherwise run without bound in modes that have no interrupt key.
+const MAX_TOOL_ROUNDS_PER_TURN: usize = 200;
+
 /// Maximum emergency compactions performed per turn in response to a
 /// context-overflow rejection. Each round is an extra summarizer call plus a
 /// retried request, so it is bounded separately from `MAX_TURN_RECOVERIES`.
@@ -3100,6 +3105,53 @@ mod tests {
     /// A transient mid-stream failure (connection drop / decode error) must
     /// not dead-end the turn either: the agent re-streams once and the retried
     /// answer is delivered.
+    #[test]
+    fn a_turn_stops_after_the_tool_round_limit() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // A model that calls a tool in every response, forever.
+            let scripts = (0..MAX_TOOL_ROUNDS_PER_TURN + 5)
+                .map(|round| {
+                    script(vec![
+                        StreamEvent::ToolCallComplete(llm::ToolCall {
+                            id: format!("call-{round}"),
+                            name: "missing".into(),
+                            arguments: json!({}),
+                        }),
+                        StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        },
+                    ])
+                })
+                .collect();
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts,
+                error_kind: MockErrorKind::Stream,
+            });
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("loop".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(
+                provider.clone(),
+                ToolRegistry::empty(),
+                "demo",
+                CancellationToken::new(),
+            )
+            .run(input_rx, event_tx)
+            .await;
+            assert_eq!(provider.calls.load(Ordering::SeqCst), MAX_TOOL_ROUNDS_PER_TURN);
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.iter().any(
+                |event| matches!(event, AgentEvent::Error(message) if message.contains("tool rounds"))
+            ));
+        });
+    }
+
     #[test]
     fn retryable_stream_error_retries_turn_instead_of_dead_ending() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
