@@ -1125,6 +1125,18 @@ pub struct Config {
     pub anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
 }
 
+/// The saved model, when it applies to the effective `provider`: the file
+/// names no provider, or the same one.
+fn file_model_for(
+    file: &FileConfig,
+    file_provider: Option<ProviderArg>,
+    provider: ProviderArg,
+) -> Option<String> {
+    file.model
+        .clone()
+        .filter(|_| file_provider.is_none_or(|file_provider| file_provider == provider))
+}
+
 impl Config {
     pub fn resolve(cli: &Cli) -> Result<Self> {
         Self::resolve_with_mcp(cli, None)
@@ -1163,7 +1175,12 @@ impl Config {
         // is read from the local credential store, so this stays offline.
         if config.provider == ProviderArg::GithubCopilot
             && cli.model.is_none()
-            && file.model.is_none()
+            && file_model_for(
+                &file,
+                file.provider.as_deref().and_then(ProviderArg::from_name),
+                config.provider,
+            )
+            .is_none()
             && let Some(model) = entitled_copilot_default(config.copilot_auth.as_ref())
         {
             config.model = model;
@@ -1238,10 +1255,13 @@ impl Config {
                 provider.env_vars().join(" or ")
             ));
         }
+        // The saved model belongs to the saved provider. A `--provider`
+        // override to a different provider uses that provider's default
+        // instead of a model id it does not serve.
         let model = cli
             .model
             .clone()
-            .or_else(|| file.model.clone())
+            .or_else(|| file_model_for(file, file_provider, provider))
             .unwrap_or_else(|| provider.default_model().to_owned());
         let secret_entries = file
             .secrets
@@ -1751,6 +1771,21 @@ mod tests {
         assert_eq!(config.provider, ProviderArg::OpencodeGo);
         assert_eq!(config.model, "cli-model");
         assert_eq!(config.reasoning, ReasoningPolicy::Off);
+
+        // A provider override without --model must not reuse the saved
+        // model of another provider.
+        let cli = Cli {
+            provider: Some(ProviderArg::OpencodeGo),
+            ..Cli::default()
+        };
+        let config = Config::resolve_from_file(
+            &cli,
+            &file,
+            PathBuf::from("/tmp/harness-config.toml"),
+            |_| Some("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(config.model, ProviderArg::OpencodeGo.default_model());
 
         let invalid = FileConfig {
             provider: Some("typo".into()),
