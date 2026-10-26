@@ -128,10 +128,7 @@ impl ReadTool {
             }
             // Fall back to the legacy validator for its precise
             // workspace-relative error messages (tests assert on them).
-            if resolve_workspace_path(path, Some(root), false)
-                .await
-                .is_ok()
-            {
+            if resolve_workspace_path(path, root, false).await.is_ok() {
                 return split_relative(path)
                     .map(ReadTarget::Workspace)
                     .map_err(|error| format!("cannot read {path}: {error}"));

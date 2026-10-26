@@ -335,7 +335,7 @@ impl FileSearchIndex {
     }
 
     async fn validate_scope(&self, scope: &str) -> Result<String, String> {
-        let candidate = resolve_workspace_path(scope, Some(&self.root), false).await?;
+        let candidate = resolve_workspace_path(scope, &self.root, false).await?;
         let canonical = fs::canonicalize(&candidate)
             .await
             .map_err(|error| format!("cannot use search path {scope}: {error}"))?;

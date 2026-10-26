@@ -417,14 +417,11 @@ pub(crate) fn normalize_workspace_root(root: impl Into<PathBuf>) -> PathBuf {
     std::fs::canonicalize(&root).unwrap_or(root)
 }
 
-/// Resolve a tool path.  Workspace-aware tools use this helper to keep paths
-/// inside the same root as `bash` and `find`.  The `None` mode is retained for
-/// the small compatibility constructors used by library callers and tests;
-/// those constructors preserve the historical process-cwd/absolute-path
-/// behavior.
+/// Resolve a tool path inside the workspace root, the same root that `bash`
+/// and `find` use, so every tool applies one containment rule.
 pub(crate) async fn resolve_workspace_path(
     value: &str,
-    workspace_root: Option<&Path>,
+    root: &Path,
     strip_at_prefix: bool,
 ) -> Result<PathBuf, String> {
     let value = if strip_at_prefix {
@@ -437,16 +434,6 @@ pub(crate) async fn resolve_workspace_path(
     }
 
     let path = PathBuf::from(value);
-    let Some(root) = workspace_root else {
-        return Ok(if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map_err(|error| format!("cannot determine working directory: {error}"))?
-                .join(path)
-        });
-    };
-
     let root = lexical_normalize(root);
     // Canonicalize the workspace root once up front so every containment
     // check below compares like-for-like.  Production callers pass an already
@@ -746,20 +733,20 @@ mod tests {
 
         // Only `a/` exists; the deep tail resolves lexically after a single
         // canonicalize of the existing ancestor.
-        let resolved = resolve_workspace_path("a/b/c/d.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("a/b/c/d.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("a/b/c/d.txt"));
 
         // An existing file resolves through the fast path.
         std::fs::write(root.join("keep.txt"), "x").unwrap();
-        let resolved = resolve_workspace_path("keep.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("keep.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("keep.txt"));
 
         // A path that lexically escapes the root is rejected up front.
-        let error = resolve_workspace_path("../outside/file.txt", Some(&root), false)
+        let error = resolve_workspace_path("../outside/file.txt", &root, false)
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
@@ -775,7 +762,7 @@ mod tests {
 
         // The symlink is the deepest existing ancestor; canonicalizing it
         // once must surface the escape even though the tail does not exist.
-        let error = resolve_workspace_path("link/sub/file.txt", Some(&root), false)
+        let error = resolve_workspace_path("link/sub/file.txt", &root, false)
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
@@ -789,7 +776,7 @@ mod tests {
 
         // Only `src/` exists; the file does not.  The parent fast path
         // resolves it with a single canonicalize of `src/`.
-        let resolved = resolve_workspace_path("src/main.rs", Some(&root), false)
+        let resolved = resolve_workspace_path("src/main.rs", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("src/main.rs"));
@@ -805,7 +792,7 @@ mod tests {
 
         // The parent is a symlink inside the workspace; the parent fast path
         // canonicalizes it and must accept the candidate.
-        let resolved = resolve_workspace_path("link/new.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("link/new.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("link/new.txt"));
@@ -821,7 +808,7 @@ mod tests {
 
         // The parent fast path canonicalizes the symlink and must surface
         // the escape before the tail is considered.
-        let error = resolve_workspace_path("escape/new.txt", Some(&root), false)
+        let error = resolve_workspace_path("escape/new.txt", &root, false)
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
@@ -844,7 +831,7 @@ mod tests {
         std::fs::write(root.join("sub/file.txt"), "inside").unwrap();
 
         // 1. Resolve while the tree is intact (production step).
-        let resolved = resolve_workspace_path("sub/file.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("sub/file.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("sub/file.txt"));

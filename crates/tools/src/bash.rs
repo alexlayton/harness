@@ -150,7 +150,7 @@ async fn resolve_workspace_dir(root: &Path, dir: &str) -> Result<PathBuf, String
         }
         return Ok(path);
     }
-    let candidate = super::resolve_workspace_path(dir, Some(root), false).await?;
+    let candidate = super::resolve_workspace_path(dir, root, false).await?;
     let metadata = tokio::fs::metadata(&candidate)
         .await
         .map_err(|error| format!("dir {dir}: {error}"))?;

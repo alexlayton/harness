@@ -10,17 +10,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 type FileLock = Arc<tokio::sync::Mutex<()>>;
 
 static FILE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, FileLock>>> = OnceLock::new();
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Serialize mutations targeting the same file.  Different files remain able
 /// to proceed concurrently.  `None` means cancellation happened while waiting
@@ -79,87 +76,13 @@ fn sweep_unreferenced_file_locks() {
     locks.retain(|_, lock| Arc::strong_count(lock) > 1);
 }
 
-/// Write a file through a same-directory temporary file and atomic rename.
-/// Keeping the temporary file beside the destination ensures the rename does
-/// not cross filesystems. Existing permissions are copied to the temporary
-/// file before it replaces the destination.
-///
-/// This helper is pathname-based and therefore is not a workspace containment
-/// primitive: callers handling workspace paths must use `atomic_write_at`
-/// on Unix or fail closed on platforms without an equivalent directory-handle
-/// API. It remains available for the Unix compatibility path and for callers
-/// that deliberately provide their own path-safety boundary.
-pub async fn atomic_write(
-    path: &Path,
-    contents: &[u8],
-    cancel: &CancellationToken,
-) -> io::Result<()> {
-    check_cancelled(cancel)?;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let permissions = fs::metadata(path)
-        .await
-        .ok()
-        .map(|metadata| metadata.permissions());
-    let (temporary_path, mut temporary_file) = create_temporary_file(parent).await?;
-    // Removes the temporary file if this future is dropped (for example an
-    // aborted tool call) before the rename; `result.is_err()` cleanup below
-    // does not run in that case.
-    let mut guard = TemporaryPathGuard {
-        path: Some(temporary_path.clone()),
-    };
-
-    let result = async {
-        for chunk in contents.chunks(64 * 1024) {
-            check_cancelled(cancel)?;
-            temporary_file.write_all(chunk).await?;
-        }
-        temporary_file.sync_all().await?;
-        drop(temporary_file);
-
-        check_cancelled(cancel)?;
-        if let Some(permissions) = permissions {
-            fs::set_permissions(&temporary_path, permissions).await?;
-        }
-        check_cancelled(cancel)?;
-        fs::rename(&temporary_path, path).await?;
-        guard.path = None;
-        // Persist the directory entry as well as the file contents so a
-        // successful atomic write survives a crash after rename. The write
-        // is already committed: a failed directory sync is logged, never
-        // reported as a failed write the caller might retry.
-        #[cfg(unix)]
-        if let Err(error) = async { fs::File::open(parent).await?.sync_all().await }.await {
-            tracing::warn!(%error, "directory sync failed after a committed write");
-        }
-        Ok(())
-    }
-    .await;
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary_path).await;
-    }
-    result
-}
-
-/// Removes a path-based temporary file on drop unless it was committed.
-struct TemporaryPathGuard {
-    path: Option<PathBuf>,
-}
-
-impl Drop for TemporaryPathGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
 /// Write `contents` to `name` inside the validated parent directory `parent_fd`
-/// (Unix): anonymous temp file via `O_TMPFILE`, then `linkat` to the final
-/// name (or `renameat` when replacing).  Both the temp creation and the
-/// commit are relative to the validated handle, so a swapped ancestor
-/// cannot redirect the write.  Returns `Ok(true)` when an existing file was
+/// (Unix): a uniquely named `.harness-edit-*` temp file created with
+/// `openat(O_CREAT | O_EXCL | O_NOFOLLOW)`, then `renameat` onto the final
+/// name.  Both the temp creation and the commit are relative to the
+/// validated handle, so a swapped ancestor cannot redirect the write.  This
+/// is the only commit path: there is no pathname-based fallback, because it
+/// could not keep the path that was validated.  Returns `Ok(true)` when an existing file was
 /// replaced, `Ok(false)` when created.
 #[cfg(unix)]
 pub async fn atomic_write_at(
@@ -299,8 +222,9 @@ async fn write_all_chunks(
 ) -> io::Result<()> {
     use std::os::fd::AsFd;
     use tokio::io::AsyncWriteExt;
-    // `rustix` fds are blocking; wrap the owned fd in a tokio File without
-    // duplicating it by transferring ownership through `File::from`.
+    // Write through a tokio File built from a duplicate of `tmp`, so dropping
+    // `file` closes only the duplicate and the caller keeps `tmp`. The caller
+    // fsyncs `tmp`, which covers writes made through the duplicate.
     let std_file = fd_to_std_file(tmp.as_fd())?;
     let mut file = tokio::fs::File::from_std(std_file);
     for chunk in contents.chunks(64 * 1024) {
@@ -309,12 +233,8 @@ async fn write_all_chunks(
         }
         file.write_all(chunk).await?;
     }
-    file.sync_all().await?;
-    // Prevent `file`'s Drop from closing the fd: the caller still owns `tmp`.
-    // Re-materialize ownership by forgetting the std wrapper's fd… instead,
-    // simply leak-guard: `into_std` below duplicates. Easiest correct path:
-    // detach by `mem::forget` after converting back — but tokio File owns
-    // the fd. To keep single ownership sound, duplicate first.
+    // Hand any buffered bytes to the kernel before the duplicate closes.
+    file.flush().await?;
     Ok(())
 }
 
@@ -339,29 +259,6 @@ async fn lock_key(path: &Path) -> PathBuf {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
     }
-}
-
-async fn create_temporary_file(parent: &Path) -> io::Result<(PathBuf, fs::File)> {
-    for _ in 0..100 {
-        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".harness-edit-{}-{counter}.tmp", std::process::id());
-        let path = parent.join(name);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a unique temporary file",
-    ))
 }
 
 fn check_cancelled(cancel: &CancellationToken) -> io::Result<()> {
