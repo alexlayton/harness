@@ -192,7 +192,7 @@ pub(super) fn function_call_item(call: &ToolCall) -> Value {
         "type": "function_call",
         "call_id": call.id,
         "name": call.name,
-        "arguments": stringify_arguments(&call.arguments),
+        "arguments": super::stringify_arguments(&call.arguments),
     })
 }
 
@@ -215,10 +215,6 @@ pub fn convert_tools(tools: &[ToolDefinition]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn stringify_arguments(arguments: &Value) -> String {
-    serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into())
 }
 
 #[derive(Debug, Default)]
@@ -386,25 +382,19 @@ impl ResponsesParser {
     }
 }
 
+/// Responses events put the error at the top level (`error`) or, for
+/// `response.failed`, inside the response object; check both in that order.
 fn error_message(value: &Value, fallback: &str) -> String {
-    value
-        .get("error")
-        .and_then(value_message)
-        .or_else(|| {
+    super::error_message(
+        &[
+            value.get("error"),
             value
                 .get("response")
-                .and_then(|response| response.get("error"))
-                .and_then(value_message)
-        })
-        .or_else(|| value.get("message").and_then(Value::as_str))
-        .unwrap_or(fallback)
-        .to_owned()
-}
-
-fn value_message(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.get("message").and_then(Value::as_str))
+                .and_then(|response| response.get("error")),
+        ],
+        value,
+        fallback,
+    )
 }
 
 fn parse_usage(value: &Value) -> Result<Usage, LlmError> {

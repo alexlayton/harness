@@ -466,7 +466,7 @@ impl AnthropicParser {
             }
             "error" => Err(super::in_band_error(
                 &[value.get("error")],
-                error_message(&value, "Anthropic error"),
+                super::error_message(&[value.get("error")], &value, "Anthropic error"),
             )),
             "ping" => Ok(Vec::new()),
             _ => {
@@ -535,21 +535,6 @@ impl AnthropicParser {
             "Anthropic stream ended without a terminal event (expected message_stop)",
         ))
     }
-}
-
-fn error_message(value: &Value, fallback: &str) -> String {
-    value
-        .get("error")
-        .and_then(value_message)
-        .or_else(|| value.get("message").and_then(Value::as_str))
-        .unwrap_or(fallback)
-        .to_owned()
-}
-
-fn value_message(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.get("message").and_then(Value::as_str))
 }
 
 impl super::StreamParser for AnthropicParser {

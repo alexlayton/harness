@@ -168,7 +168,7 @@ pub fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             "type": "function",
                             "function": {
                                 "name": call.name,
-                                "arguments": stringify_arguments(&call.arguments),
+                                "arguments": super::stringify_arguments(&call.arguments),
                             }
                         })),
                         Content::Reasoning(_)
@@ -225,10 +225,6 @@ fn text_content(content: &[Content]) -> String {
             _ => None,
         })
         .collect()
-}
-
-fn stringify_arguments(arguments: &Value) -> String {
-    serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into())
 }
 
 pub fn parse_models_body(body: &str) -> Result<Vec<ModelInfo>, LlmError> {
@@ -310,11 +306,7 @@ impl ChatStreamParser {
             // is a terminal failure, not a silent empty chunk. Overload and
             // server faults are transient (the agent re-streams); other
             // errors are permanent and are reported.
-            let detail = error_value
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error_value.as_str())
-                .unwrap_or("provider error");
+            let detail = super::value_message(error_value).unwrap_or("provider error");
             return Err(super::in_band_error(
                 &[Some(error_value)],
                 format!("chat error: {detail}"),

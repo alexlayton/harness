@@ -70,6 +70,42 @@ pub(crate) fn drive_parser_stream(
     crate::provider::redact_stream(stream, secret)
 }
 
+/// Serialize tool-call arguments into the JSON string the OpenAI-style wire
+/// formats expect. Serializing a `Value` cannot realistically fail; the `{}`
+/// fallback only keeps the request well-formed so one odd value cannot abort
+/// the whole turn.
+pub(crate) fn stringify_arguments(arguments: &serde_json::Value) -> String {
+    serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into())
+}
+
+/// Human-readable message carried by an error value that is either a bare
+/// string or an object with a string `message` field.
+pub(crate) fn value_message(value: &serde_json::Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+}
+
+/// Best human-readable message for an in-band error event.
+///
+/// `errors` are the candidate error values in priority order (dialects nest
+/// the error object at different depths, as for [`in_band_error`]). When
+/// none of them carries a message, the event's own top-level `message` and
+/// then `fallback` are used, so the user always sees some reason.
+pub(crate) fn error_message(
+    errors: &[Option<&serde_json::Value>],
+    event: &serde_json::Value,
+    fallback: &str,
+) -> String {
+    errors
+        .iter()
+        .flatten()
+        .find_map(|error| value_message(error))
+        .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
+        .unwrap_or(fallback)
+        .to_owned()
+}
+
 /// Build the error for a clean transport EOF that arrived before the
 /// dialect's protocol terminal event.  The answer is incomplete, but a new
 /// request can succeed, so it is a transient [`crate::LlmError::StreamInterrupted`].
