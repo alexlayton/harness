@@ -732,8 +732,14 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata =
-            fs::metadata(path).map_err(|source| io_error("stat auth directory", path, source))?;
+        // Do not change the mode of whatever a symlink points at. A
+        // symlinked config directory is a common dotfiles setup, so it is
+        // left as the user configured it rather than treated as an error.
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| io_error("stat auth directory", path, source))?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions)
@@ -807,8 +813,16 @@ fn ensure_private_file(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata =
-            fs::metadata(path).map_err(|source| io_error("stat auth file", path, source))?;
+        // Do not change the mode of whatever a symlink points at.
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| io_error("stat auth file", path, source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(io_error(
+                "secure auth file",
+                path,
+                std::io::Error::other("refusing to change permissions through a symlink"),
+            ));
+        }
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o600);
         fs::set_permissions(path, permissions)
@@ -887,7 +901,8 @@ impl AuthStore {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
+                // Never follow a planted symlink: the handle is chmod-ed.
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
             }
             options.open(&path)
         }
@@ -924,12 +939,14 @@ impl AuthFileLock {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
+                // Never follow a planted symlink: the handle is chmod-ed.
                 OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
                     .open(&path)
             }
             #[cfg(not(unix))]
@@ -1023,6 +1040,24 @@ mod tests {
         fs::write(&path, r#""token-sentinel-value""#).unwrap();
         let error = AuthStore::new(&path).copilot().unwrap_err().to_string();
         assert!(!error.contains("token-sentinel-value"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_files_are_never_opened_through_a_symlink() {
+        let directory = tempdir().unwrap();
+        let auth = directory.path().join("auth.json");
+        let victim = directory.path().join("victim");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&victim, "data").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&victim, AuthFileLock::lock_path(&auth)).unwrap();
+        assert!(AuthFileLock::acquire(&auth).is_err());
+        // The symlink target's mode was not changed through the link.
+        assert_ne!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
