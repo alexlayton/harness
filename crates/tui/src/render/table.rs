@@ -4,7 +4,7 @@
 
 use ratatui_core::style::Style;
 use ratatui_core::text::{Line, Span, Text};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use super::wrap_text;
 
@@ -246,16 +246,14 @@ fn alignment(group: &[Line<'_>], column: usize) -> Alignment {
     Alignment::Left
 }
 
-/// Cell width measured exactly as `wrap_text` measures it (the sum of
-/// per-character widths). Column sizing and padding must use the same
-/// function as wrapping: `UnicodeWidthStr` counts sequences such as `❤️`
-/// (VS16) as wider than their characters, so mixing the two produced cells
-/// wider than their column.
+/// Cell width measured exactly as `wrap_text` measures it (grapheme
+/// clusters, see `render::grapheme_width`). Column sizing and padding must
+/// use the same function as wrapping, or cells come out wider than their
+/// column.
 fn spans_wrap_width(spans: &[Span<'_>]) -> usize {
     spans
         .iter()
-        .flat_map(|span| span.content.chars())
-        .map(|character| UnicodeWidthChar::width(character).unwrap_or(0))
+        .map(|span| super::text_width(span.content.as_ref()))
         .sum()
 }
 

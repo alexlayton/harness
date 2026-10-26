@@ -1,7 +1,8 @@
 use ratatui_core::style::{Color, Modifier, Style};
 use ratatui_core::text::{Line, Span, Text};
 use tui_markdown::{AlertKind, Options, StyleSheet, from_str_with_options};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 mod table;
 
@@ -228,10 +229,25 @@ pub(crate) fn welcome_lines(
     lines
 }
 
+/// Display width of one grapheme cluster (a user-perceived character such as
+/// a family emoji, a flag, `❤️`, or `é` written with a combining accent).
+/// Width, wrapping, row fitting, and cursor placement all measure clusters,
+/// so a cluster is never split across rows or partly deleted, and every
+/// measurement agrees. Exact terminal rendering of rare sequences still
+/// varies.
+pub(crate) fn grapheme_width(cluster: &str) -> usize {
+    UnicodeWidthStr::width(cluster)
+}
+
+/// Display width of a string, measured cluster by cluster.
+pub(crate) fn text_width(text: &str) -> usize {
+    text.graphemes(true).map(grapheme_width).sum()
+}
+
 /// Fit fixed chrome onto one terminal row without splitting wide characters.
 fn fit_single_line(text: &str, width: usize) -> String {
     let text = &sanitize_terminal_text(text).replace('\n', " ");
-    if UnicodeWidthStr::width(text.as_str()) <= width {
+    if text_width(text) <= width {
         return text.to_owned();
     }
     if width == 0 {
@@ -240,13 +256,13 @@ fn fit_single_line(text: &str, width: usize) -> String {
     let budget = width.saturating_sub(1);
     let mut result = String::new();
     let mut used = 0usize;
-    for character in text.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(1);
-        if used + character_width > budget {
+    for cluster in text.graphemes(true) {
+        let cluster_width = grapheme_width(cluster);
+        if used + cluster_width > budget {
             break;
         }
-        result.push(character);
-        used += character_width;
+        result.push_str(cluster);
+        used += cluster_width;
     }
     result.push('…');
     result
@@ -401,13 +417,13 @@ pub(crate) fn fit_line_to_width(line: &Line<'_>, width: usize) -> Line<'static> 
     for span in &line.spans {
         let content = sanitize_terminal_text(span.content.as_ref()).replace('\n', " ");
         let mut kept = String::new();
-        for character in content.chars() {
-            let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-            if character_width > 0 && used.saturating_add(character_width) > width {
+        for cluster in content.graphemes(true) {
+            let cluster_width = grapheme_width(cluster);
+            if cluster_width > 0 && used.saturating_add(cluster_width) > width {
                 continue;
             }
-            kept.push(character);
-            used = used.saturating_add(character_width);
+            kept.push_str(cluster);
+            used = used.saturating_add(cluster_width);
         }
         if !kept.is_empty() {
             spans.push(Span::styled(kept, span.style));
@@ -455,14 +471,16 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
 
     for source_line in &source_lines {
         let line_base = base.patch(source_line.style);
-        let mut source_chars = Vec::<(char, Style, usize)>::new();
+        // Wrap unit: one grapheme cluster with its style and width.
+        let mut source_chars = Vec::<(String, Style, usize)>::new();
         for source_span in &source_line.spans {
             let style = line_base.patch(source_span.style);
             let content = sanitize_terminal_text(source_span.content.as_ref());
-            source_chars.extend(content.chars().map(|character| {
-                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-                (character, style, character_width)
-            }));
+            source_chars.extend(
+                content
+                    .graphemes(true)
+                    .map(|cluster| (cluster.to_owned(), style, grapheme_width(cluster))),
+            );
         }
 
         if source_chars.is_empty() {
@@ -470,17 +488,17 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
             continue;
         }
 
-        let mut current = Vec::<(char, Style, usize)>::new();
+        let mut current = Vec::<(String, Style, usize)>::new();
         let mut current_width = 0usize;
-        let mut pending_whitespace = Vec::<(char, Style, usize)>::new();
+        let mut pending_whitespace = Vec::<(String, Style, usize)>::new();
         let mut pending_width = 0usize;
         let mut index = 0usize;
 
         while index < source_chars.len() {
-            let is_whitespace = source_chars[index].0.is_whitespace();
+            let is_whitespace = is_whitespace_cluster(&source_chars[index].0);
             let start = index;
             while index < source_chars.len()
-                && source_chars[index].0.is_whitespace() == is_whitespace
+                && is_whitespace_cluster(&source_chars[index].0) == is_whitespace
             {
                 index += 1;
             }
@@ -491,14 +509,15 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
                 if current.is_empty() {
                     // Leading indentation is meaningful, but it still has to
                     // be chunked so a long run cannot overflow a narrow row.
-                    for &(character, style, character_width) in group {
+                    for (character, style, character_width) in group {
+                        let (style, character_width) = (*style, *character_width);
                         if character_width > 0
                             && current_width.saturating_add(character_width) > width
                         {
                             result.push(wrapped_line(std::mem::take(&mut current)));
                             current_width = 0;
                         }
-                        current.push((character, style, character_width));
+                        current.push((character.clone(), style, character_width));
                         current_width = current_width.saturating_add(character_width);
                     }
                 } else {
@@ -526,7 +545,8 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
                 pending_width = 0;
             }
 
-            for &(character, style, character_width) in group {
+            for (character, style, character_width) in group {
+                let (style, character_width) = (*style, *character_width);
                 if character_width > width {
                     // A width-two glyph cannot fit a one-column terminal. It
                     // is safer to omit that glyph than to let the terminal
@@ -541,7 +561,7 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
                     result.push(wrapped_line(std::mem::take(&mut current)));
                     current_width = 0;
                 }
-                current.push((character, style, character_width));
+                current.push((character.clone(), style, character_width));
                 current_width = current_width.saturating_add(character_width);
             }
         }
@@ -587,12 +607,16 @@ fn split_embedded_newlines(text: &Text<'_>) -> Vec<Line<'static>> {
     lines
 }
 
-fn wrapped_line(chars: Vec<(char, Style, usize)>) -> Line<'static> {
+fn wrapped_line(clusters: Vec<(String, Style, usize)>) -> Line<'static> {
     let mut spans = Vec::new();
-    for (character, style, _) in chars {
-        push_span(&mut spans, character.to_string(), style);
+    for (cluster, style, _) in clusters {
+        push_span(&mut spans, cluster, style);
     }
     Line::from(spans)
+}
+
+fn is_whitespace_cluster(cluster: &str) -> bool {
+    cluster.chars().next().is_some_and(char::is_whitespace)
 }
 
 /// Count `\n` bytes with `memchr` (SIMD-accelerated, already in the tree

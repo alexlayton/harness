@@ -99,7 +99,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// The user-input prefix. Same glyph as the committed user echo so a
 /// submitted message's pixels are exactly the prompt line it was typed on.
@@ -3436,20 +3437,21 @@ fn input_layout_with_row_width(
     for logical in input.split('\n') {
         let line_end = byte_base + logical.len();
         let cursor_here = cursor >= byte_base && cursor <= line_end;
-        let chars: Vec<(char, usize)> = logical
-            .chars()
-            .map(|c| (c, UnicodeWidthChar::width(c).unwrap_or(0)))
+        // Layout units are grapheme clusters, matching editing and wrap.
+        let chars: Vec<(&str, usize)> = logical
+            .graphemes(true)
+            .map(|cluster| (cluster, render::grapheme_width(cluster)))
             .collect();
         let cursor_char = if cursor_here {
-            Some(input[byte_base..cursor].chars().count())
+            Some(input[byte_base..cursor].graphemes(true).count())
         } else {
             None
         };
 
         // Greedy wrap; rows are append-stable, so the cursor can be located
         // afterwards by walking the row boundaries.
-        let mut visual: Vec<Vec<(char, usize)>> = Vec::new();
-        let mut current: Vec<(char, usize)> = Vec::new();
+        let mut visual: Vec<Vec<(&str, usize)>> = Vec::new();
+        let mut current: Vec<(&str, usize)> = Vec::new();
         let mut current_width = 0usize;
         for &(character, character_width) in &chars {
             if character_width > width {
@@ -3537,7 +3539,7 @@ fn input_layout_with_row_width(
         let used = row
             .spans
             .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .map(|span| render::text_width(span.content.as_ref()))
             .sum();
         let available = row_width.saturating_sub(used);
         let fits = ghost_to_width(ghost, available);
@@ -3602,13 +3604,13 @@ fn ghost_to_width(text: &str, width: usize) -> String {
     }
     let mut result = String::new();
     let mut used = 0usize;
-    for character in text.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
-        if used + character_width > width {
+    for cluster in text.graphemes(true) {
+        let cluster_width = render::grapheme_width(cluster).max(1);
+        if used + cluster_width > width {
             break;
         }
-        result.push(character);
-        used += character_width;
+        result.push_str(cluster);
+        used += cluster_width;
     }
     result
 }
@@ -3667,27 +3669,31 @@ fn insert_text(input: &mut String, cursor: &mut usize, text: &str) {
     *cursor += text.len();
 }
 
+// Editing moves and deletes whole grapheme clusters (a family emoji, a
+// flag, an accented letter with a combining mark), never part of one.
+
 fn delete_backward(input: &mut String, cursor: &mut usize) {
-    if let Some(len) = input[..*cursor].chars().next_back().map(char::len_utf8) {
+    if let Some(cluster) = input[..*cursor].graphemes(true).next_back() {
+        let len = cluster.len();
         *cursor -= len;
         input.drain(*cursor..*cursor + len);
     }
 }
 
 fn delete_forward(input: &mut String, cursor: &mut usize) {
-    if let Some(len) = input[*cursor..].chars().next().map(char::len_utf8) {
+    if let Some(len) = input[*cursor..].graphemes(true).next().map(str::len) {
         input.drain(*cursor..*cursor + len);
     }
 }
 
 fn move_left(input: &str, cursor: &mut usize) {
-    if let Some(len) = input[..*cursor].chars().next_back().map(char::len_utf8) {
-        *cursor -= len;
+    if let Some(cluster) = input[..*cursor].graphemes(true).next_back() {
+        *cursor -= cluster.len();
     }
 }
 
 fn move_right(input: &str, cursor: &mut usize) {
-    if let Some(len) = input[*cursor..].chars().next().map(char::len_utf8) {
+    if let Some(len) = input[*cursor..].graphemes(true).next().map(str::len) {
         *cursor += len;
     }
 }
@@ -3707,7 +3713,7 @@ fn line_bounds(input: &str, cursor: usize) -> (usize, usize) {
 fn vertical_move(input: &str, cursor: usize, delta: i32) -> Option<usize> {
     let before = &input[..cursor];
     let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let column = before[line_start..].chars().count();
+    let column = before[line_start..].graphemes(true).count();
     let line_index = before.matches('\n').count() as i32;
     let total_lines = input.matches('\n').count() as i32 + 1;
     let target = line_index + delta;
@@ -3723,9 +3729,9 @@ fn vertical_move(input: &str, cursor: usize, delta: i32) -> Option<usize> {
         .map(|i| position + i)
         .unwrap_or(input.len());
     let byte_column: usize = input[position..line_end]
-        .chars()
+        .graphemes(true)
         .take(column)
-        .map(char::len_utf8)
+        .map(str::len)
         .sum();
     Some(position + byte_column)
 }
@@ -4112,6 +4118,53 @@ mod tests {
             TRANSCRIPT_BUDGET_BYTES,
         );
         assert_eq!((window.kept.len(), window.dropped), (1, 0));
+    }
+
+    #[test]
+    fn editing_moves_and_deletes_whole_grapheme_clusters() {
+        // Family emoji (ZWJ sequence), a flag, and e + combining acute.
+        for cluster in ["👨‍👩‍👧", "🇳🇿", "e\u{301}", "❤️"] {
+            let mut input = format!("a{cluster}b");
+            let mut cursor = 1 + cluster.len();
+            move_left(&input, &mut cursor);
+            assert_eq!(cursor, 1, "{cluster:?}");
+            move_right(&input, &mut cursor);
+            assert_eq!(cursor, 1 + cluster.len(), "{cluster:?}");
+            delete_backward(&mut input, &mut cursor);
+            assert_eq!(input, "ab", "{cluster:?}");
+            let mut input = format!("a{cluster}b");
+            let mut cursor = 1;
+            delete_forward(&mut input, &mut cursor);
+            assert_eq!(input, "ab", "{cluster:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_rows_never_split_a_grapheme_cluster() {
+        let text = "ab👨‍👩‍👧cd🇳🇿e\u{301}";
+        for width in 1..8 {
+            let rows = render::wrap_text(&Text::from(text.to_owned()), width, Style::default());
+            let joined = rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.content.to_string()))
+                .collect::<String>();
+            // Clusters wider than the row are dropped whole, never split:
+            // every emitted cluster is one of the original clusters.
+            let originals = text
+                .graphemes(true)
+                .collect::<std::collections::HashSet<_>>();
+            for row in &rows {
+                let row_text = row
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                for cluster in row_text.graphemes(true) {
+                    assert!(originals.contains(cluster), "width {width}: {cluster:?}");
+                }
+            }
+            assert!(!joined.is_empty());
+        }
     }
 
     #[test]
