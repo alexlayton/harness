@@ -685,7 +685,8 @@ impl SubagentRunnerImpl {
         tool_calls: Vec<llm::ToolCall>,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
-        for batch in plan_tool_batches(tool_calls, registry) {
+        let batches = plan_tool_batches(tool_calls, registry);
+        for (index, batch) in batches.iter().enumerate() {
             let launch_limit = if batch.concurrent() {
                 match batch.class {
                     tools::Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
@@ -699,7 +700,7 @@ impl SubagentRunnerImpl {
             let mut hooks = NoopToolDispatchHooks;
             let outcome = execute_tool_batch_with_secrets(
                 registry,
-                &batch,
+                batch,
                 launch_limit,
                 &mut control,
                 &mut hooks,
@@ -731,6 +732,19 @@ impl SubagentRunnerImpl {
                 );
             }
             if outcome.cancellation.is_some() {
+                // Calls in later batches never ran. Give each a result so the
+                // child history and its durable session stay valid.
+                let skipped = batches[index + 1..]
+                    .iter()
+                    .flat_map(|batch| batch.calls.iter().cloned())
+                    .collect::<Vec<_>>();
+                mark_calls_failed(
+                    history,
+                    &self.store,
+                    session,
+                    &skipped,
+                    "cancelled before tool execution",
+                );
                 return Err("cancelled by user".into());
             }
         }
@@ -1332,6 +1346,65 @@ mod tests {
             .run("x", "y", SubagentMode::ReadOnly, CancellationToken::new())
             .await;
         assert_eq!(outcome.unwrap_err(), "subagents are disabled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_gives_every_later_batch_a_result() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let store = session::SessionStore::new(root.path(), &workspace).unwrap();
+        let bash = |id: &str| {
+            Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 5"}),
+            }))
+        };
+        // Two exclusive calls run as two batches; cancel during the first.
+        let provider = Arc::new(ScriptProvider::new(vec![vec![
+            bash("first"),
+            bash("second"),
+            ScriptProvider::done("tool_calls"),
+        ]]));
+        let runner = SubagentRunnerImpl::new(
+            provider,
+            "demo",
+            workspace,
+            false,
+            "",
+            SubagentPolicy::default(),
+            Some(store.clone()),
+            None,
+        );
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            canceller.cancel();
+        });
+        let error = runner
+            .run("work", "go", SubagentMode::Workspace, cancel)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        let child = store.open(&store.list().unwrap()[0].id).unwrap();
+        let count = |tool_result: bool| {
+            child
+                .events
+                .iter()
+                .filter(|record| {
+                    if tool_result {
+                        matches!(record.event, session::SessionEvent::ToolResult { .. })
+                    } else {
+                        matches!(record.event, session::SessionEvent::ToolCall { .. })
+                    }
+                })
+                .count()
+        };
+        assert_eq!(count(false), 2);
+        assert_eq!(count(true), 2, "every call needs a result");
     }
 
     #[tokio::test]
