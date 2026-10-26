@@ -62,7 +62,8 @@ fn list() -> Result<()> {
                 println!("{}\tstdio\t{}", server.name, invocation);
             }
             McpTransportConfig::Http { url, .. } => {
-                println!("{}\thttp\t{}", server.name, url);
+                // URLs often carry tokens in userinfo or the query.
+                println!("{}\thttp\t{}", server.name, mcp::redact_url(&url));
             }
         }
     }

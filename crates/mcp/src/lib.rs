@@ -11,7 +11,7 @@ mod output;
 mod runtime;
 mod tool;
 
-pub use config::{McpConfig, McpServerConfig, McpTransportConfig};
+pub use config::{McpConfig, McpServerConfig, McpTransportConfig, redact_url};
 pub use names::normalized_tool_name;
 pub use runtime::McpRuntime;
 

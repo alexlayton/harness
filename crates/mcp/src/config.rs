@@ -314,7 +314,9 @@ impl Redactions {
     }
 }
 
-fn redact_url(value: &str) -> String {
+/// Display form of a server URL with userinfo, query, and fragment removed;
+/// those parts commonly carry tokens. Unparseable URLs are fully hidden.
+pub fn redact_url(value: &str) -> String {
     let Ok(mut url) = url::Url::parse(value) else {
         return "<redacted URL>".into();
     };
