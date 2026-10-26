@@ -161,20 +161,8 @@ pub(crate) fn serialize(req: &CompletionRequest) -> Result<Vec<u8>, LlmError> {
         }
     }
     body["metadata"] = json!({"user_id":format!("user_{:x}_account_{}_session_{}",Sha256::digest(uuid::Uuid::new_v4().as_bytes()),uuid::Uuid::new_v4(),uuid::Uuid::new_v4())});
-    let adaptive = matches!(
-        req.model.as_str(),
-        "claude-opus-5-5"
-            | "claude-sonnet-5-5"
-            | "claude-haiku-5-5"
-            | "claude-fable-5-1"
-            | "claude-opus-5"
-            | "claude-sonnet-5"
-            | "claude-fable-5"
-            | "claude-opus-4-8"
-            | "claude-opus-4-7"
-            | "claude-opus-4-6"
-            | "claude-sonnet-4-6"
-    );
+    let model = crate::providers::anthropic_subscription::subscription_model(&req.model);
+    let adaptive = model.is_some_and(|model| model.adaptive_thinking);
     let thinking = adaptive || matches!(req.reasoning, ReasoningPolicy::Effort(_));
     if adaptive && req.reasoning == ReasoningPolicy::Off {
         return Err(invalid(
@@ -193,19 +181,7 @@ pub(crate) fn serialize(req: &CompletionRequest) -> Result<Vec<u8>, LlmError> {
                 ReasoningPolicy::Effort(ReasoningEffort::Minimal | ReasoningEffort::Low) => "low",
                 ReasoningPolicy::Effort(ReasoningEffort::Medium) => "medium",
                 ReasoningPolicy::Effort(ReasoningEffort::Maximum)
-                    if matches!(
-                        req.model.as_str(),
-                        "claude-opus-5-5"
-                            | "claude-sonnet-5-5"
-                            | "claude-haiku-5-5"
-                            | "claude-fable-5-1"
-                            | "claude-opus-5"
-                            | "claude-sonnet-5"
-                            | "claude-fable-5"
-                            | "claude-opus-4-8"
-                            | "claude-opus-4-7"
-                            | "claude-opus-4-6"
-                    ) =>
+                    if model.is_some_and(|model| model.max_effort) =>
                 {
                     "max"
                 }

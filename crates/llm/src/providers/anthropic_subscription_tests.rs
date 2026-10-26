@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn request() -> CompletionRequest {
     CompletionRequest {
-        model: MODELS[0].into(),
+        model: SUBSCRIPTION_MODELS[0].id.into(),
         system: None,
         messages: vec![Message::user("hello 😀")],
         tools: vec![],
@@ -187,7 +187,7 @@ async fn catalog_reports_model_specific_context_limits_without_network() {
         ("claude-sonnet-4-5", Some(200_000)),
         ("claude-haiku-4-5", Some(200_000)),
     ];
-    assert_eq!(models.len(), MODELS.len());
+    assert_eq!(models.len(), SUBSCRIPTION_MODELS.len());
     for model in models {
         let (_, limit) = expected.iter().find(|(id, _)| *id == model.id).unwrap();
         assert_eq!(model.context_length, *limit, "{}", model.id);
@@ -201,7 +201,7 @@ async fn mock_posts_exact_agent_request_without_tools_and_parses_sse() {
     let dir = tempfile::tempdir().unwrap();
     let p = provider(AuthStore::new(dir.path().join("auth.json")), endpoint);
     let models = p.list_models().await.unwrap();
-    assert_eq!(models.len(), MODELS.len());
+    assert_eq!(models.len(), SUBSCRIPTION_MODELS.len());
     assert_eq!(models[0].context_length, Some(1_000_000));
     let mut stream = p.stream(&request()).await.unwrap();
     let mut events = Vec::new();
