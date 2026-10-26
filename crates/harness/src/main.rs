@@ -45,9 +45,27 @@ fn agent_task_outcome(result: Result<(), tokio::task::JoinError>) -> Result<()> 
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match main_inner().await {
+fn main() -> ExitCode {
+    // `set_var` is only sound while no other thread can read the
+    // environment, so path overrides are normalized here, before the Tokio
+    // runtime starts its worker threads. Absolute overrides are unchanged,
+    // so doing this for every command is harmless; worktree mode needs it
+    // before it changes the process cwd.
+    if let Err(error) = absolutize_process_path_overrides() {
+        eprintln!("error: {error:#}");
+        return ExitCode::FAILURE;
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(main_inner()) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -81,9 +99,8 @@ async fn main_inner() -> Result<ExitCode> {
             std::env::current_dir().context("resolve the worktree launch directory")?,
         )
         .context("resolve the worktree launch directory")?;
-        // Resolve every process-level path override before entering the
-        // workspace. This includes config/auth, logging, and session roots.
-        absolutize_process_path_overrides()?;
+        // Process-level path overrides (config/auth, logging, session roots)
+        // were made absolute in `main`, before the runtime started.
         // Relative state/session overrides must retain launch-directory
         // semantics after the process cwd changes.
         let session_root = std::path::absolute(session::default_session_dir())
@@ -159,24 +176,39 @@ async fn main_inner() -> Result<ExitCode> {
     run_application(cli, None).await
 }
 
+/// Make relative path overrides absolute against the launch directory, so
+/// they keep their meaning after worktree mode changes the cwd. Empty values
+/// mean "unset" to every reader and are left alone (joining them used to
+/// turn them into the cwd). `XDG_CONFIG_HOME` is included because config
+/// and auth paths derive from it.
+///
+/// Must run before any other thread exists (see `main`).
 fn absolutize_process_path_overrides() -> Result<()> {
-    let current = std::env::current_dir().context("resolve launch directory")?;
+    let mut current = None;
     for variable in [
         "HARNESS_CONFIG_DIR",
         "HARNESS_LOG",
         "HARNESS_SESSION_DIR",
         "HARNESS_STATE_DIR",
+        "XDG_CONFIG_HOME",
     ] {
         let Some(value) = std::env::var_os(variable) else {
             continue;
         };
+        if value.is_empty() {
+            continue;
+        }
         let path = std::path::PathBuf::from(value);
         if path.is_absolute() {
             continue;
         }
+        let current = match &current {
+            Some(current) => current,
+            None => current.insert(std::env::current_dir().context("resolve launch directory")?),
+        };
         let absolute = current.join(path);
-        // Environment overrides are process-local and are intentionally
-        // normalized before any worktree task can change cwd.
+        // SAFETY: called from `main` before the Tokio runtime (or any other
+        // thread) starts, so no concurrent environment access is possible.
         unsafe { std::env::set_var(variable, absolute) };
     }
     Ok(())
