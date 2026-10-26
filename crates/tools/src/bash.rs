@@ -77,6 +77,9 @@ pub fn command_concurrency(_command: &str) -> Concurrency {
     Concurrency::Exclusive
 }
 
+/// Largest rtk rewrite accepted on stdout.
+const RTK_REWRITE_MAX_BYTES: usize = 64 * 1024;
+
 /// Ask rtk to rewrite a command to its token-optimized equivalent.  rtk
 /// signals support by printing the rewritten command on stdout; unsupported
 /// commands, a missing rtk binary, and timeouts all degrade to `None`, in
@@ -103,14 +106,31 @@ async fn rtk_rewrite_cancellable(
         .stderr(Stdio::null())
         .kill_on_drop(true);
     let rewrite_deadline = deadline.min(tokio::time::Instant::now() + RTK_REWRITE_TIMEOUT);
-    let output = tokio::select! {
+    let mut child = process.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // A rewritten command is one shell line; never buffer more than the cap
+    // (a broken rtk could print without end within the timeout).
+    let collect = async {
+        let mut bytes = Vec::new();
+        (&mut stdout)
+            .take(RTK_REWRITE_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .ok()?;
+        let status = child.wait().await.ok()?;
+        Some((status, bytes))
+    };
+    let (status, stdout) = tokio::select! {
         biased;
         _ = cancel.cancelled() => return None,
-        output = process.output() => output.ok()?,
+        output = collect => output?,
         _ = tokio::time::sleep_until(rewrite_deadline) => return None,
     };
-    let accepted = matches!(output.status.code(), Some(0 | 3));
-    let rewritten = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if stdout.len() > RTK_REWRITE_MAX_BYTES {
+        return None;
+    }
+    let accepted = matches!(status.code(), Some(0 | 3));
+    let rewritten = String::from_utf8_lossy(&stdout).trim().to_owned();
     (accepted && !rewritten.is_empty()).then_some(rewritten)
 }
 
