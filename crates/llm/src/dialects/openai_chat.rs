@@ -408,7 +408,12 @@ impl ChatStreamParser {
             }
         }
         if let Some(function) = item.get("function") {
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
+            // Like the ID: some endpoints repeat the complete name in every
+            // delta, others stream fragments. An exact repeat of the
+            // assembled name is idempotent ("read" + "read" stays "read").
+            if let Some(name) = function.get("name").and_then(Value::as_str)
+                && name != call.name
+            {
                 call.name.push_str(name);
             }
             if let Some(arguments) = function.get("arguments") {
@@ -601,6 +606,21 @@ mod tests {
         assert!(matches!(
             events.last(),
             Some(StreamEvent::Done { usage: Some(_), .. })
+        ));
+    }
+
+    #[test]
+    fn repeated_tool_name_deltas_are_not_concatenated() {
+        let mut parser = ChatStreamParser::new();
+        for payload in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"\"x\"}"}}]}}]}"#,
+        ] {
+            parser.parse_payload(payload).unwrap();
+        }
+        let events = parser.parse_payload("[DONE]").unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, StreamEvent::ToolCallComplete(call) if call.name == "read")
         ));
     }
 
