@@ -32,9 +32,11 @@ pub const COPILOT_API_VERSION: &str = "2026-06-01";
 /// held hostage by an unavailable enrichment endpoint.
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The known model IDs used for best-effort policy enablement after login.
-/// Routing metadata lives in the LLM crate, but policy enablement belongs to
-/// authentication and therefore intentionally keeps only IDs here.
+/// Copilot model IDs that Harness knows about.
+///
+/// Routing metadata lives in the LLM crate; this list intentionally keeps
+/// only IDs. Login no longer sends per-model policy-enablement requests, so
+/// the list is not used to make any network calls.
 pub const KNOWN_MODEL_IDS: &[&str] = &[
     "claude-haiku-4.5",
     "claude-opus-4.5",
@@ -228,7 +230,7 @@ impl GithubCopilotClient {
         })
     }
 
-    /// Override the API base used for `/models` and policy requests.  This is
+    /// Override the API base used for `/models` requests.  This is
     /// primarily useful for local fixtures and enterprise gateways; normal
     /// callers should let the Copilot token's `proxy-ep` choose the host.
     pub fn with_api_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -516,80 +518,6 @@ impl GithubCopilotClient {
             ));
         }
         Ok(url)
-    }
-
-    /// Enablement is best effort: some accounts reject policy writes even
-    /// though already-enabled models work.  Cancellation remains fatal.
-    pub async fn enable_known_models(
-        &self,
-        copilot_token: &str,
-        enterprise_domain: Option<&str>,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
-        for model_id in KNOWN_MODEL_IDS {
-            if cancel.is_cancelled() {
-                return Err(AuthError::Cancelled);
-            }
-            match self
-                .enable_model(copilot_token, model_id, enterprise_domain, cancel)
-                .await
-            {
-                Ok(_) => {}
-                Err(AuthError::Cancelled) => return Err(AuthError::Cancelled),
-                Err(_) => {
-                    // Policy enablement is advisory.  Accounts can reject
-                    // individual models while still allowing the login and
-                    // dynamic model endpoint to succeed.
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn enable_model(
-        &self,
-        copilot_token: &str,
-        model_id: &str,
-        enterprise_domain: Option<&str>,
-        cancel: &CancellationToken,
-    ) -> Result<bool> {
-        if !model_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
-        {
-            return Ok(false);
-        }
-        let domain = normalize_domain(enterprise_domain)?;
-        let base_url = self
-            .api_base_url
-            .clone()
-            .unwrap_or_else(|| copilot_base_url(copilot_token, domain.as_deref()));
-        let url = format!("{base_url}/models/{model_id}/policy");
-        let mut headers = copilot_headers();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            bearer(copilot_token)
-                .ok_or_else(|| AuthError::InvalidCredential("invalid Copilot token".into()))?,
-        );
-        headers.insert(
-            HeaderName::from_static("openai-intent"),
-            HeaderValue::from_static("chat-policy"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-interaction-type"),
-            HeaderValue::from_static("chat-policy"),
-        );
-        let request = self
-            .http
-            .post(&url)
-            .headers(headers)
-            .json(&serde_json::json!({"state": "enabled"}));
-        let response = tokio::select! {
-            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            response = request.send() => response.map_err(|error| network_error(&url, error))?,
-        };
-        Ok(response.status().is_success())
     }
 
     /// Complete the entire device login, emitting only UI-neutral events.
