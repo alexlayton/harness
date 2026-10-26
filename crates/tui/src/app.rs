@@ -1040,7 +1040,6 @@ impl CrossTerm {
                 .get(completion.selected)
                 .map(|candidate| candidate.value.clone())
         });
-        self.cancel_path_completion();
         let cursor_col = self.cursor_char_col();
         let Some(result) = commands::candidates_at_cursor(
             &self.input,
@@ -1051,12 +1050,17 @@ impl CrossTerm {
             &self.session_candidates,
             &self.skills,
         ) else {
+            self.cancel_path_completion();
             self.completion = None;
             self.session_completion_requested = false;
             return;
         };
 
-        // Path arguments scan the filesystem on a debounced task.
+        // Path arguments scan the filesystem on a debounced task. Do not
+        // cancel first: `request_path_completion` keeps the current scan and
+        // its results when the token context is unchanged (as `@` paths do),
+        // so Tab after the results arrive accepts them instead of clearing
+        // them and starting again.
         if matches!(
             result.context.target,
             CompletionTarget::Argument(ArgumentKind::Path | ArgumentKind::Session),
@@ -1064,6 +1068,7 @@ impl CrossTerm {
             self.request_path_completion(result.context, result.candidates, old_value, None);
             return;
         }
+        self.cancel_path_completion();
         let kind = match result.context.target {
             CompletionTarget::Argument(ArgumentKind::Session) => CompletionKind::Session,
             CompletionTarget::Argument(ArgumentKind::Model) => CompletionKind::Model,
@@ -5630,6 +5635,42 @@ mod tests {
         let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
         ui.handle_tab(&tx).unwrap();
         assert_eq!(ui.input, "look at @src/README.md ");
+    }
+
+    #[tokio::test]
+    async fn tab_accepts_scanned_export_and_load_paths() {
+        for command in ["/export ", "/load "] {
+            let mut ui = ui(80, 24);
+            ui.input = format!("{command}notes");
+            ui.cursor = ui.input.len();
+            ui.refresh_completion();
+            let generation = ui.path_completion_generation;
+            let context = ui
+                .completion
+                .as_ref()
+                .expect("path scan started")
+                .context
+                .clone();
+            ui.apply_path_completion(PathCompletionResult {
+                generation,
+                context,
+                candidates: vec![Candidate {
+                    value: "notes/today.md".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                }],
+                at_prefix: None,
+            });
+            // Tab refreshes completion first; unchanged context must keep the
+            // scanned result instead of clearing it.
+            let (tx, _rx) = mpsc::unbounded_channel::<InputMessage>();
+            ui.handle_tab(&tx).unwrap();
+            assert!(
+                ui.input.starts_with(&format!("{command}notes/today.md")),
+                "{}",
+                ui.input
+            );
+        }
     }
 
     #[tokio::test]
