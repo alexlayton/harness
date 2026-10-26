@@ -64,6 +64,19 @@ const CHILD_CONTEXT_MAX_TOKENS: u64 = 100_000;
 const CHILD_FINAL_REPORT_RESERVE_TOKENS: u64 = 8_000;
 const CHILD_TOOL_EVIDENCE_MAX_BYTES: usize = 8_000;
 
+/// Exploration budget for child requests: the fixed child cap, lowered to
+/// three quarters of the model's window when that is known and smaller, with
+/// room reserved for the final report. A child on a small-window model would
+/// otherwise overflow before the cap ever applied.
+fn child_context_budget(context_window: u64) -> u64 {
+    let cap = if context_window > 0 {
+        CHILD_CONTEXT_MAX_TOKENS.min(context_window / 4 * 3)
+    } else {
+        CHILD_CONTEXT_MAX_TOKENS
+    };
+    cap.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS.min(cap / 4))
+}
+
 /// Bound a child's live provider history without rewriting its durable
 /// transcript. Tool evidence is truncated first; then complete old exchanges
 /// are removed while preserving the original user request and the newest
@@ -123,6 +136,8 @@ struct SubagentModelState {
     model: String,
     reasoning: ReasoningPolicy,
     secret_masker: Arc<SecretMasker>,
+    /// The parent's resolved context window for this model; `0` = unknown.
+    context_window: u64,
 }
 
 /// Everything a nested loop needs from the host process. One instance is
@@ -195,6 +210,7 @@ impl SubagentRunnerImpl {
                 model: model.into(),
                 reasoning: ReasoningPolicy::Auto,
                 secret_masker: Arc::new(SecretMasker::default()),
+                context_window: 0,
             }),
             workspace_root,
             search_index,
@@ -265,6 +281,17 @@ impl SubagentRunnerImpl {
         state.provider = mask_provider(provider, state.secret_masker.clone());
         let model = model.into();
         state.model = state.secret_masker.mask_text(&model);
+        // A new model has its own window; the parent publishes it again.
+        state.context_window = 0;
+    }
+
+    /// Context window the parent resolved for the current model. Child
+    /// requests are bounded below it, not only by the fixed child cap.
+    pub fn update_context_window(&self, context_window: u64) {
+        self.model_state
+            .write()
+            .expect("subagent model state lock poisoned")
+            .context_window = context_window;
     }
 
     /// Current child-target model (test seam for AGENT-4 atomicity: proves
@@ -378,7 +405,7 @@ impl SubagentRunnerImpl {
             .parent_session_id
             .read()
             .expect("subagent parent session lock poisoned");
-        let (provider, model, reasoning, secret_masker) = {
+        let (provider, model, reasoning, secret_masker, context_window) = {
             let state = self
                 .model_state
                 .read()
@@ -388,6 +415,7 @@ impl SubagentRunnerImpl {
                 state.model.clone(),
                 state.reasoning,
                 state.secret_masker.clone(),
+                state.context_window,
             )
         };
         let registry = self.registry(mode)?;
@@ -438,6 +466,7 @@ impl SubagentRunnerImpl {
                 &system,
                 reasoning,
                 &secret_masker,
+                context_window,
                 &mut history,
                 &mut session,
                 cancel,
@@ -497,6 +526,7 @@ impl SubagentRunnerImpl {
         system: &str,
         reasoning: ReasoningPolicy,
         secret_masker: &Arc<SecretMasker>,
+        context_window: u64,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         cancel: CancellationToken,
@@ -510,11 +540,14 @@ impl SubagentRunnerImpl {
                 // the subagent produced instead of dead-ending the parent's
                 // tool result with an error.
                 tracing::warn!(turns, "subagent hit its turn budget");
-                return Ok(format!(
+                // Same byte cap as a normal report: the last output can be
+                // arbitrarily long.
+                let report = format!(
                     "[subagent stopped after {} turns without a final report] Last output: {}",
                     self.config.max_turns,
                     last_assistant_text(history).unwrap_or_else(|| "(none)".into())
-                ));
+                );
+                return Ok(truncate_utf8(&report, REPORT_MAX_BYTES).to_owned());
             }
             turns += 1;
 
@@ -524,8 +557,7 @@ impl SubagentRunnerImpl {
             // The note is request-local (not durable child history), and an
             // empty tool list makes the expected terminal action unambiguous.
             let final_report_turn = turns == self.config.max_turns;
-            let context_budget =
-                CHILD_CONTEXT_MAX_TOKENS.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS);
+            let context_budget = child_context_budget(context_window);
             bound_child_history(history, system, registry, context_budget);
             let mut request_messages = history.clone();
             if final_report_turn {
@@ -1042,6 +1074,18 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("without a terminal event"), "{error}");
+    }
+
+    #[test]
+    fn child_budget_follows_a_smaller_model_window() {
+        let unknown = child_context_budget(0);
+        assert_eq!(
+            unknown,
+            CHILD_CONTEXT_MAX_TOKENS - CHILD_FINAL_REPORT_RESERVE_TOKENS
+        );
+        assert_eq!(child_context_budget(1_000_000), unknown);
+        let small = child_context_budget(32_000);
+        assert!(small > 0 && small < 24_000, "{small}");
     }
 
     #[tokio::test]

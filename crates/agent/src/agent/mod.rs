@@ -410,6 +410,7 @@ impl Agent {
         // synchronously, without provider I/O.
         if self.context_window == 0 {
             self.context_window = self.compaction.resolved_window(0);
+            self.publish_context_window();
         }
         send(&events, self.context_usage_event());
         if self.prewalk.is_configured() {

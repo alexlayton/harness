@@ -544,6 +544,7 @@ impl Agent {
         // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
         self.context_window = self.compaction.resolved_window(0);
+        self.publish_context_window();
         send(events, self.context_usage_event());
         if let Some(metadata_tx) = &self.model_metadata_tx {
             spawn_model_metadata(

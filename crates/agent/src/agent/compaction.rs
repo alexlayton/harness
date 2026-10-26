@@ -33,6 +33,7 @@ impl Agent {
                 .and_then(|candidate| candidate.context_length)
                 .unwrap_or(0);
             self.context_window = self.compaction.resolved_window(reported);
+            self.publish_context_window();
             send(events, self.context_usage_event());
         }
         send(events, AgentEvent::ModelList { provider, models });
@@ -286,6 +287,14 @@ impl Agent {
         Ok(Some(compacted))
     }
 
+    /// Share the resolved window with the subagent runner, which bounds child
+    /// requests below it.
+    pub(crate) fn publish_context_window(&self) {
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_context_window(self.context_window);
+        }
+    }
+
     /// When the window was not configured and no catalogue reported it, the
     /// generous default stays in place and auto-compaction never starts.
     /// Learn a bound from the provider's overflow error instead, so later
@@ -303,6 +312,7 @@ impl Agent {
         };
         if hint < self.context_window {
             self.context_window = hint;
+            self.publish_context_window();
             send(
                 events,
                 AgentEvent::Notice(format!(
