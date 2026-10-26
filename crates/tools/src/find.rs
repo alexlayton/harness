@@ -173,7 +173,7 @@ impl FileSearchIndex {
         task: &str,
         scope: Option<String>,
         cancel: CancellationToken,
-        job: impl FnOnce(SharedFilePicker, Option<String>, CancellationToken) -> F,
+        job: impl FnOnce(SharedFilePicker, Option<String>, CancellationToken, Arc<AtomicBool>) -> F,
     ) -> Result<T, String>
     where
         F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -200,7 +200,10 @@ impl FileSearchIndex {
             _ = cancel.cancelled() => return Err("cancelled".into()),
         };
         let cancel_for_job = cancel.clone();
-        let run = job(picker, scope, cancel_for_job);
+        // FFF's grep cannot see the async token; this flag stops it early so
+        // a cancelled search releases its slot instead of running on.
+        let abort = Arc::new(AtomicBool::new(false));
+        let run = job(picker, scope, cancel_for_job, abort.clone());
         let join = tokio::task::spawn_blocking(move || {
             // If the caller is cancelled while FFF is doing synchronous work,
             // the task still owns the semaphore permit. This keeps repeated
@@ -210,7 +213,10 @@ impl FileSearchIndex {
         });
         tokio::select! {
             result = join => result.map_err(|error| format!("{task} search task failed: {error}"))?,
-            _ = cancel.cancelled() => Err("cancelled".into()),
+            _ = cancel.cancelled() => {
+                abort.store(true, Ordering::Release);
+                Err("cancelled".into())
+            }
         }
     }
 
@@ -224,7 +230,7 @@ impl FileSearchIndex {
         if query.trim().is_empty() {
             return Err("query must not be empty".into());
         }
-        self.run_search("find", scope, cancel, |picker, scope, cancel| {
+        self.run_search("find", scope, cancel, |picker, scope, cancel, _abort| {
             let query = query.clone();
             let scan_timeout = self.config.scan_timeout;
             move || {
@@ -269,8 +275,10 @@ impl FileSearchIndex {
             time_budget_ms: GREP_TIME_BUDGET_MS,
             ..GrepSearchOptions::default()
         };
-        self.run_search("grep", scope, cancel, |picker, scope, cancel| {
+        self.run_search("grep", scope, cancel, |picker, scope, cancel, abort| {
             let scan_timeout = self.config.scan_timeout;
+            let mut options = options;
+            options.abort_signal = Some(abort);
             move || {
                 grep_sync(
                     &picker,
@@ -307,8 +315,10 @@ impl FileSearchIndex {
             time_budget_ms: GREP_TIME_BUDGET_MS,
             ..GrepSearchOptions::default()
         };
-        self.run_search("grep", scope, cancel, |picker, scope, cancel| {
+        self.run_search("grep", scope, cancel, |picker, scope, cancel, abort| {
             let scan_timeout = self.config.scan_timeout;
+            let mut options = options;
+            options.abort_signal = Some(abort);
             move || {
                 multi_grep_sync(
                     &picker,
@@ -502,7 +512,11 @@ pub(crate) struct GrepRawOutput {
     match_count: usize,
     file_count: usize,
     rendered_line_count: usize,
+    /// The hard match limit cut the results.
     has_more: bool,
+    /// The search stopped before every file was searched (FFF's time
+    /// budget), so a missing match does not mean the pattern is absent.
+    incomplete: bool,
     pub(crate) regex_fallback_error: Option<String>,
     literal_fallback: bool,
 }
@@ -629,7 +643,8 @@ fn collect_grep_result(
         match_count,
         file_count: matched_files.len(),
         rendered_line_count,
-        has_more: hard_truncated || result.next_file_offset > 0,
+        has_more: hard_truncated,
+        incomplete: !hard_truncated && result.next_file_offset > 0,
         regex_fallback_error: result.regex_fallback_error.clone(),
         literal_fallback: result.literal_fallback,
     })
@@ -826,6 +841,13 @@ pub(crate) fn format_grep_output(
         } else {
             ""
         };
+        if raw.incomplete {
+            return format!(
+                "No matches for pattern `{pattern}`{fallback} in the files searched before the \
+                 search time budget ran out; the pattern can still be present. Narrow the path \
+                 or the pattern and search again."
+            );
+        }
         return format!("No matches for pattern `{pattern}`{fallback}.");
     }
 
@@ -862,6 +884,13 @@ pub(crate) fn format_grep_output(
     } else if byte_truncated {
         notices
             .push("output size limit reached; narrow the pattern to see fewer results".to_owned());
+    }
+    if raw.incomplete {
+        notices.push(
+            "search time budget reached before all files were searched; results may be \
+             incomplete, narrow the path or pattern"
+                .to_owned(),
+        );
     }
     if !raw.has_more && (raw.match_count > 1 || raw.rendered_line_count != raw.match_count) {
         notices.push(format!(
@@ -1052,6 +1081,7 @@ mod tests {
             file_count: 1,
             rendered_line_count: 1,
             has_more: false,
+            incomplete: false,
             regex_fallback_error: None,
             literal_fallback: false,
         };
@@ -1072,6 +1102,7 @@ mod tests {
             file_count: 600,
             rendered_line_count: 600,
             has_more: true,
+            incomplete: false,
             regex_fallback_error: None,
             literal_fallback: false,
         };
@@ -1086,6 +1117,7 @@ mod tests {
                 file_count: 0,
                 rendered_line_count: 0,
                 has_more: false,
+                incomplete: false,
                 regex_fallback_error: None,
                 literal_fallback: false,
             },
@@ -1095,6 +1127,24 @@ mod tests {
         );
         assert!(no_matches.contains("No matches"));
 
+        // A search cut by the time budget must not claim the pattern is absent.
+        let budget = format_grep_output(
+            GrepRawOutput {
+                lines: Vec::new(),
+                match_count: 0,
+                file_count: 0,
+                rendered_line_count: 0,
+                has_more: false,
+                incomplete: true,
+                regex_fallback_error: None,
+                literal_fallback: false,
+            },
+            "zzz",
+            50,
+            500,
+        );
+        assert!(budget.contains("time budget"), "{budget}");
+
         let fallback = format_grep_output(
             GrepRawOutput {
                 lines: vec!["a.rs:1:x".into()],
@@ -1102,6 +1152,7 @@ mod tests {
                 file_count: 1,
                 rendered_line_count: 1,
                 has_more: false,
+                incomplete: false,
                 regex_fallback_error: Some("bad regex".into()),
                 literal_fallback: false,
             },
