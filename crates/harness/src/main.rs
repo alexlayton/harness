@@ -176,6 +176,30 @@ async fn main_inner() -> Result<ExitCode> {
     run_application(cli, None).await
 }
 
+/// `--resume-session` is global, but prompt mode reads its own `--resume`,
+/// so the global flag was silently ignored there. Treat it as the prompt's
+/// `--resume`, and reject combinations that cannot both apply.
+fn apply_global_resume_to_prompt(cli: &mut Cli) -> Result<()> {
+    let Some(Command::Prompt(args)) = &mut cli.command else {
+        return Ok(());
+    };
+    let Some(global) = cli.resume.take() else {
+        return Ok(());
+    };
+    match &args.resume {
+        Some(local) if *local != global => {
+            anyhow::bail!("--resume-session `{global}` conflicts with prompt --resume `{local}`")
+        }
+        _ => {}
+    }
+    anyhow::ensure!(
+        !args.no_session,
+        "--resume-session cannot be used with --no-session"
+    );
+    args.resume = Some(global);
+    Ok(())
+}
+
 /// Make relative path overrides absolute against the launch directory, so
 /// they keep their meaning after worktree mode changes the cwd. Empty values
 /// mean "unset" to every reader and are left alone (joining them used to
@@ -214,7 +238,11 @@ fn absolutize_process_path_overrides() -> Result<()> {
     Ok(())
 }
 
-async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> Result<ExitCode> {
+async fn run_application(
+    mut cli: Cli,
+    session_root: Option<std::path::PathBuf>,
+) -> Result<ExitCode> {
+    apply_global_resume_to_prompt(&mut cli)?;
     let prompt_args = match &cli.command {
         Some(Command::Prompt(args)) => Some(args),
         _ => None,
@@ -563,7 +591,28 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::agent_task_outcome;
+    use super::{Cli, agent_task_outcome, apply_global_resume_to_prompt};
+    use clap::Parser;
+
+    #[test]
+    fn global_resume_session_applies_to_prompt_mode() {
+        let mut cli = Cli::parse_from(["harness", "--resume-session", "latest", "prompt", "hi"]);
+        apply_global_resume_to_prompt(&mut cli).unwrap();
+        let Some(super::Command::Prompt(args)) = &cli.command else {
+            panic!("prompt command expected");
+        };
+        assert_eq!(args.resume.as_deref(), Some("latest"));
+
+        let mut cli = Cli::parse_from([
+            "harness",
+            "--resume-session",
+            "latest",
+            "prompt",
+            "--no-session",
+            "hi",
+        ]);
+        assert!(apply_global_resume_to_prompt(&mut cli).is_err());
+    }
 
     #[tokio::test]
     async fn agent_panic_is_reported_instead_of_success() {
