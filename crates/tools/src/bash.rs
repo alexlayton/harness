@@ -19,8 +19,9 @@ pub struct BashTool {
 }
 
 impl BashTool {
-    /// A tool that rewrites supported commands to their token-optimized `rtk`
-    /// equivalents before execution (see [`rtk_rewrite`]).
+    /// A bash tool rooted at the workspace that runs commands unchanged.
+    /// Use [`BashTool::with_rtk_and_workspace_root`] to opt in to `rtk`
+    /// rewriting.
     pub fn with_workspace_root(root: impl Into<PathBuf>) -> Self {
         Self {
             rtk: false,
@@ -28,6 +29,10 @@ impl BashTool {
         }
     }
 
+    /// A bash tool that, when `rtk` is true, first asks the external `rtk`
+    /// binary to rewrite supported commands to token-optimized equivalents.
+    /// A missing binary, an unsupported command, or a timeout runs the
+    /// original command.
     pub fn with_rtk_and_workspace_root(rtk: bool, root: impl Into<PathBuf>) -> Self {
         Self {
             rtk,

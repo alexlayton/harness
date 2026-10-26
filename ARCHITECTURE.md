@@ -221,6 +221,9 @@ and can be disabled with `--no-context-files` or
 Skills are discovered from project `.harness/skills/` and `.agents/skills/`
 roots plus their global equivalents. Only skill name, description, and path are
 put in the system prompt. The model reads a skill body only when needed.
+Candidates are canonicalized and must stay beneath their canonical discovery
+root: contained symlinks work, and external ones never enter the catalogue or
+the read allowlist.
 Native callers can replace discovery roots with ordered `skill_dirs`; relative
 roots use the workspace. Explicit catalogs and read paths are passed to both
 child registry modes so a disabled or replaced skill set cannot revert to

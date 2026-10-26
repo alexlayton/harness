@@ -492,8 +492,12 @@ context.
 Skills are discovered from project `.harness/skills/` and `.agents/skills/`
 directories, plus global `~/.harness/skills` and `~/.agents/skills` locations.
 `HARNESS_SKILLS_DIR` overrides the global Harness skills directory.
+Symlinks inside a skills directory work when their target is in the same
+directory tree. Harness ignores a symlinked skill file or skill directory
+that points outside it, and the same rule applies to `AGENTS.md` and
+`CLAUDE.md` files.
 
-See [Architecture](../ARCHITECTURE.md#skills-and-project-context) for discovery
+See [Architecture](../ARCHITECTURE.md#project-context-and-skills) for discovery
 order, size limits, and prompt invariants.
 
 ## Logging
