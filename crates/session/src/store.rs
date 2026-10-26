@@ -307,9 +307,17 @@ impl SessionStore {
     /// lease. Every path that attaches an existing session to a runtime must
     /// use this method before it repairs the session or builds model context,
     /// so the new owner continues from the complete durable history.
+    ///
+    /// This is also the coordination point with [`delete_session`]: a delete
+    /// holds the same lease while it removes the file, so a load that raced
+    /// with it either takes the lease first (and the delete is refused) or
+    /// finds the file gone here and gets [`SessionError::NotFound`].
     pub fn acquire_active_and_reload(&self, session: &mut Session) -> Result<SessionActiveLease> {
         let lease = self.acquire_active(session)?;
         if let Some(path) = session.path().cloned() {
+            if !path.exists() {
+                return Err(SessionError::NotFound(session.id().to_string()));
+            }
             let reloaded = self.load_path(&path)?;
             if reloaded.id() != session.id() {
                 return Err(SessionError::InvalidEvent(
@@ -2693,6 +2701,22 @@ mod tests {
         assert!(matches!(
             stale.events.last().map(|record| &record.event),
             Some(SessionEvent::UserMessage { .. })
+        ));
+    }
+
+    #[test]
+    fn load_that_races_a_delete_reports_not_found() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        // Another process loaded the session, then a delete ran before the
+        // loader took the active lease.
+        let mut loaded = store.load_path(session.path().unwrap()).unwrap();
+        assert!(delete_session(root.path(), &session.id()).unwrap());
+        assert!(matches!(
+            store.acquire_active_and_reload(&mut loaded),
+            Err(SessionError::NotFound(_))
         ));
     }
 
