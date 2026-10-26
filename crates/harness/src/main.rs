@@ -233,7 +233,14 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     // monotonic clock; each line reports time since process start.
     let started = std::time::Instant::now();
     let since_start = || started.elapsed().as_millis() as u64;
-    let config: Config = Config::resolve(&cli)?;
+    // ACP sessions use only the MCP servers the editor declares. Replace the
+    // local list with an empty one, so a broken or unexpandable local server
+    // (for example an unset ${VAR}) cannot stop ACP from starting.
+    let config: Config = if matches!(&cli.command, Some(Command::Acp)) {
+        Config::resolve_with_mcp(&cli, Some(&[]))?
+    } else {
+        Config::resolve(&cli)?
+    };
     tracing::info!(stage = "config", elapsed_ms = since_start());
 
     let workspace_root =
