@@ -230,7 +230,8 @@ pub(crate) fn welcome_lines(
 
 /// Fit fixed chrome onto one terminal row without splitting wide characters.
 fn fit_single_line(text: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(text) <= width {
+    let text = &sanitize_terminal_text(text).replace('\n', " ");
+    if UnicodeWidthStr::width(text.as_str()) <= width {
         return text.to_owned();
     }
     if width == 0 {
@@ -390,12 +391,15 @@ fn line_width(line: &Line<'_>) -> usize {
 }
 
 /// Fit a styled row to a terminal-column budget without leaking controls or
-/// emitting a wide glyph into a smaller remaining space.
+/// emitting a wide glyph into a smaller remaining space. The result is one
+/// physical row: a line break inside the content (for example in a model,
+/// branch, or separator label) becomes a space, because layout counts this
+/// row once and an extra row would move the cursor off its position.
 pub(crate) fn fit_line_to_width(line: &Line<'_>, width: usize) -> Line<'static> {
     let mut spans = Vec::new();
     let mut used = 0usize;
     for span in &line.spans {
-        let content = sanitize_terminal_text(span.content.as_ref());
+        let content = sanitize_terminal_text(span.content.as_ref()).replace('\n', " ");
         let mut kept = String::new();
         for character in content.chars() {
             let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
@@ -1241,6 +1245,19 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fitted_rows_never_contain_line_breaks() {
+        let line = Line::from(vec![Span::raw("model\nname"), Span::raw("\r\nbranch")]);
+        let fitted = fit_line_to_width(&line, 80);
+        let text = fitted
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(!text.contains('\n') && !text.contains('\r'), "{text:?}");
+        assert!(!fit_single_line("a\nb", 80).contains('\n'));
     }
 
     #[test]
