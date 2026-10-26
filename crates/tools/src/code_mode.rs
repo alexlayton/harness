@@ -144,7 +144,7 @@ impl CodeMode {
                         "Call tools[\"name\"](**keyword_arguments), using names and arguments from the catalogue below. Calls are synchronous and sequential; do not await them or use asyncio.gather. ",
                         "Return a concise combined result with only the facts needed for the answer. Extract relevant fields or text inside Python instead of printing complete reports, debug logs, or successful preflight output. ",
                         "The final expression is returned; print() is supplementary output and also enters model context. Once the result is sufficient, answer the user directly. ",
-                        "Tools with structured JSON return that JSON as Python dict/list/scalars; other tools return display text as str. Do not assume text results are JSON. Failed tools raise RuntimeError. ",
+                        "Tools with structured JSON return that JSON as Python dict/list/scalars; other tools (and structured results too large to convert) return display text as str. Do not assume text results are JSON. Failed tools raise RuntimeError. ",
                         "Only the listed functions are allowed. No direct filesystem, environment, network, clock, or OS access. No built-in shell, subagents, recursive code execution, third-party packages, or state between calls. ",
                         "Limits: 32 KiB code, 50 nested calls, 50 KiB arguments/results/output, 5 seconds total interpreter execution, 120 seconds elapsed time. ",
                         "On failure inspect the started-call summary before retrying: completed changes are not rolled back. Execution is in-process, not crash-isolated or a memory security boundary. ",
@@ -353,7 +353,16 @@ impl CodeMode {
                             match structured {
                                 Some(value) => match json_to_monty(&value, 0) {
                                     Ok(value) => ExtFunctionResult::Return(value),
-                                    Err(error) => exception(&error),
+                                    // The call succeeded (and may have had
+                                    // side effects). Raising would invite the
+                                    // code to retry it, so return the display
+                                    // text with a note instead.
+                                    Err(error) => {
+                                        ExtFunctionResult::Return(MontyObject::string(&format!(
+                                            "{}\n[structured result not returned: {error}; this is the display text]",
+                                            output.content
+                                        )))
+                                    }
                                 },
                                 None => {
                                     ExtFunctionResult::Return(MontyObject::string(&output.content))
