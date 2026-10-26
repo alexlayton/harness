@@ -248,7 +248,6 @@ struct Completion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionKind {
     Slash,
-    Session,
     Model,
     Path,
 }
@@ -1108,8 +1107,8 @@ impl CrossTerm {
             return;
         }
         self.cancel_path_completion();
+        // Session arguments use the path-completion scan above.
         let kind = match result.context.target {
-            CompletionTarget::Argument(ArgumentKind::Session) => CompletionKind::Session,
             CompletionTarget::Argument(ArgumentKind::Model) => CompletionKind::Model,
             _ => CompletionKind::Slash,
         };
@@ -1123,9 +1122,9 @@ impl CrossTerm {
         old_value: Option<String>,
     ) {
         if result.candidates.is_empty() {
-            // Keep a session list open (empty) so Tab can request it; close
+            // Keep a model list open (empty) so Tab can request it; close
             // everything else.
-            if matches!(kind, CompletionKind::Session | CompletionKind::Model) {
+            if kind == CompletionKind::Model {
                 self.completion = Some(Completion {
                     context: result.context,
                     candidates: Vec::new(),
