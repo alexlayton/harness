@@ -27,6 +27,24 @@ use tokio_util::sync::CancellationToken;
 use tools::{ToolConfig, default_registry};
 use tui::{ContextFileEntry, CrossTerm, StartupEntries};
 
+/// Turn a finished agent task into an error when it panicked (or was
+/// aborted), keeping the panic message when it is a string.
+fn agent_task_outcome(result: Result<(), tokio::task::JoinError>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_panic() => {
+            let payload = error.into_panic();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            anyhow::bail!("the agent stopped unexpectedly (panic: {message})")
+        }
+        Err(error) => anyhow::bail!("the agent stopped unexpectedly: {error}"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match main_inner().await {
@@ -487,7 +505,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let ui_result = ui.run(ui_event_rx, tui_input_tx, cancel.clone()).await;
     cancel.cancel();
     let _ = input_task.await;
-    let _ = agent_task.await;
+    let agent_result = agent_task.await;
     let _ = event_task.await;
     if let Some((reporter, task)) = herdr_reporter {
         drop(reporter);
@@ -497,5 +515,24 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         }
     }
     ui_result?;
+    // A panicking agent closes its event channel, which ends the TUI like a
+    // normal quit. Report it (after the terminal is restored) and exit
+    // non-zero instead of claiming success.
+    agent_task_outcome(agent_result)?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_task_outcome;
+
+    #[tokio::test]
+    async fn agent_panic_is_reported_instead_of_success() {
+        // The panic message is printed by the default hook; the hook is
+        // process-global, so it is not replaced in a parallel test run.
+        let result = tokio::spawn(async { panic!("agent exploded") }).await;
+        let error = agent_task_outcome(result).unwrap_err().to_string();
+        assert!(error.contains("agent exploded"), "{error}");
+        assert!(agent_task_outcome(Ok(())).is_ok());
+    }
 }
