@@ -861,12 +861,7 @@ fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
 }
 
 fn load_session_file(path: &Path) -> Result<Session> {
-    let contents = read_file(path)?;
-    let (mut session, recovery) = decode_session_file_bytes(&contents, path)?;
-    session.path = Some(path.to_path_buf());
-    session.validated_bytes = recovery.valid_bytes;
-    session.file_identity = Some(file_identity(path)?);
-    Ok(session)
+    load_session_file_for_append(path).map(|(session, _)| session)
 }
 
 /// Re-read a session file for appending: returns the decoded session plus
