@@ -294,7 +294,13 @@ impl Tool for BashTool {
             // write, and close operations needed between fork and exec. It
             // runs before the shell can fork any user descendants.
             unsafe {
-                command_builder.pre_exec(move || attach_pid_to_cgroup(&cgroup_procs));
+                // A failed attach (for example a cgroup that became
+                // unwritable) must not fail the command: the process group
+                // below still contains it, and terminate_tree signals both.
+                command_builder.pre_exec(move || {
+                    let _ = attach_pid_to_cgroup(&cgroup_procs);
+                    Ok(())
+                });
             }
         }
         let mut child = match command_builder.spawn() {
