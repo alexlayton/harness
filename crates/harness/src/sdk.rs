@@ -142,7 +142,10 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         .map(Ok)
         .unwrap_or_else(std::env::current_dir)
         .context("resolve workspace directory")?;
-    let workspace = std::fs::canonicalize(workspace).context("resolve workspace directory")?;
+    // Setup reads config, context files, skills, and the session store; keep
+    // that file work off the caller's async worker.
+    let workspace = tools::blocking_io(|| std::fs::canonicalize(workspace))
+        .context("resolve workspace directory")?;
     ensure!(workspace.is_dir(), "workspace must be a directory");
     ensure!(!cancel.is_cancelled(), "Harness run cancelled");
     let provider = build_provider_with_auths(
@@ -151,12 +154,14 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
     )?;
-    let context = project_context_for(&workspace, options.no_context_files);
-    let mut tool_config = ToolConfig::new(&workspace, config.rtk);
-    if let Some(skills) = options.skill_catalog(&workspace)? {
-        tool_config = tool_config.with_skills(skills);
-    }
-    let tools = default_registry(tool_config)?;
+    let (context, tools) = tools::blocking_io(|| -> Result<_> {
+        let context = project_context_for(&workspace, options.no_context_files);
+        let mut tool_config = ToolConfig::new(&workspace, config.rtk);
+        if let Some(skills) = options.skill_catalog(&workspace)? {
+            tool_config = tool_config.with_skills(skills);
+        }
+        Ok((context, default_registry(tool_config)?))
+    })?;
     let mut builder = AgentBuilder::new(
         provider.clone(),
         config.model.clone(),
@@ -180,17 +185,20 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         builder = builder.with_code_mode(tools.clone());
     }
     if !options.no_session {
-        let store = SessionStore::default_for_workspace(&workspace)?;
-        let session = match options.resume {
-            Some(selector) => store
-                .load(&selector)
-                .with_context(|| format!("load session `{selector}`"))?,
-            None => store.create(SessionCreateOptions {
-                provider: Some(provider.name().to_owned()),
-                model: Some(config.model.clone()),
-                ..SessionCreateOptions::default()
-            })?,
-        };
+        let (store, session) = tools::blocking_io(|| -> Result<_> {
+            let store = SessionStore::default_for_workspace(&workspace)?;
+            let session = match &options.resume {
+                Some(selector) => store
+                    .load(selector)
+                    .with_context(|| format!("load session `{selector}`"))?,
+                None => store.create(SessionCreateOptions {
+                    provider: Some(provider.name().to_owned()),
+                    model: Some(config.model.clone()),
+                    ..SessionCreateOptions::default()
+                })?,
+            };
+            Ok((store, session))
+        })?;
         builder = builder.with_session(store, session);
     }
     let assembled = builder.build().await?;

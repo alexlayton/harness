@@ -842,10 +842,12 @@ async fn new_session_inner(
     if let Err(error) = assembly_cancelled(&cancel) {
         return respond_anyhow(responder, error);
     }
-    let session = match store.create(SessionCreateOptions {
-        provider: Some(state.provider.name().to_owned()),
-        model: Some(state.config.model.clone()),
-        ..SessionCreateOptions::default()
+    let session = match tools::blocking_io(|| {
+        store.create(SessionCreateOptions {
+            provider: Some(state.provider.name().to_owned()),
+            model: Some(state.config.model.clone()),
+            ..SessionCreateOptions::default()
+        })
     }) {
         Ok(session) => session,
         Err(error) => return respond_anyhow(responder, error.into()),
@@ -978,7 +980,7 @@ async fn load_session_inner(
     if let Err(error) = assembly_cancelled(&cancel) {
         return respond_anyhow(responder, error);
     }
-    let session = match store.open(&parsed_id) {
+    let session = match tools::blocking_io(|| store.open(&parsed_id)) {
         Ok(session) => session,
         Err(error) => {
             return respond_anyhow(
@@ -1043,9 +1045,11 @@ fn list_sessions(request: &ListSessionsRequest, state: &AcpState) -> ListSession
     let cwd = request.cwd.clone().unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
-    let entries = SessionStore::new(&state.session_root, &cwd)
-        .and_then(|store| store.list())
-        .unwrap_or_default();
+    // Listing opens the store (salt) and indexes every session file.
+    let entries = tools::blocking_io(|| {
+        SessionStore::new(&state.session_root, &cwd).and_then(|store| store.list())
+    })
+    .unwrap_or_default();
     ListSessionsResponse::new(
         entries
             .into_iter()
