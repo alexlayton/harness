@@ -85,25 +85,21 @@ fn injected_sync_parent_failure() -> bool {
 // would return for a real `fsync` failure, so agent turn-boundary tests
 // can prove a failed flush quarantines (AGENT-1) without touching the OS.
 //
-// The flag itself is test-only, but the guard type is always compiled: the
-// agent crate's `#[cfg(test)]` boundary tests need to name it, and
-// `#[cfg(test)]` on an imported type does not propagate across crates.
-// The `arm` body is test-only (production builds get a no-op guard).
+// `#[cfg(test)]` does not reach a dependency built for another crate's
+// tests, so the seam is also compiled with the `test-hooks` feature, which
+// the agent crate enables only as a dev-dependency. Normal builds contain
+// no hook.
 // (Plain `//` comments: `thread_local!` is a macro invocation, which
 // rustdoc denies `///` docs on.)
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     static INJECT_SYNC_SESSION_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
 /// Whether the deferred-sync flush should fail. Test-only.
-///
-/// Always compiled (not `#[cfg(test)]`): the agent crate's `#[cfg(test)]`
-/// boundary tests call through [`SyncSessionFaultGuard::arm`], and a
-/// `#[cfg(test)]` gate here would not be active when compiling the session
-/// dependency for the agent's test build. The body is test-only — in
-/// production builds the flag is never armed, so this always returns false.
-pub fn injected_sync_session_failure() -> bool {
+#[cfg(any(test, feature = "test-hooks"))]
+fn injected_sync_session_failure() -> bool {
     INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.get())
 }
 
@@ -115,9 +111,12 @@ struct HardeningFaultGuard;
 
 /// Hold the deferred-sync flush failure flag for an agent boundary test and
 /// clear it on drop (including on panic). The agent crate cannot touch the
-/// private thread-local directly, so this constructor is the seam.
+/// private thread-local directly, so this constructor is the seam. Only
+/// available with the `test-hooks` feature.
+#[cfg(any(test, feature = "test-hooks"))]
 pub struct SyncSessionFaultGuard;
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl SyncSessionFaultGuard {
     pub fn arm() -> Self {
         INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(true));
@@ -125,6 +124,7 @@ impl SyncSessionFaultGuard {
     }
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for SyncSessionFaultGuard {
     fn drop(&mut self) {
         INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(false));
@@ -241,6 +241,7 @@ impl SessionStore {
     /// every record appended so far survives power loss. Cheap to call
     /// repeatedly; a no-op when the session has no file (memory-only).
     pub fn sync_session(&self, session: &Session) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
         if injected_sync_session_failure() {
             return Err(io_error(
                 "sync session",

@@ -32,6 +32,7 @@ pub use model::{
     UsageSummary, context_messages, events_after_latest_compaction, latest_compaction_boundary,
     snapshot_entries, usage_summary,
 };
+#[cfg(any(test, feature = "test-hooks"))]
 pub use store::SyncSessionFaultGuard;
 pub use store::{
     SessionActiveLease, SessionCreateOptions, SessionIndexEntry, SessionStore, default_session_dir,

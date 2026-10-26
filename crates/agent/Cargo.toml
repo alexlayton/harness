@@ -19,4 +19,5 @@ tokio-util = "0.7"
 tracing = "0.1"
 
 [dev-dependencies]
+session = { workspace = true, features = ["test-hooks"] }
 tempfile = "3"
