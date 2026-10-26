@@ -103,6 +103,16 @@ pub fn export_transcript(session: &Session, destination: Option<&Path>) -> Resul
                 output.push_str("## Assistant\n");
                 output.push_str(&message_text(message));
                 output.push_str("\n\n");
+                // Calls embedded with opaque provider state are listed like
+                // standalone calls.
+                for content in &message.content {
+                    if let StoredContent::ToolCall {
+                        name, arguments, ..
+                    } = content
+                    {
+                        output.push_str(&format!("## Tool call: {name}\n{arguments}\n\n"));
+                    }
+                }
             }
             SessionEvent::ToolCall { call } => {
                 output.push_str(&format!(
