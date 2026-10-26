@@ -3,7 +3,7 @@ name = "auth"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
-description = "GitHub Copilot authentication and private credential storage for Harness"
+description = "GitHub Copilot, OpenAI Codex, and Anthropic Claude subscription authentication and private credential storage for Harness"
 
 [dependencies]
 fs2 = "0.4"

@@ -34,7 +34,7 @@ harness-python ── harness ──┬── agent ──┬── compact ─�
 | `compact` | Token estimation, compaction policy and planning, and summary generation. |
 | `session` | Append-only JSONL format, locking, replay, export, and provider-history reconstruction. |
 | `llm` | Provider-neutral types, provider clients, retry behavior, SSE handling, and wire-format dialects. |
-| `auth` | Copilot and OpenAI Codex OAuth, refresh, and private credential storage. |
+| `auth` | GitHub Copilot, OpenAI Codex, and Anthropic Claude subscription OAuth, refresh, and private credential storage. |
 | `tools` | Built-in tools, registry, scheduling metadata, path checks, project context, skills, and the subagent interface. |
 | `mcp` | External MCP process lifecycle, tool discovery, namespacing, and tool adapters. |
 
