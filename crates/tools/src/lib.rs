@@ -336,6 +336,22 @@ fn resolve_registry_workspace(cwd: &Path) -> Result<PathBuf, ToolInitError> {
     })
 }
 
+/// Run blocking file work (reads, `fsync`, bounded lock waits) from async
+/// code without stalling the other tasks on this Tokio worker.
+///
+/// On the multi-thread runtime, `block_in_place` first hands the worker's
+/// queued tasks to another thread. The current-thread runtime (unit tests
+/// and some embedders) cannot do that, and calling `block_in_place` there
+/// panics, so `f` runs inline.
+pub fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// Directories searched for project context (instructions and skills),
 /// nearest first: `start` and each ancestor up to and including the git
 /// repository root.  Without a git root only `start` is returned: walking to

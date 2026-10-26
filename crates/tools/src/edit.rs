@@ -268,51 +268,18 @@ async fn execute_edit_validated(
     check_cancelled(cancel)?;
     #[cfg(unix)]
     if let Some(root) = root {
-        let owned_fs;
-        let fs = if let Some(workspace_fs) = workspace_fs {
-            workspace_fs
-        } else {
-            owned_fs = WorkspaceFs::open_root(root)
-                .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-            &owned_fs
-        };
-        let fd = super::vfs::unix::open_file_relative(fs, components)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        let mut file = std::fs::File::from(fd);
-        let original_bytes = read_edit_file(&mut file, path)?;
-        check_cancelled(cancel)?;
-        if original_bytes.contains(&0) {
-            return Err(format!(
-                "Could not edit file: {path}. Binary files are not supported."
-            ));
-        }
-        let raw_content = String::from_utf8(original_bytes).map_err(|_| {
-            format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
+        // Opening, reading (up to 4 MiB twice), matching, and the metadata
+        // lookups are blocking work; keep them off the async worker. The
+        // write itself is async.
+        let PreparedEdit {
+            applied,
+            final_content,
+            existing_permissions,
+            parent_fd,
+            name,
+        } = super::blocking_io(|| {
+            prepare_edit(path, root, workspace_fs, components, edits, cancel)
         })?;
-        let (bom, content) = strip_bom(&raw_content);
-        let applied = apply_edits_exact(content, edits, path)?;
-        check_cancelled(cancel)?;
-        let mut final_content = String::with_capacity(bom.len() + applied.new_content.len());
-        final_content.push_str(bom);
-        final_content.push_str(&applied.new_content);
-        // Re-read from the same handle before committing.
-        let fd = super::vfs::unix::open_file_relative(fs, components)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        let mut current = std::fs::File::from(fd);
-        let current_bytes = read_edit_file(&mut current, path)?;
-        if current_bytes != raw_content.as_bytes() {
-            return Err(format!(
-                "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
-            ));
-        }
-        check_cancelled(cancel)?;
-        let existing_permissions = Some(
-            super::vfs::unix::open_file_metadata(fs, components)
-                .map(|metadata| metadata.permissions())
-                .map_err(|error| format!("Could not edit file: {path}. {error}"))?,
-        );
-        let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
         super::file_mutation::atomic_write_at(
             &parent_fd,
             &name,
@@ -344,6 +311,81 @@ async fn execute_edit_validated(
         let _ = (path, root, workspace_fs, components, edits, cancel);
         Err(WorkspaceFs::unsupported_operation("edit").to_string())
     }
+}
+
+/// Everything the handle-relative edit needs before its async write.
+#[cfg(unix)]
+struct PreparedEdit {
+    applied: AppliedEdits,
+    final_content: String,
+    existing_permissions: Option<std::fs::Permissions>,
+    parent_fd: std::os::fd::OwnedFd,
+    name: String,
+}
+
+/// Blocking part of a handle-relative edit: read, match, re-read to detect
+/// a concurrent change, and open the parent for the atomic write.
+#[cfg(unix)]
+fn prepare_edit(
+    path: &str,
+    root: &Path,
+    workspace_fs: Option<&WorkspaceFs>,
+    components: &[String],
+    edits: &[Edit],
+    cancel: &CancellationToken,
+) -> Result<PreparedEdit, String> {
+    let owned_fs;
+    let fs = if let Some(workspace_fs) = workspace_fs {
+        workspace_fs
+    } else {
+        owned_fs = WorkspaceFs::open_root(root)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        &owned_fs
+    };
+    let fd = super::vfs::unix::open_file_relative(fs, components)
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    let mut file = std::fs::File::from(fd);
+    let original_bytes = read_edit_file(&mut file, path)?;
+    check_cancelled(cancel)?;
+    if original_bytes.contains(&0) {
+        return Err(format!(
+            "Could not edit file: {path}. Binary files are not supported."
+        ));
+    }
+    let raw_content = String::from_utf8(original_bytes).map_err(|_| {
+        format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
+    })?;
+    let (bom, content) = strip_bom(&raw_content);
+    let applied = apply_edits_exact(content, edits, path)?;
+    check_cancelled(cancel)?;
+    let mut final_content = String::with_capacity(bom.len() + applied.new_content.len());
+    final_content.push_str(bom);
+    final_content.push_str(&applied.new_content);
+    // Re-read from the same handle before committing.
+    let fd = super::vfs::unix::open_file_relative(fs, components)
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    let mut current = std::fs::File::from(fd);
+    let current_bytes = read_edit_file(&mut current, path)?;
+    if current_bytes != raw_content.as_bytes() {
+        return Err(format!(
+            "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
+        ));
+    }
+    check_cancelled(cancel)?;
+    let existing_permissions = Some(
+        super::vfs::unix::open_file_metadata(fs, components)
+            .map(|metadata| metadata.permissions())
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?,
+    );
+    let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    Ok(PreparedEdit {
+        applied,
+        final_content,
+        existing_permissions,
+        parent_fd,
+        name,
+    })
 }
 
 #[cfg(unix)]

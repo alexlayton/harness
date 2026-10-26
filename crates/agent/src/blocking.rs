@@ -1,21 +1,7 @@
-//! Blocking session I/O from async code.
+//! Blocking session I/O from async code. The helper lives in `tools`, which
+//! uses it for file tools, so both crates share one runtime policy.
 
-/// Run blocking session I/O (appends, `fsync`, bounded lock waits) without
-/// stalling the other tasks on this Tokio worker.
-///
-/// On the multi-thread runtime, `block_in_place` first hands the worker's
-/// queued tasks to another thread, so the UI event forwarder, MCP clients,
-/// and parallel tools keep running while a disk flush waits. The
-/// current-thread runtime (unit tests and some embedders) cannot do that,
-/// and calling `block_in_place` there panics, so `f` runs inline as before.
-pub(crate) fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(f)
-        }
-        _ => f(),
-    }
-}
+pub(crate) use tools::blocking_io;
 
 #[cfg(test)]
 mod tests {
