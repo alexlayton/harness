@@ -843,7 +843,7 @@ impl CrossTerm {
     ) -> Result<bool> {
         let Event::Key(key) = event else {
             if let Event::Paste(text) = event {
-                let text = render::sanitize_terminal_text(text);
+                let text = render::sanitize_terminal_text(&normalize_paste_newlines(text));
                 insert_text(&mut self.input, &mut self.cursor, &text);
                 self.refresh_completion();
             }
@@ -2760,6 +2760,13 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     });
 }
 
+/// Many terminals deliver pasted line breaks as CR (or CRLF). The sanitizer
+/// drops CR as a control character, which joined every pasted line into
+/// one; turn both forms into LF first.
+fn normalize_paste_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Lock the shared terminal state. A panic while the lock was held must not
 /// stop later restoration, so a poisoned lock is recovered: the state only
 /// records which modes still need to be undone.
@@ -4048,6 +4055,15 @@ mod tests {
             TRANSCRIPT_BUDGET_BYTES,
         );
         assert_eq!((window.kept.len(), window.dropped), (1, 0));
+    }
+
+    #[test]
+    fn pasted_cr_line_breaks_are_kept() {
+        assert_eq!(normalize_paste_newlines("a\rb\r\nc\n"), "a\nb\nc\n");
+        assert_eq!(
+            render::sanitize_terminal_text(&normalize_paste_newlines("one\rtwo")),
+            "one\ntwo"
+        );
     }
 
     #[test]
