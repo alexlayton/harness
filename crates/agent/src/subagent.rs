@@ -568,8 +568,10 @@ impl SubagentRunnerImpl {
             };
 
             let mut text = String::new();
-            let mut opaque = Vec::<(String, serde_json::Value)>::new();
-            let mut tool_calls = Vec::<llm::ToolCall>::new();
+            // Opaque provider state and tool calls in stream order: Codex
+            // requires encrypted reasoning to stay interleaved with calls
+            // when the next request is rebuilt.
+            let mut items = Vec::<Content>::new();
             let mut stream_error = None;
             loop {
                 tokio::select! {
@@ -577,9 +579,11 @@ impl SubagentRunnerImpl {
                         Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
                         Some(Ok(StreamEvent::ReasoningDelta(_))) => {}
                         Some(Ok(StreamEvent::OpaqueState { provider, data })) => {
-                            opaque.push((provider, data));
+                            items.push(Content::Opaque { provider, data });
                         }
-                        Some(Ok(StreamEvent::ToolCallComplete(call))) => tool_calls.push(call),
+                        Some(Ok(StreamEvent::ToolCallComplete(call))) => {
+                            items.push(Content::ToolCall(call));
+                        }
                         // Child usage lands in the child session only, so
                         // parent totals never double-count delegated work.
                         Some(Ok(StreamEvent::Done {
@@ -602,8 +606,15 @@ impl SubagentRunnerImpl {
                 }
             }
 
-            append_assistant(history, &text, &opaque, tool_calls.clone());
-            for event in assistant_events(&text, &opaque, &tool_calls) {
+            let tool_calls = items
+                .iter()
+                .filter_map(|item| match item {
+                    Content::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            crate::agent::append_assistant(history, "", &text, &items);
+            for event in crate::agent::assistant_session_events("", &text, &items) {
                 Self::persist(&self.store, session, event);
             }
 
@@ -795,63 +806,6 @@ fn push_request_note(history: &mut Vec<Message>, note: &str) {
     }
 }
 
-/// Append an assistant message and provider continuation state to history.
-fn append_assistant(
-    history: &mut Vec<Message>,
-    text: &str,
-    opaque: &[(String, serde_json::Value)],
-    calls: Vec<llm::ToolCall>,
-) {
-    if text.is_empty() && opaque.is_empty() && calls.is_empty() {
-        return;
-    }
-    let mut content = Vec::new();
-    if !text.is_empty() {
-        content.push(Content::Text(text.to_owned()));
-    }
-    content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-        provider: provider.clone(),
-        data: data.clone(),
-    }));
-    content.extend(calls.into_iter().map(Content::ToolCall));
-    history.push(Message {
-        role: Role::Assistant,
-        content,
-    });
-}
-
-/// Build the durable events for one assistant exchange, mirroring
-/// `Agent::persist_assistant`: the `AssistantMessage` event carries text (and
-/// reasoning, which children do not produce) ONLY — never tool calls — and
-/// each call is emitted exactly once as a standalone `SessionEvent::ToolCall`.
-/// Putting calls in both places used to make session validation reject the
-/// duplicate, leaving exports with orphaned tool results. A response that
-/// contains only tool calls emits no message event at all.
-fn assistant_events(
-    text: &str,
-    opaque: &[(String, serde_json::Value)],
-    calls: &[llm::ToolCall],
-) -> Vec<session::SessionEvent> {
-    let mut events = Vec::new();
-    if !text.is_empty() || !opaque.is_empty() {
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(Content::Text(text.to_owned()));
-        }
-        content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-            provider: provider.clone(),
-            data: data.clone(),
-        }));
-        events.push(session::SessionEvent::AssistantMessage {
-            message: session::StoredMessage::from_llm(&Message::assistant(content)),
-        });
-    }
-    events.extend(calls.iter().map(|call| session::SessionEvent::ToolCall {
-        call: session::StoredToolCall::from(call),
-    }));
-    events
-}
-
 /// Give every streamed-but-unexecuted tool call a failed result so history
 /// stays provider-valid, then record the same durably.
 fn mark_calls_failed(
@@ -980,6 +934,62 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn opaque_state_stays_interleaved_with_tool_calls() {
+        // Codex continuation state must keep its position between calls.
+        let call = |id: &str| {
+            Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
+                id: id.into(),
+                name: "missing".into(),
+                arguments: serde_json::json!({}),
+            }))
+        };
+        let opaque = |n: u64| {
+            Ok(StreamEvent::OpaqueState {
+                provider: "openai-codex".into(),
+                data: serde_json::json!({ "n": n }),
+            })
+        };
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                opaque(1),
+                call("a"),
+                opaque(2),
+                call("b"),
+                ScriptProvider::done("tool_calls"),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta("report".into())),
+                ScriptProvider::done("stop"),
+            ],
+        ]));
+        let runner = runner_with(provider.clone());
+        runner
+            .run(
+                "audit",
+                "go",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (_, _, messages) = &provider.seen.lock().unwrap()[1];
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .unwrap();
+        let order = assistant
+            .content
+            .iter()
+            .map(|content| match content {
+                Content::Opaque { data, .. } => format!("o{}", data["n"]),
+                Content::ToolCall(call) => format!("c{}", call.id),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["o1", "ca", "o2", "cb"]);
     }
 
     #[tokio::test]

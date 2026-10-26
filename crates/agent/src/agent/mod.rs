@@ -31,6 +31,7 @@ pub use events::{
     AgentEvent, CompactionReason, InputMessage, SessionListItem, SessionSnapshotEntry, TurnError,
 };
 pub use persistence::AgentSessionState;
+pub(crate) use persistence::assistant_session_events;
 use persistence::{ui_snapshot_entries, usage_event};
 use prewalk::PrewalkState;
 pub use prewalk::{PrewalkChange, PrewalkSettings, PrewalkTarget};
@@ -40,7 +41,7 @@ pub(crate) use tool_dispatch::{
     MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch_with_secrets,
     plan_tool_batches,
 };
-pub(crate) use turn::TurnControl;
+pub(crate) use turn::{TurnControl, append_assistant};
 
 /// Maximum number of times a turn re-streams after a recoverable failure:
 /// malformed tool-call arguments, a retryable mid-stream error, or an empty
