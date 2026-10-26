@@ -652,7 +652,7 @@ impl CrossTerm {
 
     pub async fn run(
         mut self,
-        mut events: mpsc::UnboundedReceiver<UiEvent>,
+        mut events: mpsc::Receiver<UiEvent>,
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()> {
@@ -670,7 +670,7 @@ impl CrossTerm {
 
     async fn run_inner(
         &mut self,
-        events: &mut mpsc::UnboundedReceiver<UiEvent>,
+        events: &mut mpsc::Receiver<UiEvent>,
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()> {
@@ -702,8 +702,7 @@ impl CrossTerm {
                 }
                 maybe_event = events.recv() => {
                     let Some(event) = maybe_event else { return Ok(()) };
-                    self.apply_event(event);
-                    self.drain_queued_events(events);
+                    self.drain_queued_events(event, events);
                     self.paint()?;
                 }
                 maybe_path = self.path_completion_rx.recv() => {
@@ -735,22 +734,41 @@ impl CrossTerm {
 
     /// Coalesced painting: an agent burst (streaming deltas, tool start/finish
     /// pairs, notices) arrives as many channel events within a few
-    /// milliseconds. Apply what is already queued so one paint covers the
-    /// burst, but stop after [`EVENT_DRAIN_MAX_EVENTS`] events or
+    /// milliseconds. Apply `first` and what is already queued so one paint
+    /// covers the burst, but stop after [`EVENT_DRAIN_MAX_EVENTS`] events or
     /// [`EVENT_DRAIN_BUDGET`], so a producer that never lets the queue empty
     /// cannot starve input. `try_recv` never blocks, so this adds no latency.
-    /// Returns the number of events applied.
-    fn drain_queued_events(&mut self, events: &mut mpsc::UnboundedReceiver<UiEvent>) -> usize {
+    ///
+    /// Adjacent text (or reasoning) deltas are merged before they are
+    /// applied: each applied text delta refreshes the streaming markdown
+    /// cache, so one merged delta per drain avoids that work per token.
+    /// Returns the number of events received.
+    fn drain_queued_events(
+        &mut self,
+        first: UiEvent,
+        events: &mut mpsc::Receiver<UiEvent>,
+    ) -> usize {
         let started = std::time::Instant::now();
-        let mut applied = 0;
-        while applied < EVENT_DRAIN_MAX_EVENTS && started.elapsed() < EVENT_DRAIN_BUDGET {
-            let Ok(event) = events.try_recv() else {
+        let mut pending = first;
+        let mut received = 1;
+        while received < EVENT_DRAIN_MAX_EVENTS && started.elapsed() < EVENT_DRAIN_BUDGET {
+            let Ok(next) = events.try_recv() else {
                 break;
             };
-            self.apply_event(event);
-            applied += 1;
+            received += 1;
+            match (&mut pending, next) {
+                (UiEvent::TextDelta(text), UiEvent::TextDelta(more))
+                | (UiEvent::ReasoningDelta(text), UiEvent::ReasoningDelta(more)) => {
+                    text.push_str(&more);
+                }
+                (_, next) => {
+                    let ready = std::mem::replace(&mut pending, next);
+                    self.apply_event(ready);
+                }
+            }
         }
-        applied
+        self.apply_event(pending);
+        received
     }
 
     /// Rewrite only the activity row in place, leaving the rest of the live
@@ -4036,14 +4054,31 @@ mod tests {
     fn event_drain_is_bounded_while_the_queue_stays_full() {
         // A producer that keeps the channel non-empty must not hold the loop
         // away from terminal input for longer than one bounded drain.
-        let mut ui = ui(80, 24);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut first = ui(80, 24);
+        let (tx, mut rx) = mpsc::channel(EVENT_DRAIN_MAX_EVENTS * 4);
         for _ in 0..(EVENT_DRAIN_MAX_EVENTS * 4) {
-            tx.send(UiEvent::TextDelta("x".into())).unwrap();
+            tx.try_send(UiEvent::TextDelta("x".into())).unwrap();
         }
-        let applied = ui.drain_queued_events(&mut rx);
+        let applied = first.drain_queued_events(UiEvent::TextDelta("x".into()), &mut rx);
         assert!(applied <= EVENT_DRAIN_MAX_EVENTS);
         assert!(rx.try_recv().is_ok(), "the drain must leave work queued");
+        // Merged deltas keep every byte, in order.
+        assert_eq!(first.stream.as_ref().unwrap().markdown, "x".repeat(applied));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut ui = ui(80, 24);
+        for event in [
+            UiEvent::TextDelta("b".into()),
+            UiEvent::ReasoningDelta("r".into()),
+            UiEvent::TextDelta("c".into()),
+        ] {
+            tx.try_send(event).unwrap();
+        }
+        ui.drain_queued_events(UiEvent::TextDelta("a".into()), &mut rx);
+        let stream = ui.stream.as_ref().unwrap();
+        assert_eq!(
+            (stream.markdown.as_str(), stream.reasoning.as_str()),
+            ("abc", "r")
+        );
     }
 
     fn begin_ask(ui: &mut CrossTerm) -> mpsc::UnboundedReceiver<InputMessage> {

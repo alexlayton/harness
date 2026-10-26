@@ -263,6 +263,69 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
     }
 }
 
+/// Capacity of the channel from the event forwarder to the TUI. When the TUI
+/// falls behind, the forwarder waits for capacity instead of queueing an
+/// unbounded number of events in the channel.
+pub const UI_EVENT_CAPACITY: usize = 1024;
+
+/// UI events that are waiting for TUI channel capacity, in order.
+///
+/// Adjacent text deltas (and adjacent reasoning deltas) are merged while
+/// they wait, so a TUI that falls behind gets fewer, larger deltas, and the
+/// forwarder can keep draining the agent channel without growing a queue of
+/// small events. Every other event keeps its own place in the order.
+#[derive(Debug, Default)]
+pub struct PendingUiEvents(std::collections::VecDeque<tui::UiEvent>);
+
+impl PendingUiEvents {
+    pub fn push(&mut self, event: tui::UiEvent) {
+        match (self.0.back_mut(), event) {
+            (Some(tui::UiEvent::TextDelta(text)), tui::UiEvent::TextDelta(more))
+            | (Some(tui::UiEvent::ReasoningDelta(text)), tui::UiEvent::ReasoningDelta(more)) => {
+                text.push_str(&more);
+            }
+            (_, event) => self.0.push_back(event),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Send queued events while the channel has room. Returns `false` when
+    /// the TUI side is closed.
+    pub fn flush_ready(&mut self, sender: &mpsc::Sender<tui::UiEvent>) -> bool {
+        while let Some(event) = self.0.pop_front() {
+            match sender.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    self.0.push_front(event);
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        true
+    }
+
+    /// Send the oldest queued event through a reserved slot.
+    pub fn send_one(&mut self, permit: mpsc::Permit<'_, tui::UiEvent>) {
+        if let Some(event) = self.0.pop_front() {
+            permit.send(event);
+        }
+    }
+
+    /// Deliver everything left, waiting for capacity. Used after the agent
+    /// channel closed.
+    pub async fn finish(mut self, sender: &mpsc::Sender<tui::UiEvent>) {
+        while let Some(event) = self.0.pop_front() {
+            if sender.send(event).await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -603,5 +666,43 @@ mod tests {
                 reason: "overflow".into(),
             }
         );
+    }
+
+    #[test]
+    fn pending_ui_events_merge_adjacent_deltas_and_keep_order() {
+        let mut pending = PendingUiEvents::default();
+        for event in [
+            tui::UiEvent::TextDelta("a".into()),
+            tui::UiEvent::TextDelta("b".into()),
+            tui::UiEvent::ReasoningDelta("r".into()),
+            tui::UiEvent::ReasoningDelta("s".into()),
+            tui::UiEvent::TextDelta("c".into()),
+            tui::UiEvent::TurnFinished,
+            tui::UiEvent::TextDelta("d".into()),
+        ] {
+            pending.push(event);
+        }
+        let (sender, mut receiver) = mpsc::channel(2);
+        assert!(pending.flush_ready(&sender));
+        let mut received = Vec::new();
+        while !pending.is_empty() || !receiver.is_empty() {
+            while let Ok(event) = receiver.try_recv() {
+                received.push(event);
+            }
+            assert!(pending.flush_ready(&sender));
+        }
+        while let Ok(event) = receiver.try_recv() {
+            received.push(event);
+        }
+        let rendered = received
+            .iter()
+            .map(|event| match event {
+                tui::UiEvent::TextDelta(text) => format!("t:{text}"),
+                tui::UiEvent::ReasoningDelta(text) => format!("r:{text}"),
+                tui::UiEvent::TurnFinished => "done".into(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, ["t:ab", "r:rs", "t:c", "done", "t:d"]);
     }
 }

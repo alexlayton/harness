@@ -298,7 +298,9 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         mpsc::UnboundedReceiver<InputMessage>,
     ) = mpsc::unbounded_channel();
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
-    let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
+    // Bounded: a TUI that falls behind makes the forwarder wait (and merge
+    // deltas) instead of letting the channel grow without limit.
+    let (ui_event_tx, ui_event_rx) = mpsc::channel(tui_adapter::UI_EVENT_CAPACITY);
 
     // This catalog is local metadata, so a saved Claude login can populate
     // /model even when another provider is active. Do not refresh tokens or
@@ -308,7 +310,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     {
         let provider = llm::providers::AnthropicSubscriptionProvider::new(Arc::new(auth));
         if let Ok(models) = provider.list_models().await {
-            let _ = ui_event_tx.send(tui::UiEvent::ModelList {
+            let _ = ui_event_tx.try_send(tui::UiEvent::ModelList {
                 provider: provider.name().into(),
                 models: models
                     .into_iter()
@@ -399,9 +401,12 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         .map(|(reporter, _)| reporter.clone());
     let event_task = tokio::spawn(async move {
         let mut herdr_options = herdr_options;
+        let mut pending = tui_adapter::PendingUiEvents::default();
         loop {
             tokio::select! {
                 biased;
+                // Keep draining the agent so its side effects (config saves,
+                // herdr reports) stay current; UI events wait in `pending`.
                 event = runtime_event_rx.recv() => {
                     let Some(event) = event else { break };
                     // Config saves write and fsync a file. This task also
@@ -459,13 +464,19 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
                             _ => {}
                         }
                     }
-                    if ui_event_tx.send(tui_adapter::into_ui_event(event)).is_err() {
+                    pending.push(tui_adapter::into_ui_event(event));
+                    if !pending.flush_ready(&ui_event_tx) {
                         break;
                     }
+                }
+                permit = ui_event_tx.reserve(), if !pending.is_empty() => {
+                    let Ok(permit) = permit else { break };
+                    pending.send_one(permit);
                 }
                 _ = ui_event_tx.closed() => break,
             }
         }
+        pending.finish(&ui_event_tx).await;
     });
     let agent_task = tokio::spawn(agent.run(runtime_input_rx, runtime_event_tx));
 
