@@ -358,7 +358,7 @@ impl CodeMode {
                                     // code to retry it, so return the display
                                     // text with a note instead.
                                     Err(error) => {
-                                        ExtFunctionResult::Return(MontyObject::string(&format!(
+                                        ExtFunctionResult::Return(MontyObject::string(format!(
                                             "{}\n[structured result not returned: {error}; this is the display text]",
                                             output.content
                                         )))
