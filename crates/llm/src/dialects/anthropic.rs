@@ -277,6 +277,9 @@ struct PartialToolUse {
     id: String,
     name: String,
     arguments: String,
+    /// Non-empty `input` from `content_block_start`, used when no input
+    /// deltas follow.
+    initial_input: Option<Value>,
 }
 
 impl AnthropicParser {
@@ -317,6 +320,14 @@ impl AnthropicParser {
                                     .unwrap_or_default()
                                     .into(),
                                 arguments: String::new(),
+                                // Some endpoints send the complete input here
+                                // and no `input_json_delta` events.
+                                initial_input: block
+                                    .get("input")
+                                    .filter(|input| {
+                                        input.as_object().is_some_and(|object| !object.is_empty())
+                                    })
+                                    .cloned(),
                             },
                         );
                     }
@@ -483,7 +494,7 @@ impl AnthropicParser {
         }
         self.seen_tool_ids.insert(id.to_owned());
         let arguments = if tool.arguments.trim().is_empty() {
-            json!({})
+            tool.initial_input.unwrap_or_else(|| json!({}))
         } else {
             serde_json::from_str(&tool.arguments).map_err(|error| {
                 LlmError::Parse(format!("invalid Anthropic tool arguments: {error}"))
@@ -844,6 +855,24 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
         assert!(!parser.is_done());
+    }
+
+    #[test]
+    fn tool_input_from_block_start_is_kept_without_deltas() {
+        let mut parser = AnthropicParser::new();
+        let mut events = Vec::new();
+        for payload in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.rs"}}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            events.extend(parser.parse_payload(payload).unwrap());
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallComplete(call) if call.arguments == json!({"path": "a.rs"})
+        )));
     }
 
     #[test]
