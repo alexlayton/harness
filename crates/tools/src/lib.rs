@@ -7,6 +7,8 @@ mod find;
 mod grep;
 mod multigrep;
 mod outline;
+#[cfg(target_os = "linux")]
+pub mod process_scope;
 mod python;
 mod read;
 mod registry;

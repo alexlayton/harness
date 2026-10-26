@@ -167,8 +167,28 @@ type BoundedMcpTransport =
 /// Stdio transport using rmcp's protocol machinery with a pre-deserialization
 /// frame guard. The child remains owned here so close and drop retain the
 /// lifecycle guarantees of rmcp's regular child-process transport.
+/// Strong process-tree scope for a stdio server, when the platform has one.
+/// Linux uses a delegated cgroup v2 (a server that calls `setsid` cannot
+/// leave it); elsewhere only the Unix process group applies. Windows has
+/// neither here: only the direct child is killed.
+#[cfg(target_os = "linux")]
+type ProcessScope = Option<tools::process_scope::CgroupScope>;
+#[cfg(not(target_os = "linux"))]
+type ProcessScope = ();
+
+/// Kill every remaining member of the scope and remove it.
+fn release_scope(scope: &mut ProcessScope) {
+    #[cfg(target_os = "linux")]
+    drop(scope.take());
+    #[cfg(not(target_os = "linux"))]
+    let _ = scope;
+}
+
 struct BoundedStdioTransport {
     child: Option<Child>,
+    /// Dropped (which kills every member and removes the cgroup) after the
+    /// process group is signalled.
+    scope: ProcessScope,
     /// The server's own process group (Unix), so launchers such as `npx` or
     /// `uvx` cannot leave workers or grandchildren behind after close/drop.
     process_group: Option<u32>,
@@ -178,10 +198,11 @@ struct BoundedStdioTransport {
 }
 
 impl BoundedStdioTransport {
-    fn new(child: Child, stdout: ChildStdout, stdin: ChildStdin) -> Self {
+    fn new(child: Child, stdout: ChildStdout, stdin: ChildStdin, scope: ProcessScope) -> Self {
         let frame_failure = Arc::new(AtomicBool::new(false));
         let process_group = if cfg!(unix) { child.id() } else { None };
         Self {
+            scope,
             process_group,
             child: Some(child),
             transport: AsyncRwTransport::new(
@@ -290,8 +311,10 @@ impl Transport<RoleClient> for BoundedStdioTransport {
                 child.wait().await.map(|_| ())
             }
         };
-        // Sweep descendants that outlived a graceful leader exit.
+        // Sweep descendants that outlived a graceful leader exit, including
+        // ones that left the process group (cgroup, on Linux).
         kill_process_group(group);
+        release_scope(&mut self.scope);
         result
     }
 }
@@ -495,6 +518,25 @@ async fn connect_server(
             // Own a process group so close and drop can stop the whole tree.
             #[cfg(unix)]
             command.process_group(0);
+            // On Linux, also own a cgroup when this process has a delegated
+            // cgroup v2 subtree: membership survives `setsid`.
+            #[cfg(target_os = "linux")]
+            let scope = tools::process_scope::CgroupScope::new("harness-mcp");
+            #[cfg(target_os = "linux")]
+            if let Some(scope) = scope.as_ref() {
+                let procs = scope.procs_cstring();
+                // SAFETY: the hook only performs the async-signal-safe open,
+                // write, and close calls between fork and exec. A failed
+                // attach keeps the server running with its process group.
+                unsafe {
+                    command.pre_exec(move || {
+                        let _ = tools::process_scope::attach_current_process(&procs);
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let scope = ();
             command
                 .kill_on_drop(true)
                 .args(args)
@@ -513,7 +555,7 @@ async fn connect_server(
                 McpError::operation(&server.name, "initialize", "MCP child stdout was not piped")
             })?;
             let stderr = child.stderr.take();
-            let transport = BoundedStdioTransport::new(child, stdout, stdin);
+            let transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
             let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
             connect_transport(
                 server,
@@ -1197,6 +1239,62 @@ done
                 assert!(
                     std::time::Instant::now() < deadline,
                     "descendant {pid} survived MCP shutdown"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// A descendant that calls `setsid` leaves the process group; on
+        /// Linux the cgroup scope must still stop it. Skipped when this host
+        /// does not delegate a writable cgroup v2 subtree.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn shutdown_stops_descendants_that_left_the_process_group() {
+            if tools::process_scope::CgroupScope::new("harness-mcp-probe").is_none() {
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("escaped.pid");
+            let script = format!(
+                "setsid sh -c 'echo $$ > \"{}\"; exec sleep 300' </dev/null >/dev/null 2>&1 &\n{FIXTURE}",
+                pid_file.display()
+            );
+            let server = McpServerConfig {
+                name: "fixture".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), script],
+                    env: BTreeMap::from([(String::from("MCP_TEST_MODE"), "plain".into())]),
+                },
+            };
+            let runtime = McpRuntime::connect(
+                &[server],
+                &std::env::current_dir().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fixture should connect");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let pid: libc::pid_t = loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "descendant never started"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            runtime.shutdown().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // SAFETY: signal 0 only probes the test's own descendant.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "setsid descendant {pid} survived MCP shutdown"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
