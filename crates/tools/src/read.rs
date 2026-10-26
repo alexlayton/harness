@@ -430,7 +430,8 @@ async fn stream_range(
     let mut shown = 0usize;
     let wanted = limit.unwrap_or(usize::MAX).min(MAX_LINES);
     let mut truncated = false;
-    let mut oversized_line = false;
+    // Set when the byte cap stops the read inside line `line`.
+    let mut byte_cap_line = None::<usize>;
 
     'read: loop {
         if cancel.is_cancelled() {
@@ -461,7 +462,7 @@ async fn stream_range(
             if selected {
                 if output.len() >= MAX_BYTES {
                     truncated = true;
-                    oversized_line = true;
+                    byte_cap_line = Some(line);
                     break 'read;
                 }
                 output.push(byte);
@@ -491,10 +492,20 @@ async fn stream_range(
         if !text.is_empty() {
             text.push('\n');
         }
-        if oversized_line {
-            text.push_str("[truncated: oversized line exceeded the 50 KiB byte limit]");
-        } else {
-            text.push_str("[truncated: 2,000-line safety limit reached]");
+        // Tell the model exactly where to continue. A line cut by the byte
+        // cap is shown again from its start at that offset.
+        match byte_cap_line {
+            Some(cut) if shown == 0 => text.push_str(&format!(
+                "[truncated: line {cut} alone exceeds the 50 KiB output limit; use a narrower tool such as grep for its content, or continue after it with offset={}]",
+                cut.saturating_add(1)
+            )),
+            Some(cut) => text.push_str(&format!(
+                "[truncated: 50 KiB output limit reached in line {cut}; continue with offset={cut}]"
+            )),
+            None => text.push_str(&format!(
+                "[truncated: 2,000-line limit reached; continue with offset={}]",
+                line.saturating_add(1)
+            )),
         }
     }
     Ok(text)
@@ -557,6 +568,38 @@ mod tests {
             .await;
         assert_eq!(output.content, "two\nthree");
         assert!(!output.is_error);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn truncation_notices_give_the_next_offset() {
+        let dir = tempdir().unwrap();
+        let tool = ReadTool::with_workspace_root(dir.path());
+        // Line cap: 2,000 lines shown, continue at 2,001.
+        let lines = (1..=2_500).map(|n| format!("{n}\n")).collect::<String>();
+        std::fs::write(dir.path().join("lines.txt"), lines).unwrap();
+        let output = tool
+            .execute(json!({"path": "lines.txt"}), CancellationToken::new())
+            .await;
+        assert!(
+            output.content.ends_with("continue with offset=2001]"),
+            "{}",
+            &output.content[output.content.len() - 80..]
+        );
+        // Byte cap across many lines: continue at the line that was cut.
+        let wide = (1..=1_000)
+            .map(|n| format!("{n:04}{}\n", "x".repeat(96)))
+            .collect::<String>();
+        std::fs::write(dir.path().join("wide.txt"), wide).unwrap();
+        let output = tool
+            .execute(json!({"path": "wide.txt"}), CancellationToken::new())
+            .await;
+        let notice = output.content.lines().last().unwrap();
+        assert!(
+            notice.contains("50 KiB output limit reached in line 507"),
+            "{notice}"
+        );
+        assert!(notice.ends_with("continue with offset=507]"), "{notice}");
     }
 
     #[cfg(unix)]
