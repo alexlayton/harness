@@ -443,6 +443,7 @@ impl SessionStore {
             let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
+            refresh_identity_after_append(session, &path);
             drop(lock);
             return Ok(record);
         }
@@ -471,6 +472,7 @@ impl SessionStore {
             let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
+            refresh_identity_after_append(session, &path);
             drop(lock);
             return Ok(record);
         }
@@ -514,6 +516,7 @@ impl SessionStore {
         let new_size = append_encoded_record(&path, &line, self.deferred_sync(), current_size)?;
         disk_session.append_record(record.clone());
         disk_session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
+        refresh_identity_after_append(&mut disk_session, &path);
         *session = disk_session;
         drop(lock);
         Ok(record)
@@ -1025,6 +1028,19 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     file.read_to_end(&mut contents)
         .map_err(|source| io_error("read session", path, source))?;
     Ok(contents)
+}
+
+/// Record the file identity after this handle's own append. On Unix the
+/// identity is (device, inode) and does not change. Elsewhere it is (size,
+/// modification time), which every append changes; without a refresh, the
+/// next append took the slow path and re-read the whole file each time.
+#[cfg(unix)]
+fn refresh_identity_after_append(_session: &mut Session, _path: &Path) {}
+
+#[cfg(not(unix))]
+fn refresh_identity_after_append(session: &mut Session, path: &Path) {
+    // Under the session lock, so the observed identity is our own write.
+    session.file_identity = file_identity(path).ok();
 }
 
 /// Whether `cached` is a prefix of `disk`, by event id and sequence.
