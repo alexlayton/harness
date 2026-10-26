@@ -844,17 +844,27 @@ fn credential_from_token(
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| AuthError::OpenAiCodex("token response has no access token".into()))?;
+    // An empty refresh_token in a refresh response means "keep the current
+    // one", the same as an absent field.
     let refresh = value
         .get("refresh_token")
         .and_then(Value::as_str)
-        .or(old_refresh)
         .filter(|v| !v.is_empty())
+        .or(old_refresh.filter(|v| !v.is_empty()))
         .ok_or_else(|| AuthError::OpenAiCodex("token response has no refresh token".into()))?;
     let expires = value
         .get("expires_in")
         .and_then(Value::as_u64)
         .map(|seconds| unix_millis().saturating_add(seconds.saturating_mul(1000)))
-        .unwrap_or_else(|| jwt_expiry(access).unwrap_or(0));
+        .or_else(|| jwt_expiry(access))
+        .unwrap_or(0);
+    // A credential that is already expired (expires_in of 0, or no expiry
+    // at all) would be refreshed again on every use; reject it.
+    if expires <= unix_millis() {
+        return Err(AuthError::OpenAiCodex(
+            "token response has no future expiry".into(),
+        ));
+    }
     let account_id =
         account_id_from_tokens(value.get("id_token").and_then(Value::as_str), Some(access))?;
     Ok(OpenAiCodexCredential::new(
@@ -1040,6 +1050,17 @@ mod tests {
             "id_token": access,
         })
         .to_string()
+    }
+
+    #[test]
+    fn token_responses_need_a_future_expiry_and_keep_an_unrotated_refresh() {
+        let mut body: serde_json::Value = serde_json::from_str(&success_token_body("")).unwrap();
+        // An empty refresh_token keeps the current one.
+        let credential = credential_from_token(&body, Some("refresh-old")).unwrap();
+        assert_eq!(credential.refresh, "refresh-old");
+        // expires_in of 0 is an already-expired credential.
+        body["expires_in"] = serde_json::json!(0);
+        assert!(credential_from_token(&body, Some("refresh-old")).is_err());
     }
 
     fn cached_codex_credential() -> OpenAiCodexCredential {
