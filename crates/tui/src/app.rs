@@ -194,6 +194,9 @@ const MAX_VISIBLE_RUNNING_TOOLS: usize = 4;
 const EVENT_DRAIN_MAX_EVENTS: usize = 256;
 const EVENT_DRAIN_BUDGET: Duration = Duration::from_millis(8);
 
+/// Quiet time after the last resize event before the window is repainted.
+const RESIZE_SETTLE: Duration = Duration::from_millis(40);
+
 /// The visual rows of the input line plus the cursor's position within them.
 struct InputLayout {
     rows: Vec<Line<'static>>,
@@ -679,6 +682,12 @@ impl CrossTerm {
         let mut input_events = EventStream::new();
         let mut spinner_tick = tokio::time::interval(Duration::from_millis(200));
         spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Dragging a window edge emits many resize events; each full repaint
+        // reflows the visible history. Keep only the latest size and apply it
+        // once the events pause (or before anything else needs the layout).
+        let mut pending_resize: Option<(u16, u16)> = None;
+        let resize_settle = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(resize_settle);
 
         loop {
             tokio::select! {
@@ -692,16 +701,30 @@ impl CrossTerm {
                         None => return Ok(()),
                     };
                     if let Event::Resize(width, height) = event {
-                        self.handle_resize(width, height)?;
+                        pending_resize = Some((width, height));
+                        resize_settle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RESIZE_SETTLE);
                         continue;
+                    }
+                    if let Some((width, height)) = pending_resize.take() {
+                        self.handle_resize(width, height)?;
                     }
                     if self.handle_input(&event, &input_tx, &cancel)? {
                         return Ok(());
                     }
                     self.paint()?;
                 }
+                () = &mut resize_settle, if pending_resize.is_some() => {
+                    if let Some((width, height)) = pending_resize.take() {
+                        self.handle_resize(width, height)?;
+                    }
+                }
                 maybe_event = events.recv() => {
                     let Some(event) = maybe_event else { return Ok(()) };
+                    if let Some((width, height)) = pending_resize.take() {
+                        self.handle_resize(width, height)?;
+                    }
                     self.drain_queued_events(event, events);
                     self.paint()?;
                 }
