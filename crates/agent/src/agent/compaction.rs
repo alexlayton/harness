@@ -175,6 +175,9 @@ impl Agent {
         // not create a synthetic zero-token turn.
         if let SummaryOutcome::Model {
             usage: Some(usage), ..
+        }
+        | SummaryOutcome::Deterministic {
+            usage: Some(usage), ..
         } = &outcome
         {
             let summary = usage_summary(usage);
@@ -183,7 +186,7 @@ impl Agent {
 
         let compacted_through = plan.boundary;
         let summary = match &outcome {
-            SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text } => {
+            SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text, .. } => {
                 self.secret_masker.mask_text(text)
             }
             SummaryOutcome::Cancelled => unreachable!("cancelled outcome handled above"),
@@ -213,6 +216,16 @@ impl Agent {
         self.last_context_tokens = None;
         send(events, self.context_usage_event());
 
+        if matches!(outcome, SummaryOutcome::Deterministic { .. }) {
+            // A fallback summary keeps less of the conversation; tell the
+            // user instead of reporting it like a model summary.
+            send(
+                events,
+                AgentEvent::Notice(
+                    "the summarizer failed; compaction used a shorter fallback summary".into(),
+                ),
+            );
+        }
         send(
             events,
             AgentEvent::CompactionFinished {

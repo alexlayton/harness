@@ -70,8 +70,10 @@ invocations, and error messages verbatim where they matter.";
 pub enum SummaryOutcome {
     /// Successful LLM summary plus optional provider usage (recorded by the agent).
     Model { text: String, usage: Option<Usage> },
-    /// Deterministic fallback (no provider usage to record).
-    Deterministic { text: String },
+    /// Deterministic fallback. `usage` is set when the summarizer request
+    /// ran (and was billed) but its answer could not be used, for example
+    /// when it was empty.
+    Deterministic { text: String, usage: Option<Usage> },
     /// The caller cancelled compaction before a summary was completed.
     /// Cancellation is not a summarizer failure and must not be persisted.
     Cancelled,
@@ -106,17 +108,28 @@ pub async fn summarize(
             }
         }
         Err(_) if cancel.is_cancelled() => SummaryOutcome::Cancelled,
-        Err(error) => {
+        Err((error, usage)) => {
             tracing::warn!(error = %error, "LLM summarization failed; using deterministic fallback");
             SummaryOutcome::Deterministic {
                 text: deterministic_summary(plan, policy),
+                usage,
             }
         }
     }
 }
 
+/// Instruction added when an earlier summary exists, so its still-relevant
+/// content is carried forward instead of replaced by the new span alone.
+const MERGE_PREVIOUS_PROMPT: &str = "\
+The <previous-summary> above describes earlier work in this session. Merge \
+it into the new checkpoint: keep its goals, decisions, progress, and \
+critical context that still apply, update items the new conversation \
+changed, and do not drop earlier information only because it is not \
+repeated in the new conversation.\n\n";
+
 /// One-shot LLM summarization. Errors and cancellation both return `Err`, so
-/// the caller can fall back without distinguishing them.
+/// the caller can fall back without distinguishing them. The error carries
+/// the usage of a request that completed but whose answer was unusable.
 async fn model_summarize(
     provider: &dyn Provider,
     model: &str,
@@ -124,7 +137,7 @@ async fn model_summarize(
     policy: &CompactionPolicy,
     session_id: Option<&str>,
     cancel: &CancellationToken,
-) -> Result<(String, Option<Usage>), llm::LlmError> {
+) -> Result<(String, Option<Usage>), (llm::LlmError, Option<Usage>)> {
     let serialized = serialize_events(
         &plan.to_summarize,
         policy.max_summary_input_bytes,
@@ -145,6 +158,7 @@ async fn model_summarize(
         prompt.push_str("<previous-summary>\n");
         prompt.push_str(previous);
         prompt.push_str("\n</previous-summary>\n\n");
+        prompt.push_str(MERGE_PREVIOUS_PROMPT);
     }
     prompt.push_str(SUMMARIZATION_PROMPT);
 
@@ -159,10 +173,15 @@ async fn model_summarize(
         session_id: session_id.map(str::to_owned),
     };
 
+    // Same initial-request retry policy as conversation turns: one transient
+    // 429/5xx must not replace a model summary with the fallback.
+    let on_retry: llm::RetryCallback = std::sync::Arc::new(|attempt, error| {
+        tracing::warn!(attempt, error = %error, "retrying summarizer request");
+    });
     let mut stream = tokio::select! {
-        result = provider.stream(&request) => result?,
+        result = provider.stream_with_retry(&request, on_retry) => result.map_err(|error| (error, None))?,
         _ = cancel.cancelled() => {
-            return Err(llm::LlmError::Stream("summarization cancelled".into()));
+            return Err((llm::LlmError::Stream("summarization cancelled".into()), None));
         }
     };
     let mut text = String::new();
@@ -184,17 +203,19 @@ async fn model_summarize(
                     Ok(StreamEvent::ReasoningDelta(_))
                     | Ok(StreamEvent::OpaqueState { .. })
                     | Ok(StreamEvent::ToolCallComplete(_)) => {}
-                    Err(error) => return Err(error),
+                    Err(error) => return Err((error, usage)),
                 }
             }
             _ = cancel.cancelled() => {
-                return Err(llm::LlmError::Stream("summarization cancelled".into()));
+                return Err((llm::LlmError::Stream("summarization cancelled".into()), usage));
             }
         }
     }
     if text.trim().is_empty() {
-        return Err(llm::LlmError::Stream(
-            "summarizer produced no output".into(),
+        // The request completed and was billed; keep its usage.
+        return Err((
+            llm::LlmError::Stream("summarizer produced no output".into()),
+            usage,
         ));
     }
     Ok((text, usage))
@@ -527,7 +548,7 @@ mod tests {
             &cancel,
         ));
         match outcome {
-            SummaryOutcome::Deterministic { text } => {
+            SummaryOutcome::Deterministic { text, .. } => {
                 assert!(text.contains("generated context"));
                 assert!(text.contains("[User]: question"));
             }
@@ -572,7 +593,7 @@ mod tests {
         let failure = ScriptProvider {
             events: vec![Err("offline".into())],
         };
-        let SummaryOutcome::Deterministic { text } =
+        let SummaryOutcome::Deterministic { text, .. } =
             runtime.block_on(summarize(&failure, "demo", &second, &policy, None, &cancel))
         else {
             panic!("second summary must fall back");
@@ -629,7 +650,10 @@ mod tests {
         let provider = ScriptProvider {
             events: vec![Ok(StreamEvent::Done {
                 stop_reason: Some("stop".into()),
-                usage: None,
+                usage: Some(Usage {
+                    output_tokens: 3,
+                    ..Usage::default()
+                }),
             })],
         };
         let cancel = CancellationToken::new();
@@ -641,6 +665,10 @@ mod tests {
             None,
             &cancel,
         ));
-        assert!(matches!(outcome, SummaryOutcome::Deterministic { .. }));
+        // The empty answer still cost tokens; the usage must survive.
+        assert!(matches!(
+            outcome,
+            SummaryOutcome::Deterministic { usage: Some(usage), .. } if usage.output_tokens == 3
+        ));
     }
 }
