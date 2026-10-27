@@ -310,7 +310,7 @@ impl Codemode {
             .iter()
             .find(|entry| entry.name == name)
             .ok_or_else(|| format!("unknown tool: {name}; see TOOLS"))?;
-        json_to_monty(&entry.full, 0)
+        Ok(metadata_to_monty(&entry.full, 0))
     }
 
     pub(crate) fn spec(&self) -> &ToolSpec {
@@ -696,6 +696,50 @@ fn monty_to_json(value: ObjectRef<'_>, depth: usize, budget: &mut usize) -> Resu
         kind => Err(format!(
             "{kind} cannot be passed to a tool; use JSON-compatible values"
         )),
+    }
+}
+
+/// Convert catalogue metadata for `describe()`. Unlike tool arguments and
+/// results, the catalogue is already bounded at registration (512 KiB), and
+/// a valid schema must stay readable: never fail on size, depth, or integer
+/// range. Values that Python cannot represent faithfully degrade to their JSON
+/// text instead of hiding the whole definition.
+fn metadata_to_monty(value: &Value, depth: usize) -> MontyObject {
+    if depth > 64 {
+        return MontyObject::string(value.to_string());
+    }
+    match value {
+        Value::Null => MontyObject::none(),
+        Value::Bool(value) => MontyObject::bool(*value),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                MontyObject::int(value)
+            } else if let Some(value) = number.as_u64() {
+                MontyObject::bigint(num_bigint::BigInt::from(value))
+            } else if let Some(value) = number.as_f64() {
+                MontyObject::float(value)
+            } else {
+                MontyObject::string(number.to_string())
+            }
+        }
+        Value::String(value) => MontyObject::string(value),
+        Value::Array(values) => MontyObject::list(
+            values
+                .iter()
+                .map(|value| metadata_to_monty(value, depth + 1))
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(values) => MontyObject::dict(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        MontyObject::string(key),
+                        metadata_to_monty(value, depth + 1),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 

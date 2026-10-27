@@ -418,3 +418,54 @@ async fn discovery_globals_are_lazy_host_metadata_and_keep_the_prompt_small() {
         .await;
     assert!(missing.is_error && missing.content.contains("unknown tool: nope"));
 }
+
+struct BigSchema;
+
+#[async_trait]
+impl Tool for BigSchema {
+    fn spec(&self) -> ToolSpec {
+        // Larger than the 50 KiB tool-result cap, with an integer above i64.
+        let properties: serde_json::Map<String, Value> = (0..1500)
+            .map(|index| {
+                (
+                    format!("field_{index}"),
+                    json!({"type": "integer", "maximum": 18446744073709551615u64,
+                           "description": "padding to exceed the value cap"}),
+                )
+            })
+            .collect();
+        ToolSpec {
+            definition: ToolDefinition {
+                name: "big".into(),
+                description: "Tool with a large schema".into(),
+                parameters: json!({"type": "object", "properties": properties}),
+            },
+            prompt: ToolPrompt::default(),
+        }
+    }
+
+    async fn execute(&self, _args: Value, _cancel: CancellationToken) -> ToolOutput {
+        unreachable!("describe must not execute tools")
+    }
+}
+
+#[tokio::test]
+async fn describe_returns_schemas_beyond_tool_result_limits() {
+    let mut registry = ToolRegistry::new(vec![Box::new(BigSchema)]);
+    registry.enable_codemode(&[]).unwrap();
+    let output = registry
+        .execute(
+            "codemode",
+            snippet(
+                "p = describe('big')['parameters']['properties']\n(len(p), p['field_7']['maximum'])",
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(
+        output.content.contains("(1500, 18446744073709551615)"),
+        "{}",
+        output.content
+    );
+}
