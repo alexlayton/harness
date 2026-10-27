@@ -100,7 +100,7 @@ To install a specific release, pass the version through to the script:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alexlayton/harness/main/install.sh \
-  | bash -s -- --version v0.7.0
+  | bash -s -- --version v0.8.0
 ```
 
 The script uses `curl` rather than a browser, so macOS downloads normally do
@@ -120,7 +120,7 @@ that the archive was built by this repository's release workflow. To check it
 with the [GitHub CLI](https://cli.github.com/):
 
 ```sh
-gh attestation verify harness-v0.7.0-aarch64-apple-darwin.tar.gz \
+gh attestation verify harness-v0.8.0-aarch64-apple-darwin.tar.gz \
   --repo alexlayton/harness \
   --signer-workflow alexlayton/harness/.github/workflows/release.yml
 ```
@@ -228,11 +228,11 @@ local checkout with uv (a Rust toolchain is required for the first build):
 CARGO_BUILD_JOBS=1 uv add /absolute/path/to/harness
 ```
 
-To install the 0.7.0 Python MVP, use this Git dependency in `requirements.txt`.
+To install the 0.8.0 Python MVP, use this Git dependency in `requirements.txt`.
 No subdirectory setting is needed:
 
 ```text
-harness-agent @ git+https://github.com/alexlayton/harness.git@v0.7.0
+harness-agent @ git+https://github.com/alexlayton/harness.git@v0.8.0
 ```
 
 ```python
