@@ -57,19 +57,33 @@ pub fn serialize_events(
         kept.push(line);
     }
     kept.reverse();
-    let mut text = kept.join("\n");
     if truncated {
         // `summarize` adds a newline before the marker. Reserve both pieces
         // now instead of allowing the marker to exceed max_input_bytes later.
+        // Make room by dropping the *oldest* kept lines: cutting the joined
+        // text from its end removed the newest material.
         let marker_reserve = if max_input_bytes > OMISSION_MARKER.len() {
             OMISSION_MARKER.len() + 1
         } else {
             0
         };
         let transcript_budget = max_input_bytes.saturating_sub(marker_reserve);
-        text = truncate_bytes(&text, transcript_budget).to_owned();
+        let mut joined = bytes;
+        let mut first = 0;
+        while joined > transcript_budget && first + 1 < kept.len() {
+            joined -= kept[first].len() + 1;
+            first += 1;
+        }
+        kept.drain(..first);
+        let text = kept.join("\n");
+        // A single remaining line keeps its beginning (the event header).
+        let text = truncate_bytes(&text, transcript_budget).to_owned();
+        return SerializedTranscript { text, truncated };
     }
-    SerializedTranscript { text, truncated }
+    SerializedTranscript {
+        text: kept.join("\n"),
+        truncated,
+    }
 }
 
 /// Return the longest UTF-8 prefix that fits within `max_bytes`.
@@ -216,6 +230,10 @@ fn message_joined_text(message: &StoredMessage) -> Option<String> {
 }
 
 /// Render a tool call as `read(path="foo.txt")` for the transcript.
+/// Tool-call arguments in a summarizer transcript are capped like tool
+/// results: a large `write` or `edit` payload is the file body, not context.
+const MAX_TOOL_ARGUMENT_CHARS: usize = 2_000;
+
 pub fn format_tool_call(name: &str, arguments: &Value) -> String {
     let rendered = match arguments {
         Value::Object(map) => {
@@ -228,7 +246,10 @@ pub fn format_tool_call(name: &str, arguments: &Value) -> String {
         }
         other => other.to_string(),
     };
-    format!("{name}({rendered})")
+    format!(
+        "{name}({})",
+        truncate_for_summary(&rendered, MAX_TOOL_ARGUMENT_CHARS)
+    )
 }
 
 /// A JSON value rendered compactly (strings stay quoted).
@@ -401,6 +422,27 @@ mod tests {
             transcript
                 .text
                 .contains("[... 4900 more characters truncated]")
+        );
+    }
+
+    #[test]
+    fn marker_reserve_drops_oldest_lines_not_the_newest() {
+        let mut session = Session::new(SessionMetadata::new("/tmp", None, None));
+        for index in 0..20 {
+            user(
+                &mut session,
+                &format!("message number {index} with some padding"),
+            );
+        }
+        let transcript = serialize_events(&session.events, 200, 2_000);
+        assert!(transcript.truncated);
+        assert!(transcript.text.len() + OMISSION_MARKER.len() < 200);
+        assert!(
+            transcript
+                .text
+                .ends_with("message number 19 with some padding"),
+            "{}",
+            transcript.text
         );
     }
 

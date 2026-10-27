@@ -15,7 +15,8 @@ Harness prints setup instructions instead of assuming an API-key provider.
 API keys are environment-only secrets. Harness does not write them to
 `config.toml` or session files. Without an explicit model, the configured
 fallbacks are `gpt-5.6-luna` for OpenCode Go, `openai/gpt-5.6-luna` for
-OpenRouter, `gpt-5.4` for Copilot, and `gpt-5.5` for Codex. Copilot can instead
+OpenRouter, `gpt-5.4` for Copilot, `gpt-5.5` for Codex, and `claude-sonnet-4-6`
+for Anthropic Claude. Copilot can instead
 select a model available to the signed-in account.
 
 ## OpenCode Go
@@ -142,6 +143,14 @@ even when another provider is active. For example:
 ```
 
 The catalog does not confirm account access or live model availability.
+
+Reasoning works differently by model. Models with adaptive thinking always
+think: `off` is rejected, and the other levels map to Claude's `low`,
+`medium`, and `high` effort. `maximum` uses `max` where the model supports
+it, and `high` otherwise. Other Claude models think only when you set an
+explicit level, which selects a thinking token budget. Thinking cannot be
+combined with a custom temperature.
+
 The older names `anthropic-subscription` and `claude-sub` remain valid aliases.
 Existing saved credentials still work; you do not need to log in again.
 

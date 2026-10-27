@@ -163,18 +163,21 @@ impl AgentBuilder {
         // Claim the conversation before repairing it. Another live agent may
         // have a durable tool call in flight that must not be mistaken for a
         // crashed tail, even though per-append locking keeps JSONL writes safe.
+        // Reload under the lease: a previous owner may have appended after
+        // the caller loaded the session.
         let active_lease = self
             .session
-            .as_ref()
-            .map(|(store, session)| store.acquire_active(session))
+            .as_mut()
+            .map(|(store, session)| {
+                crate::blocking::blocking_io(|| store.acquire_active_and_reload(session))
+            })
             .transpose()
             .context("acquire active session")?;
         // Repair a loaded crash tail before starting MCP servers or exposing a
         // live agent. Failing here is preferable to reporting a successful
         // load that predictably quarantines on its first append.
         if let Some((store, session)) = self.session.as_mut() {
-            store
-                .repair_incomplete_tool_calls(session)
+            crate::blocking::blocking_io(|| store.repair_incomplete_tool_calls(session))
                 .context("repair incomplete session tool calls")?;
         }
         let mcp = if self.mcp_servers.is_empty() {

@@ -27,9 +27,45 @@ use tokio_util::sync::CancellationToken;
 use tools::{ToolConfig, default_registry};
 use tui::{ContextFileEntry, CrossTerm, StartupEntries};
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match main_inner().await {
+/// Turn a finished agent task into an error when it panicked (or was
+/// aborted), keeping the panic message when it is a string.
+fn agent_task_outcome(result: Result<(), tokio::task::JoinError>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.is_panic() => {
+            let payload = error.into_panic();
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|message| (*message).to_owned())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_owned());
+            anyhow::bail!("the agent stopped unexpectedly (panic: {message})")
+        }
+        Err(error) => anyhow::bail!("the agent stopped unexpectedly: {error}"),
+    }
+}
+
+fn main() -> ExitCode {
+    // `set_var` is only sound while no other thread can read the
+    // environment, so path overrides are normalized here, before the Tokio
+    // runtime starts its worker threads. Absolute overrides are unchanged,
+    // so doing this for every command is harmless; worktree mode needs it
+    // before it changes the process cwd.
+    if let Err(error) = absolutize_process_path_overrides() {
+        eprintln!("error: {error:#}");
+        return ExitCode::FAILURE;
+    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: could not start the async runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(main_inner()) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("error: {error:#}");
@@ -63,9 +99,8 @@ async fn main_inner() -> Result<ExitCode> {
             std::env::current_dir().context("resolve the worktree launch directory")?,
         )
         .context("resolve the worktree launch directory")?;
-        // Resolve every process-level path override before entering the
-        // workspace. This includes config/auth, logging, and session roots.
-        absolutize_process_path_overrides()?;
+        // Process-level path overrides (config/auth, logging, session roots)
+        // were made absolute in `main`, before the runtime started.
         // Relative state/session overrides must retain launch-directory
         // semantics after the process cwd changes.
         let session_root = std::path::absolute(session::default_session_dir())
@@ -141,30 +176,73 @@ async fn main_inner() -> Result<ExitCode> {
     run_application(cli, None).await
 }
 
+/// `--resume-session` is global, but prompt mode reads its own `--resume`,
+/// so the global flag was silently ignored there. Treat it as the prompt's
+/// `--resume`, and reject combinations that cannot both apply.
+fn apply_global_resume_to_prompt(cli: &mut Cli) -> Result<()> {
+    let Some(Command::Prompt(args)) = &mut cli.command else {
+        return Ok(());
+    };
+    let Some(global) = cli.resume.take() else {
+        return Ok(());
+    };
+    match &args.resume {
+        Some(local) if *local != global => {
+            anyhow::bail!("--resume-session `{global}` conflicts with prompt --resume `{local}`")
+        }
+        _ => {}
+    }
+    anyhow::ensure!(
+        !args.no_session,
+        "--resume-session cannot be used with --no-session"
+    );
+    args.resume = Some(global);
+    Ok(())
+}
+
+/// Make relative path overrides absolute against the launch directory, so
+/// they keep their meaning after worktree mode changes the cwd. Empty values
+/// mean "unset" to every reader and are left alone (joining them used to
+/// turn them into the cwd). `XDG_CONFIG_HOME` is included because config
+/// and auth paths derive from it.
+///
+/// Must run before any other thread exists (see `main`).
 fn absolutize_process_path_overrides() -> Result<()> {
-    let current = std::env::current_dir().context("resolve launch directory")?;
+    let mut current = None;
     for variable in [
         "HARNESS_CONFIG_DIR",
         "HARNESS_LOG",
         "HARNESS_SESSION_DIR",
         "HARNESS_STATE_DIR",
+        "XDG_CONFIG_HOME",
     ] {
         let Some(value) = std::env::var_os(variable) else {
             continue;
         };
+        if value.is_empty() {
+            continue;
+        }
         let path = std::path::PathBuf::from(value);
         if path.is_absolute() {
             continue;
         }
+        let current = match &current {
+            Some(current) => current,
+            None => current.insert(std::env::current_dir().context("resolve launch directory")?),
+        };
         let absolute = current.join(path);
-        // Environment overrides are process-local and are intentionally
-        // normalized before any worktree task can change cwd.
+        // SAFETY: called from `main` before the Tokio runtime (or any other
+        // thread) starts, so no concurrent environment access is possible.
         unsafe { std::env::set_var(variable, absolute) };
     }
     Ok(())
 }
 
-async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> Result<ExitCode> {
+async fn run_application(
+    mut cli: Cli,
+    session_root: Option<std::path::PathBuf>,
+) -> Result<ExitCode> {
+    apply_global_resume_to_prompt(&mut cli)?;
     let prompt_args = match &cli.command {
         Some(Command::Prompt(args)) => Some(args),
         _ => None,
@@ -183,7 +261,14 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     // monotonic clock; each line reports time since process start.
     let started = std::time::Instant::now();
     let since_start = || started.elapsed().as_millis() as u64;
-    let config: Config = Config::resolve(&cli)?;
+    // ACP sessions use only the MCP servers the editor declares. Replace the
+    // local list with an empty one, so a broken or unexpandable local server
+    // (for example an unset ${VAR}) cannot stop ACP from starting.
+    let config: Config = if matches!(&cli.command, Some(Command::Acp)) {
+        Config::resolve_with_mcp(&cli, Some(&[]))?
+    } else {
+        Config::resolve(&cli)?
+    };
     tracing::info!(stage = "config", elapsed_ms = since_start());
 
     let workspace_root =
@@ -298,7 +383,9 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         mpsc::UnboundedReceiver<InputMessage>,
     ) = mpsc::unbounded_channel();
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::unbounded_channel();
-    let (ui_event_tx, ui_event_rx) = mpsc::unbounded_channel();
+    // Bounded: a TUI that falls behind makes the forwarder wait (and merge
+    // deltas) instead of letting the channel grow without limit.
+    let (ui_event_tx, ui_event_rx) = mpsc::channel(tui_adapter::UI_EVENT_CAPACITY);
 
     // This catalog is local metadata, so a saved Claude login can populate
     // /model even when another provider is active. Do not refresh tokens or
@@ -308,7 +395,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     {
         let provider = llm::providers::AnthropicSubscriptionProvider::new(Arc::new(auth));
         if let Ok(models) = provider.list_models().await {
-            let _ = ui_event_tx.send(tui::UiEvent::ModelList {
+            let _ = ui_event_tx.try_send(tui::UiEvent::ModelList {
                 provider: provider.name().into(),
                 models: models
                     .into_iter()
@@ -399,68 +486,68 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         .map(|(reporter, _)| reporter.clone());
     let event_task = tokio::spawn(async move {
         let mut herdr_options = herdr_options;
+        let mut pending = tui_adapter::PendingUiEvents::default();
         loop {
             tokio::select! {
                 biased;
+                // Keep draining the agent so its side effects (config saves,
+                // herdr reports) stay current; UI events wait in `pending`.
                 event = runtime_event_rx.recv() => {
                     let Some(event) = event else { break };
-                    if let AgentEvent::ModelChanged { provider, model } = &event
-                        && let Err(error) = save_settings(provider, model)
-                    {
-                        tracing::warn!(error = %error, "could not persist model settings");
-                    }
-                    if let AgentEvent::ReasoningChanged { level } = &event
-                        && let Ok(reasoning) = level.parse()
-                        && let Err(error) = save_reasoning(reasoning)
-                    {
-                        tracing::warn!(error = %error, "could not persist reasoning setting");
-                    }
-                    // Only commands change preferences. `on` saves the target
-                    // only when none is saved, so the config stays valid.
-                    if let AgentEvent::PrewalkChanged { armed, target, reasoning, change } = &event {
-                        let saved = match change {
-                            agent::PrewalkChange::Enabled => {
-                                save_prewalk_enabled(*armed, target.as_deref())
-                            }
-                            agent::PrewalkChange::Target => target
-                                .as_deref()
-                                .map_or(Ok(()), save_prewalk_model),
-                            agent::PrewalkChange::Reasoning => reasoning
-                                .as_deref()
-                                .map(str::parse)
-                                .transpose()
-                                .map_err(|error: String| anyhow::anyhow!(error))
-                                .and_then(save_prewalk_reasoning),
-                            agent::PrewalkChange::Session => Ok(()),
-                        };
-                        if let Err(error) = saved {
-                            tracing::warn!(error = %error, "could not persist prewalk setting");
+                    // Config saves write and fsync a file. This task also
+                    // forwards every UI event, so keep the disk wait off the
+                    // async worker (main runs the multi-thread runtime).
+                    tokio::task::block_in_place(|| {
+                        if let AgentEvent::ModelChanged { provider, model } = &event
+                            && let Err(error) = save_settings(provider, model)
+                        {
+                            tracing::warn!(error = %error, "could not persist model settings");
                         }
-                    }
+                        if let AgentEvent::ReasoningChanged { level } = &event
+                            && let Ok(reasoning) = level.parse()
+                            && let Err(error) = save_reasoning(reasoning)
+                        {
+                            tracing::warn!(error = %error, "could not persist reasoning setting");
+                        }
+                        // Only commands change preferences. `on` saves the target
+                        // only when none is saved, so the config stays valid.
+                        if let AgentEvent::PrewalkChanged { armed, target, reasoning, change } = &event {
+                            let saved = match change {
+                                agent::PrewalkChange::Enabled => {
+                                    save_prewalk_enabled(*armed, target.as_deref())
+                                }
+                                agent::PrewalkChange::Target => target
+                                    .as_deref()
+                                    .map_or(Ok(()), save_prewalk_model),
+                                agent::PrewalkChange::Reasoning => reasoning
+                                    .as_deref()
+                                    .map(str::parse)
+                                    .transpose()
+                                    .map_err(|error: String| anyhow::anyhow!(error))
+                                    .and_then(save_prewalk_reasoning),
+                                agent::PrewalkChange::Session => Ok(()),
+                            };
+                            if let Err(error) = saved {
+                                tracing::warn!(error = %error, "could not persist prewalk setting");
+                            }
+                        }
+                    });
                     if let Some(reporter) = &event_herdr_reporter {
-                        match &event {
-                            AgentEvent::ModelChanged { provider, model } => {
-                                herdr_options.provider = provider.clone();
-                                herdr_options.model = model.clone();
-                                reporter.resume_options(&herdr_options);
-                            }
-                            AgentEvent::ReasoningChanged { level } => {
-                                herdr_options.reasoning = level.clone();
-                                reporter.resume_options(&herdr_options);
-                            }
-                            AgentEvent::TextDelta(_) | AgentEvent::ReasoningDelta(_) | AgentEvent::ToolCallStarted { .. } | AgentEvent::Retrying { .. } | AgentEvent::AskStarted => reporter.report(herdr::State::Working, None),
-                            AgentEvent::TurnFinished | AgentEvent::OperationFinished => reporter.report(herdr::State::Idle, None),
-                            AgentEvent::SessionChanged { id, .. } => reporter.with_session(id.clone(), &herdr_options),
-                            _ => {}
-                        }
+                        reporter.observe(&event, &mut herdr_options);
                     }
-                    if ui_event_tx.send(tui_adapter::into_ui_event(event)).is_err() {
+                    pending.push(tui_adapter::into_ui_event(event));
+                    if !pending.flush_ready(&ui_event_tx) {
                         break;
                     }
+                }
+                permit = ui_event_tx.reserve(), if !pending.is_empty() => {
+                    let Ok(permit) = permit else { break };
+                    pending.send_one(permit);
                 }
                 _ = ui_event_tx.closed() => break,
             }
         }
+        pending.finish(&ui_event_tx).await;
     });
     let agent_task = tokio::spawn(agent.run(runtime_input_rx, runtime_event_tx));
 
@@ -471,7 +558,7 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
     let ui_result = ui.run(ui_event_rx, tui_input_tx, cancel.clone()).await;
     cancel.cancel();
     let _ = input_task.await;
-    let _ = agent_task.await;
+    let agent_result = agent_task.await;
     let _ = event_task.await;
     if let Some((reporter, task)) = herdr_reporter {
         drop(reporter);
@@ -481,5 +568,45 @@ async fn run_application(cli: Cli, session_root: Option<std::path::PathBuf>) -> 
         }
     }
     ui_result?;
+    // A panicking agent closes its event channel, which ends the TUI like a
+    // normal quit. Report it (after the terminal is restored) and exit
+    // non-zero instead of claiming success.
+    agent_task_outcome(agent_result)?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, agent_task_outcome, apply_global_resume_to_prompt};
+    use clap::Parser;
+
+    #[test]
+    fn global_resume_session_applies_to_prompt_mode() {
+        let mut cli = Cli::parse_from(["harness", "--resume-session", "latest", "prompt", "hi"]);
+        apply_global_resume_to_prompt(&mut cli).unwrap();
+        let Some(super::Command::Prompt(args)) = &cli.command else {
+            panic!("prompt command expected");
+        };
+        assert_eq!(args.resume.as_deref(), Some("latest"));
+
+        let mut cli = Cli::parse_from([
+            "harness",
+            "--resume-session",
+            "latest",
+            "prompt",
+            "--no-session",
+            "hi",
+        ]);
+        assert!(apply_global_resume_to_prompt(&mut cli).is_err());
+    }
+
+    #[tokio::test]
+    async fn agent_panic_is_reported_instead_of_success() {
+        // The panic message is printed by the default hook; the hook is
+        // process-global, so it is not replaced in a parallel test run.
+        let result = tokio::spawn(async { panic!("agent exploded") }).await;
+        let error = agent_task_outcome(result).unwrap_err().to_string();
+        assert!(error.contains("agent exploded"), "{error}");
+        assert!(agent_task_outcome(Ok(())).is_ok());
+    }
 }

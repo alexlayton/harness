@@ -51,6 +51,15 @@ thread_local! {
         const { std::cell::Cell::new(false) };
     static INJECT_SYNC_PARENT_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static INJECT_APPEND_SYNC_FAILURE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Whether an append should fail after its bytes were written (as a failed
+/// `fsync` does). Test-only.
+#[cfg(test)]
+fn injected_append_sync_failure() -> bool {
+    INJECT_APPEND_SYNC_FAILURE.with(|flag| flag.get())
 }
 
 /// Whether directory permission repair should fail. Test-only.
@@ -76,25 +85,21 @@ fn injected_sync_parent_failure() -> bool {
 // would return for a real `fsync` failure, so agent turn-boundary tests
 // can prove a failed flush quarantines (AGENT-1) without touching the OS.
 //
-// The flag itself is test-only, but the guard type is always compiled: the
-// agent crate's `#[cfg(test)]` boundary tests need to name it, and
-// `#[cfg(test)]` on an imported type does not propagate across crates.
-// The `arm` body is test-only (production builds get a no-op guard).
+// `#[cfg(test)]` does not reach a dependency built for another crate's
+// tests, so the seam is also compiled with the `test-hooks` feature, which
+// the agent crate enables only as a dev-dependency. Normal builds contain
+// no hook.
 // (Plain `//` comments: `thread_local!` is a macro invocation, which
 // rustdoc denies `///` docs on.)
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     static INJECT_SYNC_SESSION_FAILURE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
 /// Whether the deferred-sync flush should fail. Test-only.
-///
-/// Always compiled (not `#[cfg(test)]`): the agent crate's `#[cfg(test)]`
-/// boundary tests call through [`SyncSessionFaultGuard::arm`], and a
-/// `#[cfg(test)]` gate here would not be active when compiling the session
-/// dependency for the agent's test build. The body is test-only — in
-/// production builds the flag is never armed, so this always returns false.
-pub fn injected_sync_session_failure() -> bool {
+#[cfg(any(test, feature = "test-hooks"))]
+fn injected_sync_session_failure() -> bool {
     INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.get())
 }
 
@@ -106,9 +111,12 @@ struct HardeningFaultGuard;
 
 /// Hold the deferred-sync flush failure flag for an agent boundary test and
 /// clear it on drop (including on panic). The agent crate cannot touch the
-/// private thread-local directly, so this constructor is the seam.
+/// private thread-local directly, so this constructor is the seam. Only
+/// available with the `test-hooks` feature.
+#[cfg(any(test, feature = "test-hooks"))]
 pub struct SyncSessionFaultGuard;
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl SyncSessionFaultGuard {
     pub fn arm() -> Self {
         INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(true));
@@ -116,6 +124,7 @@ impl SyncSessionFaultGuard {
     }
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for SyncSessionFaultGuard {
     fn drop(&mut self) {
         INJECT_SYNC_SESSION_FAILURE.with(|flag| flag.set(false));
@@ -232,6 +241,7 @@ impl SessionStore {
     /// every record appended so far survives power loss. Cheap to call
     /// repeatedly; a no-op when the session has no file (memory-only).
     pub fn sync_session(&self, session: &Session) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
         if injected_sync_session_failure() {
             return Err(io_error(
                 "sync session",
@@ -281,44 +291,43 @@ impl SessionStore {
     ///
     /// Plain loads and exports do not require this lease. Any runtime that can
     /// append conversation events must hold it so independent in-memory model
-    /// histories cannot write to the same durable log.
+    /// histories cannot write to the same durable log. To attach a session
+    /// that was loaded earlier, use [`Self::acquire_active_and_reload`].
     pub fn acquire_active(&self, session: &Session) -> Result<SessionActiveLease> {
         let Some(session_path) = session.path() else {
             return Ok(SessionActiveLease { file: None });
         };
         self.ensure_path_in_root(session_path)?;
-        let path = session_path.with_extension("jsonl.active.lock");
-        let file = {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .mode(0o600)
-                    .open(&path)
+        try_lock_active(session_path)
+    }
+
+    /// Acquire the active lease, then reload the session from disk.
+    ///
+    /// A session loaded before the lease can be stale: the previous owner may
+    /// have appended events between the load and the moment it released the
+    /// lease. Every path that attaches an existing session to a runtime must
+    /// use this method before it repairs the session or builds model context,
+    /// so the new owner continues from the complete durable history.
+    ///
+    /// This is also the coordination point with [`delete_session`]: a delete
+    /// holds the same lease while it removes the file, so a load that raced
+    /// with it either takes the lease first (and the delete is refused) or
+    /// finds the file gone here and gets [`SessionError::NotFound`].
+    pub fn acquire_active_and_reload(&self, session: &mut Session) -> Result<SessionActiveLease> {
+        let lease = self.acquire_active(session)?;
+        if let Some(path) = session.path().cloned() {
+            if !path.exists() {
+                return Err(SessionError::NotFound(session.id().to_string()));
             }
-            #[cfg(not(unix))]
-            {
-                OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&path)
+            let reloaded = self.load_path(&path)?;
+            if reloaded.id() != session.id() {
+                return Err(SessionError::InvalidEvent(
+                    "session file changed identity while it was being activated".into(),
+                ));
             }
+            *session = reloaded;
         }
-        .map_err(|source| io_error("open active session lease", &path, source))?;
-        ensure_private_file(&path)?;
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Err(SessionError::AlreadyActive(session_path.to_path_buf()))
-            }
-            Err(source) => Err(io_error("lock active session lease", &path, source)),
-        }
+        Ok(lease)
     }
 
     /// Create and immediately persist a new session header.
@@ -411,10 +420,10 @@ impl SessionStore {
         };
         self.ensure_path_in_root(&path)?;
         let lock = SessionLock::acquire(&path)?;
-        let file_size = fs::metadata(&path)
-            .map_err(|source| io_error("stat session for append", &path, source))?
-            .len();
-        let current_identity = file_identity(&path)?;
+        let metadata = fs::metadata(&path)
+            .map_err(|source| io_error("stat session for append", &path, source))?;
+        let file_size = metadata.len();
+        let current_identity = identity_from_metadata(&metadata);
         if session.validated_bytes > 0
             && session.file_identity == Some(current_identity)
             && usize::try_from(file_size).ok() == Some(session.validated_bytes)
@@ -432,9 +441,10 @@ impl SessionStore {
             };
             validate_next_event(session, &record)?;
             let line = encode_record(session.id(), &record)?;
-            let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
+            let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
+            refresh_identity_after_append(session, &path);
             drop(lock);
             return Ok(record);
         }
@@ -460,9 +470,10 @@ impl SessionStore {
             };
             validate_next_event(session, &record)?;
             let line = encode_record(session.id(), &record)?;
-            let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
+            let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
+            refresh_identity_after_append(session, &path);
             drop(lock);
             return Ok(record);
         }
@@ -475,6 +486,12 @@ impl SessionStore {
             return Err(SessionError::InvalidEvent(
                 "session object does not match its file".into(),
             ));
+        }
+        // Another writer may only have appended. A file that no longer starts
+        // with the cached events (same id, but replaced or rewritten) must not
+        // be adopted silently: the model context was built from the cache.
+        if !is_event_prefix(&session.events, &disk_session.events) {
+            return Err(SessionError::HistoryDiverged(path.clone()));
         }
         if recovery.recovered {
             // Repair the incomplete crash tail before appending: truncate to
@@ -494,9 +511,13 @@ impl SessionStore {
         };
         validate_next_event(&disk_session, &record)?;
         let line = encode_record(disk_session.id(), &record)?;
-        let new_size = append_encoded_record(&path, &line, self.deferred_sync())?;
+        let current_size = fs::metadata(&path)
+            .map_err(|source| io_error("stat session for append", &path, source))?
+            .len();
+        let new_size = append_encoded_record(&path, &line, self.deferred_sync(), current_size)?;
         disk_session.append_record(record.clone());
         disk_session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
+        refresh_identity_after_append(&mut disk_session, &path);
         *session = disk_session;
         drop(lock);
         Ok(record)
@@ -638,15 +659,72 @@ impl SessionStore {
         {
             return Ok(source.clone());
         }
+        if normalize_workspace(source.metadata.workspace_root.clone())? != self.workspace_root {
+            return Err(SessionError::WorkspaceMismatch {
+                stored: source.metadata.workspace_root.clone(),
+                requested: self.workspace_root.clone(),
+            });
+        }
+        private_dir_all(&self.workspace_dir)?;
+        self.ensure_path_in_root(&self.workspace_dir)?;
         let target = self.workspace_dir.join(format!("{}.jsonl", source.id()));
         if target.exists() {
-            return self.open(&source.id());
+            return self.open_adopted(&target, source);
         }
-        let mut adopted = self.create_with_metadata(source.header_metadata.clone())?;
-        for record in &source.events {
-            self.append_event(&mut adopted, record.event.clone())?;
+        // Build and validate the complete copy in a private temporary file,
+        // then publish it with a hard link, which fails if the name exists.
+        // Appending event by event to the final name left a partial copy
+        // after a failure, and a later adopt reused it as complete.
+        let temp =
+            self.workspace_dir
+                .join(format!(".{}.{}.adopt.tmp", source.id(), Uuid::new_v4()));
+        let published = (|| -> Result<bool> {
+            let mut file = private_file(&temp)?;
+            let mut contents = encode_header(&source.header_metadata)?;
+            contents.push('\n');
+            for record in &source.events {
+                contents.push_str(&encode_record(source.id(), record)?);
+                contents.push('\n');
+            }
+            file.write_all(contents.as_bytes())
+                .and_then(|_| file.sync_all())
+                .map_err(|source| io_error("write adopted session", &temp, source))?;
+            drop(file);
+            // Full validation of the copy before anyone can see it.
+            load_session_file(&temp)?;
+            match fs::hard_link(&temp, &target) {
+                Ok(()) => {
+                    sync_parent(&target)?;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+                Err(source) => Err(io_error("publish adopted session", &target, source)),
+            }
+        })();
+        let _ = fs::remove_file(&temp);
+        if published? {
+            self.load_path(&target)
+        } else {
+            self.open_adopted(&target, source)
         }
-        Ok(adopted)
+    }
+
+    /// Open an existing session with the same id as `source`. It is used
+    /// only when it already holds all of `source`'s events (it may have
+    /// continued since); a different or partial history is a conflict, not
+    /// a silent substitute.
+    fn open_adopted(&self, target: &Path, source: &Session) -> Result<Session> {
+        let existing = self.load_path(target)?;
+        let contains_source = existing.events.len() >= source.events.len()
+            && existing
+                .events
+                .iter()
+                .zip(&source.events)
+                .all(|(existing, source)| existing.event == source.event);
+        if !contains_source {
+            return Err(SessionError::AlreadyExists(target.to_path_buf()));
+        }
+        Ok(existing)
     }
 
     fn ensure_path_in_root(&self, path: &Path) -> Result<()> {
@@ -659,6 +737,104 @@ impl SessionStore {
             });
         }
         Ok(())
+    }
+}
+
+/// Take the active lease sidecar for `session_path` without waiting.
+fn try_lock_active(session_path: &Path) -> Result<SessionActiveLease> {
+    let path = session_path.with_extension("jsonl.active.lock");
+    let file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&path)
+        }
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+        }
+    }
+    .map_err(|source| io_error("open active session lease", &path, source))?;
+    secure_lock_file(&file, &path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(SessionError::AlreadyActive(session_path.to_path_buf()))
+        }
+        Err(source) => Err(io_error("lock active session lease", &path, source)),
+    }
+}
+
+/// Delete the session `id` from every workspace group under `root`.
+///
+/// Returns whether a file was removed; a missing session counts as success.
+/// The caller supplies only an id, so every group is scanned. Each removal:
+///
+/// 1. takes the session's active lease without waiting, so a session that a
+///    runtime owns in this or another process is refused with
+///    [`SessionError::AlreadyActive`] instead of losing history between two
+///    of its appends;
+/// 2. takes the append lock with the normal bounded wait, so the call cannot
+///    block forever;
+/// 3. removes the file and syncs its directory.
+///
+/// Both lock sidecars are retained: contenders that opened them before the
+/// deletion must keep coordinating on the same inodes. A runtime that later
+/// acquires the lease and reloads finds the file gone. This function does
+/// blocking I/O; async callers should run it off the executor and await it to
+/// completion (never detach it after a timeout, or it can delete late).
+pub fn delete_session(root: &Path, id: &SessionId) -> Result<bool> {
+    let file_name = format!("{id}.jsonl");
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(io_error("list session root", root, source)),
+    };
+    let mut deleted = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| io_error("read session root entry", root, source))?;
+        let workspace_dir = entry.path();
+        match fs::metadata(&workspace_dir) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error("inspect session group", &workspace_dir, source)),
+        }
+        let path = workspace_dir.join(&file_name);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => deleted |= delete_session_file(&path)?,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error("inspect session", &path, source)),
+        }
+    }
+    Ok(deleted)
+}
+
+/// Delete one session file with the same safety rules as [`delete_session`]:
+/// refused while the active lease is held, bounded wait for the append lock,
+/// lock sidecars retained. Returns whether the file was removed.
+pub fn delete_session_file(path: &Path) -> Result<bool> {
+    let _active = try_lock_active(path)?;
+    let _append = SessionLock::acquire(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => {
+            sync_parent(path)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error("delete session", path, source)),
     }
 }
 
@@ -685,12 +861,7 @@ fn canonicalize_with_missing_tail(path: &Path) -> PathBuf {
 }
 
 fn load_session_file(path: &Path) -> Result<Session> {
-    let contents = read_file(path)?;
-    let (mut session, recovery) = decode_session_file_bytes(&contents, path)?;
-    session.path = Some(path.to_path_buf());
-    session.validated_bytes = recovery.valid_bytes;
-    session.file_identity = Some(file_identity(path)?);
-    Ok(session)
+    load_session_file_for_append(path).map(|(session, _)| session)
 }
 
 /// Re-read a session file for appending: returns the decoded session plus
@@ -791,48 +962,60 @@ fn reconcile_external_tail(session: &mut Session, path: &Path, file_size: usize)
 }
 
 /// Append one canonical record, inserting a separator when the preceding
-/// valid record ended without a newline. Returns the resulting file length.
-fn append_encoded_record(path: &Path, line: &str, deferred_sync: bool) -> Result<u64> {
-    let file_size = fs::metadata(path)
-        .map_err(|source| io_error("stat session for append", path, source))?
-        .len();
-    let needs_separator = file_size > 0 && !file_ends_with_newline(path, file_size)?;
+/// valid record ended without a newline. `file_size` is the size observed
+/// under the session lock. Returns the resulting file length.
+///
+/// One handle serves both the tail check and the write. A failed write or
+/// sync truncates the file back to `file_size`: a partial or unsynced record
+/// left in place was later reconciled as a valid external record, so a
+/// retry of the same event appended it twice.
+fn append_encoded_record(
+    path: &Path,
+    line: &str,
+    deferred_sync: bool,
+    file_size: u64,
+) -> Result<u64> {
     let mut file = OpenOptions::new()
+        .read(true)
         .append(true)
         .open(path)
         .map_err(|source| io_error("open session for append", path, source))?;
+    let needs_separator = if file_size == 0 {
+        false
+    } else {
+        // Reads honour the seek position; append-mode writes always go to
+        // the end of the file.
+        let mut byte = [0u8; 1];
+        file.seek(SeekFrom::Start(file_size - 1))
+            .and_then(|_| file.read_exact(&mut byte))
+            .map_err(|source| io_error("read session tail", path, source))?;
+        byte[0] != b'\n'
+    };
     let write_result = (|| -> std::io::Result<()> {
         if needs_separator {
             file.write_all(b"\n")?;
         }
         file.write_all(line.as_bytes())?;
         file.write_all(b"\n")?;
-        file.flush()
+        file.flush()?;
+        #[cfg(test)]
+        if injected_append_sync_failure() {
+            return Err(std::io::Error::other("injected append sync failure"));
+        }
+        if !deferred_sync {
+            file.sync_all()?;
+        }
+        Ok(())
     })();
-    let write_result = if write_result.is_err() || !deferred_sync {
-        write_result.and_then(|_| file.sync_all())
-    } else {
-        write_result
-    };
-    write_result.map_err(|source| io_error("append session event", path, source))?;
+    if let Err(source) = write_result {
+        // Roll back so no partial or unsynced bytes become a record later.
+        let _ = file.set_len(file_size).and_then(|_| file.sync_all());
+        return Err(io_error("append session event", path, source));
+    }
     Ok(file_size
         .saturating_add(u64::from(needs_separator))
         .saturating_add(line.len() as u64)
         .saturating_add(1))
-}
-
-fn file_ends_with_newline(path: &Path, file_size: u64) -> Result<bool> {
-    if file_size == 0 {
-        return Ok(true);
-    }
-    let mut file =
-        File::open(path).map_err(|source| io_error("open session tail", path, source))?;
-    file.seek(SeekFrom::End(-1))
-        .map_err(|source| io_error("seek session tail", path, source))?;
-    let mut byte = [0u8; 1];
-    file.read_exact(&mut byte)
-        .map_err(|source| io_error("read session tail", path, source))?;
-    Ok(byte[0] == b'\n')
 }
 
 fn read_file(path: &Path) -> Result<Vec<u8>> {
@@ -843,12 +1026,38 @@ fn read_file(path: &Path) -> Result<Vec<u8>> {
     Ok(contents)
 }
 
+/// Record the file identity after this handle's own append. On Unix the
+/// identity is (device, inode) and does not change. Elsewhere it is (size,
+/// modification time), which every append changes; without a refresh, the
+/// next append took the slow path and re-read the whole file each time.
+#[cfg(unix)]
+fn refresh_identity_after_append(_session: &mut Session, _path: &Path) {}
+
+#[cfg(not(unix))]
+fn refresh_identity_after_append(session: &mut Session, path: &Path) {
+    // Under the session lock, so the observed identity is our own write.
+    session.file_identity = file_identity(path).ok();
+}
+
+/// Whether `cached` is a prefix of `disk`, by event id and sequence.
+fn is_event_prefix(cached: &[SessionEventRecord], disk: &[SessionEventRecord]) -> bool {
+    cached.len() <= disk.len()
+        && cached
+            .iter()
+            .zip(disk)
+            .all(|(cached, disk)| cached.id == disk.id && cached.sequence == disk.sequence)
+}
+
 fn file_identity(path: &Path) -> Result<(u64, u64)> {
     let metadata = fs::metadata(path).map_err(|source| io_error("stat session", path, source))?;
+    Ok(identity_from_metadata(&metadata))
+}
+
+fn identity_from_metadata(metadata: &fs::Metadata) -> (u64, u64) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        Ok((metadata.dev(), metadata.ino()))
+        (metadata.dev(), metadata.ino())
     }
     #[cfg(not(unix))]
     {
@@ -857,7 +1066,7 @@ fn file_identity(path: &Path) -> Result<(u64, u64)> {
             .ok()
             .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_nanos() as u64);
-        Ok((metadata.len(), modified))
+        (metadata.len(), modified)
     }
 }
 
@@ -1140,27 +1349,47 @@ fn list_directory(directory: &Path, workspace: Option<&Path>) -> Result<Vec<Sess
     let mut result = Vec::new();
     let entries =
         fs::read_dir(directory).map_err(|source| io_error("list sessions", directory, source))?;
+    // One unreadable or corrupt file must not hide every other session, and
+    // a skipped file must be visible in the log rather than vanish silently.
     for entry in entries {
-        let entry = entry.map_err(|source| io_error("read session entry", directory, source))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(directory = %directory.display(), %error, "skipping unreadable session entry");
+                continue;
+            }
+        };
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("jsonl") {
             continue;
         }
-        match index_file(&path, workspace)? {
+        let indexed = match index_file(&path, workspace) {
+            Ok(indexed) => indexed,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "skipping unreadable session file");
+                continue;
+            }
+        };
+        match indexed {
             Some(entry) => result.push(entry),
             None => {
                 // A torn final JSONL line is recoverable for reads even
                 // though the metadata-only scanner cannot parse that line.
                 // Fall back to the recovery-aware loader; terminated or
                 // middle-file corruption still remains excluded.
-                if let Ok(session) = load_session_file(&path)
-                    && workspace.is_none_or(|workspace| {
-                        normalize_workspace(session.metadata.workspace_root.clone())
-                            .ok()
-                            .is_some_and(|root| root == workspace)
-                    })
-                {
-                    result.push(index_from_session(&session, &path));
+                match load_session_file(&path) {
+                    Ok(session) => {
+                        if workspace.is_none_or(|workspace| {
+                            normalize_workspace(session.metadata.workspace_root.clone())
+                                .ok()
+                                .is_some_and(|root| root == workspace)
+                        }) {
+                            result.push(index_from_session(&session, &path));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "skipping corrupt session file");
+                    }
                 }
             }
         }
@@ -1245,36 +1474,43 @@ fn resolve_salt(root: &Path) -> Result<u64> {
     persist_salt(root, salt)
 }
 
+/// Publish a new salt atomically. The complete value is written and synced
+/// to a private temporary file, then hard-linked to `.salt`; linking fails
+/// if the name exists, so exactly one initializer wins and no process can
+/// read a partially written salt (which made a racing process fall back to
+/// the legacy salt 0 and a different workspace directory).
 fn persist_salt(root: &Path, salt: u64) -> Result<u64> {
     let salt_path = root.join(SALT_FILE);
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&salt_path)
-    {
-        Ok(mut file) => {
-            writeln!(file, "{salt}")
-                .and_then(|_| file.sync_all())
-                .map_err(|source| io_error("write store salt", &salt_path, source))?;
-            drop(file);
-            ensure_private_file(&salt_path)?;
-            sync_parent(&salt_path)?;
-            Ok(salt)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another process won the race.  Adopt its salt (retrying briefly
-            // in case it has not finished writing) so both processes resolve
-            // the same workspace directory.
-            for _ in 0..20 {
-                if let Some(winner) = read_salt(root) {
-                    return Ok(winner);
-                }
-                thread::sleep(Duration::from_millis(1));
+    let temp_path = root.join(format!(".salt.{}.tmp", Uuid::new_v4()));
+    let published = (|| -> Result<bool> {
+        let mut file = private_file(&temp_path)?;
+        writeln!(file, "{salt}")
+            .and_then(|_| file.sync_all())
+            .map_err(|source| io_error("write store salt", &temp_path, source))?;
+        drop(file);
+        match fs::hard_link(&temp_path, &salt_path) {
+            Ok(()) => {
+                sync_parent(&salt_path)?;
+                Ok(true)
             }
-            Ok(0)
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(source) => Err(io_error("publish store salt", &salt_path, source)),
         }
-        Err(source) => Err(io_error("create store salt", &salt_path, source)),
+    })();
+    let _ = fs::remove_file(&temp_path);
+    if published? {
+        return Ok(salt);
     }
+    // Another process won. Its salt is complete when the name appears. An
+    // older Harness may still be writing in place, so retry briefly; an
+    // unparsable salt then resolves exactly as `resolve_salt` resolves it.
+    for _ in 0..200 {
+        if let Some(winner) = read_salt(root) {
+            return Ok(winner);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(0)
 }
 
 fn read_salt(root: &Path) -> Option<u64> {
@@ -1365,6 +1601,36 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
 }
 
 /// Fail-closed permission repair for files.
+/// Secure a lock sidecar through its open handle. New sidecars are created
+/// with mode 0600; only older, permissive ones are repaired. Unlike
+/// [`ensure_private_file`] this does no `chmod` when the mode is already
+/// private and no parent-directory `fsync` (a lock file holds no data), so
+/// an append no longer pays a `chmod` and a directory sync per event.
+fn secure_lock_file(file: &File, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if injected_secure_file_failure() {
+        return Err(io_error(
+            "secure file permissions",
+            path,
+            std::io::Error::other("injected file permission failure"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error("stat private file", path, source))?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| io_error("secure file permissions", path, source))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
+}
+
 fn ensure_private_file(path: &Path) -> Result<()> {
     // Fail-closed test hook: simulate an OS permission failure before any
     // repair so tests prove append/create propagates instead of continuing
@@ -1522,7 +1788,7 @@ impl SessionLock {
         .map_err(|source| io_error("open session lock", &path, source))?;
         // Existing sidecars from older versions are secured before any lock
         // metadata or session bytes are written. Failure is fail-closed.
-        ensure_private_file(&path)?;
+        secure_lock_file(&file, &path)?;
 
         for _ in 0..LOCK_ATTEMPTS {
             match file.try_lock_exclusive() {
@@ -2106,7 +2372,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_to_valid_boundary_is_reconciled_before_append() {
+    fn truncation_of_cached_records_is_refused_until_reload() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
         let store = SessionStore::new(root.path(), workspace.path()).unwrap();
@@ -2132,9 +2398,21 @@ mod tests {
             .unwrap();
         fs::write(&path, &raw[..first_event_end]).unwrap();
         assert!(first_event_end > header_end);
+        // The stale handle holds "second", which the file no longer has; its
+        // model context would not match the log.
+        assert!(matches!(
+            store.append_event(
+                &mut stale,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("replacement")),
+                },
+            ),
+            Err(SessionError::HistoryDiverged(_))
+        ));
+        let mut reloaded = store.open(&session.id()).unwrap();
         store
             .append_event(
-                &mut stale,
+                &mut reloaded,
                 SessionEvent::UserMessage {
                     message: StoredMessage::from_llm(&Message::user("replacement")),
                 },
@@ -2432,6 +2710,72 @@ mod tests {
     }
 
     #[test]
+    fn lease_then_reload_includes_the_previous_owners_final_events() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut owner_session = store.create(SessionCreateOptions::default()).unwrap();
+        let owner = store.acquire_active(&owner_session).unwrap();
+        // A second runtime loads while the first still owns the session.
+        let mut stale = store.load_path(owner_session.path().unwrap()).unwrap();
+        store
+            .append_event(
+                &mut owner_session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("final words")),
+                },
+            )
+            .unwrap();
+        drop(owner);
+
+        let _lease = store.acquire_active_and_reload(&mut stale).unwrap();
+        assert_eq!(stale.events.len(), owner_session.events.len());
+        assert!(matches!(
+            stale.events.last().map(|record| &record.event),
+            Some(SessionEvent::UserMessage { .. })
+        ));
+    }
+
+    #[test]
+    fn load_that_races_a_delete_reports_not_found() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        // Another process loaded the session, then a delete ran before the
+        // loader took the active lease.
+        let mut loaded = store.load_path(session.path().unwrap()).unwrap();
+        assert!(delete_session(root.path(), &session.id()).unwrap());
+        assert!(matches!(
+            store.acquire_active_and_reload(&mut loaded),
+            Err(SessionError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_refuses_an_active_session_and_succeeds_after_release() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let path = session.path().unwrap().clone();
+
+        let owner = store.acquire_active(&session).unwrap();
+        assert!(matches!(
+            delete_session(root.path(), &session.id()),
+            Err(SessionError::AlreadyActive(_))
+        ));
+        assert!(path.exists(), "an owned session must not be deleted");
+        drop(owner);
+
+        assert!(delete_session(root.path(), &session.id()).unwrap());
+        assert!(!path.exists());
+        // Lock sidecars stay so contenders keep the same inodes.
+        assert!(path.with_extension("jsonl.active.lock").exists());
+        assert!(!delete_session(root.path(), &session.id()).unwrap());
+    }
+
+    #[test]
     fn advisory_lock_serializes_contenders_and_retains_sidecar_inode() {
         let directory = tempdir().unwrap();
         let victim = directory.path().join("victim.jsonl");
@@ -2579,6 +2923,170 @@ mod tests {
         assert!(store.open(&session.id()).unwrap().events.is_empty());
     }
 
+    #[test]
+    fn append_refuses_a_rewritten_file_with_the_same_id() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        let path = session.path().unwrap().clone();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        store
+            .append_event(&mut session, message("original"))
+            .unwrap();
+        // Rewrite the file: same header and id, different history.
+        let header = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .to_owned();
+        let replacement = path.with_extension("replacement");
+        fs::write(&replacement, format!("{header}\n")).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let mut other = store.load_path(&path).unwrap();
+        store
+            .append_event(&mut other, message("rewritten"))
+            .unwrap();
+
+        assert!(matches!(
+            store.append_event(&mut session, message("next")),
+            Err(SessionError::HistoryDiverged(_))
+        ));
+    }
+
+    #[test]
+    fn adopt_publishes_a_complete_copy_and_refuses_a_different_one() {
+        let external_root = tempdir().unwrap();
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let external = SessionStore::new(external_root.path(), workspace.path()).unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        let mut source = external.create(SessionCreateOptions::default()).unwrap();
+        for text in ["one", "two"] {
+            external.append_event(&mut source, message(text)).unwrap();
+        }
+        let source = external.load_path(source.path().unwrap()).unwrap();
+
+        let adopted = store.adopt(&source).unwrap();
+        assert_eq!(adopted.events, source.events);
+        // Adopting again reuses the complete copy.
+        assert_eq!(store.adopt(&source).unwrap().events, source.events);
+        let leftovers = fs::read_dir(store.workspace_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        // A same-id file with other history is a conflict, not a substitute.
+        let mut longer = source.clone();
+        longer.append(message("three"));
+        let mut different = source.clone();
+        different.events.pop();
+        different.append(message("other"));
+        assert!(matches!(
+            store.adopt(&different),
+            Err(SessionError::AlreadyExists(_))
+        ));
+        assert!(matches!(
+            store.adopt(&longer),
+            Err(SessionError::AlreadyExists(_))
+        ));
+    }
+
+    #[test]
+    fn assistant_message_cannot_separate_a_call_from_its_result() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::UserMessage {
+                    message: StoredMessage::from_llm(&Message::user("go")),
+                },
+            )
+            .unwrap();
+        store
+            .append_event(
+                &mut session,
+                SessionEvent::ToolCall {
+                    call: StoredToolCall {
+                        id: "call-1".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                },
+            )
+            .unwrap();
+        let error = store
+            .append_event(
+                &mut session,
+                SessionEvent::AssistantMessage {
+                    message: StoredMessage::from_llm(&Message::assistant(vec![
+                        llm::Content::Text("meanwhile".into()),
+                    ])),
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("unresolved tool call"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_unreadable_session_does_not_fail_the_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let good = store.create(SessionCreateOptions::default()).unwrap();
+        let bad = store.create(SessionCreateOptions::default()).unwrap();
+        let bad_path = bad.path().unwrap().clone();
+        fs::set_permissions(&bad_path, fs::Permissions::from_mode(0o000)).unwrap();
+        if File::open(&bad_path).is_ok() {
+            // Running as root: permissions do not block reads.
+            return;
+        }
+        let listed = store.list().unwrap();
+        fs::set_permissions(&bad_path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, good.id());
+    }
+
+    #[test]
+    fn failed_append_is_rolled_back_and_never_reappears() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        let path = session.path().unwrap().clone();
+        let bytes_before = fs::metadata(&path).unwrap().len();
+        let event = || SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("once")),
+        };
+        INJECT_APPEND_SYNC_FAILURE.with(|flag| flag.set(true));
+        let failed = store.append_event(&mut session, event());
+        INJECT_APPEND_SYNC_FAILURE.with(|flag| flag.set(false));
+        assert!(failed.is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), bytes_before);
+
+        // A retry from a fresh handle (as after a restart) records it once.
+        let mut reloaded = store.load_path(&path).unwrap();
+        store.append_event(&mut reloaded, event()).unwrap();
+        let events = store.load_path(&path).unwrap().events;
+        assert_eq!(events.len(), 1);
+    }
+
     /// SESSION-4: a parent-sync failure must fail the whole create instead
     /// of leaving a session header whose directory entry may not survive a
     /// crash. The injected error mirrors a real directory-`fsync` failure.
@@ -2615,6 +3123,40 @@ mod tests {
         let store = SessionStore::new(root.path(), &workspace).unwrap();
         assert_eq!(store.workspace_dir(), legacy_dir.as_path());
         assert!(!root.path().join(SALT_FILE).exists());
+    }
+
+    #[test]
+    fn concurrent_salt_initializers_agree() {
+        // A partially written salt made a racing process use the legacy
+        // salt 0 and a different workspace directory.
+        for _ in 0..20 {
+            let root = tempdir().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads = (0..8)
+                .map(|_| {
+                    let root = root.path().join("store");
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        resolve_salt(&root).unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let salts = threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                salts.iter().all(|salt| *salt == salts[0] && *salt != 0),
+                "{salts:?}"
+            );
+            let leftovers = fs::read_dir(root.path().join("store"))
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                .count();
+            assert_eq!(leftovers, 0);
+        }
     }
 
     #[test]

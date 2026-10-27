@@ -967,6 +967,7 @@ pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord
         &session.tracker,
         session.compaction_boundary,
     )?;
+    validate_new_assistant_order(record, &session.tracker)?;
     if let SessionEvent::CompactionSummary {
         compacted_through, ..
     } = &record.event
@@ -1001,6 +1002,7 @@ pub(crate) fn validate_event_suffix(
             )));
         }
         validate_record(record, expected, &ids, &tracker, boundary)?;
+        validate_new_assistant_order(record, &tracker)?;
         ids.insert(record.id);
         if let SessionEvent::CompactionSummary {
             compacted_through, ..
@@ -1079,6 +1081,26 @@ impl ToolValidationState for SuffixTracker<'_> {
     fn is_cancelled(&self) -> bool {
         self.local.is_cancelled()
     }
+}
+
+/// Rule for newly written events only: a new assistant message may not
+/// arrive while earlier tool calls still wait for results. Providers need
+/// each result directly after the response that made the call, so
+/// call → assistant text → result is not valid provider history. It is not
+/// applied when an existing file is loaded, so older logs stay readable.
+fn validate_new_assistant_order<T: ToolValidationState>(
+    record: &SessionEventRecord,
+    tracker: &T,
+) -> Result<()> {
+    if matches!(record.event, SessionEvent::AssistantMessage { .. })
+        && !tracker.pending().is_empty()
+        && !tracker.is_cancelled()
+    {
+        return Err(SessionError::InvalidEvent(
+            "assistant message follows an unresolved tool call".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_record<T: ToolValidationState>(
@@ -1354,8 +1376,17 @@ pub fn snapshot_entries(session: &Session) -> Vec<SessionSnapshotEntry> {
             SessionEvent::AssistantMessage { message } => {
                 let mut markdown = String::new();
                 let mut reasoning = String::new();
+                // Calls embedded with opaque provider state (Codex) get the
+                // same tool entries as standalone ToolCall events, so their
+                // results are matched instead of shown as anonymous tools.
+                let mut embedded_calls = Vec::new();
                 for content in &message.content {
                     match content {
+                        StoredContent::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => embedded_calls.push((id, name, arguments)),
                         StoredContent::Text { text } => {
                             if !markdown.is_empty() {
                                 markdown.push('\n');
@@ -1368,15 +1399,23 @@ pub fn snapshot_entries(session: &Session) -> Vec<SessionSnapshotEntry> {
                             }
                             reasoning.push_str(text);
                         }
-                        StoredContent::ToolCall { .. }
-                        | StoredContent::ToolResult { .. }
-                        | StoredContent::Opaque { .. } => {}
+                        StoredContent::ToolResult { .. } | StoredContent::Opaque { .. } => {}
                     }
                 }
                 if !markdown.is_empty() || !reasoning.is_empty() {
                     entries.push(SessionSnapshotEntry::Assistant {
                         markdown,
                         reasoning,
+                    });
+                }
+                for (id, name, arguments) in embedded_calls {
+                    tool_indices.insert(id.clone(), entries.len());
+                    entries.push(SessionSnapshotEntry::Tool {
+                        name: name.clone(),
+                        arguments: arguments.clone(),
+                        ok: false,
+                        output: String::new(),
+                        error: None,
                     });
                 }
             }
@@ -1565,6 +1604,42 @@ mod tests {
                 output: "file contents".into(),
                 error: None,
             }
+        );
+    }
+
+    #[test]
+    fn snapshot_entries_pair_results_with_embedded_calls() {
+        // Codex keeps calls inside the assistant message with opaque state.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        session.append(SessionEvent::AssistantMessage {
+            message: StoredMessage::from_llm(&Message::assistant(vec![
+                Content::Opaque {
+                    provider: "openai-codex".into(),
+                    data: json!({"state": 1}),
+                },
+                Content::ToolCall(llm::ToolCall {
+                    id: "call-1".into(),
+                    name: "read".into(),
+                    arguments: json!({ "path": "a.rs" }),
+                }),
+            ])),
+        });
+        session.append(SessionEvent::ToolResult {
+            tool_call_id: "call-1".into(),
+            content: "contents".into(),
+            is_error: false,
+            tool_name: None,
+        });
+        let snapshot = snapshot_entries(&session);
+        assert_eq!(
+            snapshot,
+            vec![SessionSnapshotEntry::Tool {
+                name: "read".into(),
+                arguments: json!({ "path": "a.rs" }),
+                ok: true,
+                output: "contents".into(),
+                error: None,
+            }]
         );
     }
 

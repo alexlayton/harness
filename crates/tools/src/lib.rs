@@ -7,6 +7,8 @@ mod find;
 mod grep;
 mod multigrep;
 mod outline;
+#[cfg(target_os = "linux")]
+pub mod process_scope;
 mod python;
 mod read;
 mod registry;
@@ -16,7 +18,7 @@ pub mod vfs;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
-pub use code_mode::{CodeModeEvent, CodeModeExecutor};
+pub use code_mode::{CODE_MODE_TOOL_NAME, CodeModeEvent, CodeModeExecutor};
 pub use context_files::{
     display_path, format_context_files, load_context_files, load_context_files_with,
 };
@@ -336,22 +338,49 @@ fn resolve_registry_workspace(cwd: &Path) -> Result<PathBuf, ToolInitError> {
     })
 }
 
-pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
-    // Project roots: cwd up to git repo root (or filesystem root).
-    let mut roots: Vec<(PathBuf, SkillMode)> = Vec::new();
-    let mut dir = workspace_root.to_path_buf();
-    loop {
-        roots.push((dir.join(".harness/skills"), SkillMode::Harness));
-        roots.push((dir.join(".agents/skills"), SkillMode::Agents));
-        // Stop at the git repo root.
-        if dir.join(".git").exists() {
-            break;
+/// Run blocking file work (reads, `fsync`, bounded lock waits) from async
+/// code without stalling the other tasks on this Tokio worker.
+///
+/// On the multi-thread runtime, `block_in_place` first hands the worker's
+/// queued tasks to another thread. The current-thread runtime (unit tests
+/// and some embedders) cannot do that, and calling `block_in_place` there
+/// panics, so `f` runs inline.
+pub fn blocking_io<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
         }
-        let parent = dir.parent().map(Path::to_path_buf);
-        match parent {
-            Some(parent) if parent != dir => dir = parent,
+        _ => f(),
+    }
+}
+
+/// Directories searched for project context (instructions and skills),
+/// nearest first: `start` and each ancestor up to and including the git
+/// repository root.  Without a git root only `start` is returned: walking to
+/// `/` would treat files such as `/tmp/AGENTS.md`, written by any local user,
+/// as trusted project instructions.
+pub(crate) fn project_context_dirs(start: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut dir = start.to_path_buf();
+    loop {
+        dirs.push(dir.clone());
+        if dir.join(".git").exists() {
+            return dirs;
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir => dir = parent.to_path_buf(),
             _ => break,
         }
+    }
+    vec![start.to_path_buf()]
+}
+
+pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
+    // Project roots: cwd up to the git repo root (only cwd outside a repo).
+    let mut roots: Vec<(PathBuf, SkillMode)> = Vec::new();
+    for dir in project_context_dirs(workspace_root) {
+        roots.push((dir.join(".harness/skills"), SkillMode::Harness));
+        roots.push((dir.join(".agents/skills"), SkillMode::Agents));
     }
     // Global: ~/.harness/skills (or $HARNESS_SKILLS_DIR).
     let global = std::env::var_os("HARNESS_SKILLS_DIR")
@@ -388,14 +417,11 @@ pub(crate) fn normalize_workspace_root(root: impl Into<PathBuf>) -> PathBuf {
     std::fs::canonicalize(&root).unwrap_or(root)
 }
 
-/// Resolve a tool path.  Workspace-aware tools use this helper to keep paths
-/// inside the same root as `bash` and `find`.  The `None` mode is retained for
-/// the small compatibility constructors used by library callers and tests;
-/// those constructors preserve the historical process-cwd/absolute-path
-/// behavior.
+/// Resolve a tool path inside the workspace root, the same root that `bash`
+/// and `find` use, so every tool applies one containment rule.
 pub(crate) async fn resolve_workspace_path(
     value: &str,
-    workspace_root: Option<&Path>,
+    root: &Path,
     strip_at_prefix: bool,
 ) -> Result<PathBuf, String> {
     let value = if strip_at_prefix {
@@ -408,16 +434,6 @@ pub(crate) async fn resolve_workspace_path(
     }
 
     let path = PathBuf::from(value);
-    let Some(root) = workspace_root else {
-        return Ok(if path.is_absolute() {
-            path
-        } else {
-            std::env::current_dir()
-                .map_err(|error| format!("cannot determine working directory: {error}"))?
-                .join(path)
-        });
-    };
-
     let root = lexical_normalize(root);
     // Canonicalize the workspace root once up front so every containment
     // check below compares like-for-like.  Production callers pass an already
@@ -544,7 +560,7 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             .map(|command| format!("bash: {}", first_line(command)))
             .unwrap_or_else(|| "bash".into()),
         "python" => python::summary(args),
-        "run_code" => code_mode::summary(args),
+        CODE_MODE_TOOL_NAME => code_mode::summary(args),
         "find" => {
             let query = args.get("query").and_then(Value::as_str);
             let path = args.get("path").and_then(Value::as_str);
@@ -717,20 +733,20 @@ mod tests {
 
         // Only `a/` exists; the deep tail resolves lexically after a single
         // canonicalize of the existing ancestor.
-        let resolved = resolve_workspace_path("a/b/c/d.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("a/b/c/d.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("a/b/c/d.txt"));
 
         // An existing file resolves through the fast path.
         std::fs::write(root.join("keep.txt"), "x").unwrap();
-        let resolved = resolve_workspace_path("keep.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("keep.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("keep.txt"));
 
         // A path that lexically escapes the root is rejected up front.
-        let error = resolve_workspace_path("../outside/file.txt", Some(&root), false)
+        let error = resolve_workspace_path("../outside/file.txt", &root, false)
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
@@ -746,7 +762,7 @@ mod tests {
 
         // The symlink is the deepest existing ancestor; canonicalizing it
         // once must surface the escape even though the tail does not exist.
-        let error = resolve_workspace_path("link/sub/file.txt", Some(&root), false)
+        let error = resolve_workspace_path("link/sub/file.txt", &root, false)
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
@@ -760,7 +776,7 @@ mod tests {
 
         // Only `src/` exists; the file does not.  The parent fast path
         // resolves it with a single canonicalize of `src/`.
-        let resolved = resolve_workspace_path("src/main.rs", Some(&root), false)
+        let resolved = resolve_workspace_path("src/main.rs", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("src/main.rs"));
@@ -776,7 +792,7 @@ mod tests {
 
         // The parent is a symlink inside the workspace; the parent fast path
         // canonicalizes it and must accept the candidate.
-        let resolved = resolve_workspace_path("link/new.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("link/new.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("link/new.txt"));
@@ -792,7 +808,7 @@ mod tests {
 
         // The parent fast path canonicalizes the symlink and must surface
         // the escape before the tail is considered.
-        let error = resolve_workspace_path("escape/new.txt", Some(&root), false)
+        let error = resolve_workspace_path("escape/new.txt", &root, false)
             .await
             .unwrap_err();
         assert!(error.contains("outside"), "{error}");
@@ -815,7 +831,7 @@ mod tests {
         std::fs::write(root.join("sub/file.txt"), "inside").unwrap();
 
         // 1. Resolve while the tree is intact (production step).
-        let resolved = resolve_workspace_path("sub/file.txt", Some(&root), false)
+        let resolved = resolve_workspace_path("sub/file.txt", &root, false)
             .await
             .unwrap();
         assert_eq!(resolved, root.join("sub/file.txt"));

@@ -70,7 +70,8 @@ impl OpenAiChatClient {
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         let response = self.http.get("/models").await?;
-        let body = response.text().await.map_err(LlmError::Network)?;
+        let body =
+            crate::http::read_bounded_text(response, crate::http::MAX_METADATA_BODY_BYTES).await?;
         parse_models_body(&body).map_err(|error| error.redacted(self.api_key()))
     }
 }
@@ -167,7 +168,7 @@ pub fn convert_messages(messages: &[Message]) -> Vec<Value> {
                             "type": "function",
                             "function": {
                                 "name": call.name,
-                                "arguments": stringify_arguments(&call.arguments),
+                                "arguments": super::stringify_arguments(&call.arguments),
                             }
                         })),
                         Content::Reasoning(_)
@@ -226,10 +227,6 @@ fn text_content(content: &[Content]) -> String {
         .collect()
 }
 
-fn stringify_arguments(arguments: &Value) -> String {
-    serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into())
-}
-
 pub fn parse_models_body(body: &str) -> Result<Vec<ModelInfo>, LlmError> {
     let value: Value =
         serde_json::from_str(body).map_err(|error| LlmError::Parse(error.to_string()))?;
@@ -255,6 +252,10 @@ pub fn parse_models_body(body: &str) -> Result<Vec<ModelInfo>, LlmError> {
 pub struct ChatStreamParser {
     calls: BTreeMap<u64, PartialToolCall>,
     stop_reason: Option<String>,
+    /// Latest usage seen.  Some endpoints attach cumulative usage to every
+    /// chunk, so usage alone does not end the response; it is reported on
+    /// the terminal event.
+    usage: Option<Usage>,
     done: bool,
     calls_flushed: bool,
     /// Call IDs already emitted in this response.  IDs are unique per
@@ -290,8 +291,9 @@ impl ChatStreamParser {
         if payload.trim() == "[DONE]" {
             // The documented Chat terminator has no usage of its own.  It is
             // nevertheless a complete protocol terminal: validate and emit
-            // every pending call before recording one usage-less Done event.
-            return self.complete(None);
+            // every pending call before recording one Done event with the
+            // latest usage seen (if any).
+            return self.complete();
         }
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| LlmError::Parse(format!("chat SSE payload: {error}")))?;
@@ -301,18 +303,18 @@ impl ChatStreamParser {
             && !error_value.is_null()
         {
             // A mid-stream provider error payload (e.g. `{"error": ...}`)
-            // is a terminal failure, not a silent empty chunk: surface it
-            // as `LlmError::Stream` so partial output stays an error and
-            // the agent's recovery path handles it.
-            let detail = error_value
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error_value.as_str())
-                .unwrap_or("provider error");
-            return Err(LlmError::Stream(format!("chat error: {detail}")));
+            // is a terminal failure, not a silent empty chunk. Overload and
+            // server faults are transient (the agent re-streams); other
+            // errors are permanent and are reported.
+            let detail = super::value_message(error_value).unwrap_or("provider error");
+            return Err(super::in_band_error(
+                &[Some(error_value)],
+                format!("chat error: {detail}"),
+            ));
         }
 
-        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        let choices = value.get("choices").and_then(Value::as_array);
+        if let Some(choices) = choices {
             for (choice_index, choice) in choices.iter().enumerate() {
                 if choice_index > 0 {
                     break; // v1 requests one completion
@@ -349,7 +351,14 @@ impl ChatStreamParser {
         if let Some(usage_value) = value.get("usage")
             && !usage_value.is_null()
         {
-            output.extend(self.complete(Some(parse_usage(usage_value)?))?);
+            self.usage = Some(parse_usage(usage_value)?);
+            // Usage ends the response only as the dedicated usage chunk
+            // (no choices) or after a finish_reason.  Endpoints that attach
+            // usage to every content chunk must keep streaming.
+            let usage_only = choices.is_none_or(|choices| choices.is_empty());
+            if usage_only || self.stop_reason.is_some() {
+                output.extend(self.complete()?);
+            }
         }
         Ok(output)
     }
@@ -359,22 +368,21 @@ impl ChatStreamParser {
             return Ok(Vec::new());
         }
         // Clean transport EOF without a protocol terminal event is a
-        // truncated stream, not a successful turn: surface it as
-        // `LlmError::Stream` so the agent's recovery path (persist partial
-        // text, emit a diagnostic, retry or fail loudly) handles it.  Never
+        // truncated stream, not a successful turn: surface it as the
+        // transient `LlmError::StreamInterrupted` so the agent persists the
+        // partial text and re-streams within its recovery bound.  Never
         // manufacture `Done` and never finalize unfinished tool calls here.
         self.done = true;
-        Err(LlmError::Stream(
-            "chat stream ended without a terminal event (expected [DONE], a finish_reason, or a usage chunk)"
-                .into(),
+        Err(super::truncated_stream(
+            "chat stream ended without a terminal event (expected [DONE] or a final usage chunk)",
         ))
     }
 
-    fn complete(&mut self, usage: Option<Usage>) -> Result<Vec<StreamEvent>, LlmError> {
+    fn complete(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         let mut output = self.flush_calls()?;
         output.push(StreamEvent::Done {
             stop_reason: self.stop_reason.clone(),
-            usage,
+            usage: self.usage.take(),
         });
         self.done = true;
         Ok(output)
@@ -393,7 +401,12 @@ impl ChatStreamParser {
             }
         }
         if let Some(function) = item.get("function") {
-            if let Some(name) = function.get("name").and_then(Value::as_str) {
+            // Like the ID: some endpoints repeat the complete name in every
+            // delta, others stream fragments. An exact repeat of the
+            // assembled name is idempotent ("read" + "read" stays "read").
+            if let Some(name) = function.get("name").and_then(Value::as_str)
+                && name != call.name
+            {
                 call.name.push_str(name);
             }
             if let Some(arguments) = function.get("arguments") {
@@ -590,6 +603,50 @@ mod tests {
     }
 
     #[test]
+    fn repeated_tool_name_deltas_are_not_concatenated() {
+        let mut parser = ChatStreamParser::new();
+        for payload in [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"\"x\"}"}}]}}]}"#,
+        ] {
+            parser.parse_payload(payload).unwrap();
+        }
+        let events = parser.parse_payload("[DONE]").unwrap();
+        assert!(events.iter().any(
+            |event| matches!(event, StreamEvent::ToolCallComplete(call) if call.name == "read")
+        ));
+    }
+
+    #[test]
+    fn usage_on_every_chunk_does_not_end_the_answer_early() {
+        // Some endpoints attach cumulative usage to every content chunk.
+        // Only [DONE] (or usage after finish_reason) ends the response.
+        let mut parser = ChatStreamParser::new();
+        let mut events = parser
+            .parse_payload(r#"{"choices":[{"delta":{"content":"hel"}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}"#)
+            .unwrap();
+        events.extend(
+            parser
+                .parse_payload(r#"{"choices":[{"delta":{"content":"lo"}}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#)
+                .unwrap(),
+        );
+        assert!(!parser.done);
+        events.extend(parser.parse_payload("[DONE]").unwrap());
+        let text: String = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::TextDelta(delta) => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(text, "hello");
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { usage: Some(usage), .. }) if usage.output_tokens == 2
+        ));
+    }
+
+    #[test]
     fn terminal_usage_chunk_split_across_chunks_succeeds() {
         // The terminal usage chunk split across two `push_bytes` calls
         // still terminates with `Done`: the decoder buffers the partial
@@ -633,13 +690,16 @@ mod tests {
     #[test]
     fn text_then_eof_without_terminator_fails() {
         // Text followed by clean EOF with no `[DONE]`, finish_reason, or
-        // usage chunk is a truncated stream: `finish` is a `Stream` error.
+        // usage chunk is a truncated stream: `finish` is a transient error.
         let mut parser = ChatStreamParser::new();
         parser
             .parse_payload(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
             .unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
     }
 
     #[test]
@@ -651,7 +711,10 @@ mod tests {
             )
             .unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
         assert!(parser.seen_ids.is_empty());
     }
 
@@ -813,8 +876,8 @@ mod tests {
     #[test]
     fn stream_error_after_partial_output_remains_an_error() {
         // Partial text followed by a mid-stream provider error payload is
-        // a failure, not a truncated-but-usable turn: the error surfaces
-        // as `LlmError::Stream` (agent recovery path) instead of an empty
+        // a failure, not a truncated-but-usable turn: a server fault surfaces
+        // as transient `LlmError::StreamInterrupted` instead of an empty
         // `Ok` that a later EOF would turn into a confusing truncation.
         let mut parser = ChatStreamParser::new();
         let events = parser
@@ -824,7 +887,10 @@ mod tests {
         let error = parser
             .parse_payload(r#"{"error":{"message":"boom","type":"server_error"}}"#)
             .unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
     }
 
     #[test]

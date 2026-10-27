@@ -96,7 +96,6 @@ fn outline(
     walk(
         tree.root_node(),
         source.as_bytes(),
-        0,
         filter.as_deref(),
         &mut lines,
         &mut entry_limit_hit,
@@ -125,95 +124,108 @@ fn outline(
     Ok(output)
 }
 
+/// Pre-order walk over named nodes with an explicit stack. A recursive walk
+/// overflowed the thread stack (aborting the whole process) on deeply nested
+/// input such as a 1 MiB file of `(((…`; the explicit stack lives on the heap.
 fn walk(
+    root: Node<'_>,
+    source: &[u8],
+    filter: Option<&str>,
+    out: &mut Vec<String>,
+    entry_limit_hit: &mut bool,
+    cancel: &CancellationToken,
+) {
+    let mut stack = vec![(root, 0usize)];
+    let mut children = Vec::new();
+    while let Some((node, depth)) = stack.pop() {
+        if cancel.is_cancelled() || *entry_limit_hit {
+            return;
+        }
+        let next_depth = visit(node, source, depth, filter, out, entry_limit_hit);
+        if *entry_limit_hit {
+            return;
+        }
+        let mut cursor = node.walk();
+        children.clear();
+        children.extend(node.named_children(&mut cursor));
+        // Reverse so the first child is visited first.
+        stack.extend(children.drain(..).rev().map(|child| (child, next_depth)));
+    }
+}
+
+/// Emit one declaration entry for `node` when it is a declaration, and
+/// return the depth for its children.
+fn visit(
     node: Node<'_>,
     source: &[u8],
     depth: usize,
     filter: Option<&str>,
     out: &mut Vec<String>,
     entry_limit_hit: &mut bool,
-    cancel: &CancellationToken,
-) {
-    if cancel.is_cancelled() || *entry_limit_hit {
-        return;
-    }
+) -> usize {
     let kind = node.kind();
-    let is_decl = declaration(kind);
-    let mut next_depth = depth;
-    if is_decl {
-        // A signature ends at the first body node; keep multiline parameters intact.
-        let body_start = (0..node.child_count())
-            .filter_map(|i| node.child(i))
-            .find(|child| {
-                matches!(
-                    child.kind(),
-                    "block"
-                        | "compound_statement"
-                        | "statement_block"
-                        | "class_body"
-                        | "field_declaration_list"
-                        | "declaration_list"
-                        | "function_body"
-                        | "type_body"
-                        | "enum_class_body"
-                        | "member_declaration_list"
-                )
-            })
-            .map(|child| child.start_byte())
-            .unwrap_or(node.end_byte());
-        let end = body_start.min(node.end_byte());
-        let header_end = end.min(node.start_byte().saturating_add(MAX_SIGNATURE_BYTES));
-        let header = String::from_utf8_lossy(&source[node.start_byte()..header_end]);
-        let header = header
-            .trim()
-            .trim_end_matches('{')
-            .trim_end_matches(':')
-            .trim();
-        let mut header = header.split_whitespace().collect::<Vec<_>>().join(" ");
-        if header_end < end {
-            header.push_str(" … [signature truncated]");
-        }
-        if !header.is_empty() {
-            // Match the displayed signature, not the body of the declaration.
-            let matches_filter = filter.is_none_or(|query| header.to_lowercase().contains(query));
-            if matches_filter {
-                if out.len() == MAX_ENTRIES {
-                    *entry_limit_hit = true;
-                    return;
-                }
-                // Tree-sitter's end point is exclusive. If a node ends at the
-                // start of a new line, that line is not part of the declaration.
-                let end_row = node.end_position().row
-                    - usize::from(
-                        node.end_position().column == 0
-                            && node.end_position().row > node.start_position().row,
-                    );
-                out.push(format!(
-                    "{}line {}, count {} — {}: {}",
-                    "  ".repeat(depth.min(12)),
-                    node.start_position().row + 1,
-                    end_row + 1 - node.start_position().row,
-                    kind,
-                    header
-                ));
-            }
-            next_depth += 1;
-        }
+    if !declaration(kind) {
+        return depth;
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.is_named() {
-            walk(
-                child,
-                source,
-                next_depth,
-                filter,
-                out,
-                entry_limit_hit,
-                cancel,
+    // A signature ends at the first body node; keep multiline parameters intact.
+    let body_start = (0..node.child_count())
+        .filter_map(|i| node.child(i))
+        .find(|child| {
+            matches!(
+                child.kind(),
+                "block"
+                    | "compound_statement"
+                    | "statement_block"
+                    | "class_body"
+                    | "field_declaration_list"
+                    | "declaration_list"
+                    | "function_body"
+                    | "type_body"
+                    | "enum_class_body"
+                    | "member_declaration_list"
+            )
+        })
+        .map(|child| child.start_byte())
+        .unwrap_or(node.end_byte());
+    let end = body_start.min(node.end_byte());
+    let header_end = end.min(node.start_byte().saturating_add(MAX_SIGNATURE_BYTES));
+    let header = String::from_utf8_lossy(&source[node.start_byte()..header_end]);
+    let header = header
+        .trim()
+        .trim_end_matches('{')
+        .trim_end_matches(':')
+        .trim();
+    let mut header = header.split_whitespace().collect::<Vec<_>>().join(" ");
+    if header_end < end {
+        header.push_str(" … [signature truncated]");
+    }
+    if header.is_empty() {
+        return depth;
+    }
+    // Match the displayed signature, not the body of the declaration.
+    let matches_filter = filter.is_none_or(|query| header.to_lowercase().contains(query));
+    if matches_filter {
+        if out.len() == MAX_ENTRIES {
+            *entry_limit_hit = true;
+            return depth;
+        }
+        // Tree-sitter's end point is exclusive. If a node ends at the
+        // start of a new line, that line is not part of the declaration.
+        let end_row = node.end_position().row
+            - usize::from(
+                node.end_position().column == 0
+                    && node.end_position().row > node.start_position().row,
             );
-        }
+        out.push(format!(
+            "{}line {}, count {} — {}: {}",
+            "  ".repeat(depth.min(12)),
+            node.start_position().row + 1,
+            end_row + 1 - node.start_position().row,
+            kind,
+            header
+        ));
     }
+    depth + 1
 }
 
 #[async_trait]
@@ -232,13 +244,21 @@ impl Tool for OutlineTool {
         Concurrency::ReadOnly
     }
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
-        let path = args.get("path").and_then(Value::as_str).unwrap_or("");
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
         let summary = format!("outline {path}");
-        let result = (|| -> Result<String, String> {
+        let fs = self.fs.clone();
+        // Reading and parsing up to 1 MiB is CPU and blocking file work; keep
+        // it off the async worker threads.
+        let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let path = path.as_str();
             let lang = language(path).ok_or("unsupported source extension")?;
             let relative = if PathBuf::from(path).is_absolute() {
                 PathBuf::from(path)
-                    .strip_prefix(self.fs.root())
+                    .strip_prefix(fs.root())
                     .map_err(|_| "outside workspace")?
                     .to_string_lossy()
                     .into_owned()
@@ -252,7 +272,7 @@ impl Tool for OutlineTool {
             #[cfg(unix)]
             let source = {
                 use std::io::Read;
-                let fd = super::vfs::unix::open_file_relative(&self.fs, &components)
+                let fd = super::vfs::unix::open_file_relative(&fs, &components)
                     .map_err(|e| e.to_string())?;
                 let file = std::fs::File::from(fd);
                 let mut bytes = Vec::new();
@@ -271,7 +291,9 @@ impl Tool for OutlineTool {
             };
             let filter = args.get("filter").and_then(Value::as_str);
             outline(&source, lang, filter, &cancel)
-        })();
+        })
+        .await
+        .unwrap_or_else(|error| Err(format!("outline task failed: {error}")));
         match result {
             Ok(content) => ToolOutput {
                 content,
@@ -323,6 +345,29 @@ mod tests {
         )
         .unwrap();
         assert!(!complete.contains(ENTRY_LIMIT_NOTICE));
+    }
+
+    #[test]
+    fn deeply_nested_source_does_not_overflow_the_stack() {
+        // A recursive walk aborted the process on input like this; run on a
+        // small stack so a regression fails here, not only in release builds.
+        let depth = 200_000;
+        let source = format!(
+            "fn outer() {{}}\nconst X: () = {}{};\n",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let output = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || {
+                let lang = tree_sitter_rust::LANGUAGE.into();
+                outline(&source, lang, None, &CancellationToken::new())
+            })
+            .unwrap()
+            .join()
+            .expect("outline must not overflow the stack")
+            .unwrap();
+        assert!(output.contains("fn outer()"), "{output}");
     }
 
     #[test]

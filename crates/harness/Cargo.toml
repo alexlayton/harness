@@ -9,6 +9,7 @@ name = "harness"
 path = "src/main.rs"
 
 [dependencies]
+serde_json = "1"
 agent.workspace = true
 agent-client-protocol = "=2.0.0"
 auth.workspace = true
@@ -38,6 +39,5 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 async-trait = "0.1"
-serde_json = "1"
 tempfile = "3"
 tokio-util = { version = "0.7", features = ["compat"] }

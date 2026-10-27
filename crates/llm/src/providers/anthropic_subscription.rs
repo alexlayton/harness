@@ -8,33 +8,59 @@ use std::sync::Arc;
 
 /// Supported model IDs, not proof of entitlement or live availability.
 /// Context limits are model-specific; see `context_length` below.
-pub const MODELS: &[&str] = &[
-    "claude-opus-5-5",
-    "claude-sonnet-5-5",
-    "claude-haiku-5-5",
-    "claude-fable-5-1",
-    "claude-opus-5",
-    "claude-sonnet-5",
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-opus-4-6",
-    "claude-opus-4-5",
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5",
-];
-// Keep model capacity separate from account entitlement. The overlapping
-// entries match the Claude capacities in the Copilot catalog. Do not guess
-// limits for experimental IDs that have no verified metadata here.
-fn context_length(model: &str) -> Option<u64> {
-    match model {
-        "claude-opus-5-5" | "claude-fable-5-1" | "claude-opus-5" | "claude-sonnet-5"
-        | "claude-fable-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-4-6"
-        | "claude-opus-4-6" => Some(1_000_000),
-        "claude-opus-4-5" | "claude-sonnet-4-5" | "claude-haiku-4-5" => Some(200_000),
-        _ => None,
+/// One Claude subscription model. This table is the only source for the
+/// catalogue, the context limits, and the thinking capabilities that the
+/// dialect applies; the lists were previously repeated (and had drifted)
+/// across the provider and the dialect.
+pub(crate) struct SubscriptionModel {
+    pub id: &'static str,
+    /// Model capacity, separate from account entitlement. `None` where no
+    /// verified metadata exists; limits are not guessed.
+    pub context_length: Option<u64>,
+    /// Uses adaptive thinking (`Off` is unsupported).
+    pub adaptive_thinking: bool,
+    /// Accepts the `max` adaptive effort.
+    pub max_effort: bool,
+}
+
+const fn model(
+    id: &'static str,
+    context_length: Option<u64>,
+    adaptive_thinking: bool,
+    max_effort: bool,
+) -> SubscriptionModel {
+    SubscriptionModel {
+        id,
+        context_length,
+        adaptive_thinking,
+        max_effort,
     }
+}
+
+const M: Option<u64> = Some(1_000_000);
+const K200: Option<u64> = Some(200_000);
+
+/// Supported models, newest first.
+pub(crate) const SUBSCRIPTION_MODELS: &[SubscriptionModel] = &[
+    model("claude-opus-5-5", M, true, true),
+    model("claude-sonnet-5-5", None, true, true),
+    model("claude-haiku-5-5", None, true, true),
+    model("claude-fable-5-1", M, true, true),
+    model("claude-opus-5", M, true, true),
+    model("claude-sonnet-5", M, true, true),
+    model("claude-fable-5", M, true, true),
+    model("claude-opus-4-8", M, true, true),
+    model("claude-opus-4-7", M, true, true),
+    model("claude-sonnet-4-6", M, true, false),
+    model("claude-opus-4-6", M, true, true),
+    model("claude-opus-4-5", K200, false, false),
+    model("claude-sonnet-4-5", K200, false, false),
+    model("claude-haiku-4-5", K200, false, false),
+];
+
+/// Metadata for a supported model id.
+pub(crate) fn subscription_model(id: &str) -> Option<&'static SubscriptionModel> {
+    SUBSCRIPTION_MODELS.iter().find(|model| model.id == id)
 }
 
 /// Separate provider identity keeps existing Anthropic routes unchanged.
@@ -115,17 +141,17 @@ impl Provider for AnthropicSubscriptionProvider {
         "anthropic-claude"
     }
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        Ok(MODELS
+        Ok(SUBSCRIPTION_MODELS
             .iter()
-            .map(|id| ModelInfo {
-                id: (*id).into(),
-                name: Some((*id).into()),
-                context_length: context_length(id),
+            .map(|model| ModelInfo {
+                id: model.id.into(),
+                name: Some(model.id.into()),
+                context_length: model.context_length,
             })
             .collect())
     }
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        if !MODELS.contains(&req.model.as_str()) {
+        if subscription_model(&req.model).is_none() {
             return Err(LlmError::Parse(
                 "unsupported Anthropic subscription model (see list_models)".into(),
             ));
@@ -139,17 +165,42 @@ impl Provider for AnthropicSubscriptionProvider {
             .ensure_valid()
             .await
             .map_err(|e| LlmError::Auth(e.to_string()))?;
-        // Transport details must not leak bearer values via reqwest errors.
+        match self.stream_with(req, &bytes, thinking, &c).await {
+            // An unexpired token can still be revoked server-side. Refresh
+            // once (single-flight across handles) and repeat the request.
+            Err(LlmError::Http { status: 401, .. }) => {
+                let c = self
+                    .auth
+                    .refresh_rejected(&c.access)
+                    .await
+                    .map_err(|e| LlmError::Auth(e.to_string()))?;
+                self.stream_with(req, &bytes, thinking, &c).await
+            }
+            result => result,
+        }
+    }
+}
+
+impl AnthropicSubscriptionProvider {
+    async fn stream_with(
+        &self,
+        req: &CompletionRequest,
+        bytes: &[u8],
+        thinking: bool,
+        c: &auth::AnthropicSubscriptionCredential,
+    ) -> Result<EventStream, LlmError> {
+        // Connect and timeout failures must stay `Network` so `with_retry`
+        // repeats them. A reqwest error carries the URL but never request
+        // headers, so the bearer value cannot leak through it; the URL is
+        // still removed because the endpoint can be user-configured.
         let response = crate::http::streaming_client()
             .post(format!("{}/v1/messages", self.endpoint))
             .headers(headers(thinking, true))
             .bearer_auth(&c.access)
-            .body(bytes)
+            .body(bytes.to_vec())
             .send()
             .await
-            .map_err(|_| {
-                LlmError::Stream("Anthropic subscription network request failed".into())
-            })?;
+            .map_err(|error| LlmError::Network(error.without_url()))?;
         let response = crate::http::check_status_with_secret(response, &c.access).await?;
         Ok(crate::dialects::drive_parser_stream(
             crate::sse::stream_response(response),

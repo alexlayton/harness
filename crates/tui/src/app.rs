@@ -63,7 +63,7 @@ use crate::commands::{
     self, ArgumentKind, Candidate, CandidateKind, CompletionContext, CompletionResult,
     CompletionTarget, ParsedCommand,
 };
-use crate::commit::stable_block_split_offset;
+use crate::commit::SplitScanner;
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
 use crate::paths::{self, AtPrefix};
@@ -93,13 +93,14 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// The user-input prefix. Same glyph as the committed user echo so a
 /// submitted message's pixels are exactly the prompt line it was typed on.
@@ -158,6 +159,21 @@ enum Entry {
 struct StreamState {
     reasoning: String,
     markdown: String,
+    /// Incremental stable-split scan over `markdown`; reset when it is
+    /// drained.
+    split: SplitScanner,
+    /// Wrapped reasoning rows for the last paint. Reasoning only grows
+    /// during a stream, so its length (with width and theme) identifies the
+    /// rendering; re-wrapping it on every frame was O(n) per paint.
+    reasoning_render: std::cell::RefCell<Option<ReasoningRender>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReasoningRender {
+    width: usize,
+    theme: Theme,
+    len: usize,
+    lines: Vec<Line<'static>>,
 }
 
 /// Cached rendering for completed markdown blocks in the live stream. The
@@ -186,6 +202,16 @@ struct RunningTool {
 /// the input line off-screen; the overflow row makes the hidden calls
 /// visible as a count rather than silently clipped.
 const MAX_VISIBLE_RUNNING_TOOLS: usize = 4;
+
+/// Upper bounds for one coalesced event drain. A producer that keeps the
+/// channel non-empty (a fast stream, a large snapshot replay) must not keep
+/// the loop away from terminal input, so Esc and Ctrl+C get a turn after at
+/// most this much work.
+const EVENT_DRAIN_MAX_EVENTS: usize = 256;
+const EVENT_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+/// Quiet time after the last resize event before the window is repainted.
+const RESIZE_SETTLE: Duration = Duration::from_millis(40);
 
 /// The visual rows of the input line plus the cursor's position within them.
 struct InputLayout {
@@ -222,7 +248,6 @@ struct Completion {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CompletionKind {
     Slash,
-    Session,
     Model,
     Path,
 }
@@ -583,7 +608,7 @@ impl CrossTerm {
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
         ui.enqueue_welcome();
-        install_panic_hook(ui.terminal.clone());
+        install_panic_hook(&ui.terminal);
         ui.setup_terminal()?;
         Ok(ui)
     }
@@ -594,7 +619,7 @@ impl CrossTerm {
     /// unsupported terminals report that operation as an error.
     fn setup_terminal(&mut self) -> Result<()> {
         let raw_result = {
-            let mut terminal = self.terminal.lock().unwrap();
+            let mut terminal = lock_terminal(&self.terminal);
             terminal
                 .backend
                 .enable_raw_mode()
@@ -603,10 +628,10 @@ impl CrossTerm {
         if let Err(error) = raw_result {
             return self.setup_failed(error);
         }
-        self.terminal.lock().unwrap().modes.raw_mode = true;
+        lock_terminal(&self.terminal).modes.raw_mode = true;
 
         let bracketed_result = {
-            let mut terminal = self.terminal.lock().unwrap();
+            let mut terminal = lock_terminal(&self.terminal);
             terminal
                 .backend
                 .enable_bracketed_paste(&mut self.out)
@@ -615,22 +640,19 @@ impl CrossTerm {
         if let Err(error) = bracketed_result {
             return self.setup_failed(error);
         }
-        self.terminal.lock().unwrap().modes.bracketed_paste = true;
+        lock_terminal(&self.terminal).modes.bracketed_paste = true;
 
         // The kitty keyboard protocol makes Shift+Enter report as `Enter` with
         // the SHIFT modifier, which the input handler already maps to a newline
         // (works on Ghostty; iTerm/Terminal.app do not support it). Only
         // `DISAMBIGUATE_ESCAPE_CODES` is pushed — `REPORT_ALL_KEYS_AS_ESCAPE_CODES`
         // would swallow plain characters. Popped in `restore` and the panic hook.
-        if self
-            .terminal
-            .lock()
-            .unwrap()
+        if lock_terminal(&self.terminal)
             .backend
             .push_keyboard_flags(&mut self.out)
             .is_ok()
         {
-            self.terminal.lock().unwrap().modes.keyboard_flags = true;
+            lock_terminal(&self.terminal).modes.keyboard_flags = true;
         }
         // The cursor stays visible: it *is* the input caret, sitting right
         // after the `› ` prefix. No hide, no fake cell.
@@ -648,7 +670,7 @@ impl CrossTerm {
 
     pub async fn run(
         mut self,
-        mut events: mpsc::UnboundedReceiver<UiEvent>,
+        mut events: mpsc::Receiver<UiEvent>,
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()> {
@@ -666,7 +688,7 @@ impl CrossTerm {
 
     async fn run_inner(
         &mut self,
-        events: &mut mpsc::UnboundedReceiver<UiEvent>,
+        events: &mut mpsc::Receiver<UiEvent>,
         input_tx: mpsc::UnboundedSender<InputMessage>,
         cancel: CancellationToken,
     ) -> Result<()> {
@@ -675,24 +697,18 @@ impl CrossTerm {
         let mut input_events = EventStream::new();
         let mut spinner_tick = tokio::time::interval(Duration::from_millis(200));
         spinner_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Dragging a window edge emits many resize events; each full repaint
+        // reflows the visible history. Keep only the latest size and apply it
+        // once the events pause (or before anything else needs the layout).
+        let mut pending_resize: Option<(u16, u16)> = None;
+        let resize_settle = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(resize_settle);
 
         loop {
             tokio::select! {
-                maybe_event = events.recv() => {
-                    let Some(event) = maybe_event else { return Ok(()) };
-                    self.apply_event(event);
-                    // Coalesced painting: an agent burst (streaming deltas,
-                    // tool start/finish pairs, notices) arrives as many
-                    // channel events within a few milliseconds. Drain
-                    // everything already queued and paint once per wake so
-                    // the per-delta repaint tax stays off the streaming
-                    // path. `try_recv` never blocks, so this only ever
-                    // consumes what has already been sent — no added latency.
-                    while let Ok(event) = events.try_recv() {
-                        self.apply_event(event);
-                    }
-                    self.paint()?;
-                }
+                // Terminal input is polled first: after a bounded event
+                // drain, a pending Esc or Ctrl+C always wins the next wake.
+                biased;
                 maybe_input = input_events.next() => {
                     let event = match maybe_input {
                         Some(Ok(event)) => event,
@@ -700,12 +716,31 @@ impl CrossTerm {
                         None => return Ok(()),
                     };
                     if let Event::Resize(width, height) = event {
-                        self.handle_resize(width, height)?;
+                        pending_resize = Some((width, height));
+                        resize_settle
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + RESIZE_SETTLE);
                         continue;
+                    }
+                    if let Some((width, height)) = pending_resize.take() {
+                        self.handle_resize(width, height)?;
                     }
                     if self.handle_input(&event, &input_tx, &cancel)? {
                         return Ok(());
                     }
+                    self.paint()?;
+                }
+                () = &mut resize_settle, if pending_resize.is_some() => {
+                    if let Some((width, height)) = pending_resize.take() {
+                        self.handle_resize(width, height)?;
+                    }
+                }
+                maybe_event = events.recv() => {
+                    let Some(event) = maybe_event else { return Ok(()) };
+                    if let Some((width, height)) = pending_resize.take() {
+                        self.handle_resize(width, height)?;
+                    }
+                    self.drain_queued_events(event, events);
                     self.paint()?;
                 }
                 maybe_path = self.path_completion_rx.recv() => {
@@ -733,6 +768,45 @@ impl CrossTerm {
                 }
             }
         }
+    }
+
+    /// Coalesced painting: an agent burst (streaming deltas, tool start/finish
+    /// pairs, notices) arrives as many channel events within a few
+    /// milliseconds. Apply `first` and what is already queued so one paint
+    /// covers the burst, but stop after [`EVENT_DRAIN_MAX_EVENTS`] events or
+    /// [`EVENT_DRAIN_BUDGET`], so a producer that never lets the queue empty
+    /// cannot starve input. `try_recv` never blocks, so this adds no latency.
+    ///
+    /// Adjacent text (or reasoning) deltas are merged before they are
+    /// applied: each applied text delta refreshes the streaming markdown
+    /// cache, so one merged delta per drain avoids that work per token.
+    /// Returns the number of events received.
+    fn drain_queued_events(
+        &mut self,
+        first: UiEvent,
+        events: &mut mpsc::Receiver<UiEvent>,
+    ) -> usize {
+        let started = std::time::Instant::now();
+        let mut pending = first;
+        let mut received = 1;
+        while received < EVENT_DRAIN_MAX_EVENTS && started.elapsed() < EVENT_DRAIN_BUDGET {
+            let Ok(next) = events.try_recv() else {
+                break;
+            };
+            received += 1;
+            match (&mut pending, next) {
+                (UiEvent::TextDelta(text), UiEvent::TextDelta(more))
+                | (UiEvent::ReasoningDelta(text), UiEvent::ReasoningDelta(more)) => {
+                    text.push_str(&more);
+                }
+                (_, next) => {
+                    let ready = std::mem::replace(&mut pending, next);
+                    self.apply_event(ready);
+                }
+            }
+        }
+        self.apply_event(pending);
+        received
     }
 
     /// Rewrite only the activity row in place, leaving the rest of the live
@@ -807,7 +881,7 @@ impl CrossTerm {
     ) -> Result<bool> {
         let Event::Key(key) = event else {
             if let Event::Paste(text) = event {
-                let text = render::sanitize_terminal_text(text);
+                let text = render::sanitize_terminal_text(&normalize_paste_newlines(text));
                 insert_text(&mut self.input, &mut self.cursor, &text);
                 self.refresh_completion();
             }
@@ -1004,7 +1078,6 @@ impl CrossTerm {
                 .get(completion.selected)
                 .map(|candidate| candidate.value.clone())
         });
-        self.cancel_path_completion();
         let cursor_col = self.cursor_char_col();
         let Some(result) = commands::candidates_at_cursor(
             &self.input,
@@ -1015,12 +1088,17 @@ impl CrossTerm {
             &self.session_candidates,
             &self.skills,
         ) else {
+            self.cancel_path_completion();
             self.completion = None;
             self.session_completion_requested = false;
             return;
         };
 
-        // Path arguments scan the filesystem on a debounced task.
+        // Path arguments scan the filesystem on a debounced task. Do not
+        // cancel first: `request_path_completion` keeps the current scan and
+        // its results when the token context is unchanged (as `@` paths do),
+        // so Tab after the results arrive accepts them instead of clearing
+        // them and starting again.
         if matches!(
             result.context.target,
             CompletionTarget::Argument(ArgumentKind::Path | ArgumentKind::Session),
@@ -1028,8 +1106,9 @@ impl CrossTerm {
             self.request_path_completion(result.context, result.candidates, old_value, None);
             return;
         }
+        self.cancel_path_completion();
+        // Session arguments use the path-completion scan above.
         let kind = match result.context.target {
-            CompletionTarget::Argument(ArgumentKind::Session) => CompletionKind::Session,
             CompletionTarget::Argument(ArgumentKind::Model) => CompletionKind::Model,
             _ => CompletionKind::Slash,
         };
@@ -1043,9 +1122,9 @@ impl CrossTerm {
         old_value: Option<String>,
     ) {
         if result.candidates.is_empty() {
-            // Keep a session list open (empty) so Tab can request it; close
+            // Keep a model list open (empty) so Tab can request it; close
             // everything else.
-            if matches!(kind, CompletionKind::Session | CompletionKind::Model) {
+            if kind == CompletionKind::Model {
                 self.completion = Some(Completion {
                     context: result.context,
                     candidates: Vec::new(),
@@ -1736,6 +1815,7 @@ impl CrossTerm {
                     ok: false,
                     duration_ms: 0,
                     output: String::new(),
+                    omitted_lines: 0,
                     error: None,
                     status: ToolStatus::Running,
                 };
@@ -1769,19 +1849,7 @@ impl CrossTerm {
                 {
                     self.running_tools.remove(position);
                 }
-                let record = ToolRecord {
-                    name,
-                    summary,
-                    ok,
-                    duration_ms,
-                    output,
-                    error,
-                    status: if ok {
-                        ToolStatus::Success
-                    } else {
-                        ToolStatus::Failure
-                    },
-                };
+                let record = ToolRecord::finished(name, summary, ok, duration_ms, output, error);
                 self.pending.push(Entry::Tool { record });
             }
             UiEvent::Retrying { .. } => {
@@ -1971,7 +2039,18 @@ impl CrossTerm {
                 // Same chrome retention as `SessionChanged`: the snapshot
                 // replaces the conversation, not the header.
                 retain_chrome(&mut self.transcript);
-                for snapshot in entries {
+                // A long session must not load (and print) every entry at
+                // once: keep the newest entries within the transcript budget.
+                let entries = newest_snapshot_entries(entries, TRANSCRIPT_BUDGET_BYTES);
+                if entries.dropped > 0 {
+                    self.pending.push(Entry::Notice {
+                        text: format!(
+                            "{} earlier entries are not shown; export the session to see them",
+                            entries.dropped
+                        ),
+                    });
+                }
+                for snapshot in entries.kept {
                     self.pending.push(match snapshot {
                         SessionSnapshotEntry::User { text } => Entry::User { text },
                         SessionSnapshotEntry::Assistant {
@@ -1989,19 +2068,14 @@ impl CrossTerm {
                             output,
                             error,
                         } => Entry::Tool {
-                            record: ToolRecord {
+                            record: ToolRecord::finished(
                                 name,
                                 summary,
                                 ok,
                                 duration_ms,
                                 output,
                                 error,
-                                status: if ok {
-                                    ToolStatus::Success
-                                } else {
-                                    ToolStatus::Failure
-                                },
-                            },
+                            ),
                         },
                     });
                 }
@@ -2079,10 +2153,11 @@ impl CrossTerm {
     /// unfinished suffix is intentionally left out of the cache because its
     /// Markdown meaning can still change with the next delta.
     fn refresh_stream_markdown_cache(&mut self) {
-        let Some(stream) = self.stream.as_ref() else {
+        let Some(stream) = self.stream.as_mut() else {
             return;
         };
-        let stable_offset = stable_block_split_offset(&stream.markdown).unwrap_or(0);
+        let stable_offset = stream.split.split_offset(&stream.markdown).unwrap_or(0);
+        let stream = &*stream;
         let width = render::content_width(self.width);
         let theme = self.theme;
         let reusable = self.stream_markdown_cache.as_ref().is_some_and(|cache| {
@@ -2408,11 +2483,23 @@ impl CrossTerm {
         };
         let mut lines = Vec::new();
         if !stream.reasoning.is_empty() {
-            lines.extend(render::reasoning_lines(
-                &stream.reasoning,
-                self.theme,
-                width,
-            ));
+            let mut cache = stream.reasoning_render.borrow_mut();
+            let fresh = cache.as_ref().is_some_and(|cached| {
+                cached.width == width
+                    && cached.theme == self.theme
+                    && cached.len == stream.reasoning.len()
+            });
+            if !fresh {
+                *cache = Some(ReasoningRender {
+                    width,
+                    theme: self.theme,
+                    len: stream.reasoning.len(),
+                    lines: render::reasoning_lines(&stream.reasoning, self.theme, width),
+                });
+            }
+            if let Some(cached) = cache.as_ref() {
+                lines.extend(cached.lines.iter().cloned());
+            }
         }
         if !stream.markdown.is_empty() {
             if !lines.is_empty() {
@@ -2471,7 +2558,7 @@ impl CrossTerm {
         if stream.markdown.is_empty() {
             return;
         }
-        let Some(offset) = stable_block_split_offset(&stream.markdown) else {
+        let Some(offset) = stream.split.split_offset(&stream.markdown) else {
             return;
         };
         if offset == 0 {
@@ -2488,6 +2575,7 @@ impl CrossTerm {
         self.pending.push(prefix);
         stream.reasoning.clear();
         stream.markdown.drain(..offset);
+        stream.split = SplitScanner::default();
         // The source origin moved; cached offsets are no longer meaningful.
         self.stream_markdown_cache = None;
     }
@@ -2517,12 +2605,21 @@ impl CrossTerm {
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
-        self.transcript.append(&mut self.pending);
+        let build = self.stage_full_repaint();
+        self.write_frame(build, true)
+    }
+
+    /// Prepare a full repaint. A stream prefix committed here must reach the
+    /// transcript before the frame is built: the full repaint prints only
+    /// `transcript`, and the frame bookkeeping then moves `pending` into it
+    /// without printing, so a prefix committed after the move was lost from
+    /// the screen on resize or Ctrl+O.
+    fn stage_full_repaint(&mut self) -> RegionBuild {
         let input = self.input_layout();
         let running = self.running_region();
         self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
-        let build = self.build_region_with_running(&input, running);
-        self.write_frame(build, true)
+        commit_to_transcript(&mut self.transcript, &mut self.pending);
+        self.build_region_with_running(&input, running)
     }
 
     /// Emit one frame. In incremental mode the frame is [pending entries] +
@@ -2608,7 +2705,7 @@ impl CrossTerm {
         self.out.flush().context("flush frame")?;
 
         // Bookkeeping: the printed `above` rows are now immutable scrollback.
-        self.transcript.append(&mut self.pending);
+        commit_to_transcript(&mut self.transcript, &mut self.pending);
         self.region = build.rows;
         self.cursor_row = build.cursor_row;
         self.cursor_col = build.cursor_col;
@@ -2620,7 +2717,7 @@ impl CrossTerm {
     }
 
     fn restore(&mut self) -> Result<()> {
-        let mut terminal = self.terminal.lock().unwrap();
+        let mut terminal = lock_terminal(&self.terminal);
         restore_terminal(&mut terminal, &mut self.out)
     }
 }
@@ -2720,14 +2817,177 @@ fn retain_chrome(transcript: &mut Vec<Entry>) {
     });
 }
 
-fn install_panic_hook(terminal: Arc<Mutex<TerminalState>>) {
+/// Many terminals deliver pasted line breaks as CR (or CRLF). The sanitizer
+/// drops CR as a control character, which joined every pasted line into
+/// one; turn both forms into LF first.
+fn normalize_paste_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Lock the shared terminal state. A panic while the lock was held must not
+/// stop later restoration, so a poisoned lock is recovered: the state only
+/// records which modes still need to be undone.
+fn lock_terminal(terminal: &Mutex<TerminalState>) -> MutexGuard<'_, TerminalState> {
+    terminal.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Restore the terminal when the UI thread panics.
+///
+/// The hook is process-global, but only a panic on the thread that owns the
+/// UI may restore it. Tokio catches panics in spawned tasks (for example the
+/// agent task) and the UI keeps running; restoring cooked mode there would
+/// break the live TUI. The hook holds a `Weak` reference, so it does nothing
+/// after the UI is dropped, and it uses `try_lock` because the panic can
+/// happen while the UI thread holds the terminal lock.
+/// Byte budget for `transcript`. It is only the source for resize and Ctrl+O
+/// repaints, which show one screen of history; older entries are already in
+/// terminal scrollback. Without a bound a long session keeps every message
+/// and tool result in memory.
+const TRANSCRIPT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+
+/// Approximate retained bytes of one entry.
+fn entry_bytes(entry: &Entry) -> usize {
+    match entry {
+        Entry::Banner { .. } => 0,
+        Entry::Metadata {
+            cwd,
+            branch,
+            provider,
+            model,
+            context_files,
+            mcp_servers,
+            skills,
+        } => {
+            cwd.len()
+                + branch.as_ref().map_or(0, String::len)
+                + provider.len()
+                + model.len()
+                + context_files
+                    .iter()
+                    .chain(mcp_servers)
+                    .chain(skills)
+                    .map(String::len)
+                    .sum::<usize>()
+        }
+        Entry::User { text } | Entry::Notice { text } | Entry::Error { text } => text.len(),
+        Entry::Assistant {
+            markdown,
+            reasoning,
+        } => markdown.len() + reasoning.len(),
+        Entry::Tool { record } => {
+            record.name.len()
+                + record.summary.len()
+                + record.output.len()
+                + record.error.as_ref().map_or(0, String::len)
+        }
+        Entry::Separator { label } => label.len(),
+    }
+}
+
+/// Move printed entries into the transcript, then drop the oldest
+/// conversation entries while it exceeds [`TRANSCRIPT_BUDGET_BYTES`]. The
+/// banner, metadata, and the newest entry are always kept.
+fn commit_to_transcript(transcript: &mut Vec<Entry>, pending: &mut Vec<Entry>) {
+    if pending.is_empty() {
+        return;
+    }
+    transcript.append(pending);
+    trim_transcript(transcript, TRANSCRIPT_BUDGET_BYTES);
+}
+
+fn trim_transcript(transcript: &mut Vec<Entry>, budget: usize) {
+    let mut total = transcript.iter().map(entry_bytes).sum::<usize>();
+    if total <= budget {
+        return;
+    }
+    let last = transcript.len().saturating_sub(1);
+    let mut index = 0usize;
+    transcript.retain(|entry| {
+        let keep = total <= budget
+            || index == last
+            || matches!(entry, Entry::Banner { .. } | Entry::Metadata { .. });
+        if !keep {
+            total = total.saturating_sub(entry_bytes(entry));
+        }
+        index += 1;
+        keep
+    });
+}
+
+/// Snapshot entries that fit the budget, newest last.
+struct SnapshotWindow {
+    kept: Vec<SessionSnapshotEntry>,
+    dropped: usize,
+}
+
+fn snapshot_entry_bytes(entry: &SessionSnapshotEntry) -> usize {
+    match entry {
+        SessionSnapshotEntry::User { text } => text.len(),
+        SessionSnapshotEntry::Assistant {
+            markdown,
+            reasoning,
+        } => markdown.len() + reasoning.len(),
+        SessionSnapshotEntry::Tool {
+            name,
+            summary,
+            output,
+            error,
+            ..
+        } => {
+            name.len()
+                + summary.len()
+                + output
+                    .len()
+                    .min(crate::state::MAX_RETAINED_TOOL_OUTPUT_BYTES)
+                + error.as_ref().map_or(0, |error| {
+                    error.len().min(crate::state::MAX_RETAINED_TOOL_ERROR_BYTES)
+                })
+        }
+    }
+}
+
+/// Keep the newest snapshot entries whose retained size fits `budget` (at
+/// least one entry), in their original order.
+fn newest_snapshot_entries(entries: Vec<SessionSnapshotEntry>, budget: usize) -> SnapshotWindow {
+    let mut total = 0usize;
+    let mut start = entries.len();
+    while start > 0 {
+        let bytes = snapshot_entry_bytes(&entries[start - 1]);
+        if start < entries.len() && total.saturating_add(bytes) > budget {
+            break;
+        }
+        total = total.saturating_add(bytes);
+        start -= 1;
+    }
+    let dropped = start;
+    SnapshotWindow {
+        kept: entries.into_iter().skip(dropped).collect(),
+        dropped,
+    }
+}
+
+fn install_panic_hook(terminal: &Arc<Mutex<TerminalState>>) {
+    let terminal = Arc::downgrade(terminal);
+    let ui_thread = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
-        let mut stdout = io::stdout();
-        // Panic hooks cannot report a cleanup error without obscuring the
-        // original panic, but they still use the same best-effort operation
-        // layer. A caught panic or a later Drop can retry anything that failed.
-        let _ = restore_terminal(&mut terminal.lock().unwrap(), &mut stdout);
+        if std::thread::current().id() == ui_thread
+            && let Some(terminal) = terminal.upgrade()
+        {
+            let guard = match terminal.try_lock() {
+                Ok(guard) => Some(guard),
+                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(mut guard) = guard {
+                let mut stdout = io::stdout();
+                // Panic hooks cannot report a cleanup error without obscuring
+                // the original panic, but they still use the same best-effort
+                // operation layer. A caught panic or a later Drop can retry
+                // anything that failed.
+                let _ = restore_terminal(&mut guard, &mut stdout);
+            }
+        }
         previous(panic);
     }));
 }
@@ -2945,7 +3205,7 @@ fn tool_lines(
         .add_modifier(Modifier::DIM);
     let mut lines = summary_lines;
     if !record.output.is_empty() {
-        for tail in render::output_tail(&record.output) {
+        for tail in render::output_tail_after(&record.output, record.omitted_lines) {
             push_detail_line(&mut lines, &tail, dim_style, width);
         }
     }
@@ -3176,20 +3436,21 @@ fn input_layout_with_row_width(
     for logical in input.split('\n') {
         let line_end = byte_base + logical.len();
         let cursor_here = cursor >= byte_base && cursor <= line_end;
-        let chars: Vec<(char, usize)> = logical
-            .chars()
-            .map(|c| (c, UnicodeWidthChar::width(c).unwrap_or(0)))
+        // Layout units are grapheme clusters, matching editing and wrap.
+        let chars: Vec<(&str, usize)> = logical
+            .graphemes(true)
+            .map(|cluster| (cluster, render::grapheme_width(cluster)))
             .collect();
         let cursor_char = if cursor_here {
-            Some(input[byte_base..cursor].chars().count())
+            Some(input[byte_base..cursor].graphemes(true).count())
         } else {
             None
         };
 
         // Greedy wrap; rows are append-stable, so the cursor can be located
         // afterwards by walking the row boundaries.
-        let mut visual: Vec<Vec<(char, usize)>> = Vec::new();
-        let mut current: Vec<(char, usize)> = Vec::new();
+        let mut visual: Vec<Vec<(&str, usize)>> = Vec::new();
+        let mut current: Vec<(&str, usize)> = Vec::new();
         let mut current_width = 0usize;
         for &(character, character_width) in &chars {
             if character_width > width {
@@ -3277,7 +3538,7 @@ fn input_layout_with_row_width(
         let used = row
             .spans
             .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .map(|span| render::text_width(span.content.as_ref()))
             .sum();
         let available = row_width.saturating_sub(used);
         let fits = ghost_to_width(ghost, available);
@@ -3342,13 +3603,13 @@ fn ghost_to_width(text: &str, width: usize) -> String {
     }
     let mut result = String::new();
     let mut used = 0usize;
-    for character in text.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(1).max(1);
-        if used + character_width > width {
+    for cluster in text.graphemes(true) {
+        let cluster_width = render::grapheme_width(cluster).max(1);
+        if used + cluster_width > width {
             break;
         }
-        result.push(character);
-        used += character_width;
+        result.push_str(cluster);
+        used += cluster_width;
     }
     result
 }
@@ -3407,27 +3668,31 @@ fn insert_text(input: &mut String, cursor: &mut usize, text: &str) {
     *cursor += text.len();
 }
 
+// Editing moves and deletes whole grapheme clusters (a family emoji, a
+// flag, an accented letter with a combining mark), never part of one.
+
 fn delete_backward(input: &mut String, cursor: &mut usize) {
-    if let Some(len) = input[..*cursor].chars().next_back().map(char::len_utf8) {
+    if let Some(cluster) = input[..*cursor].graphemes(true).next_back() {
+        let len = cluster.len();
         *cursor -= len;
         input.drain(*cursor..*cursor + len);
     }
 }
 
 fn delete_forward(input: &mut String, cursor: &mut usize) {
-    if let Some(len) = input[*cursor..].chars().next().map(char::len_utf8) {
+    if let Some(len) = input[*cursor..].graphemes(true).next().map(str::len) {
         input.drain(*cursor..*cursor + len);
     }
 }
 
 fn move_left(input: &str, cursor: &mut usize) {
-    if let Some(len) = input[..*cursor].chars().next_back().map(char::len_utf8) {
-        *cursor -= len;
+    if let Some(cluster) = input[..*cursor].graphemes(true).next_back() {
+        *cursor -= cluster.len();
     }
 }
 
 fn move_right(input: &str, cursor: &mut usize) {
-    if let Some(len) = input[*cursor..].chars().next().map(char::len_utf8) {
+    if let Some(len) = input[*cursor..].graphemes(true).next().map(str::len) {
         *cursor += len;
     }
 }
@@ -3447,7 +3712,7 @@ fn line_bounds(input: &str, cursor: usize) -> (usize, usize) {
 fn vertical_move(input: &str, cursor: usize, delta: i32) -> Option<usize> {
     let before = &input[..cursor];
     let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let column = before[line_start..].chars().count();
+    let column = before[line_start..].graphemes(true).count();
     let line_index = before.matches('\n').count() as i32;
     let total_lines = input.matches('\n').count() as i32 + 1;
     let target = line_index + delta;
@@ -3463,9 +3728,9 @@ fn vertical_move(input: &str, cursor: usize, delta: i32) -> Option<usize> {
         .map(|i| position + i)
         .unwrap_or(input.len());
     let byte_column: usize = input[position..line_end]
-        .chars()
+        .graphemes(true)
         .take(column)
-        .map(char::len_utf8)
+        .map(str::len)
         .sum();
     Some(position + byte_column)
 }
@@ -3816,6 +4081,131 @@ mod tests {
             .sum()
     }
 
+    #[test]
+    fn transcript_and_snapshot_keep_newest_entries_within_budget() {
+        let big = "z".repeat(TRANSCRIPT_BUDGET_BYTES / 3);
+        let mut transcript = vec![Entry::Banner {
+            title_order: render::WelcomeTitleOrder::random(),
+        }];
+        let mut pending = (0..6)
+            .map(|index| Entry::User {
+                text: format!("{index}{big}"),
+            })
+            .collect::<Vec<_>>();
+        commit_to_transcript(&mut transcript, &mut pending);
+        assert!(transcript.iter().map(entry_bytes).sum::<usize>() <= TRANSCRIPT_BUDGET_BYTES);
+        assert!(matches!(transcript[0], Entry::Banner { .. }));
+        assert!(matches!(transcript.last(), Some(Entry::User { text }) if text.starts_with('5')));
+
+        let entries = (0..6)
+            .map(|index| SessionSnapshotEntry::User {
+                text: format!("{index}{big}"),
+            })
+            .collect::<Vec<_>>();
+        let window = newest_snapshot_entries(entries, TRANSCRIPT_BUDGET_BYTES);
+        assert!(window.dropped > 0);
+        assert_eq!(window.dropped + window.kept.len(), 6);
+        assert!(matches!(
+            window.kept.last(),
+            Some(SessionSnapshotEntry::User { text }) if text.starts_with('5')
+        ));
+        // A single entry larger than the budget is still shown.
+        let window = newest_snapshot_entries(
+            vec![SessionSnapshotEntry::User {
+                text: "w".repeat(TRANSCRIPT_BUDGET_BYTES + 1),
+            }],
+            TRANSCRIPT_BUDGET_BYTES,
+        );
+        assert_eq!((window.kept.len(), window.dropped), (1, 0));
+    }
+
+    #[test]
+    fn editing_moves_and_deletes_whole_grapheme_clusters() {
+        // Family emoji (ZWJ sequence), a flag, and e + combining acute.
+        for cluster in ["👨‍👩‍👧", "🇳🇿", "e\u{301}", "❤️"] {
+            let mut input = format!("a{cluster}b");
+            let mut cursor = 1 + cluster.len();
+            move_left(&input, &mut cursor);
+            assert_eq!(cursor, 1, "{cluster:?}");
+            move_right(&input, &mut cursor);
+            assert_eq!(cursor, 1 + cluster.len(), "{cluster:?}");
+            delete_backward(&mut input, &mut cursor);
+            assert_eq!(input, "ab", "{cluster:?}");
+            let mut input = format!("a{cluster}b");
+            let mut cursor = 1;
+            delete_forward(&mut input, &mut cursor);
+            assert_eq!(input, "ab", "{cluster:?}");
+        }
+    }
+
+    #[test]
+    fn wrapped_rows_never_split_a_grapheme_cluster() {
+        let text = "ab👨‍👩‍👧cd🇳🇿e\u{301}";
+        for width in 1..8 {
+            let rows = render::wrap_text(&Text::from(text.to_owned()), width, Style::default());
+            let joined = rows
+                .iter()
+                .flat_map(|row| row.spans.iter().map(|span| span.content.to_string()))
+                .collect::<String>();
+            // Clusters wider than the row are dropped whole, never split:
+            // every emitted cluster is one of the original clusters.
+            let originals = text
+                .graphemes(true)
+                .collect::<std::collections::HashSet<_>>();
+            for row in &rows {
+                let row_text = row
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                for cluster in row_text.graphemes(true) {
+                    assert!(originals.contains(cluster), "width {width}: {cluster:?}");
+                }
+            }
+            assert!(!joined.is_empty());
+        }
+    }
+
+    #[test]
+    fn pasted_cr_line_breaks_are_kept() {
+        assert_eq!(normalize_paste_newlines("a\rb\r\nc\n"), "a\nb\nc\n");
+        assert_eq!(
+            render::sanitize_terminal_text(&normalize_paste_newlines("one\rtwo")),
+            "one\ntwo"
+        );
+    }
+
+    #[test]
+    fn event_drain_is_bounded_while_the_queue_stays_full() {
+        // A producer that keeps the channel non-empty must not hold the loop
+        // away from terminal input for longer than one bounded drain.
+        let mut first = ui(80, 24);
+        let (tx, mut rx) = mpsc::channel(EVENT_DRAIN_MAX_EVENTS * 4);
+        for _ in 0..(EVENT_DRAIN_MAX_EVENTS * 4) {
+            tx.try_send(UiEvent::TextDelta("x".into())).unwrap();
+        }
+        let applied = first.drain_queued_events(UiEvent::TextDelta("x".into()), &mut rx);
+        assert!(applied <= EVENT_DRAIN_MAX_EVENTS);
+        assert!(rx.try_recv().is_ok(), "the drain must leave work queued");
+        // Merged deltas keep every byte, in order.
+        assert_eq!(first.stream.as_ref().unwrap().markdown, "x".repeat(applied));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut ui = ui(80, 24);
+        for event in [
+            UiEvent::TextDelta("b".into()),
+            UiEvent::ReasoningDelta("r".into()),
+            UiEvent::TextDelta("c".into()),
+        ] {
+            tx.try_send(event).unwrap();
+        }
+        ui.drain_queued_events(UiEvent::TextDelta("a".into()), &mut rx);
+        let stream = ui.stream.as_ref().unwrap();
+        assert_eq!(
+            (stream.markdown.as_str(), stream.reasoning.as_str()),
+            ("abc", "r")
+        );
+    }
+
     fn begin_ask(ui: &mut CrossTerm) -> mpsc::UnboundedReceiver<InputMessage> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         ui.submit_command("/ASK  keep  this question", &tx).unwrap();
@@ -4009,6 +4399,7 @@ mod tests {
             ok: !matches!(status, ToolStatus::Failure),
             duration_ms: 1_200,
             output: String::new(),
+            omitted_lines: 0,
             error: matches!(status, ToolStatus::Failure).then(|| "boom\ntrace".into()),
             status,
         }
@@ -4186,7 +4577,21 @@ mod tests {
 
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        install_panic_hook(ui.terminal.clone());
+        install_panic_hook(&ui.terminal);
+        // A panic on another thread (for example a Tokio task whose panic is
+        // caught) must leave the live UI's terminal modes alone.
+        let worker = std::thread::spawn(|| panic!("simulated worker panic"));
+        assert!(worker.join().is_err());
+        assert!(
+            backend.calls().iter().all(|called| !matches!(
+                called,
+                TerminalOperation::DisableRaw
+                    | TerminalOperation::DisableBracketed
+                    | TerminalOperation::PopKeyboard
+                    | TerminalOperation::Newline
+            )),
+            "a worker-thread panic restored the UI terminal"
+        );
         let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             panic!("simulated terminal panic");
         }));
@@ -4964,6 +5369,7 @@ mod tests {
             // the only bound. The full text prints when the message
             // finalizes.
             markdown: (0..60).map(|i| format!("line {i}\n")).collect(),
+            ..StreamState::default()
         });
         let input = ui.input_layout();
         let build = ui.build_region(&input);
@@ -5008,6 +5414,7 @@ mod tests {
         ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: tall.clone() + &"second ".repeat(30),
+            ..StreamState::default()
         });
         let input = ui.input_layout();
         ui.commit_stream_prefix(input.rows.len());
@@ -5025,11 +5432,33 @@ mod tests {
     }
 
     #[test]
+    fn full_repaint_prints_a_stream_prefix_committed_during_the_repaint() {
+        // A full repaint prints only `transcript`. A prefix committed after
+        // pending entries moved there was never printed.
+        let mut ui = ui(80, 8);
+        let tall = format!("{}\n\n", "word ".repeat(100));
+        ui.stream = Some(StreamState {
+            reasoning: String::new(),
+            markdown: tall.clone() + &"second ".repeat(30),
+            ..StreamState::default()
+        });
+        let _build = ui.stage_full_repaint();
+        assert!(ui.pending.is_empty());
+        let prefixes = ui
+            .transcript
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Assistant { markdown, .. } if *markdown == tall))
+            .count();
+        assert_eq!(prefixes, 1);
+    }
+
+    #[test]
     fn commit_stream_prefix_keeps_short_blocks_live() {
         let mut ui = ui(80, 24);
         ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: "short\n\nanswer".into(),
+            ..StreamState::default()
         });
         let input = ui.input_layout();
         ui.commit_stream_prefix(input.rows.len());
@@ -5046,6 +5475,7 @@ mod tests {
         live.stream = Some(StreamState {
             reasoning: "thinking".into(),
             markdown: "answer".into(),
+            ..StreamState::default()
         });
         live.finalize_stream();
         assert!(live.stream.is_none());
@@ -5076,6 +5506,7 @@ mod tests {
         loaded_ui.stream = Some(StreamState {
             reasoning: String::new(),
             markdown: "live".into(),
+            ..StreamState::default()
         });
         loaded_ui.apply_event(UiEvent::SessionChanged {
             id: "abcd1234efgh".into(),
@@ -5314,6 +5745,42 @@ mod tests {
         let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
         ui.handle_tab(&tx).unwrap();
         assert_eq!(ui.input, "look at @src/README.md ");
+    }
+
+    #[tokio::test]
+    async fn tab_accepts_scanned_export_and_load_paths() {
+        for command in ["/export ", "/load "] {
+            let mut ui = ui(80, 24);
+            ui.input = format!("{command}notes");
+            ui.cursor = ui.input.len();
+            ui.refresh_completion();
+            let generation = ui.path_completion_generation;
+            let context = ui
+                .completion
+                .as_ref()
+                .expect("path scan started")
+                .context
+                .clone();
+            ui.apply_path_completion(PathCompletionResult {
+                generation,
+                context,
+                candidates: vec![Candidate {
+                    value: "notes/today.md".into(),
+                    description: "file".into(),
+                    kind: CandidateKind::File,
+                }],
+                at_prefix: None,
+            });
+            // Tab refreshes completion first; unchanged context must keep the
+            // scanned result instead of clearing it.
+            let (tx, _rx) = mpsc::unbounded_channel::<InputMessage>();
+            ui.handle_tab(&tx).unwrap();
+            assert!(
+                ui.input.starts_with(&format!("{command}notes/today.md")),
+                "{}",
+                ui.input
+            );
+        }
     }
 
     #[tokio::test]

@@ -131,16 +131,17 @@ impl HttpClient {
     }
 }
 
-/// Map a non-success HTTP status to `LlmError::Http` with a bounded body.
+/// Map a non-success HTTP status to `LlmError::Http` with a bounded body,
+/// redacting `secret` (the active API key/token) before the error becomes
+/// visible.  Providers holding a secret must use this so echoed bodies can
+/// never leak credentials.
+///
 /// `LlmError::http` is the single constructor that enforces the truncation
 /// invariant, so every status-mapped error (OpenAI dialects and Anthropic
 /// alike) is bounded here.  The body is streamed as a bounded prefix — never
 /// an unbounded `response.text()` — and the final error stays within the
 /// byte cap as valid UTF-8.  A 429 `Retry-After` hint is preserved (bounded)
 /// so `retry.rs` can honor `max(backoff+jitter, retry_after)`.
-/// Map an error while redacting the active API key/token before the
-/// error becomes visible.  Providers holding a secret must use this so
-/// echoed bodies can never leak credentials.
 pub(crate) async fn check_status_with_secret(
     response: reqwest::Response,
     secret: &str,
@@ -161,6 +162,41 @@ pub(crate) async fn check_status_with_secret(
         secret,
         retry_after,
     ))
+}
+
+/// Largest successful metadata body (model catalogues, usage) read into
+/// memory. Large public catalogues are a few MiB; a hostile or broken
+/// endpoint must not make the client buffer an unbounded body.
+pub(crate) const MAX_METADATA_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Read a successful response body as text, failing once it exceeds
+/// `limit` bytes (counted per received chunk, so a body without
+/// `Content-Length` is bounded too).
+pub(crate) async fn read_bounded_text(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<String, LlmError> {
+    use futures_util::StreamExt;
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(LlmError::Parse(format!(
+            "response body exceeds {limit} bytes"
+        )));
+    }
+    let mut body: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(LlmError::Network)?;
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(LlmError::Parse(format!(
+                "response body exceeds {limit} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|_| LlmError::Parse("response body is not UTF-8".into()))
 }
 
 /// Maximum bytes read from a non-success response body.  Multi-megabyte or
@@ -194,12 +230,6 @@ mod tests {
     use futures_util::StreamExt;
     use serde_json::json;
 
-    /// Regression test for the "harness hangs mid-turn" bug: a provider whose
-    /// SSE connection stalls (response headers arrive, then nothing — the
-    /// socket stays open) used to hang `stream.next()` forever because the
-    /// reqwest client had no timeouts.  With `read_timeout` set, the stalled
-    /// body read must surface as an error so the agent loop can recover
-    /// instead of waiting for a user interrupt.
     #[tokio::test]
     async fn shared_http_errors_redact_keys_and_preserve_retry_headers() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -280,6 +310,12 @@ mod tests {
         assert!(rendered.is_char_boundary(rendered.len()));
     }
 
+    /// Regression test for the "harness hangs mid-turn" bug: a provider whose
+    /// SSE connection stalls (response headers arrive, then nothing — the
+    /// socket stays open) used to hang `stream.next()` forever because the
+    /// reqwest client had no timeouts.  With `read_timeout` set, the stalled
+    /// body read must surface as an error so the agent loop can recover
+    /// instead of waiting for a user interrupt.
     #[tokio::test]
     async fn stalled_response_body_times_out_instead_of_hanging() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

@@ -115,6 +115,19 @@ archive contains the `harness` binary, this README, its header image, and the
 license. Verify the archive with `SHA256SUMS`, then put the binary in a
 directory on your `PATH`.
 
+Release archives also have a signed build provenance attestation. It shows
+that the archive was built by this repository's release workflow. To check it
+with the [GitHub CLI](https://cli.github.com/):
+
+```sh
+gh attestation verify harness-v0.7.0-aarch64-apple-darwin.tar.gz \
+  --repo alexlayton/harness \
+  --signer-workflow alexlayton/harness/.github/workflows/release.yml
+```
+
+The checksum check in the installer and in `harness update` confirms that the
+download is complete. It does not check the attestation.
+
 Initial releases provide these builds:
 
 - macOS on Apple silicon (`aarch64-apple-darwin`)

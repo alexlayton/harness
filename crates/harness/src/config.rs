@@ -23,17 +23,23 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Provider aliases, shared by `ProviderArg` (CLI, config file, `/model`) and
+// `LoginProvider`, so every entry point accepts the same names.
+const COPILOT_ALIASES: [&str; 2] = ["copilot", "githubcopilot"];
+const CODEX_ALIASES: [&str; 1] = ["codex"];
+const CLAUDE_ALIASES: [&str; 3] = ["anthropic-subscription", "claude-sub", "claude"];
+
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ProviderArg {
     #[value(name = "opencode-go")]
     OpencodeGo,
     #[value(name = "openrouter")]
     Openrouter,
-    #[value(name = "github-copilot", alias = "copilot")]
+    #[value(name = "github-copilot", aliases = COPILOT_ALIASES)]
     GithubCopilot,
-    #[value(name = "openai-codex", alias = "codex")]
+    #[value(name = "openai-codex", aliases = CODEX_ALIASES)]
     OpenAiCodex,
-    #[value(name = "anthropic-claude", aliases = ["anthropic-subscription", "claude-sub", "claude"])]
+    #[value(name = "anthropic-claude", aliases = CLAUDE_ALIASES)]
     AnthropicSubscription,
 }
 
@@ -48,21 +54,11 @@ impl ProviderArg {
         Self::AnthropicSubscription,
     ];
 
+    /// Parse a provider name or alias exactly as the command line does.
     pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "opencode-go" => Some(Self::OpencodeGo),
-            "openrouter" => Some(Self::Openrouter),
-            "github-copilot" | "githubcopilot" | "copilot" => Some(Self::GithubCopilot),
-            "anthropic-claude" | "anthropic-subscription" | "claude-sub" | "claude" => {
-                Some(Self::AnthropicSubscription)
-            }
-            "openai-codex" | "codex" => Some(Self::OpenAiCodex),
-            _ => None,
-        }
+        <Self as ValueEnum>::from_str(name, false).ok()
     }
 
-    /// The first name is the preferred one. The additional OpenCode name is
-    /// supported for compatibility with existing OpenCode installations.
     /// The first name is the preferred one. The additional OpenCode name is
     /// supported for compatibility with existing OpenCode installations.
     pub fn env_vars(&self) -> &'static [&'static str] {
@@ -510,8 +506,10 @@ impl FileConfig {
 /// The advisory lock covers the complete write, including the rename. The
 /// settings-specific helpers below use the same lock while editing the raw
 /// document, so concurrent read-modify-write operations cannot lose a field.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
+/// Only tests write a whole `FileConfig`; production edits go through the
+/// field-level helpers below, which edit the raw document.
+#[cfg(test)]
+fn save_file_config(path: &Path, config: &FileConfig) -> Result<()> {
     let _lock = lock_config(path)?;
     config.validate()?;
     let contents = toml::to_string_pretty(config).context("serialize config")?;
@@ -1088,11 +1086,11 @@ pub struct LoginArgs {
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum LoginProvider {
-    #[value(name = "github-copilot", alias = "copilot")]
+    #[value(name = "github-copilot", aliases = COPILOT_ALIASES)]
     GithubCopilot,
-    #[value(name = "openai-codex", alias = "codex")]
+    #[value(name = "openai-codex", aliases = CODEX_ALIASES)]
     OpenAiCodex,
-    #[value(name = "anthropic-claude", aliases = ["anthropic-subscription", "claude-sub", "claude"])]
+    #[value(name = "anthropic-claude", aliases = CLAUDE_ALIASES)]
     AnthropicSubscription,
 }
 
@@ -1123,6 +1121,18 @@ pub struct Config {
     pub codex_auth: Option<Arc<OpenAiCodexAuth>>,
     /// Shared subscription credential lifecycle (loaded only for this provider).
     pub anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
+}
+
+/// The saved model, when it applies to the effective `provider`: the file
+/// names no provider, or the same one.
+fn file_model_for(
+    file: &FileConfig,
+    file_provider: Option<ProviderArg>,
+    provider: ProviderArg,
+) -> Option<String> {
+    file.model
+        .clone()
+        .filter(|_| file_provider.is_none_or(|file_provider| file_provider == provider))
 }
 
 impl Config {
@@ -1163,7 +1173,12 @@ impl Config {
         // is read from the local credential store, so this stays offline.
         if config.provider == ProviderArg::GithubCopilot
             && cli.model.is_none()
-            && file.model.is_none()
+            && file_model_for(
+                &file,
+                file.provider.as_deref().and_then(ProviderArg::from_name),
+                config.provider,
+            )
+            .is_none()
             && let Some(model) = entitled_copilot_default(config.copilot_auth.as_ref())
         {
             config.model = model;
@@ -1238,10 +1253,13 @@ impl Config {
                 provider.env_vars().join(" or ")
             ));
         }
+        // The saved model belongs to the saved provider. A `--provider`
+        // override to a different provider uses that provider's default
+        // instead of a model id it does not serve.
         let model = cli
             .model
             .clone()
-            .or_else(|| file.model.clone())
+            .or_else(|| file_model_for(file, file_provider, provider))
             .unwrap_or_else(|| provider.default_model().to_owned());
         let secret_entries = file
             .secrets
@@ -1751,6 +1769,21 @@ mod tests {
         assert_eq!(config.provider, ProviderArg::OpencodeGo);
         assert_eq!(config.model, "cli-model");
         assert_eq!(config.reasoning, ReasoningPolicy::Off);
+
+        // A provider override without --model must not reuse the saved
+        // model of another provider.
+        let cli = Cli {
+            provider: Some(ProviderArg::OpencodeGo),
+            ..Cli::default()
+        };
+        let config = Config::resolve_from_file(
+            &cli,
+            &file,
+            PathBuf::from("/tmp/harness-config.toml"),
+            |_| Some("secret".into()),
+        )
+        .unwrap();
+        assert_eq!(config.model, ProviderArg::OpencodeGo.default_model());
 
         let invalid = FileConfig {
             provider: Some("typo".into()),

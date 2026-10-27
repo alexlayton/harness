@@ -7,6 +7,7 @@
 
 use crate::error::{AuthError, Result, io_error};
 use fs2::FileExt;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -24,6 +25,11 @@ pub const ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY: &str = "anthropic-subscription";
 pub const OPENAI_CODEX_PROVIDER_KEY: &str = "openai-codex";
 const LOCK_WAIT: Duration = Duration::from_millis(10);
 const LOCK_ATTEMPTS: usize = 200;
+/// Longest wait for another process's refresh exchange. One exchange is
+/// bounded by the 30-second OAuth client timeout, so this covers a full
+/// exchange plus its compare-and-save.
+const REFRESH_LEASE_WAIT: Duration = Duration::from_secs(45);
+const REFRESH_LEASE_POLL: Duration = Duration::from_millis(25);
 
 // Test-only fault injection for fail-closed hardening (SESSION-4).
 //
@@ -157,9 +163,8 @@ impl fmt::Debug for CopilotCredential {
     }
 }
 
-/// OAuth credentials used by the ChatGPT Codex subscription endpoint.
-/// Expiration is a Unix timestamp in milliseconds.
 /// Private Anthropic subscription OAuth tokens and optional login identity.
+/// Expiration is a Unix timestamp in milliseconds.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AnthropicSubscriptionCredential {
     #[serde(rename = "type")]
@@ -249,6 +254,8 @@ impl fmt::Debug for AnthropicSubscriptionCredential {
     }
 }
 
+/// OAuth credentials used by the ChatGPT Codex subscription endpoint.
+/// Expiration is a Unix timestamp in milliseconds.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenAiCodexCredential {
     #[serde(rename = "type")]
@@ -344,6 +351,90 @@ impl fmt::Debug for RedactedCredential<'_> {
     }
 }
 
+/// Per-provider policy for the shared load/save paths in [`AuthStore`].
+///
+/// Every provider shares the same locking, private-permission, and
+/// read-modify-write mechanics; only the key, the error text, and the
+/// compare-and-save rule differ, so those are the only things captured here.
+trait StoredCredential: Serialize + DeserializeOwned {
+    /// Entry name in `auth.json`.
+    const PROVIDER_KEY: &'static str;
+
+    /// Whether the credential carries every field a provider request needs.
+    fn has_oauth_fields(&self) -> bool;
+
+    /// Error returned when a stored or to-be-saved credential is incomplete.
+    fn missing_fields() -> AuthError;
+
+    /// Map a decode failure without ever quoting serde's message, which can
+    /// contain stored token values.
+    fn decode_error(path: &Path, error: &serde_json::Error) -> AuthError {
+        AuthError::json(path, error)
+    }
+
+    /// Whether the persisted `stored` value is still the generation a refresh
+    /// started from, so its result may replace it.
+    fn is_current(stored: &Self, expected: &Self) -> bool;
+}
+
+impl StoredCredential for CopilotCredential {
+    const PROVIDER_KEY: &'static str = COPILOT_PROVIDER_KEY;
+
+    fn has_oauth_fields(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn missing_fields() -> AuthError {
+        AuthError::InvalidCredential("credential is missing its OAuth token fields".into())
+    }
+
+    /// Copilot compares only the token pair, not expiry or enrichment such
+    /// as `available_model_ids`.
+    fn is_current(stored: &Self, expected: &Self) -> bool {
+        stored.access == expected.access && stored.refresh == expected.refresh
+    }
+}
+
+impl StoredCredential for AnthropicSubscriptionCredential {
+    const PROVIDER_KEY: &'static str = ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY;
+
+    fn has_oauth_fields(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn missing_fields() -> AuthError {
+        AuthError::InvalidCredential(
+            "Anthropic subscription credential is missing OAuth fields".into(),
+        )
+    }
+
+    fn decode_error(_path: &Path, _error: &serde_json::Error) -> AuthError {
+        AuthError::InvalidCredential(
+            "Anthropic subscription credential has invalid OAuth fields".into(),
+        )
+    }
+
+    fn is_current(stored: &Self, expected: &Self) -> bool {
+        stored.is_complete() && stored.has_same_generation(expected)
+    }
+}
+
+impl StoredCredential for OpenAiCodexCredential {
+    const PROVIDER_KEY: &'static str = OPENAI_CODEX_PROVIDER_KEY;
+
+    fn has_oauth_fields(&self) -> bool {
+        self.is_complete()
+    }
+
+    fn missing_fields() -> AuthError {
+        AuthError::InvalidCredential("OpenAI Codex credential is missing OAuth fields".into())
+    }
+
+    fn is_current(stored: &Self, expected: &Self) -> bool {
+        stored.is_complete() && stored.has_same_generation(expected)
+    }
+}
+
 /// Provider-keyed values from `auth.json`.  Unknown providers are kept as raw
 /// JSON so a Harness update cannot erase credentials written by another tool.
 pub type AuthEntries = BTreeMap<String, serde_json::Value>;
@@ -397,39 +488,14 @@ impl AuthStore {
     }
 
     pub fn anthropic_subscription(&self) -> Result<Option<AnthropicSubscriptionCredential>> {
-        let entries = self.load_unlocked()?;
-        let Some(value) = entries.get(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY) else {
-            return Ok(None);
-        };
-        // Serde type errors can quote the offending value (including tokens).
-        let credential = serde_json::from_value::<AnthropicSubscriptionCredential>(value.clone())
-            .map_err(|_| {
-            AuthError::InvalidCredential(
-                "Anthropic subscription credential has invalid OAuth fields".into(),
-            )
-        })?;
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "Anthropic subscription credential is missing OAuth fields".into(),
-            ));
-        }
-        Ok(Some(credential))
+        self.load_provider()
     }
 
     pub fn save_anthropic_subscription(
         &self,
         credential: &AnthropicSubscriptionCredential,
     ) -> Result<()> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "Anthropic subscription credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.save_provider_value(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value)
+        self.save_provider(credential)
     }
 
     /// Replace a subscription credential only if the persisted generation is still
@@ -441,57 +507,15 @@ impl AuthStore {
         expected: &AnthropicSubscriptionCredential,
         credential: &AnthropicSubscriptionCredential,
     ) -> Result<bool> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "Anthropic subscription credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.save_provider_value_if_current(ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY, value, |current| {
-            current
-                .and_then(|value| {
-                    serde_json::from_value::<AnthropicSubscriptionCredential>(value.clone()).ok()
-                })
-                .is_some_and(|current| {
-                    current.is_complete() && current.has_same_generation(expected)
-                })
-        })
+        self.save_provider_if_current(expected, credential)
     }
 
     pub fn openai_codex(&self) -> Result<Option<OpenAiCodexCredential>> {
-        let entries = self.load_unlocked()?;
-        let Some(value) = entries.get(OPENAI_CODEX_PROVIDER_KEY) else {
-            return Ok(None);
-        };
-        let credential =
-            serde_json::from_value::<OpenAiCodexCredential>(value.clone()).map_err(|source| {
-                AuthError::Json {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "OpenAI Codex credential is missing OAuth fields".into(),
-            ));
-        }
-        Ok(Some(credential))
+        self.load_provider()
     }
 
     pub fn save_openai_codex(&self, credential: &OpenAiCodexCredential) -> Result<()> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "OpenAI Codex credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.save_provider_value(OPENAI_CODEX_PROVIDER_KEY, value)
+        self.save_provider(credential)
     }
 
     /// Replace a Codex credential only if the persisted generation is still
@@ -503,44 +527,11 @@ impl AuthStore {
         expected: &OpenAiCodexCredential,
         credential: &OpenAiCodexCredential,
     ) -> Result<bool> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "OpenAI Codex credential is missing OAuth fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.save_provider_value_if_current(OPENAI_CODEX_PROVIDER_KEY, value, |current| {
-            current
-                .and_then(|value| {
-                    serde_json::from_value::<OpenAiCodexCredential>(value.clone()).ok()
-                })
-                .is_some_and(|current| {
-                    current.is_complete() && current.has_same_generation(expected)
-                })
-        })
+        self.save_provider_if_current(expected, credential)
     }
 
     pub fn copilot(&self) -> Result<Option<CopilotCredential>> {
-        let entries = self.load_unlocked()?;
-        let Some(value) = entries.get(COPILOT_PROVIDER_KEY) else {
-            return Ok(None);
-        };
-        let credential =
-            serde_json::from_value::<CopilotCredential>(value.clone()).map_err(|source| {
-                AuthError::Json {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?;
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "credential is missing its OAuth token fields".into(),
-            ));
-        }
-        Ok(Some(credential))
+        self.load_provider()
     }
 
     /// Update one provider while retaining all unrelated entries.  The lock is
@@ -564,16 +555,7 @@ impl AuthStore {
     }
 
     pub fn save_copilot(&self, credential: &CopilotCredential) -> Result<()> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "credential is missing its OAuth token fields".into(),
-            ));
-        }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.save_provider_value(COPILOT_PROVIDER_KEY, value)
+        self.save_provider(credential)
     }
 
     /// Compare-and-save the result of a Copilot refresh under the auth-file
@@ -583,21 +565,53 @@ impl AuthStore {
         expected: &CopilotCredential,
         credential: &CopilotCredential,
     ) -> Result<bool> {
-        if !credential.is_complete() {
-            return Err(AuthError::InvalidCredential(
-                "credential is missing its OAuth token fields".into(),
-            ));
+        self.save_provider_if_current(expected, credential)
+    }
+
+    /// Read and validate one provider's credential. Absence is `Ok(None)`;
+    /// a present but undecodable or incomplete entry is an error rather than
+    /// a silent logout, so a damaged file is surfaced instead of overwritten.
+    fn load_provider<T: StoredCredential>(&self) -> Result<Option<T>> {
+        let entries = self.load_unlocked()?;
+        let Some(value) = entries.get(T::PROVIDER_KEY) else {
+            return Ok(None);
+        };
+        let credential = serde_json::from_value::<T>(value.clone())
+            .map_err(|source| T::decode_error(&self.path, &source))?;
+        if !credential.has_oauth_fields() {
+            return Err(T::missing_fields());
         }
-        let value = serde_json::to_value(credential).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.save_provider_value_if_current(COPILOT_PROVIDER_KEY, value, |current| {
+        Ok(Some(credential))
+    }
+
+    /// Validate and serialize a credential before any disk work, so an
+    /// incomplete credential is never written over a usable one.
+    fn encode_provider<T: StoredCredential>(&self, credential: &T) -> Result<serde_json::Value> {
+        if !credential.has_oauth_fields() {
+            return Err(T::missing_fields());
+        }
+        serde_json::to_value(credential).map_err(|source| AuthError::json(&self.path, &source))
+    }
+
+    /// Unconditionally replace one provider's credential under the file lock.
+    fn save_provider<T: StoredCredential>(&self, credential: &T) -> Result<()> {
+        let value = self.encode_provider(credential)?;
+        self.save_provider_value(T::PROVIDER_KEY, value)
+    }
+
+    /// Replace one provider's credential only while the stored entry still
+    /// matches `expected` per [`StoredCredential::is_current`]. An entry that
+    /// no longer decodes counts as changed, so the refresh result is dropped.
+    fn save_provider_if_current<T: StoredCredential>(
+        &self,
+        expected: &T,
+        credential: &T,
+    ) -> Result<bool> {
+        let value = self.encode_provider(credential)?;
+        self.save_provider_value_if_current(T::PROVIDER_KEY, value, |current| {
             current
-                .and_then(|value| serde_json::from_value::<CopilotCredential>(value.clone()).ok())
-                .is_some_and(|current| {
-                    current.access == expected.access && current.refresh == expected.refresh
-                })
+                .and_then(|value| serde_json::from_value::<T>(value.clone()).ok())
+                .is_some_and(|current| T::is_current(&current, expected))
         })
     }
 
@@ -632,8 +646,10 @@ impl AuthStore {
         let mut file = match fs::File::open(&self.path) {
             Ok(file) => {
                 // Reading an auth file is also an opportunity to repair a
-                // permissive mode left by an older Harness version.
-                ensure_private_file(&self.path)?;
+                // permissive mode left by an older Harness version. Reads
+                // happen on every provider request, so no chmod or
+                // directory fsync is paid when the mode is already private.
+                secure_open_file(&file, &self.path)?;
                 file
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -647,20 +663,15 @@ impl AuthStore {
         if contents.trim().is_empty() {
             return Ok(BTreeMap::new());
         }
-        serde_json::from_str(&contents).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })
+        serde_json::from_str(&contents).map_err(|source| AuthError::json(&self.path, &source))
     }
 
     fn write_unlocked(&self, entries: &AuthEntries) -> Result<()> {
         let parent = self.parent_dir();
         private_dir_all(&parent)?;
         ensure_private_directory(&parent)?;
-        let contents = serde_json::to_string_pretty(entries).map_err(|source| AuthError::Json {
-            path: self.path.clone(),
-            source,
-        })?;
+        let contents = serde_json::to_string_pretty(entries)
+            .map_err(|source| AuthError::json(&self.path, &source))?;
         let temp = temporary_path(&self.path);
         let result = (|| -> Result<()> {
             let mut file = private_file(&temp)?;
@@ -752,8 +763,14 @@ fn ensure_private_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata =
-            fs::metadata(path).map_err(|source| io_error("stat auth directory", path, source))?;
+        // Do not change the mode of whatever a symlink points at. A
+        // symlinked config directory is a common dotfiles setup, so it is
+        // left as the user configured it rather than treated as an error.
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| io_error("stat auth directory", path, source))?;
+        if metadata.file_type().is_symlink() {
+            return Ok(());
+        }
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(path, permissions)
@@ -784,6 +801,34 @@ fn private_file(path: &Path) -> Result<fs::File> {
     }
 }
 
+/// Repair an open file's mode only when it is not already 0600, through its
+/// handle, and without a parent-directory sync (a mode change creates no
+/// directory entry). Used on read and lock paths, which run per request.
+fn secure_open_file(file: &fs::File, path: &Path) -> Result<()> {
+    #[cfg(test)]
+    if injected_secure_file_failure() {
+        return Err(io_error(
+            "secure auth file",
+            path,
+            std::io::Error::other("injected file permission failure"),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let metadata = file
+            .metadata()
+            .map_err(|source| io_error("stat auth file", path, source))?;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| io_error("secure auth file", path, source))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (file, path);
+    Ok(())
+}
+
 fn ensure_private_file(path: &Path) -> Result<()> {
     // Fail-closed test hook: simulate an OS permission failure before any
     // repair so tests prove lock acquisition/saves propagate instead of
@@ -799,8 +844,16 @@ fn ensure_private_file(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata =
-            fs::metadata(path).map_err(|source| io_error("stat auth file", path, source))?;
+        // Do not change the mode of whatever a symlink points at.
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|source| io_error("stat auth file", path, source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(io_error(
+                "secure auth file",
+                path,
+                std::io::Error::other("refusing to change permissions through a symlink"),
+            ));
+        }
         let mut permissions = metadata.permissions();
         permissions.set_mode(0o600);
         fs::set_permissions(path, permissions)
@@ -846,6 +899,62 @@ fn sync_parent(path: &Path) -> Result<()> {
     }
 }
 
+/// Cross-process lease held across one provider's refresh-token exchange.
+///
+/// Rotating providers (Codex, Anthropic) accept each refresh token once and
+/// can revoke the whole grant when a used token is presented again. Per-handle
+/// mutexes do not serialize separate processes, so every refresh takes this
+/// lease, reloads the stored credential, and only then exchanges. The main
+/// auth-file lock is never held across the network request. The lease is
+/// released on drop, including when the refresh future is cancelled.
+#[derive(Debug)]
+pub struct RefreshLease {
+    file: fs::File,
+}
+
+impl Drop for RefreshLease {
+    fn drop(&mut self) {
+        // Retain the sidecar inode, as for the auth-file lock.
+        let _ = self.file.unlock();
+    }
+}
+
+impl AuthStore {
+    /// Acquire the refresh lease for `provider`, waiting asynchronously (up
+    /// to a bound) while another process holds it.
+    pub async fn acquire_refresh_lease(&self, provider: &str) -> Result<RefreshLease> {
+        let path = self
+            .path
+            .with_extension(format!("json.{provider}.refresh.lock"));
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Never follow a planted symlink: the handle is chmod-ed.
+                options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            options.open(&path)
+        }
+        .map_err(|source| io_error("open refresh lease", &path, source))?;
+        secure_open_file(&file, &path)?;
+        let deadline = tokio::time::Instant::now() + REFRESH_LEASE_WAIT;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(RefreshLease { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(AuthError::LockUnavailable(path));
+                    }
+                    tokio::time::sleep(REFRESH_LEASE_POLL).await;
+                }
+                Err(source) => return Err(io_error("lock refresh lease", &path, source)),
+            }
+        }
+    }
+}
+
 struct AuthFileLock {
     file: fs::File,
 }
@@ -861,12 +970,14 @@ impl AuthFileLock {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
+                // Never follow a planted symlink: the handle is chmod-ed.
                 OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(false)
                     .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW)
                     .open(&path)
             }
             #[cfg(not(unix))]
@@ -880,7 +991,7 @@ impl AuthFileLock {
             }
         }
         .map_err(|source| io_error("open auth lock", &path, source))?;
-        ensure_private_file(&path)?;
+        secure_open_file(&file, &path)?;
 
         for _ in 0..LOCK_ATTEMPTS {
             match file.try_lock_exclusive() {
@@ -916,6 +1027,68 @@ mod tests {
             None,
             vec!["gpt-5.4".into()],
         )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refresh_lease_is_exclusive_bounded_and_released_on_drop() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let owner = store.acquire_refresh_lease("openai-codex").await.unwrap();
+        // A contender waits, then fails after the bound instead of hanging.
+        assert!(matches!(
+            store.acquire_refresh_lease("openai-codex").await,
+            Err(AuthError::LockUnavailable(_))
+        ));
+        // Leases are per provider.
+        drop(
+            store
+                .acquire_refresh_lease("anthropic-subscription")
+                .await
+                .unwrap(),
+        );
+        drop(owner);
+        store.acquire_refresh_lease("openai-codex").await.unwrap();
+    }
+
+    #[test]
+    fn invalid_stored_credentials_never_quote_token_values() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        // A token in a numeric field makes serde quote it in its message.
+        fs::write(
+            &path,
+            r#"{"github-copilot":{"type":"oauth","access":"a","refresh":"r","expires":"token-sentinel-value"},
+               "openai-codex":{"type":"oauth","access":"a","refresh":"r","expires":"token-sentinel-value"}}"#,
+        )
+        .unwrap();
+        let store = AuthStore::new(&path);
+        for error in [
+            store.copilot().unwrap_err().to_string(),
+            store.openai_codex().unwrap_err().to_string(),
+        ] {
+            assert!(!error.contains("token-sentinel-value"), "{error}");
+        }
+        fs::write(&path, r#""token-sentinel-value""#).unwrap();
+        let error = AuthStore::new(&path).copilot().unwrap_err().to_string();
+        assert!(!error.contains("token-sentinel-value"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_files_are_never_opened_through_a_symlink() {
+        let directory = tempdir().unwrap();
+        let auth = directory.path().join("auth.json");
+        let victim = directory.path().join("victim");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&victim, "data").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&victim, AuthFileLock::lock_path(&auth)).unwrap();
+        assert!(AuthFileLock::acquire(&auth).is_err());
+        // The symlink target's mode was not changed through the link.
+        assert_ne!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

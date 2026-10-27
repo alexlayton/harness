@@ -119,7 +119,7 @@ impl Agent {
             send(events, AgentEvent::Error("sessions are not enabled".into()));
             return;
         };
-        let mut session = match store.load(&selector) {
+        let mut session = match crate::blocking::blocking_io(|| store.load(&selector)) {
             Ok(session) => session,
             Err(error) => {
                 send(
@@ -133,7 +133,7 @@ impl Agent {
             .file_path()
             .is_some_and(|path| store.is_path_in_store(path))
         {
-            match store.adopt(&session) {
+            match crate::blocking::blocking_io(|| store.adopt(&session)) {
                 Ok(adopted) => session = adopted,
                 Err(error) => {
                     send(
@@ -150,7 +150,9 @@ impl Agent {
         let new_active_lease = if reuses_active_lease {
             None
         } else {
-            match store.acquire_active(&session) {
+            // Reload under the lease: the previous owner may have appended
+            // after `load` read the file.
+            match crate::blocking::blocking_io(|| store.acquire_active_and_reload(&mut session)) {
                 Ok(lease) => Some(lease),
                 Err(error) => {
                     send(
@@ -161,7 +163,9 @@ impl Agent {
                 }
             }
         };
-        if let Err(error) = store.repair_incomplete_tool_calls(&mut session) {
+        if let Err(error) =
+            crate::blocking::blocking_io(|| store.repair_incomplete_tool_calls(&mut session))
+        {
             send(
                 events,
                 AgentEvent::Error(format!("could not repair loaded session: {error}")),
@@ -540,6 +544,7 @@ impl Agent {
         // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
         self.context_window = self.compaction.resolved_window(0);
+        self.publish_context_window();
         send(events, self.context_usage_event());
         if let Some(metadata_tx) = &self.model_metadata_tx {
             spawn_model_metadata(

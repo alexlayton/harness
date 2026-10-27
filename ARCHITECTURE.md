@@ -34,7 +34,7 @@ harness-python ── harness ──┬── agent ──┬── compact ─�
 | `compact` | Token estimation, compaction policy and planning, and summary generation. |
 | `session` | Append-only JSONL format, locking, replay, export, and provider-history reconstruction. |
 | `llm` | Provider-neutral types, provider clients, retry behavior, SSE handling, and wire-format dialects. |
-| `auth` | Copilot and OpenAI Codex OAuth, refresh, and private credential storage. |
+| `auth` | GitHub Copilot, OpenAI Codex, and Anthropic Claude subscription OAuth, refresh, and private credential storage. |
 | `tools` | Built-in tools, registry, scheduling metadata, path checks, project context, skills, and the subagent interface. |
 | `mcp` | External MCP process lifecycle, tool discovery, namespacing, and tool adapters. |
 
@@ -50,14 +50,17 @@ separate events, persistence, tool scheduling, turn streaming, commands, and
 compaction.
 
 1. A frontend sends an `InputMessage`.
-2. The agent reconstructs provider history from the current `Session` and
-   builds a `CompletionRequest` with the system prompt and tool definitions.
+2. The agent appends the message to its live provider history. That history
+   is rebuilt from the `Session` only when a session is attached or after
+   compaction. Each request builds the system prompt and tool definitions
+   from one fresh `ToolRegistry` snapshot.
 3. The provider streams text, reasoning, tool calls, and usage. Bounded retry
    logic handles recoverable stream and tool-argument failures.
 4. The registry schedules tool calls by their declared concurrency class. Tool
    events and results are persisted, then the loop requests the next model
    response.
-5. A text-only response completes the turn.
+5. A text-only response completes the turn. An empty response gets a bounded
+   recovery request, and a turn stops with an error after 200 tool rounds.
 
 An armed prewalk (`crates/agent/src/agent/prewalk.rs`) can switch the active
 model once inside a turn, only after a persisted tool round that called `edit`
@@ -218,6 +221,9 @@ and can be disabled with `--no-context-files` or
 Skills are discovered from project `.harness/skills/` and `.agents/skills/`
 roots plus their global equivalents. Only skill name, description, and path are
 put in the system prompt. The model reads a skill body only when needed.
+Candidates are canonicalized and must stay beneath their canonical discovery
+root: contained symlinks work, and external ones never enter the catalogue or
+the read allowlist.
 Native callers can replace discovery roots with ordered `skill_dirs`; relative
 roots use the workspace. Explicit catalogs and read paths are passed to both
 child registry modes so a disabled or replaced skill set cannot revert to

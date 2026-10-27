@@ -75,6 +75,22 @@ impl std::fmt::Debug for PollResult {
     }
 }
 
+/// Longest device-code lifetime honored (GitHub uses 15 minutes).  An
+/// untrusted larger value is clamped so deadline arithmetic cannot overflow
+/// and a login cannot wait for days.
+pub const MAX_DEVICE_CODE_LIFETIME_SECS: u64 = 60 * 60;
+
+/// Polling interval bounds (RFC 8628 default is 5 seconds).  The upper bound
+/// keeps `slow_down` increments and untrusted intervals from overflowing or
+/// parking the login.
+pub const MIN_POLL_INTERVAL_SECS: u64 = 5;
+pub const MAX_POLL_INTERVAL_SECS: u64 = 120;
+
+/// Clamp an untrusted polling interval into the supported range.
+pub fn clamp_poll_interval(interval: u64) -> u64 {
+    interval.clamp(MIN_POLL_INTERVAL_SECS, MAX_POLL_INTERVAL_SECS)
+}
+
 pub fn parse_device_code(value: &Value) -> Result<DeviceCode> {
     let object = value
         .as_object()
@@ -103,8 +119,8 @@ pub fn parse_device_code(value: &Value) -> Result<DeviceCode> {
         device_code,
         user_code,
         verification_url,
-        expires_in,
-        interval,
+        expires_in: expires_in.min(MAX_DEVICE_CODE_LIFETIME_SECS),
+        interval: clamp_poll_interval(interval),
     })
 }
 
@@ -182,6 +198,21 @@ mod tests {
         .unwrap();
         assert_eq!(device.interval, 5);
         assert_eq!(device.verification_url, "https://github.com/login/device");
+    }
+
+    #[test]
+    fn clamps_untrusted_lifetime_and_interval() {
+        // u64::MAX would overflow `Instant + Duration` and `interval + 5`.
+        let device = parse_device_code(&json!({
+            "device_code": "device",
+            "user_code": "ABCD-EFGH",
+            "verification_uri": "https://github.com/login/device",
+            "expires_in": u64::MAX,
+            "interval": u64::MAX
+        }))
+        .unwrap();
+        assert_eq!(device.expires_in, MAX_DEVICE_CODE_LIFETIME_SECS);
+        assert_eq!(device.interval, MAX_POLL_INTERVAL_SECS);
     }
 
     #[test]

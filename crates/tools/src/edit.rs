@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use super::file_mutation::atomic_write;
 use super::file_mutation::with_file_mutation_lock;
 use super::vfs::{WorkspaceFs, split_relative};
 use super::{
@@ -11,15 +9,15 @@ use llm::util::truncate_utf8;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
-use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum source size for an exact edit (4 MiB). Larger files need a
 /// different workflow; bounded reads also protect against concurrent growth.
 const MAX_EDIT_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_DIFF_LINES: usize = 80;
-const MAX_DIFF_INPUT_LINES: usize = 10_000;
+/// Largest LCS table (old lines × new lines of the changed middle) that the
+/// preview computes; the diff crate allocates one cell per pair.
+const MAX_DIFF_CELLS: usize = 1_000_000;
 const DIFF_CONTEXT_LINES: usize = 2;
 const MAX_DIFF_LINE_BYTES: usize = 400;
 const MAX_DIFF_OUTPUT_BYTES: usize = 12 * 1024;
@@ -52,7 +50,7 @@ struct DiffSummary {
 }
 
 pub struct EditTool {
-    workspace_root: Option<PathBuf>,
+    workspace_root: PathBuf,
     workspace_fs: Option<Arc<WorkspaceFs>>,
 }
 
@@ -61,7 +59,7 @@ impl EditTool {
         let root = normalize_workspace_root(root);
         Self {
             workspace_fs: WorkspaceFs::open_root(&root).ok().map(Arc::new),
-            workspace_root: Some(root),
+            workspace_root: root,
         }
     }
 
@@ -70,7 +68,7 @@ impl EditTool {
     /// Non-Unix edits fail closed because pathname reopening is not safe.
     pub fn with_workspace_fs(_root: impl Into<PathBuf>, workspace_fs: Arc<WorkspaceFs>) -> Self {
         Self {
-            workspace_root: Some(workspace_fs.root().to_path_buf()),
+            workspace_root: workspace_fs.root().to_path_buf(),
             workspace_fs: Some(workspace_fs),
         }
     }
@@ -152,50 +150,44 @@ impl Tool for EditTool {
         // swapped after validation cannot redirect the edit. The
         // pre-commit re-read below compares against bytes read from the
         // same handle.
-        let components =
-            match resolve_workspace_path(&path, self.workspace_root.as_deref(), true).await {
-                Ok(_) => {
-                    let Some(root) = self.workspace_root.as_deref() else {
-                        return error(&summary, "cannot edit without a workspace root");
-                    };
-                    let value = path.strip_prefix('@').unwrap_or(&path);
-                    let value_path = Path::new(value);
-                    let relative = if value_path.is_absolute() {
-                        match value_path.strip_prefix(root) {
-                            Ok(relative) => relative.to_string_lossy().into_owned(),
-                            Err(_) => {
-                                return error(
-                                    &summary,
-                                    &format!("cannot edit {path}: path is outside workspace"),
-                                );
-                            }
-                        }
-                    } else {
-                        value.to_owned()
-                    };
-                    match split_relative(&relative) {
-                        Ok(components) => components,
-                        Err(io_error) => {
-                            return error(&summary, &format!("cannot edit {path}: {io_error}"));
+        let components = match resolve_workspace_path(&path, &self.workspace_root, true).await {
+            Ok(_) => {
+                let root = self.workspace_root.as_path();
+                let value = path.strip_prefix('@').unwrap_or(&path);
+                let value_path = Path::new(value);
+                let relative = if value_path.is_absolute() {
+                    match value_path.strip_prefix(root) {
+                        Ok(relative) => relative.to_string_lossy().into_owned(),
+                        Err(_) => {
+                            return error(
+                                &summary,
+                                &format!("cannot edit {path}: path is outside workspace"),
+                            );
                         }
                     }
+                } else {
+                    value.to_owned()
+                };
+                match split_relative(&relative) {
+                    Ok(components) => components,
+                    Err(io_error) => {
+                        return error(&summary, &format!("cannot edit {path}: {io_error}"));
+                    }
                 }
-                Err(message) => return error(&summary, &format!("cannot edit {path}: {message}")),
-            };
+            }
+            Err(message) => return error(&summary, &format!("cannot edit {path}: {message}")),
+        };
         let root = self.workspace_root.clone();
         let workspace_fs = self.workspace_fs.clone();
         let edit_path_display = path.clone();
         let edit_cancel = cancel.clone();
         let edit_result = with_file_mutation_lock(
-            &root
-                .as_deref()
-                .unwrap_or(std::path::Path::new("."))
-                .join(components.join("/")),
+            &root.join(components.join("/")),
             &cancel,
             move || async move {
                 execute_edit_validated(
                     &edit_path_display,
-                    root.as_deref(),
+                    &root,
                     workspace_fs.as_deref(),
                     &components,
                     &edits,
@@ -211,10 +203,23 @@ impl Tool for EditTool {
         };
         match edit_result {
             Ok(result) => {
-                let diff = generate_diff(&result.base_content, &result.new_content);
+                // The LCS preview is CPU work; keep it off the async worker.
+                let EditResult {
+                    base_content,
+                    new_content,
+                    replacement_count,
+                } = result;
+                let diff =
+                    tokio::task::spawn_blocking(move || generate_diff(&base_content, &new_content))
+                        .await
+                        .unwrap_or_else(|_| DiffSummary {
+                            text: String::new(),
+                            added_lines: 0,
+                            removed_lines: 0,
+                        });
                 let mut content = format!(
                     "Successfully replaced {} block(s) in {path} (+{} / -{} lines).",
-                    result.replacement_count, diff.added_lines, diff.removed_lines,
+                    replacement_count, diff.added_lines, diff.removed_lines,
                 );
                 if !diff.text.is_empty() {
                     content.push('\n');
@@ -244,7 +249,7 @@ struct EditResult {
 /// bytes, so a swapped ancestor cannot redirect the result.
 async fn execute_edit_validated(
     path: &str,
-    root: Option<&Path>,
+    root: &Path,
     workspace_fs: Option<&WorkspaceFs>,
     components: &[String],
     edits: &[Edit],
@@ -252,52 +257,19 @@ async fn execute_edit_validated(
 ) -> Result<EditResult, String> {
     check_cancelled(cancel)?;
     #[cfg(unix)]
-    if let Some(root) = root {
-        let owned_fs;
-        let fs = if let Some(workspace_fs) = workspace_fs {
-            workspace_fs
-        } else {
-            owned_fs = WorkspaceFs::open_root(root)
-                .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-            &owned_fs
-        };
-        let fd = super::vfs::unix::open_file_relative(fs, components)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        let mut file = std::fs::File::from(fd);
-        let original_bytes = read_edit_file(&mut file, path)?;
-        check_cancelled(cancel)?;
-        if original_bytes.contains(&0) {
-            return Err(format!(
-                "Could not edit file: {path}. Binary files are not supported."
-            ));
-        }
-        let raw_content = String::from_utf8(original_bytes).map_err(|_| {
-            format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
+    {
+        // Opening, reading (up to 4 MiB twice), matching, and the metadata
+        // lookups are blocking work; keep them off the async worker. The
+        // write itself is async.
+        let PreparedEdit {
+            applied,
+            final_content,
+            existing_permissions,
+            parent_fd,
+            name,
+        } = super::blocking_io(|| {
+            prepare_edit(path, root, workspace_fs, components, edits, cancel)
         })?;
-        let (bom, content) = strip_bom(&raw_content);
-        let applied = apply_edits_exact(content, edits, path)?;
-        check_cancelled(cancel)?;
-        let mut final_content = String::with_capacity(bom.len() + applied.new_content.len());
-        final_content.push_str(bom);
-        final_content.push_str(&applied.new_content);
-        // Re-read from the same handle before committing.
-        let fd = super::vfs::unix::open_file_relative(fs, components)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        let mut current = std::fs::File::from(fd);
-        let current_bytes = read_edit_file(&mut current, path)?;
-        if current_bytes != raw_content.as_bytes() {
-            return Err(format!(
-                "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
-            ));
-        }
-        check_cancelled(cancel)?;
-        let existing_permissions = Some(
-            super::vfs::unix::open_file_metadata(fs, components)
-                .map(|metadata| metadata.permissions())
-                .map_err(|error| format!("Could not edit file: {path}. {error}"))?,
-        );
-        let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)
-            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
         super::file_mutation::atomic_write_at(
             &parent_fd,
             &name,
@@ -307,28 +279,94 @@ async fn execute_edit_validated(
         )
         .await
         .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-        return Ok(EditResult {
+        Ok(EditResult {
             base_content: applied.base_content,
             new_content: applied.new_content,
             replacement_count: edits.len(),
-        });
+        })
     }
-    // Unix retains the compatibility path for callers without a workspace
-    // capability. Workspace tools use the handle-relative branch above;
-    // non-Unix callers fail closed before reaching this function.
-    #[cfg(unix)]
-    {
-        let base = root
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let target_path = components.iter().fold(base, |base, part| base.join(part));
-        execute_edit(path, &target_path, edits, cancel).await
-    }
+    // Non-Unix callers fail closed in `execute` before reaching this
+    // function; this arm only keeps the signature total.
     #[cfg(not(unix))]
     {
         let _ = (path, root, workspace_fs, components, edits, cancel);
         Err(WorkspaceFs::unsupported_operation("edit").to_string())
     }
+}
+
+/// Everything the handle-relative edit needs before its async write.
+#[cfg(unix)]
+struct PreparedEdit {
+    applied: AppliedEdits,
+    final_content: String,
+    existing_permissions: Option<std::fs::Permissions>,
+    parent_fd: std::os::fd::OwnedFd,
+    name: String,
+}
+
+/// Blocking part of a handle-relative edit: read, match, re-read to detect
+/// a concurrent change, and open the parent for the atomic write.
+#[cfg(unix)]
+fn prepare_edit(
+    path: &str,
+    root: &Path,
+    workspace_fs: Option<&WorkspaceFs>,
+    components: &[String],
+    edits: &[Edit],
+    cancel: &CancellationToken,
+) -> Result<PreparedEdit, String> {
+    let owned_fs;
+    let fs = if let Some(workspace_fs) = workspace_fs {
+        workspace_fs
+    } else {
+        owned_fs = WorkspaceFs::open_root(root)
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+        &owned_fs
+    };
+    let fd = super::vfs::unix::open_file_relative(fs, components)
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    let mut file = std::fs::File::from(fd);
+    let original_bytes = read_edit_file(&mut file, path)?;
+    check_cancelled(cancel)?;
+    if original_bytes.contains(&0) {
+        return Err(format!(
+            "Could not edit file: {path}. Binary files are not supported."
+        ));
+    }
+    let raw_content = String::from_utf8(original_bytes).map_err(|_| {
+        format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
+    })?;
+    let (bom, content) = strip_bom(&raw_content);
+    let applied = apply_edits_exact(content, edits, path)?;
+    check_cancelled(cancel)?;
+    let mut final_content = String::with_capacity(bom.len() + applied.new_content.len());
+    final_content.push_str(bom);
+    final_content.push_str(&applied.new_content);
+    // Re-read from the same handle before committing.
+    let fd = super::vfs::unix::open_file_relative(fs, components)
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    let mut current = std::fs::File::from(fd);
+    let current_bytes = read_edit_file(&mut current, path)?;
+    if current_bytes != raw_content.as_bytes() {
+        return Err(format!(
+            "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
+        ));
+    }
+    check_cancelled(cancel)?;
+    let existing_permissions = Some(
+        super::vfs::unix::open_file_metadata(fs, components)
+            .map(|metadata| metadata.permissions())
+            .map_err(|error| format!("Could not edit file: {path}. {error}"))?,
+    );
+    let (parent_fd, name) = super::vfs::unix::open_parent_relative(fs, components)
+        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
+    Ok(PreparedEdit {
+        applied,
+        final_content,
+        existing_permissions,
+        parent_fd,
+        name,
+    })
 }
 
 #[cfg(unix)]
@@ -357,109 +395,6 @@ fn read_edit_file(file: &mut std::fs::File, path: &str) -> Result<Vec<u8>, Strin
         return Err(oversized_edit_error(path));
     }
     Ok(bytes)
-}
-
-#[cfg(unix)]
-async fn execute_edit(
-    path: &str,
-    target_path: &Path,
-    edits: &[Edit],
-    cancel: &CancellationToken,
-) -> Result<EditResult, String> {
-    check_cancelled(cancel)?;
-
-    let metadata = fs::metadata(target_path)
-        .await
-        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-    if !metadata.is_file() {
-        let message = if metadata.is_dir() {
-            "It is a directory."
-        } else {
-            "It is not a regular file."
-        };
-        return Err(format!("Could not edit file: {path}. {message}"));
-    }
-
-    use tokio::io::AsyncReadExt;
-    if metadata.len() > MAX_EDIT_INPUT_BYTES as u64 {
-        return Err(oversized_edit_error(path));
-    }
-    let mut file = fs::File::open(target_path)
-        .await
-        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-    let mut original_bytes = Vec::new();
-    (&mut file)
-        .take((MAX_EDIT_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut original_bytes)
-        .await
-        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-    if original_bytes.len() > MAX_EDIT_INPUT_BYTES {
-        return Err(oversized_edit_error(path));
-    }
-    check_cancelled(cancel)?;
-    if original_bytes.contains(&0) {
-        return Err(format!(
-            "Could not edit file: {path}. Binary files are not supported."
-        ));
-    }
-    let raw_content = String::from_utf8(original_bytes).map_err(|_| {
-        format!("Could not edit file: {path}. The file is not valid UTF-8 or is binary.")
-    })?;
-
-    // Byte-exact editing: match every `oldText` against the original bytes
-    // (BOM-aware, mixed line endings preserved) with no LF normalization
-    // and no Unicode or whitespace folding.  All spans are computed against
-    // the original content, overlaps rejected, then applied in one pass.
-    // Every byte outside the replacement spans is preserved.
-    let (bom, content) = strip_bom(&raw_content);
-    let applied = apply_edits_exact(content, edits, path)?;
-    check_cancelled(cancel)?;
-
-    let mut final_content = String::with_capacity(bom.len() + applied.new_content.len());
-    final_content.push_str(bom);
-    final_content.push_str(&applied.new_content);
-    let final_bytes = final_content.as_bytes();
-
-    // Re-read the snapshot immediately before committing. The per-file queue
-    // handles other harness mutations; this check catches ordinary external
-    // edits without silently overwriting them.
-    let mut current = fs::File::open(target_path)
-        .await
-        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-    if current
-        .metadata()
-        .await
-        .map_err(|error| format!("Could not edit file: {path}. {error}"))?
-        .len()
-        > MAX_EDIT_INPUT_BYTES as u64
-    {
-        return Err(oversized_edit_error(path));
-    }
-    let mut current_bytes = Vec::new();
-    (&mut current)
-        .take((MAX_EDIT_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut current_bytes)
-        .await
-        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-    if current_bytes.len() > MAX_EDIT_INPUT_BYTES {
-        return Err(oversized_edit_error(path));
-    }
-    if current_bytes != raw_content.as_bytes() {
-        return Err(format!(
-            "Could not edit file: {path}. The file changed while the edit was being prepared; no changes were made."
-        ));
-    }
-    check_cancelled(cancel)?;
-
-    atomic_write(target_path, final_bytes, cancel)
-        .await
-        .map_err(|error| format!("Could not edit file: {path}. {error}"))?;
-
-    Ok(EditResult {
-        base_content: applied.base_content,
-        new_content: applied.new_content,
-        replacement_count: edits.len(),
-    })
 }
 
 fn parse_args(args: &Value) -> Result<(String, Vec<Edit>), String> {
@@ -571,14 +506,27 @@ fn apply_replacements(content: &str, replacements: &[MatchedEdit]) -> String {
     result
 }
 
+/// Every start position of `old_text` in `content`, including overlapping
+/// occurrences (they make an edit ambiguous too). Each step is a substring
+/// search from just after the previous match, so the cost is linear in the
+/// content for a unique match instead of O(content × old_text).
 fn match_positions(content: &str, old_text: &str) -> Vec<usize> {
     if old_text.is_empty() {
         return Vec::new();
     }
-    content
-        .char_indices()
-        .filter_map(|(index, _)| content[index..].starts_with(old_text).then_some(index))
-        .collect()
+    let mut positions = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = content[from..].find(old_text) {
+        let position = from + offset;
+        positions.push(position);
+        // Continue at the next character boundary after this match start.
+        let step = content[position..].chars().next().map_or(1, char::len_utf8);
+        from = position + step;
+        if from > content.len() {
+            break;
+        }
+    }
+    positions
 }
 
 fn strip_bom(content: &str) -> (&str, &str) {
@@ -620,17 +568,39 @@ fn no_change_error(path: &str, total: usize) -> String {
 }
 
 fn generate_diff(old_content: &str, new_content: &str) -> DiffSummary {
-    let old_line_count = old_content.split('\n').count();
-    let new_line_count = new_content.split('\n').count();
-    if old_line_count + new_line_count > MAX_DIFF_INPUT_LINES {
+    // Only the changed middle needs an LCS. Strip the common leading and
+    // trailing lines first (keeping the context lines next to the change),
+    // so an edit in a large file no longer builds a table for every line.
+    let old_lines = old_content.split('\n').collect::<Vec<_>>();
+    let new_lines = new_content.split('\n').collect::<Vec<_>>();
+    let mut prefix = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(old, new)| old == new)
+        .count();
+    let limit = old_lines.len().min(new_lines.len()) - prefix;
+    let mut suffix = old_lines
+        .iter()
+        .rev()
+        .zip(new_lines.iter().rev())
+        .take(limit)
+        .take_while(|(old, new)| old == new)
+        .count();
+    prefix = prefix.saturating_sub(DIFF_CONTEXT_LINES);
+    suffix = suffix.saturating_sub(DIFF_CONTEXT_LINES);
+    let old_middle = &old_lines[prefix..old_lines.len() - suffix];
+    let new_middle = &new_lines[prefix..new_lines.len() - suffix];
+    if old_middle.len().saturating_mul(new_middle.len()) > MAX_DIFF_CELLS {
         return DiffSummary {
-            text: "[diff omitted: file is too large for a bounded preview]".into(),
-            added_lines: new_line_count.saturating_sub(old_line_count),
-            removed_lines: old_line_count.saturating_sub(new_line_count),
+            text: "[diff omitted: the change is too large for a bounded preview]".into(),
+            added_lines: new_lines.len().saturating_sub(old_lines.len()),
+            removed_lines: old_lines.len().saturating_sub(new_lines.len()),
         };
     }
 
-    let parts = diff::lines(old_content, new_content);
+    let old_middle = old_middle.join("\n");
+    let new_middle = new_middle.join("\n");
+    let parts = diff::lines(&old_middle, &new_middle);
     let mut entries = Vec::with_capacity(parts.len());
     let mut added_lines = 0;
     let mut removed_lines = 0;
@@ -760,6 +730,29 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn matching_counts_overlapping_occurrences() {
+        assert_eq!(match_positions("aaaa", "aa"), vec![0, 1, 2]);
+        assert_eq!(match_positions("é-é-é", "é"), vec![0, 3, 6]);
+        assert_eq!(match_positions("abc", "d"), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn large_file_edit_still_gets_a_bounded_diff() {
+        // The whole-file LCS was skipped (or built a ~100 MB table); the
+        // changed middle alone is small.
+        let old = (0..50_000)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = old.replace("line 25000\n", "changed\n");
+        let diff = generate_diff(&old, &new);
+        assert!(diff.text.contains("- line 25000"), "{}", diff.text);
+        assert!(diff.text.contains("+ changed"), "{}", diff.text);
+        assert!(diff.text.contains("  line 24999"), "{}", diff.text);
+        assert_eq!((diff.added_lines, diff.removed_lines), (1, 1));
+    }
 
     #[cfg(unix)]
     fn create_fifo(path: &std::path::Path) {

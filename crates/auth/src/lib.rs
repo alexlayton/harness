@@ -1,8 +1,10 @@
-//! GitHub Copilot authentication for Harness.
+//! OAuth login, token refresh, and private credential storage for Harness:
+//! GitHub Copilot (device flow), OpenAI Codex (ChatGPT subscription), and the
+//! unofficial Anthropic Claude subscription.
 //!
 //! This crate is intentionally independent of `llm`, `agent`, and `tui`.
 //! Callers receive neutral [`AuthEvent`] values and decide how to render or
-//! queue input while the device flow is running.
+//! queue input while a login flow is running.
 
 pub mod device_code;
 pub mod error;
@@ -25,7 +27,7 @@ pub use openai_codex::{
 };
 pub use storage::{
     AuthEntries, AuthStore, COPILOT_PROVIDER_KEY, CopilotCredential, OPENAI_CODEX_PROVIDER_KEY,
-    OpenAiCodexCredential, RedactedCredential, auth_path, config_dir,
+    OpenAiCodexCredential, RedactedCredential, RefreshLease, auth_path, config_dir,
 };
 
 /// Unofficial Anthropic subscription OAuth.

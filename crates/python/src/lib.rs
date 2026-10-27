@@ -37,6 +37,9 @@ fn runtime() -> PyResult<&'static Runtime> {
         .map_err(|error| PyRuntimeError::new_err(format!("start Harness runtime: {error}")))
 }
 
+/// Longest wait for session and MCP cleanup after Ctrl-C.
+const CLEANUP_AFTER_SIGNAL: Duration = Duration::from_secs(10);
+
 #[pyfunction]
 #[pyo3(signature = (prompt, options_json = "{}"))]
 fn run(py: Python<'_>, prompt: String, options_json: &str) -> PyResult<String> {
@@ -61,15 +64,29 @@ fn run(py: Python<'_>, prompt: String, options_json: &str) -> PyResult<String> {
     // its signal state so Ctrl-C cancels the native call, then await session/MCP cleanup
     // before propagating the original Python exception. No Rust signal handler
     // is installed in the host process.
+    //
+    // Cleanup after Ctrl-C is bounded: a second Ctrl-C, or the cleanup
+    // deadline, returns the original exception at once. The task keeps
+    // shutting down on the shared runtime in the background.
     py.detach(move || {
         let mut signal_error = None;
+        let mut cleanup_deadline = None;
         loop {
             let received = receiver.recv_timeout(Duration::from_millis(50));
-            if signal_error.is_none()
-                && let Err(error) = Python::attach(|py| py.check_signals())
-            {
+            if let Err(error) = Python::attach(|py| py.check_signals()) {
+                if let Some(first) = signal_error.take() {
+                    // Second signal: stop waiting for cleanup.
+                    drop(error);
+                    return Err(first);
+                }
                 cancel.cancel();
                 signal_error = Some(error);
+                cleanup_deadline = Some(std::time::Instant::now() + CLEANUP_AFTER_SIGNAL);
+            }
+            if cleanup_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                && let Some(error) = signal_error.take()
+            {
+                return Err(error);
             }
             match received {
                 Ok(result) => {

@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 ///
 /// This is a completion-performance bound.
 const MAX_FILE_CANDIDATES: usize = 100;
-/// Upper bound on entries visited by one `@` workspace walk.
+/// Upper bound on entries visited by one `@` workspace walk or one command
+/// path directory listing.
 const MAX_SCANNED_ENTRIES: usize = 50_000;
 
 /// Directories that are almost always generated output or dependency trees.
@@ -222,8 +223,11 @@ pub fn find_path_candidates(
         return Vec::new();
     };
 
+    // Huge directories must not be fully materialized and sorted on every
+    // keystroke: read at most `MAX_SCANNED_ENTRIES` entries and keep only the
+    // best candidates while scanning (sorted and truncated in batches).
     let mut matches = Vec::new();
-    for entry in entries {
+    for entry in entries.take(MAX_SCANNED_ENTRIES) {
         if cancel.is_cancelled() {
             return Vec::new();
         }
@@ -252,21 +256,13 @@ pub fn find_path_candidates(
             if is_directory { "/" } else { "" }
         );
         matches.push((score, is_directory, value));
+        if matches.len() >= MAX_FILE_CANDIDATES * 8 {
+            rank_path_matches(&mut matches);
+            matches.truncate(MAX_FILE_CANDIDATES);
+        }
     }
 
-    matches.sort_by(
-        |(score_a, directory_a, value_a), (score_b, directory_b, value_b)| {
-            score_b
-                .cmp(score_a)
-                .then_with(|| directory_b.cmp(directory_a))
-                .then_with(|| {
-                    value_a
-                        .to_ascii_lowercase()
-                        .cmp(&value_b.to_ascii_lowercase())
-                })
-                .then_with(|| value_a.cmp(value_b))
-        },
-    );
+    rank_path_matches(&mut matches);
     matches
         .into_iter()
         .take(MAX_FILE_CANDIDATES)
@@ -284,6 +280,23 @@ pub fn find_path_candidates(
             },
         })
         .collect()
+}
+
+/// Best score first, then directories, then case-insensitive name.
+fn rank_path_matches<S: Ord>(matches: &mut [(S, bool, String)]) {
+    matches.sort_by(
+        |(score_a, directory_a, value_a), (score_b, directory_b, value_b)| {
+            score_b
+                .cmp(score_a)
+                .then_with(|| directory_b.cmp(directory_a))
+                .then_with(|| {
+                    value_a
+                        .to_ascii_lowercase()
+                        .cmp(&value_b.to_ascii_lowercase())
+                })
+                .then_with(|| value_a.cmp(value_b))
+        },
+    );
 }
 
 fn split_path_query(root: &Path, query: &str) -> Option<(String, PathBuf, String)> {

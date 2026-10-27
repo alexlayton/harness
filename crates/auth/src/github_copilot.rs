@@ -32,9 +32,11 @@ pub const COPILOT_API_VERSION: &str = "2026-06-01";
 /// held hostage by an unavailable enrichment endpoint.
 const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// The known model IDs used for best-effort policy enablement after login.
-/// Routing metadata lives in the LLM crate, but policy enablement belongs to
-/// authentication and therefore intentionally keeps only IDs here.
+/// Copilot model IDs that Harness knows about.
+///
+/// Routing metadata lives in the LLM crate; this list intentionally keeps
+/// only IDs. Login no longer sends per-model policy-enablement requests, so
+/// the list is not used to make any network calls.
 pub const KNOWN_MODEL_IDS: &[&str] = &[
     "claude-haiku-4.5",
     "claude-opus-4.5",
@@ -210,8 +212,14 @@ impl GithubCopilotClient {
         // Idempotent: rustls rejects double installs and we ignore the error.
         let _ = rustls::crypto::ring::default_provider().install_default();
         Ok(Self {
+            // Bound every request: Copilot refresh holds the single-flight
+            // lock while it waits. Never follow redirects, so the GitHub
+            // token is never replayed to another host.
             http: Client::builder()
                 .user_agent(COPILOT_USER_AGENT)
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(30))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|error| AuthError::Network {
                     endpoint: "GitHub".into(),
@@ -222,7 +230,7 @@ impl GithubCopilotClient {
         })
     }
 
-    /// Override the API base used for `/models` and policy requests.  This is
+    /// Override the API base used for `/models` requests.  This is
     /// primarily useful for local fixtures and enterprise gateways; normal
     /// callers should let the Copilot token's `proxy-ep` choose the host.
     pub fn with_api_base_url(mut self, base_url: impl Into<String>) -> Self {
@@ -267,7 +275,7 @@ impl GithubCopilotClient {
         }
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| {
+            value = read_json_bounded(response) => value.map_err(|_| {
                 AuthError::InvalidDeviceCode("response is not valid JSON".into())
             })?,
         };
@@ -280,8 +288,16 @@ impl GithubCopilotClient {
         device: &DeviceCode,
         cancel: &CancellationToken,
     ) -> Result<String> {
-        let deadline = Instant::now() + Duration::from_secs(device.expires_in);
-        let mut interval = device.interval.max(5);
+        // `DeviceCode` fields are public, so clamp again here: a caller-built
+        // value must not overflow the deadline or the interval arithmetic.
+        let lifetime = Duration::from_secs(
+            device
+                .expires_in
+                .min(crate::device_code::MAX_DEVICE_CODE_LIFETIME_SECS),
+        );
+        let start = Instant::now();
+        let deadline = start.checked_add(lifetime).unwrap_or(start);
+        let mut interval = crate::device_code::clamp_poll_interval(device.interval);
         // RFC 8628 waits before the first poll.
         loop {
             if Instant::now() >= deadline {
@@ -302,9 +318,10 @@ impl GithubCopilotClient {
                 PollResult::SlowDown {
                     interval: new_interval,
                 } => {
-                    interval = new_interval
-                        .unwrap_or(interval.saturating_add(5))
-                        .max(interval + 5);
+                    // RFC 8628: slow_down adds at least 5 seconds.
+                    interval = crate::device_code::clamp_poll_interval(
+                        new_interval.unwrap_or(0).max(interval.saturating_add(5)),
+                    );
                 }
             }
         }
@@ -338,7 +355,7 @@ impl GithubCopilotClient {
         let status = response.status();
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid token response".into()))?,
+            value = read_json_bounded(response) => value.map_err(|_| AuthError::DeviceFlowFailed("invalid token response".into()))?,
         };
         if !status.is_success() && value.get("error").is_none() {
             return Err(AuthError::Http {
@@ -432,7 +449,7 @@ impl GithubCopilotClient {
         }
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot token response".into()))?,
+            value = read_json_bounded(response) => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot token response".into()))?,
         };
         parse_copilot_token(&value, bearer_token, domain)
     }
@@ -474,7 +491,7 @@ impl GithubCopilotClient {
         }
         let value = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            value = response.json::<Value>() => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot models response".into()))?,
+            value = read_json_bounded(response) => value.map_err(|_| AuthError::DeviceFlowFailed("invalid Copilot models response".into()))?,
         };
         let fallback = base_url == "https://api.individual.githubcopilot.com";
         parse_available_model_ids_value(&value, fallback)
@@ -501,80 +518,6 @@ impl GithubCopilotClient {
             ));
         }
         Ok(url)
-    }
-
-    /// Enablement is best effort: some accounts reject policy writes even
-    /// though already-enabled models work.  Cancellation remains fatal.
-    pub async fn enable_known_models(
-        &self,
-        copilot_token: &str,
-        enterprise_domain: Option<&str>,
-        cancel: &CancellationToken,
-    ) -> Result<()> {
-        for model_id in KNOWN_MODEL_IDS {
-            if cancel.is_cancelled() {
-                return Err(AuthError::Cancelled);
-            }
-            match self
-                .enable_model(copilot_token, model_id, enterprise_domain, cancel)
-                .await
-            {
-                Ok(_) => {}
-                Err(AuthError::Cancelled) => return Err(AuthError::Cancelled),
-                Err(_) => {
-                    // Policy enablement is advisory.  Accounts can reject
-                    // individual models while still allowing the login and
-                    // dynamic model endpoint to succeed.
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn enable_model(
-        &self,
-        copilot_token: &str,
-        model_id: &str,
-        enterprise_domain: Option<&str>,
-        cancel: &CancellationToken,
-    ) -> Result<bool> {
-        if !model_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
-        {
-            return Ok(false);
-        }
-        let domain = normalize_domain(enterprise_domain)?;
-        let base_url = self
-            .api_base_url
-            .clone()
-            .unwrap_or_else(|| copilot_base_url(copilot_token, domain.as_deref()));
-        let url = format!("{base_url}/models/{model_id}/policy");
-        let mut headers = copilot_headers();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            bearer(copilot_token)
-                .ok_or_else(|| AuthError::InvalidCredential("invalid Copilot token".into()))?,
-        );
-        headers.insert(
-            HeaderName::from_static("openai-intent"),
-            HeaderValue::from_static("chat-policy"),
-        );
-        headers.insert(
-            HeaderName::from_static("x-interaction-type"),
-            HeaderValue::from_static("chat-policy"),
-        );
-        let request = self
-            .http
-            .post(&url)
-            .headers(headers)
-            .json(&serde_json::json!({"state": "enabled"}));
-        let response = tokio::select! {
-            _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            response = request.send() => response.map_err(|error| network_error(&url, error))?,
-        };
-        Ok(response.status().is_success())
     }
 
     /// Complete the entire device login, emitting only UI-neutral events.
@@ -949,6 +892,21 @@ impl CopilotAuth {
     }
 
     pub async fn refresh(&self) -> Result<CopilotCredential> {
+        self.refresh_inner(None).await
+    }
+
+    /// Refresh because the provider rejected `rejected_access` (HTTP 401)
+    /// although it had not expired, for example after a server-side
+    /// revocation. If another handle or process already replaced that token,
+    /// the newer credential is returned without a new exchange.
+    pub async fn refresh_rejected(&self, rejected_access: &str) -> Result<CopilotCredential> {
+        self.refresh_inner(Some(rejected_access)).await
+    }
+
+    async fn refresh_inner(&self, rejected: Option<&str>) -> Result<CopilotCredential> {
+        let usable = |credential: &CopilotCredential| {
+            !credential.is_expired() && rejected != Some(credential.access.as_str())
+        };
         // Single-flight: concurrent refreshers queue on the async guard,
         // then recheck before hitting the network.  The blocking cache
         // mutex is never held across network work.
@@ -957,13 +915,11 @@ impl CopilotAuth {
         // propagate: they must not turn into a refresh of an obsolete cache.
         let current = self.store.copilot()?.ok_or(AuthError::NotAuthenticated)?;
         let cached = self.credential()?.ok_or(AuthError::NotAuthenticated)?;
-        if !current.is_expired()
-            && (cached.is_expired() || copilot_newer_generation(&current, &cached))
-        {
+        if usable(&current) && (!usable(&cached) || copilot_newer_generation(&current, &cached)) {
             self.cache_credential(&current)?;
             return Ok(current);
         }
-        if !cached.is_expired() {
+        if usable(&cached) {
             return Ok(cached);
         }
         // If both are expired, use the persisted refresh token even if it
@@ -1118,6 +1074,24 @@ fn copilot_headers() -> HeaderMap {
 
 fn bearer(token: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(&format!("Bearer {token}")).ok()
+}
+
+/// Largest GitHub/Copilot auth response accepted.  Token and device-code
+/// payloads are small; the model catalogue is the largest.  Bounding the
+/// read keeps a hostile or broken endpoint from filling memory.
+const AUTH_BODY_LIMIT: usize = 1024 * 1024;
+
+/// Read a JSON response body of at most [`AUTH_BODY_LIMIT`] bytes.  Callers
+/// map the error to their own message; the body is never echoed.
+async fn read_json_bounded(mut response: reqwest::Response) -> std::result::Result<Value, ()> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+        if chunk.len() > AUTH_BODY_LIMIT.saturating_sub(body.len()) {
+            return Err(());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| ())
 }
 
 fn network_error(endpoint: &str, error: reqwest::Error) -> AuthError {

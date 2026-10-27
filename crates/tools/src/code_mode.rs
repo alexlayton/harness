@@ -17,6 +17,10 @@ use std::io;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// Name of the code-mode tool. Shared so the registry, dispatch, and
+/// summaries cannot drift apart.
+pub const CODE_MODE_TOOL_NAME: &str = "run_code";
+
 const MAX_CODE_BYTES: usize = 32 * 1024;
 const MAX_VALUE_BYTES: usize = 50 * 1024;
 const MAX_TOOL_CALLS: usize = 50;
@@ -130,7 +134,7 @@ impl CodeMode {
         let catalog = String::from_utf8(writer.0).map_err(|err| err.to_string())?;
         let spec = ToolSpec {
             definition: ToolDefinition {
-                name: "run_code".into(),
+                name: CODE_MODE_TOOL_NAME.into(),
                 description: format!(
                     concat!(
                         "Execute Python calculations and tool orchestration in Monty with selected Harness tools as functions. ",
@@ -144,7 +148,7 @@ impl CodeMode {
                         "Call tools[\"name\"](**keyword_arguments), using names and arguments from the catalogue below. Calls are synchronous and sequential; do not await them or use asyncio.gather. ",
                         "Return a concise combined result with only the facts needed for the answer. Extract relevant fields or text inside Python instead of printing complete reports, debug logs, or successful preflight output. ",
                         "The final expression is returned; print() is supplementary output and also enters model context. Once the result is sufficient, answer the user directly. ",
-                        "Tools with structured JSON return that JSON as Python dict/list/scalars; other tools return display text as str. Do not assume text results are JSON. Failed tools raise RuntimeError. ",
+                        "Tools with structured JSON return that JSON as Python dict/list/scalars; other tools (and structured results too large to convert) return display text as str. Do not assume text results are JSON. Failed tools raise RuntimeError. ",
                         "Only the listed functions are allowed. No direct filesystem, environment, network, clock, or OS access. No built-in shell, subagents, recursive code execution, third-party packages, or state between calls. ",
                         "Limits: 32 KiB code, 50 nested calls, 50 KiB arguments/results/output, 5 seconds total interpreter execution, 120 seconds elapsed time. ",
                         "On failure inspect the started-call summary before retrying: completed changes are not rolled back. Execution is in-process, not crash-isolated or a memory security boundary. ",
@@ -353,7 +357,16 @@ impl CodeMode {
                             match structured {
                                 Some(value) => match json_to_monty(&value, 0) {
                                     Ok(value) => ExtFunctionResult::Return(value),
-                                    Err(error) => exception(&error),
+                                    // The call succeeded (and may have had
+                                    // side effects). Raising would invite the
+                                    // code to retry it, so return the display
+                                    // text with a note instead.
+                                    Err(error) => {
+                                        ExtFunctionResult::Return(MontyObject::string(format!(
+                                            "{}\n[structured result not returned: {error}; this is the display text]",
+                                            output.content
+                                        )))
+                                    }
                                 },
                                 None => {
                                     ExtFunctionResult::Return(MontyObject::string(&output.content))
@@ -404,8 +417,10 @@ impl CodeMode {
 
 /// Purpose label shared by live execution and session replay.
 pub(crate) fn summary(args: &Value) -> String {
-    super::python::description(args)
-        .map_or_else(|| "run_code".into(), |label| format!("run_code {label}"))
+    super::python::description(args).map_or_else(
+        || CODE_MODE_TOOL_NAME.into(),
+        |label| format!("{CODE_MODE_TOOL_NAME} {label}"),
+    )
 }
 
 fn format_error(error: &str, audit: &[String], printed: &str) -> String {

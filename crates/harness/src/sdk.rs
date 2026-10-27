@@ -43,10 +43,55 @@ pub struct RunOptions {
     /// Disable instruction-file injection for this call.
     pub no_context_files: bool,
     /// Replace configured MCP servers; `None` inherits and `Some([])` disables.
+    /// Unknown keys in a server entry are rejected, like top-level options:
+    /// a typo such as `comand` must not silently drop a setting.
+    #[serde(deserialize_with = "strict_mcp_servers")]
     pub mcp_servers: Option<Vec<mcp::McpServerConfig>>,
     /// Replace all skill discovery roots; relative paths use the workspace.
     /// `None` inherits normal discovery and `Some([])` disables skills.
     pub skill_dirs: Option<Vec<PathBuf>>,
+}
+
+/// Deserialize SDK MCP servers, rejecting keys the transport does not use.
+/// `McpServerConfig` itself stays permissive because `config.toml` may carry
+/// fields that its editors preserve.
+fn strict_mcp_servers<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<mcp::McpServerConfig>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let Some(values) = Option::<Vec<serde_json::Value>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    values
+        .into_iter()
+        .map(|value| {
+            let object = value
+                .as_object()
+                .ok_or_else(|| D::Error::custom("each MCP server must be an object"))?;
+            let name = object
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?");
+            let allowed: &[&str] = match object.get("transport").and_then(serde_json::Value::as_str)
+            {
+                Some("stdio") => &["name", "transport", "command", "args", "env"],
+                Some("http") => &["name", "transport", "url", "headers"],
+                _ => &[],
+            };
+            if !allowed.is_empty()
+                && let Some(key) = object.keys().find(|key| !allowed.contains(&key.as_str()))
+            {
+                return Err(D::Error::custom(format!(
+                    "unknown field `{key}` in MCP server `{name}`"
+                )));
+            }
+            serde_json::from_value(value).map_err(D::Error::custom)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 impl RunOptions {
@@ -121,6 +166,10 @@ impl RunOptions {
 pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken) -> Result<String> {
     ensure!(!prompt.trim().is_empty(), "prompt must not be blank");
     options.validate()?;
+    // Guard a child token, not the caller's: the guard fires on every
+    // return, and cancelling the caller's token would also cancel unrelated
+    // work that shares it. The child still follows the caller's cancel.
+    let cancel = cancel.child_token();
     let _cancel_on_drop = cancel.clone().drop_guard();
     let cli = Cli {
         provider: options.provider.as_deref().and_then(ProviderArg::from_name),
@@ -138,7 +187,10 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         .map(Ok)
         .unwrap_or_else(std::env::current_dir)
         .context("resolve workspace directory")?;
-    let workspace = std::fs::canonicalize(workspace).context("resolve workspace directory")?;
+    // Setup reads config, context files, skills, and the session store; keep
+    // that file work off the caller's async worker.
+    let workspace = tools::blocking_io(|| std::fs::canonicalize(workspace))
+        .context("resolve workspace directory")?;
     ensure!(workspace.is_dir(), "workspace must be a directory");
     ensure!(!cancel.is_cancelled(), "Harness run cancelled");
     let provider = build_provider_with_auths(
@@ -147,12 +199,14 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
     )?;
-    let context = project_context_for(&workspace, options.no_context_files);
-    let mut tool_config = ToolConfig::new(&workspace, config.rtk);
-    if let Some(skills) = options.skill_catalog(&workspace)? {
-        tool_config = tool_config.with_skills(skills);
-    }
-    let tools = default_registry(tool_config)?;
+    let (context, tools) = tools::blocking_io(|| -> Result<_> {
+        let context = project_context_for(&workspace, options.no_context_files);
+        let mut tool_config = ToolConfig::new(&workspace, config.rtk);
+        if let Some(skills) = options.skill_catalog(&workspace)? {
+            tool_config = tool_config.with_skills(skills);
+        }
+        Ok((context, default_registry(tool_config)?))
+    })?;
     let mut builder = AgentBuilder::new(
         provider.clone(),
         config.model.clone(),
@@ -176,17 +230,20 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         builder = builder.with_code_mode(tools.clone());
     }
     if !options.no_session {
-        let store = SessionStore::default_for_workspace(&workspace)?;
-        let session = match options.resume {
-            Some(selector) => store
-                .load(&selector)
-                .with_context(|| format!("load session `{selector}`"))?,
-            None => store.create(SessionCreateOptions {
-                provider: Some(provider.name().to_owned()),
-                model: Some(config.model.clone()),
-                ..SessionCreateOptions::default()
-            })?,
-        };
+        let (store, session) = tools::blocking_io(|| -> Result<_> {
+            let store = SessionStore::default_for_workspace(&workspace)?;
+            let session = match &options.resume {
+                Some(selector) => store
+                    .load(selector)
+                    .with_context(|| format!("load session `{selector}`"))?,
+                None => store.create(SessionCreateOptions {
+                    provider: Some(provider.name().to_owned()),
+                    model: Some(config.model.clone()),
+                    ..SessionCreateOptions::default()
+                })?,
+            };
+            Ok((store, session))
+        })?;
         builder = builder.with_session(store, session);
     }
     let assembled = builder.build().await?;
@@ -461,6 +518,22 @@ mod tests {
         assert_eq!(disabled.skill_dirs, Some(Vec::new()));
         assert!(!defaults.no_session);
         assert!(serde_json::from_str::<RunOptions>(r#"{"modle":"typo"}"#).is_err());
+        // Nested MCP options reject typos too.
+        let typo = r#"{"mcp_servers":[{"name":"x","transport":"stdio","comand":"srv"}]}"#;
+        let error = serde_json::from_str::<RunOptions>(typo)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("comand"), "{error}");
+        let valid =
+            r#"{"mcp_servers":[{"name":"x","transport":"stdio","command":"srv","args":["a"]}]}"#;
+        assert_eq!(
+            serde_json::from_str::<RunOptions>(valid)
+                .unwrap()
+                .mcp_servers
+                .unwrap()
+                .len(),
+            1
+        );
         let conflicting = RunOptions {
             resume: Some("latest".into()),
             no_session: true,

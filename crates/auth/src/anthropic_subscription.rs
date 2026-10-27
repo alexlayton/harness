@@ -128,12 +128,38 @@ impl AnthropicSubscriptionAuth {
     }
 
     pub async fn refresh(&self) -> Result<AnthropicSubscriptionCredential> {
+        self.refresh_inner(None).await
+    }
+
+    /// Refresh because the provider rejected `rejected_access` (HTTP 401)
+    /// although it had not expired, for example after a server-side
+    /// revocation. If another handle or process already replaced that token,
+    /// the newer credential is returned without a new exchange.
+    pub async fn refresh_rejected(
+        &self,
+        rejected_access: &str,
+    ) -> Result<AnthropicSubscriptionCredential> {
+        self.refresh_inner(Some(rejected_access)).await
+    }
+
+    async fn refresh_inner(
+        &self,
+        rejected: Option<&str>,
+    ) -> Result<AnthropicSubscriptionCredential> {
+        let usable = |credential: &AnthropicSubscriptionCredential| {
+            !credential.is_expired() && rejected != Some(credential.access.as_str())
+        };
         // Single-flight: concurrent refreshers queue here, then recheck the
         // credential before refreshing so only the first waiter hits the
         // network.  Never hold the blocking cache mutex across the network;
         // the async guard is released before any `.await` on the mutex.
         let _guard = self.refresh_lock.lock().await;
-        // Reload: another waiter (or process) may have already refreshed.
+        // Serialize the single-use refresh-token exchange across processes,
+        // then reload: another process may have refreshed while we waited.
+        let _lease = self
+            .store
+            .acquire_refresh_lease(crate::storage::ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY)
+            .await?;
         let mut expired_stored = None;
         if let Ok(Some(current)) = self.store.anthropic_subscription() {
             let cached = self
@@ -148,16 +174,18 @@ impl AnthropicSubscriptionAuth {
             // The comparison also prevents an older cached expiry from
             // forcing an unnecessary exchange.
             if let Some(cached) = cached {
-                if current.is_newer_generation_than(&cached) {
+                if current.is_newer_generation_than(&cached)
+                    && rejected != Some(current.access.as_str())
+                {
                     *self.credential.lock().map_err(|_| {
                         AuthError::AnthropicSubscription("credential lock poisoned".into())
                     })? = Some(current.clone());
                     return Ok(current);
                 }
-                if !cached.is_expired() {
+                if usable(&cached) {
                     return Ok(cached);
                 }
-            } else if !current.is_expired() {
+            } else if usable(&current) {
                 *self.credential.lock().map_err(|_| {
                     AuthError::AnthropicSubscription("credential lock poisoned".into())
                 })? = Some(current.clone());
@@ -261,10 +289,19 @@ impl AnthropicSubscriptionAuth {
                 .json(&body)
                 .send()
                 .await
-                .map_err(|_| fail("token request failed"))?;
-            if !response.status().is_success() {
+                .map_err(|_| fail("token request failed (network); try again"))?;
+            let status = response.status();
+            if !status.is_success() {
+                // Only a rejection means the grant is unusable. Rate limits
+                // and server faults are temporary; asking the user to log
+                // in again would discard a still-valid refresh token.
                 return Err(fail(
-                    "token exchange rejected; run harness login anthropic-claude again",
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    {
+                        "token endpoint is temporarily unavailable; try again"
+                    } else {
+                        "token exchange rejected; run harness login anthropic-claude again"
+                    },
                 ));
             }
             let mut bytes = Vec::new();

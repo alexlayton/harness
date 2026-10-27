@@ -31,6 +31,7 @@ pub use events::{
     AgentEvent, CompactionReason, InputMessage, SessionListItem, SessionSnapshotEntry, TurnError,
 };
 pub use persistence::AgentSessionState;
+pub(crate) use persistence::assistant_session_events;
 use persistence::{ui_snapshot_entries, usage_event};
 use prewalk::PrewalkState;
 pub use prewalk::{PrewalkChange, PrewalkSettings, PrewalkTarget};
@@ -40,13 +41,18 @@ pub(crate) use tool_dispatch::{
     MAX_CONCURRENT_READ_ONLY_TOOLS, NoopToolDispatchHooks, execute_tool_batch_with_secrets,
     plan_tool_batches,
 };
-pub(crate) use turn::TurnControl;
+pub(crate) use turn::{TurnControl, append_assistant};
 
 /// Maximum number of times a turn re-streams after a recoverable failure:
 /// malformed tool-call arguments, a retryable mid-stream error, or an empty
 /// response. A model that keeps failing should eventually give up instead of
 /// looping forever.
 const MAX_TURN_RECOVERIES: usize = 3;
+
+/// Maximum tool rounds (model response with tool calls, then their
+/// results) in one parent turn. A model that never stops calling tools
+/// would otherwise run without bound in modes that have no interrupt key.
+const MAX_TOOL_ROUNDS_PER_TURN: usize = 200;
 
 /// Maximum emergency compactions performed per turn in response to a
 /// context-overflow rejection. Each round is an extra summarizer call plus a
@@ -69,8 +75,13 @@ pub enum StreamRecovery {
 /// attached can break the live-history/durable-session relationship and should
 /// be avoided outside migration code.
 pub struct Agent {
+    /// Active provider for parent requests. `/model` replaces it, and
+    /// `with_secret_masker` wraps it so provider traffic is masked too.
     pub provider: Arc<dyn Provider>,
+    /// Tools offered to the model. A fresh snapshot of this registry builds
+    /// both the tool definitions and the system prompt for every request.
     pub tools: ToolRegistry,
+    /// Active model identifier sent with every parent request.
     pub model: String,
     /// Reasoning policy applied to normal parent requests.
     pub reasoning: llm::ReasoningPolicy,
@@ -79,7 +90,11 @@ pub struct Agent {
     /// When a durable session is attached it is rebuilt from the session
     /// events whenever a session is loaded or created.
     pub history: Vec<Message>,
+    /// Application-level shutdown token. Each turn runs under a child token,
+    /// so an interrupt stops only that turn while this stops the run loop.
     pub cancel: CancellationToken,
+    /// Attached durable session, if any. `None` keeps the agent in-memory
+    /// only; attach one with `with_session` so the active lease is held.
     pub session: Option<AgentSessionState>,
     /// Exact-value masking shared by provider, persistence, and tool dispatch.
     pub(crate) secret_masker: Arc<SecretMasker>,
@@ -237,27 +252,12 @@ impl Agent {
     /// Attach a loaded/new durable session after claiming exclusive ownership.
     /// Active provider/model selection remains the caller's choice; saved
     /// metadata is informational only.
-    pub fn with_session(
-        mut self,
-        store: SessionStore,
-        mut session: Session,
-    ) -> session::Result<Self> {
-        let active_lease = store.acquire_active(&session)?;
+    pub fn with_session(self, store: SessionStore, mut session: Session) -> session::Result<Self> {
+        // Reload under the lease so events appended by a previous owner after
+        // the caller loaded `session` are part of the model context.
+        let active_lease = store.acquire_active_and_reload(&mut session)?;
         store.repair_incomplete_tool_calls(&mut session)?;
-        self.history = session
-            .context_messages()
-            .iter()
-            .map(|message| self.secret_masker.mask_message(message))
-            .collect();
-        if let Some(runner) = &self.subagent_runner {
-            runner.update_parent_session(Some(session.id()));
-        }
-        self.session = Some(AgentSessionState {
-            store,
-            session,
-            active_lease: Some(active_lease),
-        });
-        Ok(self)
+        Ok(self.with_leased_session(store, session, active_lease))
     }
 
     /// Attach a durable session whose exclusive active lease was acquired by
@@ -402,6 +402,7 @@ impl Agent {
         // synchronously, without provider I/O.
         if self.context_window == 0 {
             self.context_window = self.compaction.resolved_window(0);
+            self.publish_context_window();
         }
         send(&events, self.context_usage_event());
         if self.prewalk.is_configured() {
@@ -411,6 +412,8 @@ impl Agent {
         // first-turn critical path. The same result supplies both the model
         // catalogue and the selected model's context window; model switches
         // enqueue through this channel instead of issuing a second request.
+        // `self` owns a sender for the whole loop, so `metadata_rx` never
+        // observes a closed channel and needs no closed-channel handling.
         let (metadata_tx, mut metadata_rx) = mpsc::unbounded_channel();
         self.model_metadata_tx = Some(metadata_tx.clone());
         spawn_model_metadata(
@@ -428,9 +431,6 @@ impl Agent {
             while let Ok((provider, model, models)) = metadata_rx.try_recv() {
                 self.apply_model_metadata(provider, model, models, &events);
             }
-            if metadata_rx.is_closed() {
-                self.model_metadata_tx = None;
-            }
             let next_message = if let Some(message) = self.queued.pop_front() {
                 Some(message)
             } else if !self.input_open {
@@ -443,12 +443,8 @@ impl Agent {
                         }
                         message
                     }
-                    metadata = metadata_rx.recv() => {
-                        if let Some((provider, model, models)) = metadata {
-                            self.apply_model_metadata(provider, model, models, &events);
-                        } else {
-                            self.model_metadata_tx = None;
-                        }
+                    Some((provider, model, models)) = metadata_rx.recv() => {
+                        self.apply_model_metadata(provider, model, models, &events);
                         continue;
                     }
                     _ = self.cancel.cancelled() => None,
@@ -2083,7 +2079,6 @@ mod tests {
             let store = SessionStore::new(root.path(), workspace.path()).unwrap();
             let session = store.create(SessionCreateOptions::default()).unwrap();
             let path = session.file_path().unwrap().to_path_buf();
-            std::fs::remove_file(&path).unwrap();
             let provider = Arc::new(MockProvider {
                 calls: AtomicUsize::new(0),
                 scripts: vec![],
@@ -2096,16 +2091,18 @@ mod tests {
                 .unwrap();
             drop(input_tx);
 
-            Agent::new(
+            let agent = Agent::new(
                 provider.clone(),
                 ToolRegistry::empty(),
                 "demo",
                 CancellationToken::new(),
             )
             .with_session(store, session)
-            .unwrap()
-            .run(input_rx, event_tx)
-            .await;
+            .unwrap();
+            // Delete the file after attachment (which reloads it) so the
+            // first persist fails.
+            std::fs::remove_file(&path).unwrap();
+            agent.run(input_rx, event_tx).await;
 
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -2679,9 +2676,7 @@ mod tests {
                 scripts: vec![],
                 error_kind: MockErrorKind::Stream,
             });
-            // Delete the session file so the first persist fails.
             let path = session.file_path().unwrap().to_path_buf();
-            std::fs::remove_file(&path).unwrap();
             let (input_tx, input_rx) = mpsc::unbounded_channel();
             let (event_tx, mut event_rx) = mpsc::unbounded_channel();
             input_tx
@@ -2696,11 +2691,13 @@ mod tests {
             // Keep `session` (with its path) for the agent; the store still
             // points at the deleted file.
             let _ = &mut session;
-            Agent::new(provider.clone(), registry, "demo", CancellationToken::new())
+            let agent = Agent::new(provider.clone(), registry, "demo", CancellationToken::new())
                 .with_session(store, session)
-                .unwrap()
-                .run(input_rx, event_tx)
-                .await;
+                .unwrap();
+            // Delete the session file after attachment (which reloads it)
+            // so the first persist fails.
+            std::fs::remove_file(&path).unwrap();
+            agent.run(input_rx, event_tx).await;
             let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
             // One terminal Error at the failure source; the run loop
             // quarantines with exactly one TurnFinished — never a successful
@@ -3097,6 +3094,53 @@ mod tests {
     /// A transient mid-stream failure (connection drop / decode error) must
     /// not dead-end the turn either: the agent re-streams once and the retried
     /// answer is delivered.
+    #[test]
+    fn a_turn_stops_after_the_tool_round_limit() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // A model that calls a tool in every response, forever.
+            let scripts = (0..MAX_TOOL_ROUNDS_PER_TURN + 5)
+                .map(|round| {
+                    script(vec![
+                        StreamEvent::ToolCallComplete(llm::ToolCall {
+                            id: format!("call-{round}"),
+                            name: "missing".into(),
+                            arguments: json!({}),
+                        }),
+                        StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        },
+                    ])
+                })
+                .collect();
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts,
+                error_kind: MockErrorKind::Stream,
+            });
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx
+                .send(InputMessage::Message("loop".into()))
+                .unwrap();
+            drop(input_tx);
+            Agent::new(
+                provider.clone(),
+                ToolRegistry::empty(),
+                "demo",
+                CancellationToken::new(),
+            )
+            .run(input_rx, event_tx)
+            .await;
+            assert_eq!(provider.calls.load(Ordering::SeqCst), MAX_TOOL_ROUNDS_PER_TURN);
+            let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+            assert!(events.iter().any(
+                |event| matches!(event, AgentEvent::Error(message) if message.contains("tool rounds"))
+            ));
+        });
+    }
+
     #[test]
     fn retryable_stream_error_retries_turn_instead_of_dead_ending() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -4316,9 +4360,7 @@ mod tests {
             None,
         ));
         let runner_model = || runner.model_for_test();
-        // Delete the session file so the `ModelChange` persist fails.
         let path = session.file_path().unwrap().to_path_buf();
-        std::fs::remove_file(&path).unwrap();
         let cancel = CancellationToken::new();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
@@ -4334,6 +4376,9 @@ mod tests {
             .with_subagent_runner(runner.clone())
             .with_session(store.clone(), session)
             .unwrap();
+        // Delete the session file after attachment (which reloads it) so the
+        // `ModelChange` persist fails.
+        std::fs::remove_file(&path).unwrap();
         // Drive one step manually: the boundary quarantines on the failed
         // persist instead of committing.
         agent

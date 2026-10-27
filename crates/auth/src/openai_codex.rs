@@ -174,7 +174,14 @@ impl OpenAiCodexAuth {
     pub fn new(store: AuthStore) -> Result<Self> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let credential = store.openai_codex()?;
+        // Bound every OAuth request: refresh holds the single-flight lock
+        // while it waits, so a stalled endpoint would block every caller.
+        // Never follow redirects: a 307/308 would replay the refresh token
+        // or PKCE verifier to another host.
         let http = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| AuthError::OpenAiCodex("could not create HTTP client".into()))?;
         Ok(Self {
@@ -280,12 +287,32 @@ impl OpenAiCodexAuth {
     }
 
     pub async fn refresh(&self) -> Result<OpenAiCodexCredential> {
+        self.refresh_inner(None).await
+    }
+
+    /// Refresh because the provider rejected `rejected_access` (HTTP 401)
+    /// although it had not expired, for example after a server-side
+    /// revocation. If another handle or process already replaced that token,
+    /// the newer credential is returned without a new exchange.
+    pub async fn refresh_rejected(&self, rejected_access: &str) -> Result<OpenAiCodexCredential> {
+        self.refresh_inner(Some(rejected_access)).await
+    }
+
+    async fn refresh_inner(&self, rejected: Option<&str>) -> Result<OpenAiCodexCredential> {
+        let usable = |credential: &OpenAiCodexCredential| {
+            !credential.is_expired() && rejected != Some(credential.access.as_str())
+        };
         // Single-flight: concurrent refreshers queue here, then recheck the
         // credential before refreshing so only the first waiter hits the
         // network.  Never hold the blocking cache mutex across the network;
         // the async guard is released before any `.await` on the mutex.
         let _guard = self.refresh_lock.lock().await;
-        // Reload: another waiter (or process) may have already refreshed.
+        // Serialize the single-use refresh-token exchange across processes,
+        // then reload: another process may have refreshed while we waited.
+        let _lease = self
+            .store
+            .acquire_refresh_lease(crate::storage::OPENAI_CODEX_PROVIDER_KEY)
+            .await?;
         let mut expired_stored = None;
         if let Ok(Some(current)) = self.store.openai_codex() {
             let cached = self
@@ -300,7 +327,9 @@ impl OpenAiCodexAuth {
             // The comparison also prevents an older cached expiry from
             // forcing an unnecessary exchange.
             if let Some(cached) = cached {
-                if current.is_newer_generation_than(&cached) {
+                if current.is_newer_generation_than(&cached)
+                    && rejected != Some(current.access.as_str())
+                {
                     *self
                         .credential
                         .lock()
@@ -308,10 +337,10 @@ impl OpenAiCodexAuth {
                         Some(current.clone());
                     return Ok(current);
                 }
-                if !cached.is_expired() {
+                if usable(&cached) {
                     return Ok(cached);
                 }
-            } else if !current.is_expired() {
+            } else if usable(&current) {
                 *self
                     .credential
                     .lock()
@@ -333,12 +362,23 @@ impl OpenAiCodexAuth {
         let old_refresh = old.refresh.clone();
         // Refresh exchanges use strict status handling like the browser
         // flow: only 2xx with a token payload succeeds.
-        let value = self
+        let value = match self
             .token_strict(
                 json!({"grant_type":"refresh_token", "refresh_token":old.refresh, "client_id": OPENAI_CODEX_CLIENT_ID} ),
                 &CancellationToken::new(),
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                // A writer without the lease (an older Harness, or a login)
+                // may have stored a newer generation; prefer it to failing.
+                if let Some(current) = self.adopt_newer_on_disk(&old)? {
+                    return Ok(current);
+                }
+                return Err(error);
+            }
+        };
         let credential = credential_from_token(&value, Some(&old_refresh))?;
         // Compare and save under the auth-file lock. A separate process may
         // have rotated the credential while this exchange was in flight; in
@@ -669,8 +709,9 @@ async fn wait_for_callback_with_idle(
             _ = tokio::time::sleep(remaining) => return Err(AuthError::OpenAiCodex("browser login timed out; use `harness login openai-codex --device-code`".into())),
             value = accept => value.map_err(|_| AuthError::OpenAiCodex("callback listener failed".into()))?
         };
-        let request = match read_callback_head(&stream, cancel, idle_timeout).await {
+        let request = match read_callback_head(&stream, cancel, idle_timeout, deadline).await {
             Ok(request) => request,
+            Err(AuthError::Cancelled) => return Err(AuthError::Cancelled),
             // Idle/slow senders time out per-connection without blocking a
             // later valid callback; malformed heads are answered as failure.
             Err(_) => {
@@ -698,10 +739,16 @@ async fn wait_for_callback_with_idle(
 /// Read one HTTP request head incrementally through the `\r\n\r\n`
 /// terminator under [`CALLBACK_HEAD_LIMIT`], timing out idle connections so
 /// one hanging sender cannot block later callbacks.
+///
+/// Each read waits at most `idle_timeout`, and never past the overall login
+/// `deadline`: a sender trickling bytes cannot keep the flow alive beyond
+/// it. Readiness can be spurious, so `WouldBlock` waits again instead of
+/// rejecting a valid callback.
 async fn read_callback_head(
     stream: &tokio::net::TcpStream,
     cancel: &CancellationToken,
     idle_timeout: Duration,
+    deadline: std::time::Instant,
 ) -> Result<String> {
     let mut head: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 512];
@@ -712,6 +759,7 @@ async fn read_callback_head(
         if head.windows(4).any(|window| window == b"\r\n\r\n") {
             break;
         }
+        let wait = idle_timeout.min(deadline.saturating_duration_since(std::time::Instant::now()));
         let read = async {
             stream
                 .readable()
@@ -720,8 +768,12 @@ async fn read_callback_head(
         };
         let size = tokio::select! {
             _ = cancel.cancelled() => return Err(AuthError::Cancelled),
-            _ = tokio::time::sleep(idle_timeout) => return Err(AuthError::OpenAiCodex("callback read timed out".into())),
-            value = read => value.map_err(|_| AuthError::OpenAiCodex("callback read failed".into()))?,
+            _ = tokio::time::sleep(wait) => return Err(AuthError::OpenAiCodex("callback read timed out".into())),
+            value = read => match value {
+                Ok(size) => size,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(_) => return Err(AuthError::OpenAiCodex("callback read failed".into())),
+            },
         };
         if size == 0 {
             break;
@@ -804,17 +856,27 @@ fn credential_from_token(
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| AuthError::OpenAiCodex("token response has no access token".into()))?;
+    // An empty refresh_token in a refresh response means "keep the current
+    // one", the same as an absent field.
     let refresh = value
         .get("refresh_token")
         .and_then(Value::as_str)
-        .or(old_refresh)
         .filter(|v| !v.is_empty())
+        .or(old_refresh.filter(|v| !v.is_empty()))
         .ok_or_else(|| AuthError::OpenAiCodex("token response has no refresh token".into()))?;
     let expires = value
         .get("expires_in")
         .and_then(Value::as_u64)
         .map(|seconds| unix_millis().saturating_add(seconds.saturating_mul(1000)))
-        .unwrap_or_else(|| jwt_expiry(access).unwrap_or(0));
+        .or_else(|| jwt_expiry(access))
+        .unwrap_or(0);
+    // A credential that is already expired (expires_in of 0, or no expiry
+    // at all) would be refreshed again on every use; reject it.
+    if expires <= unix_millis() {
+        return Err(AuthError::OpenAiCodex(
+            "token response has no future expiry".into(),
+        ));
+    }
     let account_id =
         account_id_from_tokens(value.get("id_token").and_then(Value::as_str), Some(access))?;
     Ok(OpenAiCodexCredential::new(
@@ -1002,6 +1064,17 @@ mod tests {
         .to_string()
     }
 
+    #[test]
+    fn token_responses_need_a_future_expiry_and_keep_an_unrotated_refresh() {
+        let mut body: serde_json::Value = serde_json::from_str(&success_token_body("")).unwrap();
+        // An empty refresh_token keeps the current one.
+        let credential = credential_from_token(&body, Some("refresh-old")).unwrap();
+        assert_eq!(credential.refresh, "refresh-old");
+        // expires_in of 0 is an already-expired credential.
+        body["expires_in"] = serde_json::json!(0);
+        assert!(credential_from_token(&body, Some("refresh-old")).is_err());
+    }
+
     fn cached_codex_credential() -> OpenAiCodexCredential {
         OpenAiCodexCredential::new("access-cached", "refresh-cached", u64::MAX - 1, "acct")
     }
@@ -1166,32 +1239,28 @@ mod tests {
         assert_eq!(second, newer);
     }
 
-    /// Separate handles can reach the token endpoint concurrently because
-    /// their async single-flight locks are process-local. Both completions
-    /// are allowed to succeed here, but the compare-and-save winner must be
-    /// the credential returned by both handles and persisted to disk.
+    /// Separate handles have process-local single-flight locks, like two
+    /// Harness processes. The cross-process refresh lease must serialize
+    /// them: the rotating refresh token is exchanged once, and both handles
+    /// return the one generation persisted to disk.
     #[tokio::test]
-    async fn independent_codex_refresh_race_adopts_one_persisted_generation() {
+    async fn independent_codex_refresh_race_exchanges_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let exchanges = Arc::new(AtomicUsize::new(0));
-        let responses = Arc::new(tokio::sync::Barrier::new(2));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let exchanges_task = exchanges.clone();
-        let responses_task = responses.clone();
         let server = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
                     return;
                 };
                 let n = exchanges_task.fetch_add(1, Ordering::SeqCst);
-                let responses = responses_task.clone();
                 tokio::spawn(async move {
                     let mut scratch = [0u8; 8192];
                     let _ = socket.read(&mut scratch).await;
-                    responses.wait().await;
                     let payload = URL_SAFE_NO_PAD
                         .encode(br#"{"chatgpt_account_id":"acct","exp":9999999999}"#);
                     let access = format!("head-{n}.{payload}.sig");
@@ -1247,7 +1316,7 @@ mod tests {
         server.abort();
         let _ = server.await;
 
-        assert_eq!(exchanges.load(Ordering::SeqCst), 2);
+        assert_eq!(exchanges.load(Ordering::SeqCst), 1);
         assert_eq!(first, second);
         assert_eq!(AuthStore::new(path).openai_codex().unwrap().unwrap(), first);
     }

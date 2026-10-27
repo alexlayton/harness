@@ -1,4 +1,4 @@
-use super::{Tool, ToolOutput};
+use super::{CODE_MODE_TOOL_NAME, Tool, ToolOutput};
 use llm::ToolDefinition;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -145,7 +145,7 @@ impl ToolRegistry {
         if name.is_empty() {
             return Err(ToolRegistryError::EmptyName);
         }
-        if (name == "run_code" && self.code_mode.is_some())
+        if (name == CODE_MODE_TOOL_NAME && self.code_mode.is_some())
             || self.tools.iter().any(|registered| registered.name == name)
         {
             return Err(ToolRegistryError::DuplicateName(name));
@@ -160,7 +160,12 @@ impl ToolRegistry {
     /// access restrictions. Configure once, after external tool discovery.
     pub fn enable_code_mode(&mut self, names: &[String]) -> Result<(), ToolRegistryError> {
         let error = |message: String| ToolRegistryError::CodeMode(message);
-        if self.code_mode.is_some() || self.tools.iter().any(|tool| tool.name == "run_code") {
+        if self.code_mode.is_some()
+            || self
+                .tools
+                .iter()
+                .any(|tool| tool.name == CODE_MODE_TOOL_NAME)
+        {
             return Err(error("run_code already exists".into()));
         }
         let eligible = |name: &str| !matches!(name, "bash" | "python" | "subagent" | "run_code");
@@ -307,7 +312,7 @@ impl ToolRegistry {
             let prompt = &mode.spec().prompt;
             if let Some(snippet) = &prompt.snippet {
                 snippets.push(ToolPromptEntry {
-                    name: "run_code".into(),
+                    name: CODE_MODE_TOOL_NAME.into(),
                     snippet: snippet.clone(),
                 });
             }
@@ -323,7 +328,7 @@ impl ToolRegistry {
     // prompts. Never serialize them into tracing fields.
     #[tracing::instrument(name = "tool", skip_all, fields(name = %name))]
     pub async fn execute(&self, name: &str, args: Value, cancel: CancellationToken) -> ToolOutput {
-        if name == "run_code" && self.code_mode_enabled() {
+        if name == CODE_MODE_TOOL_NAME && self.code_mode_enabled() {
             return self
                 .execute_code_mode(args, cancel, &RegistryCodeModeExecutor(self))
                 .await;

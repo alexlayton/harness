@@ -64,11 +64,30 @@ impl OpenAiResponsesClient {
     }
 }
 
+/// Request instructions: the system prompt plus any message-level system
+/// text. Responses has no system role in `input` (`convert_input` skips
+/// those messages), so their text would otherwise be dropped.
+pub(crate) fn request_instructions(req: &CompletionRequest) -> Option<String> {
+    let instructions = req
+        .system
+        .iter()
+        .cloned()
+        .chain(
+            req.messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .flat_map(|message| text_parts(&message.content).map(str::to_owned)),
+        )
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    (!instructions.is_empty()).then(|| instructions.join("\n\n"))
+}
+
 pub fn build_request_body(req: &CompletionRequest, reasoning: ReasoningPolicy) -> Value {
     let mut body = Map::new();
     body.insert("model".into(), Value::String(req.model.clone()));
-    if let Some(system) = &req.system {
-        body.insert("instructions".into(), Value::String(system.clone()));
+    if let Some(instructions) = request_instructions(req) {
+        body.insert("instructions".into(), Value::String(instructions));
     }
     body.insert("input".into(), Value::Array(convert_input(&req.messages)));
     if !req.tools.is_empty() {
@@ -173,7 +192,7 @@ pub(super) fn function_call_item(call: &ToolCall) -> Value {
         "type": "function_call",
         "call_id": call.id,
         "name": call.name,
-        "arguments": stringify_arguments(&call.arguments),
+        "arguments": super::stringify_arguments(&call.arguments),
     })
 }
 
@@ -196,10 +215,6 @@ pub fn convert_tools(tools: &[ToolDefinition]) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn stringify_arguments(arguments: &Value) -> String {
-    serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into())
 }
 
 #[derive(Debug, Default)]
@@ -308,9 +323,9 @@ impl ResponsesParser {
                 // Every `incomplete` reason is a normal stop: the provider
                 // delivered a complete terminal event (status + reason +
                 // usage), so the turn records it in `Done` rather than
-                // retrying. Only transport-level problems (`Stream`), HTTP
-                // failures, and auth errors are retryable — see
-                // `LlmError::is_retryable`.
+                // retrying. Only transient failures (truncation, overload,
+                // server faults, network and 429/5xx HTTP errors) are
+                // retryable — see `LlmError::is_retryable`.
                 if kind == "response.incomplete" {
                     let detail = response
                         .get("incomplete_details")
@@ -331,8 +346,16 @@ impl ResponsesParser {
                 output.push(StreamEvent::Done { stop_reason, usage });
                 Ok(output)
             }
-            "response.failed" => Err(LlmError::Stream(error_message(&value, "response failed"))),
-            "error" => Err(LlmError::Stream(error_message(&value, "Responses error"))),
+            "response.failed" => Err(super::in_band_error(
+                &[value
+                    .get("response")
+                    .and_then(|response| response.get("error"))],
+                error_message(&value, "response failed"),
+            )),
+            "error" => Err(super::in_band_error(
+                &[value.get("error"), Some(&value)],
+                error_message(&value, "Responses error"),
+            )),
             _ => {
                 tracing::trace!(event_type = kind, "ignored Responses SSE event");
                 Ok(Vec::new())
@@ -345,40 +368,33 @@ impl ResponsesParser {
     }
 
     /// Clean transport EOF without `response.completed`/`response.incomplete`
-    /// is a truncated stream, not a successful turn: surface it as
-    /// `LlmError::Stream` so the agent's recovery path handles it.  Never
-    /// manufacture `Done` and never finalize unfinished tool calls here.
+    /// is a truncated stream, not a successful turn: surface it as the
+    /// transient `LlmError::StreamInterrupted` so the agent re-streams.
+    /// Never manufacture `Done` and never finalize unfinished tool calls here.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         if self.done {
             return Ok(Vec::new());
         }
         self.done = true;
-        Err(LlmError::Stream(
-            "Responses stream ended without a terminal event (expected response.completed or response.incomplete)"
-                .into(),
+        Err(super::truncated_stream(
+            "Responses stream ended without a terminal event (expected response.completed or response.incomplete)",
         ))
     }
 }
 
+/// Responses events put the error at the top level (`error`) or, for
+/// `response.failed`, inside the response object; check both in that order.
 fn error_message(value: &Value, fallback: &str) -> String {
-    value
-        .get("error")
-        .and_then(value_message)
-        .or_else(|| {
+    super::error_message(
+        &[
+            value.get("error"),
             value
                 .get("response")
-                .and_then(|response| response.get("error"))
-                .and_then(value_message)
-        })
-        .or_else(|| value.get("message").and_then(Value::as_str))
-        .unwrap_or(fallback)
-        .to_owned()
-}
-
-fn value_message(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.get("message").and_then(Value::as_str))
+                .and_then(|response| response.get("error")),
+        ],
+        value,
+        fallback,
+    )
 }
 
 fn parse_usage(value: &Value) -> Result<Usage, LlmError> {
@@ -433,6 +449,21 @@ mod tests {
     }
 
     #[test]
+    fn message_level_system_text_joins_instructions() {
+        let mut req = request(ReasoningPolicy::Off);
+        req.system = Some("base".into());
+        req.messages.insert(
+            0,
+            Message {
+                role: Role::System,
+                content: vec![Content::Text("extra".into())],
+            },
+        );
+        let body = build_request_body(&req, ReasoningPolicy::Off);
+        assert_eq!(body["instructions"], "base\n\nextra");
+    }
+
+    #[test]
     fn serializes_reasoning_policy() {
         let off = build_request_body(&request(ReasoningPolicy::Off), ReasoningPolicy::Off);
         assert!(off.get("reasoning").is_none());
@@ -472,11 +503,14 @@ mod tests {
     fn finish_without_terminal_event_is_a_stream_error() {
         // Clean EOF with no `response.completed`/`response.incomplete` is
         // a truncated stream, not success: `finish` returns
-        // `LlmError::Stream` and emits no completed calls.
+        // `LlmError::StreamInterrupted` and emits no completed calls.
         let mut parser = ResponsesParser::new();
         assert!(!parser.is_done());
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
         assert!(parser.is_done());
         // A second finish after the error is a no-op.
         assert!(parser.finish().unwrap().is_empty());
@@ -489,14 +523,17 @@ mod tests {
             .parse_payload(r#"{"type":"response.output_text.delta","delta":"hi"}"#)
             .unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
     }
 
     #[test]
     fn held_partial_tool_call_emits_nothing_at_eof() {
         // A completed `function_call` item is held (no `ToolCallComplete`
         // escapes before the terminal event). Clean EOF first must surface
-        // `Stream` (never `Done`); `finish` never drains held calls.
+        // `StreamInterrupted` (never `Done`); `finish` never drains held calls.
         let mut parser = ResponsesParser::new();
         let held = parser.parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"held-1","name":"read","arguments":"{\"path\":\"x\"}"}}"#).unwrap();
         assert!(
@@ -506,7 +543,10 @@ mod tests {
             "held call escaped before terminal: {held:?}"
         );
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
         assert!(parser.is_done());
         // A second finish after the error is a no-op, still no `Done`.
         assert!(parser.finish().unwrap().is_empty());
@@ -515,8 +555,8 @@ mod tests {
     #[test]
     fn stream_error_after_partial_output_remains_an_error() {
         // Partial text followed by a provider failure payload stays an
-        // error: `response.failed` surfaces `LlmError::Stream` (agent
-        // recovery path) instead of ever reaching a terminal `Done`.
+        // error: `response.failed` without a transient code surfaces the
+        // permanent `LlmError::Stream` instead of ever reaching `Done`.
         let mut parser = ResponsesParser::new();
         let events = parser
             .parse_payload(r#"{"type":"response.output_text.delta","delta":"hi"}"#)

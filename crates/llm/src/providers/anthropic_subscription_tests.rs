@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn request() -> CompletionRequest {
     CompletionRequest {
-        model: MODELS[0].into(),
+        model: SUBSCRIPTION_MODELS[0].id.into(),
         system: None,
         messages: vec![Message::user("hello 😀")],
         tools: vec![],
@@ -56,6 +56,16 @@ async fn fixture(
 }
 
 fn provider(store: AuthStore, endpoint: String) -> AnthropicSubscriptionProvider {
+    // Refresh-after-401 must never reach the real token endpoint in tests;
+    // the discard port refuses the connection immediately.
+    provider_with_token_url(store, endpoint, "http://127.0.0.1:9/token".into())
+}
+
+fn provider_with_token_url(
+    store: AuthStore,
+    endpoint: String,
+    token_url: String,
+) -> AnthropicSubscriptionProvider {
     store
         .save_anthropic_subscription(&AnthropicSubscriptionCredential::new(
             "fixture-secret",
@@ -64,8 +74,93 @@ fn provider(store: AuthStore, endpoint: String) -> AnthropicSubscriptionProvider
             "account",
         ))
         .unwrap();
-    AnthropicSubscriptionProvider::new(Arc::new(AnthropicSubscriptionAuth::new(store).unwrap()))
-        .with_endpoint(endpoint)
+    let auth = AnthropicSubscriptionAuth::new(store)
+        .unwrap()
+        .with_endpoints(auth::AnthropicSubscriptionEndpoints {
+            authorize_url: "http://127.0.0.1:9/authorize".into(),
+            token_url,
+        });
+    AnthropicSubscriptionProvider::new(Arc::new(auth)).with_endpoint(endpoint)
+}
+
+/// Read one HTTP request (head and Content-Length body) and return its head.
+async fn read_request(socket: &mut tokio::net::TcpStream) -> String {
+    let mut bytes = Vec::new();
+    loop {
+        let mut chunk = [0; 4096];
+        let n = socket.read(&mut chunk).await.unwrap();
+        assert!(n > 0);
+        bytes.extend_from_slice(&chunk[..n]);
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .map(str::to_owned)
+                })
+                .map_or(0, |len| len.parse().unwrap());
+            if bytes.len() >= end + 4 + len {
+                return head;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_access_token_is_refreshed_once_and_the_request_repeated() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let body = [
+        json!({"type":"message_start","message":{"usage":{"input_tokens":2}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+        json!({"type":"message_stop"}),
+    ]
+    .iter()
+    .map(|v| format!("data: {v}\n\n"))
+    .collect::<String>();
+    let server = tokio::spawn(async move {
+        let mut heads = Vec::new();
+        for step in 0..3 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = read_request(&mut socket).await;
+            let (status, content_type, payload) = match step {
+                0 => (401, "text/plain", "revoked".to_owned()),
+                1 => (
+                    200,
+                    "application/json",
+                    json!({"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600})
+                        .to_string(),
+                ),
+                _ => (200, "text/event-stream", body.clone()),
+            };
+            socket
+                .write_all(format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}", payload.len()).as_bytes())
+                .await
+                .unwrap();
+            heads.push(head.to_ascii_lowercase());
+        }
+        heads
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let store = AuthStore::new(dir.path().join("auth.json"));
+    let p = provider_with_token_url(store.clone(), base.clone(), format!("{base}/token"));
+    let mut stream = p
+        .stream(&request())
+        .await
+        .expect("request is repeated after refresh");
+    while let Some(event) = stream.next().await {
+        event.unwrap();
+    }
+    let heads = server.await.unwrap();
+    assert!(heads[0].contains("authorization: bearer fixture-secret"));
+    assert!(heads[1].starts_with("post /token"));
+    assert!(heads[2].contains("authorization: bearer fresh-access"));
+    assert_eq!(
+        store.anthropic_subscription().unwrap().unwrap().access,
+        "fresh-access"
+    );
 }
 
 #[tokio::test]
@@ -92,7 +187,7 @@ async fn catalog_reports_model_specific_context_limits_without_network() {
         ("claude-sonnet-4-5", Some(200_000)),
         ("claude-haiku-4-5", Some(200_000)),
     ];
-    assert_eq!(models.len(), MODELS.len());
+    assert_eq!(models.len(), SUBSCRIPTION_MODELS.len());
     for model in models {
         let (_, limit) = expected.iter().find(|(id, _)| *id == model.id).unwrap();
         assert_eq!(model.context_length, *limit, "{}", model.id);
@@ -106,7 +201,7 @@ async fn mock_posts_exact_agent_request_without_tools_and_parses_sse() {
     let dir = tempfile::tempdir().unwrap();
     let p = provider(AuthStore::new(dir.path().join("auth.json")), endpoint);
     let models = p.list_models().await.unwrap();
-    assert_eq!(models.len(), MODELS.len());
+    assert_eq!(models.len(), SUBSCRIPTION_MODELS.len());
     assert_eq!(models[0].context_length, Some(1_000_000));
     let mut stream = p.stream(&request()).await.unwrap();
     let mut events = Vec::new();

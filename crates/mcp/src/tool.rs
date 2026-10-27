@@ -45,23 +45,36 @@ pub(crate) fn validate_remote_tool(server: &str, remote: &RemoteTool) -> Result<
             message: "tool name is too long or contains control characters".into(),
         });
     }
+    // Titles and descriptions are free prose: many servers use multi-line
+    // descriptions. Control characters do not reject the tool (that would
+    // fail startup of every MCP server); `McpTool::new` removes them instead.
     if let Some(title) = &remote.title
-        && (title.len() > MAX_TOOL_DESCRIPTION_BYTES || title.chars().any(char::is_control))
+        && title.len() > MAX_TOOL_DESCRIPTION_BYTES
     {
         return Err(McpError::Tool {
             server: server.into(),
             tool: name.to_owned(),
-            message: "tool title is too long or contains control characters".into(),
+            message: "tool title is too long".into(),
         });
     }
     if let Some(description) = &remote.description
-        && (description.len() > MAX_TOOL_DESCRIPTION_BYTES
-            || description.chars().any(char::is_control))
+        && description.len() > MAX_TOOL_DESCRIPTION_BYTES
     {
         return Err(McpError::Tool {
             server: server.into(),
             tool: name.to_owned(),
-            message: "tool description is too long or contains control characters".into(),
+            message: "tool description is too long".into(),
+        });
+    }
+    // Providers require function parameters to be an object schema; one tool
+    // with another type makes every request with the tool list fail.
+    if let Some(kind) = remote.input_schema.get("type")
+        && kind != "object"
+    {
+        return Err(McpError::Tool {
+            server: server.into(),
+            tool: name.to_owned(),
+            message: "input schema type must be \"object\"".into(),
         });
     }
     let mut stats = SchemaStats::default();
@@ -88,10 +101,13 @@ pub(crate) fn validate_remote_tool(server: &str, remote: &RemoteTool) -> Result<
             .filter(|description| !description.is_empty())
             .map_or(String::new(), |description| format!(" {description}"))
     );
+    // The output schema is part of the catalogue too (code mode shows it),
+    // so it counts toward the aggregate budget.
     let definition = serde_json::json!({
         "name": normalized_tool_name(server, name),
         "description": generated_description,
         "parameters": *remote.input_schema,
+        "output_schema": remote.output_schema.as_deref(),
     });
     serde_json::to_vec(&definition)
         .map(|bytes| bytes.len())
@@ -179,6 +195,18 @@ fn truncate_name(value: &str) -> String {
     llm::util::truncate_utf8(value, MAX_TOOL_NAME_BYTES)
 }
 
+/// Keep line breaks and tabs in an untrusted description, normalize CRLF and
+/// lone CR to LF, and drop every other control character (escape sequences
+/// must not reach the prompt or a terminal).
+fn sanitize_description(description: &str) -> String {
+    description
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|character| matches!(character, '\n' | '\t') || !character.is_control())
+        .collect()
+}
+
 /// Adapter from one discovered MCP tool to Harness's protocol-neutral tool
 /// interface. It is intentionally exclusive: server annotations are untrusted.
 pub(crate) struct McpTool {
@@ -189,6 +217,7 @@ pub(crate) struct McpTool {
     parameters: Value,
     output_schema: Option<Value>,
     peer: Peer<RoleClient>,
+    redactions: crate::config::Redactions,
 }
 
 impl McpTool {
@@ -196,6 +225,7 @@ impl McpTool {
         server: &str,
         remote: RemoteTool,
         peer: Peer<RoleClient>,
+        redactions: crate::config::Redactions,
     ) -> Result<Self, McpError> {
         let original_name = remote.name.to_string();
         validate_remote_tool(server, &remote)?;
@@ -206,13 +236,19 @@ impl McpTool {
                 message: "tool name is empty".into(),
             });
         }
-        let parameters = Value::Object((*remote.input_schema).clone());
+        let mut parameters = (*remote.input_schema).clone();
+        // MCP input schemas are objects; some servers omit the explicit type,
+        // which strict providers reject.
+        parameters
+            .entry("type")
+            .or_insert_with(|| Value::String("object".into()));
+        let parameters = Value::Object(parameters);
         let output_schema = remote
             .output_schema
             .map(|schema| Value::Object((*schema).clone()));
         let description = remote
             .description
-            .map(|description| description.to_string())
+            .map(|description| sanitize_description(&description))
             .unwrap_or_default();
         Ok(Self {
             name: normalized_tool_name(server, &original_name),
@@ -222,6 +258,7 @@ impl McpTool {
             parameters,
             output_schema,
             peer,
+            redactions,
         })
     }
 }
@@ -326,8 +363,9 @@ impl McpTool {
     }
 
     fn error(&self, message: impl fmt::Display) -> ToolOutput {
+        // Transport errors can echo configured headers or URL tokens.
         ToolOutput {
-            content: crate::output::cap_display(message),
+            content: crate::output::cap_display(self.redactions.apply(&message.to_string())),
             is_error: true,
             summary: self.summary(),
         }
@@ -409,6 +447,45 @@ mod tests {
     fn remote_tool_validation_rejects_control_names() {
         let tool = remote("bad\u{1b}[2J");
         assert!(validate_remote_tool("server", &tool).is_err());
+    }
+
+    #[test]
+    fn multiline_descriptions_are_accepted_and_sanitized() {
+        // Many servers ship multi-line descriptions; rejecting them failed
+        // the whole MCP startup.
+        let mut tool = remote("multiline");
+        tool.title = Some("Title\twith tab".into());
+        tool.description = Some(Cow::Borrowed(
+            "Line one.\r\nLine two.\n\tIndented \u{1b}[2Jtext",
+        ));
+        assert!(validate_remote_tool("server", &tool).is_ok());
+        assert_eq!(
+            sanitize_description(tool.description.as_deref().unwrap()),
+            "Line one.\nLine two.\n\tIndented [2Jtext"
+        );
+    }
+
+    #[test]
+    fn input_schema_must_be_an_object_and_output_schema_counts() {
+        let mut tool = remote("typed");
+        tool.input_schema = Arc::new(
+            serde_json::json!({"type": "string"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(validate_remote_tool("server", &tool).is_err());
+
+        let plain = remote("sized");
+        let base = validate_remote_tool("server", &plain).unwrap();
+        let mut with_output = remote("sized");
+        with_output.output_schema = Some(Arc::new(
+            serde_json::json!({"type": "object", "description": "x".repeat(1000)})
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        assert!(validate_remote_tool("server", &with_output).unwrap() > base + 1000);
     }
 
     #[test]

@@ -16,6 +16,52 @@ pub struct AgentSessionState {
     pub active_lease: Option<SessionActiveLease>,
 }
 
+/// Durable events for one assistant response, shared by the parent turn and
+/// subagents. `items` holds opaque provider state and tool calls in stream
+/// order. With opaque state, everything stays in one assistant message so
+/// Codex continuation state remains interleaved with its calls (session
+/// validates and replays embedded calls like standalone ones). Otherwise
+/// the message carries reasoning and text, and each call is a standalone
+/// `ToolCall` event.
+pub(crate) fn assistant_session_events(
+    reasoning: &str,
+    text: &str,
+    items: &[Content],
+) -> Vec<SessionEvent> {
+    let mut events = Vec::new();
+    if reasoning.is_empty() && text.is_empty() && items.is_empty() {
+        return events;
+    }
+    let mut content = Vec::new();
+    if !reasoning.is_empty() {
+        content.push(Content::Reasoning(reasoning.to_owned()));
+    }
+    if !text.is_empty() {
+        content.push(Content::Text(text.to_owned()));
+    }
+    let has_opaque = items
+        .iter()
+        .any(|item| matches!(item, Content::Opaque { .. }));
+    if has_opaque {
+        content.extend(items.iter().cloned());
+    }
+    let message = Message::assistant(content);
+    if !message.content.is_empty() {
+        events.push(SessionEvent::AssistantMessage {
+            message: StoredMessage::from_llm(&message),
+        });
+    }
+    if !has_opaque {
+        events.extend(items.iter().filter_map(|item| match item {
+            Content::ToolCall(call) => Some(SessionEvent::ToolCall {
+                call: StoredToolCall::from(call),
+            }),
+            _ => None,
+        }));
+    }
+    events
+}
+
 impl Agent {
     /// Stable id of the attached durable conversation, if any. Passed
     /// through on each request so providers with per-conversation
@@ -36,9 +82,7 @@ impl Agent {
         let Some(state) = self.session.as_mut() else {
             return Ok(());
         };
-        state
-            .store
-            .append_event(&mut state.session, event)
+        crate::blocking::blocking_io(|| state.store.append_event(&mut state.session, event))
             .map(|_| ())
             .map_err(|error| {
                 let message = format!("session persistence failed: {error}");
@@ -78,15 +122,17 @@ impl Agent {
             return Ok(None);
         };
         let mut staged = state.session.clone();
-        state
-            .store
-            .append_event(&mut staged, SessionEvent::ModelChange { provider, model })
-            .map(|_| Some(staged))
-            .map_err(|error| {
-                let message = format!("session persistence failed: {error}");
-                send(events, AgentEvent::Error(message.clone()));
-                TurnError::Persist(message)
-            })
+        crate::blocking::blocking_io(|| {
+            state
+                .store
+                .append_event(&mut staged, SessionEvent::ModelChange { provider, model })
+        })
+        .map(|_| Some(staged))
+        .map_err(|error| {
+            let message = format!("session persistence failed: {error}");
+            send(events, AgentEvent::Error(message.clone()));
+            TurnError::Persist(message)
+        })
     }
 
     /// Flush one session clone at the deferred-sync boundary. Model changes
@@ -101,7 +147,7 @@ impl Agent {
         if !store.deferred_sync() {
             return Ok(());
         }
-        if let Err(error) = store.sync_session(session) {
+        if let Err(error) = crate::blocking::blocking_io(|| store.sync_session(session)) {
             let message = format!("session persistence failed during sync: {error}");
             send(events, AgentEvent::Error(message.clone()));
             return Err(TurnError::Persist(message));
@@ -142,46 +188,8 @@ impl Agent {
         items: &[Content],
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), TurnError> {
-        if reasoning.is_empty() && text.is_empty() && items.is_empty() {
-            return Ok(());
-        }
-        let mut content = Vec::new();
-        if !reasoning.is_empty() {
-            content.push(Content::Reasoning(reasoning.to_owned()));
-        }
-        if !text.is_empty() {
-            content.push(Content::Text(text.to_owned()));
-        }
-        let has_opaque = items
-            .iter()
-            .any(|item| matches!(item, Content::Opaque { .. }));
-        if has_opaque {
-            // Codex continuation state must remain interleaved with calls in
-            // one assistant message. Embedded calls are validated and replayed
-            // by session using the same state machine as standalone calls.
-            content.extend(items.iter().cloned());
-        }
-        let message = Message::assistant(content);
-        if !message.content.is_empty() {
-            self.persist_event(
-                SessionEvent::AssistantMessage {
-                    message: StoredMessage::from_llm(&message),
-                },
-                events,
-            )?;
-        }
-        if !has_opaque {
-            for call in items.iter().filter_map(|item| match item {
-                Content::ToolCall(call) => Some(call),
-                _ => None,
-            }) {
-                self.persist_event(
-                    SessionEvent::ToolCall {
-                        call: StoredToolCall::from(call),
-                    },
-                    events,
-                )?;
-            }
+        for event in assistant_session_events(reasoning, text, items) {
+            self.persist_event(event, events)?;
         }
         Ok(())
     }

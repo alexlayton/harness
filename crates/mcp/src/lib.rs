@@ -5,12 +5,13 @@
 
 mod client;
 mod config;
+mod http_client;
 mod names;
 mod output;
 mod runtime;
 mod tool;
 
-pub use config::{McpConfig, McpServerConfig, McpTransportConfig};
+pub use config::{McpConfig, McpServerConfig, McpTransportConfig, redact_url};
 pub use names::normalized_tool_name;
 pub use runtime::McpRuntime;
 
@@ -58,6 +59,35 @@ pub enum McpError {
 }
 
 impl McpError {
+    /// Remove configured secret values from the error's free text.
+    pub(crate) fn redact(self, redactions: &config::Redactions) -> Self {
+        match self {
+            Self::Config { server, message } => Self::Config {
+                server,
+                message: redactions.apply(&message),
+            },
+            Self::Operation {
+                server,
+                operation,
+                message,
+            } => Self::Operation {
+                server,
+                operation,
+                message: redactions.apply(&message),
+            },
+            Self::Tool {
+                server,
+                tool,
+                message,
+            } => Self::Tool {
+                server,
+                tool,
+                message: redactions.apply(&message),
+            },
+            other => other,
+        }
+    }
+
     pub(crate) fn operation(
         server: &str,
         operation: &'static str,

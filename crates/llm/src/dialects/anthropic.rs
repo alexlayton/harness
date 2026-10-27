@@ -115,10 +115,20 @@ pub fn build_request_body(req: &CompletionRequest) -> Value {
             }]),
         );
     }
-    body.insert(
-        "messages".into(),
-        Value::Array(convert_messages(&req.messages)),
-    );
+    let mut messages = convert_messages(&req.messages);
+    // Third breakpoint (of four allowed): the end of the conversation, so
+    // the next turn reads the whole prior history from cache instead of
+    // paying for it again. Thinking blocks cannot carry cache_control.
+    if let Some(block) = messages
+        .last_mut()
+        .and_then(|message| message["content"].as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+        && block["type"] != "thinking"
+        && block["type"] != "redacted_thinking"
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+    body.insert("messages".into(), Value::Array(messages));
     if !req.tools.is_empty() {
         // Breakpoint on the last tool covers every tool definition (they sit
         // before the system block in the effective prompt prefix).
@@ -277,6 +287,9 @@ struct PartialToolUse {
     id: String,
     name: String,
     arguments: String,
+    /// Non-empty `input` from `content_block_start`, used when no input
+    /// deltas follow.
+    initial_input: Option<Value>,
 }
 
 impl AnthropicParser {
@@ -317,6 +330,14 @@ impl AnthropicParser {
                                     .unwrap_or_default()
                                     .into(),
                                 arguments: String::new(),
+                                // Some endpoints send the complete input here
+                                // and no `input_json_delta` events.
+                                initial_input: block
+                                    .get("input")
+                                    .filter(|input| {
+                                        input.as_object().is_some_and(|object| !object.is_empty())
+                                    })
+                                    .cloned(),
                             },
                         );
                     }
@@ -443,7 +464,10 @@ impl AnthropicParser {
                 });
                 Ok(output)
             }
-            "error" => Err(LlmError::Stream(error_message(&value, "Anthropic error"))),
+            "error" => Err(super::in_band_error(
+                &[value.get("error")],
+                super::error_message(&[value.get("error")], &value, "Anthropic error"),
+            )),
             "ping" => Ok(Vec::new()),
             _ => {
                 tracing::trace!(event_type = kind, "ignored Anthropic SSE event");
@@ -480,7 +504,7 @@ impl AnthropicParser {
         }
         self.seen_tool_ids.insert(id.to_owned());
         let arguments = if tool.arguments.trim().is_empty() {
-            json!({})
+            tool.initial_input.unwrap_or_else(|| json!({}))
         } else {
             serde_json::from_str(&tool.arguments).map_err(|error| {
                 LlmError::Parse(format!("invalid Anthropic tool arguments: {error}"))
@@ -499,33 +523,18 @@ impl AnthropicParser {
     }
 
     /// Clean transport EOF without `message_stop` is a truncated stream,
-    /// not a successful turn: surface it as `LlmError::Stream` so the
-    /// agent's recovery path handles it.  Never manufacture `Done` and
-    /// never finalize unfinished tool calls here.
+    /// not a successful turn: surface it as the transient
+    /// `LlmError::StreamInterrupted` so the agent re-streams.  Never
+    /// manufacture `Done` and never finalize unfinished tool calls here.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
         if self.done {
             return Ok(Vec::new());
         }
         self.done = true;
-        Err(LlmError::Stream(
-            "Anthropic stream ended without a terminal event (expected message_stop)".into(),
+        Err(super::truncated_stream(
+            "Anthropic stream ended without a terminal event (expected message_stop)",
         ))
     }
-}
-
-fn error_message(value: &Value, fallback: &str) -> String {
-    value
-        .get("error")
-        .and_then(value_message)
-        .or_else(|| value.get("message").and_then(Value::as_str))
-        .unwrap_or(fallback)
-        .to_owned()
-}
-
-fn value_message(value: &Value) -> Option<&str> {
-    value
-        .as_str()
-        .or_else(|| value.get("message").and_then(Value::as_str))
 }
 
 impl super::StreamParser for AnthropicParser {
@@ -575,6 +584,15 @@ mod tests {
 
         let tools = body.get("tools").unwrap().as_array().unwrap();
         assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+
+        // The end of the conversation is a breakpoint too.
+        let messages = body["messages"].as_array().unwrap();
+        let last_block = messages.last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
 
         // No tools: only the system breakpoint exists.
         let bare = CompletionRequest {
@@ -806,7 +824,10 @@ mod tests {
 
         assert!(!parser.is_done());
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
         assert!(parser.is_done());
         assert!(parser.finish().unwrap().is_empty());
     }
@@ -817,14 +838,17 @@ mod tests {
         parser.parse_payload(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read","input":{}}}"#).unwrap();
         parser.parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#).unwrap();
         let error = parser.finish().unwrap_err();
-        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
     }
 
     #[test]
     fn stream_error_after_partial_output_remains_an_error() {
         // Partial text followed by a provider `error` payload stays an
-        // error: it surfaces `LlmError::Stream` (agent recovery path) and
-        // never reaches a terminal `Done`.
+        // error: it surfaces the permanent `LlmError::Stream` and never
+        // reaches a terminal `Done`.
         let mut parser = AnthropicParser::new();
         let events = parser
             .parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#)
@@ -835,6 +859,47 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
         assert!(!parser.is_done());
+    }
+
+    #[test]
+    fn tool_input_from_block_start_is_kept_without_deltas() {
+        let mut parser = AnthropicParser::new();
+        let mut events = Vec::new();
+        for payload in [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.rs"}}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            events.extend(parser.parse_payload(payload).unwrap());
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolCallComplete(call) if call.arguments == json!({"path": "a.rs"})
+        )));
+    }
+
+    #[test]
+    fn overloaded_in_band_error_is_transient() {
+        // Anthropic reports overload mid-stream as an `error` event. A new
+        // request can succeed, so the agent must be able to re-stream it.
+        let mut parser = AnthropicParser::new();
+        let error = parser
+            .parse_payload(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
+        assert!(error.is_retryable());
+        let error = AnthropicParser::new()
+            .parse_payload(
+                r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#,
+            )
+            .unwrap_err();
+        assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
     }
 
     #[test]

@@ -189,20 +189,27 @@ pub(crate) async fn run() -> Result<()> {
     );
 
     let running = std::env::current_exe().context("locate the running Harness executable")?;
-    let parent = running
+    let launch_parent = running
         .parent()
         .ok_or_else(|| anyhow::anyhow!("running executable has no parent directory"))?;
-    let install_path = parent.join("harness");
+    let launch_path = launch_parent.join("harness");
     // Do not replace a different path (for example, a symlinked alias) or an
     // installation whose directory is not writable.
     let running_real = std::fs::canonicalize(&running).context("resolve running executable")?;
-    let install_real =
-        std::fs::canonicalize(&install_path).context("resolve installed executable")?;
+    let launch_real =
+        std::fs::canonicalize(&launch_path).context("resolve installed executable")?;
     ensure!(
-        running_real == install_real,
+        running_real == launch_real,
         "the running executable is not the `harness` binary at {}; refusing to replace it",
-        install_path.display()
+        launch_path.display()
     );
+    // Replace the real file, not a symlink that points at it: renaming over
+    // the link (as on macOS, where current_exe can return the link path)
+    // turned it into a regular file and left the real install untouched.
+    let install_path = running_real;
+    let parent = install_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("installed executable has no parent directory"))?;
     let staged = parent.join(format!(".harness.update.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&staged);
     std::fs::copy(&downloaded, &staged)

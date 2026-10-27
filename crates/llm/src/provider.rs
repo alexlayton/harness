@@ -28,10 +28,11 @@ pub trait Provider: Send + Sync {
     /// reference instead of leaking or registering statics.
     fn name(&self) -> &str;
 
-    /// Perform a single request and return its event stream.  Retrying is the
-    /// caller's concern via [`Provider::stream_with_retry`]; this default
-    /// implementation wraps [`Provider::stream`] with the shared backoff and
-    /// forwards retry notices to the callback.
+    /// Perform a single request and return its event stream.  Implementations
+    /// do not back off and retry transient failures: callers that want that
+    /// use [`Provider::stream_with_retry`], which wraps this method, so the
+    /// retry policy stays in one place for every provider.  (A provider may
+    /// still repeat a request once after refreshing a rejected credential.)
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError>;
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError>;

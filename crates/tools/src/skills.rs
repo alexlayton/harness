@@ -32,6 +32,18 @@ pub const MAX_NAME_LENGTH: usize = 64;
 /// Max skill description length per Agent Skills spec.
 pub const MAX_DESCRIPTION_LENGTH: usize = 1024;
 
+/// Largest skill file read. Skill files are instructions loaded on demand;
+/// a larger file is skipped with a diagnostic instead of being allocated.
+pub const MAX_SKILL_FILE_BYTES: usize = 256 * 1024;
+
+/// Most skills kept in one catalogue. Later (lower priority) skills are
+/// dropped with a diagnostic.
+pub const MAX_SKILLS: usize = 200;
+
+/// Byte budget of the skills section in the system prompt. Skills that do
+/// not fit are listed only as a count.
+pub const MAX_SKILLS_PROMPT_BYTES: usize = 32 * 1024;
+
 /// Which skill-discovery convention a root follows.  [`SkillMode::Harness`]
 /// roots (`.harness/skills`) also treat a root-level `.md` file as a skill;
 /// [`SkillMode::Agents`] roots (`.agents/skills`) do not.
@@ -274,16 +286,19 @@ fn load_skill_from_content(
         });
         return None;
     };
-    if description.len() > MAX_DESCRIPTION_LENGTH {
+    let description = if description.len() > MAX_DESCRIPTION_LENGTH {
         diagnostics.push(SkillDiagnostic {
             severity: SkillSeverity::Warning,
             message: format!(
-                "description exceeds {MAX_DESCRIPTION_LENGTH} characters ({})",
+                "description exceeds {MAX_DESCRIPTION_LENGTH} characters ({}); it is truncated",
                 description.len()
             ),
             path: Some(display_path.to_path_buf()),
         });
-    }
+        llm::truncate_utf8_prefix(&description, MAX_DESCRIPTION_LENGTH).to_owned()
+    } else {
+        description
+    };
     // Reads: the skill file itself, plus its base dir (for resources).
     // Accumulation happens in `discover`'s post-selection loop so shadowed
     // skills never contribute paths.
@@ -426,10 +441,20 @@ fn load_contained_skill(
     let raw = {
         use std::io::Read;
         let fd = super::vfs::unix::open_file_relative(workspace, &components).ok()?;
-        let mut file = std::fs::File::from(fd);
-        let mut raw = String::new();
-        file.read_to_string(&mut raw).ok()?;
-        raw
+        let file = std::fs::File::from(fd);
+        let mut bytes = Vec::new();
+        file.take(MAX_SKILL_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() > MAX_SKILL_FILE_BYTES {
+            diagnostics.push(SkillDiagnostic {
+                severity: SkillSeverity::Warning,
+                message: format!("skill file exceeds {MAX_SKILL_FILE_BYTES} bytes; skipped"),
+                path: Some(candidate.to_path_buf()),
+            });
+            return None;
+        }
+        String::from_utf8(bytes).ok()?
     };
     #[cfg(not(unix))]
     {
@@ -530,6 +555,14 @@ pub fn discover(roots: &[(PathBuf, SkillMode)]) -> SkillCatalog {
                 });
                 continue;
             }
+            if all_skills.len() == MAX_SKILLS {
+                all_diagnostics.push(SkillDiagnostic {
+                    severity: SkillSeverity::Warning,
+                    message: format!("more than {MAX_SKILLS} skills; skipping the rest"),
+                    path: Some(skill.file_path.clone()),
+                });
+                continue;
+            }
             by_name.insert(skill.name.clone());
             all_skills.push(skill);
         }
@@ -576,20 +609,28 @@ pub fn format_skills_prompt(catalog: &SkillCatalog) -> String {
         String::new(),
         "<available_skills>".to_owned(),
     ];
+    let mut used = 0usize;
+    let mut omitted = 0usize;
     for skill in &visible {
-        lines.push("  <skill>".to_owned());
-        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!(
-            "    <description>{}</description>",
-            escape_xml(&skill.description)
-        ));
-        lines.push(format!(
-            "    <location>{}</location>",
+        let entry = format!(
+            "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>",
+            escape_xml(&skill.name),
+            escape_xml(&skill.description),
             escape_xml(&skill.file_path.to_string_lossy())
-        ));
-        lines.push("  </skill>".to_owned());
+        );
+        if omitted > 0 || used + entry.len() > MAX_SKILLS_PROMPT_BYTES {
+            omitted += 1;
+            continue;
+        }
+        used += entry.len() + 1;
+        lines.push(entry);
     }
     lines.push("</available_skills>".to_owned());
+    if omitted > 0 {
+        lines.push(format!(
+            "{omitted} more skills are not listed because the skills section reached its size limit."
+        ));
+    }
     lines.join("\n")
 }
 
@@ -628,6 +669,33 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn skills_prompt_stays_within_its_budget_and_counts_omitted_skills() {
+        let skills = (0..MAX_SKILLS)
+            .map(|index| Skill {
+                name: format!("skill-{index}"),
+                description: "d".repeat(MAX_DESCRIPTION_LENGTH),
+                file_path: PathBuf::from(format!("/skills/{index}/SKILL.md")),
+                base_dir: PathBuf::from(format!("/skills/{index}")),
+                instructions: String::new(),
+                disable_model_invocation: false,
+            })
+            .collect();
+        let catalog = SkillCatalog {
+            skills,
+            diagnostics: Vec::new(),
+            read_paths: Vec::new(),
+        };
+        let prompt = format_skills_prompt(&catalog);
+        assert!(
+            prompt.len() < MAX_SKILLS_PROMPT_BYTES + 2 * 1024,
+            "{}",
+            prompt.len()
+        );
+        assert!(prompt.contains("more skills are not listed"));
+        assert!(prompt.contains("<name>skill-0</name>"));
+    }
 
     #[test]
     fn parses_frontmatter_and_extracts_body() {

@@ -152,7 +152,8 @@ impl Provider for OpenCodeGoProvider {
             .get("/usage")
             .await
             .map_err(|error| error.redacted(&self.usage.api_key))?;
-        let body = response.text().await.map_err(LlmError::Network)?;
+        let body =
+            crate::http::read_bounded_text(response, crate::http::MAX_METADATA_BODY_BYTES).await?;
         parse_usage_body(&body)
             .map(Some)
             .map_err(|error| error.redacted(&self.usage.api_key))

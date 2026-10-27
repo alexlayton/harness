@@ -2,7 +2,9 @@ use super::persistence::usage_event;
 use super::{
     Agent, AgentEvent, CompactionReason, InputMessage, MAX_OVERFLOW_RECOVERIES, TurnError, send,
 };
-use compact::{SummaryOutcome, plan_compaction, summarize as compact_summarize};
+use compact::{
+    SummaryOutcome, plan_compaction, plan_overflow_compaction, summarize as compact_summarize,
+};
 use llm::LlmError;
 use session::{SessionEvent, usage_summary};
 use std::collections::VecDeque;
@@ -31,6 +33,7 @@ impl Agent {
                 .and_then(|candidate| candidate.context_length)
                 .unwrap_or(0);
             self.context_window = self.compaction.resolved_window(reported);
+            self.publish_context_window();
             send(events, self.context_usage_event());
         }
         send(events, AgentEvent::ModelList { provider, models });
@@ -128,8 +131,20 @@ impl Agent {
         // so one pre-turn scans the live range once (PERF-1).
         let estimated =
             estimated_context.unwrap_or_else(|| self.context_tokens_estimate(extra_bytes));
-        let Some(plan) = plan_compaction(&session, &self.compaction, estimated) else {
-            send(events, AgentEvent::Notice("nothing to compact yet".into()));
+        // Overflow recovery may summarize the whole live region when the
+        // newest unit alone is too large to retain.
+        let plan = if reason == CompactionReason::Overflow {
+            plan_overflow_compaction(&session, &self.compaction, estimated)
+        } else {
+            plan_compaction(&session, &self.compaction, estimated)
+        };
+        let Some(plan) = plan else {
+            let notice = if reason == CompactionReason::Overflow {
+                "context overflow: no older material can be compacted"
+            } else {
+                "nothing to compact yet"
+            };
+            send(events, AgentEvent::Notice(notice.into()));
             return Ok(false);
         };
 
@@ -160,6 +175,9 @@ impl Agent {
         // not create a synthetic zero-token turn.
         if let SummaryOutcome::Model {
             usage: Some(usage), ..
+        }
+        | SummaryOutcome::Deterministic {
+            usage: Some(usage), ..
         } = &outcome
         {
             let summary = usage_summary(usage);
@@ -168,7 +186,7 @@ impl Agent {
 
         let compacted_through = plan.boundary;
         let summary = match &outcome {
-            SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text } => {
+            SummaryOutcome::Model { text, .. } | SummaryOutcome::Deterministic { text, .. } => {
                 self.secret_masker.mask_text(text)
             }
             SummaryOutcome::Cancelled => unreachable!("cancelled outcome handled above"),
@@ -198,6 +216,16 @@ impl Agent {
         self.last_context_tokens = None;
         send(events, self.context_usage_event());
 
+        if matches!(outcome, SummaryOutcome::Deterministic { .. }) {
+            // A fallback summary keeps less of the conversation; tell the
+            // user instead of reporting it like a model summary.
+            send(
+                events,
+                AgentEvent::Notice(
+                    "the summarizer failed; compaction used a shorter fallback summary".into(),
+                ),
+            );
+        }
         send(
             events,
             AgentEvent::CompactionFinished {
@@ -272,6 +300,42 @@ impl Agent {
         Ok(Some(compacted))
     }
 
+    /// Share the resolved window with the subagent runner, which bounds child
+    /// requests below it.
+    pub(crate) fn publish_context_window(&self) {
+        if let Some(runner) = &self.subagent_runner {
+            runner.update_context_window(self.context_window);
+        }
+    }
+
+    /// When the window was not configured and no catalogue reported it, the
+    /// generous default stays in place and auto-compaction never starts.
+    /// Learn a bound from the provider's overflow error instead, so later
+    /// turns compact before the next rejection.
+    fn learn_window_from_overflow(
+        &mut self,
+        error: &LlmError,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) {
+        if self.compaction.context_window > 0 {
+            return;
+        }
+        let Some(hint) = window_hint_from_overflow(error) else {
+            return;
+        };
+        if hint < self.context_window {
+            self.context_window = hint;
+            self.publish_context_window();
+            send(
+                events,
+                AgentEvent::Notice(format!(
+                    "context window set to about {hint} tokens from the provider's limit"
+                )),
+            );
+            send(events, self.context_usage_event());
+        }
+    }
+
     /// Handle a context-overflow provider error (a 400 whose body matches
     /// context-exceeded patterns) by emergency-compacting and returning
     /// whether the caller should retry the request. Bounded to
@@ -294,6 +358,7 @@ impl Agent {
             return Ok(false);
         }
         *attempts += 1;
+        self.learn_window_from_overflow(error, events);
         if self
             .compact_with_turn_input(events, input, cancel, CompactionReason::Overflow, 0, None)
             .await?
@@ -310,6 +375,43 @@ impl Agent {
             Ok(false)
         }
     }
+}
+
+/// Upper bound on the context window taken from a context-overflow error.
+///
+/// Providers state the limit next to the rejected size, for example
+/// "maximum context length is 128000 tokens … resulted in 130000 tokens" or
+/// "190000 + 32768 > 200000". The largest number is the limit or slightly
+/// above it, never the much smaller `max_tokens` term, so it is a safe
+/// estimate. Numbers below 1024 (status codes) are ignored.
+pub(crate) fn window_hint_from_overflow(error: &LlmError) -> Option<u64> {
+    let text = error.to_string();
+    let mut largest = None::<u64>;
+    let mut digits = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character.is_ascii_digit() {
+            digits.push(character);
+        } else if character == ','
+            && !digits.is_empty()
+            && chars.peek().is_some_and(char::is_ascii_digit)
+        {
+            // Thousands separator: "128,000".
+        } else if !digits.is_empty() {
+            if let Ok(value) = digits.parse::<u64>()
+                && value >= 1024
+            {
+                largest = Some(largest.map_or(value, |current| current.max(value)));
+            }
+            digits.clear();
+        }
+    }
+    if let Ok(value) = digits.parse::<u64>()
+        && value >= 1024
+    {
+        largest = Some(largest.map_or(value, |current| current.max(value)));
+    }
+    largest
 }
 
 /// Whether a provider error is a context-window rejection (the request it
@@ -331,4 +433,29 @@ pub(crate) fn is_context_overflow(error: &LlmError) -> bool {
         "token limit",
     ];
     PATTERNS.iter().any(|pattern| body.contains(pattern))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::window_hint_from_overflow;
+    use llm::LlmError;
+
+    #[test]
+    fn overflow_errors_yield_a_safe_window_bound() {
+        let openai = LlmError::http(
+            400,
+            "This model's maximum context length is 128,000 tokens. However, your messages \
+             resulted in 130000 tokens.",
+        );
+        assert_eq!(window_hint_from_overflow(&openai), Some(130_000));
+        let anthropic = LlmError::http(
+            400,
+            "input length and max_tokens exceed context limit: 190000 + 32768 > 200000",
+        );
+        assert_eq!(window_hint_from_overflow(&anthropic), Some(200_000));
+        assert_eq!(
+            window_hint_from_overflow(&LlmError::http(400, "context length exceeded")),
+            None
+        );
+    }
 }

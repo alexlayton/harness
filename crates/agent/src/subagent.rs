@@ -64,6 +64,19 @@ const CHILD_CONTEXT_MAX_TOKENS: u64 = 100_000;
 const CHILD_FINAL_REPORT_RESERVE_TOKENS: u64 = 8_000;
 const CHILD_TOOL_EVIDENCE_MAX_BYTES: usize = 8_000;
 
+/// Exploration budget for child requests: the fixed child cap, lowered to
+/// three quarters of the model's window when that is known and smaller, with
+/// room reserved for the final report. A child on a small-window model would
+/// otherwise overflow before the cap ever applied.
+fn child_context_budget(context_window: u64) -> u64 {
+    let cap = if context_window > 0 {
+        CHILD_CONTEXT_MAX_TOKENS.min(context_window / 4 * 3)
+    } else {
+        CHILD_CONTEXT_MAX_TOKENS
+    };
+    cap.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS.min(cap / 4))
+}
+
 /// Bound a child's live provider history without rewriting its durable
 /// transcript. Tool evidence is truncated first; then complete old exchanges
 /// are removed while preserving the original user request and the newest
@@ -123,6 +136,8 @@ struct SubagentModelState {
     model: String,
     reasoning: ReasoningPolicy,
     secret_masker: Arc<SecretMasker>,
+    /// The parent's resolved context window for this model; `0` = unknown.
+    context_window: u64,
 }
 
 /// Everything a nested loop needs from the host process. One instance is
@@ -195,6 +210,7 @@ impl SubagentRunnerImpl {
                 model: model.into(),
                 reasoning: ReasoningPolicy::Auto,
                 secret_masker: Arc::new(SecretMasker::default()),
+                context_window: 0,
             }),
             workspace_root,
             search_index,
@@ -265,6 +281,17 @@ impl SubagentRunnerImpl {
         state.provider = mask_provider(provider, state.secret_masker.clone());
         let model = model.into();
         state.model = state.secret_masker.mask_text(&model);
+        // A new model has its own window; the parent publishes it again.
+        state.context_window = 0;
+    }
+
+    /// Context window the parent resolved for the current model. Child
+    /// requests are bounded below it, not only by the fixed child cap.
+    pub fn update_context_window(&self, context_window: u64) {
+        self.model_state
+            .write()
+            .expect("subagent model state lock poisoned")
+            .context_window = context_window;
     }
 
     /// Current child-target model (test seam for AGENT-4 atomicity: proves
@@ -341,8 +368,23 @@ impl SubagentRunnerImpl {
         parent_session: Option<session::SessionId>,
     ) -> Option<session::Session> {
         let store = store.as_ref()?;
+        // A session title is one line in listings; the model-written
+        // description can contain newlines and other control characters.
+        let title = description
+            .chars()
+            .map(|character| {
+                if character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         match store.create(SessionCreateOptions {
-            title: Some(description.to_owned()),
+            title: Some(title),
             provider: Some(provider.to_owned()),
             model: Some(model.to_owned()),
             parent_session,
@@ -378,7 +420,7 @@ impl SubagentRunnerImpl {
             .parent_session_id
             .read()
             .expect("subagent parent session lock poisoned");
-        let (provider, model, reasoning, secret_masker) = {
+        let (provider, model, reasoning, secret_masker, context_window) = {
             let state = self
                 .model_state
                 .read()
@@ -388,6 +430,7 @@ impl SubagentRunnerImpl {
                 state.model.clone(),
                 state.reasoning,
                 state.secret_masker.clone(),
+                state.context_window,
             )
         };
         let registry = self.registry(mode)?;
@@ -438,6 +481,7 @@ impl SubagentRunnerImpl {
                 &system,
                 reasoning,
                 &secret_masker,
+                context_window,
                 &mut history,
                 &mut session,
                 cancel,
@@ -455,7 +499,7 @@ impl SubagentRunnerImpl {
         );
         if let Some(child) = session.as_ref()
             && let Some(store) = self.store.as_ref()
-            && let Err(error) = store.sync_session(child)
+            && let Err(error) = crate::blocking::blocking_io(|| store.sync_session(child))
         {
             // Deferred-sync stores flush at the parent's turn boundary
             // anyway; a failed explicit sync here only loses durability of
@@ -467,16 +511,23 @@ impl SubagentRunnerImpl {
 
     /// Persist one event to the child session when both a store and a child
     /// exist. Failures are logged, never fatal: an unpersisted delegation
-    /// still completed its real work.
+    /// still completed its real work. After the first failure the child
+    /// session is detached and nothing more is recorded: later events (a
+    /// result whose call was not written, for example) would make the
+    /// durable transcript invalid.
     fn persist(
         store: &Option<SessionStore>,
         session: &mut Option<session::Session>,
         event: session::SessionEvent,
     ) {
-        if let (Some(store), Some(child)) = (store, session)
-            && let Err(error) = store.append_event(child, event)
+        if let (Some(store), Some(child)) = (store, session.as_mut())
+            && let Err(error) = crate::blocking::blocking_io(|| store.append_event(child, event))
         {
-            tracing::warn!(error = %error, "subagent session persist failed");
+            tracing::warn!(
+                error = %error,
+                "subagent session persist failed; recording stopped for this run"
+            );
+            *session = None;
         }
     }
 
@@ -490,6 +541,7 @@ impl SubagentRunnerImpl {
         system: &str,
         reasoning: ReasoningPolicy,
         secret_masker: &Arc<SecretMasker>,
+        context_window: u64,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         cancel: CancellationToken,
@@ -503,11 +555,14 @@ impl SubagentRunnerImpl {
                 // the subagent produced instead of dead-ending the parent's
                 // tool result with an error.
                 tracing::warn!(turns, "subagent hit its turn budget");
-                return Ok(format!(
+                // Same byte cap as a normal report: the last output can be
+                // arbitrarily long.
+                let report = format!(
                     "[subagent stopped after {} turns without a final report] Last output: {}",
                     self.config.max_turns,
                     last_assistant_text(history).unwrap_or_else(|| "(none)".into())
-                ));
+                );
+                return Ok(truncate_utf8(&report, REPORT_MAX_BYTES).to_owned());
             }
             turns += 1;
 
@@ -517,8 +572,7 @@ impl SubagentRunnerImpl {
             // The note is request-local (not durable child history), and an
             // empty tool list makes the expected terminal action unambiguous.
             let final_report_turn = turns == self.config.max_turns;
-            let context_budget =
-                CHILD_CONTEXT_MAX_TOKENS.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS);
+            let context_budget = child_context_budget(context_window);
             bound_child_history(history, system, registry, context_budget);
             let mut request_messages = history.clone();
             if final_report_turn {
@@ -568,42 +622,66 @@ impl SubagentRunnerImpl {
             };
 
             let mut text = String::new();
-            let mut opaque = Vec::<(String, serde_json::Value)>::new();
-            let mut tool_calls = Vec::<llm::ToolCall>::new();
+            // Opaque provider state and tool calls in stream order: Codex
+            // requires encrypted reasoning to stay interleaved with calls
+            // when the next request is rebuilt.
+            let mut items = Vec::<Content>::new();
             let mut stream_error = None;
+            let mut saw_done = false;
             loop {
                 tokio::select! {
                     next = stream.next() => match next {
                         Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
                         Some(Ok(StreamEvent::ReasoningDelta(_))) => {}
                         Some(Ok(StreamEvent::OpaqueState { provider, data })) => {
-                            opaque.push((provider, data));
+                            items.push(Content::Opaque { provider, data });
                         }
-                        Some(Ok(StreamEvent::ToolCallComplete(call))) => tool_calls.push(call),
+                        Some(Ok(StreamEvent::ToolCallComplete(call))) => {
+                            items.push(Content::ToolCall(call));
+                        }
                         // Child usage lands in the child session only, so
                         // parent totals never double-count delegated work.
                         Some(Ok(StreamEvent::Done {
                             usage: Some(usage),..
-                        })) => Self::persist(
-                            &self.store,
-                            session,
-                            session::SessionEvent::Usage {
-                                usage: usage_summary(&usage),
-                            },
-                        ),
-                        Some(Ok(StreamEvent::Done { .. })) => {}
+                        })) => {
+                            saw_done = true;
+                            Self::persist(
+                                &self.store,
+                                session,
+                                session::SessionEvent::Usage {
+                                    usage: usage_summary(&usage),
+                                },
+                            );
+                        }
+                        Some(Ok(StreamEvent::Done { .. })) => saw_done = true,
                         Some(Err(error)) => {
                             stream_error = Some(error);
                             break;
                         }
-                        None => break,
+                        None => {
+                            // A stream that ends without its terminal event
+                            // is truncated: its text is not a complete report.
+                            if !saw_done {
+                                stream_error = Some(llm::LlmError::StreamInterrupted(
+                                    "subagent stream ended without a terminal event".into(),
+                                ));
+                            }
+                            break;
+                        }
                     },
                     _ = cancel.cancelled() => return Err("cancelled by user".into()),
                 }
             }
 
-            append_assistant(history, &text, &opaque, tool_calls.clone());
-            for event in assistant_events(&text, &opaque, &tool_calls) {
+            let tool_calls = items
+                .iter()
+                .filter_map(|item| match item {
+                    Content::ToolCall(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            crate::agent::append_assistant(history, "", &text, &items);
+            for event in crate::agent::assistant_session_events("", &text, &items) {
                 Self::persist(&self.store, session, event);
             }
 
@@ -623,12 +701,15 @@ impl SubagentRunnerImpl {
 
             if tool_calls.is_empty() {
                 if text.trim().is_empty() {
-                    // Treat an empty reply like any other stall: nudge once
-                    // by appending a user note and continuing within budget.
-                    history.push(Message::user(
+                    // Treat an empty reply like any other stall: nudge and
+                    // continue within budget. An empty reply adds no
+                    // assistant message, so fold the note into a trailing
+                    // user message instead of creating two adjacent ones.
+                    push_request_note(
+                        history,
                         "[system note: your previous response produced no output; continue \
                          and complete the task.]",
-                    ));
+                    );
                     continue;
                 }
                 // Text-only reply: this *is* the report.
@@ -661,7 +742,8 @@ impl SubagentRunnerImpl {
         tool_calls: Vec<llm::ToolCall>,
         cancel: &CancellationToken,
     ) -> Result<(), String> {
-        for batch in plan_tool_batches(tool_calls, registry) {
+        let batches = plan_tool_batches(tool_calls, registry);
+        for (index, batch) in batches.iter().enumerate() {
             let launch_limit = if batch.concurrent() {
                 match batch.class {
                     tools::Concurrency::ReadOnly => MAX_CONCURRENT_READ_ONLY_TOOLS,
@@ -675,7 +757,7 @@ impl SubagentRunnerImpl {
             let mut hooks = NoopToolDispatchHooks;
             let outcome = execute_tool_batch_with_secrets(
                 registry,
-                &batch,
+                batch,
                 launch_limit,
                 &mut control,
                 &mut hooks,
@@ -707,6 +789,19 @@ impl SubagentRunnerImpl {
                 );
             }
             if outcome.cancellation.is_some() {
+                // Calls in later batches never ran. Give each a result so the
+                // child history and its durable session stay valid.
+                let skipped = batches[index + 1..]
+                    .iter()
+                    .flat_map(|batch| batch.calls.iter().cloned())
+                    .collect::<Vec<_>>();
+                mark_calls_failed(
+                    history,
+                    &self.store,
+                    session,
+                    &skipped,
+                    "cancelled before tool execution",
+                );
                 return Err("cancelled by user".into());
             }
         }
@@ -793,63 +888,6 @@ fn push_request_note(history: &mut Vec<Message>, note: &str) {
     } else {
         history.push(Message::user(note));
     }
-}
-
-/// Append an assistant message and provider continuation state to history.
-fn append_assistant(
-    history: &mut Vec<Message>,
-    text: &str,
-    opaque: &[(String, serde_json::Value)],
-    calls: Vec<llm::ToolCall>,
-) {
-    if text.is_empty() && opaque.is_empty() && calls.is_empty() {
-        return;
-    }
-    let mut content = Vec::new();
-    if !text.is_empty() {
-        content.push(Content::Text(text.to_owned()));
-    }
-    content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-        provider: provider.clone(),
-        data: data.clone(),
-    }));
-    content.extend(calls.into_iter().map(Content::ToolCall));
-    history.push(Message {
-        role: Role::Assistant,
-        content,
-    });
-}
-
-/// Build the durable events for one assistant exchange, mirroring
-/// `Agent::persist_assistant`: the `AssistantMessage` event carries text (and
-/// reasoning, which children do not produce) ONLY — never tool calls — and
-/// each call is emitted exactly once as a standalone `SessionEvent::ToolCall`.
-/// Putting calls in both places used to make session validation reject the
-/// duplicate, leaving exports with orphaned tool results. A response that
-/// contains only tool calls emits no message event at all.
-fn assistant_events(
-    text: &str,
-    opaque: &[(String, serde_json::Value)],
-    calls: &[llm::ToolCall],
-) -> Vec<session::SessionEvent> {
-    let mut events = Vec::new();
-    if !text.is_empty() || !opaque.is_empty() {
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(Content::Text(text.to_owned()));
-        }
-        content.extend(opaque.iter().map(|(provider, data)| Content::Opaque {
-            provider: provider.clone(),
-            data: data.clone(),
-        }));
-        events.push(session::SessionEvent::AssistantMessage {
-            message: session::StoredMessage::from_llm(&Message::assistant(content)),
-        });
-    }
-    events.extend(calls.iter().map(|call| session::SessionEvent::ToolCall {
-        call: session::StoredToolCall::from(call),
-    }));
-    events
 }
 
 /// Give every streamed-but-unexecuted tool call a failed result so history
@@ -980,6 +1018,120 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn opaque_state_stays_interleaved_with_tool_calls() {
+        // Codex continuation state must keep its position between calls.
+        let call = |id: &str| {
+            Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
+                id: id.into(),
+                name: "missing".into(),
+                arguments: serde_json::json!({}),
+            }))
+        };
+        let opaque = |n: u64| {
+            Ok(StreamEvent::OpaqueState {
+                provider: "openai-codex".into(),
+                data: serde_json::json!({ "n": n }),
+            })
+        };
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                opaque(1),
+                call("a"),
+                opaque(2),
+                call("b"),
+                ScriptProvider::done("tool_calls"),
+            ],
+            vec![
+                Ok(StreamEvent::TextDelta("report".into())),
+                ScriptProvider::done("stop"),
+            ],
+        ]));
+        let runner = runner_with(provider.clone());
+        runner
+            .run(
+                "audit",
+                "go",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (_, _, messages) = &provider.seen.lock().unwrap()[1];
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .unwrap();
+        let order = assistant
+            .content
+            .iter()
+            .map(|content| match content {
+                Content::Opaque { data, .. } => format!("o{}", data["n"]),
+                Content::ToolCall(call) => format!("c{}", call.id),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["o1", "ca", "o2", "cb"]);
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_is_not_a_successful_report() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![Ok(StreamEvent::TextDelta(
+            "partial fin".into(),
+        ))]]));
+        let runner = runner_with(provider);
+        let error = runner
+            .run(
+                "audit",
+                "go",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("without a terminal event"), "{error}");
+    }
+
+    #[test]
+    fn child_budget_follows_a_smaller_model_window() {
+        let unknown = child_context_budget(0);
+        assert_eq!(
+            unknown,
+            CHILD_CONTEXT_MAX_TOKENS - CHILD_FINAL_REPORT_RESERVE_TOKENS
+        );
+        assert_eq!(child_context_budget(1_000_000), unknown);
+        let small = child_context_budget(32_000);
+        assert!(small > 0 && small < 24_000, "{small}");
+    }
+
+    #[tokio::test]
+    async fn empty_reply_nudge_keeps_roles_alternating() {
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![ScriptProvider::done("stop")],
+            vec![
+                Ok(StreamEvent::TextDelta("report".into())),
+                ScriptProvider::done("stop"),
+            ],
+        ]));
+        let runner = runner_with(provider.clone());
+        runner
+            .run(
+                "audit",
+                "go",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let (_, _, messages) = &provider.seen.lock().unwrap()[1];
+        assert!(
+            messages
+                .windows(2)
+                .all(|pair| !(pair[0].role == Role::User && pair[1].role == Role::User)),
+            "{messages:?}"
+        );
     }
 
     #[tokio::test]
@@ -1291,6 +1443,65 @@ mod tests {
             .run("x", "y", SubagentMode::ReadOnly, CancellationToken::new())
             .await;
         assert_eq!(outcome.unwrap_err(), "subagents are disabled");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_gives_every_later_batch_a_result() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let store = session::SessionStore::new(root.path(), &workspace).unwrap();
+        let bash = |id: &str| {
+            Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
+                id: id.into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 5"}),
+            }))
+        };
+        // Two exclusive calls run as two batches; cancel during the first.
+        let provider = Arc::new(ScriptProvider::new(vec![vec![
+            bash("first"),
+            bash("second"),
+            ScriptProvider::done("tool_calls"),
+        ]]));
+        let runner = SubagentRunnerImpl::new(
+            provider,
+            "demo",
+            workspace,
+            false,
+            "",
+            SubagentPolicy::default(),
+            Some(store.clone()),
+            None,
+        );
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            canceller.cancel();
+        });
+        let error = runner
+            .run("work", "go", SubagentMode::Workspace, cancel)
+            .await
+            .unwrap_err();
+        assert!(error.contains("cancelled"), "{error}");
+        let child = store.open(&store.list().unwrap()[0].id).unwrap();
+        let count = |tool_result: bool| {
+            child
+                .events
+                .iter()
+                .filter(|record| {
+                    if tool_result {
+                        matches!(record.event, session::SessionEvent::ToolResult { .. })
+                    } else {
+                        matches!(record.event, session::SessionEvent::ToolCall { .. })
+                    }
+                })
+                .count()
+        };
+        assert_eq!(count(false), 2);
+        assert_eq!(count(true), 2, "every call needs a result");
     }
 
     #[tokio::test]

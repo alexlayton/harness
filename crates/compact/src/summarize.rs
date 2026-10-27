@@ -70,8 +70,10 @@ invocations, and error messages verbatim where they matter.";
 pub enum SummaryOutcome {
     /// Successful LLM summary plus optional provider usage (recorded by the agent).
     Model { text: String, usage: Option<Usage> },
-    /// Deterministic fallback (no provider usage to record).
-    Deterministic { text: String },
+    /// Deterministic fallback. `usage` is set when the summarizer request
+    /// ran (and was billed) but its answer could not be used, for example
+    /// when it was empty.
+    Deterministic { text: String, usage: Option<Usage> },
     /// The caller cancelled compaction before a summary was completed.
     /// Cancellation is not a summarizer failure and must not be persisted.
     Cancelled,
@@ -106,17 +108,28 @@ pub async fn summarize(
             }
         }
         Err(_) if cancel.is_cancelled() => SummaryOutcome::Cancelled,
-        Err(error) => {
+        Err((error, usage)) => {
             tracing::warn!(error = %error, "LLM summarization failed; using deterministic fallback");
             SummaryOutcome::Deterministic {
                 text: deterministic_summary(plan, policy),
+                usage,
             }
         }
     }
 }
 
+/// Instruction added when an earlier summary exists, so its still-relevant
+/// content is carried forward instead of replaced by the new span alone.
+const MERGE_PREVIOUS_PROMPT: &str = "\
+The <previous-summary> above describes earlier work in this session. Merge \
+it into the new checkpoint: keep its goals, decisions, progress, and \
+critical context that still apply, update items the new conversation \
+changed, and do not drop earlier information only because it is not \
+repeated in the new conversation.\n\n";
+
 /// One-shot LLM summarization. Errors and cancellation both return `Err`, so
-/// the caller can fall back without distinguishing them.
+/// the caller can fall back without distinguishing them. The error carries
+/// the usage of a request that completed but whose answer was unusable.
 async fn model_summarize(
     provider: &dyn Provider,
     model: &str,
@@ -124,7 +137,7 @@ async fn model_summarize(
     policy: &CompactionPolicy,
     session_id: Option<&str>,
     cancel: &CancellationToken,
-) -> Result<(String, Option<Usage>), llm::LlmError> {
+) -> Result<(String, Option<Usage>), (llm::LlmError, Option<Usage>)> {
     let serialized = serialize_events(
         &plan.to_summarize,
         policy.max_summary_input_bytes,
@@ -145,6 +158,7 @@ async fn model_summarize(
         prompt.push_str("<previous-summary>\n");
         prompt.push_str(previous);
         prompt.push_str("\n</previous-summary>\n\n");
+        prompt.push_str(MERGE_PREVIOUS_PROMPT);
     }
     prompt.push_str(SUMMARIZATION_PROMPT);
 
@@ -159,10 +173,15 @@ async fn model_summarize(
         session_id: session_id.map(str::to_owned),
     };
 
+    // Same initial-request retry policy as conversation turns: one transient
+    // 429/5xx must not replace a model summary with the fallback.
+    let on_retry: llm::RetryCallback = std::sync::Arc::new(|attempt, error| {
+        tracing::warn!(attempt, error = %error, "retrying summarizer request");
+    });
     let mut stream = tokio::select! {
-        result = provider.stream(&request) => result?,
+        result = provider.stream_with_retry(&request, on_retry) => result.map_err(|error| (error, None))?,
         _ = cancel.cancelled() => {
-            return Err(llm::LlmError::Stream("summarization cancelled".into()));
+            return Err((llm::LlmError::Stream("summarization cancelled".into()), None));
         }
     };
     let mut text = String::new();
@@ -184,17 +203,19 @@ async fn model_summarize(
                     Ok(StreamEvent::ReasoningDelta(_))
                     | Ok(StreamEvent::OpaqueState { .. })
                     | Ok(StreamEvent::ToolCallComplete(_)) => {}
-                    Err(error) => return Err(error),
+                    Err(error) => return Err((error, usage)),
                 }
             }
             _ = cancel.cancelled() => {
-                return Err(llm::LlmError::Stream("summarization cancelled".into()));
+                return Err((llm::LlmError::Stream("summarization cancelled".into()), usage));
             }
         }
     }
     if text.trim().is_empty() {
-        return Err(llm::LlmError::Stream(
-            "summarizer produced no output".into(),
+        // The request completed and was billed; keep its usage.
+        return Err((
+            llm::LlmError::Stream("summarizer produced no output".into()),
+            usage,
         ));
     }
     Ok((text, usage))
@@ -229,45 +250,89 @@ fn append_file_lists(summary: String, plan: &CompactionPlan, max_summary_bytes: 
     truncate_bytes(&combined, max_summary_bytes).to_owned()
 }
 
-/// Deterministic fallback, capped at `max_summary_bytes`. Earlier generated
-/// context takes priority over the new span, then file lists. Preserve the
-/// transcript omission notice and reserve room for a distinct final-budget
-/// notice when needed (if the budget permits it). Never split a UTF-8 point.
+/// Deterministic fallback, capped at `max_summary_bytes`.
+///
+/// The newest material wins. File lists may use a quarter of the budget,
+/// and the previous summary at most half of what remains (keeping its newest
+/// part); the new span gets the rest, newest events first, and any unused
+/// space goes back to the previous summary. Before, the previous summary was
+/// placed first and the result was cut from the end, so repeated fallbacks
+/// dropped every new span. Never splits a UTF-8 code point.
 fn deterministic_summary(plan: &CompactionPlan, policy: &CompactionPolicy) -> String {
+    const HEADER: &str = "This is generated context, not a verbatim transcript.\n";
+    const PREVIOUS_OPEN: &str = "<previous-generated-summary>\n";
+    const PREVIOUS_CLOSE: &str = "\n</previous-generated-summary>\n";
+    const EARLIER_OMITTED: &str = "[... earlier summary omitted ...]\n";
+    const NO_MATERIAL: &str = "(no conversation material)";
+
+    let budget = policy.max_summary_bytes;
+    let files = format_file_operations(&extract_file_operations(&plan.to_summarize));
+    let files = truncate_bytes(&files, budget / 4);
+    let mut available = budget.saturating_sub(HEADER.len() + files.len());
+
+    let previous = plan
+        .previous_summary
+        .as_deref()
+        .filter(|previous| !previous.is_empty());
+    let previous_overhead = PREVIOUS_OPEN.len() + PREVIOUS_CLOSE.len() + EARLIER_OMITTED.len();
+    let previous_reserve = previous.map_or(0, |previous| {
+        (previous.len() + previous_overhead).min(available / 2)
+    });
+    let transcript_budget = available
+        .saturating_sub(previous_reserve)
+        .min(policy.max_summary_input_bytes);
     let serialized = serialize_events(
         &plan.to_summarize,
-        policy.max_summary_input_bytes,
+        transcript_budget,
         DEFAULT_TOOL_RESULT_CHARS,
     );
-    let mut text = String::from("This is generated context, not a verbatim transcript.\n");
-    if let Some(previous) = &plan.previous_summary {
-        text.push_str("<previous-generated-summary>\n");
-        text.push_str(previous);
-        text.push_str("\n</previous-generated-summary>\n");
+    // `serialize_events` reserves room for "\n" + marker inside its budget.
+    let marker = serialized.truncated && transcript_budget > OMISSION_MARKER.len();
+    let transcript_len = if serialized.text.is_empty() {
+        NO_MATERIAL.len()
+    } else {
+        serialized.text.len()
+    } + if marker { OMISSION_MARKER.len() + 1 } else { 0 };
+    available = available.saturating_sub(transcript_len);
+
+    let mut text = String::from(HEADER);
+    if let Some(previous) = previous {
+        let room = available.saturating_sub(previous_overhead);
+        if room > 0 {
+            text.push_str(PREVIOUS_OPEN);
+            if previous.len() > room {
+                text.push_str(EARLIER_OMITTED);
+                text.push_str(tail_bytes(previous, room));
+            } else {
+                text.push_str(previous);
+            }
+            text.push_str(PREVIOUS_CLOSE);
+        }
     }
     if serialized.text.is_empty() {
-        text.push_str("(no conversation material)");
+        text.push_str(NO_MATERIAL);
     } else {
         text.push_str(&serialized.text);
     }
-    if serialized.truncated && policy.max_summary_input_bytes > OMISSION_MARKER.len() {
+    if marker {
         text.push('\n');
         text.push_str(OMISSION_MARKER);
     }
-    text.push_str(&format_file_operations(&extract_file_operations(
-        &plan.to_summarize,
-    )));
+    text.push_str(files);
+    // Tiny budgets cannot hold the fixed parts; stay a hard limit anyway.
+    truncate_bytes(&text, budget).to_owned()
+}
 
-    const BUDGET_NOTICE: &str = "[... summary content omitted ...]";
-    let budget = policy.max_summary_bytes;
-    if text.len() <= budget {
+/// Return the longest UTF-8 suffix that fits within `max_bytes`.
+fn tail_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
         return text;
     }
-    if budget < BUDGET_NOTICE.len() {
-        return truncate_bytes(&text, budget).to_owned();
+    let mut start = text.len() - max_bytes;
+    while !text.is_char_boundary(start) {
+        start += 1;
     }
-    let prefix = truncate_bytes(&text, budget - BUDGET_NOTICE.len());
-    format!("{prefix}{BUDGET_NOTICE}")
+    &text[start..]
 }
 
 #[cfg(test)]
@@ -448,6 +513,25 @@ mod tests {
     }
 
     #[test]
+    fn repeated_fallbacks_keep_the_newest_span() {
+        // A previous summary as large as the budget used to fill it, so the
+        // new span was cut away on every fallback.
+        let mut plan = build_plan();
+        plan.previous_summary = Some("p".repeat(8 * 1024));
+        let policy = CompactionPolicy {
+            max_summary_bytes: 2 * 1024,
+            ..CompactionPolicy::default()
+        };
+        let last = &plan.to_summarize.last().unwrap().event;
+        let newest = crate::serialize::serialize_record(last, DEFAULT_TOOL_RESULT_CHARS);
+        let newest = truncate_bytes(&newest, 40).to_owned();
+        let summary = deterministic_summary(&plan, &policy);
+        assert!(summary.len() <= policy.max_summary_bytes);
+        assert!(summary.contains(&newest), "{summary}");
+        assert!(summary.contains("<previous-generated-summary>"));
+    }
+
+    #[test]
     fn stream_error_falls_back_to_deterministic() {
         let runtime = runtime();
         let plan = build_plan();
@@ -464,7 +548,7 @@ mod tests {
             &cancel,
         ));
         match outcome {
-            SummaryOutcome::Deterministic { text } => {
+            SummaryOutcome::Deterministic { text, .. } => {
                 assert!(text.contains("generated context"));
                 assert!(text.contains("[User]: question"));
             }
@@ -509,7 +593,7 @@ mod tests {
         let failure = ScriptProvider {
             events: vec![Err("offline".into())],
         };
-        let SummaryOutcome::Deterministic { text } =
+        let SummaryOutcome::Deterministic { text, .. } =
             runtime.block_on(summarize(&failure, "demo", &second, &policy, None, &cancel))
         else {
             panic!("second summary must fall back");
@@ -566,7 +650,10 @@ mod tests {
         let provider = ScriptProvider {
             events: vec![Ok(StreamEvent::Done {
                 stop_reason: Some("stop".into()),
-                usage: None,
+                usage: Some(Usage {
+                    output_tokens: 3,
+                    ..Usage::default()
+                }),
             })],
         };
         let cancel = CancellationToken::new();
@@ -578,6 +665,10 @@ mod tests {
             None,
             &cancel,
         ));
-        assert!(matches!(outcome, SummaryOutcome::Deterministic { .. }));
+        // The empty answer still cost tokens; the usage must survive.
+        assert!(matches!(
+            outcome,
+            SummaryOutcome::Deterministic { usage: Some(usage), .. } if usage.output_tokens == 3
+        ));
     }
 }

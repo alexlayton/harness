@@ -80,11 +80,7 @@ pub(super) fn fit_tables(text: Text<'static>, width: usize) -> Text<'static> {
         let mut widths = vec![1usize; columns];
         for row in &rows {
             for (index, cell) in row.iter().enumerate() {
-                widths[index] = widths[index].max(
-                    cell.iter()
-                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                        .sum(),
-                );
+                widths[index] = widths[index].max(spans_wrap_width(cell));
             }
         }
         // Leave a fitting table alone, including its original alignment.
@@ -186,13 +182,10 @@ pub(super) fn fit_tables(text: Text<'static>, width: usize) -> Text<'static> {
                 let mut spans = vec![Span::styled("│", border_style)];
                 for (column, &w) in widths.iter().enumerate() {
                     let cell = wrapped[column].get(row_line);
-                    let content_width = cell.map_or(0, |line| {
-                        line.spans
-                            .iter()
-                            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-                            .sum()
-                    });
-                    let extra = w - content_width;
+                    let content_width = cell.map_or(0, |line| spans_wrap_width(&line.spans));
+                    // Saturate: a wrapped cell must never be wider than its
+                    // column, but a width mismatch must not panic the UI.
+                    let extra = w.saturating_sub(content_width);
                     let left = match alignments[column] {
                         Alignment::Left => 0,
                         Alignment::Right => extra,
@@ -251,6 +244,17 @@ fn alignment(group: &[Line<'_>], column: usize) -> Alignment {
         }
     }
     Alignment::Left
+}
+
+/// Cell width measured exactly as `wrap_text` measures it (grapheme
+/// clusters, see `render::grapheme_width`). Column sizing and padding must
+/// use the same function as wrapping, or cells come out wider than their
+/// column.
+fn spans_wrap_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| super::text_width(span.content.as_ref()))
+        .sum()
 }
 
 fn prefix_width(prefix: &[Span<'_>]) -> usize {

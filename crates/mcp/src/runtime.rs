@@ -1,5 +1,7 @@
 use crate::client::HarnessClient;
+use crate::config::Redactions;
 use crate::config::{MAX_CONCURRENT_MCP_STARTUPS, McpServerConfig, McpTransportConfig};
+use crate::http_client::BoundedHttpClient;
 use crate::tool::{MAX_REMOTE_DEFINITION_BYTES, MAX_REMOTE_TOOLS, McpTool, validate_remote_tool};
 use crate::{
     MCP_INITIALIZE_TIMEOUT, MCP_LIST_TIMEOUT, MCP_MAX_FRAME_BYTES, MCP_SHUTDOWN_TIMEOUT,
@@ -8,8 +10,8 @@ use crate::{
 use futures_util::future::join_all;
 use rmcp::ClientLifecycleMode;
 use rmcp::model::{
-    ErrorData, JsonRpcMessage, PaginatedRequestParams, ProtocolVersion, RequestId,
-    Tool as RemoteTool,
+    ClientNotification, ErrorData, JsonRpcMessage, PaginatedRequestParams, ProtocolVersion,
+    RequestId, Tool as RemoteTool,
 };
 use rmcp::service::{
     RoleClient, RunningService, RxJsonRpcMessage, TxJsonRpcMessage,
@@ -165,17 +167,43 @@ type BoundedMcpTransport =
 /// Stdio transport using rmcp's protocol machinery with a pre-deserialization
 /// frame guard. The child remains owned here so close and drop retain the
 /// lifecycle guarantees of rmcp's regular child-process transport.
+/// Strong process-tree scope for a stdio server, when the platform has one.
+/// Linux uses a delegated cgroup v2 (a server that calls `setsid` cannot
+/// leave it); elsewhere only the Unix process group applies. Windows has
+/// neither here: only the direct child is killed.
+#[cfg(target_os = "linux")]
+type ProcessScope = Option<tools::process_scope::CgroupScope>;
+#[cfg(not(target_os = "linux"))]
+type ProcessScope = ();
+
+/// Kill every remaining member of the scope and remove it.
+fn release_scope(scope: &mut ProcessScope) {
+    #[cfg(target_os = "linux")]
+    drop(scope.take());
+    #[cfg(not(target_os = "linux"))]
+    let _ = scope;
+}
+
 struct BoundedStdioTransport {
     child: Option<Child>,
+    /// Dropped (which kills every member and removes the cgroup) after the
+    /// process group is signalled.
+    scope: ProcessScope,
+    /// The server's own process group (Unix), so launchers such as `npx` or
+    /// `uvx` cannot leave workers or grandchildren behind after close/drop.
+    process_group: Option<u32>,
     transport: BoundedMcpTransport,
     pending_requests: Arc<StdMutex<VecDeque<RequestId>>>,
     frame_failure: Arc<AtomicBool>,
 }
 
 impl BoundedStdioTransport {
-    fn new(child: Child, stdout: ChildStdout, stdin: ChildStdin) -> Self {
+    fn new(child: Child, stdout: ChildStdout, stdin: ChildStdin, scope: ProcessScope) -> Self {
         let frame_failure = Arc::new(AtomicBool::new(false));
+        let process_group = if cfg!(unix) { child.id() } else { None };
         Self {
+            scope,
+            process_group,
             child: Some(child),
             transport: AsyncRwTransport::new(
                 BoundedFrameReader::new_with_failure(
@@ -242,6 +270,22 @@ impl Transport<RoleClient> for BoundedStdioTransport {
                 .expect("pending MCP requests lock")
                 .push_back(id.clone());
         }
+        // A cancelled (or timed-out, then cancelled) request may never get a
+        // response. Forget its id now: otherwise every cancelled call leaked
+        // an entry, and a later frame failure could be reported against the
+        // stale id instead of the request that actually failed.
+        if let JsonRpcMessage::Notification(notification) = &item
+            && let ClientNotification::CancelledNotification(cancelled) = &notification.notification
+            && let Some(id) = &cancelled.params.request_id
+        {
+            let mut pending = self
+                .pending_requests
+                .lock()
+                .expect("pending MCP requests lock");
+            if let Some(index) = pending.iter().position(|pending_id| pending_id == id) {
+                pending.remove(index);
+            }
+        }
         let pending_requests = self.pending_requests.clone();
         let send = self.transport.send(item);
         async move {
@@ -272,13 +316,22 @@ impl Transport<RoleClient> for BoundedStdioTransport {
         let Some(mut child) = self.child.take() else {
             return Ok(());
         };
-        match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        let group = self.process_group.take();
+        let result = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
             Ok(result) => result.map(|_| ()),
             Err(_) => {
+                // Signal the group before reaping the leader: an unreaped
+                // leader keeps the group ID from being reused.
+                kill_process_group(group);
                 child.start_kill()?;
                 child.wait().await.map(|_| ())
             }
-        }
+        };
+        // Sweep descendants that outlived a graceful leader exit, including
+        // ones that left the process group (cgroup, on Linux).
+        kill_process_group(group);
+        release_scope(&mut self.scope);
+        result
     }
 }
 
@@ -287,6 +340,8 @@ impl Drop for BoundedStdioTransport {
         let Some(mut child) = self.child.take() else {
             return;
         };
+        // The leader is not reaped yet, so the group ID is still reserved.
+        kill_process_group(self.process_group.take());
         let _ = child.start_kill();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
@@ -295,6 +350,23 @@ impl Drop for BoundedStdioTransport {
         }
     }
 }
+
+/// SIGKILL every process in a stdio server's process group.
+#[cfg(unix)]
+fn kill_process_group(group: Option<u32>) {
+    if let Some(group) = group.filter(|group| *group > 0)
+        && let Ok(group) = libc::pid_t::try_from(group)
+    {
+        // SAFETY: the group ID is the PID of a child this runtime spawned with
+        // `process_group(0)`; a negative PID targets only that group.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_group: Option<u32>) {}
 
 /// Connected MCP servers for one agent/session. The runtime owns protocol and
 /// child-process lifetimes; tools only retain cloneable request handles.
@@ -319,7 +391,9 @@ struct ConnectedServer {
     name: String,
     client: RunningService<RoleClient, HarnessClient>,
     tools: Vec<RemoteTool>,
-    stderr_task: Option<JoinHandle<()>>,
+    stderr_task: Option<StderrTask>,
+    /// Configured secret values removed from this server's tool errors.
+    redactions: Redactions,
 }
 
 impl McpRuntime {
@@ -353,9 +427,14 @@ impl McpRuntime {
                 let workspace_root = workspace_root.to_path_buf();
                 let server_cancel = startup_cancel.clone();
                 tasks.spawn(async move {
+                    let redactions = Redactions::for_server(&server);
                     connect_server(&server, &workspace_root, server_cancel)
                         .await
-                        .map(|connected| (server.name.clone(), connected))
+                        .map(|mut connected| {
+                            connected.redactions = redactions.clone();
+                            (server.name.clone(), connected)
+                        })
+                        .map_err(|error| error.redact(&redactions))
                 });
             }
             if startup_cancel.is_cancelled() {
@@ -416,6 +495,7 @@ impl McpRuntime {
                     &server.name,
                     remote.clone(),
                     server.client.peer().clone(),
+                    server.redactions.clone(),
                 )?))?;
             }
         }
@@ -451,6 +531,28 @@ async fn connect_server(
     match &server.transport {
         McpTransportConfig::Stdio { command, args, env } => {
             let mut command = tokio::process::Command::new(command);
+            // Own a process group so close and drop can stop the whole tree.
+            #[cfg(unix)]
+            command.process_group(0);
+            // On Linux, also own a cgroup when this process has a delegated
+            // cgroup v2 subtree: membership survives `setsid`.
+            #[cfg(target_os = "linux")]
+            let scope = tools::process_scope::CgroupScope::new("harness-mcp");
+            #[cfg(target_os = "linux")]
+            if let Some(scope) = scope.as_ref() {
+                let procs = scope.procs_cstring();
+                // SAFETY: the hook only performs the async-signal-safe open,
+                // write, and close calls between fork and exec. A failed
+                // attach keeps the server running with its process group.
+                unsafe {
+                    command.pre_exec(move || {
+                        let _ = tools::process_scope::attach_current_process(&procs);
+                        Ok(())
+                    });
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let scope = ();
             command
                 .kill_on_drop(true)
                 .args(args)
@@ -469,7 +571,7 @@ async fn connect_server(
                 McpError::operation(&server.name, "initialize", "MCP child stdout was not piped")
             })?;
             let stderr = child.stderr.take();
-            let transport = BoundedStdioTransport::new(child, stdout, stdin);
+            let transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
             let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
             connect_transport(
                 server,
@@ -494,11 +596,16 @@ async fn connect_server(
                     Ok((name, value))
                 })
                 .collect::<Result<HashMap<_, _>, McpError>>()?;
+            // rmcp's reqwest client reads JSON and error bodies without a
+            // byte cap; the bounded client applies the frame limit to every
+            // response body before parsing.
+            let client = BoundedHttpClient::new(MCP_MAX_FRAME_BYTES)
+                .map_err(|error| McpError::operation(&server.name, "initialize", error))?;
             let make_transport = || {
                 let config = StreamableHttpClientTransportConfig::with_uri(url.clone())
                     .custom_headers(headers.clone())
                     .max_sse_event_size(MCP_MAX_FRAME_BYTES);
-                StreamableHttpClientTransport::from_config(config)
+                StreamableHttpClientTransport::with_client(client.clone(), config)
             };
             let result = connect_transport(
                 server,
@@ -550,7 +657,7 @@ async fn connect_transport<T>(
     workspace_root: &Path,
     cancel: CancellationToken,
     transport: T,
-    stderr_task: Option<JoinHandle<()>>,
+    stderr_task: Option<StderrTask>,
     lifecycle: ClientLifecycleMode,
 ) -> Result<ConnectedServer, McpError>
 where
@@ -615,11 +722,41 @@ where
         client,
         tools,
         stderr_task,
+        redactions: Redactions::default(),
     })
 }
 
-fn spawn_stderr_reader(name: String, mut stderr: tokio::process::ChildStderr) -> JoinHandle<()> {
-    tokio::spawn(async move {
+/// Stderr reader task that is aborted when dropped. Startup futures can be
+/// dropped mid-connection (cancellation, or a sibling server failing); a
+/// plain `JoinHandle` would then detach the reader, and a surviving
+/// descendant holding the pipe would keep it alive.
+struct StderrTask(Option<JoinHandle<()>>);
+
+impl StderrTask {
+    fn abort(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+
+    async fn stop(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for StderrTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+fn spawn_stderr_reader(name: String, mut stderr: tokio::process::ChildStderr) -> StderrTask {
+    StderrTask(Some(tokio::spawn(async move {
         let mut buffer = [0u8; MCP_STDERR_CHUNK_BYTES];
         let mut bytes = 0usize;
         while let Ok(read) = stderr.read(&mut buffer).await {
@@ -631,7 +768,7 @@ fn spawn_stderr_reader(name: String, mut stderr: tokio::process::ChildStderr) ->
         if bytes > 0 {
             tracing::debug!(server = %name, bytes, "MCP server emitted stderr");
         }
-    })
+    })))
 }
 
 async fn list_tools_bounded(
@@ -686,10 +823,9 @@ async fn list_tools_bounded(
     }
 }
 
-async fn abort_stderr_task(task: Option<JoinHandle<()>>) {
+async fn abort_stderr_task(task: Option<StderrTask>) {
     if let Some(task) = task {
-        task.abort();
-        let _ = task.await;
+        task.stop().await;
     }
 }
 
@@ -925,6 +1061,45 @@ mod tests {
     #[cfg(unix)]
     mod stdio_server_tests {
         use super::*;
+
+        /// A cancelled request may never get a response; its pending id
+        /// must not stay behind.
+        #[tokio::test]
+        async fn cancelled_requests_leave_no_pending_id() {
+            use rmcp::model::{
+                CancelledNotification, CancelledNotificationParam, ClientRequest, PingRequest,
+            };
+            let mut child = tokio::process::Command::new("/bin/cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let stdout = child.stdout.take().unwrap();
+            #[cfg(target_os = "linux")]
+            let scope = None;
+            #[cfg(not(target_os = "linux"))]
+            let scope = ();
+            let mut transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
+            transport
+                .send(JsonRpcMessage::request(
+                    ClientRequest::PingRequest(PingRequest::default()),
+                    RequestId::Number(7),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(transport.pending_requests.lock().unwrap().len(), 1);
+            transport
+                .send(JsonRpcMessage::notification(
+                    ClientNotification::CancelledNotification(CancelledNotification::new(
+                        CancelledNotificationParam::new(Some(RequestId::Number(7)), None),
+                    )),
+                ))
+                .await
+                .unwrap();
+            assert!(transport.pending_requests.lock().unwrap().is_empty());
+        }
         use std::collections::BTreeMap;
 
         // The fixture deliberately writes both one large printf and many small
@@ -1079,6 +1254,104 @@ done
                     .await
                     .expect("frame rejection must not wait for list timeout");
                 assert_prompt_error(result, "tools/list");
+            }
+        }
+
+        /// Launchers such as `npx` start workers; closing the server must
+        /// also stop descendants that do not hold its pipes.
+        #[tokio::test]
+        async fn shutdown_stops_server_descendants() {
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("descendant.pid");
+            let script = format!(
+                "sleep 300 </dev/null >/dev/null 2>&1 &\necho $! > '{}'\n{FIXTURE}",
+                pid_file.display()
+            );
+            let server = McpServerConfig {
+                name: "fixture".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), script],
+                    env: BTreeMap::from([(String::from("MCP_TEST_MODE"), "plain".into())]),
+                },
+            };
+            let runtime = McpRuntime::connect(
+                &[server],
+                &std::env::current_dir().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fixture should connect");
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            runtime.shutdown().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // SAFETY: signal 0 only probes the test's own descendant.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "descendant {pid} survived MCP shutdown"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// A descendant that calls `setsid` leaves the process group; on
+        /// Linux the cgroup scope must still stop it. Skipped when this host
+        /// does not delegate a writable cgroup v2 subtree.
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn shutdown_stops_descendants_that_left_the_process_group() {
+            if tools::process_scope::CgroupScope::new("harness-mcp-probe").is_none() {
+                return;
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let pid_file = directory.path().join("escaped.pid");
+            let script = format!(
+                "setsid sh -c 'echo $$ > \"{}\"; exec sleep 300' </dev/null >/dev/null 2>&1 &\n{FIXTURE}",
+                pid_file.display()
+            );
+            let server = McpServerConfig {
+                name: "fixture".into(),
+                transport: McpTransportConfig::Stdio {
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), script],
+                    env: BTreeMap::from([(String::from("MCP_TEST_MODE"), "plain".into())]),
+                },
+            };
+            let runtime = McpRuntime::connect(
+                &[server],
+                &std::env::current_dir().unwrap(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fixture should connect");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let pid: libc::pid_t = loop {
+                if let Some(pid) = std::fs::read_to_string(&pid_file)
+                    .ok()
+                    .and_then(|text| text.trim().parse().ok())
+                {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "descendant never started"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            runtime.shutdown().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            // SAFETY: signal 0 only probes the test's own descendant.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "setsid descendant {pid} survived MCP shutdown"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
 

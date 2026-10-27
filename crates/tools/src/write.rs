@@ -1,5 +1,3 @@
-#[cfg(unix)]
-use super::file_mutation::atomic_write;
 use super::file_mutation::with_file_mutation_lock;
 use super::vfs::{WorkspaceFs, split_relative};
 use super::{
@@ -8,14 +6,12 @@ use super::{
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(unix)]
-use tokio::fs;
 use tokio_util::sync::CancellationToken;
 
 pub struct WriteTool {
-    workspace_root: Option<PathBuf>,
+    workspace_root: PathBuf,
     workspace_fs: Option<Arc<WorkspaceFs>>,
 }
 
@@ -24,7 +20,7 @@ impl WriteTool {
         let root = normalize_workspace_root(root);
         Self {
             workspace_fs: WorkspaceFs::open_root(&root).ok().map(Arc::new),
-            workspace_root: Some(root),
+            workspace_root: root,
         }
     }
 
@@ -33,7 +29,7 @@ impl WriteTool {
     /// Non-Unix writes fail closed because pathname reopening is not safe.
     pub fn with_workspace_fs(_root: impl Into<PathBuf>, workspace_fs: Arc<WorkspaceFs>) -> Self {
         Self {
-            workspace_root: Some(workspace_fs.root().to_path_buf()),
+            workspace_root: workspace_fs.root().to_path_buf(),
             workspace_fs: Some(workspace_fs),
         }
     }
@@ -96,34 +92,28 @@ impl Tool for WriteTool {
         // then commit through the validated parent handle: the temp file is
         // created and renamed relative to the same handle, so the path
         // written is the path that was validated.
-        let components =
-            match resolve_workspace_path(&path, self.workspace_root.as_deref(), false).await {
-                Ok(_) => match split_relative(&path) {
-                    Ok(components) => components,
-                    Err(io_error) => {
-                        return error(
-                            &format!("write {path}"),
-                            &format!("cannot write {path}: {io_error}"),
-                        );
-                    }
-                },
-                Err(message) => {
+        let components = match resolve_workspace_path(&path, &self.workspace_root, false).await {
+            Ok(_) => match split_relative(&path) {
+                Ok(components) => components,
+                Err(io_error) => {
                     return error(
                         &format!("write {path}"),
-                        &format!("cannot write {path}: {message}"),
+                        &format!("cannot write {path}: {io_error}"),
                     );
                 }
-            };
+            },
+            Err(message) => {
+                return error(
+                    &format!("write {path}"),
+                    &format!("cannot write {path}: {message}"),
+                );
+            }
+        };
         let summary = format!("write {path}");
         let root = self.workspace_root.clone();
         let workspace_fs = self.workspace_fs.clone();
-        let Some(result) = with_file_mutation_lock(
-            &root
-                .as_deref()
-                .unwrap_or(std::path::Path::new("."))
-                .join(components.join("/")),
-            &cancel,
-            || async {
+        let Some(result) =
+            with_file_mutation_lock(&root.join(components.join("/")), &cancel, || async {
                 write_validated(
                     &root,
                     workspace_fs.as_deref(),
@@ -133,9 +123,8 @@ impl Tool for WriteTool {
                 )
                 .await
                 .map_err(|io_error| format!("cannot write {path}: {io_error}"))
-            },
-        )
-        .await
+            })
+            .await
         else {
             return error(&summary, "cancelled");
         };
@@ -160,11 +149,10 @@ fn error(summary: &str, content: &str) -> ToolOutput {
 
 /// Write `content` through validated handles: open the workspace root,
 /// create missing parents handle-relatively, then commit the temp file
-/// with a handle-relative rename. On Unix, callers without a workspace
-/// capability retain the path-based [`atomic_write`] compatibility path;
-/// non-Unix workspace callers fail closed instead.
+/// with a handle-relative rename. Non-Unix callers fail closed, because
+/// pathname reopening cannot keep the validated path.
 async fn write_validated(
-    root: &Option<PathBuf>,
+    root: &Path,
     workspace_fs: Option<&WorkspaceFs>,
     components: &[String],
     content: &str,
@@ -177,7 +165,7 @@ async fn write_validated(
         ));
     }
     #[cfg(unix)]
-    if let Some(root) = root.as_deref() {
+    {
         let owned_fs;
         let fs = if let Some(workspace_fs) = workspace_fs {
             workspace_fs
@@ -205,44 +193,11 @@ async fn write_validated(
             existing,
             cancel,
         )
-        .await?;
-        return Ok(());
+        .await
+        .map(|_| ())
     }
-    // Unix retains the compatibility path for callers that do not provide a
-    // workspace root. Workspace tools always take the handle-relative branch
-    // above; non-Unix callers fail closed before reaching this function.
-    #[cfg(unix)]
-    {
-        let base = root.clone().unwrap_or_else(|| PathBuf::from("."));
-        let full_path = components.iter().fold(base, |base, part| base.join(part));
-        if cancel.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "cancelled",
-            ));
-        }
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        if cancel.is_cancelled() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "cancelled",
-            ));
-        }
-        match fs::metadata(&full_path).await {
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "not a regular file",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-        return atomic_write(&full_path, content.as_bytes(), cancel).await;
-    }
+    // Non-Unix callers fail closed in `execute` before reaching this
+    // function; this arm only keeps the signature total.
     #[cfg(not(unix))]
     {
         let _ = (root, workspace_fs, components, content, cancel);

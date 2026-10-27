@@ -1,7 +1,8 @@
 use super::InputMessage;
 use super::persistence::usage_event;
 use super::{
-    Agent, AgentEvent, CompactionReason, MAX_TURN_RECOVERIES, StreamRecovery, TurnError, send,
+    Agent, AgentEvent, CompactionReason, MAX_TOOL_ROUNDS_PER_TURN, MAX_TURN_RECOVERIES,
+    StreamRecovery, TurnError, send,
 };
 use crate::prompt::system_prompt_with_workspace_context;
 use futures_util::stream::StreamExt;
@@ -111,6 +112,7 @@ impl Agent {
         self.history.push(user_message.clone());
         let mut recoveries = 0;
         let mut overflow_recoveries = 0;
+        let mut tool_rounds = 0usize;
         loop {
             let tool_snapshot = self.tools.snapshot();
             let mut system = system_prompt_with_workspace_context(
@@ -364,6 +366,15 @@ impl Agent {
                     // do not blame or repeat calls from completed rounds.
                     if recoveries < MAX_TURN_RECOVERIES {
                         recoveries += 1;
+                        // Final-answer-only frontends discard the failed
+                        // round, so its text must be given again in full.
+                        let answer = match self.stream_recovery {
+                            StreamRecovery::Continue => "",
+                            StreamRecovery::Replace => {
+                                " Give the complete final answer from the beginning, not \
+                                 only the missing part."
+                            }
+                        };
                         push_recovery_note(
                             &mut self.history,
                             format!(
@@ -371,7 +382,7 @@ impl Agent {
                                  ({parse_message}). Continue the task. Check the tool results \
                                  already in the conversation and do not repeat actions that \
                                  completed. If a tool call is still needed, issue it with \
-                                 valid arguments.]"
+                                 valid arguments.{answer}]"
                             ),
                         );
                         retried = true;
@@ -441,6 +452,25 @@ impl Agent {
             // the prewalk target without splitting a call from its result.
             if handoff {
                 self.prewalk_handoff(events).await?;
+            }
+            // Headless, Python, and ACP runs have no Esc key: a model that
+            // keeps calling tools must not run (and spend) without bound.
+            // The round is complete, so stopping here leaves valid history;
+            // a new message continues the task.
+            tool_rounds += 1;
+            if tool_rounds >= MAX_TOOL_ROUNDS_PER_TURN {
+                let message = format!(
+                    "stopped after {MAX_TOOL_ROUNDS_PER_TURN} tool rounds in one turn; \
+                     send a message to continue"
+                );
+                self.persist_event(
+                    SessionEvent::Error {
+                        message: message.clone(),
+                    },
+                    events,
+                )?;
+                send(events, AgentEvent::Error(message));
+                return Ok(());
             }
         }
     }
