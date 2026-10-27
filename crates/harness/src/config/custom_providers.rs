@@ -115,6 +115,16 @@ impl CustomProviderConfig {
                     "[providers.{name}]: the `{header}` header is set by harness"
                 ));
             }
+            if parsed == reqwest::header::AUTHORIZATION
+                && self
+                    .headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case(header))
+            {
+                return Err(anyhow!(
+                    "[providers.{name}]: `{header}` would store a credential in config.toml; use `api_key_env`, or `env_headers` to name an environment variable"
+                ));
+            }
             if parsed == reqwest::header::AUTHORIZATION && self.api_key_env.is_some() {
                 return Err(anyhow!(
                     "[providers.{name}]: set either `api_key_env` or an `{header}` header, not both"
@@ -254,6 +264,28 @@ X-Client = "harness"
         };
         let config = Config::resolve_from_file(&cli, &file, path.clone(), |_| None).unwrap();
         assert_eq!(config.model, "other");
+        // A saved model belongs to the saved provider: overriding to the
+        // custom provider uses its default, not another provider's model.
+        let other: FileConfig = toml::from_str(
+            r#"
+provider = "openrouter"
+model = "vendor/model"
+
+[providers.lmstudio]
+type = "openai-compatible"
+base_url = "http://localhost:1234/v1"
+default_model = "qwen3-coder"
+"#,
+        )
+        .unwrap();
+        let cli = Cli {
+            provider: Some("lmstudio".into()),
+            ..Cli::default()
+        };
+        let config =
+            Config::resolve_from_file(&cli, &other, path.clone(), |_| Some("key".into())).unwrap();
+        assert_eq!(config.model, "qwen3-coder");
+
         let cli = Cli {
             provider: Some("missing".into()),
             ..Cli::default()
@@ -271,6 +303,14 @@ X-Client = "harness"
             ),
             (
                 "[providers.x]\ntype = \"openai-compatible\"\nbase_url = \"http://x\"\napi_key_env = \"K\"\nheaders = { authorization = \"y\" }",
+                "credential in config.toml",
+            ),
+            (
+                "[providers.x]\ntype = \"openai-compatible\"\nbase_url = \"http://x\"\nheaders = { Authorization = \"Bearer y\" }",
+                "credential in config.toml",
+            ),
+            (
+                "[providers.x]\ntype = \"openai-compatible\"\nbase_url = \"http://x\"\napi_key_env = \"K\"\nenv_headers = { Authorization = \"T\" }",
                 "not both",
             ),
             (

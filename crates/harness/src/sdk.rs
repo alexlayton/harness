@@ -97,16 +97,22 @@ where
 impl RunOptions {
     /// Check overrides before opening sessions or connecting providers/tools.
     pub fn validate(&self) -> Result<()> {
-        // Names are checked against the built-ins and `[providers]` once the
-        // config file is loaded.
         if let Some(provider) = &self.provider {
             ensure!(!provider.trim().is_empty(), "provider must not be blank");
+            // Invalid inputs must raise before any session or provider work,
+            // so custom names are checked against the config file here.
+            ensure!(
+                crate::config::provider_is_known(provider)?,
+                "unknown provider `{provider}`"
+            );
         }
         if let Some(model) = &self.model {
             ensure!(!model.trim().is_empty(), "model must not be blank");
         }
         if let Some(model) = &self.prewalk_model {
-            crate::config::parse_prewalk_target(model)?;
+            // Only the shape is checked; custom provider prefixes are resolved
+            // against the config file when it is loaded.
+            crate::config::parse_prewalk_target(model, &Default::default())?;
         }
         if let Some(resume) = &self.resume {
             ensure!(!resume.trim().is_empty(), "resume must not be blank");

@@ -19,8 +19,9 @@ pub struct OpenAiCompatibleProvider {
 impl OpenAiCompatibleProvider {
     /// Build a provider for `base_url`. An empty `api_key` sends no
     /// `Authorization` header, which local servers commonly expect.
-    /// `context_window` fills in models whose `/models` entry omits a
-    /// context length, because local servers rarely report one.
+    /// `context_window` is the planning fallback for models whose `/models`
+    /// entry omits a context length (or when that request fails), because
+    /// local servers rarely report one.
     pub fn new(
         name: impl Into<String>,
         base_url: impl Into<String>,
@@ -47,16 +48,13 @@ impl Provider for OpenAiCompatibleProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        let mut models = self
-            .chat
+        self.chat
             .list_models()
             .await
-            .map_err(|error| error.redacted(self.chat.api_key()))?;
-        if let Some(window) = self.context_window {
-            for model in &mut models {
-                model.context_length.get_or_insert(window);
-            }
-        }
-        Ok(models)
+            .map_err(|error| error.redacted(self.chat.api_key()))
+    }
+
+    fn context_window_hint(&self) -> Option<u64> {
+        self.context_window
     }
 }

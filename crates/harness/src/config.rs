@@ -203,10 +203,10 @@ pub struct PrewalkConfig {
 }
 
 impl PrewalkConfig {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, providers: &BTreeMap<String, CustomProviderConfig>) -> Result<()> {
         match &self.model {
             Some(model) => {
-                parse_prewalk_target(model).context("[prewalk].model")?;
+                parse_prewalk_target(model, providers).context("[prewalk].model")?;
             }
             None if self.enabled => {
                 return Err(anyhow!("[prewalk].enabled requires [prewalk].model"));
@@ -218,20 +218,30 @@ impl PrewalkConfig {
 }
 
 /// Parse `[<provider>:]<model>`. A prefix is a provider only when Harness
-/// knows it, so model ids such as `vendor/model:free` keep their colon.
-pub fn parse_prewalk_target(value: &str) -> Result<PrewalkTarget> {
+/// knows it (built-in or in `providers`), so model ids such as
+/// `vendor/model:free` keep their colon.
+pub fn parse_prewalk_target(
+    value: &str,
+    providers: &BTreeMap<String, CustomProviderConfig>,
+) -> Result<PrewalkTarget> {
     let value = value.trim();
     if value.is_empty() {
         return Err(anyhow!("prewalk model must not be blank"));
     }
     if let Some((provider, model)) = value.split_once(':')
         && let Some(provider) = ProviderArg::from_name(provider)
+            .map(|provider| provider.to_string())
+            .or_else(|| {
+                providers
+                    .contains_key(provider)
+                    .then(|| provider.to_owned())
+            })
     {
         if model.is_empty() {
             return Err(anyhow!("prewalk model must not be blank"));
         }
         return Ok(PrewalkTarget {
-            provider: Some(provider.to_string()),
+            provider: Some(provider),
             model: model.to_owned(),
         });
     }
@@ -483,6 +493,17 @@ fn non_empty_env_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Load a TOML configuration.  A missing file is the same as an empty config.
+/// Whether `name` selects a built-in provider or a `[providers.<name>]` entry
+/// in the user's config file. MCP servers are ignored so that callers which
+/// override them are not blocked by stale entries.
+pub fn provider_is_known(name: &str) -> Result<bool> {
+    if ProviderArg::from_name(name).is_some() {
+        return Ok(true);
+    }
+    let file = load_file_config_with_mcp(&config_path(), Some(&[]))?;
+    Ok(file.providers.contains_key(name))
+}
+
 pub fn load_file_config(path: &Path) -> Result<FileConfig> {
     load_file_config_with_mcp(path, None)
 }
@@ -539,7 +560,7 @@ impl FileConfig {
             mcp.validate().map_err(|error| anyhow!(error))?;
         }
         if let Some(prewalk) = &self.prewalk {
-            prewalk.validate()?;
+            prewalk.validate(&self.providers)?;
         }
         for (name, provider) in &self.providers {
             provider.validate(name)?;
@@ -1385,7 +1406,7 @@ impl Config {
                 .prewalk_model
                 .as_deref()
                 .or_else(|| file.prewalk.as_ref()?.model.as_deref())
-                .map(parse_prewalk_target)
+                .map(|value| parse_prewalk_target(value, &file.providers))
                 .transpose()?,
             reasoning: cli
                 .prewalk_reasoning_effort
@@ -2042,14 +2063,36 @@ mod tests {
 
     #[test]
     fn prewalk_target_prefix_is_a_provider_only_when_known() {
-        let target = parse_prewalk_target("openrouter:vendor/model:free").unwrap();
+        let none = BTreeMap::new();
+        let target = parse_prewalk_target("openrouter:vendor/model:free", &none).unwrap();
         assert_eq!(target.provider.as_deref(), Some("openrouter"));
         assert_eq!(target.model, "vendor/model:free");
-        let target = parse_prewalk_target("vendor/model:free").unwrap();
+        let target = parse_prewalk_target("vendor/model:free", &none).unwrap();
         assert_eq!(target.provider, None);
         assert_eq!(target.model, "vendor/model:free");
-        assert!(parse_prewalk_target("openrouter:").is_err());
-        assert!(parse_prewalk_target("  ").is_err());
+        assert!(parse_prewalk_target("openrouter:", &none).is_err());
+        assert!(parse_prewalk_target("  ", &none).is_err());
+
+        // A configured custom provider name is a provider prefix too.
+        let custom = BTreeMap::from([(
+            "lmstudio".to_owned(),
+            CustomProviderConfig {
+                kind: CustomProviderKind::OpenAiCompatible,
+                base_url: "http://localhost:1234/v1".into(),
+                api_key_env: None,
+                default_model: None,
+                context_window: None,
+                headers: BTreeMap::new(),
+                env_headers: BTreeMap::new(),
+            },
+        )]);
+        let target = parse_prewalk_target("lmstudio:qwen3:8b", &custom).unwrap();
+        assert_eq!(target.provider.as_deref(), Some("lmstudio"));
+        assert_eq!(target.model, "qwen3:8b");
+        assert_eq!(
+            parse_prewalk_target("lmstudio:x", &none).unwrap().provider,
+            None
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ impl Agent {
                     candidate.id == model || candidate.name.as_deref() == Some(model.as_str())
                 })
                 .and_then(|candidate| candidate.context_length)
+                .or_else(|| self.provider.context_window_hint())
                 .unwrap_or(0);
             self.context_window = self.compaction.resolved_window(reported);
             self.publish_context_window();

@@ -193,16 +193,21 @@ environment variables, and their values are masked like
 [`[secrets]`](./configuration.md#secret-masking) entries.
 
 Local servers usually do not report context lengths. Set `context_window` so
-that compaction starts at the right time; a value reported by `/models` takes
-precedence, and `[compaction] context_window` overrides both.
+that compaction starts at the right time. It is used when `/models` fails or
+does not report a length for the model; a reported value takes precedence, and
+`[compaction] context_window` overrides both.
 
 Rules:
 
 - A name can contain ASCII letters, digits, `-`, `_`, and `.`. It cannot be a
   built-in provider name or alias.
 - `base_url` must be an `http://` or `https://` URL.
-- `Content-Type` cannot be overridden. Use either `api_key_env` or an
-  `Authorization` header, not both.
+- `Content-Type` cannot be overridden. `headers` cannot set `Authorization`,
+  because it would put a credential in `config.toml`; use `api_key_env`, or
+  name an environment variable in `env_headers`. Do not combine `api_key_env`
+  with an `Authorization` entry in `env_headers`.
+- The provider name is also valid in a `[prewalk]` target, for example
+  `model = "lmstudio:qwen3-coder-30b"`.
 - Harness sends only the standard Chat Completions request. It does not send
   provider-specific reasoning controls, so `reasoning_effort` has no effect.
 

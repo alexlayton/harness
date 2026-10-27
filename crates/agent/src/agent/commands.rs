@@ -543,7 +543,9 @@ impl Agent {
         // is fetched in the background so a slow catalogue cannot block the
         // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
-        self.context_window = self.compaction.resolved_window(0);
+        self.context_window = self
+            .compaction
+            .resolved_window(self.provider.context_window_hint().unwrap_or(0));
         self.publish_context_window();
         send(events, self.context_usage_event());
         if let Some(metadata_tx) = &self.model_metadata_tx {
