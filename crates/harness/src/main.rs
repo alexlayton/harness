@@ -415,7 +415,7 @@ async fn run_application(
     // Construct the terminal before assembling the agent or claiming the
     // Herdr pane, so setup errors leave neither running MCPs nor a report.
     let update_notice = update::check_latest().await;
-    let ui = CrossTerm::new(
+    let mut ui = CrossTerm::new(
         &config.model,
         &provider_name,
         providers,
@@ -437,6 +437,7 @@ async fn run_application(
         config.tui_minimal,
         workspace_root,
     )?;
+    ui.set_provider_aliases(ProviderArg::alias_names());
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)

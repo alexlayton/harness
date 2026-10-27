@@ -59,6 +59,23 @@ impl ProviderArg {
         Self::AnthropicSubscription,
     ];
 
+    /// Every alias (not the canonical names) that `from_name` accepts, so a
+    /// frontend can recognise `codex:<model>` without listing aliases as
+    /// separate providers.
+    pub fn alias_names() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .filter_map(|provider| provider.to_possible_value())
+            .flat_map(|value| {
+                value
+                    .get_name_and_aliases()
+                    .skip(1)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     /// Parse a provider name or alias exactly as the command line does.
     pub fn from_name(name: &str) -> Option<Self> {
         <Self as ValueEnum>::from_str(name, false).ok()
@@ -1916,6 +1933,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("/tmp/bad-config.toml"));
+    }
+
+    #[test]
+    fn alias_names_lists_aliases_but_not_canonical_names() {
+        let aliases = ProviderArg::alias_names();
+        for alias in ["codex", "copilot", "claude"] {
+            assert!(aliases.iter().any(|name| name == alias), "{alias}");
+            assert!(ProviderArg::from_name(alias).is_some());
+        }
+        assert!(!aliases.iter().any(|name| name == "openrouter"));
     }
 
     #[test]

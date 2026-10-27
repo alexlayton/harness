@@ -377,15 +377,19 @@ fn parse_model_argument<'a>(
 /// names. Provider names never contain a colon, but model ids may (Ollama
 /// `qwen3:8b`, OpenRouter `vendor/model:free`), so a bare `/model qwen3:8b`
 /// must stay one model id for the current provider.
-pub fn fold_unknown_provider_prefix(command: ParsedCommand, providers: &[String]) -> ParsedCommand {
+pub fn fold_unknown_provider_prefix(
+    command: ParsedCommand,
+    providers: &[String],
+    aliases: &[String],
+) -> ParsedCommand {
+    let known = |name: &str| {
+        providers
+            .iter()
+            .chain(aliases)
+            .any(|known| known.eq_ignore_ascii_case(name))
+    };
     let fold = |provider: Option<String>, model: String| match provider {
-        Some(name)
-            if !providers
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&name)) =>
-        {
-            (None, format!("{name}:{model}"))
-        }
+        Some(name) if !known(&name) => (None, format!("{name}:{model}")),
         provider => (provider, model),
     };
     match command {
@@ -1804,8 +1808,18 @@ mod tests {
     #[test]
     fn unknown_provider_prefix_stays_part_of_the_model_id() {
         let providers = vec!["ollama".to_owned(), "openrouter".to_owned()];
-        let fold =
-            |text: &str| fold_unknown_provider_prefix(parse_command(text).unwrap(), &providers);
+        let aliases = vec!["codex".to_owned()];
+        let fold = |text: &str| {
+            fold_unknown_provider_prefix(parse_command(text).unwrap(), &providers, &aliases)
+        };
+        // An alias still selects its provider.
+        assert_eq!(
+            fold("/model codex:gpt-5.5"),
+            ParsedCommand::SetModel {
+                provider: Some("codex".into()),
+                model: "gpt-5.5".into(),
+            }
+        );
         // A known provider: the first colon separates it from the model.
         assert_eq!(
             fold("/model OLLAMA:qwen3:8b"),
