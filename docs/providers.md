@@ -185,6 +185,11 @@ harness --provider lmstudio
 /model lmstudio:<model>
 ```
 
+The first `:` in `/model` separates the provider from the model only when the
+text before it is a provider name, so a model id with its own colon works both
+ways: `/model ollama:qwen3:8b` switches provider, and `/model qwen3:8b` keeps
+the current provider.
+
 Harness sends requests to `{base_url}/chat/completions` and reads the model
 list from `{base_url}/models`. When `api_key_env` is set, its value is sent as
 `Authorization: Bearer <key>`; otherwise no `Authorization` header is sent.

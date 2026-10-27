@@ -371,6 +371,36 @@ fn parse_model_argument<'a>(
     }
 }
 
+/// Treat a `<prefix>:` that is not a known provider as part of the model id.
+///
+/// Parsing splits at the first colon because it cannot know the provider
+/// names. Provider names never contain a colon, but model ids may (Ollama
+/// `qwen3:8b`, OpenRouter `vendor/model:free`), so a bare `/model qwen3:8b`
+/// must stay one model id for the current provider.
+pub fn fold_unknown_provider_prefix(command: ParsedCommand, providers: &[String]) -> ParsedCommand {
+    let fold = |provider: Option<String>, model: String| match provider {
+        Some(name)
+            if !providers
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(&name)) =>
+        {
+            (None, format!("{name}:{model}"))
+        }
+        provider => (provider, model),
+    };
+    match command {
+        ParsedCommand::SetModel { provider, model } => {
+            let (provider, model) = fold(provider, model);
+            ParsedCommand::SetModel { provider, model }
+        }
+        ParsedCommand::SetPrewalkModel { provider, model } => {
+            let (provider, model) = fold(provider, model);
+            ParsedCommand::SetPrewalkModel { provider, model }
+        }
+        other => other,
+    }
+}
+
 /// Parse a slash command against the static command set plus an optional
 /// dynamic skill catalog. Skill aliases (`/<skill-name>`) are only recognized
 /// when the name does not collide with a static command, so `/model` and
@@ -1769,5 +1799,35 @@ mod tests {
             assert_eq!(replacement, format!("(@src/main.rs{punctuation}"));
             assert_eq!(new_cursor, "(@src/main.rs".chars().count());
         }
+    }
+
+    #[test]
+    fn unknown_provider_prefix_stays_part_of_the_model_id() {
+        let providers = vec!["ollama".to_owned(), "openrouter".to_owned()];
+        let fold =
+            |text: &str| fold_unknown_provider_prefix(parse_command(text).unwrap(), &providers);
+        // A known provider: the first colon separates it from the model.
+        assert_eq!(
+            fold("/model OLLAMA:qwen3:8b"),
+            ParsedCommand::SetModel {
+                provider: Some("OLLAMA".into()),
+                model: "qwen3:8b".into(),
+            }
+        );
+        // No known provider: the whole text is the model id.
+        assert_eq!(
+            fold("/model qwen3:8b"),
+            ParsedCommand::SetModel {
+                provider: None,
+                model: "qwen3:8b".into(),
+            }
+        );
+        assert_eq!(
+            fold("/prewalk-model vendor/model:free"),
+            ParsedCommand::SetPrewalkModel {
+                provider: None,
+                model: "vendor/model:free".into(),
+            }
+        );
     }
 }

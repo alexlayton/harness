@@ -1609,7 +1609,7 @@ impl CrossTerm {
         input_tx: &mpsc::UnboundedSender<InputMessage>,
     ) -> Result<()> {
         let command = match commands::parse_command_with_skills(input, &self.skills) {
-            Ok(command) => command,
+            Ok(command) => commands::fold_unknown_provider_prefix(command, &self.providers),
             Err(error) => {
                 self.add_error(error);
                 return Ok(());
