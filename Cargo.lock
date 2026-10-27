@@ -4710,6 +4710,7 @@ dependencies = [
  "llm",
  "monty",
  "monty-types",
+ "num-bigint",
  "proptest",
  "rustix",
  "serde",

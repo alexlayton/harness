@@ -40,7 +40,7 @@ impl Tool for CountingTool {
 fn registry() -> (ToolRegistry, Arc<AtomicUsize>) {
     let executions = Arc::new(AtomicUsize::new(0));
     let mut registry = ToolRegistry::new(vec![Box::new(CountingTool(executions.clone()))]);
-    registry.enable_code_mode(&[]).unwrap();
+    registry.enable_codemode(&[]).unwrap();
     (registry, executions)
 }
 
@@ -48,7 +48,7 @@ fn batch() -> ToolBatch {
     ToolBatch {
         calls: vec![ToolCall {
             id: "parent-code-call".into(),
-            name: "run_code".into(),
+            name: "codemode".into(),
             arguments: json!({
                 "code": "tools['counting'](value=7)",
                 "description": "Run one callback"
@@ -80,9 +80,9 @@ impl ToolDispatchHooks for StartHooks {
     ) {
     }
 
-    fn nested(&mut self, parent: &str, event: CodeModeEvent) -> Result<(), String> {
+    fn nested(&mut self, parent: &str, event: CodemodeEvent) -> Result<(), String> {
         assert_eq!(parent, "parent-code-call");
-        if let CodeModeEvent::Started {
+        if let CodemodeEvent::Started {
             name, arguments, ..
         } = event
         {

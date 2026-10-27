@@ -1,5 +1,5 @@
 mod bash;
-mod code_mode;
+mod codemode;
 pub mod context_files;
 mod edit;
 pub mod file_mutation;
@@ -18,7 +18,7 @@ pub mod vfs;
 mod write;
 
 pub use bash::{BashTool, command_concurrency, truncate_command_output};
-pub use code_mode::{CODE_MODE_TOOL_NAME, CodeModeEvent, CodeModeExecutor};
+pub use codemode::{CODEMODE_TOOL_NAME, CodemodeEvent, CodemodeExecutor};
 pub use context_files::{
     display_path, format_context_files, load_context_files, load_context_files_with,
 };
@@ -560,7 +560,8 @@ pub fn call_summary(name: &str, args: &Value) -> String {
             .map(|command| format!("bash: {}", first_line(command)))
             .unwrap_or_else(|| "bash".into()),
         "python" => python::summary(args),
-        CODE_MODE_TOOL_NAME => code_mode::summary(args),
+        // `run_code` is the pre-rename name; old sessions still replay it.
+        CODEMODE_TOOL_NAME | "run_code" => codemode::summary(args),
         "find" => {
             let query = args.get("query").and_then(Value::as_str);
             let path = args.get("path").and_then(Value::as_str);

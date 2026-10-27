@@ -101,7 +101,7 @@ pub(crate) fn validate_remote_tool(server: &str, remote: &RemoteTool) -> Result<
             .filter(|description| !description.is_empty())
             .map_or(String::new(), |description| format!(" {description}"))
     );
-    // The output schema is part of the catalogue too (code mode shows it),
+    // The output schema is part of the catalogue too (codemode shows it),
     // so it counts toward the aggregate budget.
     let definition = serde_json::json!({
         "name": normalized_tool_name(server, name),

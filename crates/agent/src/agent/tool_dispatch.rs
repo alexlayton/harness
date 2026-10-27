@@ -1,7 +1,7 @@
 use super::InputMessage;
 use super::prewalk::triggers_handoff;
 use super::{Agent, AgentEvent, AgentSessionState, TurnError, send};
-use crate::code_mode::{AgentCodeModeExecutor, NestedEventSink, NestedNotification};
+use crate::codemode::{AgentCodemodeExecutor, NestedEventSink, NestedNotification};
 use crate::secrets::SecretMasker;
 use futures_util::FutureExt;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -16,7 +16,7 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tools::{
-    CODE_MODE_TOOL_NAME, CodeModeEvent, Concurrency, ToolOutput, ToolRegistry, call_summary,
+    CODEMODE_TOOL_NAME, CodemodeEvent, Concurrency, ToolOutput, ToolRegistry, call_summary,
 };
 
 /// Upper bound on read-only tool calls running at once.  Read tools are
@@ -124,7 +124,7 @@ fn execution_arguments(
     match secrets {
         Some(masker)
             if restore_secrets
-                && call.name != CODE_MODE_TOOL_NAME
+                && call.name != CODEMODE_TOOL_NAME
                 && registry.accepts_restored_secrets(&call.name) =>
         {
             let (value, rejected_key) = masker.restore_json_for_execution(&call.arguments);
@@ -188,7 +188,7 @@ pub(crate) trait ToolDispatchHooks {
 
     /// Acknowledge a nested event before the workflow can continue. In
     /// particular, a start must be durable before tool side effects begin.
-    fn nested(&mut self, _parent: &str, _event: CodeModeEvent) -> Result<(), String> {
+    fn nested(&mut self, _parent: &str, _event: CodemodeEvent) -> Result<(), String> {
         Ok(())
     }
 }
@@ -199,7 +199,7 @@ struct AgentToolDispatchHooks<'a> {
     session: Option<&'a mut AgentSessionState>,
     secrets: &'a SecretMasker,
     nested_starts: HashMap<String, (String, Instant)>,
-    /// A nested code-mode call that ends the prewalk planning phase.
+    /// A nested codemode call that ends the prewalk planning phase.
     nested_handoff: bool,
 }
 
@@ -271,11 +271,11 @@ impl ToolDispatchHooks for AgentToolDispatchHooks<'_> {
         }
     }
 
-    fn nested(&mut self, parent: &str, event: CodeModeEvent) -> Result<(), String> {
+    fn nested(&mut self, parent: &str, event: CodemodeEvent) -> Result<(), String> {
         // Unknown events are durable audit records, not provider messages.
-        // Only the parent run_code call/result enters model history.
+        // Only the parent codemode call/result enters model history.
         let durable = match &event {
-            CodeModeEvent::Started {
+            CodemodeEvent::Started {
                 call_id,
                 name,
                 arguments,
@@ -288,7 +288,7 @@ impl ToolDispatchHooks for AgentToolDispatchHooks<'_> {
                     "arguments": arguments,
                 }),
             },
-            CodeModeEvent::Finished {
+            CodemodeEvent::Finished {
                 call_id,
                 name,
                 output,
@@ -327,7 +327,7 @@ impl ToolDispatchHooks for AgentToolDispatchHooks<'_> {
             })?;
         }
         match event {
-            CodeModeEvent::Started {
+            CodemodeEvent::Started {
                 call_id,
                 name,
                 arguments,
@@ -344,7 +344,7 @@ impl ToolDispatchHooks for AgentToolDispatchHooks<'_> {
                     },
                 );
             }
-            CodeModeEvent::Finished {
+            CodemodeEvent::Finished {
                 call_id,
                 name,
                 output,
@@ -525,12 +525,12 @@ async fn execute_with_secret_policy(
             is_error: true,
             summary: "rejected secret-bearing argument key".into(),
         }
-    } else if name == CODE_MODE_TOOL_NAME && registry.code_mode_enabled() {
+    } else if name == CODEMODE_TOOL_NAME && registry.codemode_enabled() {
         let cancel = notifications.cancel.clone();
         let executor =
-            AgentCodeModeExecutor::new(registry, secrets, restore_secrets, notifications);
+            AgentCodemodeExecutor::new(registry, secrets, restore_secrets, notifications);
         registry
-            .execute_code_mode(arguments.value, cancel, &executor)
+            .execute_codemode(arguments.value, cancel, &executor)
             .await
     } else {
         registry
@@ -720,7 +720,7 @@ impl Agent {
     /// parent history so provider history stays valid.
     ///
     /// Returns whether the round called a tool that ends the prewalk
-    /// planning phase, directly or through code mode.
+    /// planning phase, directly or through codemode.
     pub(crate) async fn dispatch_tool_batches(
         &mut self,
         tool_calls: Vec<ToolCall>,
@@ -888,7 +888,7 @@ fn send_finished(
 }
 
 #[cfg(test)]
-mod code_mode_tests;
+mod codemode_tests;
 
 #[cfg(test)]
 mod tests {

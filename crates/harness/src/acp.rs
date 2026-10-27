@@ -1461,8 +1461,8 @@ async fn spawn_agent(
         state.config.codex_auth.clone(),
         state.config.anthropic_auth.clone(),
     ));
-    if let Some(tools) = &state.config.code_mode {
-        builder = builder.with_code_mode(tools.clone());
+    if let Some(tools) = &state.config.codemode {
+        builder = builder.with_codemode(tools.clone());
     }
     let agent = build_agent_with_timeout(builder, &cancel, SESSION_ASSEMBLY_TIMEOUT).await?;
     if cancel.is_cancelled() {

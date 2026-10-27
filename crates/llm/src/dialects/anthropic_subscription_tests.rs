@@ -211,7 +211,7 @@ fn signed_and_redacted_thinking_roundtrip_without_display_duplication() {
 
 #[test]
 fn registered_tool_spellings_roundtrip_with_one_wire_prefix() {
-    for registered in ["read", "_read", "run_code"] {
+    for registered in ["read", "_read", "codemode"] {
         for response_name in [registered.to_owned(), format!("_{registered}")] {
             let mut req = request();
             req.tools[0].name = registered.into();
@@ -277,7 +277,7 @@ fn exact_wire_names_take_precedence_over_original_name_aliases() {
 #[test]
 fn name_aliases_do_not_expose_folded_or_unregistered_tools() {
     let mut req = request();
-    req.tools[0].name = "run_code".into();
+    req.tools[0].name = "codemode".into();
     req.tools[0].description = "Available functions: read, write, python".into();
     for name in [
         "read",
@@ -286,7 +286,7 @@ fn name_aliases_do_not_expose_folded_or_unregistered_tools() {
         "_write",
         "python",
         "_python",
-        "__run_code",
+        "__codemode",
     ] {
         let mut parser = SubscriptionParser::new(&req);
         start(&mut parser);

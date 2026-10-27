@@ -90,46 +90,53 @@ builds, and tests. Monty runs in the Harness process and is **not** a security
 boundary or crash-isolated sandbox. No configuration is needed to enable these
 tools.
 
-## Code mode
+## Codemode
 
-Code mode lets the model write one Python program that calls selected tools and
+Codemode lets the model write one Python program that calls selected tools and
 filters their results. Enable it in `config.toml`:
 
 ```toml
-[code_mode]
+[codemode]
 enabled = true
 ```
 
-It is off by default. The setting applies to the terminal UI, headless mode,
+It is off by default. The older `[code_mode]` table name is still read. The setting applies to the terminal UI, headless mode,
 and ACP. Restart Harness to change the selection. With no `tools` list, all
 eligible built-in and connected MCP tools are selected. To select fewer tools:
 
 ```toml
-[code_mode]
+[codemode]
 enabled = true
 tools = ["read", "find", "grep", "outline"]
 ```
 
 Use the registered, namespaced names for MCP tools. Unknown or excluded names
-stop startup with an error. `bash`, `python`, `subagent`, and `run_code` cannot
+stop startup with an error. `bash`, `python`, `subagent`, and `codemode` cannot
 be selected. `bash` and `subagent` stay available as normal model calls when
-registered. Code mode replaces the standalone `python` tool: its definition and
-prompt guidance are hidden, and calculations run directly in `run_code` without
-calling any tools. With code mode disabled, `python` remains available normally.
+registered. Codemode replaces the standalone `python` tool: its definition and
+prompt guidance are hidden, and calculations run directly in `codemode` without
+calling any tools. With codemode disabled, `python` remains available normally.
 Other tools not in an explicit selection also remain normal model calls.
 Subagents keep their existing tool sets, including standalone `python` for
-workspace children; they do not receive code mode or the parent's MCP tools.
+workspace children; they do not receive codemode or the parent's MCP tools.
 
-Selected tools are removed from the model-facing native tool list. Their
-schemas and descriptions instead form the `run_code` catalogue. Catalogue
-construction stops if its serialized JSON exceeds 512 KiB; select fewer tools
-if startup reports this limit. Inside a snippet, each function is available
+Selected tools are removed from the model-facing native tool list. The
+`codemode` description lists each one as a compact signature and first sentence
+(for example `read(path, offset?, limit?)`), within a small byte budget; tools
+past the budget appear by name only. Full descriptions, parameter schemas, and
+output schemas stay inside Harness and are not sent with every request. A
+snippet reads them on demand through three globals, which are host metadata
+and do not count as tool calls: `TOOLS` (name to summary), `describe(name)`
+(full description, parameters, and output schema), and `MODULES` (available
+and unavailable Python modules). Catalogue construction stops if its
+serialized JSON exceeds 512 KiB; select fewer tools if startup reports this
+limit. Inside a snippet, each function is available
 through `tools["name"]`. This dictionary
 preserves MCP names that contain characters which are not valid in Python
 identifiers. Use keyword arguments, including `**{"class": value}` when a
 parameter name is a Python keyword.
 
-For example, the model can send this source in `run_code`, with a short
+For example, the model can send this source in `codemode`, with a short
 `description` label:
 
 ```python
@@ -182,7 +189,7 @@ file access goes through the selected tools. As with `python`, Monty runs in
 process: it is not crash-isolated, and there is no enforced memory sandbox.
 A cancelled interpreter step can finish computing up to its execution limit,
 but it cannot start host tools. MCP servers retain their normal external
-access; code mode does not make those servers a security sandbox.
+access; codemode does not make those servers a security sandbox.
 
 ## Secret masking
 
@@ -244,7 +251,7 @@ Turn activity, usage, completion, and session output are unchanged.
 Prewalk is a one-shot handoff from the active (planning) model to a faster or
 cheaper target model. The planning model investigates the workspace, writes a
 short numbered plan in its visible reply, and makes the first change. After the
-first tool round that calls `edit` or `write` (also inside `run_code`, and also
+first tool round that calls `edit` or `write` (also inside `codemode`, and also
 when the call fails), Harness switches to the target model and tells it to
 continue the plan. Other tools, including `bash`, do not end the planning phase.
 

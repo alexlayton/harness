@@ -444,8 +444,8 @@ async fn run_application(
         .with_session(session_store, session)
         .with_prewalk(config.prewalk.settings(cli.resume.is_some())?)
         .with_provider_factory(provider_factory);
-    if let Some(tools) = &config.code_mode {
-        builder = builder.with_code_mode(tools.clone());
+    if let Some(tools) = &config.codemode {
+        builder = builder.with_codemode(tools.clone());
     }
     let agent = builder.build().await?;
 

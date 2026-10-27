@@ -1,4 +1,4 @@
-//! Agent policy for code-mode callbacks. The code itself always stays masked;
+//! Agent policy for codemode callbacks. The code itself always stays masked;
 //! only an opted-in tool receives a temporary restored argument view.
 //!
 //! Nested starts are acknowledged only after their durable record is written.
@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tools::{CodeModeEvent, CodeModeExecutor, ToolOutput, ToolRegistry};
+use tools::{CodemodeEvent, CodemodeExecutor, ToolOutput, ToolRegistry};
 
 /// A callback waits for the dispatch loop to persist and acknowledge its event.
 pub(crate) struct NestedNotification {
     pub(crate) parent_call_id: String,
-    pub(crate) event: CodeModeEvent,
+    pub(crate) event: CodemodeEvent,
     pub(crate) ack: oneshot::Sender<Result<(), String>>,
 }
 
@@ -29,14 +29,14 @@ pub(crate) struct NestedEventSink {
 
 /// Applies the same secret boundary as ordinary dispatch, without reacquiring
 /// the registry execution gate already held for the complete workflow.
-pub(crate) struct AgentCodeModeExecutor<'a> {
+pub(crate) struct AgentCodemodeExecutor<'a> {
     registry: &'a ToolRegistry,
     secrets: Option<&'a SecretMasker>,
     restore_secrets: bool,
     notifications: NestedEventSink,
 }
 
-impl<'a> AgentCodeModeExecutor<'a> {
+impl<'a> AgentCodemodeExecutor<'a> {
     pub(crate) fn new(
         registry: &'a ToolRegistry,
         secrets: Option<&'a SecretMasker>,
@@ -51,15 +51,15 @@ impl<'a> AgentCodeModeExecutor<'a> {
         }
     }
 
-    fn mask_event(&self, event: CodeModeEvent) -> CodeModeEvent {
+    fn mask_event(&self, event: CodemodeEvent) -> CodemodeEvent {
         // Namespace bridge-local IDs so successive workflows cannot collide
         // in the frontend, even if each interpreter starts its counter at zero.
         match event {
-            CodeModeEvent::Started {
+            CodemodeEvent::Started {
                 call_id,
                 name,
                 arguments,
-            } => CodeModeEvent::Started {
+            } => CodemodeEvent::Started {
                 call_id: format!("{}:{call_id}", self.notifications.parent_call_id),
                 name: self
                     .secrets
@@ -69,11 +69,11 @@ impl<'a> AgentCodeModeExecutor<'a> {
                     None => arguments,
                 },
             },
-            CodeModeEvent::Finished {
+            CodemodeEvent::Finished {
                 call_id,
                 name,
                 output,
-            } => CodeModeEvent::Finished {
+            } => CodemodeEvent::Finished {
                 call_id: format!("{}:{call_id}", self.notifications.parent_call_id),
                 name: self
                     .secrets
@@ -88,7 +88,7 @@ impl<'a> AgentCodeModeExecutor<'a> {
 }
 
 #[async_trait]
-impl CodeModeExecutor for AgentCodeModeExecutor<'_> {
+impl CodemodeExecutor for AgentCodemodeExecutor<'_> {
     async fn call(
         &self,
         name: &str,
@@ -126,7 +126,7 @@ impl CodeModeExecutor for AgentCodeModeExecutor<'_> {
         let result = tokio::select! {
             biased;
             _ = self.notifications.cancel.cancelled() => (rejected("cancelled"), None),
-            result = self.registry.execute_code_mode_tool(name, arguments, cancel) => result,
+            result = self.registry.execute_codemode_tool(name, arguments, cancel) => result,
         };
         match self.secrets {
             Some(masker) => (
@@ -137,7 +137,7 @@ impl CodeModeExecutor for AgentCodeModeExecutor<'_> {
         }
     }
 
-    async fn record(&self, event: CodeModeEvent) -> Result<(), String> {
+    async fn record(&self, event: CodemodeEvent) -> Result<(), String> {
         let (ack, received) = oneshot::channel();
         let notification = NestedNotification {
             parent_call_id: self.notifications.parent_call_id.clone(),
@@ -146,17 +146,17 @@ impl CodeModeExecutor for AgentCodeModeExecutor<'_> {
         };
         tokio::select! {
             biased;
-            _ = self.notifications.cancel.cancelled() => return Err("code-mode workflow cancelled".into()),
-            _ = self.notifications.admission.cancelled() => return Err("code-mode admission closed".into()),
+            _ = self.notifications.cancel.cancelled() => return Err("codemode workflow cancelled".into()),
+            _ = self.notifications.admission.cancelled() => return Err("codemode admission closed".into()),
             sent = self.notifications.sender.send(notification) => {
-                sent.map_err(|_| "code-mode dispatch closed".to_owned())?;
+                sent.map_err(|_| "codemode dispatch closed".to_owned())?;
             }
         }
         tokio::select! {
             biased;
-            _ = self.notifications.cancel.cancelled() => Err("code-mode workflow cancelled".into()),
-            _ = self.notifications.admission.cancelled() => Err("code-mode admission closed".into()),
-            result = received => result.map_err(|_| "code-mode acknowledgement dropped".to_owned())?,
+            _ = self.notifications.cancel.cancelled() => Err("codemode workflow cancelled".into()),
+            _ = self.notifications.admission.cancelled() => Err("codemode admission closed".into()),
+            result = received => result.map_err(|_| "codemode acknowledgement dropped".to_owned())?,
         }
     }
 }
@@ -181,7 +181,7 @@ fn rejected(content: &str) -> ToolOutput {
     ToolOutput {
         content: content.into(),
         is_error: true,
-        summary: "code-mode callback rejected".into(),
+        summary: "codemode callback rejected".into(),
     }
 }
 
@@ -250,10 +250,10 @@ mod tests {
             }),
         ])
         .unwrap();
-        registry.enable_code_mode(&[]).unwrap();
+        registry.enable_codemode(&[]).unwrap();
         let masker = SecretMasker::new([("TOKEN".into(), "secret-value".into())]).unwrap();
         let (sender, _receiver) = mpsc::channel(1);
-        let executor = AgentCodeModeExecutor::new(
+        let executor = AgentCodemodeExecutor::new(
             &registry,
             Some(&masker),
             true,
@@ -287,12 +287,12 @@ mod tests {
             assert!(output.is_error);
         }
         assert_eq!(received.lock().unwrap().len(), 2);
-        let event = executor.mask_event(CodeModeEvent::Started {
+        let event = executor.mask_event(CodemodeEvent::Started {
             call_id: "nested".into(),
             name: "tool-secret-value".into(),
             arguments: json!({"value": "secret-value"}),
         });
-        let CodeModeEvent::Started {
+        let CodemodeEvent::Started {
             name, arguments, ..
         } = event
         else {
@@ -300,7 +300,7 @@ mod tests {
         };
         assert_eq!(name, format!("tool-{placeholder}"));
         assert_eq!(arguments["value"], placeholder);
-        let event = executor.mask_event(CodeModeEvent::Finished {
+        let event = executor.mask_event(CodemodeEvent::Finished {
             call_id: "nested".into(),
             name: "tool-secret-value".into(),
             output: ToolOutput {
@@ -309,7 +309,7 @@ mod tests {
                 is_error: false,
             },
         });
-        let CodeModeEvent::Finished { name, output, .. } = event else {
+        let CodemodeEvent::Finished { name, output, .. } = event else {
             unreachable!()
         };
         assert_eq!(name, format!("tool-{placeholder}"));
@@ -326,9 +326,9 @@ mod tests {
             received: received.clone(),
         })])
         .unwrap();
-        registry.enable_code_mode(&[]).unwrap();
+        registry.enable_codemode(&[]).unwrap();
         let (sender, mut receiver) = mpsc::channel(1);
-        let executor = AgentCodeModeExecutor::new(
+        let executor = AgentCodemodeExecutor::new(
             &registry,
             None,
             true,
@@ -341,7 +341,7 @@ mod tests {
         );
         let workflow = async {
             executor
-                .record(CodeModeEvent::Started {
+                .record(CodemodeEvent::Started {
                     call_id: "nested".into(),
                     name: "local".into(),
                     arguments: json!({}),
@@ -357,7 +357,7 @@ mod tests {
         let notification = receiver.recv().await.unwrap();
         assert_eq!(notification.parent_call_id, "parent");
         assert!(
-            matches!(notification.event, CodeModeEvent::Started { call_id, .. } if call_id == "parent:nested")
+            matches!(notification.event, CodemodeEvent::Started { call_id, .. } if call_id == "parent:nested")
         );
         assert!(received.lock().unwrap().is_empty());
         notification.ack.send(Err("persist failed".into())).unwrap();

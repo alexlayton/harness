@@ -1,7 +1,7 @@
 pub mod agent;
 pub mod assembly;
 mod blocking;
-mod code_mode;
+mod codemode;
 pub mod prompt;
 pub mod secrets;
 pub mod subagent;

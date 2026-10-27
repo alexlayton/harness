@@ -2,7 +2,7 @@
 //!
 //! While armed, the planning model investigates, writes a visible plan, and
 //! starts the change. The first `edit` or `write` call, including one nested
-//! in `run_code`, ends the planning phase: after that tool round is persisted,
+//! in `codemode`, ends the planning phase: after that tool round is persisted,
 //! the agent switches to the target model and nudges it to continue the plan.
 //! Harness has no todo tool, so the plan must be visible assistant text; opaque
 //! or provider-specific reasoning does not survive a cross-provider switch.

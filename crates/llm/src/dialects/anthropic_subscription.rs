@@ -263,7 +263,7 @@ impl SubscriptionParser {
             .iter()
             .map(|t| (format!("_{}", t.name), t.name.clone()))
             .collect();
-        // Prompt guidance and code-mode catalogues use original names. Accept
+        // Prompt guidance and codemode catalogues use original names. Accept
         // those too when the model omits our wire prefix, but only for tools
         // offered in this request. Exact wire names take precedence if a tool
         // already starts with `_`; never strip prefixes from arbitrary names.

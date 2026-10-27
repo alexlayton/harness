@@ -19,8 +19,8 @@ const MAX_OUTPUT_BYTES: usize = 50 * 1024;
 const RUN_LIMIT: Duration = Duration::from_secs(5);
 // Keep these lists in the tool definition so the model does not need web access
 // to discover Monty's fixed import surface (Monty 1.0.0-beta.2).
-const AVAILABLE_MODULES: &str = "asyncio, base64, binascii, collections, copy, dataclasses, datetime, functools, itertools, json, math, os, pathlib, random, re, sys, time, typing, unicodedata";
-const UNAVAILABLE_MODULES: &str = "abc, argparse, array, bisect, contextlib, csv, ctypes, decimal, enum, fractions, hashlib, heapq, hmac, http, inspect, io, logging, multiprocessing, operator, pickle, queue, socket, string, struct, subprocess, tempfile, threading, traceback, types, typing_extensions, unittest, urllib, uuid, warnings, weakref, zipfile, zlib, _collections_abc, _typeshed";
+pub(crate) const AVAILABLE_MODULES: &str = "asyncio, base64, binascii, collections, copy, dataclasses, datetime, functools, itertools, json, math, os, pathlib, random, re, sys, time, typing, unicodedata";
+pub(crate) const UNAVAILABLE_MODULES: &str = "abc, argparse, array, bisect, contextlib, csv, ctypes, decimal, enum, fractions, hashlib, heapq, hmac, http, inspect, io, logging, multiprocessing, operator, pickle, queue, socket, string, struct, subprocess, tempfile, threading, traceback, types, typing_extensions, unittest, urllib, uuid, warnings, weakref, zipfile, zlib, _collections_abc, _typeshed";
 
 /// Execute standalone Python snippets in the Monty interpreter.
 pub struct PythonTool;

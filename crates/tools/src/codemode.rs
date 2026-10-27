@@ -9,17 +9,14 @@ use monty_types::{
     CompileOptions, ExcType, ExtFunctionResult, MontyException, MontyObject, NameLookupResult,
     ObjectRef, PrintWriter, ResourceLimits, ResourceTracker, SleepMode,
 };
-use serde::Serialize;
-use serde::ser::{SerializeSeq, Serializer};
 use serde_json::{Map, Value, json};
 use std::fmt::Write;
-use std::io;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Name of the code-mode tool. Shared so the registry, dispatch, and
+/// Name of the codemode tool. Shared so the registry, dispatch, and
 /// summaries cannot drift apart.
-pub const CODE_MODE_TOOL_NAME: &str = "run_code";
+pub const CODEMODE_TOOL_NAME: &str = "codemode";
 
 const MAX_CODE_BYTES: usize = 32 * 1024;
 const MAX_VALUE_BYTES: usize = 50 * 1024;
@@ -34,7 +31,7 @@ mod tests;
 
 /// An internal tool lifecycle, separate from model-issued tool calls.
 #[derive(Clone, Debug)]
-pub enum CodeModeEvent {
+pub enum CodemodeEvent {
     /// Must be acknowledged before the tool is allowed to start.
     Started {
         call_id: String,
@@ -52,7 +49,7 @@ pub enum CodeModeEvent {
 /// Host policy for nested calls. Implementations must check tool access and
 /// apply per-tool secret handling before returning either result form.
 #[async_trait]
-pub trait CodeModeExecutor: Send + Sync {
+pub trait CodemodeExecutor: Send + Sync {
     /// Execute one selected tool, returning display text and optional JSON.
     async fn call(
         &self,
@@ -63,7 +60,7 @@ pub trait CodeModeExecutor: Send + Sync {
 
     /// Record a lifecycle event. A failed acknowledgement stops the snippet;
     /// it is not a catchable Python exception that could permit more calls.
-    async fn record(&self, _event: CodeModeEvent) -> Result<(), String> {
+    async fn record(&self, _event: CodemodeEvent) -> Result<(), String> {
         Ok(())
     }
 }
@@ -71,95 +68,181 @@ pub trait CodeModeExecutor: Send + Sync {
 /// One immutable catalogue, generated from the same registered tool specs that
 /// previously supplied native definitions. The dictionary interface preserves
 /// arbitrary MCP names and keyword names without lossy Python aliases.
-pub(crate) struct CodeMode {
+///
+/// Only a compact index is sent to the model. Full descriptions and JSON
+/// schemas stay host-side and are reached from Python through `describe()`,
+/// so the provider-visible prompt does not grow with every connected server.
+pub(crate) struct Codemode {
     pub(crate) names: Vec<String>,
+    entries: Vec<Entry>,
     spec: ToolSpec,
 }
 
-#[derive(Serialize)]
-struct CatalogEntry<'a> {
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a Value,
-    output_schema: Option<Value>,
+/// Full catalogue entry, served lazily by `describe(name)`.
+struct Entry {
+    name: String,
+    summary: String,
+    full: Value,
 }
 
-// Stop serialization on overflow, not after constructing an arbitrarily large
-// JSON string. Tool specs are borrowed and output schemas are obtained lazily,
-// so rejection also avoids copying the rest of the selected catalogue.
-struct CatalogWriter(Vec<u8>);
+/// Bytes of the model-facing index spent on `name(args) - summary` lines.
+/// Tools past this budget are listed by name only.
+const INDEX_BUDGET: usize = 4 * 1024;
+/// Bytes for the names-only tail. Anything beyond is reachable via `TOOLS`.
+const INDEX_TAIL_BUDGET: usize = 2 * 1024;
+const MAX_SUMMARY_CHARS: usize = 100;
+const MAX_SIGNATURE_PARAMS: usize = 8;
 
-impl io::Write for CatalogWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > MAX_CATALOG_BYTES.saturating_sub(self.0.len()) {
-            return Err(io::Error::new(
-                io::ErrorKind::FileTooLarge,
-                "code-mode catalogue exceeds 512 KiB; select fewer tools",
-            ));
+/// Globals resolved lazily by the host when a snippet first uses the name.
+const GLOBAL_TOOLS: &str = "TOOLS";
+const GLOBAL_MODULES: &str = "MODULES";
+const GLOBAL_DESCRIBE: &str = "describe";
+
+/// First sentence of a tool description, without the generated MCP prefix.
+fn first_sentence(description: &str) -> String {
+    let mut text = description.trim();
+    if text.starts_with("MCP tool `")
+        && let Some(end) = text.find("`.")
+    {
+        let rest = &text[end + 2..];
+        // Skip the "from server `x`." clause when present.
+        text = rest.trim_start();
+    }
+    let line = text.lines().next().unwrap_or("");
+    let end = line
+        .match_indices(". ")
+        .next()
+        .map_or(line.len(), |(index, _)| index + 1);
+    let sentence = line[..end].trim();
+    if sentence.chars().count() <= MAX_SUMMARY_CHARS {
+        sentence.to_owned()
+    } else {
+        let cut: String = sentence.chars().take(MAX_SUMMARY_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
+/// Compact signature such as `read(path, offset?, limit?)`; `?` is optional.
+fn signature(name: &str, parameters: &Value) -> String {
+    let required: Vec<&str> = parameters
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|names| names.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let mut parts = Vec::new();
+    if let Some(properties) = parameters.get("properties").and_then(Value::as_object) {
+        for (index, key) in properties.keys().enumerate() {
+            if index == MAX_SIGNATURE_PARAMS {
+                parts.push("…".to_owned());
+                break;
+            }
+            parts.push(if required.contains(&key.as_str()) {
+                key.clone()
+            } else {
+                format!("{key}?")
+            });
         }
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
     }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
+    format!("{name}({})", parts.join(", "))
 }
 
-impl CodeMode {
+/// Render the model-facing index within its byte budgets.
+fn render_index(entries: &[Entry], parameters: &[String]) -> String {
+    let mut out = String::new();
+    let mut tail: Vec<&str> = Vec::new();
+    for (entry, signature) in entries.iter().zip(parameters) {
+        let line = if entry.summary.is_empty() {
+            format!("- {signature}\n")
+        } else {
+            format!("- {signature} - {}\n", entry.summary)
+        };
+        if tail.is_empty() && out.len() + line.len() <= INDEX_BUDGET {
+            out.push_str(&line);
+        } else {
+            tail.push(&entry.name);
+        }
+    }
+    if !tail.is_empty() {
+        let mut names = String::new();
+        let mut shown = 0;
+        for name in &tail {
+            if names.len() + name.len() + 2 > INDEX_TAIL_BUDGET {
+                break;
+            }
+            if shown > 0 {
+                names.push_str(", ");
+            }
+            names.push_str(name);
+            shown += 1;
+        }
+        out.push_str(&format!("More (names only; use describe): {names}"));
+        if shown < tail.len() {
+            out.push_str(&format!(" and {} more in TOOLS", tail.len() - shown));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+impl Codemode {
     pub(crate) fn new<'a>(
         tools: impl IntoIterator<Item = (&'a ToolSpec, Option<Value>)>,
     ) -> Result<Self, String> {
-        let mut writer = CatalogWriter(Vec::new());
-        let mut serializer = serde_json::Serializer::pretty(&mut writer);
-        let mut catalog = serializer
-            .serialize_seq(None)
-            .map_err(|err| err.to_string())?;
         let mut names = Vec::new();
+        let mut entries = Vec::new();
+        let mut signatures = Vec::new();
+        let mut total = 0usize;
         for (spec, output_schema) in tools {
-            catalog
-                .serialize_element(&CatalogEntry {
-                    name: &spec.definition.name,
-                    description: &spec.definition.description,
-                    parameters: &spec.definition.parameters,
-                    output_schema,
-                })
-                .map_err(|err| err.to_string())?;
-            names.push(spec.definition.name.clone());
+            let definition = &spec.definition;
+            if definition.name == GLOBAL_DESCRIBE {
+                return Err(format!(
+                    "tool name is reserved by codemode: {GLOBAL_DESCRIBE}"
+                ));
+            }
+            let full = json!({
+                "name": definition.name,
+                "description": definition.description,
+                "parameters": definition.parameters,
+                "output_schema": output_schema,
+            });
+            // Bound the catalogue as it grows; the full text is kept host-side.
+            total = total.saturating_add(full.to_string().len());
+            if total > MAX_CATALOG_BYTES {
+                return Err("codemode catalogue exceeds 512 KiB; select fewer tools".into());
+            }
+            signatures.push(signature(&definition.name, &definition.parameters));
+            entries.push(Entry {
+                name: definition.name.clone(),
+                summary: first_sentence(&definition.description),
+                full,
+            });
+            names.push(definition.name.clone());
         }
         if names.is_empty() {
             return Err("no eligible tools selected".into());
         }
-        catalog.end().map_err(|err| err.to_string())?;
-        let catalog = String::from_utf8(writer.0).map_err(|err| err.to_string())?;
+        let index = render_index(&entries, &signatures);
         let spec = ToolSpec {
             definition: ToolDefinition {
-                name: CODE_MODE_TOOL_NAME.into(),
+                name: CODEMODE_TOOL_NAME.into(),
                 description: format!(
                     concat!(
-                        "Execute Python calculations and tool orchestration in Monty with selected Harness tools as functions. ",
-                        "Tool calls are optional: calculations and data transformations can use ordinary Python without accessing tools. Prefer run_code over bash for Python computation. ",
-                        "Prefer ONE run_code call for a complete, self-contained task when it fits the limits. ",
-                        "Plan the workflow before calling: put required preflight checks, repeated lookups, dependent calls, and result filtering in the SAME snippet. ",
-                        "The catalogue entries are Python functions, not native tools. Call them only inside run_code; do not issue them as separate tool calls. ",
-                        "Use loops for multiple inputs and variables/conditionals to use earlier results in later calls; do not return to the model between steps that Python can handle. ",
-                        "Do not add unnecessary service checks or split a task merely to inspect a successful check. ",
-                        "Split only when results need model reasoning or a user decision, an unexpected failure needs inspection, or the workflow would exceed limits. Never guess arguments or continue unsafe work just to keep one call. ",
-                        "Call tools[\"name\"](**keyword_arguments), using names and arguments from the catalogue below. Calls are synchronous and sequential; do not await them or use asyncio.gather. ",
-                        "Return a concise combined result with only the facts needed for the answer. Extract relevant fields or text inside Python instead of printing complete reports, debug logs, or successful preflight output. ",
-                        "The final expression is returned; print() is supplementary output and also enters model context. Once the result is sufficient, answer the user directly. ",
-                        "Tools with structured JSON return that JSON as Python dict/list/scalars; other tools (and structured results too large to convert) return display text as str. Do not assume text results are JSON. Failed tools raise RuntimeError. ",
-                        "Only the listed functions are allowed. No direct filesystem, environment, network, clock, or OS access. No built-in shell, subagents, recursive code execution, third-party packages, or state between calls. ",
-                        "Limits: 32 KiB code, 50 nested calls, 50 KiB arguments/results/output, 5 seconds total interpreter execution, 120 seconds elapsed time. ",
-                        "On failure inspect the started-call summary before retrying: completed changes are not rolled back. Execution is in-process, not crash-isolated or a memory security boundary. ",
-                        "Available functions and their original JSON schemas:\n{}"
+                        "Run Python (Monty) that calls selected tools as functions; prefer it over bash for Python computation. ",
+                        "Put dependent calls, loops and filtering in ONE snippet. Call tools[\"name\"](**kwargs): keyword arguments only, synchronous, no await. ",
+                        "Structured tools return dict/list/scalars, others return str; a failed tool raises RuntimeError. ",
+                        "The last expression is the result; print() output also enters context, so return only the facts needed. ",
+                        "Globals: TOOLS (name -> summary), describe(name) (full description, parameters and output schema; use it when arguments are unclear), MODULES (importable and unavailable modules). ",
+                        "No file, env, network or OS access, no third-party packages, no state between calls. ",
+                        "Limits: 32 KiB code, 50 tool calls, 50 KiB per value, 5 s compute, 120 s total. ",
+                        "Completed tool calls are not rolled back on failure; inspect before replaying. ",
+                        "Tools (`?` = optional argument):\n{}"
                     ),
-                    catalog
+                    index
                 ),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "code": {"type": "string", "description": "Python source for the complete task: combine required checks, loops, dependent tool calls, and filtering in one snippet when safe and within limits. Access tool functions through the tools dictionary. Return a concise combined final expression, not complete raw reports."},
+                        "code": {"type": "string", "description": "Python source for the whole task. Return a concise final expression."},
                         "description": {"type": "string", "minLength": 1, "maxLength": 80, "description": "Short, single-line action label describing the purpose."}
                     },
                     "required": ["code", "description"],
@@ -167,17 +250,67 @@ impl CodeMode {
                 }),
             },
             prompt: ToolPrompt::new(
-                "Run Python calculations and orchestrate selected tools with sequential function calls",
+                "Run Python that calls selected tools as functions (see its description)",
                 [
-                    "Use run_code for standalone Python calculations and data transformations instead of launching Python with bash. No tool calls are required for pure computation.",
-                    "Prefer one run_code call per complete, self-contained task within the execution limits. Include required preflight checks, loops over multiple inputs, dependent calls, and filtering in the same snippet; do not add unnecessary checks or return to the model between steps Python can handle. Split when results need model reasoning, user input, failure inspection, or more execution budget, not merely because tools depend on each other.",
-                    "Use tools[\"name\"](**kwargs); nested calls run sequentially and return JSON when available, otherwise text. Return only a concise combined result needed for the answer. Printed text also enters model context: do not print complete reports or successful preflight output unless needed. Once the result is sufficient, answer directly.",
-                    "Catalogue entries are Python functions, not native tools. Call them only inside run_code, never as separate tool calls.",
-                    "Code-mode state is fresh for each call. On errors or interruption, do not blindly replay a snippet: earlier tool calls can already have changed files or external state. Never continue unsafe work just to keep a single call.",
+                    "Use codemode instead of bash for Python computation; batch dependent tool calls into one snippet and return only what the answer needs. Do not blindly replay a failed snippet: earlier calls may have changed state.",
                 ],
             ),
         };
-        Ok(Self { names, spec })
+        Ok(Self {
+            names,
+            entries,
+            spec,
+        })
+    }
+
+    /// Value for a lazily resolved sandbox global, or `None` if undefined.
+    fn global(&self, name: &str) -> Option<MontyObject> {
+        match name {
+            GLOBAL_TOOLS => Some(MontyObject::dict(self.entries.iter().map(|entry| {
+                (
+                    MontyObject::string(&entry.name),
+                    MontyObject::string(&entry.summary),
+                )
+            }))),
+            GLOBAL_MODULES => {
+                let list =
+                    |text: &str| MontyObject::list(text.split(", ").map(MontyObject::string));
+                Some(MontyObject::dict([
+                    (
+                        MontyObject::string("available"),
+                        list(super::python::AVAILABLE_MODULES),
+                    ),
+                    (
+                        MontyObject::string("unavailable"),
+                        list(super::python::UNAVAILABLE_MODULES),
+                    ),
+                ]))
+            }
+            GLOBAL_DESCRIBE => Some(MontyObject::function(GLOBAL_DESCRIBE, None)),
+            _ => None,
+        }
+    }
+
+    /// Host-side metadata lookup. It cannot run a tool, so it needs no audit
+    /// record and does not count toward the nested-call limit.
+    fn describe(&self, args: &monty_types::CallArgs) -> Result<MontyObject, String> {
+        let mut positional = args.args();
+        let mut keywords = args.kwargs();
+        let name = match (positional.len(), keywords.len()) {
+            (1, 0) => positional.next().and_then(|value| value.as_str()),
+            (0, 1) => keywords
+                .next()
+                .filter(|(key, _)| key.as_str() == Some("name"))
+                .and_then(|(_, value)| value.as_str()),
+            _ => None,
+        }
+        .ok_or("describe(name) takes one tool name string")?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| format!("unknown tool: {name}; see TOOLS"))?;
+        Ok(metadata_to_monty(&entry.full, 0))
     }
 
     pub(crate) fn spec(&self) -> &ToolSpec {
@@ -192,7 +325,7 @@ impl CodeMode {
         &self,
         args: Value,
         cancel: CancellationToken,
-        executor: &dyn CodeModeExecutor,
+        executor: &dyn CodemodeExecutor,
     ) -> ToolOutput {
         let summary = summary(&args);
         if super::python::description(&args).is_none() {
@@ -218,7 +351,7 @@ impl CodeMode {
             biased;
             _ = workflow_cancel.cancelled() => Err("cancelled; an unfinished nested call may have applied changes".into()),
             result = tokio::time::timeout_at(deadline, self.drive(code.to_owned(), &mut printed, &mut audit, &workflow_cancel, executor)) => {
-                result.unwrap_or_else(|_| Err("code-mode elapsed-time limit exceeded; an unfinished nested call may have applied changes".into()))
+                result.unwrap_or_else(|_| Err("codemode elapsed-time limit exceeded; an unfinished nested call may have applied changes".into()))
             }
         };
         let value = match result {
@@ -241,7 +374,7 @@ impl CodeMode {
             result = tokio::time::timeout_at(deadline, render) => match result {
                 Ok(Ok(content)) => Ok(content),
                 Ok(Err(error)) => Err(format!("result formatter failed: {error}")),
-                Err(_) => Err("code-mode elapsed-time limit exceeded while formatting the result".into()),
+                Err(_) => Err("codemode elapsed-time limit exceeded while formatting the result".into()),
             }
         };
         match content {
@@ -260,7 +393,7 @@ impl CodeMode {
         printed: &mut String,
         audit: &mut Vec<String>,
         cancel: &CancellationToken,
-        executor: &dyn CodeModeExecutor,
+        executor: &dyn CodemodeExecutor,
     ) -> Result<MontyObject, String> {
         let inputs = MontyObject::dict(
             self.names
@@ -270,7 +403,7 @@ impl CodeMode {
         let mut progress = step(printed, move |print| {
             MontyRun::new(
                 code,
-                "<run_code>",
+                "<codemode>",
                 vec!["tools".into()],
                 CompileOptions::default(),
             )?
@@ -298,7 +431,7 @@ impl CodeMode {
             if !matches!(progress, RunProgress::Complete(_)) {
                 suspensions += 1;
                 if suspensions > MAX_SUSPENSIONS {
-                    return Err("code-mode suspension limit exceeded (1000); inspect partial results before retrying".into());
+                    return Err("codemode suspension limit exceeded (1000); inspect partial results before retrying".into());
                 }
             }
             if cancel.is_cancelled() {
@@ -307,9 +440,15 @@ impl CodeMode {
             progress = match progress {
                 RunProgress::Complete(value) => return Ok(value),
                 RunProgress::FunctionCall(call) => {
-                    if !self.contains(&call.function_name) || call.object_id.is_some() {
+                    if call.function_name == GLOBAL_DESCRIBE && call.object_id.is_none() {
+                        let result = match self.describe(&call.args) {
+                            Ok(value) => ExtFunctionResult::Return(value),
+                            Err(error) => exception(&error),
+                        };
+                        step(printed, move |print| call.resume(result, print)).await?
+                    } else if !self.contains(&call.function_name) || call.object_id.is_some() {
                         step(printed, move |print| {
-                            call.resume(exception("tool is not available in code mode"), print)
+                            call.resume(exception("tool is not available in codemode"), print)
                         })
                         .await?
                     } else if audit.len() >= MAX_TOOL_CALLS {
@@ -328,7 +467,7 @@ impl CodeMode {
                         let name = call.function_name.clone();
                         let call_id = call.call_id.to_string();
                         executor
-                            .record(CodeModeEvent::Started {
+                            .record(CodemodeEvent::Started {
                                 call_id: call_id.clone(),
                                 name: name.clone(),
                                 arguments: arguments.clone(),
@@ -381,7 +520,7 @@ impl CodeMode {
                         *audit.last_mut().expect("admitted call") =
                             format!("{}: {name} — {status}", audit.len());
                         executor
-                            .record(CodeModeEvent::Finished {
+                            .record(CodemodeEvent::Finished {
                                 call_id,
                                 name,
                                 output,
@@ -391,8 +530,18 @@ impl CodeMode {
                     }
                 }
                 RunProgress::NameLookup(lookup) => {
+                    // Resolve only the documented globals, and only for plain
+                    // names, not attribute lookups on host objects.
+                    let value = lookup
+                        .object_id()
+                        .is_none()
+                        .then(|| self.global(&lookup.name))
+                        .flatten();
                     step(printed, move |print| {
-                        lookup.resume(NameLookupResult::Undefined, print)
+                        lookup.resume(
+                            value.map_or(NameLookupResult::Undefined, NameLookupResult::Value),
+                            print,
+                        )
                     })
                     .await?
                 }
@@ -418,8 +567,8 @@ impl CodeMode {
 /// Purpose label shared by live execution and session replay.
 pub(crate) fn summary(args: &Value) -> String {
     super::python::description(args).map_or_else(
-        || CODE_MODE_TOOL_NAME.into(),
-        |label| format!("{CODE_MODE_TOOL_NAME} {label}"),
+        || CODEMODE_TOOL_NAME.into(),
+        |label| format!("{CODEMODE_TOOL_NAME} {label}"),
     )
 }
 
@@ -547,6 +696,50 @@ fn monty_to_json(value: ObjectRef<'_>, depth: usize, budget: &mut usize) -> Resu
         kind => Err(format!(
             "{kind} cannot be passed to a tool; use JSON-compatible values"
         )),
+    }
+}
+
+/// Convert catalogue metadata for `describe()`. Unlike tool arguments and
+/// results, the catalogue is already bounded at registration (512 KiB), and
+/// a valid schema must stay readable: never fail on size, depth, or integer
+/// range. Values that Python cannot represent faithfully degrade to their JSON
+/// text instead of hiding the whole definition.
+fn metadata_to_monty(value: &Value, depth: usize) -> MontyObject {
+    if depth > 64 {
+        return MontyObject::string(value.to_string());
+    }
+    match value {
+        Value::Null => MontyObject::none(),
+        Value::Bool(value) => MontyObject::bool(*value),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                MontyObject::int(value)
+            } else if let Some(value) = number.as_u64() {
+                MontyObject::bigint(num_bigint::BigInt::from(value))
+            } else if let Some(value) = number.as_f64() {
+                MontyObject::float(value)
+            } else {
+                MontyObject::string(number.to_string())
+            }
+        }
+        Value::String(value) => MontyObject::string(value),
+        Value::Array(values) => MontyObject::list(
+            values
+                .iter()
+                .map(|value| metadata_to_monty(value, depth + 1))
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(values) => MontyObject::dict(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        MontyObject::string(key),
+                        metadata_to_monty(value, depth + 1),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
     }
 }
 

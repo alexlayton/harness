@@ -1155,7 +1155,7 @@ while IFS= read -r line; do
                 list-chunked)
                     chunked_huge "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"tools\":[{\"name\":\"fixture\",\"description\":\"" "\",\"inputSchema\":{\"type\":\"object\"}}]}}"
                     ;;
-                code-mode-structured)
+                codemode-structured)
                     printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"numeric-step","inputSchema":{"type":"object","properties":{"value":{"type":"integer","minimum":0}},"required":["value"],"additionalProperties":false},"outputSchema":{"title":"Fixture numeric step","type":"object","properties":{"next_value":{"type":"integer","minimum":1}},"required":["next_value"],"additionalProperties":false}}]}}\n' "$id"
                     ;;
                 paged)
@@ -1175,7 +1175,7 @@ while IFS= read -r line; do
             ;;
         *'"method":"tools/call"'*)
             case "$MCP_TEST_MODE" in
-                code-mode-structured)
+                codemode-structured)
                     value=$(printf '%s\n' "$line" | sed -n 's/.*"value":\([0-9][0-9]*\).*/\1/p')
                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"display must not be parsed"}],"structuredContent":{"next_value":%s}}}\n' "$id" "$((value * 3 + 1))"
                     ;;
@@ -1376,10 +1376,10 @@ done
         }
 
         #[tokio::test]
-        async fn code_mode_preserves_remote_output_schema_and_dependent_structured_calls() {
+        async fn codemode_preserves_remote_output_schema_and_dependent_structured_calls() {
             let runtime = tokio::time::timeout(
                 Duration::from_secs(15),
-                connect_fixture("code-mode-structured"),
+                connect_fixture("codemode-structured"),
             )
             .await
             .expect("fixture connection must finish promptly")
@@ -1389,8 +1389,8 @@ done
                 .register_into(&mut registry)
                 .expect("fixture tool should register");
             registry
-                .enable_code_mode(&[])
-                .expect("remote tool should support code mode");
+                .enable_codemode(&[])
+                .expect("remote tool should support codemode");
             let definitions = registry.definitions();
             let name = crate::normalized_tool_name("fixture", "numeric-step");
             // Both results must be JSON, not the deliberately non-JSON display
@@ -1403,7 +1403,7 @@ done
             let output = tokio::time::timeout(
                 Duration::from_secs(15),
                 registry.execute(
-                    "run_code",
+                    "codemode",
                     serde_json::json!({
                         "code": code,
                         "description": "Compute two dependent remote numeric steps"
@@ -1415,33 +1415,35 @@ done
             // Reap the fixture before assertions, including timeout failures.
             runtime.shutdown().await;
 
-            let description = &definitions
-                .iter()
-                .find(|definition| definition.name == "run_code")
-                .expect("code mode should expose run_code")
-                .description;
-            // Read a JSON entry without depending on catalogue prose, layout,
-            // or whether entries are in an array or a compact JSON stream.
-            let entry = description
-                .match_indices('{')
-                .find_map(|(offset, _)| {
-                    let entry = serde_json::Deserializer::from_str(&description[offset..])
-                        .into_iter::<serde_json::Value>()
-                        .next()?
-                        .ok()?;
-                    (entry["name"] == name).then_some(entry)
-                })
-                .expect("catalogue should contain the discovered remote tool");
-            assert_eq!(
-                entry["output_schema"],
-                serde_json::json!({
-                    "title": "Fixture numeric step",
-                    "type": "object",
-                    "properties": {"next_value": {"type": "integer", "minimum": 1}},
-                    "required": ["next_value"],
-                    "additionalProperties": false
-                })
+            // The full schema is served on demand by `describe`, not embedded
+            // in the provider-visible description. This is host metadata only,
+            // so it works after the fixture is gone.
+            assert!(
+                !definitions
+                    .iter()
+                    .find(|definition| definition.name == "codemode")
+                    .expect("codemode should expose codemode")
+                    .description
+                    .contains("Fixture numeric step")
             );
+            let described = registry
+                .execute(
+                    "codemode",
+                    serde_json::json!({
+                        "code": format!("describe(\"{name}\")['output_schema']"),
+                        "description": "Read the remote output schema"
+                    }),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(!described.is_error, "{}", described.content);
+            for expected in ["Fixture numeric step", "next_value", "'minimum': 1"] {
+                assert!(
+                    described.content.contains(expected),
+                    "{}",
+                    described.content
+                );
+            }
             let output = output.expect("dependent remote calls must finish promptly");
             assert!(!output.is_error, "{}", output.content);
             // 4 -> 13, then (13 + 2) -> 46. A fixed or lost argument cannot pass.
