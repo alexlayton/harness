@@ -52,7 +52,7 @@ fn registry(name: &'static str) -> (ToolRegistry, Arc<Mutex<Vec<Value>>>) {
         calls: calls.clone(),
         started: None,
     })]);
-    registry.enable_code_mode(&[]).unwrap();
+    registry.enable_codemode(&[]).unwrap();
     (registry, calls)
 }
 
@@ -67,14 +67,14 @@ async fn structured_dependent_calls_preserve_names_and_hold_gate_once() {
     registry.set_execution_gate(gate.clone());
     let snapshot = registry.snapshot();
     assert_eq!(snapshot.definitions.len(), 1);
-    assert_eq!(snapshot.definitions[0].name, "run_code");
-    assert_eq!(snapshot.prompt_context.snippets[0].name, "run_code");
+    assert_eq!(snapshot.definitions[0].name, "codemode");
+    assert_eq!(snapshot.prompt_context.snippets[0].name, "codemode");
     assert!(
         snapshot.definitions[0]
             .description
             .contains("mcp__server__tool-with-dashes")
     );
-    let output = tokio::time::timeout(Duration::from_secs(10), registry.execute("run_code", snippet(
+    let output = tokio::time::timeout(Duration::from_secs(10), registry.execute("codemode", snippet(
         "first = tools['mcp__server__tool-with-dashes'](**{'class': 4})\nsecond = tools['mcp__server__tool-with-dashes'](value=first['class'] + 1)\nsecond['value']"
     ), CancellationToken::new())).await.expect("workflow must not reacquire its gate");
     assert!(!output.is_error, "{}", output.content);
@@ -97,7 +97,7 @@ async fn structured_dependent_calls_preserve_names_and_hold_gate_once() {
 }
 
 #[tokio::test]
-async fn python_is_replaced_only_in_the_registry_with_code_mode_enabled() {
+async fn python_is_replaced_only_in_the_registry_with_codemode_enabled() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut registry = ToolRegistry::new(vec![
         Box::new(Echo {
@@ -128,23 +128,23 @@ async fn python_is_replaced_only_in_the_registry_with_code_mode_enabled() {
     }
 
     // Standalone Python is replaced even with only some tools folded in.
-    registry.enable_code_mode(&["echo".into()]).unwrap();
-    let code_mode = registry.snapshot();
-    let names: Vec<_> = code_mode
+    registry.enable_codemode(&["echo".into()]).unwrap();
+    let codemode = registry.snapshot();
+    let names: Vec<_> = codemode
         .definitions
         .iter()
         .map(|tool| tool.name.as_str())
         .collect();
-    assert_eq!(names, ["other", "bash", "run_code"]);
+    assert_eq!(names, ["other", "bash", "codemode"]);
     assert!(
-        !code_mode
+        !codemode
             .prompt_context
             .snippets
             .iter()
             .any(|tool| tool.name == "python")
     );
     for guideline in &python_prompt.guidelines {
-        assert!(!code_mode.prompt_context.guidelines.contains(guideline));
+        assert!(!codemode.prompt_context.guidelines.contains(guideline));
     }
     assert!(
         registry
@@ -155,7 +155,7 @@ async fn python_is_replaced_only_in_the_registry_with_code_mode_enabled() {
     // Hidden from the native catalogue must not mean admitted as a callback.
     assert!(
         registry
-            .execute_code_mode_tool("python", snippet("6 * 7"), CancellationToken::new())
+            .execute_codemode_tool("python", snippet("6 * 7"), CancellationToken::new())
             .await
             .0
             .is_error
@@ -163,7 +163,7 @@ async fn python_is_replaced_only_in_the_registry_with_code_mode_enabled() {
     assert!(
         registry
             .execute(
-                "run_code",
+                "codemode",
                 snippet("tools['python'](code='6 * 7', description='Calculate')"),
                 CancellationToken::new()
             )
@@ -171,7 +171,7 @@ async fn python_is_replaced_only_in_the_registry_with_code_mode_enabled() {
             .is_error
     );
     let output = registry
-        .execute("run_code", snippet("6 * 7"), CancellationToken::new())
+        .execute("codemode", snippet("6 * 7"), CancellationToken::new())
         .await;
     assert!(!output.is_error, "{}", output.content);
     assert!(output.content.contains("Result: 42"));
@@ -191,7 +191,7 @@ async fn tool_budget_and_host_access_fail_closed_without_replaying_calls() {
     let (registry, calls) = registry("echo");
     let output = registry
         .execute(
-            "run_code",
+            "codemode",
             snippet("for i in range(51):\n    tools['echo'](value=i)"),
             CancellationToken::new(),
         )
@@ -201,7 +201,7 @@ async fn tool_budget_and_host_access_fail_closed_without_replaying_calls() {
     assert_eq!(calls.lock().unwrap().len(), 50);
     for code in [
         "tools['bash'](command='touch escaped')",
-        "tools['run_code'](code='pass')",
+        "tools['codemode'](code='pass')",
         "open('/tmp/not-allowed', 'w')",
         "import os\nos.getenv('HOME')",
         "import time\ntime.time()",
@@ -209,7 +209,7 @@ async fn tool_budget_and_host_access_fail_closed_without_replaying_calls() {
         "tools['echo'](object())",
     ] {
         let output = registry
-            .execute("run_code", snippet(code), CancellationToken::new())
+            .execute("codemode", snippet(code), CancellationToken::new())
             .await;
         assert!(output.is_error, "{code}: {}", output.content);
     }
@@ -217,14 +217,14 @@ async fn tool_budget_and_host_access_fail_closed_without_replaying_calls() {
     // Each call has fresh globals, not a REPL carried over from the previous snippet.
     registry
         .execute(
-            "run_code",
+            "codemode",
             snippet("previous = 42"),
             CancellationToken::new(),
         )
         .await;
     assert!(
         registry
-            .execute("run_code", snippet("previous"), CancellationToken::new())
+            .execute("codemode", snippet("previous"), CancellationToken::new())
             .await
             .is_error
     );
@@ -239,12 +239,12 @@ async fn cancellation_and_future_drop_cannot_admit_later_tools() {
         calls: calls.clone(),
         started: Some(started.clone()),
     })]);
-    registry.enable_code_mode(&[]).unwrap();
+    registry.enable_codemode(&[]).unwrap();
     let gate = Arc::new(tokio::sync::Mutex::new(()));
     registry.set_execution_gate(gate.clone());
     let code = snippet("tools['echo'](value=1)\ntools['echo'](value=2)");
     let cancel = CancellationToken::new();
-    let run = registry.execute("run_code", code.clone(), cancel.clone());
+    let run = registry.execute("codemode", code.clone(), cancel.clone());
     tokio::pin!(run);
     tokio::select! {
         _ = started.notified() => {},
@@ -258,7 +258,7 @@ async fn cancellation_and_future_drop_cannot_admit_later_tools() {
     assert!(output.content.contains("execution status unknown"));
     assert!(gate.try_lock().is_ok());
     {
-        let run = registry.execute("run_code", code, CancellationToken::new());
+        let run = registry.execute("codemode", code, CancellationToken::new());
         tokio::pin!(run);
         tokio::select! {
             _ = started.notified() => {},
@@ -280,7 +280,7 @@ async fn representations_and_printed_text_cannot_hide_errors_or_exceed_limits() 
     let output = tokio::time::timeout(
         Duration::from_secs(10),
         registry.execute(
-            "run_code",
+            "codemode",
             snippet("value = [0]\nfor _ in range(60):\n    value = [value, value]\nvalue"),
             CancellationToken::new(),
         ),
@@ -292,7 +292,7 @@ async fn representations_and_printed_text_cannot_hide_errors_or_exceed_limits() 
     assert!(output.content.len() <= MAX_VALUE_BYTES + 32);
     let output = registry
         .execute(
-            "run_code",
+            "codemode",
             snippet("tools['echo'](value=1)\nprint('x' * 51200, end='')\n1 / 0"),
             CancellationToken::new(),
         )
@@ -301,7 +301,7 @@ async fn representations_and_printed_text_cannot_hide_errors_or_exceed_limits() 
     assert!(output.content.starts_with("1 nested tool call(s) started"));
     assert!(output.content.contains("ZeroDivisionError"));
     assert!(output.content.contains("1: echo — returned"));
-    let output = registry.execute("run_code", snippet(
+    let output = registry.execute("codemode", snippet(
         "for _ in range(1001):\n    try:\n        missing\n    except NameError:\n        pass"
     ), CancellationToken::new()).await;
     assert!(output.is_error);
@@ -359,21 +359,21 @@ fn oversized_catalogue_stops_before_requesting_more_schemas() {
         }),
     ]);
     let native = registry.snapshot();
-    assert!(registry.enable_code_mode(&[]).is_err());
+    assert!(registry.enable_codemode(&[]).is_err());
     // Reject while serializing the first tool, not after materializing all
-    // output schemas or exposing a partial run_code catalogue.
+    // output schemas or exposing a partial codemode catalogue.
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert!(!registry.code_mode_enabled());
+    assert!(!registry.codemode_enabled());
     assert_eq!(registry.snapshot(), native);
 }
 
 #[test]
 fn selections_and_json_conversion_reject_unsupported_values() {
     let (mut registry, _) = registry("echo");
-    assert!(registry.enable_code_mode(&[]).is_err());
-    for name in ["bash", "python", "subagent", "run_code", "missing"] {
+    assert!(registry.enable_codemode(&[]).is_err());
+    for name in ["bash", "python", "subagent", "codemode", "missing"] {
         let mut empty = ToolRegistry::empty();
-        assert!(empty.enable_code_mode(&[name.into()]).is_err());
+        assert!(empty.enable_codemode(&[name.into()]).is_err());
     }
     let mut budget = MAX_VALUE_BYTES;
     assert!(monty_to_json(MontyObject::float(f64::NAN).as_ref(), 0, &mut budget).is_err());
@@ -384,4 +384,37 @@ fn selections_and_json_conversion_reject_unsupported_values() {
         MontyObject::string("x".repeat(MAX_VALUE_BYTES + 1)),
     );
     assert!(arguments(&args).is_err());
+}
+
+#[tokio::test]
+async fn discovery_globals_are_lazy_host_metadata_and_keep_the_prompt_small() {
+    let (registry, calls) = registry("echo");
+    let description = registry.snapshot().definitions[0].description.clone();
+    // The index names the tool but never embeds its JSON schema.
+    assert!(description.contains("echo(value?)"));
+    assert!(!description.contains("\"type\": \"integer\""));
+
+    let output = registry
+        .execute(
+            "codemode",
+            snippet(
+                "info = describe('echo')\n[list(TOOLS), info['parameters']['properties']['value']['type'], 'json' in MODULES['available']]",
+            ),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(output.content.contains("'echo'") && output.content.contains("'integer'"));
+    assert!(output.content.contains("True"));
+    // Discovery never invokes a tool.
+    assert!(calls.lock().unwrap().is_empty());
+
+    let missing = registry
+        .execute(
+            "codemode",
+            snippet("describe('nope')"),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(missing.is_error && missing.content.contains("unknown tool: nope"));
 }

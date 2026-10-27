@@ -138,13 +138,13 @@ filesystem access or host callbacks; it runs in-process and is not
 crash-isolated or a security sandbox. Use dedicated file tools for files and
 bash for commands, builds, and tests.
 
-Opt-in `[code_mode]` folds selected parent tools into one generated `run_code`
+Opt-in `[codemode]` folds selected parent tools into one generated `codemode`
 catalogue from that same registry. Monty calls functions through a `tools`
 dictionary; calls are synchronous and sequential, with fresh state per snippet.
 Shell, calculation-only Python, subagents, and recursive code calls are excluded
-from nested execution. When code mode is enabled, standalone `python` is also
-hidden from native definitions and prompt guidance; `run_code` handles pure
-calculations without tool calls. Registries without code mode, including
+from nested execution. When codemode is enabled, standalone `python` is also
+hidden from native definitions and prompt guidance; `codemode` handles pure
+calculations without tool calls. Registries without codemode, including
 workspace subagents, retain standalone `python` unchanged.
 The workflow holds the shared execution gate once; admitted nested calls use an
 ungated, selection-checked entry point. Interpreter steps run on blocking threads
@@ -153,8 +153,8 @@ cancellation. The agent applies secret policy per nested call and acknowledges
 starts only after persistence (including sync in deferred-sync sessions).
 Nested lifecycle events use history-only `code_mode_call` / `code_mode_result`
 audit records, not model-issued tool-call events. Only the outer result enters
-provider history. See `crates/tools/src/code_mode.rs`,
-`crates/agent/src/code_mode.rs`, and the tool-dispatch hooks.
+provider history. See `crates/tools/src/codemode.rs`,
+`crates/agent/src/codemode.rs`, and the tool-dispatch hooks.
 
 Dedicated path tools confine writes to the workspace and reject lexical or
 symlink escapes. `read` accepts absolute paths outside the workspace (a plain
@@ -186,7 +186,7 @@ stdio frame and HTTP SSE event is capped at 1 MiB before rmcp deserialization;
 at most 256 tools and 512 KiB of aggregate definitions per server; schemas
 bounded by depth, node count, and
 string/total size; output compacted and capped at 20 KiB. Structured JSON up to
-that limit is retained separately for code-mode callbacks, with the server's
+that limit is retained separately for codemode callbacks, with the server's
 optional output schema. Oversized structured values fall back to bounded display
 text. Tool-list changes require a new connection, and MCP tools are not passed
 to subagents.

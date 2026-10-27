@@ -129,10 +129,10 @@ pub struct SubagentConfig {
     pub max_concurrent: Option<usize>,
 }
 
-/// Opt-in code mode settings parsed from `[code_mode]`.
+/// Opt-in codemode settings parsed from `[codemode]`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CodeModeConfig {
-    /// Expose selected tools through `run_code` only when explicitly enabled.
+pub struct CodemodeConfig {
+    /// Expose selected tools through `codemode` only when explicitly enabled.
     #[serde(default)]
     pub enabled: bool,
     /// Tool names to expose; an empty list selects all eligible tools.
@@ -368,9 +368,10 @@ pub struct FileConfig {
     /// `compaction`: absent from disk when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subagents: Option<SubagentConfig>,
-    /// Opt-in code mode settings (`[code_mode]`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub code_mode: Option<CodeModeConfig>,
+    /// Opt-in codemode settings (`[codemode]`). The pre-rename
+    /// `[code_mode]` table is still read so existing configs keep working.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "code_mode")]
+    pub codemode: Option<CodemodeConfig>,
     /// Exact-value secret masking configured under `[secrets]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<SecretsConfig>,
@@ -398,7 +399,7 @@ impl PartialEq for FileConfig {
             && self.rtk == other.rtk
             && self.compaction == other.compaction
             && self.subagents == other.subagents
-            && self.code_mode == other.code_mode
+            && self.codemode == other.codemode
             && self.secrets == other.secrets
             && self.mcp == other.mcp
             && self.tui == other.tui
@@ -1103,8 +1104,8 @@ pub struct Config {
     pub compaction: CompactionPolicy,
     /// Resolved subagent bounds (file `[subagents]` over defaults).
     pub subagents: SubagentPolicy,
-    /// Selected code mode tools, present only when code mode is enabled.
-    pub code_mode: Option<Vec<String>>,
+    /// Selected codemode tools, present only when codemode is enabled.
+    pub codemode: Option<Vec<String>>,
     /// Resolved once at startup. Its `Debug` implementation omits values.
     pub secret_masker: Arc<SecretMasker>,
     /// MCP servers after deterministic validation and `${ENV_VAR}` expansion.
@@ -1336,8 +1337,8 @@ impl Config {
                 .as_ref()
                 .map(resolve_subagents)
                 .unwrap_or_default(),
-            code_mode: file
-                .code_mode
+            codemode: file
+                .codemode
                 .as_ref()
                 .filter(|config| config.enabled)
                 .map(|config| config.tools.clone()),
@@ -1866,7 +1867,7 @@ mod tests {
                 max_turns: Some(10),
                 max_concurrent: Some(2),
             }),
-            code_mode: None,
+            codemode: None,
             secrets: None,
             mcp: None,
             tui: Some(TuiConfig { minimal: true }),
@@ -1942,33 +1943,34 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_requires_explicit_opt_in_and_preserves_tool_selection() {
+    fn codemode_requires_explicit_opt_in_and_preserves_tool_selection() {
         let path = PathBuf::from("config.toml");
         let absent: FileConfig = toml::from_str("").unwrap();
-        assert_eq!(absent.code_mode, None);
-        assert!(!toml::to_string(&absent).unwrap().contains("code_mode"));
+        assert_eq!(absent.codemode, None);
+        assert!(!toml::to_string(&absent).unwrap().contains("codemode"));
 
         for (table, expected) in [
             ("", None),
-            ("[code_mode]", None),
-            ("[code_mode]\ntools = ['read']", None),
-            ("[code_mode]\nenabled = false\ntools = ['read']", None),
+            ("[codemode]", None),
+            ("[codemode]\ntools = ['read']", None),
+            ("[codemode]\nenabled = false\ntools = ['read']", None),
+            ("[codemode]\nenabled = true", Some(Vec::new())),
             ("[code_mode]\nenabled = true", Some(Vec::new())),
             (
-                "[code_mode]\nenabled = true\ntools = ['read', 'grep']",
+                "[codemode]\nenabled = true\ntools = ['read', 'grep']",
                 Some(vec!["read".to_owned(), "grep".to_owned()]),
             ),
         ] {
             let file =
                 parse_file_config(&format!("provider = 'opencode-go'\n{table}"), &path).unwrap();
-            if table == "[code_mode]" {
-                assert_eq!(file.code_mode, Some(CodeModeConfig::default()));
+            if table == "[codemode]" {
+                assert_eq!(file.codemode, Some(CodemodeConfig::default()));
             }
             let resolved = Config::resolve_from_file(&Cli::default(), &file, path.clone(), |_| {
                 Some("test-key".into())
             })
             .unwrap();
-            assert_eq!(resolved.code_mode, expected, "{table}");
+            assert_eq!(resolved.codemode, expected, "{table}");
             let saved = toml::to_string(&file).unwrap();
             assert_eq!(toml::from_str::<FileConfig>(&saved).unwrap(), file);
         }

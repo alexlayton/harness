@@ -226,8 +226,8 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
     ));
-    if let Some(tools) = &config.code_mode {
-        builder = builder.with_code_mode(tools.clone());
+    if let Some(tools) = &config.codemode {
+        builder = builder.with_codemode(tools.clone());
     }
     if !options.no_session {
         let (store, session) = tools::blocking_io(|| -> Result<_> {

@@ -55,7 +55,7 @@ pub struct AgentBuilder {
     provider_factory: Option<ProviderFactory>,
     secret_masker: Arc<SecretMasker>,
     mcp_servers: Vec<mcp::McpServerConfig>,
-    code_mode: Option<Vec<String>>,
+    codemode: Option<Vec<String>>,
     prewalk: PrewalkSettings,
 }
 
@@ -82,7 +82,7 @@ impl AgentBuilder {
             provider_factory: None,
             secret_masker: Arc::new(SecretMasker::default()),
             mcp_servers: Vec::new(),
-            code_mode: None,
+            codemode: None,
             prewalk: PrewalkSettings::default(),
         }
     }
@@ -149,11 +149,11 @@ impl AgentBuilder {
         self
     }
 
-    /// Expose selected parent tools through `run_code` instead of direct calls.
+    /// Expose selected parent tools through `codemode` instead of direct calls.
     /// An empty list selects every eligible tool. Nested agents keep their
-    /// ordinary registries; code mode is enabled after all parent registration.
-    pub fn with_code_mode(mut self, tools: Vec<String>) -> Self {
-        self.code_mode = Some(tools);
+    /// ordinary registries; codemode is enabled after all parent registration.
+    pub fn with_codemode(mut self, tools: Vec<String>) -> Self {
+        self.codemode = Some(tools);
         self
     }
 
@@ -242,8 +242,8 @@ impl AgentBuilder {
             None
         };
 
-        if let Some(names) = self.code_mode
-            && let Err(error) = self.tools.enable_code_mode(&names)
+        if let Some(names) = self.codemode
+            && let Err(error) = self.tools.enable_codemode(&names)
         {
             if let Some(mcp) = mcp {
                 mcp.shutdown().await;
@@ -251,7 +251,7 @@ impl AgentBuilder {
             return Err(anyhow::anyhow!(
                 self.secret_masker.mask_text(&error.to_string())
             ))
-            .context("enable code mode");
+            .context("enable codemode");
         }
 
         let assembly_cancel = self.cancel.clone();

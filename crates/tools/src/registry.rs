@@ -1,4 +1,4 @@
-use super::{CODE_MODE_TOOL_NAME, Tool, ToolOutput};
+use super::{CODEMODE_TOOL_NAME, Tool, ToolOutput};
 use llm::ToolDefinition;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -16,8 +16,8 @@ pub enum ToolRegistryError {
     DuplicateName(String),
     #[error("tool name must not be empty")]
     EmptyName,
-    #[error("invalid code-mode configuration: {0}")]
-    CodeMode(String),
+    #[error("invalid codemode configuration: {0}")]
+    Codemode(String),
 }
 
 struct RegisteredTool {
@@ -36,7 +36,7 @@ pub struct ToolRegistry {
     skills: Option<super::skills::SkillCatalog>,
     file_search_index: Option<Arc<super::FileSearchIndex>>,
     execution_gate: Option<ToolExecutionGate>,
-    code_mode: Option<super::code_mode::CodeMode>,
+    codemode: Option<super::codemode::Codemode>,
 }
 
 impl ToolRegistry {
@@ -62,7 +62,7 @@ impl ToolRegistry {
             skills: None,
             file_search_index: None,
             execution_gate: None,
-            code_mode: None,
+            codemode: None,
         };
         for tool in tools {
             registry.register(tool)?;
@@ -145,7 +145,7 @@ impl ToolRegistry {
         if name.is_empty() {
             return Err(ToolRegistryError::EmptyName);
         }
-        if (name == CODE_MODE_TOOL_NAME && self.code_mode.is_some())
+        if (name == CODEMODE_TOOL_NAME && self.codemode.is_some())
             || self.tools.iter().any(|registered| registered.name == name)
         {
             return Err(ToolRegistryError::DuplicateName(name));
@@ -154,21 +154,21 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Fold selected tools into one model-facing `run_code` catalogue. An
+    /// Fold selected tools into one model-facing `codemode` catalogue. An
     /// empty selection includes all tools except shell and orchestration tools.
     /// Underlying executors stay private to this registry, preserving child
     /// access restrictions. Configure once, after external tool discovery.
-    pub fn enable_code_mode(&mut self, names: &[String]) -> Result<(), ToolRegistryError> {
-        let error = |message: String| ToolRegistryError::CodeMode(message);
-        if self.code_mode.is_some()
+    pub fn enable_codemode(&mut self, names: &[String]) -> Result<(), ToolRegistryError> {
+        let error = |message: String| ToolRegistryError::Codemode(message);
+        if self.codemode.is_some()
             || self
                 .tools
                 .iter()
-                .any(|tool| tool.name == CODE_MODE_TOOL_NAME)
+                .any(|tool| tool.name == CODEMODE_TOOL_NAME)
         {
-            return Err(error("run_code already exists".into()));
+            return Err(error("codemode already exists".into()));
         }
-        let eligible = |name: &str| !matches!(name, "bash" | "python" | "subagent" | "run_code");
+        let eligible = |name: &str| !matches!(name, "bash" | "python" | "subagent" | "codemode");
         for name in names {
             if !eligible(name) || !self.tools.iter().any(|tool| &tool.name == name) {
                 return Err(error(format!("tool is unavailable or excluded: {name}")));
@@ -179,47 +179,47 @@ impl ToolRegistry {
             .iter()
             .filter(|tool| eligible(&tool.name) && (names.is_empty() || names.contains(&tool.name)))
             .map(|tool| (&tool.spec, tool.tool.output_schema()));
-        self.code_mode = Some(super::code_mode::CodeMode::new(tools).map_err(error)?);
+        self.codemode = Some(super::codemode::Codemode::new(tools).map_err(error)?);
         Ok(())
     }
 
-    /// Whether this registry exposes code mode to its owning agent.
-    pub fn code_mode_enabled(&self) -> bool {
-        self.code_mode.is_some()
+    /// Whether this registry exposes codemode to its owning agent.
+    pub fn codemode_enabled(&self) -> bool {
+        self.codemode.is_some()
     }
 
-    fn hidden_by_code_mode(&self, name: &str) -> bool {
-        self.code_mode
+    fn hidden_by_codemode(&self, name: &str) -> bool {
+        self.codemode
             .as_ref()
             .is_some_and(|mode| mode.contains(name))
     }
 
-    fn replaced_by_code_mode(&self, name: &str) -> bool {
-        self.code_mode_enabled() && name == "python"
+    fn replaced_by_codemode(&self, name: &str) -> bool {
+        self.codemode_enabled() && name == "python"
     }
 
     fn hidden_from_native_catalogue(&self, name: &str) -> bool {
-        self.hidden_by_code_mode(name) || self.replaced_by_code_mode(name)
+        self.hidden_by_codemode(name) || self.replaced_by_codemode(name)
     }
 
     /// Execute a selected nested tool without reacquiring the workflow gate.
-    /// Only call from a code-mode executor while `execute_code_mode` owns the
+    /// Only call from a codemode executor while `execute_codemode` owns the
     /// workflow. This entry point never admits shell or recursive code calls.
-    pub async fn execute_code_mode_tool(
+    pub async fn execute_codemode_tool(
         &self,
         name: &str,
         args: Value,
         cancel: CancellationToken,
     ) -> (ToolOutput, Option<Value>) {
         if !cancel.is_cancelled()
-            && self.hidden_by_code_mode(name)
+            && self.hidden_by_codemode(name)
             && let Some(tool) = self.tools.iter().find(|tool| tool.name == name)
         {
             return tool.tool.execute_structured(args, cancel).await;
         }
         (
             ToolOutput {
-                content: "code-mode tool unavailable or workflow cancelled".into(),
+                content: "codemode tool unavailable or workflow cancelled".into(),
                 is_error: true,
                 summary: name.into(),
             },
@@ -230,18 +230,18 @@ impl ToolRegistry {
     /// Execute one exclusive code workflow. Nested calls use the ungated
     /// entry point above; acquiring this same non-reentrant gate twice would
     /// deadlock. Interpreter steps cannot dispatch tools after future drop.
-    pub async fn execute_code_mode(
+    pub async fn execute_codemode(
         &self,
         args: Value,
         cancel: CancellationToken,
-        executor: &dyn super::CodeModeExecutor,
+        executor: &dyn super::CodemodeExecutor,
     ) -> ToolOutput {
         let denied = || ToolOutput {
-            content: "code mode disabled or workflow cancelled before execution".into(),
+            content: "codemode disabled or workflow cancelled before execution".into(),
             is_error: true,
-            summary: super::code_mode::summary(&args),
+            summary: super::codemode::summary(&args),
         };
-        let Some(mode) = &self.code_mode else {
+        let Some(mode) = &self.codemode else {
             return denied();
         };
         if cancel.is_cancelled() {
@@ -272,7 +272,7 @@ impl ToolRegistry {
         }
     }
 
-    /// Model-facing definitions, including the generated code-mode catalogue
+    /// Model-facing definitions, including the generated codemode catalogue
     /// instead of duplicate native definitions for folded tools.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
@@ -280,7 +280,7 @@ impl ToolRegistry {
             .filter(|tool| !self.hidden_from_native_catalogue(&tool.name))
             .map(|tool| tool.spec.definition.clone())
             .chain(
-                self.code_mode
+                self.codemode
                     .iter()
                     .map(|mode| mode.spec().definition.clone()),
             )
@@ -292,8 +292,8 @@ impl ToolRegistry {
         let mut guidelines = Vec::new();
         for tool in &self.tools {
             // Unlike folded tools, standalone Python is replaced, not exposed
-            // inside run_code. Do not retain its competing prompt guidelines.
-            if self.replaced_by_code_mode(&tool.name) {
+            // inside codemode. Do not retain its competing prompt guidelines.
+            if self.replaced_by_codemode(&tool.name) {
                 continue;
             }
             let prompt = tool.spec.prompt.clone();
@@ -308,11 +308,11 @@ impl ToolRegistry {
             }
             guidelines.extend(prompt.guidelines);
         }
-        if let Some(mode) = &self.code_mode {
+        if let Some(mode) = &self.codemode {
             let prompt = &mode.spec().prompt;
             if let Some(snippet) = &prompt.snippet {
                 snippets.push(ToolPromptEntry {
-                    name: CODE_MODE_TOOL_NAME.into(),
+                    name: CODEMODE_TOOL_NAME.into(),
                     snippet: snippet.clone(),
                 });
             }
@@ -328,21 +328,21 @@ impl ToolRegistry {
     // prompts. Never serialize them into tracing fields.
     #[tracing::instrument(name = "tool", skip_all, fields(name = %name))]
     pub async fn execute(&self, name: &str, args: Value, cancel: CancellationToken) -> ToolOutput {
-        if name == CODE_MODE_TOOL_NAME && self.code_mode_enabled() {
+        if name == CODEMODE_TOOL_NAME && self.codemode_enabled() {
             return self
-                .execute_code_mode(args, cancel, &RegistryCodeModeExecutor(self))
+                .execute_codemode(args, cancel, &RegistryCodemodeExecutor(self))
                 .await;
         }
-        if self.replaced_by_code_mode(name) {
+        if self.replaced_by_codemode(name) {
             return ToolOutput {
-                content: "python is replaced by run_code while code mode is enabled; run calculations directly in run_code".into(),
+                content: "python is replaced by codemode while codemode is enabled; run calculations directly in codemode".into(),
                 is_error: true,
                 summary: name.into(),
             };
         }
-        if self.hidden_by_code_mode(name) {
+        if self.hidden_by_codemode(name) {
             return ToolOutput {
-                content: "tool is available inside run_code only".into(),
+                content: "tool is available inside codemode only".into(),
                 is_error: true,
                 summary: name.into(),
             };
@@ -409,17 +409,17 @@ impl ToolRegistry {
     }
 }
 
-struct RegistryCodeModeExecutor<'a>(&'a ToolRegistry);
+struct RegistryCodemodeExecutor<'a>(&'a ToolRegistry);
 
 #[async_trait::async_trait]
-impl super::CodeModeExecutor for RegistryCodeModeExecutor<'_> {
+impl super::CodemodeExecutor for RegistryCodemodeExecutor<'_> {
     async fn call(
         &self,
         name: &str,
         args: Value,
         cancel: CancellationToken,
     ) -> (ToolOutput, Option<Value>) {
-        self.0.execute_code_mode_tool(name, args, cancel).await
+        self.0.execute_codemode_tool(name, args, cancel).await
     }
 }
 
