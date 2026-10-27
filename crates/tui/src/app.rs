@@ -434,6 +434,9 @@ pub struct CrossTerm {
 
     /// Cached completion models for a provider.
     providers: Vec<String>,
+    /// Alternative names of `providers` that `/model <alias>:<model>` accepts.
+    /// Kept apart so completion lists only canonical names.
+    provider_aliases: Vec<String>,
     model_lists: HashMap<String, Vec<ModelEntry>>,
     session_candidates: Vec<SessionListEntry>,
     /// Discovered skills, for `/<skill>` completion and `/skill <name>`
@@ -527,6 +530,7 @@ impl CrossTerm {
             initial_session_seen: false,
             tools_expanded: false,
             providers,
+            provider_aliases: Vec::new(),
             model_lists: HashMap::new(),
             session_candidates: Vec::new(),
             skills,
@@ -611,6 +615,12 @@ impl CrossTerm {
         install_panic_hook(&ui.terminal);
         ui.setup_terminal()?;
         Ok(ui)
+    }
+
+    /// Register provider aliases so `/model <alias>:<model>` still switches
+    /// provider instead of being read as a model id.
+    pub fn set_provider_aliases(&mut self, aliases: Vec<String>) {
+        self.provider_aliases = aliases;
     }
 
     /// Enable terminal modes in dependency order. Only successful operations
@@ -1609,7 +1619,11 @@ impl CrossTerm {
         input_tx: &mpsc::UnboundedSender<InputMessage>,
     ) -> Result<()> {
         let command = match commands::parse_command_with_skills(input, &self.skills) {
-            Ok(command) => command,
+            Ok(command) => commands::fold_unknown_provider_prefix(
+                command,
+                &self.providers,
+                &self.provider_aliases,
+            ),
             Err(error) => {
                 self.add_error(error);
                 return Ok(());

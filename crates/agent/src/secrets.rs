@@ -570,6 +570,10 @@ impl Provider for MaskingProvider {
         Ok(models)
     }
 
+    fn context_window_hint(&self) -> Option<u64> {
+        self.inner.context_window_hint()
+    }
+
     async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {
         let usage = self
             .inner
@@ -727,6 +731,30 @@ mod tests {
             assert!(!output.contains("aaaaaaaa"), "{output}");
             assert!(!output.contains("abababab"), "{output}");
         }
+    }
+
+    #[test]
+    fn masking_provider_forwards_the_context_window_hint() {
+        struct Hinted;
+
+        #[async_trait::async_trait]
+        impl Provider for Hinted {
+            fn name(&self) -> &str {
+                "hinted"
+            }
+            async fn stream(&self, _: &CompletionRequest) -> Result<EventStream, LlmError> {
+                unreachable!("not streamed")
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(Vec::new())
+            }
+            fn context_window_hint(&self) -> Option<u64> {
+                Some(8192)
+            }
+        }
+
+        let masked = mask_provider(Arc::new(Hinted), Arc::new(masker()));
+        assert_eq!(masked.context_window_hint(), Some(8192));
     }
 
     #[test]

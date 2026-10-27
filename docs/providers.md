@@ -1,7 +1,9 @@
 # Providers and authentication
 
-Harness supports five providers. Select one with `--provider`, in
-`config.toml`, or with `/model` in the terminal UI. If none is selected,
+Harness supports five built-in providers and any number of
+[OpenAI-compatible endpoints](#openai-compatible-endpoints) that you define.
+Select one with `--provider`, in `config.toml`, or with `/model` in the
+terminal UI. If none is selected,
 Harness prints setup instructions instead of assuming an API-key provider.
 
 | Provider | Configuration name | Authentication |
@@ -153,6 +155,66 @@ combined with a custom temperature.
 
 The older names `anthropic-subscription` and `claude-sub` remain valid aliases.
 Existing saved credentials still work; you do not need to log in again.
+
+## OpenAI-compatible endpoints
+
+Define a named provider under `[providers.<name>]` to use any server that
+supports the OpenAI Chat Completions API, such as LM Studio, Ollama, vLLM, or a
+gateway. Then select it by name:
+
+```toml
+provider = "lmstudio"
+model = "qwen3-coder-30b"
+
+[providers.lmstudio]
+type = "openai-compatible"            # required
+base_url = "http://localhost:1234/v1"   # required; API root, including /v1
+api_key_env = "LMSTUDIO_API_KEY"        # optional; omit when no key is needed
+default_model = "qwen3-coder-30b"       # optional; used when `model` is unset
+context_window = 32768                  # optional; see below
+
+[providers.lmstudio.headers]            # optional literal, non-secret values
+X-Client = "harness"
+
+[providers.lmstudio.env_headers]        # optional; header = environment variable
+X-Api-Token = "MY_GATEWAY_TOKEN"
+```
+
+```text
+harness --provider lmstudio
+/model lmstudio:<model>
+```
+
+The first `:` in `/model` separates the provider from the model only when the
+text before it is a provider name, so a model id with its own colon works both
+ways: `/model ollama:qwen3:8b` switches provider, and `/model qwen3:8b` keeps
+the current provider.
+
+Harness sends requests to `{base_url}/chat/completions` and reads the model
+list from `{base_url}/models`. When `api_key_env` is set, its value is sent as
+`Authorization: Bearer <key>`; otherwise no `Authorization` header is sent.
+Secrets stay out of `config.toml`: `api_key_env` and `env_headers` name
+environment variables, and their values are masked like
+[`[secrets]`](./configuration.md#secret-masking) entries.
+
+Local servers usually do not report context lengths. Set `context_window` so
+that compaction starts at the right time. It is used when `/models` fails or
+does not report a length for the model; a reported value takes precedence, and
+`[compaction] context_window` overrides both.
+
+Rules:
+
+- A name can contain ASCII letters, digits, `-`, `_`, and `.`. It cannot be a
+  built-in provider name or alias.
+- `base_url` must be an `http://` or `https://` URL.
+- `Content-Type` cannot be overridden. `headers` cannot set `Authorization`,
+  because it would put a credential in `config.toml`; use `api_key_env`, or
+  name an environment variable in `env_headers`. Do not combine `api_key_env`
+  with an `Authorization` entry in `env_headers`.
+- The provider name is also valid in a `[prewalk]` target, for example
+  `model = "lmstudio:qwen3-coder-30b"`.
+- Harness sends only the standard Chat Completions request. It does not send
+  provider-specific reasoning controls, so `reasoning_effort` has no effect.
 
 ## Reasoning effort
 

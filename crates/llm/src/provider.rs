@@ -37,6 +37,14 @@ pub trait Provider: Send + Sync {
 
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError>;
 
+    /// A context window to plan against when the model catalogue cannot
+    /// supply one (the request failed, or the model is not listed). Only
+    /// providers with user-supplied knowledge, such as a local server whose
+    /// `/models` reports no lengths, return `Some`.
+    fn context_window_hint(&self) -> Option<u64> {
+        None
+    }
+
     /// Fetch the current subscription allowance, when this provider has a
     /// usage endpoint. Providers without subscription allowances return `None`.
     async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {

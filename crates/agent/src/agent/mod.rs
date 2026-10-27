@@ -214,7 +214,8 @@ impl Agent {
 
     /// Attach a compaction policy (resolved from `config.toml`).
     pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
-        self.context_window = policy.resolved_window(0);
+        self.context_window =
+            policy.resolved_window(self.provider.context_window_hint().unwrap_or(0));
         self.compaction = policy;
         self
     }
@@ -401,7 +402,9 @@ impl Agent {
         // of using the builder; establish the generous/configured value
         // synchronously, without provider I/O.
         if self.context_window == 0 {
-            self.context_window = self.compaction.resolved_window(0);
+            self.context_window = self
+                .compaction
+                .resolved_window(self.provider.context_window_hint().unwrap_or(0));
             self.publish_context_window();
         }
         send(&events, self.context_usage_event());

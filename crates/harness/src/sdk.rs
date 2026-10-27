@@ -1,6 +1,6 @@
 //! One-shot agent execution without terminal or process-global frontend setup.
 
-use crate::config::{Cli, Config, ProviderArg, build_provider_with_auths, provider_factory};
+use crate::config::{Cli, Config, build_provider_with_auths, provider_factory};
 use crate::context::project_context_for;
 use agent::assembly::AgentBuilder;
 use agent::{AgentEvent, InputMessage, StreamRecovery};
@@ -98,8 +98,11 @@ impl RunOptions {
     /// Check overrides before opening sessions or connecting providers/tools.
     pub fn validate(&self) -> Result<()> {
         if let Some(provider) = &self.provider {
+            ensure!(!provider.trim().is_empty(), "provider must not be blank");
+            // Invalid inputs must raise before any session or provider work,
+            // so custom names are checked against the config file here.
             ensure!(
-                ProviderArg::from_name(provider).is_some(),
+                crate::config::provider_is_known(provider)?,
                 "unknown provider `{provider}`"
             );
         }
@@ -107,7 +110,9 @@ impl RunOptions {
             ensure!(!model.trim().is_empty(), "model must not be blank");
         }
         if let Some(model) = &self.prewalk_model {
-            crate::config::parse_prewalk_target(model)?;
+            // Only the shape is checked; custom provider prefixes are resolved
+            // against the config file when it is loaded.
+            crate::config::parse_prewalk_target(model, &Default::default())?;
         }
         if let Some(resume) = &self.resume {
             ensure!(!resume.trim().is_empty(), "resume must not be blank");
@@ -172,7 +177,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     let cancel = cancel.child_token();
     let _cancel_on_drop = cancel.clone().drop_guard();
     let cli = Cli {
-        provider: options.provider.as_deref().and_then(ProviderArg::from_name),
+        provider: options.provider.clone(),
         model: options.model.clone(),
         reasoning_effort: options.reasoning_effort,
         prewalk: options.prewalk,
@@ -195,6 +200,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     ensure!(!cancel.is_cancelled(), "Harness run cancelled");
     let provider = build_provider_with_auths(
         &config.provider.to_string(),
+        &config.custom_providers,
         config.copilot_auth.clone(),
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
@@ -222,6 +228,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     .with_project_context(context)
     .with_prewalk(config.prewalk.settings(options.resume.is_some())?)
     .with_provider_factory(provider_factory(
+        config.custom_providers.clone(),
         config.copilot_auth.clone(),
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),

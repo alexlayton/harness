@@ -280,12 +280,14 @@ async fn run_application(
     // their local model catalogs work before login.
     let copilot_auth = config.copilot_auth.clone();
     let provider_factory = provider_factory(
+        config.custom_providers.clone(),
         copilot_auth.clone(),
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
     );
     let provider: Arc<dyn Provider> = build_provider_with_auths(
         &config.provider.to_string(),
+        &config.custom_providers,
         copilot_auth.clone(),
         config.codex_auth.clone(),
         config.anthropic_auth.clone(),
@@ -375,6 +377,7 @@ async fn run_application(
     let providers = ProviderArg::ALL
         .iter()
         .map(ToString::to_string)
+        .chain(config.custom_providers.keys().cloned())
         .collect::<Vec<_>>();
     let cancel = CancellationToken::new();
     let (tui_input_tx, tui_input_rx) = mpsc::unbounded_channel();
@@ -412,7 +415,7 @@ async fn run_application(
     // Construct the terminal before assembling the agent or claiming the
     // Herdr pane, so setup errors leave neither running MCPs nor a report.
     let update_notice = update::check_latest().await;
-    let ui = CrossTerm::new(
+    let mut ui = CrossTerm::new(
         &config.model,
         &provider_name,
         providers,
@@ -434,6 +437,7 @@ async fn run_application(
         config.tui_minimal,
         workspace_root,
     )?;
+    ui.set_provider_aliases(ProviderArg::alias_names());
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)

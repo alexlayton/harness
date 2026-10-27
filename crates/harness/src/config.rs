@@ -29,6 +29,11 @@ const COPILOT_ALIASES: [&str; 2] = ["copilot", "githubcopilot"];
 const CODEX_ALIASES: [&str; 1] = ["codex"];
 const CLAUDE_ALIASES: [&str; 3] = ["anthropic-subscription", "claude-sub", "claude"];
 
+mod custom_providers;
+
+use custom_providers::build_custom_provider;
+pub use custom_providers::{CustomProviderConfig, CustomProviderKind, CustomProviders};
+
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ProviderArg {
     #[value(name = "opencode-go")]
@@ -53,6 +58,23 @@ impl ProviderArg {
         Self::OpenAiCodex,
         Self::AnthropicSubscription,
     ];
+
+    /// Every alias (not the canonical names) that `from_name` accepts, so a
+    /// frontend can recognise `codex:<model>` without listing aliases as
+    /// separate providers.
+    pub fn alias_names() -> Vec<String> {
+        Self::ALL
+            .iter()
+            .filter_map(|provider| provider.to_possible_value())
+            .flat_map(|value| {
+                value
+                    .get_name_and_aliases()
+                    .skip(1)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
 
     /// Parse a provider name or alias exactly as the command line does.
     pub fn from_name(name: &str) -> Option<Self> {
@@ -95,6 +117,49 @@ impl fmt::Display for ProviderArg {
             Self::AnthropicSubscription => "anthropic-claude",
         })
     }
+}
+
+/// The provider selected for this process: a built-in integration or a
+/// user-defined `[providers.<name>]` endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderChoice {
+    Builtin(ProviderArg),
+    Custom(String),
+}
+
+impl ProviderChoice {
+    /// The built-in integration, or `None` for a user-defined provider.
+    pub fn builtin(&self) -> Option<ProviderArg> {
+        match self {
+            Self::Builtin(provider) => Some(*provider),
+            Self::Custom(_) => None,
+        }
+    }
+}
+
+/// Lets callers ask "is this Copilot?" without unwrapping the choice.
+impl PartialEq<ProviderArg> for ProviderChoice {
+    fn eq(&self, other: &ProviderArg) -> bool {
+        self.builtin() == Some(*other)
+    }
+}
+
+impl fmt::Display for ProviderChoice {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Builtin(provider) => provider.fmt(formatter),
+            Self::Custom(name) => formatter.write_str(name),
+        }
+    }
+}
+
+/// Shell-style environment variable name: `[A-Za-z_][A-Za-z0-9_]*`.
+fn is_env_var_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    characters
+        .next()
+        .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 /// Per-key compaction settings parsed from `[compaction]` in `config.toml`.
@@ -155,10 +220,10 @@ pub struct PrewalkConfig {
 }
 
 impl PrewalkConfig {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self, providers: &BTreeMap<String, CustomProviderConfig>) -> Result<()> {
         match &self.model {
             Some(model) => {
-                parse_prewalk_target(model).context("[prewalk].model")?;
+                parse_prewalk_target(model, providers).context("[prewalk].model")?;
             }
             None if self.enabled => {
                 return Err(anyhow!("[prewalk].enabled requires [prewalk].model"));
@@ -170,20 +235,30 @@ impl PrewalkConfig {
 }
 
 /// Parse `[<provider>:]<model>`. A prefix is a provider only when Harness
-/// knows it, so model ids such as `vendor/model:free` keep their colon.
-pub fn parse_prewalk_target(value: &str) -> Result<PrewalkTarget> {
+/// knows it (built-in or in `providers`), so model ids such as
+/// `vendor/model:free` keep their colon.
+pub fn parse_prewalk_target(
+    value: &str,
+    providers: &BTreeMap<String, CustomProviderConfig>,
+) -> Result<PrewalkTarget> {
     let value = value.trim();
     if value.is_empty() {
         return Err(anyhow!("prewalk model must not be blank"));
     }
     if let Some((provider, model)) = value.split_once(':')
         && let Some(provider) = ProviderArg::from_name(provider)
+            .map(|provider| provider.to_string())
+            .or_else(|| {
+                providers
+                    .contains_key(provider)
+                    .then(|| provider.to_owned())
+            })
     {
         if model.is_empty() {
             return Err(anyhow!("prewalk model must not be blank"));
         }
         return Ok(PrewalkTarget {
-            provider: Some(provider.to_string()),
+            provider: Some(provider),
             model: model.to_owned(),
         });
     }
@@ -244,14 +319,7 @@ impl SecretsConfig {
     fn validate(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         for name in &self.env {
-            let mut characters = name.chars();
-            let valid_first = characters
-                .next()
-                .is_some_and(|character| character == '_' || character.is_ascii_alphabetic());
-            if !valid_first
-                || !characters
-                    .all(|character| character == '_' || character.is_ascii_alphanumeric())
-            {
+            if !is_env_var_name(name) {
                 return Err(anyhow!(
                     "[secrets].env contains invalid environment variable name `{name}`"
                 ));
@@ -384,6 +452,9 @@ pub struct FileConfig {
     /// Prewalk handoff settings (`[prewalk]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prewalk: Option<PrewalkConfig>,
+    /// User-defined providers (`[providers.<name>]`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, CustomProviderConfig>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, toml::Value>,
 }
@@ -404,6 +475,7 @@ impl PartialEq for FileConfig {
             && self.mcp == other.mcp
             && self.tui == other.tui
             && self.prewalk == other.prewalk
+            && self.providers == other.providers
             && self.extra == other.extra
     }
 }
@@ -439,6 +511,17 @@ fn non_empty_env_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Load a TOML configuration.  A missing file is the same as an empty config.
+/// Whether `name` selects a built-in provider or a `[providers.<name>]` entry
+/// in the user's config file. MCP servers are ignored so that callers which
+/// override them are not blocked by stale entries.
+pub fn provider_is_known(name: &str) -> Result<bool> {
+    if ProviderArg::from_name(name).is_some() {
+        return Ok(true);
+    }
+    let file = load_file_config_with_mcp(&config_path(), Some(&[]))?;
+    Ok(file.providers.contains_key(name))
+}
+
 pub fn load_file_config(path: &Path) -> Result<FileConfig> {
     load_file_config_with_mcp(path, None)
 }
@@ -495,9 +578,23 @@ impl FileConfig {
             mcp.validate().map_err(|error| anyhow!(error))?;
         }
         if let Some(prewalk) = &self.prewalk {
-            prewalk.validate()?;
+            prewalk.validate(&self.providers)?;
+        }
+        for (name, provider) in &self.providers {
+            provider.validate(name)?;
         }
         Ok(())
+    }
+
+    /// Resolve a provider name against the built-ins, then `[providers]`.
+    pub fn provider_choice(&self, name: &str) -> Option<ProviderChoice> {
+        ProviderArg::from_name(name)
+            .map(ProviderChoice::Builtin)
+            .or_else(|| {
+                self.providers
+                    .contains_key(name)
+                    .then(|| ProviderChoice::Custom(name.to_owned()))
+            })
     }
 }
 
@@ -910,9 +1007,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Override the configured provider for this process.
-    #[arg(long, value_enum, global = true)]
-    pub provider: Option<ProviderArg>,
+    /// Override the configured provider for this process: a built-in name
+    /// or a `[providers.<name>]` entry from the config file.
+    #[arg(long, value_name = "PROVIDER", global = true)]
+    pub provider: Option<String>,
 
     /// Override the configured model for this process.
     #[arg(long, global = true)]
@@ -1097,7 +1195,9 @@ pub enum LoginProvider {
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub provider: ProviderArg,
+    pub provider: ProviderChoice,
+    /// User-defined providers, needed again whenever the provider changes.
+    pub custom_providers: CustomProviders,
     pub model: String,
     pub reasoning: ReasoningPolicy,
     pub rtk: bool,
@@ -1128,8 +1228,8 @@ pub struct Config {
 /// names no provider, or the same one.
 fn file_model_for(
     file: &FileConfig,
-    file_provider: Option<ProviderArg>,
-    provider: ProviderArg,
+    file_provider: Option<&ProviderChoice>,
+    provider: &ProviderChoice,
 ) -> Option<String> {
     file.model
         .clone()
@@ -1155,7 +1255,9 @@ impl Config {
         // an unrelated `--provider` override.
         let effective_provider = cli
             .provider
-            .or_else(|| file.provider.as_deref().and_then(ProviderArg::from_name));
+            .as_deref()
+            .or(file.provider.as_deref())
+            .and_then(ProviderArg::from_name);
         let copilot_auth = (effective_provider == Some(ProviderArg::GithubCopilot))
             .then(|| CopilotAuth::from_default().map(Arc::new))
             .transpose()?;
@@ -1176,8 +1278,11 @@ impl Config {
             && cli.model.is_none()
             && file_model_for(
                 &file,
-                file.provider.as_deref().and_then(ProviderArg::from_name),
-                config.provider,
+                file.provider
+                    .as_deref()
+                    .and_then(|name| file.provider_choice(name))
+                    .as_ref(),
+                &config.provider,
             )
             .is_none()
             && let Some(model) = entitled_copilot_default(config.copilot_auth.as_ref())
@@ -1222,7 +1327,7 @@ impl Config {
         // Validate the persisted name even when a CLI override is present;
         // otherwise a typo could remain hidden until a later launch.
         let file_provider = match file.provider.as_deref() {
-            Some(name) => Some(ProviderArg::from_name(name).ok_or_else(|| {
+            Some(name) => Some(file.provider_choice(name).ok_or_else(|| {
                 anyhow!(
                     "unknown provider `{name}` in config file {}",
                     path.display()
@@ -1230,39 +1335,58 @@ impl Config {
             })?),
             None => None,
         };
-        let provider = cli.provider.or(file_provider).ok_or_else(|| {
+        let cli_provider = match cli.provider.as_deref() {
+            Some(name) => Some(file.provider_choice(name).ok_or_else(|| {
+                anyhow!(
+                    "unknown provider `{name}`: use a built-in provider or define `[providers.{name}]` in {}",
+                    path.display()
+                )
+            })?),
+            None => None,
+        };
+        let provider = cli_provider.or(file_provider.clone()).ok_or_else(|| {
             anyhow!(
-                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go      OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter       OpenRouter; set OPENROUTER_API_KEY\n  github-copilot   GitHub Copilot; run `harness login github-copilot`\n  openai-codex     OpenAI Codex; run `harness login openai-codex`\n  anthropic-claude  Unofficial Claude subscription; run `harness login anthropic-claude`",
+                "no provider configured. Choose one with --provider <name> or set `provider` in {}:\n  opencode-go       OpenCode Go; set OPENCODE_GO_API_KEY or OPENCODE_API_KEY\n  openrouter        OpenRouter; set OPENROUTER_API_KEY\n  github-copilot    GitHub Copilot; run `harness login github-copilot`\n  openai-codex      OpenAI Codex; run `harness login openai-codex`\n  anthropic-claude  Unofficial Claude subscription; run `harness login anthropic-claude`\n  <name>            a `[providers.<name>]` table with `type = \"openai-compatible\"` and `base_url`",
                 path.display()
             )
         })?;
         // GitHub Copilot authenticates through the private auth store and is
         // intentionally constructible before the first login.  Existing API
         // key providers retain their old environment-only requirement.
-        let api_key = key_for(provider)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_default();
-        if !matches!(
-            provider,
-            ProviderArg::GithubCopilot
-                | ProviderArg::OpenAiCodex
-                | ProviderArg::AnthropicSubscription
-        ) && api_key.is_empty()
+        // User-defined providers read their optional key when constructed.
+        if let Some(builtin) = provider.builtin()
+            && !matches!(
+                builtin,
+                ProviderArg::GithubCopilot
+                    | ProviderArg::OpenAiCodex
+                    | ProviderArg::AnthropicSubscription
+            )
+            && key_for(builtin).is_none_or(|value| value.trim().is_empty())
         {
             return Err(anyhow!(
                 "missing API key: set {}",
-                provider.env_vars().join(" or ")
+                builtin.env_vars().join(" or ")
             ));
         }
         // The saved model belongs to the saved provider. A `--provider`
         // override to a different provider uses that provider's default
         // instead of a model id it does not serve.
+        let default_model = match &provider {
+            ProviderChoice::Builtin(builtin) => Some(builtin.default_model().to_owned()),
+            ProviderChoice::Custom(name) => file.providers[name].default_model.clone(),
+        };
         let model = cli
             .model
             .clone()
-            .or_else(|| file_model_for(file, file_provider, provider))
-            .unwrap_or_else(|| provider.default_model().to_owned());
-        let secret_entries = file
+            .or_else(|| file_model_for(file, file_provider.as_ref(), &provider))
+            .or(default_model)
+            .ok_or_else(|| {
+                anyhow!(
+                    "no model configured for provider `{provider}`: pass --model, or set `model` or `[providers.{provider}].default_model` in {}",
+                    path.display()
+                )
+            })?;
+        let mut secret_entries = file
             .secrets
             .as_ref()
             .map(|secrets| {
@@ -1284,6 +1408,7 @@ impl Config {
             })
             .transpose()?
             .unwrap_or_default();
+        custom_providers::add_secret_entries(&file.providers, &mut secret_entries);
         let secret_masker =
             Arc::new(SecretMasker::new(secret_entries).map_err(|error| anyhow!(error))?);
         if secret_masker.mask_text(&model) != model
@@ -1299,7 +1424,7 @@ impl Config {
                 .prewalk_model
                 .as_deref()
                 .or_else(|| file.prewalk.as_ref()?.model.as_deref())
-                .map(parse_prewalk_target)
+                .map(|value| parse_prewalk_target(value, &file.providers))
                 .transpose()?,
             reasoning: cli
                 .prewalk_reasoning_effort
@@ -1321,6 +1446,7 @@ impl Config {
             .map_err(|error| anyhow!(error))?;
         Ok(Self {
             provider,
+            custom_providers: Arc::new(file.providers.clone()),
             model,
             reasoning: cli
                 .reasoning_effort
@@ -1375,20 +1501,28 @@ fn entitled_copilot_default(auth: Option<&Arc<CopilotAuth>>) -> Option<String> {
 
 /// Construct a provider with shared OAuth handles. Keeping refresh state in
 /// the provider-owned handles avoids reloading credentials on model switches.
+/// Built-in names win; `custom_providers` supplies `[providers.<name>]`.
 pub fn build_provider_with_auths(
     name: &str,
+    custom_providers: &BTreeMap<String, CustomProviderConfig>,
     copilot_auth: Option<Arc<CopilotAuth>>,
     codex_auth: Option<Arc<OpenAiCodexAuth>>,
     anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
 ) -> Result<Arc<dyn Provider>> {
-    let provider = ProviderArg::from_name(name).ok_or_else(|| {
+    let Some(provider) = ProviderArg::from_name(name) else {
+        if let Some(config) = custom_providers.get(name) {
+            return build_custom_provider(name, config);
+        }
         let expected = ProviderArg::ALL
             .iter()
             .map(ToString::to_string)
+            .chain(custom_providers.keys().cloned())
             .collect::<Vec<_>>()
             .join(", ");
-        anyhow!("unknown provider: {name} (expected one of: {expected})")
-    })?;
+        return Err(anyhow!(
+            "unknown provider: {name} (expected one of: {expected})"
+        ));
+    };
     Ok(match provider {
         ProviderArg::OpencodeGo => {
             let api_key = env_api_key(provider).ok_or_else(|| {
@@ -1428,6 +1562,7 @@ pub fn build_provider_with_auths(
 
 /// Build the runtime's provider factory while retaining shared OAuth state.
 pub fn provider_factory(
+    custom_providers: CustomProviders,
     copilot_auth: Option<Arc<CopilotAuth>>,
     codex_auth: Option<Arc<OpenAiCodexAuth>>,
     anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
@@ -1435,6 +1570,7 @@ pub fn provider_factory(
     Arc::new(move |name| {
         build_provider_with_auths(
             name,
+            &custom_providers,
             copilot_auth.clone(),
             codex_auth.clone(),
             anthropic_auth.clone(),
@@ -1466,7 +1602,7 @@ mod tests {
         let prompt =
             Cli::try_parse_from(["harness", "prompt", "--provider", "openai-codex", "hello"])
                 .unwrap();
-        assert_eq!(prompt.provider, Some(ProviderArg::OpenAiCodex));
+        assert_eq!(prompt.provider.as_deref(), Some("openai-codex"));
         assert!(matches!(
             prompt.command,
             Some(Command::Prompt(PromptArgs { prompt, .. })) if prompt == ["hello"]
@@ -1604,7 +1740,7 @@ mod tests {
             "--device-code",
         ])
         .unwrap();
-        assert_eq!(cli.provider, Some(ProviderArg::Openrouter));
+        assert_eq!(cli.provider.as_deref(), Some("openrouter"));
         assert!(matches!(
             cli.command,
             Some(Command::Login(LoginArgs {
@@ -1631,7 +1767,7 @@ mod tests {
         }
 
         let cli = Cli {
-            provider: Some(ProviderArg::Openrouter),
+            provider: Some("openrouter".into()),
             model: Some("anthropic/demo".into()),
             ..Cli::default()
         };
@@ -1665,7 +1801,7 @@ mod tests {
             .unwrap();
             assert_eq!(config.provider, ProviderArg::AnthropicSubscription);
             assert_eq!(config.model, "claude-sonnet-4-6");
-            assert_eq!(ProviderArg::from_name(name), Some(config.provider));
+            assert_eq!(ProviderArg::from_name(name), config.provider.builtin());
         }
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -1690,7 +1826,7 @@ mod tests {
             ))
             .unwrap();
         let auth = Arc::new(AnthropicSubscriptionAuth::new(store).unwrap());
-        let factory = provider_factory(None, None, Some(auth));
+        let factory = provider_factory(Default::default(), None, None, Some(auth));
         for name in [
             "anthropic-claude",
             "anthropic-subscription",
@@ -1710,7 +1846,7 @@ mod tests {
     #[test]
     fn copilot_resolves_without_an_api_key() {
         let cli = Cli {
-            provider: Some(ProviderArg::GithubCopilot),
+            provider: Some("github-copilot".into()),
             model: None,
             ..Cli::default()
         };
@@ -1755,7 +1891,7 @@ mod tests {
         );
 
         let cli = Cli {
-            provider: Some(ProviderArg::OpencodeGo),
+            provider: Some("opencode-go".into()),
             model: Some("cli-model".into()),
             reasoning_effort: Some(ReasoningPolicy::Off),
             ..Cli::default()
@@ -1774,7 +1910,7 @@ mod tests {
         // A provider override without --model must not reuse the saved
         // model of another provider.
         let cli = Cli {
-            provider: Some(ProviderArg::OpencodeGo),
+            provider: Some("opencode-go".into()),
             ..Cli::default()
         };
         let config = Config::resolve_from_file(
@@ -1801,6 +1937,16 @@ mod tests {
     }
 
     #[test]
+    fn alias_names_lists_aliases_but_not_canonical_names() {
+        let aliases = ProviderArg::alias_names();
+        for alias in ["codex", "copilot", "claude"] {
+            assert!(aliases.iter().any(|name| name == alias), "{alias}");
+            assert!(ProviderArg::from_name(alias).is_some());
+        }
+        assert!(!aliases.iter().any(|name| name == "openrouter"));
+    }
+
+    #[test]
     fn login_selects_only_when_provider_is_unset() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -1820,7 +1966,7 @@ mod tests {
     #[test]
     fn supports_legacy_opencode_key_name() {
         let cli = Cli {
-            provider: Some(ProviderArg::OpencodeGo),
+            provider: Some("opencode-go".into()),
             ..Cli::default()
         };
         let config =
@@ -1831,7 +1977,7 @@ mod tests {
     #[test]
     fn missing_key_names_environment_variables() {
         let cli = Cli {
-            provider: Some(ProviderArg::Openrouter),
+            provider: Some("openrouter".into()),
             ..Cli::default()
         };
         let error = Config::resolve_with_key_values(&cli, None, None, None)
@@ -1840,7 +1986,7 @@ mod tests {
         assert!(error.to_string().contains("OPENROUTER_API_KEY"));
 
         let cli = Cli {
-            provider: Some(ProviderArg::OpencodeGo),
+            provider: Some("opencode-go".into()),
             ..Cli::default()
         };
         let error = Config::resolve_with_key_values(&cli, None, None, None)
@@ -1872,6 +2018,19 @@ mod tests {
             mcp: None,
             tui: Some(TuiConfig { minimal: true }),
             prewalk: None,
+            providers: [(
+                "lmstudio".to_owned(),
+                CustomProviderConfig {
+                    kind: CustomProviderKind::OpenAiCompatible,
+                    base_url: "http://localhost:1234/v1".into(),
+                    api_key_env: Some("LMSTUDIO_API_KEY".into()),
+                    default_model: None,
+                    context_window: Some(32_768),
+                    headers: [("X-Client".to_owned(), "harness".to_owned())].into(),
+                    env_headers: [("X-Token".to_owned(), "LMSTUDIO_TOKEN".to_owned())].into(),
+                },
+            )]
+            .into(),
             extra: [("future".to_owned(), toml::Value::String("kept".into()))]
                 .into_iter()
                 .collect(),
@@ -1932,14 +2091,36 @@ mod tests {
 
     #[test]
     fn prewalk_target_prefix_is_a_provider_only_when_known() {
-        let target = parse_prewalk_target("openrouter:vendor/model:free").unwrap();
+        let none = BTreeMap::new();
+        let target = parse_prewalk_target("openrouter:vendor/model:free", &none).unwrap();
         assert_eq!(target.provider.as_deref(), Some("openrouter"));
         assert_eq!(target.model, "vendor/model:free");
-        let target = parse_prewalk_target("vendor/model:free").unwrap();
+        let target = parse_prewalk_target("vendor/model:free", &none).unwrap();
         assert_eq!(target.provider, None);
         assert_eq!(target.model, "vendor/model:free");
-        assert!(parse_prewalk_target("openrouter:").is_err());
-        assert!(parse_prewalk_target("  ").is_err());
+        assert!(parse_prewalk_target("openrouter:", &none).is_err());
+        assert!(parse_prewalk_target("  ", &none).is_err());
+
+        // A configured custom provider name is a provider prefix too.
+        let custom = BTreeMap::from([(
+            "lmstudio".to_owned(),
+            CustomProviderConfig {
+                kind: CustomProviderKind::OpenAiCompatible,
+                base_url: "http://localhost:1234/v1".into(),
+                api_key_env: None,
+                default_model: None,
+                context_window: None,
+                headers: BTreeMap::new(),
+                env_headers: BTreeMap::new(),
+            },
+        )]);
+        let target = parse_prewalk_target("lmstudio:qwen3:8b", &custom).unwrap();
+        assert_eq!(target.provider.as_deref(), Some("lmstudio"));
+        assert_eq!(target.model, "qwen3:8b");
+        assert_eq!(
+            parse_prewalk_target("lmstudio:x", &none).unwrap().provider,
+            None
+        );
     }
 
     #[test]
