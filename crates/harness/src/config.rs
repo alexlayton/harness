@@ -30,9 +30,11 @@ const CODEX_ALIASES: [&str; 1] = ["codex"];
 const CLAUDE_ALIASES: [&str; 3] = ["anthropic-subscription", "claude-sub", "claude"];
 
 mod custom_providers;
+mod mcp_servers;
 
 use custom_providers::build_custom_provider;
 pub use custom_providers::{CustomProviderConfig, CustomProviderKind, CustomProviders};
+pub use mcp_servers::{FileMcpConfig, FileMcpServer};
 
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum ProviderArg {
@@ -443,9 +445,10 @@ pub struct FileConfig {
     /// Exact-value secret masking configured under `[secrets]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secrets: Option<SecretsConfig>,
-    /// External MCP servers configured under `[[mcp.servers]]`.
+    /// External MCP servers configured under `[[mcp.servers]]`. Entries with
+    /// `enabled = false` connect only when a launch passes `--mcp <NAME>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp: Option<mcp::McpConfig>,
+    pub mcp: Option<FileMcpConfig>,
     /// Terminal UI presentation settings (`[tui]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<TuiConfig>,
@@ -575,7 +578,7 @@ impl FileConfig {
             secrets.validate()?;
         }
         if let Some(mcp) = &self.mcp {
-            mcp.validate().map_err(|error| anyhow!(error))?;
+            mcp.validate()?;
         }
         if let Some(prewalk) = &self.prewalk {
             prewalk.validate(&self.providers)?;
@@ -867,11 +870,11 @@ fn select_provider_after_login_at(path: &Path, provider: ProviderArg) -> Result<
 }
 
 /// Add one stdio MCP server while retaining unrelated and unknown settings.
-pub fn add_mcp_server(name: &str, command: &[String]) -> Result<()> {
-    add_mcp_server_at(&config_path(), name, command)
+pub fn add_mcp_server(name: &str, command: &[String], enabled: bool) -> Result<()> {
+    add_mcp_server_at(&config_path(), name, command, enabled)
 }
 
-fn add_mcp_server_at(path: &Path, name: &str, command: &[String]) -> Result<()> {
+fn add_mcp_server_at(path: &Path, name: &str, command: &[String], enabled: bool) -> Result<()> {
     let (executable, args) = command
         .split_first()
         .ok_or_else(|| anyhow!("an MCP server command is required"))?;
@@ -896,6 +899,9 @@ fn add_mcp_server_at(path: &Path, name: &str, command: &[String]) -> Result<()> 
     let mut arguments = toml_edit::Array::new();
     arguments.extend(args.iter().map(String::as_str));
     server["args"] = toml_edit::value(arguments);
+    if !enabled {
+        server["enabled"] = toml_edit::value(false);
+    }
     insert_mcp_server_at(path, name, server)
 }
 
@@ -904,8 +910,9 @@ pub fn add_http_mcp_server(
     name: &str,
     url: &str,
     headers: &BTreeMap<String, String>,
+    enabled: bool,
 ) -> Result<()> {
-    add_http_mcp_server_at(&config_path(), name, url, headers)
+    add_http_mcp_server_at(&config_path(), name, url, headers, enabled)
 }
 
 fn add_http_mcp_server_at(
@@ -913,6 +920,7 @@ fn add_http_mcp_server_at(
     name: &str,
     url: &str,
     headers: &BTreeMap<String, String>,
+    enabled: bool,
 ) -> Result<()> {
     let candidate = mcp::McpServerConfig {
         name: name.to_owned(),
@@ -938,6 +946,9 @@ fn add_http_mcp_server_at(
         }
         server["headers"] = toml_edit::Item::Table(header_table);
     }
+    if !enabled {
+        server["enabled"] = toml_edit::value(false);
+    }
     insert_mcp_server_at(path, name, server)
 }
 
@@ -962,6 +973,35 @@ fn insert_mcp_server_at(path: &Path, name: &str, server: toml_edit::Table) -> Re
             anyhow::bail!("MCP server `{name}` is already configured");
         }
         servers.push(server);
+        Ok(())
+    })
+}
+
+/// Mark one named MCP server as connected by default (`true`) or only on
+/// request with `--mcp` (`false`), retaining unrelated and unknown settings.
+pub fn set_mcp_server_enabled(name: &str, enabled: bool) -> Result<()> {
+    set_mcp_server_enabled_at(&config_path(), name, enabled)
+}
+
+fn set_mcp_server_enabled_at(path: &Path, name: &str, enabled: bool) -> Result<()> {
+    update_config_document(path, |document| {
+        let server = document
+            .get_mut("mcp")
+            .and_then(toml_edit::Item::as_table_mut)
+            .and_then(|mcp| mcp.get_mut("servers"))
+            .and_then(toml_edit::Item::as_array_of_tables_mut)
+            .and_then(|servers| {
+                servers
+                    .iter_mut()
+                    .find(|server| server.get("name").and_then(|item| item.as_str()) == Some(name))
+            })
+            .ok_or_else(|| anyhow!("MCP server `{name}` is not configured"))?;
+        // The default is not written, matching how the file is serialized.
+        if enabled {
+            server.remove("enabled");
+        } else {
+            server["enabled"] = toml_edit::value(false);
+        }
         Ok(())
     })
 }
@@ -1052,6 +1092,11 @@ pub struct Cli {
     /// Resume a persisted interactive session by id, unique prefix, `latest`, or path.
     #[arg(long = "resume-session", value_name = "ID|latest|PATH", global = true)]
     pub resume: Option<String>,
+
+    /// Also connect a configured MCP server marked `enabled = false` for this
+    /// process. Repeat the flag to connect several.
+    #[arg(long = "mcp", value_name = "NAME", global = true)]
+    pub mcp: Vec<String>,
 }
 
 /// Frontend and authentication commands. With no command Harness starts the
@@ -1085,6 +1130,10 @@ pub enum McpCommand {
     /// Delete a server by name.
     #[command(alias = "remove", alias = "rm")]
     Delete { name: String },
+    /// Connect a server in every launch again.
+    Enable { name: String },
+    /// Connect a server only in launches that pass `--mcp <NAME>`.
+    Disable { name: String },
     /// List configured servers.
     List,
 }
@@ -1097,6 +1146,9 @@ pub enum McpCommand {
 pub struct McpAddArgs {
     /// Stable name used to namespace this server's tools.
     pub name: String,
+    /// Connect this server only in launches that pass `--mcp <NAME>`.
+    #[arg(long)]
+    pub disabled: bool,
     /// Streamable HTTP endpoint instead of a stdio command.
     #[arg(long, value_name = "URL", conflicts_with = "command")]
     pub url: Option<String>,
@@ -1210,6 +1262,9 @@ pub struct Config {
     pub secret_masker: Arc<SecretMasker>,
     /// MCP servers after deterministic validation and `${ENV_VAR}` expansion.
     pub mcp_servers: Vec<mcp::McpServerConfig>,
+    /// Opt-in servers this launch requested with `--mcp`, kept so a Herdr
+    /// resume command can request the same ones.
+    pub mcp_requested: Vec<String>,
     /// Whether the interactive frontend skips its welcome header.
     pub tui_minimal: bool,
     /// Prewalk preference, target, and explicit startup request.
@@ -1438,9 +1493,20 @@ impl Config {
         {
             return Err(anyhow!("prewalk model cannot contain a configured secret"));
         }
-        let mcp_servers = file
-            .mcp
-            .as_ref()
+        // Select before expanding `${ENV_VAR}` values: an opt-in server that
+        // this launch does not request must not need its credentials.
+        let selected = match &file.mcp {
+            Some(mcp) => Some(mcp.select(&cli.mcp)?),
+            None => {
+                anyhow::ensure!(
+                    cli.mcp.is_empty(),
+                    "unknown MCP server `{}`; no MCP servers are configured",
+                    cli.mcp[0]
+                );
+                None
+            }
+        };
+        let mcp_servers = selected
             .map(|mcp| mcp.resolve_with(|name| std::env::var(name).ok()))
             .transpose()
             .map_err(|error| anyhow!(error))?;
@@ -1470,6 +1536,7 @@ impl Config {
                 .map(|config| config.tools.clone()),
             secret_masker,
             mcp_servers: mcp_servers.unwrap_or_default(),
+            mcp_requested: cli.mcp.clone(),
             tui_minimal: file.tui.as_ref().is_some_and(|tui| tui.minimal),
             prewalk,
             // Only the process-wide [`Config::resolve`] loads credentials;
@@ -1681,7 +1748,7 @@ mod tests {
         assert!(matches!(
             http_mcp.command,
             Some(Command::Mcp(McpArgs {
-                command: Some(McpCommand::Add(McpAddArgs { name, url: Some(url), header, command }))
+                command: Some(McpCommand::Add(McpAddArgs { name, url: Some(url), header, command, .. }))
             })) if name == "remote"
                 && url == "https://example.test/mcp"
                 && header == ["Authorization=Bearer ${MCP_TOKEN}"]
@@ -1690,6 +1757,18 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["harness", "mcp"]).unwrap().command,
             Some(Command::Mcp(McpArgs { command: None }))
+        ));
+
+        let selected =
+            Cli::try_parse_from(["harness", "--mcp", "email", "--mcp", "calendar", "mcp"]).unwrap();
+        assert_eq!(selected.mcp, ["email", "calendar"]);
+        assert!(matches!(
+            Cli::try_parse_from(["harness", "mcp", "add", "x", "--disabled", "--", "srv"])
+                .unwrap()
+                .command,
+            Some(Command::Mcp(McpArgs {
+                command: Some(McpCommand::Add(McpAddArgs { disabled: true, .. }))
+            }))
         ));
 
         let resumed = Cli::try_parse_from(["harness", "--resume-session", "session-123"]).unwrap();
@@ -2239,17 +2318,18 @@ future_server_key = "keep"
             &path,
             "filesystem",
             &["npx".into(), "-y".into(), "server-filesystem".into()],
+            true,
         )
         .unwrap();
-        assert!(add_mcp_server_at(&path, "filesystem", &["other".into()]).is_err());
+        assert!(add_mcp_server_at(&path, "filesystem", &["other".into()], true).is_err());
         let loaded = load_file_config(&path).unwrap();
         let servers = &loaded.mcp.unwrap().servers;
         assert_eq!(servers.len(), 2);
         let added = servers
             .iter()
-            .find(|server| server.name == "filesystem")
+            .find(|server| server.config.name == "filesystem")
             .unwrap();
-        let mcp::McpTransportConfig::Stdio { command, args, .. } = &added.transport else {
+        let mcp::McpTransportConfig::Stdio { command, args, .. } = &added.config.transport else {
             panic!("expected stdio server")
         };
         assert_eq!(command, Path::new("npx"));
@@ -2277,15 +2357,54 @@ future_server_key = "keep"
             ("X-Tenant".into(), "acme".into()),
         ]);
 
-        add_http_mcp_server_at(&path, "remote", "https://example.test/mcp", &headers).unwrap();
+        add_http_mcp_server_at(&path, "remote", "https://example.test/mcp", &headers, true)
+            .unwrap();
         let loaded = load_file_config(&path).unwrap();
         let server = &loaded.mcp.unwrap().servers[0];
-        let mcp::McpTransportConfig::Http { url, headers } = &server.transport else {
+        let mcp::McpTransportConfig::Http { url, headers } = &server.config.transport else {
             panic!("expected HTTP server")
         };
         assert_eq!(url, "https://example.test/mcp");
         assert_eq!(headers["Authorization"], "Bearer ${MCP_TOKEN}");
         assert_eq!(headers["X-Tenant"], "acme");
+    }
+
+    #[test]
+    fn opt_in_flag_round_trips_through_add_enable_and_disable() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let headers = BTreeMap::from([("X-Tenant".into(), "acme".into())]);
+        add_http_mcp_server_at(&path, "email", "https://example.test/mcp", &headers, false)
+            .unwrap();
+        add_mcp_server_at(&path, "local", &["server".into()], true).unwrap();
+
+        let enabled = |path: &Path, name: &str| {
+            load_file_config(path)
+                .unwrap()
+                .mcp
+                .unwrap()
+                .servers
+                .into_iter()
+                .find(|server| server.config.name == name)
+                .unwrap()
+                .enabled
+        };
+        // `enabled = false` sits beside a headers sub-table and must still
+        // parse back onto the server rather than into the table.
+        assert!(!enabled(&path, "email"));
+        assert!(enabled(&path, "local"));
+        assert!(
+            !fs::read_to_string(&path)
+                .unwrap()
+                .contains("enabled = true")
+        );
+
+        set_mcp_server_enabled_at(&path, "email", true).unwrap();
+        assert!(enabled(&path, "email"));
+        assert!(!fs::read_to_string(&path).unwrap().contains("enabled"));
+        set_mcp_server_enabled_at(&path, "local", false).unwrap();
+        assert!(!enabled(&path, "local"));
+        assert!(set_mcp_server_enabled_at(&path, "missing", false).is_err());
     }
 
     #[test]
@@ -2481,12 +2600,12 @@ future_server_key = "keep"
             },
         }];
         let replaced = load_file_config_with_mcp(&path, Some(&servers)).unwrap();
-        assert_eq!(replaced.mcp.unwrap().servers, servers);
+        assert_eq!(replaced.mcp.unwrap().runtime().servers, servers);
         assert_eq!(fs::read_to_string(&path).unwrap(), contents);
 
         let missing = directory.path().join("missing.toml");
         let standalone = load_file_config_with_mcp(&missing, Some(&servers)).unwrap();
-        assert_eq!(standalone.mcp.unwrap().servers, servers);
+        assert_eq!(standalone.mcp.unwrap().runtime().servers, servers);
         assert!(!missing.exists());
     }
 

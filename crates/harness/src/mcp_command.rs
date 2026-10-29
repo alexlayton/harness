@@ -1,6 +1,6 @@
 use crate::config::{
     McpArgs, McpCommand, add_http_mcp_server, add_mcp_server, config_path, delete_mcp_server,
-    load_file_config,
+    load_file_config, set_mcp_server_enabled,
 };
 use anyhow::{Result, anyhow};
 use mcp::McpTransportConfig;
@@ -13,11 +13,22 @@ pub fn run(args: &McpArgs) -> Result<ExitCode> {
         Some(McpCommand::Add(args)) => {
             if let Some(url) = &args.url {
                 let headers = parse_headers(&args.header)?;
-                add_http_mcp_server(&args.name, url, &headers)?;
+                add_http_mcp_server(&args.name, url, &headers, !args.disabled)?;
             } else {
-                add_mcp_server(&args.name, &args.command)?;
+                add_mcp_server(&args.name, &args.command, !args.disabled)?;
             }
             println!("Added MCP server `{}`.", args.name);
+            if args.disabled {
+                println!("It connects only with `--mcp {}`.", args.name);
+            }
+        }
+        Some(McpCommand::Enable { name }) => {
+            set_mcp_server_enabled(name, true)?;
+            println!("MCP server `{name}` now connects in every launch.");
+        }
+        Some(McpCommand::Disable { name }) => {
+            set_mcp_server_enabled(name, false)?;
+            println!("MCP server `{name}` now connects only with `--mcp {name}`.");
         }
         Some(McpCommand::Delete { name }) => {
             delete_mcp_server(name)?;
@@ -51,7 +62,11 @@ fn list() -> Result<()> {
         return Ok(());
     }
 
-    for server in servers {
+    for entry in servers {
+        let server = entry.config;
+        // Opt-in servers are marked so the list explains why a launch
+        // may not connect them.
+        let suffix = if entry.enabled { "" } else { "\t(opt-in)" };
         match server.transport {
             McpTransportConfig::Stdio { command, args, .. } => {
                 let mut invocation = format!("{:?}", command);
@@ -59,11 +74,11 @@ fn list() -> Result<()> {
                     invocation.push(' ');
                     invocation.push_str(&format!("{arg:?}"));
                 }
-                println!("{}\tstdio\t{}", server.name, invocation);
+                println!("{}\tstdio\t{}{}", server.name, invocation, suffix);
             }
             McpTransportConfig::Http { url, .. } => {
                 // URLs often carry tokens in userinfo or the query.
-                println!("{}\thttp\t{}", server.name, mcp::redact_url(&url));
+                println!("{}\thttp\t{}{}", server.name, mcp::redact_url(&url), suffix);
             }
         }
     }

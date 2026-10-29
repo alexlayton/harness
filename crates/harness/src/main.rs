@@ -469,6 +469,7 @@ async fn run_application(
         no_context_files: cli.no_context_files,
         defer_session_sync: cli.defer_session_sync,
         worktree: herdr_worktree,
+        mcp: config.mcp_requested.clone(),
     };
     let herdr = herdr::Herdr::from_env();
     let herdr_reporter = herdr.as_ref().map(|h| h.start());

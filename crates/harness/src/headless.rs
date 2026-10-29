@@ -535,6 +535,7 @@ async fn run_headless_resolved(
         no_context_files,
         defer_session_sync,
         worktree: herdr_worktree,
+        mcp: config.mcp_requested.clone(),
     };
     let herdr = crate::herdr::Herdr::from_env();
     let herdr_reporter = herdr.as_ref().map(|h| h.start());
