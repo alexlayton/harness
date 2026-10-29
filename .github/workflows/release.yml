@@ -65,6 +65,11 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: harness-${{ needs.checks.outputs.tag }}-x86_64-unknown-linux-gnu.tar.gz
             smoke: true
+          # Native arm64 runner with the same glibc 2.35 baseline as above.
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: harness-${{ needs.checks.outputs.tag }}-aarch64-unknown-linux-gnu.tar.gz
+            smoke: true
           - os: macos-14
             target: aarch64-apple-darwin
             archive: harness-${{ needs.checks.outputs.tag }}-aarch64-apple-darwin.tar.gz

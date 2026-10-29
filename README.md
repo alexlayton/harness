@@ -133,9 +133,11 @@ Initial releases provide these builds:
 - macOS on Apple silicon (`aarch64-apple-darwin`)
 - macOS on Intel (`x86_64-apple-darwin`)
 - Linux x86-64 with glibc 2.35 or newer (`x86_64-unknown-linux-gnu`)
+- Linux arm64 with glibc 2.35 or newer (`aarch64-unknown-linux-gnu`)
 
-The GNU Linux artifact is built on Ubuntu 22.04 to keep that minimum runtime
-baseline stable. Windows is not supported in the initial release.
+The GNU Linux artifacts are built on Ubuntu 22.04 runners, x86-64 and arm64,
+to keep that minimum runtime baseline stable. Windows is not supported in the
+initial release.
 
 Homebrew users can install the source formula:
 
