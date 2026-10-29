@@ -58,8 +58,13 @@ name `harness` with the active provider, model, reasoning effort, session ID,
 and any `--no-context-files` or `--defer-session-sync` options. Herdr 0.9.2 or
 newer is required to consume the resume argv after `--`. Arguments are checked
 against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
-characters). Repeated reports are coalesced, but state transitions are sent in
-order. Reports are best-effort and use a short timeout; failures do not affect
+characters). When launched through `harness worktree BRANCH`, the resume argv
+re-enters the same worktree (`worktree BRANCH --dir PATH`), because Herdr
+restores the pane in the launch directory and sessions are scoped to the
+workspace directory. Repeated reports are coalesced, and when several changes
+queue while a Herdr call is running, only the newest state is sent, as Herdr's
+guide asks. The session title is sent as display-only pane metadata
+(`pane report-metadata --title`) and cleared on exit. Reports are best-effort and use a short timeout; failures do not affect
 Harness output and are logged when `HARNESS_LOG` is set. Outside a fully
 configured Herdr pane, no integration is activated. TUI and headless lifecycles
 report state and release the pane on process exit. ACP remains independent

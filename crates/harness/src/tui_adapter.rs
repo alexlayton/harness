@@ -150,6 +150,7 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
         AgentEvent::SessionChanged { id, title, loaded } => {
             tui::UiEvent::SessionChanged { id, title, loaded }
         }
+        AgentEvent::SessionTitleChanged { title } => tui::UiEvent::SessionTitleChanged { title },
         AgentEvent::SessionSnapshot { entries } => tui::UiEvent::SessionSnapshot {
             entries: entries
                 .into_iter()

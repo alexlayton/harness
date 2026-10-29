@@ -333,6 +333,7 @@ async fn drive_headless_events_into(
             AgentEvent::AskStarted | AgentEvent::AskAnswer(_) => {}
             AgentEvent::OperationFinished
             | AgentEvent::SessionSnapshot { .. }
+            | AgentEvent::SessionTitleChanged { .. }
             | AgentEvent::SessionList { .. }
             | AgentEvent::ModelList { .. }
             | AgentEvent::ContextUsageUpdated { .. }
@@ -383,6 +384,7 @@ async fn run_headless(
         project_context,
         no_context_files,
         false,
+        None,
     )
     .await
 }
@@ -401,6 +403,7 @@ pub(crate) async fn run_headless_with_prompt(
     project_context: String,
     no_context_files: bool,
     defer_session_sync: bool,
+    herdr_worktree: Option<crate::herdr::WorktreeResume>,
 ) -> Result<ExitCode> {
     run_headless_resolved(
         config,
@@ -413,6 +416,7 @@ pub(crate) async fn run_headless_with_prompt(
         project_context,
         no_context_files,
         defer_session_sync,
+        herdr_worktree,
     )
     .await
 }
@@ -443,6 +447,7 @@ async fn run_headless_with_cancel(
         project_context,
         no_context_files,
         false,
+        None,
     )
     .await
 }
@@ -459,6 +464,7 @@ async fn run_headless_resolved(
     project_context: String,
     no_context_files: bool,
     defer_session_sync: bool,
+    herdr_worktree: Option<crate::herdr::WorktreeResume>,
 ) -> Result<ExitCode> {
     let session = match (&args.resume, &store) {
         (Some(selector), Some(store)) => Some(
@@ -528,6 +534,7 @@ async fn run_headless_resolved(
         reasoning: config.reasoning.as_str().into(),
         no_context_files,
         defer_session_sync,
+        worktree: herdr_worktree,
     };
     let herdr = crate::herdr::Herdr::from_env();
     let herdr_reporter = herdr.as_ref().map(|h| h.start());
