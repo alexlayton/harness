@@ -31,6 +31,9 @@ pub(crate) struct ResumeOptions {
     pub no_context_files: bool,
     pub defer_session_sync: bool,
     pub worktree: Option<WorktreeResume>,
+    /// Opt-in MCP servers connected by this process, so a resumed session
+    /// gets the same ones.
+    pub mcp: Vec<String>,
 }
 
 impl ResumeOptions {
@@ -53,6 +56,10 @@ impl ResumeOptions {
         }
         if self.defer_session_sync {
             argv.push("--defer-session-sync".into());
+        }
+        for name in &self.mcp {
+            argv.push("--mcp".into());
+            argv.push(name.clone());
         }
         // Global flags stay before the subcommand. Retention (`--keep`) is
         // sticky in the repository, so it does not need to be repeated.
@@ -392,6 +399,7 @@ mod tests {
             no_context_files: false,
             defer_session_sync: true,
             worktree: None,
+            mcp: Vec::new(),
         }
     }
 
@@ -401,7 +409,9 @@ mod tests {
             bin: "herdr".into(),
             pane: "pane-1".into(),
         };
-        let argv = options().argv("sess").unwrap();
+        let mut options = options();
+        options.mcp = vec!["email".into()];
+        let argv = options.argv("sess").unwrap();
         let args = h.report_args(&Snapshot {
             state: State::Working,
             session: Some("sess".into()),
@@ -416,6 +426,7 @@ mod tests {
         assert!(args.windows(2).any(|w| w == ["--provider", "openrouter"]));
         assert!(args.windows(2).any(|w| w == ["--reasoning-effort", "low"]));
         assert!(args.contains(&"--defer-session-sync".into()));
+        assert!(argv.windows(2).any(|w| w == ["--mcp", "email"]));
         assert!(args.ends_with(&argv));
     }
 
@@ -477,6 +488,7 @@ mod tests {
             no_context_files: true,
             defer_session_sync: false,
             worktree: None,
+            mcp: Vec::new(),
         };
         reporter.report(State::Working, None);
         reporter.with_session("session-1".into(), &options);

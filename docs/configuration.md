@@ -55,7 +55,7 @@ CLI at `HERDR_BIN_PATH`. Reports use the stable `harness` source and `Harness`
 agent name, report working as soon as a turn starts and idle when ready for
 input, and attach the actual agent session ID. Resume argv uses the executable
 name `harness` with the active provider, model, reasoning effort, session ID,
-and any `--no-context-files` or `--defer-session-sync` options. Herdr 0.9.2 or
+and any `--no-context-files`, `--defer-session-sync`, or `--mcp` options. Herdr 0.9.2 or
 newer is required to consume the resume argv after `--`. Arguments are checked
 against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
 characters). When launched through `harness worktree BRANCH`, the resume argv
@@ -371,6 +371,9 @@ harness mcp add remote --url https://example.com/mcp
 harness mcp add private --url https://example.com/mcp \
   --header 'Authorization=Bearer ${MCP_TOKEN}'
 harness mcp delete filesystem
+harness mcp add email --disabled --url https://example.com/mail-mcp
+harness mcp enable email
+harness mcp disable email
 ```
 
 `harness mcp` and `harness mcp list` list the configured servers. For stdio,
@@ -379,6 +382,33 @@ executable. Servers are launched directly, so add the executable and each
 argument as a separate command-line value rather than supplying one shell
 command string. Repeat `--header NAME=VALUE` to configure HTTP request headers.
 The commands update `config.toml` atomically and preserve unrelated settings.
+
+### Per-session servers
+
+A server with `enabled = false` is configured but not connected by default.
+A launch connects it only when it names the server with `--mcp`; repeat the
+flag for several servers:
+
+```text
+harness mcp add email --disabled --url https://example.com/mail-mcp
+harness --mcp email
+harness --mcp email --mcp calendar prompt "Summarize today's mail"
+```
+
+```toml
+[[mcp.servers]]
+name = "email"
+transport = "http"
+url = "https://example.com/mail-mcp"
+enabled = false
+```
+
+`harness mcp enable <name>` and `harness mcp disable <name>` toggle the
+setting, and `harness mcp list` marks opt-in servers. Selection happens before
+`${ENV_VAR}` expansion, so an opt-in server's credentials are required only in
+launches that request it. An unknown `--mcp` name is an error. Servers connect
+once per process, so `/new` and `/resume` keep the launch's selection. A Herdr
+resume command repeats the same `--mcp` flags.
 
 The equivalent stdio configuration is:
 
@@ -551,3 +581,4 @@ harness acp --provider openai-codex
 | `--no-session` | Do not persist a prompt-mode run. |
 | `--defer-session-sync` | Sync session records at turn boundaries. |
 | `--no-context-files` | Disable project instruction files. |
+| `--mcp <name>` | Also connect a server marked `enabled = false`; repeatable. |
