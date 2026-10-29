@@ -2127,6 +2127,7 @@ impl CrossTerm {
             UiEvent::SessionExported { path } => {
                 self.add_notice(format!("exported session to {path}"));
             }
+            UiEvent::SessionTitleChanged { .. } => {}
             UiEvent::SkillsLoaded {
                 skills,
                 diagnostics,

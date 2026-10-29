@@ -247,6 +247,10 @@ pub enum UiEvent {
         title: Option<String>,
         loaded: bool,
     },
+    /// The session received its first title. The terminal UI does not show it.
+    SessionTitleChanged {
+        title: String,
+    },
     SessionSnapshot {
         entries: Vec<SessionSnapshotEntry>,
     },

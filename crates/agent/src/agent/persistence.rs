@@ -173,12 +173,31 @@ impl Agent {
         message: &Message,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(), TurnError> {
+        let had_title = self
+            .session
+            .as_ref()
+            .is_some_and(|state| state.session.title().is_some());
         self.persist_event(
             SessionEvent::UserMessage {
                 message: StoredMessage::from_llm(message),
             },
             events,
-        )
+        )?;
+        // The first user message names the session; tell frontends once.
+        if !had_title
+            && let Some(title) = self
+                .session
+                .as_ref()
+                .and_then(|state| state.session.title())
+        {
+            send(
+                events,
+                AgentEvent::SessionTitleChanged {
+                    title: self.secret_masker.mask_text(title),
+                },
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn persist_assistant(

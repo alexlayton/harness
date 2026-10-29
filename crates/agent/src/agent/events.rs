@@ -141,6 +141,11 @@ pub enum AgentEvent {
         title: Option<String>,
         loaded: bool,
     },
+    /// The active session received its first title, derived from the first
+    /// user message. Text is already secret-masked.
+    SessionTitleChanged {
+        title: String,
+    },
     SessionSnapshot {
         entries: Vec<SessionSnapshotEntry>,
     },

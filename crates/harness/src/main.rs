@@ -123,6 +123,12 @@ async fn main_inner() -> Result<ExitCode> {
                 "worktree: warning: the launch checkout has uncommitted changes; the new worktree contains committed Git state only"
             );
         }
+        // Herdr restarts the pane in the launch directory, so a resumed
+        // session must enter this worktree again to find its workspace.
+        let herdr_worktree = herdr::WorktreeResume {
+            branch: args.branch.clone(),
+            dir: lease.path().to_path_buf(),
+        };
         cli.command = args
             .command
             .map(|WorktreeCommand::Prompt(prompt)| Command::Prompt(prompt));
@@ -137,7 +143,8 @@ async fn main_inner() -> Result<ExitCode> {
             }
             return Err(enter_error);
         }
-        let application_result = run_application(cli, Some(session_root)).await;
+        let application_result =
+            run_application(cli, Some(session_root), Some(herdr_worktree)).await;
         if let Err(error) = std::env::set_current_dir(&launch_directory) {
             let retained_path = lease.release_without_cleanup();
             let restore_error = anyhow::Error::new(error).context(format!(
@@ -173,7 +180,7 @@ async fn main_inner() -> Result<ExitCode> {
         return application_result;
     }
 
-    run_application(cli, None).await
+    run_application(cli, None, None).await
 }
 
 /// `--resume-session` is global, but prompt mode reads its own `--resume`,
@@ -241,6 +248,7 @@ fn absolutize_process_path_overrides() -> Result<()> {
 async fn run_application(
     mut cli: Cli,
     session_root: Option<std::path::PathBuf>,
+    herdr_worktree: Option<herdr::WorktreeResume>,
 ) -> Result<ExitCode> {
     apply_global_resume_to_prompt(&mut cli)?;
     let prompt_args = match &cli.command {
@@ -338,6 +346,7 @@ async fn run_application(
             context_bundle.rendered,
             cli.no_context_files,
             cli.defer_session_sync,
+            herdr_worktree,
         )
         .await;
     }
@@ -459,6 +468,7 @@ async fn run_application(
         reasoning: config.reasoning.as_str().into(),
         no_context_files: cli.no_context_files,
         defer_session_sync: cli.defer_session_sync,
+        worktree: herdr_worktree,
     };
     let herdr = herdr::Herdr::from_env();
     let herdr_reporter = herdr.as_ref().map(|h| h.start());
