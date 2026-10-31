@@ -25,6 +25,10 @@ const MAX_SUSPENSIONS: usize = 1000;
 const COMPUTE_LIMIT: Duration = Duration::from_secs(5);
 const WALL_LIMIT: Duration = Duration::from_secs(120);
 const MAX_CATALOG_BYTES: usize = 512 * 1024;
+/// Budget for successful nested-call outputs echoed back when a snippet
+/// fails. Without them the model has to replay every earlier call (and pay a
+/// round trip) just to recover results that were already computed.
+const MAX_SALVAGED_BYTES: usize = 24 * 1024;
 
 #[cfg(test)]
 mod tests;
@@ -291,6 +295,31 @@ impl Codemode {
         }
     }
 
+    /// Add a recovery hint to an unknown `tools[...]` key. Models see their
+    /// top-level tools with a provider-specific `_` prefix (and tools such as
+    /// `bash` that are not callable from a snippet at all), so a bare
+    /// `KeyError` makes them guess again.
+    fn explain(&self, error: String) -> String {
+        let Some(key) = error
+            .lines()
+            .rev()
+            .find_map(|line| line.trim().strip_prefix("KeyError: "))
+            .map(|key| key.trim().trim_matches(['\'', '"']).to_owned())
+        else {
+            return error;
+        };
+        let bare = key.trim_start_matches('_');
+        let hint = if self.contains(bare) {
+            format!("use tools[\"{bare}\"] (codemode tool names have no `_` prefix)")
+        } else {
+            format!(
+                "`{bare}` is not callable from codemode; call it as a separate top-level tool. Available: {}",
+                self.names.join(", ")
+            )
+        };
+        format!("{error}\nhint: {hint}")
+    }
+
     /// Host-side metadata lookup. It cannot run a tool, so it needs no audit
     /// record and does not count toward the nested-call limit.
     fn describe(&self, args: &monty_types::CallArgs) -> Result<MontyObject, String> {
@@ -346,17 +375,21 @@ impl Codemode {
         let _cancel_on_drop = workflow_cancel.clone().drop_guard();
         let mut printed = String::new();
         let mut audit = Vec::new();
+        let mut salvaged = Vec::new();
         let deadline = tokio::time::Instant::now() + WALL_LIMIT;
         let result = tokio::select! {
             biased;
             _ = workflow_cancel.cancelled() => Err("cancelled; an unfinished nested call may have applied changes".into()),
-            result = tokio::time::timeout_at(deadline, self.drive(code.to_owned(), &mut printed, &mut audit, &workflow_cancel, executor)) => {
+            result = tokio::time::timeout_at(deadline, self.drive(code.to_owned(), &mut printed, &mut audit, &mut salvaged, &workflow_cancel, executor)) => {
                 result.unwrap_or_else(|_| Err("codemode elapsed-time limit exceeded; an unfinished nested call may have applied changes".into()))
             }
         };
         let value = match result {
             Ok(value) => value,
-            Err(error) => return failure(&format_error(&error, &audit, &printed), summary),
+            Err(error) => {
+                let error = self.explain(error);
+                return failure(&format_error(&error, &audit, &salvaged, &printed), summary);
+            }
         };
         // Formatting is also computation: shared values can have enormous
         // representations. Keep it off Tokio and stop on the first full write.
@@ -383,7 +416,7 @@ impl Codemode {
                 is_error: false,
                 summary,
             },
-            Err(error) => failure(&format_error(&error, &audit, ""), summary),
+            Err(error) => failure(&format_error(&error, &audit, &salvaged, ""), summary),
         }
     }
 
@@ -392,6 +425,7 @@ impl Codemode {
         code: String,
         printed: &mut String,
         audit: &mut Vec<String>,
+        salvaged: &mut Vec<String>,
         cancel: &CancellationToken,
         executor: &dyn CodemodeExecutor,
     ) -> Result<MontyObject, String> {
@@ -490,6 +524,18 @@ impl Codemode {
                                 .truncate(output.content.floor_char_boundary(MAX_VALUE_BYTES));
                             output.content.push_str("\n[output truncated]");
                         }
+                        if !output.is_error {
+                            let used: usize = salvaged.iter().map(String::len).sum();
+                            let room = MAX_SALVAGED_BYTES.saturating_sub(used);
+                            if room > 0 {
+                                let mut text = output.content.clone();
+                                if text.len() > room {
+                                    text.truncate(text.floor_char_boundary(room));
+                                    text.push_str("\n[truncated]");
+                                }
+                                salvaged.push(format!("{}: {name}\n{text}", audit.len()));
+                            }
+                        }
                         let result = if output.is_error {
                             exception(&output.content)
                         } else {
@@ -572,7 +618,7 @@ pub(crate) fn summary(args: &Value) -> String {
     )
 }
 
-fn format_error(error: &str, audit: &[String], printed: &str) -> String {
+fn format_error(error: &str, audit: &[String], salvaged: &[String], printed: &str) -> String {
     let mut output = super::python::BoundedOutput::new(String::new());
     // Keep recovery information ahead of supplementary output. A full print
     // buffer must never hide completed mutations or the failure reason.
@@ -585,6 +631,15 @@ fn format_error(error: &str, audit: &[String], printed: &str) -> String {
         let _ = writeln!(output, "{entry}");
     }
     let _ = writeln!(output, "{error}");
+    if !salvaged.is_empty() {
+        let _ = writeln!(
+            output,
+            "Results of calls that succeeded before the failure (do not replay them):"
+        );
+        for entry in salvaged {
+            let _ = writeln!(output, "{entry}");
+        }
+    }
     let _ = output.write_str(printed);
     output.finish()
 }
