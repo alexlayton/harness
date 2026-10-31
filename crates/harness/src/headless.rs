@@ -76,10 +76,10 @@ fn cancel_on_sigint(cancel: CancellationToken) {
 }
 
 /// Observe runtime lifecycle without adding any output to stdout or stderr.
-fn observe_herdr_events(
+fn observe_herdr_tui_events(
     mut input: mpsc::UnboundedReceiver<AgentEvent>,
-    reporter: crate::herdr::Reporter,
-    options: crate::herdr::ResumeOptions,
+    reporter: crate::herdr_tui::Reporter,
+    options: crate::herdr_tui::ResumeOptions,
 ) -> mpsc::UnboundedReceiver<AgentEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -403,7 +403,7 @@ pub(crate) async fn run_headless_with_prompt(
     project_context: String,
     no_context_files: bool,
     defer_session_sync: bool,
-    herdr_worktree: Option<crate::herdr::WorktreeResume>,
+    herdr_tui_worktree: Option<crate::herdr_tui::WorktreeResume>,
 ) -> Result<ExitCode> {
     run_headless_resolved(
         config,
@@ -416,7 +416,7 @@ pub(crate) async fn run_headless_with_prompt(
         project_context,
         no_context_files,
         defer_session_sync,
-        herdr_worktree,
+        herdr_tui_worktree,
     )
     .await
 }
@@ -464,7 +464,7 @@ async fn run_headless_resolved(
     project_context: String,
     no_context_files: bool,
     defer_session_sync: bool,
-    herdr_worktree: Option<crate::herdr::WorktreeResume>,
+    herdr_tui_worktree: Option<crate::herdr_tui::WorktreeResume>,
 ) -> Result<ExitCode> {
     let session = match (&args.resume, &store) {
         (Some(selector), Some(store)) => Some(
@@ -528,33 +528,33 @@ async fn run_headless_resolved(
         Err(_) if cancel.is_cancelled() => return Ok(ExitCode::from(130)),
         Err(error) => return Err(error),
     };
-    let herdr_options = crate::herdr::ResumeOptions {
+    let herdr_tui_options = crate::herdr_tui::ResumeOptions {
         provider: config.provider.to_string(),
         model: config.model.clone(),
         reasoning: config.reasoning.as_str().into(),
         no_context_files,
         defer_session_sync,
-        worktree: herdr_worktree,
+        worktree: herdr_tui_worktree,
         mcp: config.mcp_requested.clone(),
     };
-    let herdr = crate::herdr::Herdr::from_env();
-    let herdr_reporter = herdr.as_ref().map(|h| h.start());
-    if let (Some((reporter, _)), Some(id)) = (&herdr_reporter, session_id) {
-        reporter.with_session(id, &herdr_options);
+    let herdr_tui = crate::herdr_tui::HerdrTui::from_env();
+    let herdr_tui_reporter = herdr_tui.as_ref().map(|h| h.start());
+    if let (Some((reporter, _)), Some(id)) = (&herdr_tui_reporter, session_id) {
+        reporter.with_session(id, &herdr_tui_options);
     }
 
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     // Send the single user turn, then close the channel so the agent's run
     // loop exits after this turn has drained its tool-call rounds.
-    if let Some((reporter, _)) = &herdr_reporter {
-        reporter.report(crate::herdr::State::Working, None);
+    if let Some((reporter, _)) = &herdr_tui_reporter {
+        reporter.report(crate::herdr_tui::State::Working, None);
     }
     let send_result = input_tx.send(InputMessage::Message(prompt));
     drop(input_tx);
 
-    let event_rx = if let Some((reporter, _)) = &herdr_reporter {
-        observe_herdr_events(event_rx, reporter.clone(), herdr_options)
+    let event_rx = if let Some((reporter, _)) = &herdr_tui_reporter {
+        observe_herdr_tui_events(event_rx, reporter.clone(), herdr_tui_options)
     } else {
         event_rx
     };
@@ -564,11 +564,11 @@ async fn run_headless_resolved(
     // A closed event channel is not proof that the agent completed: preserve
     // panics and runtime task failures instead of returning a blank success.
     let agent_result = agent_task.await;
-    if let Some((reporter, task)) = herdr_reporter {
+    if let Some((reporter, task)) = herdr_tui_reporter {
         drop(reporter);
         let _ = task.await;
-        if let Some(herdr) = herdr {
-            herdr.release().await;
+        if let Some(herdr_tui) = herdr_tui {
+            herdr_tui.release().await;
         }
     }
     send_result.context("send prompt to agent")?;

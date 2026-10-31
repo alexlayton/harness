@@ -47,34 +47,37 @@ preserves configuration keys that it does not know when it saves these values.
 Use `harness --resume-session ID` to reopen a persisted interactive session;
 headless runs use `harness prompt --resume ID PROMPT`.
 
-## Herdr integration
+## Herdr TUI integration
+
+This is for the original Herdr TUI. The Herdr desktop app uses
+[program status (OSC 7501)](#program-status-osc-7501) instead.
 
 When `HERDR_ENV=1` and `HERDR_PANE_ID`, `HERDR_BIN_PATH`, and
-`HERDR_SOCKET_PATH` are all set, Harness reports pane state through the Herdr
+`HERDR_SOCKET_PATH` are all set, Harness reports pane state through the Herdr TUI
 CLI at `HERDR_BIN_PATH`. Reports use the stable `harness` source and `Harness`
 agent name, report working as soon as a turn starts and idle when ready for
 input, and attach the actual agent session ID. Resume argv uses the executable
 name `harness` with the active provider, model, reasoning effort, session ID,
-and any `--no-context-files`, `--defer-session-sync`, or `--mcp` options. Herdr 0.9.2 or
+and any `--no-context-files`, `--defer-session-sync`, or `--mcp` options. Herdr TUI 0.9.2 or
 newer is required to consume the resume argv after `--`. Arguments are checked
-against Herdr's limits (64 arguments, 8 KiB, and no apostrophes or control
+against Herdr TUI's limits (64 arguments, 8 KiB, and no apostrophes or control
 characters). When launched through `harness worktree BRANCH`, the resume argv
-re-enters the same worktree (`worktree BRANCH --dir PATH`), because Herdr
+re-enters the same worktree (`worktree BRANCH --dir PATH`), because Herdr TUI
 restores the pane in the launch directory and sessions are scoped to the
 workspace directory. Repeated reports are coalesced, and when several changes
-queue while a Herdr call is running, only the newest state is sent, as Herdr's
+queue while a Herdr TUI call is running, only the newest state is sent, as Herdr TUI's
 guide asks. The session title is sent as display-only pane metadata
 (`pane report-metadata --title`) and cleared on exit. Reports are best-effort and use a short timeout; failures do not affect
 Harness output and are logged when `HARNESS_LOG` is set. Outside a fully
-configured Herdr pane, no integration is activated. TUI and headless lifecycles
+configured Herdr TUI pane, no integration is activated. TUI and headless lifecycles
 report state and release the pane on process exit. ACP remains independent
 because it multiplexes multiple editor sessions over a single JSON-RPC process.
-The bash tool and its optional `rtk` rewriter remove inherited Herdr pane
+The bash tool and its optional `rtk` rewriter remove inherited Herdr TUI pane
 variables from child processes, so a nested Harness cannot claim the parent's
 pane by accident.
 This does not prevent a command from setting those variables itself. See
-[Herdr's integration guide](https://herdr.dev/docs/add-herdr-support/) for
-Herdr-side behavior and requirements.
+[Herdr TUI's integration guide](https://herdr.dev/docs/add-herdr-support/) for
+Herdr TUI-side behavior and requirements.
 
 Set `rtk = true` to let the bash tool rewrite supported commands through an
 installed `rtk` executable for smaller tool output. This feature is off by
@@ -407,7 +410,7 @@ enabled = false
 setting, and `harness mcp list` marks opt-in servers. Selection happens before
 `${ENV_VAR}` expansion, so an opt-in server's credentials are required only in
 launches that request it. An unknown `--mcp` name is an error. Servers connect
-once per process, so `/new` and `/resume` keep the launch's selection. A Herdr
+once per process, so `/new` and `/resume` keep the launch's selection. A Herdr TUI
 resume command repeats the same `--mcp` flags.
 
 The equivalent stdio configuration is:

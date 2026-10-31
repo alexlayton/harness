@@ -61,7 +61,7 @@ advanced options.
 
 - A fast, direct-crossterm terminal UI that keeps completed output in native
   terminal scrollback.
-- Herdr pane status reporting and session resume when launched from a Herdr pane.
+- Herdr TUI pane status reporting and session resume when launched from a Herdr TUI pane.
 - Headless output for scripts and pipelines.
 - ACP support for compatible editors.
 - OpenCode Go, OpenRouter, GitHub Copilot, and OpenAI Codex subscription

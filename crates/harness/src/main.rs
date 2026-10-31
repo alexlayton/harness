@@ -1,6 +1,6 @@
 mod acp;
 mod headless;
-mod herdr;
+mod herdr_tui;
 mod login;
 mod mcp_command;
 mod tui_adapter;
@@ -123,9 +123,9 @@ async fn main_inner() -> Result<ExitCode> {
                 "worktree: warning: the launch checkout has uncommitted changes; the new worktree contains committed Git state only"
             );
         }
-        // Herdr restarts the pane in the launch directory, so a resumed
+        // Herdr TUI restarts the pane in the launch directory, so a resumed
         // session must enter this worktree again to find its workspace.
-        let herdr_worktree = herdr::WorktreeResume {
+        let herdr_tui_worktree = herdr_tui::WorktreeResume {
             branch: args.branch.clone(),
             dir: lease.path().to_path_buf(),
         };
@@ -144,7 +144,7 @@ async fn main_inner() -> Result<ExitCode> {
             return Err(enter_error);
         }
         let application_result =
-            run_application(cli, Some(session_root), Some(herdr_worktree)).await;
+            run_application(cli, Some(session_root), Some(herdr_tui_worktree)).await;
         if let Err(error) = std::env::set_current_dir(&launch_directory) {
             let retained_path = lease.release_without_cleanup();
             let restore_error = anyhow::Error::new(error).context(format!(
@@ -248,7 +248,7 @@ fn absolutize_process_path_overrides() -> Result<()> {
 async fn run_application(
     mut cli: Cli,
     session_root: Option<std::path::PathBuf>,
-    herdr_worktree: Option<herdr::WorktreeResume>,
+    herdr_tui_worktree: Option<herdr_tui::WorktreeResume>,
 ) -> Result<ExitCode> {
     apply_global_resume_to_prompt(&mut cli)?;
     let prompt_args = match &cli.command {
@@ -346,7 +346,7 @@ async fn run_application(
             context_bundle.rendered,
             cli.no_context_files,
             cli.defer_session_sync,
-            herdr_worktree,
+            herdr_tui_worktree,
         )
         .await;
     }
@@ -422,7 +422,7 @@ async fn run_application(
     }
 
     // Construct the terminal before assembling the agent or claiming the
-    // Herdr pane, so setup errors leave neither running MCPs nor a report.
+    // Herdr TUI pane, so setup errors leave neither running MCPs nor a report.
     let update_notice = update::check_latest().await;
     let mut ui = CrossTerm::new(
         &config.model,
@@ -462,22 +462,22 @@ async fn run_application(
     }
     let agent = builder.build().await?;
 
-    let herdr_options = herdr::ResumeOptions {
+    let herdr_tui_options = herdr_tui::ResumeOptions {
         provider: provider_name.clone(),
         model: config.model.clone(),
         reasoning: config.reasoning.as_str().into(),
         no_context_files: cli.no_context_files,
         defer_session_sync: cli.defer_session_sync,
-        worktree: herdr_worktree,
+        worktree: herdr_tui_worktree,
         mcp: config.mcp_requested.clone(),
     };
-    let herdr = herdr::Herdr::from_env();
-    let herdr_reporter = herdr.as_ref().map(|h| h.start());
-    if let Some((reporter, _)) = &herdr_reporter {
-        reporter.with_session(session_id, &herdr_options);
+    let herdr_tui = herdr_tui::HerdrTui::from_env();
+    let herdr_tui_reporter = herdr_tui.as_ref().map(|h| h.start());
+    if let Some((reporter, _)) = &herdr_tui_reporter {
+        reporter.with_session(session_id, &herdr_tui_options);
     }
 
-    let input_reporter = herdr_reporter
+    let input_reporter = herdr_tui_reporter
         .as_ref()
         .map(|(reporter, _)| reporter.clone());
     let input_task = tokio::spawn(tui_adapter::forward_inputs(
@@ -492,21 +492,21 @@ async fn run_application(
                     | tui::InputMessage::CompactSession
             ) && let Some(reporter) = &input_reporter
             {
-                reporter.report(herdr::State::Working, None);
+                reporter.report(herdr_tui::State::Working, None);
             }
         },
     ));
-    let event_herdr_reporter = herdr_reporter
+    let event_herdr_tui_reporter = herdr_tui_reporter
         .as_ref()
         .map(|(reporter, _)| reporter.clone());
     let event_task = tokio::spawn(async move {
-        let mut herdr_options = herdr_options;
+        let mut herdr_tui_options = herdr_tui_options;
         let mut pending = tui_adapter::PendingUiEvents::default();
         loop {
             tokio::select! {
                 biased;
                 // Keep draining the agent so its side effects (config saves,
-                // herdr reports) stay current; UI events wait in `pending`.
+                // Herdr TUI reports) stay current; UI events wait in `pending`.
                 event = runtime_event_rx.recv() => {
                     let Some(event) = event else { break };
                     // Config saves write and fsync a file. This task also
@@ -547,8 +547,8 @@ async fn run_application(
                             }
                         }
                     });
-                    if let Some(reporter) = &event_herdr_reporter {
-                        reporter.observe(&event, &mut herdr_options);
+                    if let Some(reporter) = &event_herdr_tui_reporter {
+                        reporter.observe(&event, &mut herdr_tui_options);
                     }
                     pending.push(tui_adapter::into_ui_event(event));
                     if !pending.flush_ready(&ui_event_tx) {
@@ -575,11 +575,11 @@ async fn run_application(
     let _ = input_task.await;
     let agent_result = agent_task.await;
     let _ = event_task.await;
-    if let Some((reporter, task)) = herdr_reporter {
+    if let Some((reporter, task)) = herdr_tui_reporter {
         drop(reporter);
         let _ = task.await;
-        if let Some(herdr) = herdr {
-            herdr.release().await;
+        if let Some(herdr_tui) = herdr_tui {
+            herdr_tui.release().await;
         }
     }
     ui_result?;

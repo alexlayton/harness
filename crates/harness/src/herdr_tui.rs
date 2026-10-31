@@ -1,4 +1,8 @@
-//! Best-effort integration with Herdr's pane-agent CLI.
+//! Best-effort integration with the Herdr TUI pane-agent CLI.
+//!
+//! The Herdr TUI (the original terminal Herdr) is separate from the Herdr
+//! desktop app. The app reads status only from OSC 7501 (see
+//! `tui::program_status`) and does not use this CLI or resume commands.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -13,7 +17,7 @@ static LAST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A `harness worktree` launch that the resume command must recreate.
 ///
-/// Sessions are scoped to the workspace directory, and Herdr restores the
+/// Sessions are scoped to the workspace directory, and Herdr TUI restores the
 /// pane in the shell's directory (the launch directory), so the resume command
 /// must enter the same worktree again before it loads the session.
 #[derive(Clone, Debug)]
@@ -110,12 +114,12 @@ impl Snapshot {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Herdr {
+pub(crate) struct HerdrTui {
     bin: String,
     pane: String,
 }
-impl Herdr {
-    /// Enable integration only in a complete Herdr pane environment.
+impl HerdrTui {
+    /// Enable integration only in a complete Herdr TUI pane environment.
     pub(crate) fn from_env() -> Option<Self> {
         if std::env::var("HERDR_ENV").ok().as_deref() != Some("1") {
             return None;
@@ -194,30 +198,31 @@ impl Herdr {
             .stderr(Stdio::null());
         match timeout(Duration::from_millis(750), command.status()).await {
             Ok(Ok(status)) if status.success() => {}
-            Ok(Ok(status)) => tracing::warn!(%status, "Herdr command failed"),
-            Ok(Err(error)) => tracing::warn!(%error, "could not run Herdr command"),
-            Err(_) => tracing::warn!("Herdr command timed out"),
+            Ok(Ok(status)) => tracing::warn!(%status, "Herdr TUI command failed"),
+            Ok(Err(error)) => tracing::warn!(%error, "could not run Herdr TUI command"),
+            Err(_) => tracing::warn!("Herdr TUI command timed out"),
         }
     }
 
     pub(crate) fn start(&self) -> (Reporter, JoinHandle<()>) {
         let (reporter, mut rx) = Reporter::channel();
-        let herdr = self.clone();
+        let herdr_tui = self.clone();
         let task = tokio::spawn(async move {
             let mut sent: Option<Snapshot> = None;
             let mut sent_title: Option<String> = None;
-            // Herdr asks integrations to send only the latest state: changes
-            // queued while a CLI call is pending are superseded, not replayed.
+            // Herdr TUI asks integrations to send only the latest state:
+            // changes queued while a CLI call is pending are superseded, not
+            // replayed.
             while let Some(next) = latest(&mut rx).await {
                 if sent
                     .as_ref()
                     .is_none_or(|sent| !sent.same_agent_report(&next))
                 {
-                    herdr.invoke(herdr.report_args(&next)).await;
+                    herdr_tui.invoke(herdr_tui.report_args(&next)).await;
                 }
                 if next.title != sent_title {
-                    herdr
-                        .invoke(herdr.metadata_args(next.title.as_deref()))
+                    herdr_tui
+                        .invoke(herdr_tui.metadata_args(next.title.as_deref()))
                         .await;
                     sent_title.clone_from(&next.title);
                 }
@@ -226,7 +231,7 @@ impl Herdr {
             // Release clears lifecycle state; metadata is cleared explicitly
             // so a stale title does not outlive the process.
             if sent_title.is_some() {
-                herdr.invoke(herdr.metadata_args(None)).await;
+                herdr_tui.invoke(herdr_tui.metadata_args(None)).await;
             }
         });
         (reporter, task)
@@ -315,7 +320,7 @@ impl Reporter {
         self.update(|current| current.title = title);
     }
 
-    /// Map one agent event to a Herdr state or resume-command update. The
+    /// Map one agent event to a Herdr TUI state or resume-command update. The
     /// TUI and headless frontends share this so their reports cannot drift.
     pub(crate) fn observe(&self, event: &agent::AgentEvent, options: &mut ResumeOptions) {
         use agent::AgentEvent;
@@ -370,8 +375,8 @@ fn sequence() -> String {
     }
 }
 
-/// Herdr's `--` resume argv is deliberately stricter than a shell command:
-/// it is passed directly to exec and must be safe for Herdr's persisted form.
+/// Herdr TUI's `--` resume argv is deliberately stricter than a shell command:
+/// it is passed directly to exec and must be safe for its persisted form.
 fn valid_resume_argv(argv: &[String]) -> bool {
     if argv.is_empty()
         || argv.len() > 64
@@ -405,7 +410,7 @@ mod tests {
 
     #[test]
     fn report_uses_cli_syntax_and_resume_preserves_model_and_session() {
-        let h = Herdr {
+        let h = HerdrTui {
             bin: "herdr".into(),
             pane: "pane-1".into(),
         };
@@ -449,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_argv_obeys_herdr_limits() {
+    fn resume_argv_obeys_herdr_tui_limits() {
         assert!(valid_resume_argv(&[
             "harness".into(),
             "--model".into(),
@@ -476,7 +481,7 @@ mod tests {
 
     #[tokio::test]
     async fn state_updates_retain_session_and_resume_argv() {
-        let h = Herdr {
+        let h = HerdrTui {
             bin: "herdr".into(),
             pane: "pane".into(),
         };

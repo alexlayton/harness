@@ -1262,7 +1262,7 @@ pub struct Config {
     pub secret_masker: Arc<SecretMasker>,
     /// MCP servers after deterministic validation and `${ENV_VAR}` expansion.
     pub mcp_servers: Vec<mcp::McpServerConfig>,
-    /// Opt-in servers this launch requested with `--mcp`, kept so a Herdr
+    /// Opt-in servers this launch requested with `--mcp`, kept so a Herdr TUI
     /// resume command can request the same ones.
     pub mcp_requested: Vec<String>,
     /// Whether the interactive frontend skips its welcome header.

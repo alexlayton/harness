@@ -119,7 +119,7 @@ references rather than literal credentials. See the repository's
 Each call resolves the current configuration again. Options override only
 that call and do not modify `config.toml`. The library does not change the
 process directory, mutate environment variables, install signal handlers,
-initialize global logging, or report Herdr pane state.
+initialize global logging, or report Herdr TUI pane state.
 
 ## Options
 
