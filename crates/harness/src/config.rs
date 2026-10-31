@@ -2093,6 +2093,7 @@ mod tests {
             model: Some("demo".into()),
             reasoning_effort: Some(ReasoningPolicy::Effort(llm::ReasoningEffort::High)),
             rtk: true,
+            program_status: Some(false),
             compaction: Some(CompactConfig {
                 keep_recent_turns: Some(5),
                 ..CompactConfig::default()
