@@ -54,11 +54,11 @@ const KILL_GRACE: Duration = Duration::from_millis(500);
 /// Shared deadline for draining stdout+stderr after the shell ends.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Do not give tool-launched processes the parent's Herdr pane identity.
+/// Do not give tool-launched processes the parent's Herdr TUI pane identity.
 /// A nested Harness process would otherwise claim the same pane and release
 /// its agent status when it exits. This is not a sandbox: shell commands can
 /// still set these variables explicitly.
-fn remove_herdr_pane_env(command: &mut Command) {
+fn remove_herdr_tui_pane_env(command: &mut Command) {
     for name in [
         "HERDR_ENV",
         "HERDR_PANE_ID",
@@ -102,7 +102,7 @@ async fn rtk_rewrite_cancellable(
         return None;
     }
     let mut process = Command::new("rtk");
-    remove_herdr_pane_env(&mut process);
+    remove_herdr_tui_pane_env(&mut process);
     process
         .arg("rewrite")
         .arg(command)
@@ -275,7 +275,7 @@ impl Tool for BashTool {
 
         let cwd = self.cwd.clone();
         let mut command_builder = Command::new("sh");
-        remove_herdr_pane_env(&mut command_builder);
+        remove_herdr_tui_pane_env(&mut command_builder);
         command_builder
             .arg("-c")
             .arg(&run_command)
@@ -749,9 +749,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn child_commands_do_not_inherit_herdr_pane_identity() {
+    async fn child_commands_do_not_inherit_herdr_tui_pane_identity() {
         // Set these on the child command, not the process, so this test is
-        // safe even if other tests run while Harness itself is inside Herdr.
+        // safe even if other tests run while Harness itself is inside Herdr TUI.
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -766,7 +766,7 @@ mod tests {
             .env("HERDR_SOCKET_PATH", "/tmp/parent.sock")
             .env("HERDR_BIN_PATH", "/tmp/herdr")
             .env("HARNESS_CHILD_ENV_TEST", "kept");
-        remove_herdr_pane_env(&mut command);
+        remove_herdr_tui_pane_env(&mut command);
         let output = command.output().await.unwrap();
         assert!(output.status.success());
         assert_eq!(

@@ -89,7 +89,7 @@ text from their final result.
   It reads the normal configuration and returns the final answer as text. The
   extension releases the GIL during waits and requests native cancellation on
   Python signals before waiting for cleanup. It does not change cwd, install
-  signal handlers, initialize global logging, or report Herdr state. Per-call
+  signal handlers, initialize global logging, or report Herdr TUI state. Per-call
   `mcp_servers` and `skill_dirs` lists replace defaults; omitted lists inherit
   them and empty lists disable the corresponding source. MCP overrides apply
   before persisted server validation and environment expansion.

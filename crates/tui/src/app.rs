@@ -67,6 +67,7 @@ use crate::commit::SplitScanner;
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
 use crate::paths::{self, AtPrefix};
+use crate::program_status;
 use crate::render::{self, Theme};
 use crate::state::{ToolRecord, ToolStatus};
 use crate::{
@@ -476,6 +477,9 @@ pub struct CrossTerm {
     activity_region_row: Option<usize>,
 
     terminal: Arc<Mutex<TerminalState>>,
+
+    /// OSC 7501 program-status tracker; `None` when reporting is off.
+    program_status: Option<program_status::Tracker>,
 }
 
 impl CrossTerm {
@@ -554,6 +558,7 @@ impl CrossTerm {
             cursor_row: 0,
             cursor_col: 0,
             activity_region_row: None,
+            program_status: None,
             terminal: Arc::new(Mutex::new(TerminalState {
                 backend: Box::new(CrosstermBackend),
                 modes: TerminalModes::default(),
@@ -615,6 +620,21 @@ impl CrossTerm {
         install_panic_hook(&ui.terminal);
         ui.setup_terminal()?;
         Ok(ui)
+    }
+
+    /// Report status to the terminal with OSC 7501 (the Program Status
+    /// Protocol). Terminals that do not know it ignore the sequence. Reports
+    /// are written at the start of a frame so they never split one, and the
+    /// record is cleared on exit so no stale `done` outlives the process.
+    pub fn enable_program_status(&mut self) {
+        self.program_status = Some(program_status::Tracker::new());
+    }
+
+    /// Update the status tracker, if reporting is on.
+    fn status(&mut self, update: impl FnOnce(&mut program_status::Tracker)) {
+        if let Some(tracker) = &mut self.program_status {
+            update(tracker);
+        }
     }
 
     /// Register provider aliases so `/model <alias>:<model>` still switches
@@ -685,6 +705,10 @@ impl CrossTerm {
         cancel: CancellationToken,
     ) -> Result<()> {
         let result = self.run_inner(&mut events, input_tx, cancel).await;
+        if let Some(report) = self.program_status.as_mut().and_then(|s| s.clear_report()) {
+            let _ = self.out.write_all(report.as_bytes());
+            let _ = self.out.flush();
+        }
         let restore = self.restore();
         match (result, restore) {
             (Ok(()), Ok(())) => Ok(()),
@@ -933,6 +957,7 @@ impl CrossTerm {
             // Esc closes the list instead.
             KeyCode::Esc => {
                 if self.busy {
+                    self.status(|status| status.interrupt());
                     let _ = input_tx.send(InputMessage::Interrupt);
                 } else if self.completion.is_some() {
                     self.close_completion();
@@ -1590,6 +1615,7 @@ impl CrossTerm {
             self.busy = true;
             self.activity = Activity::Preparing;
             self.spinner = 0;
+            self.status(|status| status.start_work());
         }
         Ok(())
     }
@@ -1795,6 +1821,7 @@ impl CrossTerm {
                 self.busy = true;
                 self.activity = Activity::Working;
                 self.operation_label = None;
+                self.status(|status| status.progress());
                 self.dismiss_ask();
                 self.stream().markdown.push_str(&delta);
                 self.refresh_stream_markdown_cache();
@@ -1806,6 +1833,7 @@ impl CrossTerm {
                 self.busy = true;
                 self.activity = Activity::Reasoning;
                 self.operation_label = None;
+                self.status(|status| status.start_work());
                 self.dismiss_ask();
                 self.stream().reasoning.push_str(&delta);
             }
@@ -1817,6 +1845,7 @@ impl CrossTerm {
                 self.busy = true;
                 self.activity = Activity::Processing;
                 self.operation_label = None;
+                self.status(|status| status.start_work());
                 self.dismiss_ask();
                 // Text streamed before the call is a complete message.
                 self.finalize_stream();
@@ -1870,6 +1899,7 @@ impl CrossTerm {
                 self.busy = true;
                 self.activity = Activity::Retrying;
                 self.operation_label = None;
+                self.status(|status| status.start_work());
             }
             UiEvent::Error(error) => {
                 self.finalize_stream();
@@ -1885,6 +1915,7 @@ impl CrossTerm {
                 self.busy = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
+                self.status(|status| status.fail(&error));
                 self.add_error(error);
             }
             UiEvent::AskStarted => {
@@ -1893,6 +1924,7 @@ impl CrossTerm {
                 self.activity = Activity::Asking;
                 self.operation_label = None;
                 self.spinner = 0;
+                self.status(|status| status.start_work());
             }
             UiEvent::AskAnswer(answer) => {
                 self.ask_answer = Some(answer);
@@ -1904,16 +1936,19 @@ impl CrossTerm {
                 self.busy = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
+                self.status(|status| status.finish_turn());
             }
             UiEvent::OperationStarted { label } => {
                 self.busy = true;
                 self.operation_label = Some(label);
                 self.spinner = 0;
+                self.status(|status| status.start_work());
             }
             UiEvent::OperationFinished => {
                 self.busy = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
+                self.status(|status| status.finish_operation());
             }
             UiEvent::BackgroundOperationStarted { id, label } => {
                 if let Some((_, current)) = self
@@ -2020,10 +2055,14 @@ impl CrossTerm {
             UiEvent::SubscriptionUsageLoaded { provider, usage } => {
                 self.add_notice(format_subscription_usage(&provider, &usage));
             }
-            UiEvent::SessionChanged { id, loaded, .. } => {
+            UiEvent::SessionChanged { id, loaded, title } => {
                 self.dismiss_ask();
                 self.finalize_stream();
                 self.running_tools.clear();
+                self.status(|status| {
+                    status.reset();
+                    status.set_title(title.as_deref());
+                });
                 // The terminal keeps everything physically, but the resize
                 // repaint redraws from this store, so the session-global
                 // chrome (banner, metadata, and the boundary separator that
@@ -2127,7 +2166,9 @@ impl CrossTerm {
             UiEvent::SessionExported { path } => {
                 self.add_notice(format!("exported session to {path}"));
             }
-            UiEvent::SessionTitleChanged { .. } => {}
+            UiEvent::SessionTitleChanged { title } => {
+                self.status(|status| status.set_title(Some(&title)));
+            }
             UiEvent::SkillsLoaded {
                 skills,
                 diagnostics,
@@ -2670,6 +2711,11 @@ impl CrossTerm {
         let cursor_abs = total - build.rows.len() + build.cursor_row;
 
         let mut buffer = String::new();
+        // OSC 7501 moves no cursor and draws nothing; leading the frame keeps
+        // it from splitting any of the frame's own escape sequences.
+        if let Some(report) = self.program_status.as_mut().and_then(|s| s.take_report()) {
+            buffer.push_str(&report);
+        }
         if clear_all {
             let _ = write!(buffer, "{}{}", Clear(ClearType::All), MoveTo(0, 0));
         } else if !self.region.is_empty() {

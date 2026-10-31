@@ -9,6 +9,7 @@ mod commit;
 mod environment;
 mod input;
 mod paths;
+pub mod program_status;
 mod render;
 mod state;
 
