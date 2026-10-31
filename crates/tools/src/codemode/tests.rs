@@ -275,6 +275,46 @@ async fn cancellation_and_future_drop_cannot_admit_later_tools() {
 }
 
 #[tokio::test]
+async fn failures_return_earlier_results_and_hint_at_unknown_tool_names() {
+    let (registry, _) = registry("echo");
+    let output = registry
+        .execute(
+            "codemode",
+            snippet("tools['echo'](value=7)\ntools['_bash'](command='ls')"),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(output.is_error);
+    // The completed call's result survives so the model need not replay it.
+    assert!(
+        output.content.contains("do not replay"),
+        "{}",
+        output.content
+    );
+    assert!(output.content.contains("1: echo\n"), "{}", output.content);
+    // A prefixed or non-codemode name gets an actionable hint, not a bare KeyError.
+    assert!(output.content.contains("hint:"), "{}", output.content);
+    assert!(
+        output.content.contains("Available: echo"),
+        "{}",
+        output.content
+    );
+
+    let output = registry
+        .execute(
+            "codemode",
+            snippet("tools['_echo'](value=1)"),
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(
+        output.content.contains("use tools[\"echo\"]"),
+        "{}",
+        output.content
+    );
+}
+
+#[tokio::test]
 async fn representations_and_printed_text_cannot_hide_errors_or_exceed_limits() {
     let (registry, _) = registry("echo");
     let output = tokio::time::timeout(

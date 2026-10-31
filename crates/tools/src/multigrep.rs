@@ -42,7 +42,7 @@ impl Tool for MultiGrepTool {
                         "path": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Optional workspace-relative directory scope"
+                            "description": "Optional workspace-relative directory or file scope"
                         },
                         "limit": {
                             "type": "integer",
