@@ -472,6 +472,11 @@ async fn run_application(
         mcp: config.mcp_requested.clone(),
     };
     let herdr_tui = herdr_tui::HerdrTui::from_env();
+    // Herdr TUI panes use its own CLI reports. The Herdr app and other
+    // terminals read OSC 7501, which stays off inside a Herdr TUI pane.
+    if config.program_status && herdr_tui.is_none() {
+        ui.enable_program_status();
+    }
     let herdr_tui_reporter = herdr_tui.as_ref().map(|h| h.start());
     if let Some((reporter, _)) = &herdr_tui_reporter {
         reporter.with_session(session_id, &herdr_tui_options);

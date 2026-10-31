@@ -94,6 +94,51 @@ fn observe_herdr_tui_events(
     rx
 }
 
+/// OSC 7501 status shared between the event observer and the lifecycle code.
+type SharedStatus = Arc<std::sync::Mutex<tui::program_status::Tracker>>;
+
+/// Write a program-status report to stderr. Stdout carries only the answer,
+/// and the caller enables reports only when stderr is a terminal.
+fn write_status_report(report: Option<String>) {
+    if let Some(report) = report {
+        let mut stderr = std::io::stderr();
+        let _ = stderr.write_all(report.as_bytes());
+        let _ = stderr.flush();
+    }
+}
+
+/// Track the turn for OSC 7501 without adding output. Reports are written
+/// only at the start and end of the run, so nothing interleaves with `-v`
+/// output.
+fn observe_program_status(
+    mut input: mpsc::UnboundedReceiver<AgentEvent>,
+    status: SharedStatus,
+) -> mpsc::UnboundedReceiver<AgentEvent> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(event) = input.recv().await {
+            if let Ok(mut status) = status.lock() {
+                match &event {
+                    AgentEvent::TextDelta(_) => status.progress(),
+                    AgentEvent::ReasoningDelta(_)
+                    | AgentEvent::ToolCallStarted { .. }
+                    | AgentEvent::Retrying { .. } => status.start_work(),
+                    AgentEvent::Error(message) => status.fail(message),
+                    AgentEvent::SessionChanged { title, .. } => {
+                        status.set_title(title.as_deref());
+                    }
+                    AgentEvent::SessionTitleChanged { title } => status.set_title(Some(title)),
+                    _ => {}
+                }
+            }
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 /// Headless event driver variant that knows the application cancellation
 /// token, allowing it to discard a cancelled round's buffered prose.
 async fn drive_headless_events_with_cancel(
@@ -543,6 +588,18 @@ async fn run_headless_resolved(
         reporter.with_session(id, &herdr_tui_options);
     }
 
+    // Report OSC 7501 status on stderr, only when a person can see it. Herdr
+    // TUI panes use that integration's own reports instead.
+    let program_status: Option<SharedStatus> = (config.program_status
+        && herdr_tui.is_none()
+        && std::io::stderr().is_terminal())
+    .then(|| {
+        let mut tracker = tui::program_status::Tracker::new();
+        tracker.start_work();
+        write_status_report(tracker.take_report());
+        Arc::new(std::sync::Mutex::new(tracker))
+    });
+
     let agent_task = tokio::spawn(agent.run(input_rx, event_tx));
 
     // Send the single user turn, then close the channel so the agent's run
@@ -555,6 +612,8 @@ async fn run_headless_resolved(
 
     let event_rx = if let Some((reporter, _)) = &herdr_tui_reporter {
         observe_herdr_tui_events(event_rx, reporter.clone(), herdr_tui_options)
+    } else if let Some(status) = &program_status {
+        observe_program_status(event_rx, status.clone())
     } else {
         event_rx
     };
@@ -564,6 +623,19 @@ async fn run_headless_resolved(
     // A closed event channel is not proof that the agent completed: preserve
     // panics and runtime task failures instead of returning a blank success.
     let agent_result = agent_task.await;
+    // Leave a `done`/`error` record behind, as the protocol asks of a program
+    // that exits when it finishes. A cancelled run is `idle`.
+    if let Some(status) = &program_status
+        && let Ok(mut status) = status.lock()
+    {
+        if interrupted {
+            status.interrupt();
+        } else if agent_result.is_err() {
+            status.fail("agent task failed");
+        }
+        status.finish_turn();
+        write_status_report(status.take_report());
+    }
     if let Some((reporter, task)) = herdr_tui_reporter {
         drop(reporter);
         let _ = task.await;

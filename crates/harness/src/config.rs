@@ -429,6 +429,11 @@ pub struct FileConfig {
     /// user explicitly sets `rtk = true`.
     #[serde(default)]
     pub rtk: bool,
+    /// Report status to the terminal with OSC 7501 (the Program Status
+    /// Protocol). On unless set to `false`; terminals that do not know the
+    /// sequence ignore it. Absent from disk when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_status: Option<bool>,
     /// Compact settings. Anything the compiler cannot answer comes from
     /// [`CompactionPolicy::default`]. Absent from disk when unset, so older
     /// harness versions treat the config as unchanged.
@@ -471,6 +476,7 @@ impl PartialEq for FileConfig {
             && self.model == other.model
             && self.reasoning_effort == other.reasoning_effort
             && self.rtk == other.rtk
+            && self.program_status == other.program_status
             && self.compaction == other.compaction
             && self.subagents == other.subagents
             && self.codemode == other.codemode
@@ -1267,6 +1273,8 @@ pub struct Config {
     pub mcp_requested: Vec<String>,
     /// Whether the interactive frontend skips its welcome header.
     pub tui_minimal: bool,
+    /// Whether to report status with OSC 7501 (default on).
+    pub program_status: bool,
     /// Prewalk preference, target, and explicit startup request.
     pub prewalk: PrewalkPolicy,
     /// The Copilot credential handle loaded once during resolution. Startup
@@ -1538,6 +1546,7 @@ impl Config {
             mcp_servers: mcp_servers.unwrap_or_default(),
             mcp_requested: cli.mcp.clone(),
             tui_minimal: file.tui.as_ref().is_some_and(|tui| tui.minimal),
+            program_status: file.program_status.unwrap_or(true),
             prewalk,
             // Only the process-wide [`Config::resolve`] loads credentials;
             // the testable forms never touch auth.json.
