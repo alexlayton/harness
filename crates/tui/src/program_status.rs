@@ -161,9 +161,14 @@ impl Tracker {
         }
     }
 
-    /// A non-turn operation (for example `/compact`) ended. Commands are not
-    /// results to look at, so success returns to `idle`.
+    /// An operation (for example `/compact`) ended. Commands are not results
+    /// to look at, so success returns to `idle`. A skill runs a whole turn
+    /// inside its operation: that turn already reported `done` or `error`, and
+    /// the operation ending must not replace it.
     pub fn finish_operation(&mut self) {
+        if self.state != State::Working {
+            return;
+        }
         self.interrupted = false;
         match self.failure.take() {
             Some(message) => self.set(State::Error, Some(message)),
@@ -258,6 +263,22 @@ mod tests {
         tracker.interrupt();
         tracker.fail("cancelled");
         tracker.finish_turn();
+        assert!(tracker.take_report().unwrap().contains("state=idle"));
+
+        // A skill ends its turn, then its enclosing operation.
+        tracker.start_work();
+        tracker.finish_turn();
+        tracker.finish_operation();
+        assert!(tracker.take_report().unwrap().contains("state=done"));
+        tracker.start_work();
+        tracker.fail("skill failed");
+        tracker.finish_turn();
+        tracker.finish_operation();
+        assert!(tracker.take_report().unwrap().contains("state=error"));
+
+        // A command with no turn returns to idle.
+        tracker.start_work();
+        tracker.finish_operation();
         assert!(tracker.take_report().unwrap().contains("state=idle"));
 
         tracker.start_work();
