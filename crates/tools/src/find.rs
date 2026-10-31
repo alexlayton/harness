@@ -172,8 +172,9 @@ impl FileSearchIndex {
         &self,
         task: &str,
         scope: Option<String>,
+        allow_file: bool,
         cancel: CancellationToken,
-        job: impl FnOnce(SharedFilePicker, Option<String>, CancellationToken, Arc<AtomicBool>) -> F,
+        job: impl FnOnce(SharedFilePicker, Option<SearchScope>, CancellationToken, Arc<AtomicBool>) -> F,
     ) -> Result<T, String>
     where
         F: FnOnce() -> Result<T, String> + Send + 'static,
@@ -185,8 +186,7 @@ impl FileSearchIndex {
         let picker = self.ensure_picker().await?.clone();
         let scope = match scope {
             Some(scope) if !scope.trim().is_empty() && scope != "." => {
-                let scope = self.validate_scope(&scope).await?;
-                (!scope.is_empty()).then_some(scope)
+                self.validate_scope(&scope, allow_file).await?
             }
             _ => None,
         };
@@ -230,20 +230,26 @@ impl FileSearchIndex {
         if query.trim().is_empty() {
             return Err("query must not be empty".into());
         }
-        self.run_search("find", scope, cancel, |picker, scope, cancel, _abort| {
-            let query = query.clone();
-            let scan_timeout = self.config.scan_timeout;
-            move || {
-                search_sync(
-                    &picker,
-                    &query,
-                    scope.as_deref(),
-                    limit,
-                    scan_timeout,
-                    &cancel,
-                )
-            }
-        })
+        self.run_search(
+            "find",
+            scope,
+            false,
+            cancel,
+            |picker, scope, cancel, _abort| {
+                let query = query.clone();
+                let scan_timeout = self.config.scan_timeout;
+                move || {
+                    search_sync(
+                        &picker,
+                        &query,
+                        scope.as_ref().map(|scope| scope.path.as_str()),
+                        limit,
+                        scan_timeout,
+                        &cancel,
+                    )
+                }
+            },
+        )
         .await
     }
 
@@ -275,22 +281,28 @@ impl FileSearchIndex {
             time_budget_ms: GREP_TIME_BUDGET_MS,
             ..GrepSearchOptions::default()
         };
-        self.run_search("grep", scope, cancel, |picker, scope, cancel, abort| {
-            let scan_timeout = self.config.scan_timeout;
-            let mut options = options;
-            options.abort_signal = Some(abort);
-            move || {
-                grep_sync(
-                    &picker,
-                    &pattern,
-                    scope.as_deref(),
-                    &options,
-                    limit,
-                    scan_timeout,
-                    &cancel,
-                )
-            }
-        })
+        self.run_search(
+            "grep",
+            scope,
+            true,
+            cancel,
+            |picker, scope, cancel, abort| {
+                let scan_timeout = self.config.scan_timeout;
+                let mut options = options;
+                options.abort_signal = Some(abort);
+                move || {
+                    grep_sync(
+                        &picker,
+                        &pattern,
+                        scope.as_ref(),
+                        &options,
+                        limit,
+                        scan_timeout,
+                        &cancel,
+                    )
+                }
+            },
+        )
         .await
     }
 
@@ -315,26 +327,39 @@ impl FileSearchIndex {
             time_budget_ms: GREP_TIME_BUDGET_MS,
             ..GrepSearchOptions::default()
         };
-        self.run_search("grep", scope, cancel, |picker, scope, cancel, abort| {
-            let scan_timeout = self.config.scan_timeout;
-            let mut options = options;
-            options.abort_signal = Some(abort);
-            move || {
-                multi_grep_sync(
-                    &picker,
-                    &patterns,
-                    scope.as_deref(),
-                    &options,
-                    limit,
-                    scan_timeout,
-                    &cancel,
-                )
-            }
-        })
+        self.run_search(
+            "grep",
+            scope,
+            true,
+            cancel,
+            |picker, scope, cancel, abort| {
+                let scan_timeout = self.config.scan_timeout;
+                let mut options = options;
+                options.abort_signal = Some(abort);
+                move || {
+                    multi_grep_sync(
+                        &picker,
+                        &patterns,
+                        scope.as_ref(),
+                        &options,
+                        limit,
+                        scan_timeout,
+                        &cancel,
+                    )
+                }
+            },
+        )
         .await
     }
 
-    async fn validate_scope(&self, scope: &str) -> Result<String, String> {
+    /// Resolve a model-supplied scope to a workspace-relative directory, or
+    /// a single file when `allow_file` is set. `None` means the whole
+    /// workspace (the scope resolved to the root).
+    async fn validate_scope(
+        &self,
+        scope: &str,
+        allow_file: bool,
+    ) -> Result<Option<SearchScope>, String> {
         let candidate = resolve_workspace_path(scope, &self.root, false).await?;
         let canonical = fs::canonicalize(&candidate)
             .await
@@ -348,8 +373,13 @@ impl FileSearchIndex {
         let metadata = fs::metadata(&canonical)
             .await
             .map_err(|error| format!("cannot inspect search path {scope}: {error}"))?;
-        if !metadata.is_dir() {
-            return Err(format!("search path {scope} is not a directory"));
+        let file = metadata.is_file();
+        if !metadata.is_dir() && !(allow_file && file) {
+            return Err(if allow_file {
+                format!("search path {scope} is not a file or directory")
+            } else {
+                format!("search path {scope} is not a directory")
+            });
         }
         let relative = canonical
             .strip_prefix(&self.root)
@@ -358,7 +388,10 @@ impl FileSearchIndex {
             .slash_separators()
             .trim_matches('/')
             .to_owned();
-        Ok(relative)
+        Ok((!relative.is_empty()).then_some(SearchScope {
+            path: relative,
+            file,
+        }))
     }
 }
 
@@ -530,6 +563,35 @@ fn escape_glob(value: &str) -> String {
     escaped
 }
 
+/// A validated, workspace-relative search scope. Grep accepts a single file
+/// because models routinely pass one (and a rejected call costs a full model
+/// round trip); find only accepts directories.
+#[derive(Clone, Debug)]
+pub(crate) struct SearchScope {
+    path: String,
+    file: bool,
+}
+
+impl SearchScope {
+    /// FFF glob constraint selecting exactly this scope.
+    fn glob(&self) -> String {
+        if self.file {
+            escape_glob(&self.path)
+        } else {
+            format!("{}/**", escape_glob(&self.path))
+        }
+    }
+
+    /// Defensive post-filter: whether an indexed path lies inside the scope.
+    fn contains(&self, candidate: &str) -> bool {
+        candidate == self.path
+            || (!self.file
+                && candidate
+                    .strip_prefix(self.path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/')))
+    }
+}
+
 /// Fully formatted, owned result of a grep search.  Everything the formatter
 /// needs is copied out while the picker read guard is alive.
 pub(crate) struct GrepRawOutput {
@@ -549,7 +611,7 @@ pub(crate) struct GrepRawOutput {
 fn grep_sync(
     shared_picker: &SharedFilePicker,
     pattern: &str,
-    scope: Option<&str>,
+    scope: Option<&SearchScope>,
     options: &GrepSearchOptions,
     hard_limit: usize,
     scan_timeout: Duration,
@@ -565,7 +627,7 @@ fn grep_sync(
         .ok_or_else(|| "find index is unavailable".to_owned())?;
 
     let mut parsed = parse_grep_query(pattern);
-    let scoped_glob = scope.map(|scope| format!("{}/**", escape_glob(scope)));
+    let scoped_glob = scope.map(SearchScope::glob);
     if let Some(glob) = scoped_glob.as_deref() {
         parsed.constraints.push(Constraint::Glob(glob));
     }
@@ -579,7 +641,7 @@ fn grep_sync(
 fn multi_grep_sync(
     shared_picker: &SharedFilePicker,
     patterns: &[String],
-    scope: Option<&str>,
+    scope: Option<&SearchScope>,
     options: &GrepSearchOptions,
     hard_limit: usize,
     scan_timeout: Duration,
@@ -592,7 +654,7 @@ fn multi_grep_sync(
     let picker = guard
         .as_ref()
         .ok_or_else(|| "find index is unavailable".to_owned())?;
-    let scoped_glob = scope.map(|scope| format!("{}/**", escape_glob(scope)));
+    let scoped_glob = scope.map(SearchScope::glob);
     let constraints = scoped_glob
         .as_deref()
         .map(|glob| vec![Constraint::Glob(glob)])
@@ -605,11 +667,10 @@ fn multi_grep_sync(
 fn collect_grep_result(
     result: GrepResult<'_>,
     picker: &FilePicker,
-    scope: Option<&str>,
+    scope: Option<&SearchScope>,
     hard_limit: usize,
     cancel: &CancellationToken,
 ) -> Result<GrepRawOutput, String> {
-    let scope_prefix = scope.map(|scope| format!("{scope}/"));
     let mut source_lines: BTreeMap<(String, u64), (String, bool)> = BTreeMap::new();
     let mut matched_files = BTreeSet::new();
     let mut match_count = 0usize;
@@ -621,10 +682,7 @@ fn collect_grep_result(
         let path = result.files[m.file_index]
             .relative_path(picker)
             .slash_separators();
-        if let Some(prefix) = scope_prefix.as_deref()
-            && path != scope.unwrap_or_default()
-            && !path.starts_with(prefix)
-        {
+        if scope.is_some_and(|scope| !scope.contains(&path)) {
             continue;
         }
         if match_count >= hard_limit {

@@ -26,7 +26,7 @@ impl Tool for GrepTool {
         ToolSpec {
             definition: ToolDefinition {
                 name: "grep".into(),
-                description: "Search file contents for a pattern using a fast indexed, ripgrep-compatible engine. Results respect repository ignore rules and are returned as workspace-relative paths with line numbers. Patterns may include fff constraints (e.g. `TODO *.rs` scopes to Rust files) and `path` restricts the search to a directory.".into(),
+                description: "Search file contents for a pattern using a fast indexed, ripgrep-compatible engine. Results respect repository ignore rules and are returned as workspace-relative paths with line numbers. Patterns may include fff constraints (e.g. `TODO *.rs` scopes to Rust files) and `path` restricts the search to a directory or a single file.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -38,7 +38,7 @@ impl Tool for GrepTool {
                         "path": {
                             "type": "string",
                             "minLength": 1,
-                            "description": "Optional workspace-relative directory scope. Omit this field to search the entire workspace; when provided it must not be empty."
+                            "description": "Optional workspace-relative directory or file scope. Omit this field to search the entire workspace; when provided it must not be empty."
                         },
                         "mode": {
                             "type": "string",
@@ -270,5 +270,24 @@ mod tests {
             .await;
         assert!(bad_mode.is_error);
         assert!(bad_mode.content.contains("unknown mode"));
+    }
+
+    #[tokio::test]
+    async fn accepts_a_single_file_as_the_scope() {
+        let directory = tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(directory.path().join("src/a.rs"), "let x = 1;\n").unwrap();
+        std::fs::write(directory.path().join("src/ab.rs"), "let x = 2;\n").unwrap();
+        let tool = GrepTool::new(Arc::new(FileSearchIndex::new(directory.path()).unwrap()));
+
+        let output = tool
+            .execute(
+                json!({"pattern": "let x", "path": "src/a.rs"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("src/a.rs:1:"));
+        assert!(!output.content.contains("src/ab.rs"));
     }
 }
