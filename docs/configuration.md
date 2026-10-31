@@ -79,6 +79,36 @@ This does not prevent a command from setting those variables itself. See
 [Herdr TUI's integration guide](https://herdr.dev/docs/add-herdr-support/) for
 Herdr TUI-side behavior and requirements.
 
+## Program status (OSC 7501)
+
+Harness reports what it is doing with the
+[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status)
+(`OSC 7501`), so terminals and multiplexers such as the Herdr app can show
+whether it is working, finished, or failed. Terminals that do not know the
+sequence ignore it. Reports are on by default; turn them off with:
+
+```toml
+program_status = false
+```
+
+Every report carries `app=harness` and the session title. States:
+
+| Event | State |
+| --- | --- |
+| A turn or command starts, or output streams | `working` |
+| A turn finishes | `done` (the result is ready to look at) |
+| A turn fails | `error`, with a short `msg` |
+| The user cancels with Esc | `idle` |
+| The TUI exits | `clear` (no stale `done` is left behind) |
+
+Harness has no approval gate, so it never reports `blocked`.
+
+In the TUI a report is written at the start of a frame, so it cannot split the
+frame's escape sequences. In `harness prompt` the report goes to stderr, and
+only when stderr is a terminal, so stdout stays the answer only. A headless run
+leaves a `done` or `error` record on exit, as the protocol recommends. Inside a
+Herdr TUI pane Harness sends only the Herdr TUI reports described above.
+
 Set `rtk = true` to let the bash tool rewrite supported commands through an
 installed `rtk` executable for smaller tool output. This feature is off by
 default.

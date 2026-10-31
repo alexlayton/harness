@@ -61,6 +61,7 @@ advanced options.
 
 - A fast, direct-crossterm terminal UI that keeps completed output in native
   terminal scrollback.
+- Program status reporting with OSC 7501 (works with the Herdr app and other supporting terminals).
 - Herdr TUI pane status reporting and session resume when launched from a Herdr TUI pane.
 - Headless output for scripts and pipelines.
 - ACP support for compatible editors.
