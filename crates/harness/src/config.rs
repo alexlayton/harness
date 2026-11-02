@@ -336,6 +336,33 @@ impl SecretsConfig {
     }
 }
 
+/// Resolves `[secrets].env` names into `(name, value)` masking entries.
+///
+/// Missing or empty variables are skipped intentionally: a shared dotfiles
+/// config may list secrets that only exist on some machines, and a value that
+/// is absent from the environment cannot leak into model content, so there is
+/// nothing to mask. Non-Unicode values still fail closed because they are set
+/// but cannot be matched reliably.
+fn resolve_secret_env_entries(
+    names: &[String],
+    lookup: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
+) -> Result<Vec<(String, String)>> {
+    let mut entries = Vec::new();
+    for name in names {
+        match lookup(name) {
+            Ok(value) if value.is_empty() => {}
+            Ok(value) => entries.push((name.clone(), value)),
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(anyhow!(
+                    "configured secret environment variable `{name}` is not valid Unicode"
+                ));
+            }
+        }
+    }
+    Ok(entries)
+}
+
 fn resolve_subagents(config: &SubagentConfig) -> SubagentPolicy {
     let defaults = SubagentPolicy::default();
     SubagentPolicy {
@@ -1452,23 +1479,7 @@ impl Config {
         let mut secret_entries = file
             .secrets
             .as_ref()
-            .map(|secrets| {
-                secrets
-                    .env
-                    .iter()
-                    .map(|name| {
-                        let value = std::env::var(name).map_err(|error| match error {
-                            std::env::VarError::NotPresent => anyhow!(
-                                "configured secret environment variable `{name}` is not set"
-                            ),
-                            std::env::VarError::NotUnicode(_) => anyhow!(
-                                "configured secret environment variable `{name}` is not valid Unicode"
-                            ),
-                        })?;
-                        Ok((name.clone(), value))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })
+            .map(|secrets| resolve_secret_env_entries(&secrets.env, |name| std::env::var(name)))
             .transpose()?
             .unwrap_or_default();
         custom_providers::add_secret_entries(&file.providers, &mut secret_entries);
@@ -2552,6 +2563,35 @@ future_server_key = "keep"
         // The unknown-field survival path must not see the compaction table.
         let loaded = load_file_config(&path).unwrap();
         assert!(!loaded.extra.contains_key("compaction"));
+    }
+
+    #[test]
+    fn secret_env_resolution_skips_missing_and_empty_variables() {
+        let names = vec![
+            "PRESENT_TOKEN".to_owned(),
+            "MISSING_TOKEN".to_owned(),
+            "EMPTY_TOKEN".to_owned(),
+        ];
+        let entries = resolve_secret_env_entries(&names, |name| match name {
+            "PRESENT_TOKEN" => Ok("present-secret-value".to_owned()),
+            "EMPTY_TOKEN" => Ok(String::new()),
+            _ => Err(std::env::VarError::NotPresent),
+        })
+        .unwrap();
+        assert_eq!(
+            entries,
+            vec![(
+                "PRESENT_TOKEN".to_owned(),
+                "present-secret-value".to_owned()
+            )]
+        );
+
+        let error = resolve_secret_env_entries(&names, |_| {
+            Err(std::env::VarError::NotUnicode(std::ffi::OsString::new()))
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not valid Unicode"), "{error}");
     }
 
     #[test]
