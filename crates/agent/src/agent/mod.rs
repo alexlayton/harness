@@ -102,11 +102,7 @@ pub struct Agent {
     provider_factory: Option<ProviderFactory>,
     /// Input messages received while a turn is running.  They are drained by
     /// `run` before the next turn starts.
-    queued: VecDeque<InputMessage>,
-    /// Whether the input channel has not yet been observed closed.  Once
-    /// closed, the run loop stops selecting on it (a closed `recv` would
-    /// otherwise complete immediately and starve the stream polling).
-    input_open: bool,
+    input: TurnInput,
     /// In-memory notes (stream/empty-response recovery, prewalk handoff) that
     /// were appended to `history` but are not durable events. A compaction
     /// rebuilds `history` from the session, which would silently drop them
@@ -142,6 +138,66 @@ pub struct Agent {
     prewalk: PrewalkState,
 }
 
+/// Input-channel state shared by every operation boundary.
+///
+/// Operations that borrow the agent while they run cannot also write these
+/// fields, so they work on an [`InputFork`] and hand it back through
+/// [`TurnInput::absorb`]. Keeping that protocol in one place prevents a new
+/// boundary from dropping buffered messages or forgetting a closed channel.
+struct TurnInput {
+    /// Messages received while an operation was running; drained by `run`
+    /// before it reads the channel again.
+    queued: VecDeque<InputMessage>,
+    /// Whether the channel has not yet been observed closed. Once closed the
+    /// run loop stops selecting on it (a closed `recv` would otherwise
+    /// complete immediately and starve stream polling).
+    open: bool,
+}
+
+impl Default for TurnInput {
+    fn default() -> Self {
+        Self {
+            queued: VecDeque::new(),
+            open: true,
+        }
+    }
+}
+
+/// Scratch input state for an operation that borrows the agent.
+#[must_use = "an input fork must be handed back with TurnInput::absorb"]
+struct InputFork {
+    open: bool,
+    buffered: VecDeque<InputMessage>,
+}
+
+impl InputFork {
+    /// Keep a non-interrupt message in arrival order for later.
+    fn buffer(&mut self, message: InputMessage) {
+        self.buffered.push_back(message);
+    }
+
+    /// Record that the channel closed so it is no longer polled.
+    fn close(&mut self) {
+        self.open = false;
+    }
+}
+
+impl TurnInput {
+    /// Start scratch state mirroring the current open flag.
+    fn fork(&self) -> InputFork {
+        InputFork {
+            open: self.open,
+            buffered: VecDeque::new(),
+        }
+    }
+
+    /// Merge a finished operation's observations back in.
+    fn absorb(&mut self, fork: InputFork) {
+        self.open = fork.open;
+        self.queued.extend(fork.buffered);
+    }
+}
+
 /// How an isolated `/ask` request ended. A bool conflated "finished" with
 /// "interrupted" and "application shutdown"; only shutdown stops the loop.
 enum AskOutcome {
@@ -173,8 +229,7 @@ impl Agent {
             session: None,
             secret_masker: Arc::new(SecretMasker::default()),
             provider_factory: None,
-            queued: VecDeque::new(),
-            input_open: true,
+            input: TurnInput::default(),
             ephemeral_notes: Vec::new(),
             last_context_tokens: None,
             context_window: 0,
@@ -452,15 +507,15 @@ impl Agent {
             while let Ok((provider, model, models)) = metadata_rx.try_recv() {
                 self.apply_model_metadata(provider, model, models, &events);
             }
-            let next_message = if let Some(message) = self.queued.pop_front() {
+            let next_message = if let Some(message) = self.input.queued.pop_front() {
                 Some(message)
-            } else if !self.input_open {
+            } else if !self.input.open {
                 None
             } else {
                 tokio::select! {
                     message = input.recv() => {
                         if message.is_none() {
-                            self.input_open = false;
+                            self.input.open = false;
                         }
                         message
                     }
@@ -497,8 +552,7 @@ impl Agent {
                     // Poll input while the isolated request is opening or
                     // streaming. Dropping the future on Esc stops only this
                     // request; other messages retain their queue order.
-                    let mut buffered = VecDeque::new();
-                    let mut input_open = self.input_open;
+                    let mut fork = self.input.fork();
                     let outcome = {
                         let operation = self.answer_isolated_question(question, &events);
                         tokio::pin!(operation);
@@ -506,17 +560,16 @@ impl Agent {
                             tokio::select! {
                                 biased;
                                 _ = self.cancel.cancelled() => break AskOutcome::Shutdown,
-                                message = input.recv(), if input_open => match message {
+                                message = input.recv(), if fork.open => match message {
                                     Some(InputMessage::Interrupt) => break AskOutcome::Interrupted,
-                                    Some(message) => buffered.push_back(message),
-                                    None => input_open = false,
+                                    Some(message) => fork.buffer(message),
+                                    None => fork.close(),
                                 },
                                 outcome = &mut operation => break outcome,
                             }
                         }
                     };
-                    self.input_open = input_open;
-                    self.queued.extend(buffered);
+                    self.input.absorb(fork);
                     match outcome {
                         AskOutcome::Done | AskOutcome::Interrupted => {
                             send(&events, AgentEvent::OperationFinished);
@@ -3990,7 +4043,7 @@ mod tests {
         assert!(turn_cancel.is_cancelled());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
-            agent.queued.pop_front(),
+            agent.input.queued.pop_front(),
             Some(InputMessage::Message(text)) if text == "next message"
         ));
         let loaded = store.open(&session_id).unwrap();

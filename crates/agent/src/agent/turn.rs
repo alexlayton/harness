@@ -233,13 +233,13 @@ impl Agent {
                         return Err(TurnError::Shutdown);
                     }
                     _ = cancel.cancelled() => break None,
-                    message = input.recv(), if self.input_open => match message {
+                    message = input.recv(), if self.input.open => match message {
                         Some(InputMessage::Interrupt) => {
                             cancel.cancel();
                             break None;
                         }
-                        Some(message) => self.queued.push_back(message),
-                        None => self.input_open = false,
+                        Some(message) => self.input.queued.push_back(message),
+                        None => self.input.open = false,
                     },
                     result = &mut provider_future => break Some(result),
                 }
@@ -305,14 +305,14 @@ impl Agent {
                         cancelled = true;
                         break;
                     }
-                    message = input.recv(), if self.input_open => match message {
+                    message = input.recv(), if self.input.open => match message {
                         Some(InputMessage::Interrupt) => {
                             cancel.cancel();
                             cancelled = true;
                             break;
                         }
-                        Some(message) => self.queued.push_back(message),
-                        None => self.input_open = false,
+                        Some(message) => self.input.queued.push_back(message),
+                        None => self.input.open = false,
                     },
                     next = stream.next() => {
                         let Some(next) = next else {

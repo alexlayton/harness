@@ -7,7 +7,6 @@ use compact::{
 };
 use llm::LlmError;
 use session::{SessionEvent, usage_summary};
-use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -254,8 +253,7 @@ impl Agent {
         estimated_context: Option<u64>,
     ) -> Result<Option<bool>, TurnError> {
         let application = self.cancel.clone();
-        let mut buffered = VecDeque::new();
-        let mut input_open = self.input_open;
+        let mut fork = self.input.fork();
         let mut interrupted = false;
         let compacted = {
             let mut application_open = true;
@@ -269,20 +267,19 @@ impl Agent {
                         application_open = false;
                         cancel.cancel();
                     }
-                    message = input.recv(), if input_open => match message {
+                    message = input.recv(), if fork.open => match message {
                         Some(InputMessage::Interrupt) => {
                             interrupted = true;
                             cancel.cancel();
                         }
-                        Some(message) => buffered.push_back(message),
-                        None => input_open = false,
+                        Some(message) => fork.buffer(message),
+                        None => fork.close(),
                     },
                     result = &mut compaction => break result,
                 }
             }
         };
-        self.input_open = input_open;
-        self.queued.extend(buffered);
+        self.input.absorb(fork);
         let compacted = match compacted {
             Ok(compacted) => compacted,
             Err(TurnError::Shutdown) => {

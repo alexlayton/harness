@@ -5,7 +5,6 @@ use super::{
 };
 use llm::Provider;
 use session::{ExportOptions, Session, SessionCreateOptions, export_jsonl, snapshot_entries};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -331,8 +330,7 @@ impl Agent {
     ) -> TurnControl {
         let cancel = self.cancel.child_token();
         let application = self.cancel.clone();
-        let mut buffered = VecDeque::new();
-        let mut input_open = self.input_open;
+        let mut fork = self.input.fork();
         let mut interrupted = false;
         let outcome = {
             let mut application_open = true;
@@ -346,19 +344,18 @@ impl Agent {
                         application_open = false;
                         cancel.cancel();
                     }
-                    message = input.recv(), if input_open => match message {
+                    message = input.recv(), if fork.open => match message {
                         Some(InputMessage::Interrupt) => {
                             interrupted = true;
                             cancel.cancel();
                         }
-                        Some(message) => buffered.push_back(message),
-                        None => input_open = false,
+                        Some(message) => fork.buffer(message),
+                        None => fork.close(),
                     },
                 }
             }
         };
-        self.input_open = input_open;
-        self.queued.extend(buffered);
+        self.input.absorb(fork);
         if self.flush_deferred_sync(events).is_err() {
             return TurnControl::Quarantine;
         }
