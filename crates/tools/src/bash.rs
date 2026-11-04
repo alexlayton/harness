@@ -413,43 +413,32 @@ impl Tool for BashTool {
             output.push_str(&stderr.render());
         }
         let mut is_error = false;
-        let mut suffix = String::new();
-        if stdout_lost || stderr_lost {
-            // A timed-out drain or panicked reader must not look like a
-            // command that simply printed nothing.
-            let which = match (stdout_lost, stderr_lost) {
-                (true, true) => "stdout and stderr",
-                (true, false) => "stdout",
-                _ => "stderr",
-            };
-            suffix.push_str(&format!(
-                "[warning: {which} output was lost or incomplete (reader timed out or failed)]"
-            ));
-        }
+        let mut status = String::new();
         match end {
-            End::Exited(status) => {
-                if !status.success() {
+            End::Exited(exit) => {
+                if !exit.success() {
                     is_error = true;
-                    if let Some(code) = status.code() {
-                        suffix.push_str(&format!("[exit code {code}]"));
+                    if let Some(code) = exit.code() {
+                        status = format!("[exit code {code}]");
                     } else {
-                        suffix.push_str("[process terminated by signal]");
+                        status = "[process terminated by signal]".into();
                     }
                 }
             }
             End::TimedOut => {
                 is_error = true;
-                suffix.push_str(&format!("[timed out after {timeout}s]"));
+                status = format!("[timed out after {timeout}s]");
             }
             End::Cancelled => {
                 is_error = true;
-                suffix.push_str("[cancelled]");
+                status = "[cancelled]".into();
             }
             End::WaitFailed(error) => {
                 is_error = true;
-                suffix.push_str(&format!("[failed to wait for shell: {error}]"));
+                status = format!("[failed to wait for shell: {error}]");
             }
         }
+        let suffix = compose_suffix(stdout_lost, stderr_lost, &status);
         output = truncate_command_output(&output);
         if !suffix.is_empty() {
             if !output.is_empty() {
@@ -468,6 +457,28 @@ impl Tool for BashTool {
             },
         }
     }
+}
+
+/// Join the lost-output warning (if any) and the status marker (if any), each
+/// on its own line, so the warning never runs into e.g. `[exit code 3]`.
+fn compose_suffix(stdout_lost: bool, stderr_lost: bool, status: &str) -> String {
+    let mut lines = Vec::new();
+    if stdout_lost || stderr_lost {
+        // A timed-out drain or panicked reader must not look like a command
+        // that simply printed nothing.
+        let which = match (stdout_lost, stderr_lost) {
+            (true, true) => "stdout and stderr",
+            (true, false) => "stdout",
+            _ => "stderr",
+        };
+        lines.push(format!(
+            "[warning: {which} output was lost or incomplete (reader timed out or failed)]"
+        ));
+    }
+    if !status.is_empty() {
+        lines.push(status.to_owned());
+    }
+    lines.join("\n")
 }
 
 /// Why the shell's tree is being ended. Kill-grace policy keys off this
@@ -713,7 +724,6 @@ async fn terminate_tree(
     #[cfg(unix)]
     {
         let _ = child;
-        let _ = cancel;
         if let Some(pgid) = group_id {
             // SAFETY: `killpg`-equivalent via libc with the group's own
             // pgid; a negative pid targets the group, signals are
@@ -744,8 +754,7 @@ async fn terminate_tree(
         // Fallback: kill the shell handle. This cannot reach already-detached
         // grandchildren, but the direct child must still be killed before the
         // timeout/cancellation branch waits for it.
-        let _ = group_id;
-        let _ = cancel;
+        let _ = (group_id, cancel, reason);
         let _ = child.start_kill();
     }
 }
@@ -789,6 +798,24 @@ mod tests {
         .await;
         assert!(!lost);
         assert_eq!(capture.bytes, b"hi");
+    }
+
+    #[test]
+    fn suffix_puts_warning_and_status_on_separate_lines() {
+        assert_eq!(compose_suffix(false, false, ""), "");
+        assert_eq!(
+            compose_suffix(false, false, "[exit code 3]"),
+            "[exit code 3]"
+        );
+        assert_eq!(
+            compose_suffix(true, false, ""),
+            "[warning: stdout output was lost or incomplete (reader timed out or failed)]"
+        );
+        assert_eq!(
+            compose_suffix(true, true, "[exit code 3]"),
+            "[warning: stdout and stderr output was lost or incomplete (reader timed out or failed)]\n[exit code 3]"
+        );
+        assert!(compose_suffix(false, true, "[cancelled]").starts_with("[warning: stderr "));
     }
 
     #[cfg(unix)]
@@ -1316,6 +1343,13 @@ mod tests {
         // pipe-holding child into later tests.
         cleanup.kill();
         assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output
+                .content
+                .contains("[warning: stdout and stderr output was lost or incomplete"),
+            "{}",
+            output.content
+        );
         // The lower bound proves both pipes were actually held through the
         // drain (an early EOF would finish at ~1s); the upper bound proves
         // both streams shared one deadline instead of two sequential waits

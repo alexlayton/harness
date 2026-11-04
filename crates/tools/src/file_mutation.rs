@@ -279,14 +279,22 @@ async fn lock_key(path: &Path) -> PathBuf {
             .join(path)
     };
     // A file that does not exist yet must map to the key it will have once
-    // created (and through symlinked parent directories), so canonicalize the
-    // parent and re-attach the file name.
-    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
-        && let Ok(parent) = fs::canonicalize(parent).await
-    {
-        return parent.join(name);
+    // created (and through symlinked parent directories): canonicalize the
+    // deepest ancestor that exists and re-attach the missing components. A
+    // missing parent directory (created later by the mutation) is covered.
+    let mut missing = Vec::new();
+    let mut ancestor = absolute.as_path();
+    loop {
+        let (Some(parent), Some(name)) = (ancestor.parent(), ancestor.file_name()) else {
+            return absolute;
+        };
+        missing.push(name.to_owned());
+        if let Ok(mut resolved) = fs::canonicalize(parent).await {
+            resolved.extend(missing.iter().rev());
+            return resolved;
+        }
+        ancestor = parent;
     }
-    absolute
 }
 
 fn check_cancelled(cancel: &CancellationToken) -> io::Result<()> {
@@ -369,6 +377,7 @@ mod tests {
         previous.bits() as u32
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn lock_key_is_stable_for_new_files_and_symlinked_parents() {
         let dir = tempfile::tempdir().unwrap();
@@ -382,6 +391,37 @@ mod tests {
         let after = lock_key(&real.join("new.txt")).await;
         assert_eq!(before, after);
         assert_eq!(via_alias, after);
+
+        // Parent directories that do not exist yet resolve through the
+        // deepest existing ancestor, so the key is stable once they exist.
+        let nested_alias = lock_key(&alias.join("a/b/new.txt")).await;
+        std::fs::create_dir_all(real.join("a/b")).unwrap();
+        std::fs::write(real.join("a/b/new.txt"), "x").unwrap();
+        assert_eq!(nested_alias, lock_key(&real.join("a/b/new.txt")).await);
+    }
+
+    #[tokio::test]
+    async fn lock_map_is_swept_when_the_holder_is_dropped_mid_operation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dropped.txt");
+        let key = lock_key(&path).await;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                let cancel = CancellationToken::new();
+                with_file_mutation_lock(&path, &cancel, || async {
+                    let _ = entered_tx.send(());
+                    std::future::pending::<()>().await;
+                })
+                .await
+            })
+        };
+        entered_rx.await.unwrap();
+        assert!(has_file_lock(&key));
+        task.abort();
+        let _ = task.await;
+        assert!(!has_file_lock(&key));
     }
 
     #[tokio::test]
