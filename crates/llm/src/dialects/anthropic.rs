@@ -308,9 +308,22 @@ impl AnthropicParser {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if self.done {
+            // Anything after the terminal event (duplicate `message_stop`,
+            // trailing blocks) must not yield a second `Done`.
+            tracing::trace!(event_type = kind, "ignored Anthropic event after terminal");
+            return Ok(Vec::new());
+        }
         match kind {
             "content_block_start" => {
-                let index = value.get("index").and_then(as_u64).unwrap_or(0);
+                let index = value.get("index").and_then(as_u64).ok_or_else(|| {
+                    LlmError::Parse("Anthropic content_block_start is missing an index".into())
+                })?;
+                if self.blocks.contains_key(&index) {
+                    return Err(LlmError::Parse(format!(
+                        "duplicate Anthropic content_block_start for open index {index}"
+                    )));
+                }
                 self.current_index = Some(index);
                 let block = value.get("content_block").unwrap_or(&Value::Null);
                 match block.get("type").and_then(Value::as_str) {
@@ -351,13 +364,31 @@ impl AnthropicParser {
                 Ok(Vec::new())
             }
             "content_block_delta" => {
-                let index = value
-                    .get("index")
-                    .and_then(as_u64)
-                    .or(self.current_index)
-                    .unwrap_or(0);
+                let index = self.block_index(&value, "content_block_delta")?;
                 let delta = value.get("delta").unwrap_or(&Value::Null);
-                match delta.get("type").and_then(Value::as_str) {
+                let delta_type = delta.get("type").and_then(Value::as_str);
+                let expected = match delta_type {
+                    Some("text_delta") => Some((
+                        "text",
+                        matches!(self.blocks.get(&index), Some(BlockKind::Text)),
+                    )),
+                    Some("thinking_delta") => Some((
+                        "thinking",
+                        matches!(self.blocks.get(&index), Some(BlockKind::Thinking)),
+                    )),
+                    Some("input_json_delta") => Some((
+                        "tool_use",
+                        matches!(self.blocks.get(&index), Some(BlockKind::Tool)),
+                    )),
+                    _ => None,
+                };
+                if let Some((block, false)) = expected {
+                    return Err(LlmError::Parse(format!(
+                        "Anthropic {} does not match open block at index {index} (expected {block})",
+                        delta_type.unwrap_or_default()
+                    )));
+                }
+                match delta_type {
                     Some("text_delta") => Ok(delta
                         .get("text")
                         .and_then(Value::as_str)
@@ -383,12 +414,13 @@ impl AnthropicParser {
                 }
             }
             "content_block_stop" => {
-                let index = value
-                    .get("index")
-                    .and_then(as_u64)
-                    .or(self.current_index)
-                    .unwrap_or(0);
-                self.finish_tool(index)
+                let index = self.block_index(&value, "content_block_stop")?;
+                if self.current_index == Some(index) {
+                    self.current_index = None;
+                }
+                let result = self.finish_tool(index);
+                self.blocks.remove(&index);
+                result
             }
             "message_start" => {
                 if let Some(usage) = value
@@ -474,6 +506,16 @@ impl AnthropicParser {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Resolve the block index of a delta/stop: the explicit `index`, else
+    /// the most recently started open block. Never defaults to 0.
+    fn block_index(&self, value: &Value, kind: &str) -> Result<u64, LlmError> {
+        value
+            .get("index")
+            .and_then(as_u64)
+            .or(self.current_index)
+            .ok_or_else(|| LlmError::Parse(format!("Anthropic {kind} has no open block index")))
     }
 
     fn finish_tool(&mut self, index: u64) -> Result<Vec<StreamEvent>, LlmError> {
@@ -602,6 +644,67 @@ mod tests {
         let body = build_request_body(&bare);
         assert!(body.get("tools").is_none());
         assert!(body.get("system").is_some());
+    }
+
+    fn start(index: u64, kind: &str) -> String {
+        format!(
+            r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"{kind}","id":"t{index}","name":"bash"}}}}"#
+        )
+    }
+
+    #[test]
+    fn rejects_duplicate_start_for_open_index() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(&start(0, "tool_use")).unwrap();
+        assert!(matches!(
+            parser.parse_payload(&start(0, "text")),
+            Err(LlmError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn missing_index_is_not_defaulted_to_zero() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(&start(0, "text")).unwrap();
+        parser
+            .parse_payload(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap();
+        // No open block: a stop without an index must not hit block 0.
+        assert!(matches!(
+            parser.parse_payload(r#"{"type":"content_block_stop"}"#),
+            Err(LlmError::Parse(_))
+        ));
+        assert!(matches!(
+            parser
+                .parse_payload(r#"{"type":"content_block_start","content_block":{"type":"text"}}"#),
+            Err(LlmError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_kind_mismatched_delta() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(&start(0, "text")).unwrap();
+        assert!(matches!(
+            parser.parse_payload(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#
+            ),
+            Err(LlmError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn events_after_message_stop_are_ignored() {
+        let mut parser = AnthropicParser::new();
+        let first = parser.parse_payload(r#"{"type":"message_stop"}"#).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            parser
+                .parse_payload(r#"{"type":"message_stop"}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parser.parse_payload(&start(0, "text")).unwrap().is_empty());
     }
 
     #[test]
@@ -850,6 +953,11 @@ mod tests {
         // error: it surfaces the permanent `LlmError::Stream` and never
         // reaches a terminal `Done`.
         let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            )
+            .unwrap();
         let events = parser
             .parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#)
             .unwrap();
