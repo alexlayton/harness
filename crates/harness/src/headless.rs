@@ -10,6 +10,7 @@
 use crate::config::{Config, PromptArgs, provider_factory};
 #[cfg(test)]
 use crate::context::project_context_for;
+use crate::turn_output::TurnOutputReducer;
 use agent::assembly::AgentBuilder;
 use agent::{AgentEvent, InputMessage, StreamRecovery};
 use anyhow::{Context, Result, anyhow};
@@ -145,45 +146,65 @@ async fn drive_headless_events_with_cancel(
     event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     verbose: bool,
     cancellation: Option<&CancellationToken>,
-) -> ExitCode {
+) -> (ExitCode, bool) {
     let mut stdout = std::io::BufWriter::new(std::io::stdout());
     let mut stderr = std::io::stderr();
     let result =
-        drive_headless_events_into(event_rx, verbose, &mut stdout, &mut stderr, cancellation).await;
+        drive_headless_events_core(event_rx, verbose, &mut stdout, &mut stderr, cancellation).await;
     if stdout.flush().is_err() {
-        return ExitCode::from(1);
+        return (
+            ExitCode::from(1),
+            cancellation.is_some_and(|c| c.is_cancelled()),
+        );
     }
-    result.unwrap_or(ExitCode::from(1))
+    // Without a finished turn there is no answer to protect, so a
+    // cancellation observed now is the reason the run stopped.
+    result.unwrap_or_else(|_| {
+        (
+            ExitCode::from(1),
+            cancellation.is_some_and(|c| c.is_cancelled()),
+        )
+    })
 }
 
 /// Writer-injectable core of the headless event driver so tests can assert the
 /// stdout/stderr split without touching the process streams.
+#[cfg(test)]
 async fn drive_headless_events_into(
-    mut event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    event_rx: mpsc::UnboundedReceiver<AgentEvent>,
     verbose: bool,
     stdout: &mut (impl Write + Unpin),
     stderr: &mut (impl Write + Unpin),
     cancellation: Option<&CancellationToken>,
 ) -> Result<ExitCode> {
+    drive_headless_events_core(event_rx, verbose, stdout, stderr, cancellation)
+        .await
+        .map(|(code, _)| code)
+}
+
+/// Returns the exit code and whether the turn ended while cancelled.
+async fn drive_headless_events_core(
+    mut event_rx: mpsc::UnboundedReceiver<AgentEvent>,
+    verbose: bool,
+    stdout: &mut (impl Write + Unpin),
+    stderr: &mut (impl Write + Unpin),
+    cancellation: Option<&CancellationToken>,
+) -> Result<(ExitCode, bool)> {
     // Text is held until the model round is known to be text-only. Prose
     // emitted before a tool call is an intermediate thought, not the answer a
     // shell pipeline should consume. Stdout therefore never streams: the
     // answer is written and flushed once, when the turn finishes.
-    let mut pending_text = String::new();
-    let mut active_tools = 0usize;
+    // `TurnOutputReducer` owns that policy (shared with the SDK and ACP).
+    let mut turn = TurnOutputReducer::default();
     let mut reasoning_open = false;
-    let mut error_pending = false;
-    let mut saw_turn_finished = false;
+    let mut interrupted = false;
 
     while let Some(event) = event_rx.recv().await {
+        // A genuine recovery (text or a new tool call) clears a prior error;
+        // metadata, retries, and lifecycle events do not.
+        let intermediate = turn.observe(&event);
         match &event {
-            AgentEvent::TextDelta(delta) => {
-                pending_text.push_str(delta);
-                // A text delta after an error belongs to a genuine recovery;
-                // metadata, retries, and tool lifecycle events do not clear
-                // the failure state.
-                error_pending = false;
-            }
+            AgentEvent::TextDelta(_) => {}
             AgentEvent::ReasoningDelta(delta) => {
                 if verbose {
                     write!(stderr, "{delta}")?;
@@ -191,13 +212,11 @@ async fn drive_headless_events_into(
                 }
             }
             AgentEvent::ToolCallStarted { summary, .. } => {
-                if !pending_text.is_empty() {
-                    if verbose {
-                        writeln!(stderr, "intermediate: {pending_text}")?;
-                    }
-                    pending_text.clear();
+                if let Some(text) = intermediate
+                    && verbose
+                {
+                    writeln!(stderr, "intermediate: {text}")?;
                 }
-                active_tools = active_tools.saturating_add(1);
                 if reasoning_open {
                     writeln!(stderr)?;
                     reasoning_open = false;
@@ -214,13 +233,6 @@ async fn drive_headless_events_into(
                 error,
                 ..
             } => {
-                active_tools = active_tools.saturating_sub(1);
-                if active_tools == 0 {
-                    // Any text that appeared in a tool-bearing round is
-                    // intermediate as well. The next text delta starts the
-                    // final text-only round.
-                    pending_text.clear();
-                }
                 if verbose {
                     let mark = if *ok { "✓" } else { "✗" };
                     writeln!(stderr, "{mark} {summary} ({duration_ms}ms)")?;
@@ -258,9 +270,7 @@ async fn drive_headless_events_into(
                 }
             }
             AgentEvent::Error(message) => {
-                pending_text.clear();
                 writeln!(stderr, "error: {message}")?;
-                error_pending = true;
             }
             AgentEvent::UsageUpdated {
                 input_tokens,
@@ -295,23 +305,21 @@ async fn drive_headless_events_into(
                     writeln!(stderr)?;
                     reasoning_open = false;
                 }
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                // Decide at the turn boundary: a SIGINT that arrives after
+                // the answer is complete must not turn it into exit 130.
+                interrupted = cancellation.is_some_and(CancellationToken::is_cancelled);
+                if interrupted {
                     // A cancelled provider round may have emitted prose
                     // before its tool calls were complete, but it is not a
                     // final answer and must never leak to stdout.
-                    pending_text.clear();
-                    active_tools = 0;
+                    turn.discard_pending();
                 }
-                if active_tools == 0 && !pending_text.is_empty() {
-                    stdout.write_all(pending_text.as_bytes())?;
+                let answer = if interrupted { "" } else { turn.answer() };
+                if !answer.is_empty() {
+                    stdout.write_all(answer.as_bytes())?;
                     stdout.write_all(b"\n")?;
-                    stdout.flush()?;
-                } else {
-                    stdout.flush()?;
                 }
-                pending_text.clear();
-                active_tools = 0;
-                saw_turn_finished = true;
+                stdout.flush()?;
             }
             AgentEvent::SessionChanged { id, .. } => {
                 if verbose {
@@ -387,16 +395,17 @@ async fn drive_headless_events_into(
         }
     }
 
-    if !saw_turn_finished {
+    if !turn.finished() {
         return Err(anyhow!(
             "agent event stream ended before the turn completed"
         ));
     }
-    Ok(if error_pending {
+    let code = if turn.error().is_some() {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
-    })
+    };
+    Ok((code, interrupted))
 }
 
 /// Run one non-interactive prompt to completion and return the process code.
@@ -617,8 +626,8 @@ async fn run_headless_resolved(
     } else {
         event_rx
     };
-    let exit_code = drive_headless_events_with_cancel(event_rx, args.verbose, Some(&cancel)).await;
-    let interrupted = cancel.is_cancelled();
+    let (exit_code, interrupted) =
+        drive_headless_events_with_cancel(event_rx, args.verbose, Some(&cancel)).await;
     cancel.cancel();
     // A closed event channel is not proof that the agent completed: preserve
     // panics and runtime task failures instead of returning a blank success.
@@ -788,6 +797,35 @@ mod tests {
         });
         assert!(stdout.is_empty());
         assert_eq!(code, ExitCode::SUCCESS);
+    }
+
+    #[test]
+    fn interrupt_after_the_turn_finished_keeps_the_answer_and_is_not_130() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let (stdout, outcome) = runtime.block_on(async {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let cancel = CancellationToken::new();
+            tx.send(AgentEvent::TextDelta("the answer".into())).unwrap();
+            tx.send(AgentEvent::TurnFinished).unwrap();
+            // SIGINT lands during post-turn shutdown, after the answer.
+            let late = cancel.clone();
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                late.cancel();
+                drop(tx);
+            });
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let outcome =
+                drive_headless_events_core(rx, false, &mut stdout, &mut stderr, Some(&cancel))
+                    .await
+                    .unwrap();
+            (stdout, outcome)
+        });
+        assert_eq!(String::from_utf8(stdout).unwrap(), "the answer\n");
+        assert_eq!(outcome, (ExitCode::SUCCESS, false));
     }
 
     #[test]

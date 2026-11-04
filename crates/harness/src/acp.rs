@@ -1525,9 +1525,8 @@ async fn forward_events(
             AgentEvent::Error(message) => {
                 prompts.mark_error(&acp_session_id, message);
             }
-            AgentEvent::TextDelta(_)
-            | AgentEvent::ReasoningDelta(_)
-            | AgentEvent::ToolCallStarted { .. } => {
+            // Same recovery rule as headless and the SDK.
+            event if crate::turn_output::clears_error(event) => {
                 prompts.clear_error(&acp_session_id);
             }
             AgentEvent::UsageUpdated { cost, .. } => {

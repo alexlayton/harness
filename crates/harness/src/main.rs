@@ -16,7 +16,7 @@ use config::{
     provider_factory, save_prewalk_enabled, save_prewalk_model, save_prewalk_reasoning,
     save_reasoning, save_settings,
 };
-use harness::{config, context};
+use harness::{config, context, turn_output};
 use headless::run_headless_with_prompt;
 use llm::Provider;
 use session::{SessionCreateOptions, SessionStore};
