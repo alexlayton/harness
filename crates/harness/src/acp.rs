@@ -168,9 +168,10 @@ struct PendingAssembly {
 }
 
 /// Shared adapter state for the lifetime of one stdio connection. Everything
-/// that is still being assembled stays in this map until the connection
-/// closes, even after completion, so there is no gap between task completion
-/// and lifecycle ownership during disconnect.
+/// that is still being assembled stays in the `pending_assemblies` map until
+/// its task has finished, and a finished task is only pruned while the map's
+/// lock is held, so there is no gap between task completion and lifecycle
+/// ownership during disconnect.
 struct AcpState {
     /// Directory holding the session store's workspace groups. Resolved once
     /// at startup (from `HARNESS_SESSION_DIR`/`HARNESS_STATE_DIR` env or the
@@ -186,6 +187,10 @@ struct AcpState {
     /// Canonical IDs claimed before a load starts filesystem, MCP, or agent
     /// assembly. This prevents duplicate requests from both starting agents.
     loading_sessions: Mutex<HashSet<String>>,
+    /// Canonical IDs being deleted, from the moment the live handle is taken
+    /// until the file is gone. Loads are refused meanwhile so they cannot
+    /// assemble an agent against a file that is about to disappear.
+    deleting_sessions: Mutex<HashSet<String>>,
     prompts: Arc<PromptTracker>,
     pending_assemblies: Mutex<HashMap<uuid::Uuid, PendingAssembly>>,
     transport_closed: AtomicBool,
@@ -204,18 +209,68 @@ impl Drop for LoadReservation {
     }
 }
 
+/// RAII claim held for the whole of a session deletion.
+struct DeleteReservation {
+    state: Arc<AcpState>,
+    id: String,
+}
+
+impl Drop for DeleteReservation {
+    fn drop(&mut self) {
+        self.state
+            .deleting_sessions
+            .lock()
+            .unwrap()
+            .remove(&self.id);
+    }
+}
+
 impl AcpState {
     /// Claim a canonical session ID before expensive load assembly.
     fn reserve_load(self: &Arc<Self>, id: &str) -> Result<LoadReservation> {
+        // Lock order (shared with `begin_delete`): sessions, loading, deleting.
         let sessions = self.sessions.lock().unwrap();
         let mut loading = self.loading_sessions.lock().unwrap();
-        if sessions.contains_key(id) || !loading.insert(id.to_owned()) {
-            anyhow::bail!("session `{id}` is already loaded or loading");
+        let deleting = self.deleting_sessions.lock().unwrap();
+        if sessions.contains_key(id) || deleting.contains(id) || !loading.insert(id.to_owned()) {
+            anyhow::bail!("session `{id}` is already loaded, loading, or being deleted");
         }
         Ok(LoadReservation {
             state: self.clone(),
             id: id.to_owned(),
         })
+    }
+
+    /// Atomically claim deletion of `id` and take its live handle, if any.
+    /// Doing both under the admission locks closes the window in which a load
+    /// could reserve the same ID between the checks and the removal.
+    fn begin_delete(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> std::result::Result<(DeleteReservation, Option<SessionHandle>), &'static str> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let loading = self.loading_sessions.lock().unwrap();
+        let mut deleting = self.deleting_sessions.lock().unwrap();
+        if loading.contains(id) {
+            return Err("cannot delete a session while it is loading");
+        }
+        if deleting.contains(id) {
+            return Err("session is already being deleted");
+        }
+        // Reject deletion while a prompt is active. This keeps the protocol
+        // response tied to a live session and avoids deleting a file whose
+        // agent is still allowed to append a turn.
+        if self.prompts.in_flight.lock().unwrap().contains_key(id) {
+            return Err("cannot delete a session while a prompt is running; cancel it first");
+        }
+        deleting.insert(id.to_owned());
+        Ok((
+            DeleteReservation {
+                state: self.clone(),
+                id: id.to_owned(),
+            },
+            sessions.remove(id),
+        ))
     }
 
     /// Claim an assembly task for this connection. The closed check is made
@@ -233,6 +288,9 @@ impl AcpState {
         if self.transport_closed.load(Ordering::Acquire) {
             Err(pending)
         } else {
+            // Finished tasks own nothing; drop them so the map does not grow
+            // with every `session/new` and `session/load`.
+            assemblies.retain(|_, assembly| !assembly.task.is_finished());
             assemblies.insert(id, pending);
             Ok(())
         }
@@ -321,6 +379,7 @@ where
         no_context_files,
         sessions: Mutex::new(HashMap::new()),
         loading_sessions: Mutex::new(HashSet::new()),
+        deleting_sessions: Mutex::new(HashSet::new()),
         prompts: Arc::new(PromptTracker {
             in_flight: Mutex::new(HashMap::new()),
         }),
@@ -1097,25 +1156,14 @@ async fn delete_session(
         Err(error) => return respond_invalid_params(responder, anyhow::Error::new(error)),
     };
     let id = parsed_id.to_string();
-    if state.loading_sessions.lock().unwrap().contains(&id) {
-        let _ = responder.respond_with_error(
-            AcError::invalid_request()
-                .data("cannot delete a session while it is loading".to_owned()),
-        );
-        return Ok(());
-    }
-    // Reject deletion while a prompt is active. This keeps the protocol
-    // response tied to a live session and avoids deleting a file whose agent
-    // is still allowed to append a turn.
-    let handle = {
-        let mut sessions = state.sessions.lock().unwrap();
-        if state.prompts.in_flight.lock().unwrap().contains_key(&id) {
-            let _ = responder.respond_with_error(AcError::invalid_request().data(
-                "cannot delete a session while a prompt is running; cancel it first".to_owned(),
-            ));
+    // Held through shutdown, the file delete, and the response.
+    let (_reservation, handle) = match state.begin_delete(&id) {
+        Ok(claimed) => claimed,
+        Err(reason) => {
+            let _ =
+                responder.respond_with_error(AcError::invalid_request().data(reason.to_owned()));
             return Ok(());
         }
-        sessions.remove(&id)
     };
     if let Some(handle) = handle {
         shutdown_session(handle).await;
@@ -1914,6 +1962,7 @@ mod tests {
             no_context_files: true,
             sessions: Mutex::new(HashMap::new()),
             loading_sessions: Mutex::new(HashSet::new()),
+            deleting_sessions: Mutex::new(HashSet::new()),
             prompts: Arc::new(PromptTracker {
                 in_flight: Mutex::new(HashMap::new()),
             }),
@@ -2239,6 +2288,46 @@ done
         deleting.join().unwrap().unwrap();
         assert!(!path.exists());
         assert!(lock_path.exists(), "sidecar inode must be retained");
+    }
+
+    #[tokio::test]
+    async fn delete_reservation_blocks_loads_and_second_deletes() {
+        let state = test_acp_state();
+        let (guard, handle) = state.begin_delete("id").unwrap();
+        assert!(handle.is_none());
+        assert!(state.reserve_load("id").is_err());
+        assert!(state.begin_delete("id").is_err());
+        // Other sessions are unaffected.
+        assert!(state.reserve_load("other").is_ok());
+        drop(guard);
+        assert!(state.reserve_load("id").is_ok());
+    }
+
+    #[tokio::test]
+    async fn loading_session_cannot_be_deleted() {
+        let state = test_acp_state();
+        let load = state.reserve_load("id").unwrap();
+        assert!(state.begin_delete("id").is_err());
+        assert!(state.deleting_sessions.lock().unwrap().is_empty());
+        drop(load);
+        assert!(state.begin_delete("id").is_ok());
+    }
+
+    #[tokio::test]
+    async fn finished_assemblies_are_pruned_when_tracking_new_ones() {
+        let state = test_acp_state();
+        for _ in 0..3 {
+            let task = tokio::spawn(async {});
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            let pending = PendingAssembly {
+                cancel: CancellationToken::new(),
+                task,
+            };
+            assert!(state.track_assembly(uuid::Uuid::new_v4(), pending).is_ok());
+        }
+        assert_eq!(state.pending_assemblies.lock().unwrap().len(), 1);
     }
 
     /// Duplicate load admission is claimed before assembly, so only one
