@@ -344,10 +344,21 @@ impl Transport<RoleClient> for BoundedStdioTransport {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        // Every cleanup step runs even when an earlier one fails: a failed
-        // transport shutdown must not leave the child, its process group, or
-        // the cgroup scope behind. The first error is returned.
         let transport_result = self.transport.close().await;
+        self.finish_close(transport_result).await
+    }
+}
+
+impl BoundedStdioTransport {
+    /// Reap the child, sweep its process group, and release the scope, given
+    /// the outcome of the transport shutdown. Every cleanup step runs even
+    /// when an earlier one failed: a failed transport shutdown must not leave
+    /// the child, its process group, or the cgroup scope behind. The first
+    /// error is returned. Split out of `close` so tests can inject a failure.
+    async fn finish_close(
+        &mut self,
+        transport_result: Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
         let Some(mut child) = self.child.take() else {
             release_scope(&mut self.scope);
             return transport_result;
@@ -1014,7 +1025,7 @@ mod tests {
     }
 
     #[test]
-    fn first_cleanup_error_wins_but_later_error_is_not_lost() {
+    fn first_cleanup_error_wins_and_a_later_error_surfaces_alone() {
         assert_eq!(first_error::<&str>(Ok(()), Ok(())), Ok(()));
         assert_eq!(first_error(Err("a"), Err("b")), Err("a"));
         assert_eq!(first_error(Err("a"), Ok(())), Err("a"));
@@ -1331,6 +1342,10 @@ while IFS= read -r line; do
                     value=$(printf '%s\n' "$line" | sed -n 's/.*"value":\([0-9][0-9]*\).*/\1/p')
                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"display must not be parsed"}],"structuredContent":{"next_value":%s}}}\n' "$id" "$((value * 3 + 1))"
                     ;;
+                list-changed)
+                    printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id"
+                    ;;
                 call-text-single)
                     single_huge "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" "\"}]}}"
                     ;;
@@ -1502,6 +1517,84 @@ done
                 assert!(
                     std::time::Instant::now() < deadline,
                     "setsid descendant {pid} survived MCP shutdown"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn list_changed_notification_marks_tools_stale() {
+            let runtime = connect_fixture("list-changed")
+                .await
+                .expect("fixture should connect");
+            let mut registry = ToolRegistry::empty();
+            runtime.register_into(&mut registry).unwrap();
+            assert_eq!(runtime.tools_stale("fixture"), Some(false));
+            assert_eq!(runtime.tools_stale("nope"), None);
+            // The fixture sends the notification just before the call result,
+            // so it has been handled by the time the call returns or soon after.
+            let output = registry
+                .execute(
+                    &crate::normalized_tool_name("fixture", "fixture"),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(!output.is_error, "{}", output.content);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while runtime.tools_stale("fixture") != Some(true) {
+                assert!(tokio::time::Instant::now() < deadline, "never marked stale");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Staleness is informational; the server stays usable.
+            assert_eq!(runtime.server_status("fixture"), Some(ServerStatus::Ready));
+            runtime.shutdown().await;
+        }
+
+        /// A failed transport shutdown must still sweep descendants that
+        /// outlived the leader and return the transport error.
+        #[tokio::test]
+        async fn failed_transport_close_still_sweeps_process_group() {
+            use std::os::unix::process::CommandExt as _;
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("sleep 300 >/dev/null 2>&1 & echo $!; exit 0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .process_group(0);
+            let mut child = command.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut line = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                if stdout.read(&mut byte).await.unwrap() == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            let pid: libc::pid_t = String::from_utf8(line).unwrap().trim().parse().unwrap();
+            #[cfg(target_os = "linux")]
+            let scope = None;
+            #[cfg(not(target_os = "linux"))]
+            let scope = ();
+            let mut transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
+            // SAFETY: signal 0 only probes for existence.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "grandchild should run");
+            let error = transport
+                .finish_close(Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected")))
+                .await
+                .expect_err("injected transport error must be returned");
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(transport.child.is_none());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            // SAFETY: as above. The killed orphan is reaped by init.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "descendant survived close"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
