@@ -1033,11 +1033,10 @@ impl CopilotAuth {
                 store.save_copilot(credential)
             })
             .await?;
-        *self
-            .credential
-            .lock()
-            .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-            Some(credential.clone());
+        // Cache under the single-flight lock so a refresh that started from
+        // the previous login cannot cache its result over this credential.
+        let _guard = self.refresh_lock.lock().await;
+        self.cache_credential(&credential)?;
         Ok(credential)
     }
 }

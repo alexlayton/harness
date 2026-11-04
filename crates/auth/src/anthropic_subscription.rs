@@ -256,7 +256,10 @@ impl AnthropicSubscriptionAuth {
             Some(current.clone());
         Ok(current)
     }
-    fn persist(&self, credential: AnthropicSubscriptionCredential) -> Result<()> {
+    /// Persist a freshly logged-in credential. Holds the single-flight lock
+    /// so an in-flight refresh cannot save or cache over the new login.
+    async fn persist(&self, credential: AnthropicSubscriptionCredential) -> Result<()> {
+        let _guard = self.refresh_lock.lock().await;
         self.store.save_anthropic_subscription(&credential)?;
         *self
             .credential
@@ -287,7 +290,7 @@ impl AnthropicSubscriptionAuth {
         let code = tokio::select! { _=cancel.cancelled()=>return Err(AuthError::Cancelled), result=tokio::time::timeout(Duration::from_secs(600),wait_callback(listener,&values.state))=> result.map_err(|_|fail("browser login timed out"))?? };
         let value=self.token(json!({"grant_type":"authorization_code","client_id":CLIENT_ID,"code":code,"state":values.state,"code_verifier":values.verifier,"redirect_uri":REDIRECT}),cancel).await?;
         let credential = credential_from_token(&value, None)?;
-        self.persist(credential.clone())?;
+        self.persist(credential.clone()).await?;
         emit(AuthEvent::Finished);
         Ok(credential)
     }
@@ -626,6 +629,21 @@ mod tests {
             );
         }
         task.abort();
+    }
+    #[tokio::test]
+    async fn login_persist_waits_for_an_in_flight_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        let auth = AnthropicSubscriptionAuth::new(store.clone()).unwrap();
+        let guard = auth.refresh_lock.lock().await;
+        let login = auth.clone();
+        let task = tokio::spawn(async move { login.persist(old()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "login must queue behind refresh");
+        assert!(store.anthropic_subscription().unwrap().is_none());
+        drop(guard);
+        task.await.unwrap().unwrap();
+        assert_eq!(store.anthropic_subscription().unwrap().unwrap(), old());
     }
     #[tokio::test]
     async fn metadata_only_disk_change_during_refresh_keeps_the_new_tokens() {

@@ -405,7 +405,10 @@ impl OpenAiCodexAuth {
             Some(current.clone());
         Ok(current)
     }
-    fn persist(&self, credential: OpenAiCodexCredential) -> Result<()> {
+    /// Persist a freshly logged-in credential. Holds the single-flight lock
+    /// so an in-flight refresh cannot save or cache over the new login.
+    async fn persist(&self, credential: OpenAiCodexCredential) -> Result<()> {
+        let _guard = self.refresh_lock.lock().await;
         self.store.save_openai_codex(&credential)?;
         *self
             .credential
@@ -434,7 +437,7 @@ impl OpenAiCodexAuth {
         let code = wait_for_callback(listener, &values.state, cancel).await?;
         let value = self.token_strict(json!({"grant_type":"authorization_code", "client_id":OPENAI_CODEX_CLIENT_ID, "code":code, "code_verifier":values.verifier, "redirect_uri":"http://localhost:1455/auth/callback"}), cancel).await?;
         let credential = credential_from_token(&value, None)?;
-        self.persist(credential.clone())?;
+        self.persist(credential.clone()).await?;
         emit(AuthEvent::Finished);
         Ok(credential)
     }
@@ -523,7 +526,7 @@ impl OpenAiCodexAuth {
                 )
                 .await?;
             let credential = credential_from_token(&value, None)?;
-            self.persist(credential.clone())?;
+            self.persist(credential.clone()).await?;
             emit(AuthEvent::Finished);
             return Ok(credential);
         }
