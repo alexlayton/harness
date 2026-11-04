@@ -87,6 +87,8 @@ pub struct Agent {
     pub reasoning: llm::ReasoningPolicy,
     /// Reasoning summary style requested on normal turns.
     pub reasoning_summary: llm::ReasoningSummary,
+    /// Requests that reported usage in this process, for the zero-cache check.
+    usage_requests: u32,
     stream_recovery: StreamRecovery,
     /// Kept public as a short-term compatibility path for existing callers.
     /// When a durable session is attached it is rebuilt from the session
@@ -259,6 +261,7 @@ impl Agent {
             model: model.into(),
             reasoning: llm::ReasoningPolicy::Auto,
             reasoning_summary: llm::ReasoningSummary::Auto,
+            usage_requests: 0,
             stream_recovery: StreamRecovery::default(),
             history: Vec::new(),
             cancel,
