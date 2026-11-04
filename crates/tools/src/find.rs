@@ -100,9 +100,11 @@ impl FileSearchIndex {
     /// Create the underlying picker on first use. Construction itself is
     /// cheap (thread spawns only); the filesystem walk runs on fff's own
     /// background thread afterwards, and the first search waits for scan
-    /// completion exactly as it always has. Failures are cached by the
-    /// [`OnceCell`] so every call observes the same error instead of
-    /// re-spawning watchers.
+    /// completion exactly as it always has. Failures are deliberately *not*
+    /// cached: [`OnceCell::get_or_try_init`] leaves the cell empty on error,
+    /// so a transient failure (e.g. watcher limits) is retried by the next
+    /// call. The failed attempt's local picker is dropped, leaving no
+    /// half-initialised state behind.
     async fn ensure_picker(&self) -> Result<&SharedFilePicker, String> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err("find index is shut down".into());
@@ -157,6 +159,9 @@ impl FileSearchIndex {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Closing the semaphore makes any search that passed the flag check
+        // but has not yet been admitted fail instead of starting new work.
+        self.search_slots.close();
         let Some(picker) = self.picker.get() else {
             return;
         };
@@ -1016,6 +1021,26 @@ mod tests {
             .search(query.to_owned(), None, 100, CancellationToken::new())
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_search_admission() {
+        let directory = tempdir().unwrap();
+        let index = FileSearchIndex::new(directory.path()).unwrap();
+        assert!(!index.search_slots.is_closed());
+        index.shutdown();
+        assert!(index.search_slots.is_closed());
+        assert!(
+            Arc::clone(&index.search_slots)
+                .acquire_owned()
+                .await
+                .is_err()
+        );
+        let error = index
+            .search("x".into(), None, 10, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(error.contains("shut down"), "{error}");
     }
 
     #[tokio::test]
