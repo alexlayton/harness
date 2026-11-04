@@ -1154,9 +1154,7 @@ impl CrossTerm {
             &self.session_candidates,
             &self.skills,
         ) else {
-            self.cancel_path_completion();
-            self.completion = None;
-            self.session_fetch = Fetch::Idle;
+            self.close_completion();
             return;
         };
 
@@ -1239,7 +1237,9 @@ impl CrossTerm {
         input_tx: &mpsc::UnboundedSender<InputMessage>,
     ) -> Result<()> {
         self.apply_replacement(candidate, context);
-        self.completion = None;
+        // Also cancels any in-flight path scan so a stale result cannot
+        // reopen the popup over the accepted text.
+        self.close_completion();
         // A None-argument command (e.g. `/new`) has no arguments to complete;
         // the refresh below would otherwise keep its own name listed.
         let argument_less = matches!(context.target, CompletionTarget::Command,)
@@ -4369,6 +4369,32 @@ mod tests {
             entry,
             Entry::User { text } if text.contains("keep  this question")
         )));
+    }
+
+    #[test]
+    fn accepting_a_candidate_cancels_the_inflight_path_scan() {
+        let mut ui = ui(80, 24);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ui.input = "/ne".into();
+        ui.cursor = ui.input.len();
+        let token = CancellationToken::new();
+        ui.path_completion_cancel = Some(token.clone());
+        let generation = ui.path_completion_generation;
+        let context = CompletionContext {
+            target: CompletionTarget::Command,
+            token_start: 0,
+            token_end: 3,
+            query: "ne".into(),
+        };
+        let candidate = Candidate {
+            value: "new".into(),
+            description: String::new(),
+            kind: CandidateKind::Slash,
+        };
+        ui.accept_candidate(&candidate, &context, &tx).unwrap();
+        assert!(token.is_cancelled());
+        assert_ne!(ui.path_completion_generation, generation);
+        assert!(ui.completion.is_none());
     }
 
     #[test]
