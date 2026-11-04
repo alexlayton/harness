@@ -200,10 +200,25 @@ impl AgentBuilder {
             }
             Some(runtime)
         };
-        if self.cancel.is_cancelled() {
-            if let Some(mcp) = mcp {
-                mcp.shutdown().await;
+        // Every remaining fallible step lives in `assemble`, so the running
+        // MCP servers are shut down in exactly one place on any failure
+        // instead of on each early-return path.
+        match self.assemble(active_lease) {
+            Ok(agent) => Ok(AssembledAgent { agent, mcp }),
+            Err(error) => {
+                if let Some(mcp) = mcp {
+                    mcp.shutdown().await;
+                }
+                Err(error)
             }
+        }
+    }
+
+    /// Register subagents/codemode and construct the agent. Synchronous and
+    /// side-effect-free apart from the registry, so a caller owning external
+    /// resources (MCP) can clean them up on any `Err`.
+    fn assemble(mut self, active_lease: Option<session::SessionActiveLease>) -> Result<Agent> {
+        if self.cancel.is_cancelled() {
             anyhow::bail!("agent assembly cancelled");
         }
         let parent_session = self.session.as_ref().map(|(_, session)| session.id());
@@ -231,12 +246,9 @@ impl AgentBuilder {
                 runner = runner.with_execution_gate(gate);
             }
             let runner = Arc::new(runner);
-            if let Err(error) = self.tools.register_subagent(runner.clone()) {
-                if let Some(mcp) = mcp {
-                    mcp.shutdown().await;
-                }
-                return Err(error).context("register subagent tool");
-            }
+            self.tools
+                .register_subagent(runner.clone())
+                .context("register subagent tool")?;
             Some(runner)
         } else {
             None
@@ -245,9 +257,6 @@ impl AgentBuilder {
         if let Some(names) = self.codemode
             && let Err(error) = self.tools.enable_codemode(&names)
         {
-            if let Some(mcp) = mcp {
-                mcp.shutdown().await;
-            }
             return Err(anyhow::anyhow!(
                 self.secret_masker.mask_text(&error.to_string())
             ))
@@ -279,12 +288,9 @@ impl AgentBuilder {
             );
         }
         if assembly_cancel.is_cancelled() {
-            if let Some(mcp) = mcp {
-                mcp.shutdown().await;
-            }
             anyhow::bail!("agent assembly cancelled");
         }
-        Ok(AssembledAgent { agent, mcp })
+        Ok(agent)
     }
 }
 
