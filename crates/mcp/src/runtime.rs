@@ -1,4 +1,4 @@
-use crate::client::HarnessClient;
+use crate::client::{HarnessClient, ServerHealth, ServerStatus};
 use crate::config::Redactions;
 use crate::config::{MAX_CONCURRENT_MCP_STARTUPS, McpServerConfig, McpTransportConfig};
 use crate::http_client::BoundedHttpClient;
@@ -437,6 +437,7 @@ struct ConnectedServer {
     stderr_task: Option<StderrTask>,
     /// Configured secret values removed from this server's tool errors.
     redactions: Redactions,
+    health: Arc<ServerHealth>,
 }
 
 impl McpRuntime {
@@ -529,6 +530,23 @@ impl McpRuntime {
         Ok(connected)
     }
 
+    /// Current status of the named server, or `None` if it is unknown. A
+    /// transport that died since the last call is detected here.
+    pub fn server_status(&self, name: &str) -> Option<ServerStatus> {
+        let server = self.servers.iter().find(|server| server.name == name)?;
+        if server.client.peer().is_transport_closed() {
+            server.health.mark_failed();
+        }
+        Some(server.health.status())
+    }
+
+    /// True when the server sent `tools/list_changed`; the registered tools
+    /// are not refreshed until the session reconnects.
+    pub fn tools_stale(&self, name: &str) -> Option<bool> {
+        let server = self.servers.iter().find(|server| server.name == name)?;
+        Some(server.health.tools_stale())
+    }
+
     /// Register all discovered remote tools into a registry. The caller must
     /// retain this runtime until every resulting agent tool call has completed.
     pub fn register_into(&self, registry: &mut ToolRegistry) -> Result<(), McpError> {
@@ -539,6 +557,7 @@ impl McpRuntime {
                     remote.clone(),
                     server.client.peer().clone(),
                     server.redactions.clone(),
+                    server.health.clone(),
                 )?))?;
             }
         }
@@ -553,6 +572,7 @@ impl McpRuntime {
         // close futures. This also prevents a global shutdown timeout from
         // dropping JoinHandles and detaching stderr tasks.
         for server in &mut servers {
+            server.health.mark_closed();
             if let Some(task) = server.stderr_task.take() {
                 task.abort();
             }
@@ -744,7 +764,8 @@ where
     T: Transport<RoleClient> + 'static,
     T::Error: std::error::Error + Send + Sync + 'static,
 {
-    let handler = match HarnessClient::new(workspace_root) {
+    let health = Arc::new(ServerHealth::default());
+    let handler = match HarnessClient::new(workspace_root, health.clone()) {
         Ok(handler) => handler,
         Err(error) => {
             abort_stderr_task(stderr_task).await;
@@ -804,6 +825,7 @@ where
         tools,
         stderr_task,
         redactions: Redactions::default(),
+        health,
     })
 }
 
@@ -1483,6 +1505,40 @@ done
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        }
+
+        #[tokio::test]
+        async fn dead_server_is_marked_failed_and_calls_fail_fast() {
+            let runtime = connect_fixture("paged")
+                .await
+                .expect("fixture should connect");
+            let mut registry = ToolRegistry::empty();
+            runtime.register_into(&mut registry).unwrap();
+            assert_eq!(runtime.server_status("fixture"), Some(ServerStatus::Ready));
+            // Stop the protocol loop as a crash/EOF would.
+            runtime.servers[0].client.cancellation_token().cancel();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while runtime.server_status("fixture") != Some(ServerStatus::Failed) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "never marked failed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                registry.execute(
+                    &crate::normalized_tool_name("fixture", "first"),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("call to a dead server must not hang");
+            assert!(output.is_error);
+            assert!(output.content.contains("unavailable"), "{}", output.content);
+            assert_eq!(runtime.server_status("nope"), None);
+            runtime.shutdown().await;
         }
 
         #[tokio::test]

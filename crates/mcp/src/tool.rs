@@ -218,6 +218,7 @@ pub(crate) struct McpTool {
     output_schema: Option<Value>,
     peer: Peer<RoleClient>,
     redactions: crate::config::Redactions,
+    health: std::sync::Arc<crate::client::ServerHealth>,
 }
 
 impl McpTool {
@@ -226,6 +227,7 @@ impl McpTool {
         remote: RemoteTool,
         peer: Peer<RoleClient>,
         redactions: crate::config::Redactions,
+        health: std::sync::Arc<crate::client::ServerHealth>,
     ) -> Result<Self, McpError> {
         let original_name = remote.name.to_string();
         validate_remote_tool(server, &remote)?;
@@ -259,6 +261,7 @@ impl McpTool {
             output_schema,
             peer,
             redactions,
+            health,
         })
     }
 }
@@ -301,6 +304,9 @@ impl Tool for McpTool {
             Value::Object(arguments) => arguments,
             _ => return (self.error("MCP tool arguments must be a JSON object"), None),
         };
+        if let Some(message) = self.unavailable() {
+            return (self.error(message), None);
+        }
         let params =
             CallToolRequestParams::new(self.original_name.clone()).with_arguments(arguments);
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
@@ -315,7 +321,7 @@ impl Tool for McpTool {
                 self.peer.send_cancellable_request(request, PeerRequestOptions::no_options()),
             ) => match result {
                 Ok(Ok(handle)) => handle,
-                Ok(Err(error)) => return (self.error(format_args!("MCP tools/call failed: {error}")), None),
+                Ok(Err(error)) => return (self.call_failed(&error), None),
                 Err(_) => return (self.error("MCP tools/call request timed out"), None),
             }
         };
@@ -327,8 +333,11 @@ impl Tool for McpTool {
             result = tokio::time::timeout_at(deadline, &mut handle.rx) => match result {
                 Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => execution_output(result, self.summary()),
                 Ok(Ok(Ok(_))) => (self.error("MCP tools/call returned an unsupported non-final response"), None),
-                Ok(Ok(Err(error))) => (self.error(format_args!("MCP tools/call failed: {error}")), None),
-                Ok(Err(_)) => (self.error("MCP tools/call connection closed before a response"), None),
+                Ok(Ok(Err(error))) => (self.call_failed(&error), None),
+                Ok(Err(_)) => {
+                    self.health.mark_failed();
+                    (self.error("MCP tools/call connection closed before a response"), None)
+                }
                 Err(_) => {
                     self.cancel_request_bounded(&handle).await;
                     (self.error("MCP tool call timed out"), None)
@@ -339,6 +348,31 @@ impl Tool for McpTool {
 }
 
 impl McpTool {
+    /// A clear error when the server is known dead, so calls fail at once
+    /// instead of waiting on a transport that will never answer.
+    fn unavailable(&self) -> Option<String> {
+        if self.peer.is_transport_closed() {
+            self.health.mark_failed();
+        }
+        match self.health.status() {
+            crate::ServerStatus::Ready => None,
+            crate::ServerStatus::Failed => Some(format!(
+                "MCP server `{}` is unavailable: its connection closed or crashed",
+                self.server
+            )),
+            crate::ServerStatus::Closed => {
+                Some(format!("MCP server `{}` has been shut down", self.server))
+            }
+        }
+    }
+
+    fn call_failed(&self, error: &rmcp::ServiceError) -> ToolOutput {
+        if matches!(error, rmcp::ServiceError::TransportClosed) {
+            self.health.mark_failed();
+        }
+        self.error(format_args!("MCP tools/call failed: {error}"))
+    }
+
     fn summary(&self) -> String {
         format!("{}:{}", self.server, self.original_name)
     }
