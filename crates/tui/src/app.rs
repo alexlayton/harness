@@ -1933,7 +1933,6 @@ impl CrossTerm {
                 // A finish only reports on a call from a running turn; if the
                 // turn already ended (late event) it must not re-arm the spinner.
                 if self.busy {
-                    self.turn_active = true;
                     self.activity = Activity::Working;
                     self.operation_label = None;
                 }
@@ -1950,9 +1949,10 @@ impl CrossTerm {
                 self.pending.push(Entry::Tool { record });
             }
             UiEvent::Retrying { .. } => {
-                // Retries only occur inside a live turn; ignore late ones.
+                // Retries also occur inside `/ask`, which ends with
+                // `OperationFinished`, so a retry must not claim turn
+                // ownership; `turn_active` stays whatever started the work.
                 if self.busy {
-                    self.turn_active = true;
                     self.activity = Activity::Retrying;
                     self.operation_label = None;
                     self.status(|status| status.start_work());
@@ -4443,6 +4443,20 @@ mod tests {
         ui.apply_event(UiEvent::TextDelta("hi".into()));
         ui.apply_event(UiEvent::OperationStarted { label: "L".into() });
         assert_eq!(ui.activity, Activity::Preparing);
+    }
+
+    #[test]
+    fn retry_during_ask_does_not_make_it_a_turn() {
+        let mut ui = ui(80, 24);
+        let _rx = begin_ask(&mut ui);
+        ui.apply_event(UiEvent::Retrying {
+            attempt: 1,
+            message: String::new(),
+        });
+        assert!(ui.busy);
+        ui.apply_event(UiEvent::AskAnswer("answer".into()));
+        ui.apply_event(UiEvent::OperationFinished);
+        assert!(!ui.busy, "operation end must clear a retried ask");
     }
 
     #[test]
