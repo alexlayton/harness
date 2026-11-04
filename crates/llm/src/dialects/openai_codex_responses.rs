@@ -320,6 +320,23 @@ mod tests {
     }
 
     #[test]
+    fn eof_without_terminal_discards_shadow_items() {
+        use crate::dialects::StreamParser;
+        let mut parser = CodexParser::new();
+        StreamParser::parse_event(
+            &mut parser,
+            &crate::sse::SseEvent {
+                event: None,
+                data: r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"r","encrypted_content":"x"}}"#.into(),
+            },
+        )
+        .unwrap();
+        assert!(!parser.pending_items.is_empty());
+        assert!(StreamParser::finish(&mut parser).is_err());
+        assert!(parser.pending_items.is_empty());
+    }
+
+    #[test]
     fn incomplete_terminal_event_succeeds_with_reason_and_usage() {
         // Codex shares the Responses terminal contract: `response.incomplete`
         // is a handled terminal event preserving reason, status, and usage.

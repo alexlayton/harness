@@ -926,6 +926,7 @@ mod tests {
             "got {error:?}"
         );
         assert_eq!(parser.phase, Phase::Failed);
+        assert!(parser.ready.is_empty(), "held calls must be discarded");
         assert!(parser.finish().unwrap().is_empty());
         assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
     }
@@ -938,6 +939,7 @@ mod tests {
         let error = parser.parse_payload(CALL_DELTA).unwrap_err();
         assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
         assert_eq!(parser.phase, Phase::Failed);
+        assert!(parser.ready.is_empty(), "held calls must be discarded");
         assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
     }
 

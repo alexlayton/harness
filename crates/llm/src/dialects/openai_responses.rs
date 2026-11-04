@@ -474,6 +474,7 @@ mod tests {
             .unwrap();
         assert!(parser.parse_payload("not json").is_err());
         assert_eq!(parser.phase, Phase::Failed);
+        assert!(parser.pending_calls.is_empty());
         assert!(parser.is_done());
         // A later terminal must not flush the discarded call or yield Done.
         assert!(parser.parse_payload(ok).unwrap().is_empty());
