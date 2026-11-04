@@ -264,6 +264,7 @@ mod tests {
                 admission: CancellationToken::new(),
             },
         );
+        let _scope = registry.enter_codemode_scope();
         let placeholder = "{{harness-secret:TOKEN}}";
         for name in ["local", "external"] {
             let (output, structured) = executor

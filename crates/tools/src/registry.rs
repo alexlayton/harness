@@ -42,6 +42,16 @@ pub struct ToolRegistry {
     codemode_active: std::sync::atomic::AtomicUsize,
 }
 
+/// Guard returned by [`ToolRegistry::enter_codemode_scope`].
+#[doc(hidden)]
+pub struct CodemodeScope<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for CodemodeScope<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl ToolRegistry {
     /// Construct a registry and reject duplicate names.  `try_new` is the
     /// fallible equivalent useful to callers that do not want a panic when
@@ -269,16 +279,18 @@ impl ToolRegistry {
             return denied();
         }
         // Admit nested ungated calls only while this workflow owns the gate.
-        struct Active<'a>(&'a std::sync::atomic::AtomicUsize);
-        impl Drop for Active<'_> {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
+        let _active = self.enter_codemode_scope();
+        mode.execute(args, cancel, executor).await
+    }
+
+    /// Admit nested ungated calls until the returned guard drops. Used by
+    /// `execute_codemode`; exposed (hidden) so executor tests in other crates
+    /// can exercise the nested entry point without running a whole workflow.
+    #[doc(hidden)]
+    pub fn enter_codemode_scope(&self) -> CodemodeScope<'_> {
         self.codemode_active
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let _active = Active(&self.codemode_active);
-        mode.execute(args, cancel, executor).await
+        CodemodeScope(&self.codemode_active)
     }
 
     /// Capture definitions and prompt metadata from one immutable registry
