@@ -107,6 +107,12 @@ pub struct Agent {
     /// closed, the run loop stops selecting on it (a closed `recv` would
     /// otherwise complete immediately and starve the stream polling).
     input_open: bool,
+    /// In-memory notes (stream/empty-response recovery, prewalk handoff) that
+    /// were appended to `history` but are not durable events. A compaction
+    /// rebuilds `history` from the session, which would silently drop them
+    /// while the per-turn recovery budget still counts them, so they are
+    /// replayed onto the rebuilt history. Cleared once a turn is underway.
+    ephemeral_notes: Vec<String>,
     /// Exact context occupation from the most recent completed request
     /// (`input_tokens + output_tokens` of its `Done` usage). Drives the
     /// pre-turn trigger; `None` before the first request or after a model
@@ -158,6 +164,7 @@ impl Agent {
             provider_factory: None,
             queued: VecDeque::new(),
             input_open: true,
+            ephemeral_notes: Vec::new(),
             last_context_tokens: None,
             context_window: 0,
             compaction: CompactionPolicy::default(),
@@ -3887,6 +3894,67 @@ mod tests {
             record.event,
             SessionEvent::CompactionSummary { .. } | SessionEvent::Usage { .. }
         )));
+    }
+
+    /// A recovery note lives only in memory. A mid-turn compaction rebuilds
+    /// history from the session, so the note must be replayed or the model
+    /// loses its instruction while the recovery budget stays spent.
+    #[test]
+    fn compaction_rebuild_preserves_in_memory_recovery_notes() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = populate_session(&store, 12, 12_000);
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    // Empty response: queues the "produced no output" note.
+                    script(vec![StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    }]),
+                    // The nudged request then overflows and compacts.
+                    vec![Err("context length exceeded for this request".into())],
+                    summarizer_script(),
+                    script(vec![
+                        StreamEvent::TextDelta("done".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
+                seen: Mutex::new(Vec::new()),
+            });
+            let (events, provider) = run_session_agent(
+                &store,
+                session,
+                provider,
+                vec![InputMessage::Message("do the work".into())],
+            )
+            .await;
+            assert!(events.contains(&AgentEvent::TextDelta("done".into())));
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 4);
+            let mentions_note = |messages: &[Message]| {
+                messages.iter().any(|message| {
+                    message.content.iter().any(|content| {
+                        matches!(content, Content::Text(text) if text.contains("produced no output"))
+                    })
+                })
+            };
+            assert!(mentions_note(&seen[1].1), "nudged request carries the note");
+            assert!(
+                seen[3].1.iter().any(is_summary_message),
+                "final request must use the compacted history"
+            );
+            assert!(
+                mentions_note(&seen[3].1),
+                "the recovery note must survive the compaction rebuild"
+            );
+        });
     }
 
     #[test]

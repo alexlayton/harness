@@ -31,6 +31,7 @@ impl Agent {
     pub(crate) fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
         let Some(store) = self.session.as_ref().map(|state| state.store.clone()) else {
             self.history.clear();
+            self.ephemeral_notes.clear();
             self.last_context_tokens = None;
             send(
                 events,
@@ -77,6 +78,7 @@ impl Agent {
             .as_deref()
             .map(|title| self.secret_masker.mask_text(title));
         self.history.clear();
+        self.ephemeral_notes.clear();
         self.last_context_tokens = None;
         self.session = Some(AgentSessionState {
             store,
@@ -189,6 +191,7 @@ impl Agent {
             .iter()
             .map(|message| self.secret_masker.mask_message(message))
             .collect();
+        self.ephemeral_notes.clear();
         self.last_context_tokens = None;
         let snapshot = ui_snapshot_entries(snapshot_entries(&session), &self.secret_masker);
         self.session = Some(AgentSessionState {

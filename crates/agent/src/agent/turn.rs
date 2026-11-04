@@ -58,6 +58,23 @@ impl Agent {
         control
     }
 
+    /// Append a non-durable note to history and remember it so a compaction
+    /// rebuild can replay it ([`Self::replay_ephemeral_notes`]).
+    pub(crate) fn push_ephemeral_note(&mut self, note: String) {
+        push_recovery_note(&mut self.history, note.clone());
+        self.ephemeral_notes.push(note);
+    }
+
+    /// Re-append the in-memory notes after `history` was rebuilt from the
+    /// session. Without this a mid-turn compaction would drop a recovery
+    /// instruction (or prewalk handoff note) the model still needs while the
+    /// turn's recovery budget stays spent.
+    pub(crate) fn replay_ephemeral_notes(&mut self) {
+        for note in &self.ephemeral_notes {
+            push_recovery_note(&mut self.history, note.clone());
+        }
+    }
+
     /// Turn body: everything `run_turn` historically did, minus token
     /// construction and the deferred-sync flush (both owned by
     /// [`Self::execute_turn`]).
@@ -107,6 +124,9 @@ impl Agent {
             }
         }
 
+        // Notes from the previous turn survived the pre-turn rebuild above;
+        // from here on they are ordinary history until the next rebuild.
+        self.ephemeral_notes.clear();
         let user_message = Message::user(user_text);
         self.persist_user_message(&user_message, events)?;
         self.history.push(user_message.clone());
@@ -375,16 +395,13 @@ impl Agent {
                                  only the missing part."
                             }
                         };
-                        push_recovery_note(
-                            &mut self.history,
-                            format!(
-                                "[system note: the provider response could not be parsed \
+                        self.push_ephemeral_note(format!(
+                            "[system note: the provider response could not be parsed \
                                  ({parse_message}). Continue the task. Check the tool results \
                                  already in the conversation and do not repeat actions that \
                                  completed. If a tool call is still needed, issue it with \
                                  valid arguments.{answer}]"
-                            ),
-                        );
+                        ));
                         retried = true;
                     }
                 } else if error.is_retryable() {
@@ -402,13 +419,10 @@ impl Agent {
                                  actions that already completed."
                             }
                         };
-                        push_recovery_note(
-                            &mut self.history,
-                            format!(
-                                "[system note: your response stream was interrupted \
+                        self.push_ephemeral_note(format!(
+                            "[system note: your response stream was interrupted \
                                  ({message}); {instruction}]"
-                            ),
-                        );
+                        ));
                         retried = true;
                     }
                 }
@@ -424,8 +438,7 @@ impl Agent {
                 // Nudge once instead of silently ending the turn.
                 if text.trim().is_empty() && recoveries < MAX_TURN_RECOVERIES {
                     recoveries += 1;
-                    push_recovery_note(
-                        &mut self.history,
+                    self.push_ephemeral_note(
                         "[system note: your previous response produced no output; continue \
                          and complete the task.]"
                             .into(),

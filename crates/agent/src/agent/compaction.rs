@@ -213,6 +213,7 @@ impl Agent {
                 .map(|message| self.secret_masker.mask_message(message))
                 .collect();
             send(events, usage_event(&state.session.metadata.usage));
+            self.replay_ephemeral_notes();
         }
         self.last_context_tokens = None;
         send(events, self.context_usage_event());

@@ -7,7 +7,7 @@
 //! Harness has no todo tool, so the plan must be visible assistant text; opaque
 //! or provider-specific reasoning does not survive a cross-provider switch.
 
-use super::turn::{TurnControl, push_recovery_note};
+use super::turn::TurnControl;
 use super::{Agent, AgentEvent, TurnError, send};
 use llm::ReasoningPolicy;
 use std::fmt;
@@ -404,7 +404,7 @@ impl Agent {
             self.set_reasoning_policy(reasoning);
         }
         self.prewalk.restore = Some(restore);
-        push_recovery_note(&mut self.history, HANDOFF_NOTE.into());
+        self.push_ephemeral_note(HANDOFF_NOTE.into());
         send(
             events,
             AgentEvent::PrewalkHandoff {
