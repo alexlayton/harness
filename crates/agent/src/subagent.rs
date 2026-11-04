@@ -100,9 +100,19 @@ fn bound_child_history(
         }
     }
 
-    while estimate(history) > max_tokens && history.len() > 1 {
-        let mut end = 2.min(history.len());
-        while end < history.len() && history[end].role == Role::Tool {
+    // Drop whole units: an assistant message plus its tool results and any
+    // interstitial request notes, up to the next assistant message. That keeps
+    // `history[1]` an assistant (never two adjacent user messages) and never
+    // removes the newest assistant exchange, which synthesis depends on.
+    while estimate(history) > max_tokens {
+        let Some(newest) = history.iter().rposition(|m| m.role == Role::Assistant) else {
+            break;
+        };
+        if newest <= 1 {
+            break;
+        }
+        let mut end = 2;
+        while end < newest && history[end].role != Role::Assistant {
             end += 1;
         }
         history.drain(1..end);
@@ -716,6 +726,29 @@ impl SubagentRunnerImpl {
                 return Ok(truncate_utf8(text.trim(), REPORT_MAX_BYTES).to_owned());
             }
 
+            // The final turn offers no tools, but a model can still emit
+            // calls. Never execute them (workspace mode would run edits after
+            // the budget is spent): answer each with an error so history stays
+            // valid, and return whatever text came with them as the report.
+            if final_report_turn {
+                mark_calls_failed(
+                    history,
+                    &self.store,
+                    session,
+                    &tool_calls,
+                    "tool calls are not allowed on the final report turn; the call was not executed",
+                );
+                let report = format!(
+                    "[subagent requested tools on its final turn; no tools were executed] {}",
+                    if text.trim().is_empty() {
+                        "(no report text)"
+                    } else {
+                        text.trim()
+                    }
+                );
+                return Ok(truncate_utf8(&report, REPORT_MAX_BYTES).to_owned());
+            }
+
             self.dispatch_tool_batches(
                 registry,
                 secret_masker,
@@ -1237,11 +1270,102 @@ mod tests {
             ));
         }
         bound_child_history(&mut history, "system", &registry, 100);
-        let estimate =
-            estimate_provider_context_tokens(Some("system"), &registry.definitions(), &history);
-        assert!(estimate <= 100 || history.len() == 1);
+        // The newest exchange is always kept for synthesis, even when it
+        // alone exceeds the budget; everything older is discarded.
+        assert_eq!(history.len(), 3);
+        assert!(matches!(
+            history[2].content.as_slice(),
+            [Content::ToolResult { tool_call_id, .. }] if tool_call_id == "call-5"
+        ));
         assert_eq!(history[0].content.len(), 1);
         assert!(history.len() < 13);
+    }
+
+    fn assistant_call(index: usize) -> Message {
+        Message::assistant(vec![Content::ToolCall(llm::ToolCall {
+            id: format!("call-{index}"),
+            name: "missing".into(),
+            arguments: json!({}),
+        })])
+    }
+
+    #[test]
+    fn trimmed_history_never_has_adjacent_user_messages() {
+        let registry = ToolRegistry::empty();
+        let mut history = vec![
+            Message::user("task"),
+            assistant_call(0),
+            Message::tool_result("call-0", "x".repeat(20_000), false),
+            Message::user("[system note: no output]"),
+            assistant_call(1),
+            Message::tool_result("call-1", "x".repeat(20_000), false),
+            assistant_call(2),
+            Message::tool_result("call-2", "small", false),
+        ];
+        bound_child_history(&mut history, "system", &registry, 100);
+        assert!(
+            history
+                .windows(2)
+                .all(|pair| !(pair[0].role == Role::User && pair[1].role == Role::User)),
+            "{history:?}"
+        );
+        assert_ne!(history[1].role, Role::User);
+    }
+
+    #[test]
+    fn trimming_keeps_the_newest_exchange() {
+        let registry = ToolRegistry::empty();
+        let mut history = vec![Message::user("task")];
+        for index in 0..6 {
+            history.push(assistant_call(index));
+            history.push(Message::tool_result(
+                format!("call-{index}"),
+                format!("evidence-{index}"),
+                false,
+            ));
+        }
+        bound_child_history(&mut history, "system", &registry, 1);
+        assert!(history.len() >= 3);
+        let last = history.last().unwrap();
+        assert!(matches!(
+            last.content.as_slice(),
+            [Content::ToolResult { content, .. }] if content == "evidence-5"
+        ));
+    }
+
+    #[tokio::test]
+    async fn final_turn_tool_calls_are_not_dispatched() {
+        let max_turns = SubagentPolicy::default().max_turns;
+        let call = || {
+            Ok(StreamEvent::ToolCallComplete(llm::ToolCall {
+                id: format!("c{}", rand_suffix()),
+                name: "missing".into(),
+                arguments: json!({}),
+            }))
+        };
+        let mut scripts = Vec::new();
+        for _ in 0..max_turns - 1 {
+            scripts.push(vec![call(), ScriptProvider::done("tool_calls")]);
+        }
+        scripts.push(vec![
+            Ok(StreamEvent::TextDelta("partial findings".into())),
+            call(),
+            ScriptProvider::done("tool_calls"),
+        ]);
+        let provider = Arc::new(ScriptProvider::new(scripts));
+        let runner = runner_with(provider.clone());
+        let report = runner
+            .run(
+                "loop",
+                "keep exploring",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(report.contains("no tools were executed"), "{report}");
+        assert!(report.contains("partial findings"), "{report}");
+        assert_eq!(provider.seen.lock().unwrap().len(), max_turns);
     }
 
     #[test]
