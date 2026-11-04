@@ -221,6 +221,7 @@ impl Agent {
             // the future does not hold an immutable borrow of `self`
             // while durable events are appended below.
             let provider = self.provider.clone();
+            let request_started = std::time::Instant::now();
             let provider_future = provider.stream_with_retry(&request, on_retry);
             tokio::pin!(provider_future);
             let stream_result = loop {
@@ -249,6 +250,8 @@ impl Agent {
                 self.persist_cancelled_for("turn interrupted before response", events)?;
                 return Ok(());
             };
+            let connect_ms = request_started.elapsed().as_millis();
+            let mut first_event_ms: Option<u128> = None;
             let mut stream = match stream_result {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -319,6 +322,7 @@ impl Agent {
                         let Some(next) = next else {
                             break;
                         };
+                        first_event_ms.get_or_insert_with(|| request_started.elapsed().as_millis());
                         match next {
                             Ok(StreamEvent::TextDelta(delta)) => {
                                 text.push_str(&delta);
@@ -340,6 +344,17 @@ impl Agent {
                                         done_usage
                                             .input_tokens
                                             .saturating_add(done_usage.output_tokens),
+                                    );
+                                    // Latency breakdown for diagnosing slow
+                                    // requests from the log: request sent ->
+                                    // response accepted -> first stream event
+                                    // -> terminal event.
+                                    tracing::info!(
+                                        connect_ms,
+                                        first_event_ms = first_event_ms.unwrap_or_default(),
+                                        total_ms = request_started.elapsed().as_millis(),
+                                        output_tokens = done_usage.output_tokens,
+                                        "model request timing"
                                     );
                                     self.usage_requests = self.usage_requests.saturating_add(1);
                                     if cache_miss_is_suspicious(
