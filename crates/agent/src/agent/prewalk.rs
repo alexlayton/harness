@@ -13,6 +13,16 @@ use llm::ReasoningPolicy;
 use std::fmt;
 use tokio::sync::mpsc;
 
+/// Result of returning to the planning selection after a handoff.
+pub(crate) enum RestoreOutcome {
+    /// Nothing to restore, or the restore succeeded.
+    Ready,
+    /// The switch was refused (and reported); the restore point is kept.
+    Rejected,
+    /// The loop must stop (shutdown or quarantine).
+    Stop(TurnControl),
+}
+
 /// Appended to the system prompt only while a handoff is pending.
 const PLANNING_NUDGE: &str = "\n\nPrewalk: you are the planning model for this task. Investigate first. Before your first edit or write call, state a short numbered implementation plan in your visible reply: files to change, ordered steps, and how to verify. Then make the first edit. After that tool round, the implementation model (possibly with a different reasoning effort) continues from your plan and this conversation, so keep the plan concrete and self-contained.";
 
@@ -169,9 +179,11 @@ impl Agent {
             return TurnControl::Continue;
         }
         if enabled {
-            let control = self.restore_prewalk_planning(events).await;
-            if control != TurnControl::Continue {
-                return control;
+            match self.restore_prewalk_planning(events).await {
+                RestoreOutcome::Ready => {}
+                // Already reported; arming now would plan on the target.
+                RestoreOutcome::Rejected => return TurnControl::Continue,
+                RestoreOutcome::Stop(control) => return control,
             }
         }
         self.prewalk.enabled = enabled;
@@ -261,12 +273,12 @@ impl Agent {
     pub(crate) async fn restore_prewalk_for_new_session(
         &mut self,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> TurnControl {
+    ) -> RestoreOutcome {
         if self.prewalk.enabled {
             self.restore_prewalk_planning(events).await
         } else {
             self.prewalk.forget_restore();
-            TurnControl::Continue
+            RestoreOutcome::Ready
         }
     }
 
@@ -276,9 +288,11 @@ impl Agent {
     async fn restore_prewalk_planning(
         &mut self,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> TurnControl {
-        let Some(restore) = self.prewalk.restore.take() else {
-            return TurnControl::Continue;
+    ) -> RestoreOutcome {
+        // Keep the restore point until the switch succeeds so a rejected
+        // switch can be retried instead of losing the planning selection.
+        let Some(restore) = self.prewalk.restore.clone() else {
+            return RestoreOutcome::Ready;
         };
         let same_model = restore.provider.eq_ignore_ascii_case(self.provider.name())
             && restore.model == self.model;
@@ -290,16 +304,17 @@ impl Agent {
                 .await;
             if !matches!(switched, Ok(true)) {
                 if self.flush_deferred_sync(events).is_err() {
-                    return TurnControl::Quarantine;
+                    return RestoreOutcome::Stop(TurnControl::Quarantine);
                 }
                 return match switched {
-                    Err(TurnError::Shutdown) => TurnControl::Shutdown,
-                    Err(TurnError::Persist(_)) => TurnControl::Quarantine,
+                    Err(TurnError::Shutdown) => RestoreOutcome::Stop(TurnControl::Shutdown),
+                    Err(TurnError::Persist(_)) => RestoreOutcome::Stop(TurnControl::Quarantine),
                     // The rejected switch is already reported; stay here.
-                    Ok(_) => TurnControl::Continue,
+                    Ok(_) => RestoreOutcome::Rejected,
                 };
             }
         }
+        self.prewalk.restore = None;
         let reasoning = (restore.reasoning != self.reasoning).then_some(restore.reasoning);
         if let Some(reasoning) = reasoning {
             self.set_reasoning_policy(reasoning);
@@ -314,15 +329,17 @@ impl Agent {
                 },
             );
         }
-        TurnControl::Continue
+        RestoreOutcome::Ready
     }
 
-    /// `/new` re-arms from the preference; a consumed handoff is not inherited.
+    /// `/new` re-arms from the preference; a consumed handoff is not
+    /// inherited. `allow_arm` is false when the planning restore was rejected.
     pub(crate) fn rearm_prewalk_for_new_session(
         &mut self,
         events: &mpsc::UnboundedSender<AgentEvent>,
+        allow_arm: bool,
     ) {
-        let armed = self.prewalk.enabled && self.prewalk.target.is_some();
+        let armed = allow_arm && self.prewalk.enabled && self.prewalk.target.is_some();
         if armed || self.prewalk.armed {
             self.prewalk.armed = armed;
             self.send_prewalk_state(PrewalkChange::Session, events);
@@ -562,5 +579,70 @@ mod tests {
                 ),
             ]
         );
+    }
+    /// An agent whose restore point names a provider it cannot switch to.
+    fn agent_with_unreachable_restore() -> Agent {
+        let provider = Arc::new(Recorder {
+            calls: AtomicUsize::new(0),
+            scripts: Vec::new(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut agent = Agent::new(
+            provider,
+            ToolRegistry::empty(),
+            "cheap",
+            CancellationToken::new(),
+        )
+        .with_prewalk(PrewalkSettings {
+            enabled: false,
+            target: Some(PrewalkTarget {
+                provider: None,
+                model: "cheap".into(),
+            }),
+            armed: false,
+            reasoning: None,
+        });
+        agent.prewalk.restore = Some(PrewalkRestore {
+            provider: "other".into(),
+            model: "planner".into(),
+            reasoning: ReasoningPolicy::Auto,
+        });
+        agent
+    }
+
+    #[tokio::test]
+    async fn rejected_restore_does_not_arm_and_keeps_the_restore_point() {
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = agent_with_unreachable_restore();
+        agent.handle_set_prewalk(true, &events).await;
+        assert!(!agent.prewalk.armed && !agent.prewalk.enabled);
+        assert!(agent.prewalk.restore.is_some());
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Error(_))));
+
+        // `/new` has the same rule: the preference is on, but arming would
+        // plan on the target model.
+        agent.prewalk.enabled = true;
+        let outcome = agent.restore_prewalk_for_new_session(&events).await;
+        assert!(matches!(outcome, RestoreOutcome::Rejected));
+        agent.rearm_prewalk_for_new_session(&events, false);
+        assert!(!agent.prewalk.armed);
+        assert!(agent.prewalk.restore.is_some());
+    }
+
+    #[tokio::test]
+    async fn rejected_user_commands_keep_the_restore_point() {
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut agent = agent_with_unreachable_restore()
+            .with_provider_factory(Arc::new(|name| anyhow::bail!("no provider {name}")));
+        agent
+            .handle_set_model_boundary(Some("bogus".into()), "x".into(), &events)
+            .await;
+        agent.handle_set_reasoning("nonsense".into(), &events);
+        assert!(agent.prewalk.restore.is_some());
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Error(_))));
+
+        // A valid reasoning selection takes ownership of the session.
+        agent.handle_set_reasoning("off".into(), &events);
+        assert!(agent.prewalk.restore.is_none());
     }
 }

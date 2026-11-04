@@ -530,6 +530,10 @@ impl Agent {
             runner.update_model(self.provider.clone(), self.model.clone());
         }
         if source == ModelChangeSource::User {
+            // A committed user selection replaces the planning model the
+            // restore point would return to. Rejected commands must not
+            // reach here, so they keep it.
+            self.prewalk.forget_restore();
             send(
                 events,
                 AgentEvent::ModelChanged {
@@ -580,6 +584,7 @@ impl Agent {
         reasoning: llm::ReasoningPolicy,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
+        self.prewalk.forget_restore();
         self.set_reasoning_policy(reasoning);
         send(
             events,

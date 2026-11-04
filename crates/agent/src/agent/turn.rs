@@ -441,6 +441,13 @@ impl Agent {
             // The dispatcher marks the turn-scoped token when tool
             // execution is interrupted. Do not issue another provider
             // request; the shared turn boundary owns TurnFinished.
+            //
+            // The round is durable even when interrupted, so hand off first:
+            // otherwise an interrupted `edit` leaves prewalk armed and the
+            // next prompt plans again on the planning model.
+            if handoff {
+                self.prewalk_handoff(events).await?;
+            }
             if cancel.is_cancelled() {
                 return Ok(());
             }
@@ -448,11 +455,6 @@ impl Agent {
             // observed. That exact snapshot no longer describes the next
             // request, so use the complete-history estimator instead.
             self.last_context_tokens = None;
-            // The tool round is durable, so the next request can come from
-            // the prewalk target without splitting a call from its result.
-            if handoff {
-                self.prewalk_handoff(events).await?;
-            }
             // Headless, Python, and ACP runs have no Esc key: a model that
             // keeps calling tools must not run (and spend) without bound.
             // The round is complete, so stopping here leaves valid history;

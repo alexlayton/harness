@@ -33,8 +33,8 @@ pub use events::{
 pub use persistence::AgentSessionState;
 pub(crate) use persistence::assistant_session_events;
 use persistence::{ui_snapshot_entries, usage_event};
-use prewalk::PrewalkState;
 pub use prewalk::{PrewalkChange, PrewalkSettings, PrewalkTarget};
+use prewalk::{PrewalkState, RestoreOutcome};
 pub use tool_dispatch::SubagentLimits;
 pub(crate) use tool_dispatch::{
     CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
@@ -509,12 +509,17 @@ impl Agent {
                 InputMessage::NewConversation => {
                     // After a handoff, a new prewalk cycle starts again from
                     // the planning model unless the user chose another one.
-                    match self.restore_prewalk_for_new_session(&events).await {
-                        TurnControl::Shutdown | TurnControl::Quarantine => break,
-                        TurnControl::Continue => {}
-                    }
+                    let restored = match self.restore_prewalk_for_new_session(&events).await {
+                        RestoreOutcome::Stop(TurnControl::Shutdown | TurnControl::Quarantine) => {
+                            break;
+                        }
+                        RestoreOutcome::Stop(TurnControl::Continue) | RestoreOutcome::Ready => true,
+                        RestoreOutcome::Rejected => false,
+                    };
                     self.handle_new_session(&events);
-                    self.rearm_prewalk_for_new_session(&events);
+                    // A rejected restore leaves us on the target model; arming
+                    // would plan there, so stay disarmed until it succeeds.
+                    self.rearm_prewalk_for_new_session(&events, restored);
                     continue;
                 }
                 InputMessage::LoadSession { selector } => {
@@ -549,7 +554,6 @@ impl Agent {
                     continue;
                 }
                 InputMessage::SetModel { provider, model } => {
-                    self.prewalk.forget_restore();
                     // Model changes persist first and commit atomically;
                     // failures leave parent and subagent selection unchanged
                     // and surface one terminal event via quarantine.
@@ -563,7 +567,6 @@ impl Agent {
                     continue;
                 }
                 InputMessage::SetReasoning { level } => {
-                    self.prewalk.forget_restore();
                     self.handle_set_reasoning(level, &events);
                     continue;
                 }
