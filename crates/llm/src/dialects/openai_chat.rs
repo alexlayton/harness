@@ -256,12 +256,28 @@ pub struct ChatStreamParser {
     /// chunk, so usage alone does not end the response; it is reported on
     /// the terminal event.
     usage: Option<Usage>,
-    done: bool,
-    calls_flushed: bool,
+    /// Validated calls held until the protocol terminal. Emitting them on
+    /// `finish_reason` would let a stream that then truncates (no `[DONE]`
+    /// or usage chunk) leak executable calls from a failed response, unlike
+    /// the Anthropic and Responses parsers.
+    ready: Vec<ToolCall>,
+    phase: Phase,
     /// Call IDs already emitted in this response.  IDs are unique per
     /// assistant response; a repeated ID is a provider error, not a second
     /// call, and surfaces as `LlmError::Parse` before execution.
     seen_ids: HashSet<String>,
+}
+
+/// Lifecycle of one chat response. `Done` and `Failed` are distinct so a
+/// failed stream can never be mistaken for a completed one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Streaming,
+    /// `finish_reason` seen; calls are validated and held for the terminal.
+    Finishing,
+    Done,
+    Failed,
 }
 
 #[derive(Debug, Default)]
@@ -281,13 +297,22 @@ impl ChatStreamParser {
     }
 
     pub fn parse_payload(&mut self, payload: &str) -> Result<Vec<StreamEvent>, LlmError> {
+        if matches!(self.phase, Phase::Done | Phase::Failed) {
+            return Ok(Vec::new());
+        }
+        let result = self.parse_inner(payload);
+        if result.is_err() {
+            self.phase = Phase::Failed;
+            self.ready.clear();
+        }
+        result
+    }
+
+    fn parse_inner(&mut self, payload: &str) -> Result<Vec<StreamEvent>, LlmError> {
         // A terminal payload is sometimes followed by a transport-level
         // duplicate (or is passed to the parser directly after a usage
         // terminal).  Do not allow either case to produce another terminal
         // event or process data after the turn has ended.
-        if self.done {
-            return Ok(Vec::new());
-        }
         if payload.trim() == "[DONE]" {
             // The documented Chat terminator has no usage of its own.  It is
             // nevertheless a complete protocol terminal: validate and emit
@@ -336,6 +361,11 @@ impl ChatStreamParser {
                         output.push(StreamEvent::ReasoningDelta(reasoning.to_owned()));
                     }
                     if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                        if self.phase == Phase::Finishing && !tool_calls.is_empty() {
+                            return Err(LlmError::Parse(
+                                "chat tool call delta after finish_reason".into(),
+                            ));
+                        }
                         for (fallback_index, item) in tool_calls.iter().enumerate() {
                             self.accumulate_tool_call(item, fallback_index as u64);
                         }
@@ -343,7 +373,10 @@ impl ChatStreamParser {
                 }
                 if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                     self.stop_reason = Some(reason.to_owned());
-                    output.extend(self.flush_calls()?);
+                    if self.phase == Phase::Streaming {
+                        self.ready = self.validate_calls()?;
+                        self.phase = Phase::Finishing;
+                    }
                 }
             }
         }
@@ -364,7 +397,7 @@ impl ChatStreamParser {
     }
 
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
-        if self.done {
+        if matches!(self.phase, Phase::Done | Phase::Failed) {
             return Ok(Vec::new());
         }
         // Clean transport EOF without a protocol terminal event is a
@@ -372,19 +405,27 @@ impl ChatStreamParser {
         // transient `LlmError::StreamInterrupted` so the agent persists the
         // partial text and re-streams within its recovery bound.  Never
         // manufacture `Done` and never finalize unfinished tool calls here.
-        self.done = true;
+        self.phase = Phase::Failed;
+        self.ready.clear();
         Err(super::truncated_stream(
             "chat stream ended without a terminal event (expected [DONE] or a final usage chunk)",
         ))
     }
 
     fn complete(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
-        let mut output = self.flush_calls()?;
+        if self.phase == Phase::Streaming {
+            self.ready = self.validate_calls()?;
+        }
+        let mut output: Vec<StreamEvent> = self
+            .ready
+            .drain(..)
+            .map(StreamEvent::ToolCallComplete)
+            .collect();
         output.push(StreamEvent::Done {
             stop_reason: self.stop_reason.clone(),
             usage: self.usage.take(),
         });
-        self.done = true;
+        self.phase = Phase::Done;
         Ok(output)
     }
 
@@ -419,10 +460,7 @@ impl ChatStreamParser {
         }
     }
 
-    fn flush_calls(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
-        if self.calls_flushed && self.calls.is_empty() {
-            return Ok(Vec::new());
-        }
+    fn validate_calls(&mut self) -> Result<Vec<ToolCall>, LlmError> {
         // Validate every call before emitting any: a malformed call fails
         // the response with `LlmError::Parse` (handled by the agent's
         // malformed-tool recovery) and no `ToolCallComplete` is emitted.
@@ -462,12 +500,11 @@ impl ChatStreamParser {
                 },
             ));
         }
-        self.calls_flushed = true;
         self.calls.clear();
         let mut result = Vec::with_capacity(validated.len());
         for (id, call) in validated {
             self.seen_ids.insert(id);
-            result.push(StreamEvent::ToolCallComplete(call));
+            result.push(call);
         }
         Ok(result)
     }
@@ -495,7 +532,7 @@ impl super::StreamParser for ChatStreamParser {
     }
 
     fn is_done(&self) -> bool {
-        self.done
+        matches!(self.phase, Phase::Done | Phase::Failed)
     }
 
     fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
@@ -630,7 +667,7 @@ mod tests {
                 .parse_payload(r#"{"choices":[{"delta":{"content":"lo"}}],"usage":{"prompt_tokens":2,"completion_tokens":2}}"#)
                 .unwrap(),
         );
-        assert!(!parser.done);
+        assert!(parser.phase != Phase::Done);
         events.extend(parser.parse_payload("[DONE]").unwrap());
         let text: String = events
             .iter()
@@ -663,7 +700,7 @@ mod tests {
         let mut parser = ChatStreamParser::new();
         let done = parser.parse_event(&events[0]).unwrap();
         assert!(matches!(&done[0], StreamEvent::Done { .. }), "got {done:?}");
-        assert!(parser.done);
+        assert!(parser.phase == Phase::Done);
         assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
     }
 
@@ -728,7 +765,7 @@ mod tests {
             .unwrap();
         let error = parser.parse_payload("[DONE]").unwrap_err();
         assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
-        assert!(!parser.done);
+        assert!(parser.phase == Phase::Failed);
         assert!(parser.seen_ids.is_empty());
     }
 
@@ -742,7 +779,7 @@ mod tests {
             .unwrap();
         let error = parser.parse_payload("[DONE]").unwrap_err();
         assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
-        assert!(!parser.done);
+        assert!(parser.phase == Phase::Failed);
     }
 
     #[test]
@@ -755,7 +792,7 @@ mod tests {
             .unwrap();
         let error = parser.parse_payload("[DONE]").unwrap_err();
         assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
-        assert!(!parser.done);
+        assert!(parser.phase == Phase::Failed);
         assert!(parser.seen_ids.is_empty());
     }
 
@@ -840,6 +877,7 @@ mod tests {
                 .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
                 .unwrap(),
         );
+        events.extend(parser.parse_payload("[DONE]").unwrap());
         assert!(
             events.iter().any(|event| matches!(event, StreamEvent::ToolCallComplete(call) if call.id == "call-1" && call.name == "read")),
             "got {events:?}"
@@ -858,9 +896,10 @@ mod tests {
                     }] } }]
                 }).to_string()).unwrap();
             }
-            let events = parser
+            parser
                 .parse_payload(r#"{"choices":[{"finish_reason":"tool_calls"}]}"#)
                 .unwrap();
+            let events = parser.parse_payload("[DONE]").unwrap();
             let StreamEvent::ToolCallComplete(call) = &events[0] else {
                 panic!("missing call: {events:?}");
             };
@@ -871,6 +910,51 @@ mod tests {
             ]);
             assert_eq!(wire[0]["tool_calls"][0]["id"], wire[1]["tool_call_id"]);
         }
+    }
+
+    const CALL_DELTA: &str = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read","arguments":"{}"}}]}}]}"#;
+    const FINISH_TOOLS: &str = r#"{"choices":[{"finish_reason":"tool_calls"}]}"#;
+
+    #[test]
+    fn tool_calls_after_finish_reason_then_eof_emit_nothing_and_interrupt() {
+        let mut parser = ChatStreamParser::new();
+        parser.parse_payload(CALL_DELTA).unwrap();
+        assert!(parser.parse_payload(FINISH_TOOLS).unwrap().is_empty());
+        let error = parser.finish().unwrap_err();
+        assert!(
+            matches!(error, LlmError::StreamInterrupted(_)),
+            "got {error:?}"
+        );
+        assert_eq!(parser.phase, Phase::Failed);
+        assert!(parser.finish().unwrap().is_empty());
+        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn late_tool_call_delta_after_finish_reason_is_rejected() {
+        let mut parser = ChatStreamParser::new();
+        parser.parse_payload(CALL_DELTA).unwrap();
+        parser.parse_payload(FINISH_TOOLS).unwrap();
+        let error = parser.parse_payload(CALL_DELTA).unwrap_err();
+        assert!(matches!(error, LlmError::Parse(_)), "got {error:?}");
+        assert_eq!(parser.phase, Phase::Failed);
+        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn finish_reason_then_done_emits_held_calls_once() {
+        let mut parser = ChatStreamParser::new();
+        parser.parse_payload(CALL_DELTA).unwrap();
+        assert!(parser.parse_payload(FINISH_TOOLS).unwrap().is_empty());
+        let events = parser.parse_payload("[DONE]").unwrap();
+        assert_eq!(events.len(), 2, "got {events:?}");
+        assert!(matches!(&events[0], StreamEvent::ToolCallComplete(call) if call.id == "call-1"));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::Done { stop_reason: Some(reason), .. } if reason == "tool_calls"
+        ));
+        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
+        assert!(parser.finish().unwrap().is_empty());
     }
 
     #[test]
