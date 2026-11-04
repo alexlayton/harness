@@ -85,6 +85,10 @@ pub struct Agent {
     pub model: String,
     /// Reasoning policy applied to normal parent requests.
     pub reasoning: llm::ReasoningPolicy,
+    /// Reasoning summary style requested on normal turns.
+    pub reasoning_summary: llm::ReasoningSummary,
+    /// Requests that reported usage in this process, for the zero-cache check.
+    usage_requests: u32,
     stream_recovery: StreamRecovery,
     /// Kept public as a short-term compatibility path for existing callers.
     /// When a durable session is attached it is rebuilt from the session
@@ -256,6 +260,8 @@ impl Agent {
             tools,
             model: model.into(),
             reasoning: llm::ReasoningPolicy::Auto,
+            reasoning_summary: llm::ReasoningSummary::Auto,
+            usage_requests: 0,
             stream_recovery: StreamRecovery::default(),
             history: Vec::new(),
             cancel,
@@ -274,6 +280,12 @@ impl Agent {
             model_metadata_tx: None,
             prewalk: PrewalkState::default(),
         }
+    }
+
+    /// Configure the reasoning summary style for subsequent normal requests.
+    pub fn with_reasoning_summary(mut self, summary: llm::ReasoningSummary) -> Self {
+        self.reasoning_summary = summary;
+        self
     }
 
     /// Configure reasoning for subsequent normal requests.
@@ -426,6 +438,7 @@ impl Agent {
             temperature: None,
             reasoning: self.reasoning,
             session_id: None,
+            reasoning_summary: llm::ReasoningSummary::None,
         };
         let stream_result = tokio::select! {
             biased;

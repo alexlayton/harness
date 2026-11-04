@@ -349,7 +349,7 @@ impl SubagentRunnerImpl {
             tracing::debug!(mode = mode.as_str(), "building child tool registry");
             #[cfg(test)]
             builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let mut config = ToolConfig::new(&workspace_root, rtk);
+            let mut config = ToolConfig::new(&workspace_root, rtk).without_repeat_read_notes();
             if let Some(skills) = &self.skills {
                 config = config.with_skills(skills.clone());
             }
@@ -605,6 +605,7 @@ impl SubagentRunnerImpl {
                 temperature: None,
                 reasoning,
                 session_id: session.as_ref().map(|child| child.id().to_string()),
+                reasoning_summary: llm::ReasoningSummary::None,
             };
             // Standard initial-request retry policy, same as the parent: a
             // transient 429/5xx while *obtaining* the stream must not

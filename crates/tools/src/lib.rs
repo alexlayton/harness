@@ -169,6 +169,10 @@ pub struct ToolConfig {
     pub rtk: bool,
     /// Optional resolved skill catalog, including an explicitly empty catalog.
     pub skills: Option<SkillCatalog>,
+    /// Whether `read` notes repeat reads of unchanged content. Child
+    /// registries are shared by sibling subagents, so they turn this off: one
+    /// child's earlier read says nothing about what another child has seen.
+    pub repeat_read_notes: bool,
 }
 
 impl ToolConfig {
@@ -177,7 +181,14 @@ impl ToolConfig {
             cwd: cwd.into(),
             rtk,
             skills: None,
+            repeat_read_notes: true,
         }
+    }
+
+    /// Stop `read` from annotating repeat reads (used for shared child registries).
+    pub fn without_repeat_read_notes(mut self) -> Self {
+        self.repeat_read_notes = false;
+        self
     }
 
     /// Replace default skill discovery with a host-owned catalog.
@@ -248,6 +259,7 @@ pub fn default_registry_with_index(
         vec![
             Box::new(
                 ReadTool::with_workspace_fs(&workspace_root, workspace_fs.clone())
+                    .with_repeat_notes(config.repeat_read_notes)
                     .with_allowed_paths(read_paths.clone()),
             ),
             Box::new(EditTool::with_workspace_fs(
@@ -317,6 +329,7 @@ pub fn read_only_registry_with_index(
         vec![
             Box::new(
                 ReadTool::with_workspace_fs(&workspace_root, workspace_fs.clone())
+                    .with_repeat_notes(config.repeat_read_notes)
                     .with_allowed_paths(read_paths),
             ),
             Box::new(OutlineTool::new(workspace_fs)),

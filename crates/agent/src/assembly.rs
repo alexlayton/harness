@@ -44,6 +44,7 @@ pub struct AgentBuilder {
     provider: Arc<dyn Provider>,
     model: String,
     reasoning: ReasoningPolicy,
+    reasoning_summary: llm::ReasoningSummary,
     stream_recovery: StreamRecovery,
     tools: ToolRegistry,
     cancel: CancellationToken,
@@ -71,6 +72,7 @@ impl AgentBuilder {
             provider,
             model: model.into(),
             reasoning: ReasoningPolicy::Auto,
+            reasoning_summary: llm::ReasoningSummary::Auto,
             stream_recovery: StreamRecovery::default(),
             tools,
             cancel,
@@ -85,6 +87,12 @@ impl AgentBuilder {
             codemode: None,
             prewalk: PrewalkSettings::default(),
         }
+    }
+
+    /// Configure the reasoning summary style for parent requests.
+    pub fn with_reasoning_summary(mut self, summary: llm::ReasoningSummary) -> Self {
+        self.reasoning_summary = summary;
+        self
     }
 
     /// Configure reasoning policy for parent and nested model requests.
@@ -267,6 +275,7 @@ impl AgentBuilder {
         let mut agent = Agent::new(self.provider, self.tools, self.model, self.cancel)
             .with_secret_masker(self.secret_masker)
             .with_reasoning(self.reasoning)
+            .with_reasoning_summary(self.reasoning_summary)
             .with_stream_recovery(self.stream_recovery)
             .with_project_context(self.project_context)
             .with_compaction(self.compaction)

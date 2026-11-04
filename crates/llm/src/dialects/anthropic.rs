@@ -633,6 +633,7 @@ mod tests {
             temperature: None,
             reasoning: crate::ReasoningPolicy::Auto,
             session_id: None,
+            reasoning_summary: Default::default(),
         };
         let body = build_request_body(&request);
         let system = body.get("system").unwrap().as_array().unwrap();

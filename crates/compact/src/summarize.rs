@@ -171,6 +171,7 @@ async fn model_summarize(
         temperature: None,
         reasoning: ReasoningPolicy::Off,
         session_id: session_id.map(str::to_owned),
+        reasoning_summary: llm::ReasoningSummary::None,
     };
 
     // Same initial-request retry policy as conversation turns: one transient

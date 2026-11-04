@@ -339,6 +339,7 @@ impl SecretMasker {
             temperature: request.temperature,
             reasoning: request.reasoning,
             session_id: request.session_id.clone(),
+            reasoning_summary: request.reasoning_summary,
         }
     }
 
@@ -869,6 +870,7 @@ mod tests {
             temperature: None,
             reasoning: llm::ReasoningPolicy::Auto,
             session_id: None,
+            reasoning_summary: Default::default(),
         };
 
         let mut response = provider.stream(&request).await.unwrap();

@@ -1526,6 +1526,7 @@ async fn spawn_agent(
     )
     .with_secret_masker(state.config.secret_masker.clone())
     .with_reasoning(state.config.reasoning)
+    .with_reasoning_summary(state.config.reasoning_summary.unwrap_or_default())
     .with_compaction(state.config.compaction.clone())
     .with_subagents(state.config.subagents, false)
     .with_mcp_servers(mcp_servers)

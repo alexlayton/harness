@@ -207,6 +207,7 @@ impl Agent {
                 temperature: None,
                 reasoning: self.reasoning,
                 session_id: self.session_id(),
+                reasoning_summary: self.reasoning_summary,
             };
 
             let retry_events = events.clone();
@@ -220,6 +221,7 @@ impl Agent {
             // the future does not hold an immutable borrow of `self`
             // while durable events are appended below.
             let provider = self.provider.clone();
+            let request_started = std::time::Instant::now();
             let provider_future = provider.stream_with_retry(&request, on_retry);
             tokio::pin!(provider_future);
             let stream_result = loop {
@@ -248,6 +250,8 @@ impl Agent {
                 self.persist_cancelled_for("turn interrupted before response", events)?;
                 return Ok(());
             };
+            let connect_ms = request_started.elapsed().as_millis();
+            let mut first_event_ms: Option<u128> = None;
             let mut stream = match stream_result {
                 Ok(stream) => stream,
                 Err(error) => {
@@ -318,6 +322,7 @@ impl Agent {
                         let Some(next) = next else {
                             break;
                         };
+                        first_event_ms.get_or_insert_with(|| request_started.elapsed().as_millis());
                         match next {
                             Ok(StreamEvent::TextDelta(delta)) => {
                                 text.push_str(&delta);
@@ -340,6 +345,28 @@ impl Agent {
                                             .input_tokens
                                             .saturating_add(done_usage.output_tokens),
                                     );
+                                    // Latency breakdown for diagnosing slow
+                                    // requests from the log: request sent ->
+                                    // response accepted -> first stream event
+                                    // -> terminal event.
+                                    tracing::info!(
+                                        connect_ms,
+                                        first_event_ms = first_event_ms.unwrap_or_default(),
+                                        total_ms = request_started.elapsed().as_millis(),
+                                        output_tokens = done_usage.output_tokens,
+                                        "model request timing"
+                                    );
+                                    self.usage_requests = self.usage_requests.saturating_add(1);
+                                    if cache_miss_is_suspicious(
+                                        self.usage_requests,
+                                        done_usage.cached_tokens,
+                                    ) {
+                                        tracing::warn!(
+                                            request = self.usage_requests,
+                                            input_tokens = done_usage.input_tokens,
+                                            "provider reported zero cached tokens on a reused session; prompt caching may be broken"
+                                        );
+                                    }
                                     let summary = usage_summary(&done_usage);
                                     self.persist_usage_best_effort(summary.clone(), events);
                                     if let Some(state) = self.session.as_ref() {
@@ -621,4 +648,27 @@ pub(crate) fn append_assistant(
         role: Role::Assistant,
         content,
     });
+}
+
+/// Requests after which a reused session should have some cache hits.
+const CACHE_WARN_AFTER_REQUESTS: u32 = 3;
+
+/// True when the `request_number`th request of a session (1-based) reported
+/// `cached_tokens == 0` despite earlier requests having warmed the prefix.
+/// Providers that omit the field (`None`) never trigger it.
+fn cache_miss_is_suspicious(request_number: u32, cached_tokens: Option<u64>) -> bool {
+    request_number > CACHE_WARN_AFTER_REQUESTS && cached_tokens == Some(0)
+}
+
+#[cfg(test)]
+mod cache_warning_tests {
+    use super::cache_miss_is_suspicious;
+
+    #[test]
+    fn warns_only_for_explicit_zero_after_warmup() {
+        assert!(!cache_miss_is_suspicious(3, Some(0)));
+        assert!(cache_miss_is_suspicious(4, Some(0)));
+        assert!(!cache_miss_is_suspicious(4, Some(10)));
+        assert!(!cache_miss_is_suspicious(9, None));
+    }
 }
