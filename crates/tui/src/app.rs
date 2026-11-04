@@ -411,10 +411,9 @@ pub struct CrossTerm {
 
     stream: Option<StreamState>,
     stream_markdown_cache: Option<StreamMarkdownCache>,
-    /// Latest isolated answer, shown in the live region but never committed to history.
+    /// Latest isolated answer, shown inline in the live region at its full
+    /// height and never committed to history. Esc dismisses it.
     ask_answer: Option<String>,
-    /// First wrapped answer row in the transient pager.
-    ask_offset: usize,
     /// Currently running tool calls, keyed by harness call id and kept in
     /// launch order. Concurrent fan-out (e.g. several `subagent` calls in one
     /// response) means more than one record can be live at once; a finish
@@ -537,7 +536,6 @@ impl CrossTerm {
             stream: None,
             stream_markdown_cache: None,
             ask_answer: None,
-            ask_offset: 0,
             running_tools: Vec::new(),
             background_operations: Vec::new(),
             input: String::new(),
@@ -983,10 +981,6 @@ impl CrossTerm {
                 } else {
                     self.dismiss_ask();
                 }
-            }
-            KeyCode::PageUp | KeyCode::PageDown if self.ask_answer.is_some() => {
-                self.scroll_ask(key.code == KeyCode::PageDown);
-                return Ok(false);
             }
             KeyCode::Enter
                 if key
@@ -1995,7 +1989,6 @@ impl CrossTerm {
             }
             UiEvent::AskAnswer(answer) => {
                 self.ask_answer = Some(answer);
-                self.ask_offset = 0;
             }
             UiEvent::TurnFinished => {
                 self.finalize_stream();
@@ -2419,9 +2412,9 @@ impl CrossTerm {
     ) -> RegionBuild {
         let theme = self.theme;
         let content = render::content_width(self.width);
-        // Reserve a header and at least one answer row even for a large
+        // Reserve at least one answer row even for a large
         // draft. The final height guard still covers degenerate terminals.
-        let answer_reserve = usize::from(self.ask_answer.is_some()) * 2;
+        let answer_reserve = usize::from(self.ask_answer.is_some());
         let (input_rows, input_cursor_row) = clip_input(
             input,
             self.height as usize,
@@ -2431,7 +2424,7 @@ impl CrossTerm {
 
         let mut rows: Vec<Line<'static>> = Vec::new();
         let mut activity_row_index: Option<usize> = None;
-        // Small screens prioritize answer text over pager chrome and gaps.
+        // Small screens prioritize answer text over gaps.
         let section_gap = if self.ask_answer.is_some() && self.height < 6 {
             0
         } else {
@@ -2439,20 +2432,9 @@ impl CrossTerm {
         };
         if self.ask_answer.is_some() {
             let answer = self.ask_lines(content);
-            let (header, budget) = self.ask_page_layout(input_rows.len(), running.rows);
-            let start = self.ask_offset.min(answer.len().saturating_sub(budget));
-            let end = (start + budget).min(answer.len());
-            if header {
-                rows.push(Line::from(Span::styled(
-                    format!(
-                        "/ask · {}–{end}/{} · PgUp/PgDn · Esc close",
-                        start + 1,
-                        answer.len()
-                    ),
-                    Style::default().fg(theme.dim_text),
-                )));
-            }
-            rows.extend(answer[start..end].iter().cloned());
+            // Oversized answers were already moved to scrollback by
+            // `commit_oversized_ask`, so the whole answer fits here.
+            rows.extend(answer.iter().cloned());
         } else {
             // The streaming tail shows only its newest rows; rows that
             // scrolled out are printed in full when the message finalizes.
@@ -2573,11 +2555,10 @@ impl CrossTerm {
 
     fn dismiss_ask(&mut self) {
         self.ask_answer = None;
-        self.ask_offset = 0;
     }
 
     /// Split and wrap sanitized source before producing terminal rows. The
-    /// complete result stays in this transient pager, never in the transcript.
+    /// complete result stays in this transient inline view, never in the transcript.
     fn ask_lines(&self, width: usize) -> Vec<Line<'static>> {
         let answer = render::sanitize_terminal_text(self.ask_answer.as_deref().unwrap_or(""));
         render::wrap_text(
@@ -2587,33 +2568,34 @@ impl CrossTerm {
         )
     }
 
-    fn ask_page_layout(&self, input_rows: usize, running_rows: usize) -> (bool, usize) {
+    /// Rows available to the inline answer beside the input and activity.
+    fn ask_budget(&self, input_rows: usize, running_rows: usize) -> usize {
         let gaps = if self.height < 6 {
             0
         } else {
             render::SECTION_GAP * (1 + usize::from(self.busy) + usize::from(running_rows > 0))
         };
-        let available = (self.height as usize)
-            .saturating_sub(input_rows + running_rows + usize::from(self.busy) + gaps);
-        let header = available > 1;
-        (header, available.saturating_sub(usize::from(header)).max(1))
+        (self.height as usize)
+            .saturating_sub(input_rows + running_rows + usize::from(self.busy) + gaps)
+            .max(1)
     }
 
-    fn scroll_ask(&mut self, forward: bool) {
-        let input = self.input_layout();
-        let running_rows = self.running_region().rows;
-        let (input_rows, _) = clip_input(&input, self.height as usize, self.busy, running_rows + 2);
-        let (_, page) = self.ask_page_layout(input_rows.len(), running_rows);
-        let max_offset = self
-            .ask_lines(render::content_width(self.width))
-            .len()
-            .saturating_sub(page);
-        let current = self.ask_offset.min(max_offset);
-        self.ask_offset = if forward {
-            current.saturating_add(page).min(max_offset)
-        } else {
-            current.saturating_sub(page)
-        };
+    /// An answer taller than the screen cannot live in the region. Print it
+    /// into scrollback instead, where the terminal scrolls it, rather than
+    /// clipping or paging it.
+    fn commit_oversized_ask(&mut self, input_rows: usize, running_rows: usize) {
+        if self.ask_answer.is_none() {
+            return;
+        }
+        let budget = self.ask_budget(input_rows, running_rows);
+        let rows = self.ask_lines(render::content_width(self.width)).len();
+        if rows > budget
+            && let Some(text) = self.ask_answer.take()
+        {
+            self.pending.push(Entry::Notice {
+                text: render::sanitize_terminal_text(&text),
+            });
+        }
     }
 
     /// Rendered rows of the in-flight assistant message (reasoning block,
@@ -2733,6 +2715,7 @@ impl CrossTerm {
         let input = self.input_layout();
         let running = self.running_region();
         self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
+        self.commit_oversized_ask(input.rows.len(), running.rows);
         let build = self.build_region_with_running(&input, running);
         self.write_frame(build, false)
     }
@@ -2759,6 +2742,7 @@ impl CrossTerm {
         let input = self.input_layout();
         let running = self.running_region();
         self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
+        self.commit_oversized_ask(input.rows.len(), running.rows);
         commit_to_transcript(&mut self.transcript, &mut self.pending);
         self.build_region_with_running(&input, running)
     }
@@ -4510,75 +4494,71 @@ mod tests {
     }
 
     #[test]
-    fn ask_pager_wraps_all_answer_text_and_can_be_dismissed_without_history() {
+    fn ask_answer_renders_inline_at_full_height_and_esc_dismisses_it() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
-        for (width, height, busy) in [
-            (40, 2, false),
-            (40, 4, true),
-            (40, 8, false),
-            (80, 12, false),
-        ] {
-            let mut ui = ui(width, height);
-            ui.busy = busy;
-            let answer = (0..20)
-                .map(|row| {
-                    (0..12)
-                        .map(|word| format!("r{row}-w{word:02}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            ui.apply_event(UiEvent::AskAnswer(format!("\x1b[31m{answer}\x1b[0m")));
-            let expected = ui.ask_lines(render::content_width(width));
-            let mut visible = HashSet::new();
-            loop {
-                let build = ui.build_region(&ui.input_layout());
-                assert!(build.rows.len() <= height as usize);
-                assert!(build.cursor_row < build.rows.len());
-                for row in &build.rows {
-                    let text = row_text(row);
-                    assert!(!text.contains(['\n', '\r', '\x1b']));
-                    assert!(row_width(row) <= render::content_width(width));
-                    visible.insert(text);
-                }
-                let previous = ui.ask_offset;
-                ui.handle_input(
-                    &Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::empty())),
-                    &tx,
-                    &cancel,
-                )
-                .unwrap();
-                if ui.ask_offset == previous {
-                    break;
-                }
-            }
+        let mut ui = ui(60, 24);
+        let answer = (0..6)
+            .map(|row| format!("\x1b[31mrow {row} of the answer\x1b[0m"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.apply_event(UiEvent::AskAnswer(answer));
+        let input = ui.input_layout();
+        ui.commit_oversized_ask(input.rows.len(), 0);
+        let build = ui.build_region(&input);
+        let text = build.rows.iter().map(row_text).collect::<Vec<_>>();
+        for row in 0..6 {
             assert!(
-                expected.iter().all(|row| visible.contains(&row_text(row))),
-                "every wrapped answer row must be reachable"
+                text.iter()
+                    .any(|line| line.contains(&format!("row {row} of")))
             );
-            let last_offset = ui.ask_offset;
-            ui.handle_input(
-                &Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::empty())),
-                &tx,
-                &cancel,
-            )
-            .unwrap();
-            assert!(ui.ask_offset < last_offset);
-            ui.apply_event(UiEvent::OperationFinished);
-            ui.handle_input(
-                &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
-                &tx,
-                &cancel,
-            )
-            .unwrap();
-            assert!(ui.ask_answer.is_none());
-            assert!(ui.pending.is_empty());
-            assert!(ui.transcript.is_empty());
-            assert!(rx.try_recv().is_err());
-            assert!(!cancel.is_cancelled());
         }
+        assert!(
+            !text
+                .iter()
+                .any(|line| line.contains("PgUp") || line.contains("/ask ·")),
+            "no pager chrome: {text:?}"
+        );
+        assert!(text.iter().all(|line| !line.contains('\x1b')));
+
+        // Page keys do nothing; Esc closes the answer without touching history.
+        for code in [KeyCode::PageDown, KeyCode::PageUp] {
+            ui.handle_input(
+                &Event::Key(KeyEvent::new(code, KeyModifiers::empty())),
+                &tx,
+                &cancel,
+            )
+            .unwrap();
+            assert!(ui.ask_answer.is_some());
+        }
+        ui.handle_input(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
+            &tx,
+            &cancel,
+        )
+        .unwrap();
+        assert!(ui.ask_answer.is_none());
+        assert!(ui.pending.is_empty());
+        assert!(ui.transcript.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn ask_answer_taller_than_the_screen_flows_into_scrollback() {
+        let mut ui = ui(40, 8);
+        let answer = (0..30)
+            .map(|row| format!("line {row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.apply_event(UiEvent::AskAnswer(answer));
+        let input = ui.input_layout();
+        ui.commit_oversized_ask(input.rows.len(), 0);
+        assert!(ui.ask_answer.is_none());
+        let printed = format!("{:?}", ui.pending);
+        assert!(printed.contains("line 0") && printed.contains("line 29"));
+        let build = ui.build_region(&ui.input_layout());
+        assert!(build.rows.len() <= 8);
     }
 
     #[test]
@@ -4603,10 +4583,8 @@ mod tests {
     fn ask_provider_open_error_completes_busy_without_retaining_question() {
         let mut ui = ui(80, 24);
         ui.ask_answer = Some("previous answer".into());
-        ui.ask_offset = 10;
         let _rx = begin_ask(&mut ui);
         assert!(ui.ask_answer.is_none());
-        assert_eq!(ui.ask_offset, 0);
         ui.apply_event(UiEvent::Error("provider open failed".into()));
         ui.apply_event(UiEvent::OperationFinished);
         assert!(!ui.busy);
