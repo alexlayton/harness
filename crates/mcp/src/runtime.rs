@@ -25,7 +25,6 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -34,6 +33,22 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tools::ToolRegistry;
+
+/// Why the frame reader stopped. Kept distinct so an I/O failure is never
+/// reported as an oversized frame (or vice versa).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FrameFailure {
+    /// A frame exceeded the configured byte limit.
+    Overflow,
+    /// The underlying reader failed.
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+/// Failure shared between the reader and its transport wrapper.
+type FrameFailureSlot = Arc<StdMutex<Option<FrameFailure>>>;
 
 /// A bounded newline-delimited reader for MCP stdio.
 ///
@@ -47,27 +62,42 @@ struct BoundedFrameReader<R> {
     frame_length: usize,
     pending: Vec<u8>,
     pending_start: usize,
-    failed: bool,
-    failure_signal: Arc<AtomicBool>,
+    failed: Option<FrameFailure>,
+    failure_signal: FrameFailureSlot,
     eof: bool,
 }
 
 impl<R> BoundedFrameReader<R> {
     #[cfg(test)]
     fn new(inner: R, max_length: usize) -> Self {
-        Self::new_with_failure(inner, max_length, Arc::new(AtomicBool::new(false)))
+        Self::new_with_failure(inner, max_length, FrameFailureSlot::default())
     }
 
-    fn new_with_failure(inner: R, max_length: usize, failure_signal: Arc<AtomicBool>) -> Self {
+    fn new_with_failure(inner: R, max_length: usize, failure_signal: FrameFailureSlot) -> Self {
         Self {
             inner,
             max_length,
             frame_length: 0,
             pending: Vec::new(),
             pending_start: 0,
-            failed: false,
+            failed: None,
             failure_signal,
             eof: false,
+        }
+    }
+
+    fn fail(&mut self, failure: FrameFailure) {
+        *self.failure_signal.lock().expect("frame failure lock") = Some(failure.clone());
+        self.failed = Some(failure);
+    }
+
+    fn failure_error(&self) -> std::io::Error {
+        match &self.failed {
+            Some(FrameFailure::Io { kind, message }) => std::io::Error::new(*kind, message.clone()),
+            _ => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MCP frame exceeds {} bytes", self.max_length),
+            ),
         }
     }
 
@@ -95,8 +125,7 @@ impl<R> BoundedFrameReader<R> {
                 // Do not retain the offending byte or any bytes after it. The
                 // already pending prefix is delivered first, then the next
                 // read reports the terminal framing error.
-                self.failed = true;
-                self.failure_signal.store(true, Ordering::Release);
+                self.fail(FrameFailure::Overflow);
                 break;
             } else {
                 self.frame_length += 1;
@@ -119,11 +148,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedFrameReader<R> {
             self.copy_pending(buffer);
             return Poll::Ready(Ok(()));
         }
-        if self.failed {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("MCP frame exceeds {} bytes", self.max_length),
-            )));
+        if self.failed.is_some() {
+            return Poll::Ready(Err(self.failure_error()));
         }
         if self.eof {
             return Poll::Ready(Ok(()));
@@ -136,8 +162,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedFrameReader<R> {
         match Pin::new(&mut self.inner).poll_read(cx, &mut chunk_buffer) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => {
-                self.failed = true;
-                self.failure_signal.store(true, Ordering::Release);
+                self.fail(FrameFailure::Io {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                });
                 Poll::Ready(Err(error))
             }
             Poll::Ready(Ok(())) => {
@@ -151,10 +179,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedFrameReader<R> {
                     self.copy_pending(buffer);
                     Poll::Ready(Ok(()))
                 } else {
-                    Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("MCP frame exceeds {} bytes", self.max_length),
-                    )))
+                    Poll::Ready(Err(self.failure_error()))
                 }
             }
         }
@@ -194,12 +219,12 @@ struct BoundedStdioTransport {
     process_group: Option<u32>,
     transport: BoundedMcpTransport,
     pending_requests: Arc<StdMutex<VecDeque<RequestId>>>,
-    frame_failure: Arc<AtomicBool>,
+    frame_failure: FrameFailureSlot,
 }
 
 impl BoundedStdioTransport {
     fn new(child: Child, stdout: ChildStdout, stdin: ChildStdin, scope: ProcessScope) -> Self {
-        let frame_failure = Arc::new(AtomicBool::new(false));
+        let frame_failure = FrameFailureSlot::default();
         let process_group = if cfg!(unix) { child.id() } else { None };
         Self {
             scope,
@@ -235,19 +260,26 @@ impl BoundedStdioTransport {
     }
 
     fn frame_failure_response(&self) -> Option<RxJsonRpcMessage<RoleClient>> {
-        if !self.frame_failure.load(Ordering::Acquire) {
-            return None;
-        }
+        let failure = self
+            .frame_failure
+            .lock()
+            .expect("frame failure lock")
+            .clone()?;
         let id = self
             .pending_requests
             .lock()
             .expect("pending MCP requests lock")
             .pop_front()?;
         Some(JsonRpcMessage::error(
-            ErrorData::invalid_request(
-                format!("MCP frame exceeds {MCP_MAX_FRAME_BYTES} bytes"),
-                None,
-            ),
+            match failure {
+                FrameFailure::Overflow => ErrorData::invalid_request(
+                    format!("MCP frame exceeds {MCP_MAX_FRAME_BYTES} bytes"),
+                    None,
+                ),
+                FrameFailure::Io { message, .. } => {
+                    ErrorData::internal_error(format!("MCP transport read failed: {message}"), None)
+                }
+            },
             Some(id),
         ))
     }
@@ -871,6 +903,7 @@ async fn abort_stderr_task(task: Option<StderrTask>) {
 mod tests {
     use super::*;
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct ChunkedReader {
         data: Vec<u8>,
@@ -945,6 +978,37 @@ mod tests {
         assert_eq!(output, b"12345678");
         let error = error.expect("chunked frame must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe gone")))
+        }
+    }
+
+    #[tokio::test]
+    async fn io_errors_are_not_reported_as_oversized_frames() {
+        let slot = FrameFailureSlot::default();
+        let mut reader = BoundedFrameReader::new_with_failure(FailingReader, 8, slot.clone());
+        let mut byte = [0u8; 1];
+        for _ in 0..2 {
+            let error = reader.read(&mut byte).await.expect_err("io error");
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(!error.to_string().contains("exceeds"), "{error}");
+        }
+        assert!(matches!(
+            slot.lock().unwrap().clone(),
+            Some(FrameFailure::Io {
+                kind: io::ErrorKind::BrokenPipe,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
