@@ -212,7 +212,20 @@ impl super::StreamParser for CodexParser {
                 }
             });
 
-        let events = self.inner.parse_event(event)?;
+        if self.inner.is_done() {
+            // Terminal or failed already: the inner parser ignores the event,
+            // and flushing again would replay stale opaque state.
+            self.pending_items.clear();
+            return Ok(Vec::new());
+        }
+        let events = match self.inner.parse_event(event) {
+            Ok(events) => events,
+            Err(error) => {
+                // Never keep shadow items the inner parser has discarded.
+                self.pending_items.clear();
+                return Err(error);
+            }
+        };
         if self.inner.is_done() {
             return self.flush_terminal(events);
         }
@@ -230,6 +243,7 @@ impl super::StreamParser for CodexParser {
         // Do not release pending opaque state on EOF: the shared parser has
         // not observed a valid terminal event, so replaying it would create a
         // durable partial turn.
+        self.pending_items.clear();
         self.inner.finish()
     }
 }
@@ -279,6 +293,30 @@ mod tests {
         let maximum =
             build_request_body(&request(ReasoningPolicy::Effort(ReasoningEffort::Maximum)));
         assert_eq!(maximum["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn failed_inner_parser_discards_shadow_items_and_ignores_later_events() {
+        use crate::dialects::StreamParser;
+        let ev = |data: &str| crate::sse::SseEvent {
+            event: None,
+            data: data.into(),
+        };
+        let mut parser = CodexParser::new();
+        StreamParser::parse_event(
+            &mut parser,
+            &ev(r#"{"type":"response.output_item.done","item":{"type":"reasoning","id":"r","encrypted_content":"x"}}"#),
+        )
+        .unwrap();
+        assert!(StreamParser::parse_event(&mut parser, &ev("not json")).is_err());
+        assert!(parser.pending_items.is_empty());
+        // A later terminal must not release stale opaque state or a Done.
+        let after = StreamParser::parse_event(
+            &mut parser,
+            &ev(r#"{"type":"response.completed","response":{"status":"completed"}}"#),
+        )
+        .unwrap();
+        assert!(after.is_empty(), "got {after:?}");
     }
 
     #[test]
