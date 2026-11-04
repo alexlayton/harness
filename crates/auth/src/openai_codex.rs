@@ -1161,7 +1161,9 @@ mod tests {
         let fixture = fixture(vec![(200, success_token_body("refresh-next"))]).await;
         let directory = tempfile::tempdir().unwrap();
         let store = AuthStore::new(directory.path().join("auth.json"));
-        store.save_openai_codex(&expired_codex_credential()).unwrap();
+        store
+            .save_openai_codex(&expired_codex_credential())
+            .unwrap();
         let auth = auth_with_fixture(&directory, &fixture).await;
         store
             .save_provider_value("openai-codex", serde_json::json!({"type":"oauth"}))
