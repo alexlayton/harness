@@ -690,6 +690,15 @@ impl ToolCallTracker {
         }
     }
 
+    /// Fresh tracker using the same replay mode as `self`, so a derived
+    /// check (compaction boundaries) applies the rule the log is loaded under.
+    fn replay_mode(&self) -> Self {
+        Self {
+            legacy_replay: self.legacy_replay,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn pending(&self) -> &[String] {
         &self.pending
     }
@@ -813,6 +822,8 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     // reach all of them or a dangling call survives in provider context.
     let mut call_locations = HashMap::<String, Vec<usize>>::new();
     let mut tracker = ToolCallTracker::default();
+    // Calls whose result could not be placed in valid provider order.
+    let mut unanswered = HashSet::<String>::new();
 
     for record in selected {
         match &record.event {
@@ -864,6 +875,15 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                 is_error,
                 ..
             } => {
+                // A result is only provider-valid directly after the
+                // assistant message holding its call (or sibling results).
+                // Legacy logs can hold a late result after a user message;
+                // drop it and the call it answers rather than emit that.
+                if !result_follows_its_call(&messages, &call_locations, tool_call_id) {
+                    unanswered.insert(tool_call_id.clone());
+                    tracker.record(&record.event);
+                    continue;
+                }
                 messages.push(Message::tool_result(
                     tool_call_id.clone(),
                     content.clone(),
@@ -889,7 +909,7 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     // assistant's ordinary text/reasoning, but remove only those calls.  This
     // guarantees the next provider request is structurally valid.
     for (id, indexes) in call_locations {
-        if tracker.is_completed(&id) {
+        if tracker.is_completed(&id) && !unanswered.contains(&id) {
             continue;
         }
         for index in indexes {
@@ -900,6 +920,23 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     }
     messages.retain(|message| !message.content.is_empty());
     messages
+}
+
+/// True when the trailing run of tool-result messages in `messages` follows
+/// the assistant message that carries `call_id`.
+fn result_follows_its_call(
+    messages: &[Message],
+    call_locations: &HashMap<String, Vec<usize>>,
+    call_id: &str,
+) -> bool {
+    let run_start = messages
+        .iter()
+        .rposition(|message| message.role != Role::Tool)
+        .map_or(0, |index| index + 1);
+    run_start > 0
+        && call_locations
+            .get(call_id)
+            .is_some_and(|locations| locations.contains(&(run_start - 1)))
 }
 
 /// Find the most recent compaction summary and the sequence boundary it
@@ -1003,7 +1040,12 @@ fn validate_events_with(events: &[SessionEventRecord], mut tracker: ToolCallTrac
         } = &record.event
         {
             compaction_boundary = Some(*compacted_through);
-            validate_compaction_boundary(events, *compacted_through, record.sequence)?;
+            validate_compaction_boundary(
+                events,
+                *compacted_through,
+                record.sequence,
+                tracker.replay_mode(),
+            )?;
         }
         tracker.record(&record.event);
     }
@@ -1032,7 +1074,12 @@ pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord
     {
         let mut events = session.events.clone();
         events.push(record.clone());
-        validate_compaction_boundary(&events, *compacted_through, record.sequence)?;
+        validate_compaction_boundary(
+            &events,
+            *compacted_through,
+            record.sequence,
+            ToolCallTracker::default(),
+        )?;
     }
     Ok(())
 }
@@ -1069,7 +1116,12 @@ pub(crate) fn validate_event_suffix(
             boundary = Some(*compacted_through);
             let mut events = session.events.clone();
             events.extend(records.iter().cloned());
-            validate_compaction_boundary(&events, *compacted_through, record.sequence)?;
+            validate_compaction_boundary(
+                &events,
+                *compacted_through,
+                record.sequence,
+                ToolCallTracker::default(),
+            )?;
         }
         tracker.record(&record.event);
         expected = expected.saturating_add(1);
@@ -1293,6 +1345,7 @@ fn validate_compaction_boundary(
     events: &[SessionEventRecord],
     boundary: u64,
     summary_sequence: u64,
+    mut tracker: ToolCallTracker,
 ) -> Result<()> {
     if boundary > 0 && !events.iter().any(|record| record.sequence == boundary) {
         return Err(SessionError::InvalidEvent(format!(
@@ -1300,7 +1353,6 @@ fn validate_compaction_boundary(
         )));
     }
 
-    let mut tracker = ToolCallTracker::default();
     for record in events {
         if record.sequence > boundary {
             break;
@@ -2090,6 +2142,124 @@ mod tests {
         let encoded = crate::codec::encode_session(&session).unwrap();
         let decoded = crate::codec::decode_session(&encoded, "<memory>").unwrap();
         assert_eq!(decoded.events, session.events);
+    }
+
+    /// Legacy shape: user, call A, Error, user, result A, assistant, then a
+    /// summary whose boundary covers everything before it.
+    fn legacy_late_result_log_with_summary() -> Session {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        for event in [
+            SessionEvent::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "late".into(),
+                is_error: false,
+                tool_name: Some("read".into()),
+            },
+            SessionEvent::AssistantMessage {
+                message: StoredMessage::from_llm(&Message::assistant(vec![Content::Text(
+                    "ok".into(),
+                )])),
+            },
+        ] {
+            let sequence = session.events.last().unwrap().sequence + 1;
+            session.events.push(SessionEventRecord {
+                id: EventId::new(),
+                sequence,
+                timestamp: now_timestamp(),
+                event,
+            });
+        }
+        let boundary = session.events.last().unwrap().sequence;
+        let sequence = boundary + 1;
+        session.events.push(SessionEventRecord {
+            id: EventId::new(),
+            sequence,
+            timestamp: now_timestamp(),
+            event: SessionEvent::CompactionSummary {
+                summary: "s".into(),
+                compacted_through: boundary,
+            },
+        });
+        session
+    }
+
+    #[test]
+    fn legacy_late_result_log_with_later_compaction_still_decodes() {
+        let session = legacy_late_result_log_with_summary();
+        let encoded = crate::codec::encode_session(&session).unwrap();
+        let decoded = crate::codec::decode_session(&encoded, "<memory>").unwrap();
+        assert_eq!(decoded.events, session.events);
+    }
+
+    #[test]
+    fn legacy_late_result_boundary_inside_the_tail_uses_the_legacy_rule() {
+        // Boundary after the user message but before the late result: the
+        // legacy rule sees call-1 still pending and must reject it, the
+        // strict rule rejects the orphan result; either way it is invalid.
+        let mut session = legacy_late_result_log_with_summary();
+        let SessionEvent::CompactionSummary {
+            compacted_through, ..
+        } = &mut session.events.last_mut().unwrap().event
+        else {
+            unreachable!()
+        };
+        *compacted_through = 4;
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn context_messages_for_legacy_late_result_has_valid_role_order() {
+        // Without the summary: user, call, Error, user, late result, assistant.
+        let mut session = legacy_late_result_log_with_summary();
+        session.events.pop();
+        let messages = context_messages(&session.events);
+        assert_valid_tool_order(&messages);
+        assert!(
+            messages.iter().all(|m| m
+                .content
+                .iter()
+                .all(|c| !matches!(c, Content::ToolCall(_) | Content::ToolResult { .. }))),
+            "orphan call/result pair must be dropped: {messages:?}"
+        );
+        // With the summary the live tail is the same events.
+        let with_summary = legacy_late_result_log_with_summary();
+        assert_valid_tool_order(&context_messages(&with_summary.events));
+    }
+
+    fn assert_valid_tool_order(messages: &[Message]) {
+        let mut open: Vec<String> = Vec::new();
+        for message in messages {
+            match message.role {
+                Role::Tool => {
+                    for content in &message.content {
+                        let Content::ToolResult { tool_call_id, .. } = content else {
+                            continue;
+                        };
+                        let index = open
+                            .iter()
+                            .position(|id| id == tool_call_id)
+                            .unwrap_or_else(|| panic!("orphan result {tool_call_id}"));
+                        open.remove(index);
+                    }
+                }
+                _ => {
+                    assert!(
+                        open.is_empty(),
+                        "calls {open:?} unanswered before next message"
+                    );
+                    if message.role == Role::Assistant {
+                        open.extend(message.content.iter().filter_map(|c| match c {
+                            Content::ToolCall(call) => Some(call.id.clone()),
+                            _ => None,
+                        }));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
