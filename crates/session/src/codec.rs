@@ -668,6 +668,24 @@ mod tests {
     }
 
     #[test]
+    fn invalid_utf8_crash_tail_keeps_the_last_records_newline() {
+        let mut session = Session::new(SessionMetadata::new("/tmp/project", None, None));
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("hello")),
+        });
+        let encoded = encode_session(&session).unwrap();
+        let mut bytes = encoded.clone().into_bytes();
+        // A multi-byte sequence cut off mid-character after the final newline.
+        bytes.extend_from_slice(b"{\"x\":\"\xE2\x82");
+        let (decoded, recovery) = decode_session_file_bytes(&bytes, "<memory>").unwrap();
+        assert!(recovery.is_recovered());
+        assert_eq!(recovery.valid_bytes(), encoded.len());
+        assert_eq!(&bytes[..recovery.valid_bytes()], encoded.as_bytes());
+        assert_eq!(bytes[recovery.valid_bytes() - 1], b'\n');
+        assert_eq!(decoded.events, session.events);
+    }
+
+    #[test]
     fn canonical_round_trip_keeps_unknown_events() {
         let mut session = Session::new(SessionMetadata::new(
             "/tmp/project",
