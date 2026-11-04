@@ -61,6 +61,16 @@ fn snippet(code: &str) -> Value {
 }
 
 #[tokio::test]
+async fn nested_entry_point_is_rejected_outside_a_running_workflow() {
+    let (registry, calls) = registry("echo");
+    let (output, _) = registry
+        .execute_codemode_tool("echo", json!({"a": 1}), CancellationToken::new())
+        .await;
+    assert!(output.is_error);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn structured_dependent_calls_preserve_names_and_hold_gate_once() {
     let (mut registry, calls) = registry("mcp__server__tool-with-dashes");
     let gate = Arc::new(tokio::sync::Mutex::new(()));

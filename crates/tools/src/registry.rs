@@ -37,6 +37,9 @@ pub struct ToolRegistry {
     file_search_index: Option<Arc<super::FileSearchIndex>>,
     execution_gate: Option<ToolExecutionGate>,
     codemode: Option<super::codemode::Codemode>,
+    /// Number of `execute_codemode` workflows currently owning the gate;
+    /// nested ungated calls are only admitted while this is non-zero.
+    codemode_active: std::sync::atomic::AtomicUsize,
 }
 
 impl ToolRegistry {
@@ -63,6 +66,7 @@ impl ToolRegistry {
             file_search_index: None,
             execution_gate: None,
             codemode: None,
+            codemode_active: std::sync::atomic::AtomicUsize::new(0),
         };
         for tool in tools {
             registry.register(tool)?;
@@ -204,7 +208,8 @@ impl ToolRegistry {
 
     /// Execute a selected nested tool without reacquiring the workflow gate.
     /// Only call from a codemode executor while `execute_codemode` owns the
-    /// workflow. This entry point never admits shell or recursive code calls.
+    /// workflow; outside a running workflow it is rejected, so it cannot be
+    /// used to bypass the execution gate. This entry point never admits shell or recursive code calls.
     pub async fn execute_codemode_tool(
         &self,
         name: &str,
@@ -212,6 +217,10 @@ impl ToolRegistry {
         cancel: CancellationToken,
     ) -> (ToolOutput, Option<Value>) {
         if !cancel.is_cancelled()
+            && self
+                .codemode_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
             && self.hidden_by_codemode(name)
             && let Some(tool) = self.tools.iter().find(|tool| tool.name == name)
         {
@@ -259,6 +268,16 @@ impl ToolRegistry {
         if cancel.is_cancelled() {
             return denied();
         }
+        // Admit nested ungated calls only while this workflow owns the gate.
+        struct Active<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Active<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        self.codemode_active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let _active = Active(&self.codemode_active);
         mode.execute(args, cancel, executor).await
     }
 
