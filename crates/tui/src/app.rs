@@ -2584,18 +2584,22 @@ impl CrossTerm {
     /// into scrollback instead, where the terminal scrolls it, rather than
     /// clipping or paging it.
     fn commit_oversized_ask(&mut self, input_rows: usize, running_rows: usize) {
-        if self.ask_answer.is_none() {
-            return;
+        if let Some(text) = self.take_oversized_ask(input_rows, running_rows) {
+            self.pending.push(Entry::Notice { text });
         }
+    }
+
+    /// Remove and return the answer (sanitized) when it no longer fits.
+    fn take_oversized_ask(&mut self, input_rows: usize, running_rows: usize) -> Option<String> {
+        self.ask_answer.as_ref()?;
         let budget = self.ask_budget(input_rows, running_rows);
         let rows = self.ask_lines(render::content_width(self.width)).len();
-        if rows > budget
-            && let Some(text) = self.ask_answer.take()
-        {
-            self.pending.push(Entry::Notice {
-                text: render::sanitize_terminal_text(&text),
-            });
+        if rows <= budget {
+            return None;
         }
+        self.ask_answer
+            .take()
+            .map(|text| render::sanitize_terminal_text(&text))
     }
 
     /// Rendered rows of the in-flight assistant message (reasoning block,
@@ -2729,8 +2733,16 @@ impl CrossTerm {
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
-        let build = self.stage_full_repaint();
-        self.write_frame(build, true)
+        let (build, oversized) = self.stage_full_repaint();
+        self.write_frame(build, true)?;
+        // The clipped history repaint above cannot show a newly oversized
+        // answer, so print it the normal incremental way afterwards: it then
+        // reaches scrollback in full, above the live region.
+        if let Some(text) = oversized {
+            self.pending.push(Entry::Notice { text });
+            self.paint()?;
+        }
+        Ok(())
     }
 
     /// Prepare a full repaint. A stream prefix committed here must reach the
@@ -2738,13 +2750,17 @@ impl CrossTerm {
     /// `transcript`, and the frame bookkeeping then moves `pending` into it
     /// without printing, so a prefix committed after the move was lost from
     /// the screen on resize or Ctrl+O.
-    fn stage_full_repaint(&mut self) -> RegionBuild {
+    ///
+    /// An answer that no longer fits is returned (and removed from the live
+    /// region) rather than queued: queuing it here would move it into the
+    /// transcript unprinted, and the clipped repaint would drop its head.
+    fn stage_full_repaint(&mut self) -> (RegionBuild, Option<String>) {
         let input = self.input_layout();
         let running = self.running_region();
         self.commit_stream_prefix_with_running(input.rows.len(), running.rows);
-        self.commit_oversized_ask(input.rows.len(), running.rows);
         commit_to_transcript(&mut self.transcript, &mut self.pending);
-        self.build_region_with_running(&input, running)
+        let oversized = self.take_oversized_ask(input.rows.len(), running.rows);
+        (self.build_region_with_running(&input, running), oversized)
     }
 
     /// Emit one frame. In incremental mode the frame is [pending entries] +
@@ -4545,6 +4561,25 @@ mod tests {
     }
 
     #[test]
+    fn full_repaint_defers_a_newly_oversized_answer_instead_of_dropping_it() {
+        let mut ui = ui(80, 24);
+        let answer = (0..14)
+            .map(|row| format!("line {row}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.apply_event(UiEvent::AskAnswer(answer));
+        // The terminal shrinks so the visible answer no longer fits.
+        ui.height = 8;
+        let (build, oversized) = ui.stage_full_repaint();
+        assert!(build.rows.len() <= 8);
+        let text = oversized.expect("answer is handed back for incremental printing");
+        assert!(text.contains("line 0") && text.contains("line 13"));
+        // It must not have been moved into the transcript unprinted.
+        assert!(!format!("{:?}", ui.transcript).contains("line 0"));
+        assert!(ui.ask_answer.is_none());
+    }
+
+    #[test]
     fn ask_answer_taller_than_the_screen_flows_into_scrollback() {
         let mut ui = ui(40, 8);
         let answer = (0..30)
@@ -5652,7 +5687,7 @@ mod tests {
             markdown: tall.clone() + &"second ".repeat(30),
             ..StreamState::default()
         });
-        let _build = ui.stage_full_repaint();
+        let (_build, _oversized) = ui.stage_full_repaint();
         assert!(ui.pending.is_empty());
         let prefixes = ui
             .transcript
