@@ -717,6 +717,13 @@ impl ToolCallIds {
     fn finish(&mut self, call_id: &str) -> Option<ToolCallId> {
         self.in_flight.remove(call_id)
     }
+
+    /// Every call of a turn has ended when the turn does (the agent closes
+    /// cancelled and nested calls itself); drop leftovers so a misbehaving
+    /// turn cannot grow the map for the life of the session.
+    fn end_turn(&mut self) {
+        self.in_flight.clear();
+    }
 }
 
 /// Translate one agent event into at most one ACP session update. Events
@@ -1615,6 +1622,9 @@ async fn forward_events(
         } else {
             translate_event(&event, &mut ids, 0)
         };
+        if matches!(event, AgentEvent::TurnFinished) {
+            ids.end_turn();
+        }
         if let Some(update) = update {
             let notification =
                 SessionNotification::new(SessionId::from(acp_session_id.clone()), update);
@@ -2308,6 +2318,14 @@ done
         deleting.join().unwrap().unwrap();
         assert!(!path.exists());
         assert!(lock_path.exists(), "sidecar inode must be retained");
+    }
+
+    #[test]
+    fn turn_end_drops_unfinished_tool_call_ids() {
+        let mut ids = ToolCallIds::default();
+        ids.start("call-1", "read", "read file");
+        ids.end_turn();
+        assert!(ids.finish("call-1").is_none());
     }
 
     #[test]
