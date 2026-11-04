@@ -1,7 +1,7 @@
 use super::persistence::{ui_snapshot_entries, usage_event};
 use super::{
-    Agent, AgentEvent, AgentSessionState, CompactionReason, InputMessage, SessionListItem,
-    TurnControl, TurnError, send,
+    Agent, AgentEvent, AgentSessionState, CompactionReason, ContextWindow, InputMessage,
+    ModelMetadata, SessionListItem, TurnControl, TurnError, send,
 };
 use llm::Provider;
 use session::{ExportOptions, Session, SessionCreateOptions, export_jsonl, snapshot_entries};
@@ -513,6 +513,10 @@ impl Agent {
                 .expect("staged model change requires a session")
                 .session = staged;
         }
+        // A window learned from overflow belongs to the selection that
+        // produced it; re-selecting the identical provider/model keeps it.
+        let same_selection = self.provider.name() == provider.name() && self.model == model;
+        self.model_generation += 1;
         self.provider = provider;
         self.model = model.clone();
         // Future subagents must follow the parent's active selection; running
@@ -538,15 +542,19 @@ impl Agent {
         // is fetched in the background so a slow catalogue cannot block the
         // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
-        self.context_window = self
-            .compaction
-            .resolved_window(self.provider.context_window_hint().unwrap_or(0));
+        if !(same_selection && matches!(self.context_window, ContextWindow::Learned(_))) {
+            self.context_window = ContextWindow::Metadata(
+                self.compaction
+                    .resolved_window(self.provider.context_window_hint().unwrap_or(0)),
+            );
+        }
         self.publish_context_window();
         send(events, self.context_usage_event());
         if let Some(metadata_tx) = &self.model_metadata_tx {
             spawn_model_metadata(
                 metadata_tx.clone(),
                 self.provider.clone(),
+                self.model_generation,
                 canonical,
                 self.model.clone(),
                 self.cancel.clone(),
@@ -787,15 +795,16 @@ async fn fetch_model_catalogue(
 }
 
 pub(crate) fn spawn_model_metadata(
-    sender: mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>,
+    sender: mpsc::UnboundedSender<ModelMetadata>,
     provider: Arc<dyn Provider>,
+    generation: u64,
     provider_name: String,
     model: String,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
         if let Some(models) = fetch_model_catalogue(provider, &cancel).await {
-            let _ = sender.send((provider_name, model, models));
+            let _ = sender.send((generation, provider_name, model, models));
         }
     });
 }

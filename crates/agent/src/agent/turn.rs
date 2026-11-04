@@ -154,8 +154,8 @@ impl Agent {
         // threaded through the percent notice and `compact_and_reload` so
         // one pre-turn scans the live range a single time (PERF-1).
         if let Some(context) = self.should_auto_compact(&user_text) {
-            let percent = if self.context_window > 0 {
-                ((context as f64 / self.context_window as f64) * 100.0) as u32
+            let percent = if self.context_window.tokens() > 0 {
+                ((context as f64 / self.context_window.tokens() as f64) * 100.0) as u32
             } else {
                 0
             };

@@ -115,8 +115,14 @@ pub struct Agent {
     /// switch, when the estimator takes over.
     last_context_tokens: Option<u64>,
     /// Resolved provider context window (config override → model-reported
-    /// `context_length` → generous default).
-    context_window: u64,
+    /// `context_length` → generous default), tagged with where it came from
+    /// so a window learned from an overflow error is not clobbered.
+    context_window: ContextWindow,
+    /// Bumped on every model change. Background metadata responses carry the
+    /// generation they were requested for, so a late response for an earlier
+    /// selection is ignored even when the model name is selected again
+    /// (A → B → A).
+    model_generation: u64,
     /// Token-aware compaction policy.
     compaction: CompactionPolicy,
     /// Rendered project-context block (AGENTS.md / CLAUDE.md), loaded once at
@@ -133,7 +139,7 @@ pub struct Agent {
     /// Channel used by background model metadata requests. Keeping the sender
     /// on the agent lets model changes remain non-blocking while the run loop
     /// applies ready results at every operation boundary.
-    model_metadata_tx: Option<mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>>,
+    model_metadata_tx: Option<mpsc::UnboundedSender<ModelMetadata>>,
     /// One-shot planning-to-implementation model handoff.
     prewalk: PrewalkState,
 }
@@ -198,6 +204,33 @@ impl TurnInput {
     }
 }
 
+/// A background model-catalogue result: `(generation, provider, model, models)`.
+type ModelMetadata = (u64, String, String, Vec<llm::ModelInfo>);
+
+/// Context window plus its provenance. `Unknown` replaces a zero sentinel;
+/// `Learned` (from a provider overflow error) is the most trustworthy value
+/// for the current model selection and must not be replaced by catalogue
+/// metadata that arrives later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextWindow {
+    /// Not resolved yet (before `run` or `with_compaction`).
+    Unknown,
+    /// Config override, catalogue `context_length`, provider hint, or default.
+    Metadata(u64),
+    /// Bound parsed from a context-overflow rejection.
+    Learned(u64),
+}
+
+impl ContextWindow {
+    /// Token count, or 0 while unknown (callers treat 0 as "no bound").
+    fn tokens(self) -> u64 {
+        match self {
+            Self::Unknown => 0,
+            Self::Metadata(tokens) | Self::Learned(tokens) => tokens,
+        }
+    }
+}
+
 /// How an isolated `/ask` request ended. A bool conflated "finished" with
 /// "interrupted" and "application shutdown"; only shutdown stops the loop.
 enum AskOutcome {
@@ -232,7 +265,8 @@ impl Agent {
             input: TurnInput::default(),
             ephemeral_notes: Vec::new(),
             last_context_tokens: None,
-            context_window: 0,
+            context_window: ContextWindow::Unknown,
+            model_generation: 0,
             compaction: CompactionPolicy::default(),
             project_context: String::new(),
             subagent_limits: SubagentLimits::default(),
@@ -287,8 +321,9 @@ impl Agent {
 
     /// Attach a compaction policy (resolved from `config.toml`).
     pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
-        self.context_window =
-            policy.resolved_window(self.provider.context_window_hint().unwrap_or(0));
+        self.context_window = ContextWindow::Metadata(
+            policy.resolved_window(self.provider.context_window_hint().unwrap_or(0)),
+        );
         self.compaction = policy;
         self
     }
@@ -474,10 +509,11 @@ impl Agent {
         // Tests and embedded callers may update the policy directly instead
         // of using the builder; establish the generous/configured value
         // synchronously, without provider I/O.
-        if self.context_window == 0 {
-            self.context_window = self
-                .compaction
-                .resolved_window(self.provider.context_window_hint().unwrap_or(0));
+        if self.context_window == ContextWindow::Unknown {
+            self.context_window = ContextWindow::Metadata(
+                self.compaction
+                    .resolved_window(self.provider.context_window_hint().unwrap_or(0)),
+            );
             self.publish_context_window();
         }
         send(&events, self.context_usage_event());
@@ -495,6 +531,7 @@ impl Agent {
         spawn_model_metadata(
             metadata_tx,
             self.provider.clone(),
+            self.model_generation,
             self.secret_masker.mask_text(self.provider.name()),
             self.model.clone(),
             self.cancel.clone(),
@@ -504,8 +541,8 @@ impl Agent {
             // Apply every result that is already ready before selecting the
             // next queued operation. Otherwise a busy queued-turn stream can
             // starve startup metadata indefinitely.
-            while let Ok((provider, model, models)) = metadata_rx.try_recv() {
-                self.apply_model_metadata(provider, model, models, &events);
+            while let Ok((generation, provider, model, models)) = metadata_rx.try_recv() {
+                self.apply_model_metadata(generation, provider, model, models, &events);
             }
             let next_message = if let Some(message) = self.input.queued.pop_front() {
                 Some(message)
@@ -519,8 +556,8 @@ impl Agent {
                         }
                         message
                     }
-                    Some((provider, model, models)) = metadata_rx.recv() => {
-                        self.apply_model_metadata(provider, model, models, &events);
+                    Some((generation, provider, model, models)) = metadata_rx.recv() => {
+                        self.apply_model_metadata(generation, provider, model, models, &events);
                         continue;
                     }
                     _ = self.cancel.cancelled() => None,
@@ -4712,7 +4749,7 @@ mod tests {
         .with_subagent_runner(runner.clone())
         .with_session(store.clone(), session)
         .unwrap();
-        agent.context_window = 77_777;
+        agent.context_window = ContextWindow::Metadata(77_777);
         agent.last_context_tokens = Some(123);
         agent.model_metadata_tx = Some(metadata_tx);
         let before_session = agent.session.as_ref().unwrap().session.clone();
@@ -4727,7 +4764,7 @@ mod tests {
         assert!(Arc::ptr_eq(&agent.provider, &old_provider));
         assert_eq!(agent.model, "old-model");
         assert_eq!(runner.model_for_test(), "old-model");
-        assert_eq!(agent.context_window, 77_777);
+        assert_eq!(agent.context_window, ContextWindow::Metadata(77_777));
         assert_eq!(agent.last_context_tokens, Some(123));
         assert_eq!(
             agent.session.as_ref().unwrap().session,
