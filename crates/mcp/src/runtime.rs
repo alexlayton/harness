@@ -1555,7 +1555,6 @@ done
         /// outlived the leader and return the transport error.
         #[tokio::test]
         async fn failed_transport_close_still_sweeps_process_group() {
-            use std::os::unix::process::CommandExt as _;
             let mut command = tokio::process::Command::new("/bin/sh");
             command
                 .arg("-c")
