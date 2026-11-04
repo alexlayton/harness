@@ -500,6 +500,15 @@ impl Codemode {
                         };
                         let name = call.function_name.clone();
                         let call_id = call.call_id.to_string();
+                        // The host may persist the start and then lose the
+                        // acknowledgement (cancel/admission race), so the
+                        // audit entry must exist before the record attempt to
+                        // stay a superset of the durable log. Its text claims
+                        // nothing beyond "unknown" until a result is recorded.
+                        audit.push(format!(
+                            "{}: {name} — execution status unknown",
+                            audit.len() + 1
+                        ));
                         executor
                             .record(CodemodeEvent::Started {
                                 call_id: call_id.clone(),
@@ -512,10 +521,6 @@ impl Codemode {
                         if cancel.is_cancelled() {
                             return Err("cancelled before nested tool execution".into());
                         }
-                        audit.push(format!(
-                            "{}: {name} — execution status unknown",
-                            audit.len() + 1
-                        ));
                         let (mut output, structured) =
                             executor.call(&name, arguments, cancel.child_token()).await;
                         if output.content.len() > MAX_VALUE_BYTES {
@@ -563,8 +568,7 @@ impl Codemode {
                         } else {
                             "returned"
                         };
-                        *audit.last_mut().expect("admitted call") =
-                            format!("{}: {name} — {status}", audit.len());
+                        let finished = format!("{}: {name} — {status}", audit.len());
                         executor
                             .record(CodemodeEvent::Finished {
                                 call_id,
@@ -572,6 +576,10 @@ impl Codemode {
                                 output,
                             })
                             .await?;
+                        // Only claim a result once it is durable; if the
+                        // record above fails the log has no result for this
+                        // call, so the entry stays "execution status unknown".
+                        *audit.last_mut().expect("admitted call") = finished;
                         step(printed, move |print| call.resume(result, print)).await?
                     }
                 }

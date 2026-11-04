@@ -509,3 +509,74 @@ async fn describe_returns_schemas_beyond_tool_result_limits() {
         output.content
     );
 }
+
+/// Records events like the durable log and can refuse selected acknowledgements.
+struct LogExecutor {
+    log: Mutex<Vec<&'static str>>,
+    fail_started: bool,
+    fail_finished: bool,
+}
+
+#[async_trait]
+impl CodemodeExecutor for LogExecutor {
+    async fn call(
+        &self,
+        _name: &str,
+        args: Value,
+        _cancel: CancellationToken,
+    ) -> (ToolOutput, Option<Value>) {
+        (
+            ToolOutput {
+                content: args.to_string(),
+                summary: "echo".into(),
+                is_error: false,
+            },
+            None,
+        )
+    }
+
+    async fn record(&self, event: CodemodeEvent) -> Result<(), String> {
+        // The event is durable even when its acknowledgement is lost.
+        let (kind, fail) = match event {
+            CodemodeEvent::Started { .. } => ("started", self.fail_started),
+            CodemodeEvent::Finished { .. } => ("finished", self.fail_finished),
+        };
+        self.log.lock().unwrap().push(kind);
+        if fail { Err("ack lost".into()) } else { Ok(()) }
+    }
+}
+
+#[tokio::test]
+async fn audit_never_outruns_or_lags_the_recorded_nested_events() {
+    let (registry, _) = registry("echo");
+    for (fail_started, fail_finished) in [(false, true), (true, false)] {
+        let executor = LogExecutor {
+            log: Mutex::new(Vec::new()),
+            fail_started,
+            fail_finished,
+        };
+        let output = registry
+            .execute_codemode(
+                snippet("tools['echo'](value=1)"),
+                CancellationToken::new(),
+                &executor,
+            )
+            .await;
+        assert!(output.is_error);
+        let log = executor.log.lock().unwrap().clone();
+        // One durable start, so the audit must report exactly one started call.
+        assert!(
+            output.content.starts_with("1 nested tool call(s) started"),
+            "{}",
+            output.content
+        );
+        // With no durable result the audit must not claim one.
+        assert!(
+            output
+                .content
+                .contains("1: echo — execution status unknown"),
+            "{log:?} {}",
+            output.content
+        );
+    }
+}
