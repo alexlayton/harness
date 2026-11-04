@@ -513,6 +513,11 @@ impl Agent {
             // otherwise an interrupted `edit` leaves prewalk armed and the
             // next prompt plans again on the planning model.
             if handoff {
+                // Provider switching persists a model-change event; never
+                // start that once the application is shutting down.
+                if self.cancel.is_cancelled() {
+                    return Err(TurnError::Shutdown);
+                }
                 self.prewalk_handoff(events).await?;
             }
             if cancel.is_cancelled() {

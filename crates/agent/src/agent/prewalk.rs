@@ -645,4 +645,81 @@ mod tests {
         agent.handle_set_reasoning("off".into(), &events);
         assert!(agent.prewalk.restore.is_none());
     }
+    /// An `edit` tool that shuts the application down while it runs.
+    struct ShutdownEdit(CancellationToken);
+
+    #[async_trait]
+    impl tools::Tool for ShutdownEdit {
+        fn spec(&self) -> tools::ToolSpec {
+            tools::ToolSpec {
+                definition: llm::ToolDefinition {
+                    name: "edit".into(),
+                    description: "probe".into(),
+                    parameters: json!({"type": "object"}),
+                },
+                prompt: tools::ToolPrompt::default(),
+            }
+        }
+
+        fn concurrency(&self, _args: &serde_json::Value) -> tools::Concurrency {
+            tools::Concurrency::Exclusive
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+            _cancel: CancellationToken,
+        ) -> tools::ToolOutput {
+            self.0.cancel();
+            tools::ToolOutput {
+                content: "done".into(),
+                is_error: false,
+                summary: "edit".into(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_handoff_switch_is_persisted_during_application_shutdown() {
+        let done = StreamEvent::Done {
+            stop_reason: None,
+            usage: None,
+        };
+        let provider = Arc::new(Recorder {
+            calls: AtomicUsize::new(0),
+            scripts: vec![vec![call("e", "edit"), done]],
+            seen: Mutex::new(Vec::new()),
+        });
+        let app = CancellationToken::new();
+        let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        input_tx
+            .send(InputMessage::Message("change it".into()))
+            .unwrap();
+        drop(input_tx);
+        Agent::new(
+            provider.clone(),
+            ToolRegistry::new(vec![Box::new(ShutdownEdit(app.clone()))]),
+            "planner",
+            app,
+        )
+        .with_prewalk(PrewalkSettings {
+            enabled: true,
+            target: Some(PrewalkTarget {
+                provider: None,
+                model: "cheap".into(),
+            }),
+            armed: true,
+            reasoning: None,
+        })
+        .run(input_rx, event_tx)
+        .await;
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(
+                !matches!(event, AgentEvent::PrewalkHandoff { .. }),
+                "handoff must not run during shutdown"
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
 }

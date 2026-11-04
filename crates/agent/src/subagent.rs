@@ -1313,6 +1313,71 @@ mod tests {
     }
 
     #[test]
+    fn trimmed_history_never_orphans_a_tool_result() {
+        let registry = ToolRegistry::empty();
+        for budget in [1, 2_000, 6_000, 12_000] {
+            let mut history = vec![Message::user("task")];
+            for index in 0..6 {
+                // Two parallel calls per exchange, plus a request note.
+                history.push(Message::assistant(vec![
+                    Content::ToolCall(llm::ToolCall {
+                        id: format!("a{index}"),
+                        name: "missing".into(),
+                        arguments: json!({}),
+                    }),
+                    Content::ToolCall(llm::ToolCall {
+                        id: format!("b{index}"),
+                        name: "missing".into(),
+                        arguments: json!({}),
+                    }),
+                ]));
+                history.push(Message::tool_result(
+                    format!("a{index}"),
+                    "x".repeat(8_000),
+                    false,
+                ));
+                history.push(Message::tool_result(
+                    format!("b{index}"),
+                    "y".repeat(8_000),
+                    false,
+                ));
+                if index % 2 == 0 {
+                    history.push(Message::user("[system note: continue]"));
+                }
+            }
+            bound_child_history(&mut history, "system", &registry, budget);
+            assert_eq!(history[0].role, Role::User);
+            assert_eq!(history[1].role, Role::Assistant, "budget {budget}");
+            let mut open_calls: Vec<String> = Vec::new();
+            for message in &history[1..] {
+                match message.role {
+                    Role::Assistant => {
+                        open_calls = message
+                            .content
+                            .iter()
+                            .filter_map(|content| match content {
+                                Content::ToolCall(call) => Some(call.id.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                    }
+                    Role::Tool => {
+                        for content in &message.content {
+                            if let Content::ToolResult { tool_call_id, .. } = content {
+                                assert!(
+                                    open_calls.contains(tool_call_id),
+                                    "orphan {tool_call_id} at budget {budget}"
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    #[test]
     fn trimming_keeps_the_newest_exchange() {
         let registry = ToolRegistry::empty();
         let mut history = vec![Message::user("task")];
