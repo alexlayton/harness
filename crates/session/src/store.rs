@@ -193,7 +193,36 @@ pub struct SessionIndexEntry {
 /// future contenders continue to lock the same inode.
 #[derive(Debug)]
 pub struct SessionActiveLease {
-    file: Option<File>,
+    scope: LeaseScope,
+}
+
+/// What an active lease actually guards. The memory-only case is explicit
+/// rather than a `None` file, so a lease that guards nothing is never
+/// mistaken for one that holds a sidecar lock.
+#[derive(Debug)]
+enum LeaseScope {
+    /// The session has no backing file; there is nothing to lock.
+    MemoryOnly,
+    /// An exclusive lock on the sidecar for this session file.
+    File { lock: File, session_path: PathBuf },
+}
+
+impl SessionActiveLease {
+    /// Whether this lease holds a real file lock (false for a memory-only
+    /// session, which has no durable log to protect).
+    pub fn is_file_backed(&self) -> bool {
+        matches!(self.scope, LeaseScope::File { .. })
+    }
+
+    /// Whether this lease guards `session`: a file lease only guards the
+    /// file it locked; a memory-only lease only guards file-less sessions.
+    pub fn covers(&self, session: &Session) -> bool {
+        match (&self.scope, session.path()) {
+            (LeaseScope::MemoryOnly, None) => true,
+            (LeaseScope::File { session_path, .. }, Some(path)) => session_path == path,
+            _ => false,
+        }
+    }
 }
 
 /// Filesystem-backed session storage.  Sessions are grouped by a stable key
@@ -322,7 +351,9 @@ impl SessionStore {
     /// that was loaded earlier, use [`Self::acquire_active_and_reload`].
     pub fn acquire_active(&self, session: &Session) -> Result<SessionActiveLease> {
         let Some(session_path) = session.path() else {
-            return Ok(SessionActiveLease { file: None });
+            return Ok(SessionActiveLease {
+                scope: LeaseScope::MemoryOnly,
+            });
         };
         self.ensure_path_in_root(session_path)?;
         try_lock_active(session_path)
@@ -522,7 +553,7 @@ impl SessionStore {
         if !is_event_prefix(&session.events, &disk_session.events) {
             return Err(SessionError::HistoryDiverged(path.clone()));
         }
-        if recovery.recovered {
+        if recovery.is_recovered() {
             // Repair the incomplete crash tail before appending: truncate to
             // the last valid record so the fragment never becomes a
             // terminated corrupt line.  This keeps the session append-only
@@ -798,7 +829,12 @@ fn try_lock_active(session_path: &Path) -> Result<SessionActiveLease> {
     .map_err(|source| io_error("open active session lease", &path, source))?;
     secure_lock_file(&file, &path)?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
+        Ok(()) => Ok(SessionActiveLease {
+            scope: LeaseScope::File {
+                lock: file,
+                session_path: session_path.to_path_buf(),
+            },
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             Err(SessionError::AlreadyActive(session_path.to_path_buf()))
         }
@@ -902,7 +938,7 @@ fn load_session_file_for_append(path: &Path) -> Result<(Session, TailRecovery)> 
     let contents = read_file(path)?;
     let (mut session, recovery) = decode_session_file_bytes(&contents, path)?;
     session.path = Some(path.to_path_buf());
-    session.validated_bytes = recovery.valid_bytes;
+    session.validated_bytes = recovery.valid_bytes();
     session.file_identity = Some(file_identity(path)?);
     Ok((session, recovery))
 }
@@ -915,7 +951,7 @@ fn truncate_to_valid_tail(path: &Path, recovery: &TailRecovery) -> Result<()> {
         .write(true)
         .open(path)
         .map_err(|source| io_error("open session for repair", path, source))?;
-    file.set_len(recovery.valid_bytes as u64)
+    file.set_len(recovery.valid_bytes() as u64)
         .map_err(|source| io_error("truncate incomplete session tail", path, source))?;
     file.sync_all()
         .map_err(|source| io_error("sync repaired session", path, source))
@@ -1846,8 +1882,8 @@ impl Drop for SessionLock {
 
 impl Drop for SessionActiveLease {
     fn drop(&mut self) {
-        if let Some(file) = &self.file {
-            let _ = file.unlock();
+        if let LeaseScope::File { lock, .. } = &self.scope {
+            let _ = lock.unlock();
         }
     }
 }
@@ -3192,6 +3228,19 @@ mod tests {
         assert!(clone.sync_owed(&session), "failed sync keeps the debt");
         clone.sync_session(&session).unwrap();
         assert!(!store.sync_owed(&session), "success clears the debt");
+    }
+
+    #[test]
+    fn active_lease_scope_is_explicit() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let lease = store.acquire_active(&session).unwrap();
+        assert!(lease.is_file_backed());
+        assert!(lease.covers(&session));
+        let other = store.create(SessionCreateOptions::default()).unwrap();
+        assert!(!lease.covers(&other), "lease guards only its own file");
     }
 
     #[test]
