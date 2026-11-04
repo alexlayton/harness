@@ -36,6 +36,10 @@ where
     }
 
     let key = lock_key(path).await;
+    // Declared before `lock` so it drops after it (reverse order): the sweep
+    // then sees the released reference on every exit, including cancellation
+    // while waiting and the future being dropped.
+    let _sweep = SweepOnDrop;
     let lock = {
         let locks = FILE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
         // Poisoning is recoverable: the map is only ever mutated while the
@@ -56,15 +60,30 @@ where
         }
         _ = cancel.cancelled() => return None,
     };
-    drop(lock);
-
-    // The map otherwise keeps every path ever locked, growing without bound
-    // over long sessions.  A lock whose strong count is 1 (only the map holds
-    // it) is unreachable: lookups clone under the map mutex, so nobody can be
-    // waiting on it.  Sweeping after each operation bounds the map to paths
-    // with in-flight or queued edits.
-    sweep_unreferenced_file_locks();
     Some(result)
+}
+
+/// The map otherwise keeps every path ever locked, growing without bound
+/// over long sessions.  A lock whose strong count is 1 (only the map holds
+/// it) is unreachable: lookups clone under the map mutex, so nobody can be
+/// waiting on it.  Sweeping on every exit bounds the map to paths with
+/// in-flight or queued edits.
+struct SweepOnDrop;
+
+impl Drop for SweepOnDrop {
+    fn drop(&mut self) {
+        sweep_unreferenced_file_locks();
+    }
+}
+
+#[cfg(test)]
+fn has_file_lock(key: &Path) -> bool {
+    FILE_LOCKS.get().is_some_and(|locks| {
+        locks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(key)
+    })
 }
 
 /// Drop entries from [`FILE_LOCKS`] that no longer have any reference outside
@@ -252,13 +271,22 @@ async fn lock_key(path: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(path).await {
         return canonical;
     }
-    if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(path)
+    };
+    // A file that does not exist yet must map to the key it will have once
+    // created (and through symlinked parent directories), so canonicalize the
+    // parent and re-attach the file name.
+    if let (Some(parent), Some(name)) = (absolute.parent(), absolute.file_name())
+        && let Ok(parent) = fs::canonicalize(parent).await
+    {
+        return parent.join(name);
     }
+    absolute
 }
 
 fn check_cancelled(cancel: &CancellationToken) -> io::Result<()> {
@@ -339,6 +367,56 @@ mod tests {
         let previous = rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
         rustix::process::umask(previous);
         previous.bits() as u32
+    }
+
+    #[tokio::test]
+    async fn lock_key_is_stable_for_new_files_and_symlinked_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let via_alias = lock_key(&alias.join("new.txt")).await;
+        let before = lock_key(&real.join("new.txt")).await;
+        std::fs::write(real.join("new.txt"), "x").unwrap();
+        let after = lock_key(&real.join("new.txt")).await;
+        assert_eq!(before, after);
+        assert_eq!(via_alias, after);
+    }
+
+    #[tokio::test]
+    async fn lock_map_is_swept_after_cancelled_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        let key = lock_key(&path).await;
+        let holder = CancellationToken::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let first = {
+            let path = path.clone();
+            tokio::spawn(async move {
+                with_file_mutation_lock(&path, &holder, || async {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                })
+                .await
+            })
+        };
+        entered_rx.await.unwrap();
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let waited = with_file_mutation_lock(&path, &cancel, || async {}).await;
+        assert!(waited.is_none());
+        // The holder still owns the entry; once it finishes, nothing may
+        // remain even though the cancelled waiter exited without success.
+        assert!(has_file_lock(&key));
+        release_tx.send(()).unwrap();
+        first.await.unwrap();
+        assert!(!has_file_lock(&key));
     }
 
     #[tokio::test]
