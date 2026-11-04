@@ -98,6 +98,30 @@ struct PromptTracker {
     in_flight: Mutex<HashMap<String, InFlight>>,
 }
 
+/// Why a prompt could not end with a stop reason.
+#[derive(Debug, PartialEq, Eq)]
+enum PromptFailure {
+    Agent(String),
+    AgentDied,
+}
+
+/// Decide a prompt's result. A cancel wins over a provider error (the user
+/// asked to stop), but only when the turn actually ended: if the agent task
+/// died (`stop_reason == None`) a late cancel must not hide that as a clean
+/// `Cancelled`.
+fn prompt_outcome(
+    cancelled: bool,
+    error: Option<String>,
+    stop_reason: Option<StopReason>,
+) -> Result<StopReason, PromptFailure> {
+    match (cancelled, error, stop_reason) {
+        (true, _, Some(_)) => Ok(StopReason::Cancelled),
+        (_, Some(error), _) => Err(PromptFailure::Agent(error)),
+        (_, None, Some(reason)) => Ok(reason),
+        (_, None, None) => Err(PromptFailure::AgentDied),
+    }
+}
+
 impl PromptTracker {
     /// Resolve the pending prompt for a session, if any, and answer the
     /// editor. Called by the forwarder on `TurnFinished` (with a stop reason)
@@ -107,15 +131,11 @@ impl PromptTracker {
         let Some(entry) = self.in_flight.lock().unwrap().remove(session_id) else {
             return;
         };
-        let response = if entry.cancelled {
-            Ok(PromptResponse::new(StopReason::Cancelled))
-        } else {
-            match (entry.error, stop_reason) {
-                (Some(error), _) => Err(AcError::internal_error().data(error)),
-                (None, Some(reason)) => Ok(PromptResponse::new(reason)),
-                (None, None) => Err(AcError::internal_error()
-                    .data("agent task ended before the turn completed".to_owned())),
-            }
+        let response = match prompt_outcome(entry.cancelled, entry.error, stop_reason) {
+            Ok(reason) => Ok(PromptResponse::new(reason)),
+            Err(PromptFailure::Agent(error)) => Err(AcError::internal_error().data(error)),
+            Err(PromptFailure::AgentDied) => Err(AcError::internal_error()
+                .data("agent task ended before the turn completed".to_owned())),
         };
         let _ = entry.responder.respond_with_result(response);
     }
@@ -2288,6 +2308,26 @@ done
         deleting.join().unwrap().unwrap();
         assert!(!path.exists());
         assert!(lock_path.exists(), "sidecar inode must be retained");
+    }
+
+    #[test]
+    fn agent_death_is_not_reported_as_a_clean_cancel() {
+        assert_eq!(
+            prompt_outcome(true, None, None),
+            Err(PromptFailure::AgentDied)
+        );
+        assert_eq!(
+            prompt_outcome(true, Some("boom".into()), Some(StopReason::EndTurn)),
+            Ok(StopReason::Cancelled)
+        );
+        assert_eq!(
+            prompt_outcome(false, Some("boom".into()), Some(StopReason::EndTurn)),
+            Err(PromptFailure::Agent("boom".into()))
+        );
+        assert_eq!(
+            prompt_outcome(false, None, Some(StopReason::EndTurn)),
+            Ok(StopReason::EndTurn)
+        );
     }
 
     #[tokio::test]
