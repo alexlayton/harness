@@ -188,6 +188,7 @@ impl Tool for BashTool {
                 [
                     "Use bash for tests, builds, git, or when no dedicated tool applies. Use the available Monty tool for standalone Python calculations instead of launching Python with bash.".to_owned(),
                     "Use dir for commands in subdirectories instead of cd.".to_owned(),
+                    "Combine independent inspection commands (ls, git status, cat of several files) into one bash call instead of one call each.".to_owned(),
                 ],
             ),
         }

@@ -155,9 +155,12 @@ impl Tool for SubagentTool {
                 name: SUBAGENT_TOOL_NAME.to_owned(),
                 description: "Delegate a self-contained task to a fresh subagent that works \
                               autonomously with its own tools and context window, then returns \
-                              its final report. Use for parallelizable work across independent \
-                              scopes (per-crate sweeps, multi-file research) or to isolate a \
-                              large exploratory detour from this conversation."
+                              its final report. Use for broad, parallelizable work across \
+                              independent scopes (per-crate sweeps, multi-file research) or to \
+                              isolate a large exploratory detour from this conversation. The \
+                              subagent cannot see your context and re-reads everything it needs, \
+                              so do not delegate work you can finish in one or two direct tool \
+                              calls or that covers files already in your context."
                     .to_owned(),
                 parameters: json!({
                     "type": "object",
@@ -185,6 +188,7 @@ impl Tool for SubagentTool {
                 vec![
                     "Delegated prompts must include all relevant context, paths, constraints, and the expected result.",
                     "Prefer read_only subagents for independent breadth; use workspace only for delegated commands or mutations.",
+                    "Do not delegate what one or two direct calls can do or files already in your context; the parent waits while a subagent re-reads them.",
                 ],
             ),
         }
