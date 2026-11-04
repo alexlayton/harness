@@ -2068,6 +2068,8 @@ impl CrossTerm {
                 reasoning,
                 change,
             } => {
+                // Armed without a target cannot hand off; never show it armed.
+                let armed = armed && target.is_some();
                 let was_armed = std::mem::replace(&mut self.prewalk_armed, armed);
                 self.prewalk_target = target;
                 self.prewalk_reasoning = reasoning;
@@ -5683,6 +5685,18 @@ mod tests {
             ui.stream.as_ref().expect("stream remains").markdown,
             "short\n\nanswer"
         );
+    }
+
+    #[test]
+    fn prewalk_is_never_shown_armed_without_a_target() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::PrewalkChanged {
+            armed: true,
+            target: None,
+            reasoning: None,
+            change: PrewalkChange::Session,
+        });
+        assert!(!ui.prewalk_armed);
     }
 
     #[test]
