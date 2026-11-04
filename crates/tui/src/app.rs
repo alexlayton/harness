@@ -153,6 +153,18 @@ enum Entry {
     },
 }
 
+/// Lifecycle of an on-demand backend fetch. `Failed` is distinct from `Idle`
+/// so typed refreshes do not re-fire a failing request on every keystroke;
+/// only an explicit Tab retries it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Fetch {
+    #[default]
+    Idle,
+    InFlight,
+    Loaded,
+    Failed,
+}
+
 /// The in-flight assistant message. The stable markdown prefix is drained
 /// into `pending` (as [`Entry::Assistant`]) once it outgrows the live-tail
 /// budget, keeping long responses flowing into scrollback incrementally.
@@ -448,11 +460,12 @@ pub struct CrossTerm {
     /// Configured MCP server names for the header MCP row.
     mcp_servers: Vec<String>,
     update_notice: Option<String>,
-    session_completion_requested: bool,
+    /// Completion-driven `ListSessions` lifecycle.
+    session_fetch: Fetch,
     session_list_display_requested: bool,
-    /// Providers we have already asked the agent to fetch, to avoid duplicate
-    /// `ListModels` requests while typing through a model token.
-    model_list_requested: HashSet<String>,
+    /// Per-provider `ListModels` lifecycle, so typing through a model token
+    /// neither duplicates a request nor hammers a provider that failed.
+    model_fetch: HashMap<String, Fetch>,
     completion: Option<Completion>,
     path_completion_tx: mpsc::UnboundedSender<PathCompletionResult>,
     path_completion_rx: mpsc::UnboundedReceiver<PathCompletionResult>,
@@ -541,9 +554,9 @@ impl CrossTerm {
             context_files,
             mcp_servers,
             update_notice,
-            session_completion_requested: false,
+            session_fetch: Fetch::Idle,
             session_list_display_requested: false,
-            model_list_requested: HashSet::new(),
+            model_fetch: HashMap::new(),
             completion: None,
             path_completion_tx,
             path_completion_rx,
@@ -1023,7 +1036,7 @@ impl CrossTerm {
         // Recompute completion after any input mutation; refreshing at the
         // end of every handled key keeps the draft's ghost/hint in sync.
         self.refresh_completion();
-        self.request_typed_backend(input_tx)?;
+        self.request_typed_backend(input_tx, false)?;
         Ok(false)
     }
 
@@ -1125,7 +1138,7 @@ impl CrossTerm {
         ) else {
             self.cancel_path_completion();
             self.completion = None;
-            self.session_completion_requested = false;
+            self.session_fetch = Fetch::Idle;
             return;
         };
 
@@ -1196,7 +1209,7 @@ impl CrossTerm {
     fn close_completion(&mut self) {
         self.cancel_path_completion();
         self.completion = None;
-        self.session_completion_requested = false;
+        self.session_fetch = Fetch::Idle;
     }
 
     /// Apply a candidate to the draft, move the cursor, then recompute the
@@ -1217,7 +1230,7 @@ impl CrossTerm {
         if argument_less {
             return Ok(());
         }
-        self.request_backend(input_tx, context, candidate)?;
+        self.request_backend(input_tx, context, candidate, true)?;
         self.refresh_completion();
         Ok(())
     }
@@ -1239,6 +1252,7 @@ impl CrossTerm {
     fn request_typed_backend(
         &mut self,
         input_tx: &mpsc::UnboundedSender<InputMessage>,
+        explicit: bool,
     ) -> Result<()> {
         let Some(context) = self
             .completion
@@ -1264,25 +1278,36 @@ impl CrossTerm {
                 description: String::new(),
                 kind: CandidateKind::Slash,
             },
+            explicit,
         )
     }
 
     /// Send anything the new draft now needs from the agent: a `ListSessions`
     /// for `/load` arguments or a `ListModels` when a `provider:` token was
     /// just completed and its model list is unknown. The dedupe sets keep
-    /// repeated Tab presses from spamming the agent.
+    /// repeated Tab presses from spamming the agent. Typing (`explicit` false)
+    /// only fetches what was never requested; an explicit Tab also retries a
+    /// failed fetch.
     fn request_backend(
         &mut self,
         input_tx: &mpsc::UnboundedSender<InputMessage>,
         context: &CompletionContext,
         candidate: &Candidate,
+        explicit: bool,
     ) -> Result<()> {
         let is_session = matches!(
             context.target,
             CompletionTarget::Argument(ArgumentKind::Session),
         );
-        if is_session && self.session_candidates.is_empty() && !self.session_completion_requested {
-            self.session_completion_requested = true;
+        let session_may_fetch = match self.session_fetch {
+            Fetch::Idle => true,
+            // A list that arrived empty is only re-asked on an explicit Tab,
+            // not on every keystroke.
+            Fetch::Loaded | Fetch::Failed => explicit,
+            Fetch::InFlight => false,
+        };
+        if is_session && self.session_candidates.is_empty() && session_may_fetch {
+            self.session_fetch = Fetch::InFlight;
             input_tx
                 .send(InputMessage::ListSessions)
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
@@ -1303,9 +1328,18 @@ impl CrossTerm {
             .map(str::to_owned);
         if let Some(provider) = provider
             && !self.model_lists.contains_key(&provider)
-            && !self.model_list_requested.contains(provider.as_str())
+            && match self
+                .model_fetch
+                .get(provider.as_str())
+                .copied()
+                .unwrap_or_default()
+            {
+                Fetch::Idle => true,
+                Fetch::Failed => explicit,
+                Fetch::InFlight | Fetch::Loaded => false,
+            }
         {
-            self.model_list_requested.insert(provider.clone());
+            self.model_fetch.insert(provider.clone(), Fetch::InFlight);
             input_tx
                 .send(InputMessage::ListModels {
                     provider: provider.clone(),
@@ -1323,16 +1357,9 @@ impl CrossTerm {
         };
         if completion.candidates.is_empty() {
             // Session/model lists often arrive a beat late; repeat Tab asks
-            // the backend again.
-            self.request_backend(
-                input_tx,
-                &completion.context,
-                &Candidate {
-                    value: String::new(),
-                    description: String::new(),
-                    kind: CandidateKind::Slash,
-                },
-            )?;
+            // the backend again. Use the typed token (not an empty one) so a
+            // `provider:` model catalogue can be re-requested too.
+            self.request_typed_backend(input_tx, true)?;
             return Ok(());
         }
         if completion.candidates.len() == 1 {
@@ -1915,6 +1942,14 @@ impl CrossTerm {
                 self.busy = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
+                // Failures carry no request id. `ListSessions` is answered
+                // synchronously, so an error while one is in flight is its
+                // reply; drop the display request so a later completion-driven
+                // list is not printed unasked.
+                self.session_list_display_requested = false;
+                if self.session_fetch == Fetch::InFlight {
+                    self.session_fetch = Fetch::Failed;
+                }
                 self.status(|status| status.fail(&error));
                 self.add_error(error);
             }
@@ -1965,6 +2000,13 @@ impl CrossTerm {
                 self.background_operations.retain(|(key, _)| *key != id);
                 if let Some(error) = error {
                     // A lookup failure must not finalize streamed text or tools.
+                    // Model fetches are the only in-flight background lookups
+                    // keyed here; allow an explicit Tab to retry them.
+                    for state in self.model_fetch.values_mut() {
+                        if *state == Fetch::InFlight {
+                            *state = Fetch::Failed;
+                        }
+                    }
                     self.add_error(error);
                 }
             }
@@ -2028,6 +2070,7 @@ impl CrossTerm {
                 self.apply_prewalk_switch("Prewalk planning model", provider, model, reasoning);
             }
             UiEvent::ModelList { provider, models } => {
+                self.model_fetch.insert(provider.clone(), Fetch::Loaded);
                 self.model_lists.insert(provider, models);
                 if commands::is_command_input(&self.input) {
                     self.refresh_completion();
@@ -2135,7 +2178,7 @@ impl CrossTerm {
             }
             UiEvent::SessionList { sessions } => {
                 self.session_candidates = sessions.clone();
-                self.session_completion_requested = false;
+                self.session_fetch = Fetch::Loaded;
                 let total = sessions.len();
                 let mut notice = if sessions.is_empty() {
                     "No sessions for this workspace".to_owned()
@@ -5615,7 +5658,7 @@ mod tests {
         ui.cursor = ui.input.len();
         ui.refresh_completion();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        ui.request_typed_backend(&tx).unwrap();
+        ui.request_typed_backend(&tx, false).unwrap();
         assert_eq!(
             rx.try_recv().ok(),
             Some(InputMessage::ListModels {
@@ -5629,13 +5672,87 @@ mod tests {
         ui2.cursor = ui2.input.len();
         ui2.refresh_completion();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        ui2.request_typed_backend(&tx).unwrap();
+        ui2.request_typed_backend(&tx, false).unwrap();
         assert_eq!(
             rx.try_recv().ok(),
             Some(InputMessage::ListModels {
                 provider: "openrouter".into(),
             })
         );
+    }
+
+    #[test]
+    fn failed_sessions_command_does_not_print_a_later_completion_list() {
+        let mut ui = ui(80, 24);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ui.submit_command("/sessions", &tx).unwrap();
+        ui.apply_event(UiEvent::Error("could not list sessions: x".into()));
+        ui.apply_event(UiEvent::SessionList {
+            sessions: Vec::new(),
+        });
+        assert!(!ui.pending.iter().any(|entry| matches!(
+            entry,
+            Entry::Notice { text } if text == "No sessions for this workspace"
+        )));
+    }
+
+    fn load_ui() -> CrossTerm {
+        let mut ui = ui(80, 24);
+        ui.input = "/load ".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        ui
+    }
+
+    #[tokio::test]
+    async fn failed_session_fetch_retries_on_tab_not_on_typing() {
+        let mut ui = load_ui();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
+        ui.apply_event(UiEvent::Error("could not list sessions: x".into()));
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
+    }
+
+    #[tokio::test]
+    async fn empty_session_list_is_not_refetched_per_keystroke() {
+        let mut ui = load_ui();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
+        ui.apply_event(UiEvent::SessionList {
+            sessions: Vec::new(),
+        });
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_model_fetch_retries_on_tab_not_on_typing() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model openrouter:".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = InputMessage::ListModels {
+            provider: "openrouter".into(),
+        };
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(request.clone()));
+        // Still in flight: no duplicate request.
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+        ui.apply_event(UiEvent::BackgroundOperationFinished {
+            id: 1,
+            error: Some("model list failed".into()),
+        });
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(request));
     }
 
     #[tokio::test]
