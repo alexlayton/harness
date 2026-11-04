@@ -344,27 +344,38 @@ impl Transport<RoleClient> for BoundedStdioTransport {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        self.transport.close().await?;
+        // Every cleanup step runs even when an earlier one fails: a failed
+        // transport shutdown must not leave the child, its process group, or
+        // the cgroup scope behind. The first error is returned.
+        let transport_result = self.transport.close().await;
         let Some(mut child) = self.child.take() else {
-            return Ok(());
+            release_scope(&mut self.scope);
+            return transport_result;
         };
         let group = self.process_group.take();
-        let result = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        let reap_result = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
             Ok(result) => result.map(|_| ()),
             Err(_) => {
                 // Signal the group before reaping the leader: an unreaped
                 // leader keeps the group ID from being reused.
                 kill_process_group(group);
-                child.start_kill()?;
-                child.wait().await.map(|_| ())
+                match child.start_kill() {
+                    Ok(()) => child.wait().await.map(|_| ()),
+                    Err(error) => Err(error),
+                }
             }
         };
         // Sweep descendants that outlived a graceful leader exit, including
         // ones that left the process group (cgroup, on Linux).
         kill_process_group(group);
         release_scope(&mut self.scope);
-        result
+        first_error(transport_result, reap_result)
     }
+}
+
+/// Return the first failure of two sequential cleanup steps.
+fn first_error<E>(first: Result<(), E>, second: Result<(), E>) -> Result<(), E> {
+    first.and(second)
 }
 
 impl Drop for BoundedStdioTransport {
@@ -978,6 +989,14 @@ mod tests {
         assert_eq!(output, b"12345678");
         let error = error.expect("chunked frame must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn first_cleanup_error_wins_but_later_error_is_not_lost() {
+        assert_eq!(first_error::<&str>(Ok(()), Ok(())), Ok(()));
+        assert_eq!(first_error(Err("a"), Err("b")), Err("a"));
+        assert_eq!(first_error(Err("a"), Ok(())), Err("a"));
+        assert_eq!(first_error(Ok(()), Err("b")), Err("b"));
     }
 
     struct FailingReader;
