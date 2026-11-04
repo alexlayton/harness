@@ -362,16 +362,7 @@ impl Agent {
         if self.flush_deferred_sync(events).is_err() {
             return TurnControl::Quarantine;
         }
-        if interrupted && !application.is_cancelled() {
-            // `handle_compact_session` has already observed the cancelled
-            // operation and deliberately persisted no summary.
-            return TurnControl::Continue;
-        }
-        match outcome {
-            Ok(()) => TurnControl::Continue,
-            Err(TurnError::Shutdown) => TurnControl::Shutdown,
-            Err(TurnError::Persist(_)) => TurnControl::Quarantine,
-        }
+        compact_boundary_control(outcome, interrupted, application.is_cancelled())
     }
 
     /// Boundary wrapper for model changes. The append is staged on a cloned
@@ -857,4 +848,49 @@ fn spawn_model_list_with_cancel(
             AgentEvent::BackgroundOperationFinished { id, error },
         );
     });
+}
+
+/// Map a manual-compaction outcome to the boundary decision. Persistence
+/// failures are matched first: a user interrupt must not swallow an error
+/// that requires quarantine (the log may be unwritable). Only then does a
+/// plain interrupt, which deliberately persisted no summary, continue.
+fn compact_boundary_control(
+    outcome: Result<(), TurnError>,
+    interrupted: bool,
+    application_cancelled: bool,
+) -> TurnControl {
+    match outcome {
+        Err(TurnError::Persist(_)) => TurnControl::Quarantine,
+        _ if interrupted && !application_cancelled => TurnControl::Continue,
+        Ok(()) => TurnControl::Continue,
+        Err(TurnError::Shutdown) => TurnControl::Shutdown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A persistence failure must quarantine even when the user also
+    /// interrupted; the old ordering returned `Continue` here.
+    #[test]
+    fn interrupt_does_not_swallow_compaction_persist_error() {
+        let persist = || Err(TurnError::Persist("disk full".into()));
+        assert!(matches!(
+            compact_boundary_control(persist(), true, false),
+            TurnControl::Quarantine
+        ));
+        assert!(matches!(
+            compact_boundary_control(persist(), false, false),
+            TurnControl::Quarantine
+        ));
+        assert!(matches!(
+            compact_boundary_control(Ok(()), true, false),
+            TurnControl::Continue
+        ));
+        assert!(matches!(
+            compact_boundary_control(Err(TurnError::Shutdown), true, true),
+            TurnControl::Shutdown
+        ));
+    }
 }
