@@ -590,3 +590,27 @@ async fn audit_never_outruns_or_lags_the_recorded_nested_events() {
         );
     }
 }
+
+#[tokio::test]
+async fn cancel_during_interpreter_step_keeps_earlier_printed_output() {
+    let (registry, _) = registry("echo");
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        trigger.cancel();
+    });
+    let output = registry
+        .execute(
+            "codemode",
+            snippet("print('printed-before-cancel')\nwhile True:\n    pass"),
+            cancel,
+        )
+        .await;
+    assert!(output.is_error, "{}", output.content);
+    assert!(
+        output.content.contains("printed-before-cancel"),
+        "{}",
+        output.content
+    );
+}
