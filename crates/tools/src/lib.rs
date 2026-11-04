@@ -235,7 +235,8 @@ pub fn default_registry_with_index(
     }
     let skills = config
         .skills
-        .unwrap_or_else(|| discover_skills_for_config(&workspace_root));
+        .unwrap_or_else(|| discover_skills_for_config(&workspace_root))
+        .with_derived_read_paths();
     let read_paths = skills.read_paths.clone();
     let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
         ToolInitError::Workspace {
@@ -303,7 +304,8 @@ pub fn read_only_registry_with_index(
     }
     let skills = config
         .skills
-        .unwrap_or_else(|| discover_skills_for_config(&workspace_root));
+        .unwrap_or_else(|| discover_skills_for_config(&workspace_root))
+        .with_derived_read_paths();
     let read_paths = skills.read_paths.clone();
     let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
         ToolInitError::Workspace {
@@ -648,6 +650,43 @@ mod tests {
             call_summary("python", &serde_json::json!({"code": "1 + 1"})),
             "python"
         );
+    }
+
+    #[tokio::test]
+    async fn read_allowlist_is_derived_from_the_registered_skills() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("SKILL.md");
+        std::fs::write(&file, "---\nname: s\ndescription: d\n---\nbody\n").unwrap();
+        // Hand-built catalog whose `read_paths` drifted (empty) from `skills`.
+        let catalog = SkillCatalog {
+            skills: vec![Skill {
+                name: "s".into(),
+                description: "d".into(),
+                file_path: file.clone(),
+                base_dir: outside.path().to_path_buf(),
+                instructions: "body".into(),
+                disable_model_invocation: false,
+            }],
+            diagnostics: Vec::new(),
+            read_paths: Vec::new(),
+        };
+        let registry =
+            default_registry(ToolConfig::new(workspace.path(), false).with_skills(catalog.clone()))
+                .unwrap();
+        assert!(!registry.skills().unwrap().read_paths.is_empty());
+        let output = registry
+            .execute(
+                "read",
+                serde_json::json!({"path": file.to_string_lossy()}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let read_only =
+            read_only_registry(ToolConfig::new(workspace.path(), false).with_skills(catalog))
+                .unwrap();
+        assert!(!read_only.skills().unwrap().read_paths.is_empty());
     }
 
     #[test]
