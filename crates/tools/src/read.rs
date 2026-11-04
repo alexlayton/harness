@@ -6,11 +6,16 @@ use super::{
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::fs;
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
+
+/// Path, offset and limit identifying one read range.
+type ReadKey = (String, usize, Option<usize>);
 
 pub struct ReadTool {
     workspace_root: Option<PathBuf>,
@@ -23,7 +28,16 @@ pub struct ReadTool {
     /// retains the directory handle used for the final read, so an allowlisted
     /// pathname cannot be redirected after discovery.
     allowed_paths: Option<Vec<AllowedPath>>,
+    /// Content fingerprints of earlier reads, keyed by path and range, so a
+    /// repeat read of unchanged content can say so.
+    seen: Mutex<HashMap<ReadKey, u64>>,
+    /// Off for registries shared between agents, where "your last read" is
+    /// ambiguous.
+    repeat_notes: bool,
 }
+
+/// Fingerprints kept before the map is reset, bounding memory in long sessions.
+const MAX_TRACKED_READS: usize = 512;
 
 #[derive(Clone)]
 struct AllowedPath {
@@ -40,6 +54,8 @@ impl ReadTool {
             workspace_fs: WorkspaceFs::open_root(&root).ok().map(Arc::new),
             workspace_root: Some(root),
             allowed_paths: None,
+            seen: Mutex::default(),
+            repeat_notes: true,
         }
     }
 
@@ -50,7 +66,15 @@ impl ReadTool {
             workspace_root: Some(workspace_fs.root().to_path_buf()),
             workspace_fs: Some(workspace_fs),
             allowed_paths: None,
+            seen: Mutex::default(),
+            repeat_notes: true,
         }
+    }
+
+    /// Enable or disable repeat-read annotations (enabled by default).
+    pub fn with_repeat_notes(mut self, enabled: bool) -> Self {
+        self.repeat_notes = enabled;
+        self
     }
 
     /// Add a set of allowed absolute paths (from the skills catalog). On Unix,
@@ -393,11 +417,32 @@ impl Tool for ReadTool {
             Err(message) => return error(&format!("read {path}"), &message),
         };
 
+        let selected = if self.repeat_notes && self.is_repeat(&path, offset, limit, &selected) {
+            format!("{selected}\n(unchanged since your last read of this range in this session)")
+        } else {
+            selected
+        };
         ToolOutput {
             content: selected,
             is_error: false,
             summary: format!("read {path}"),
         }
+    }
+}
+
+impl ReadTool {
+    /// Record this read and report whether the same path and range returned
+    /// byte-identical content last time. Content hashing (not mtime) keeps
+    /// the note truthful even when a file is rewritten with the same size.
+    fn is_repeat(&self, path: &str, offset: usize, limit: Option<usize>, content: &str) -> bool {
+        let mut hasher = DefaultHasher::new();
+        content.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= MAX_TRACKED_READS {
+            seen.clear();
+        }
+        seen.insert((path.to_owned(), offset, limit), fingerprint) == Some(fingerprint)
     }
 }
 
@@ -549,6 +594,45 @@ mod tests {
             "mkfifo failed: {}",
             std::io::Error::last_os_error()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeat_read_of_unchanged_content_is_noted() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let tool = ReadTool::with_workspace_root(dir.path());
+        let run = || tool.execute(json!({"path":"file.txt"}), CancellationToken::new());
+        assert!(!run().await.content.contains("unchanged"));
+        let again = run().await;
+        assert!(again.content.starts_with("one\n"));
+        assert!(again.content.contains("unchanged since your last read"));
+        std::fs::write(&path, "two\n").unwrap();
+        assert!(!run().await.content.contains("unchanged"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeat_notes_can_be_disabled() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "one\n").unwrap();
+        let tool = ReadTool::with_workspace_root(dir.path()).with_repeat_notes(false);
+        for _ in 0..2 {
+            let output = tool
+                .execute(json!({"path":"file.txt"}), CancellationToken::new())
+                .await;
+            assert!(!output.content.contains("unchanged"));
+        }
+    }
+
+    #[test]
+    fn tracked_reads_are_bounded() {
+        let tool = ReadTool::with_workspace_root(std::env::temp_dir());
+        for index in 0..(MAX_TRACKED_READS * 2) {
+            tool.is_repeat(&format!("f{index}"), 1, None, "x");
+        }
+        assert!(tool.seen.lock().unwrap().len() <= MAX_TRACKED_READS);
     }
 
     #[cfg(unix)]
