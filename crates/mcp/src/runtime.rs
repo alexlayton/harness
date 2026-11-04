@@ -1397,17 +1397,19 @@ done
             };
             let rendered = error.to_string();
             assert!(rendered.contains(operation), "{rendered}");
+            // The point of these tests: the oversized frame is rejected
+            // itself, not by the operation's own deadline expiring.
+            assert!(!rendered.contains("timed out"), "{rendered}");
             assert!(rendered.len() <= crate::output::MAX_OUTPUT_BYTES);
         }
 
         #[tokio::test]
         async fn oversized_initialize_frames_fail_promptly() {
-            // 10s, matching the catalogue sibling: the assertion is that
-            // frame rejection short-circuits the 15s initialize deadline,
-            // not that fixtures spawn in 3s. macOS runners are too slow
-            // for the tighter bound and tripped it spuriously.
+            // The outer bound is only a hang guard. Promptness is asserted
+            // by the error not being the 15s initialize deadline; a wall
+            // clock bound tripped spuriously on loaded macOS runners.
             for mode in ["initialize-single", "initialize-chunked"] {
-                let result = tokio::time::timeout(Duration::from_secs(10), connect_fixture(mode))
+                let result = tokio::time::timeout(Duration::from_secs(60), connect_fixture(mode))
                     .await
                     .expect("frame rejection must not wait for initialize timeout");
                 assert_prompt_error(result, "initialize");
@@ -1417,7 +1419,7 @@ done
         #[tokio::test]
         async fn oversized_catalogue_frame_fails_before_tools_are_materialized() {
             for mode in ["list-single", "list-chunked"] {
-                let result = tokio::time::timeout(Duration::from_secs(10), connect_fixture(mode))
+                let result = tokio::time::timeout(Duration::from_secs(60), connect_fixture(mode))
                     .await
                     .expect("frame rejection must not wait for list timeout");
                 assert_prompt_error(result, "tools/list");
