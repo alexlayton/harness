@@ -1044,7 +1044,20 @@ impl CrossTerm {
         Ok(false)
     }
 
+    /// If the input no longer matches the recalled entry, the user edited it:
+    /// adopt the edit as a fresh draft so the next Up/Down keeps it instead of
+    /// overwriting it with a history entry.
+    fn detach_edited_history(&mut self) {
+        if let Some(pos) = self.history_pos
+            && self.history.get(pos) != Some(&self.input)
+        {
+            self.history_pos = None;
+            self.draft.clear();
+        }
+    }
+
     fn history_up(&mut self) {
+        self.detach_edited_history();
         let current = self.input.clone();
         if let Some(value) = history_previous(
             &self.history,
@@ -1058,6 +1071,7 @@ impl CrossTerm {
     }
 
     fn history_down(&mut self) {
+        self.detach_edited_history();
         if let Some(value) = history_next(&self.history, &mut self.history_pos, &self.draft) {
             self.input = value;
             self.cursor = self.input.len();
@@ -4355,6 +4369,22 @@ mod tests {
             entry,
             Entry::User { text } if text.contains("keep  this question")
         )));
+    }
+
+    #[test]
+    fn editing_a_recalled_history_entry_keeps_the_edit() {
+        let mut ui = ui(80, 24);
+        ui.history = vec!["one".into(), "two".into()];
+        ui.history_up();
+        assert_eq!(ui.input, "two");
+        ui.input.push_str("-edited");
+        ui.cursor = ui.input.len();
+        ui.history_down();
+        assert_eq!(ui.input, "two-edited");
+        ui.history_up();
+        assert_eq!(ui.input, "two");
+        ui.history_down();
+        assert_eq!(ui.input, "two-edited", "edit is the restored draft");
     }
 
     #[test]
