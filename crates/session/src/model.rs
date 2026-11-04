@@ -793,7 +793,10 @@ impl ToolCallTracker {
 pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     let selected = events_after_latest_compaction(events);
     let mut messages = Vec::<Message>::new();
-    let mut call_locations = HashMap::<String, usize>::new();
+    // Every message position that carries each call id. A duplicate id must
+    // not shadow the first occurrence: stripping an incomplete call has to
+    // reach all of them or a dangling call survives in provider context.
+    let mut call_locations = HashMap::<String, Vec<usize>>::new();
     let mut tracker = ToolCallTracker::default();
 
     for record in selected {
@@ -805,7 +808,7 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                 let index = messages.len();
                 for content in &message.content {
                     if let StoredContent::ToolCall { id, .. } = content {
-                        call_locations.insert(id.clone(), index);
+                        call_locations.entry(id.clone()).or_default().push(index);
                     }
                 }
                 messages.push(message.to_llm());
@@ -837,7 +840,7 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                     messages[index]
                         .content
                         .push(Content::ToolCall(call.clone().into()));
-                    entry.insert(index);
+                    entry.insert(vec![index]);
                 }
             }
             SessionEvent::ToolResult {
@@ -870,12 +873,14 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     // A crash can leave a complete ToolCall line without its result.  Keep the
     // assistant's ordinary text/reasoning, but remove only those calls.  This
     // guarantees the next provider request is structurally valid.
-    for (id, index) in call_locations {
+    for (id, indexes) in call_locations {
         if tracker.is_completed(&id) {
             continue;
         }
-        if let Some(Message { content, .. }) = messages.get_mut(index) {
-            content.retain(|item| !matches!(item, Content::ToolCall(call) if call.id == id));
+        for index in indexes {
+            if let Some(Message { content, .. }) = messages.get_mut(index) {
+                content.retain(|item| !matches!(item, Content::ToolCall(call) if call.id == id));
+            }
         }
     }
     messages.retain(|message| !message.content.is_empty());
@@ -2108,6 +2113,23 @@ mod tests {
         });
         push_tool_call(&mut session, "call-1", "read");
         assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn duplicate_call_ids_do_not_leave_a_dangling_call_in_context() {
+        // Not a valid log (validation rejects reuse), but reconstruction must
+        // still never emit an unanswered call, whichever occurrence is first.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_assistant_call(&mut session, "dup", "read");
+        push_assistant_call(&mut session, "dup", "read");
+        let dangling = session
+            .context_messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|content| matches!(content, Content::ToolCall(call) if call.id == "dup"))
+            .count();
+        assert_eq!(dangling, 0);
     }
 
     #[test]
