@@ -340,11 +340,12 @@ impl Tool for BashTool {
             Exited(std::process::ExitStatus),
             TimedOut,
             Cancelled,
+            WaitFailed(std::io::Error),
         }
         let end = tokio::select! {
             result = child.wait() => match result {
                 Ok(status) => End::Exited(status),
-                Err(_) => End::Cancelled,
+                Err(error) => End::WaitFailed(error),
             },
             _ = tokio::time::sleep_until(deadline) => {
                 terminate_tree(
@@ -352,6 +353,7 @@ impl Tool for BashTool {
                     group_id,
                     process_guard.containment(),
                     &cancel,
+                    EndReason::TimedOut,
                 )
                 .await;
                 let _ = child.wait().await;
@@ -363,6 +365,7 @@ impl Tool for BashTool {
                     group_id,
                     process_guard.containment(),
                     &cancel,
+                    EndReason::Cancelled,
                 )
                 .await;
                 let _ = child.wait().await;
@@ -375,7 +378,19 @@ impl Tool for BashTool {
         // detached descendants before they can keep these pipes open or
         // mutate the workspace after this tool returns. Other Unix platforms
         // retain only the process-group best effort documented below.
-        terminate_tree(&mut child, group_id, process_guard.containment(), &cancel).await;
+        let cleanup_reason = match &end {
+            End::TimedOut => EndReason::TimedOut,
+            End::Cancelled => EndReason::Cancelled,
+            End::Exited(_) | End::WaitFailed(_) => EndReason::Finished,
+        };
+        terminate_tree(
+            &mut child,
+            group_id,
+            process_guard.containment(),
+            &cancel,
+            cleanup_reason,
+        )
+        .await;
 
         // Drain stdout and stderr concurrently under one shared deadline
         // (not two sequential one-second waits): held pipes on both
@@ -384,25 +399,11 @@ impl Tool for BashTool {
             .checked_add(DRAIN_TIMEOUT)
             .unwrap_or_else(tokio::time::Instant::now);
         let (stdout, stderr) = tokio::join!(
-            async {
-                match tokio::time::timeout_at(drain_deadline, &mut readers.stdout).await {
-                    Ok(Ok(capture)) => capture,
-                    _ => {
-                        readers.stdout.abort();
-                        TailCapture::default()
-                    }
-                }
-            },
-            async {
-                match tokio::time::timeout_at(drain_deadline, &mut readers.stderr).await {
-                    Ok(Ok(capture)) => capture,
-                    _ => {
-                        readers.stderr.abort();
-                        TailCapture::default()
-                    }
-                }
-            }
+            drain_reader(&mut readers.stdout, drain_deadline),
+            drain_reader(&mut readers.stderr, drain_deadline)
         );
+        let (stdout, stdout_lost) = stdout;
+        let (stderr, stderr_lost) = stderr;
         let mut output = stdout.render();
         if !stderr.bytes.is_empty() {
             if !output.is_empty() {
@@ -413,24 +414,40 @@ impl Tool for BashTool {
         }
         let mut is_error = false;
         let mut suffix = String::new();
+        if stdout_lost || stderr_lost {
+            // A timed-out drain or panicked reader must not look like a
+            // command that simply printed nothing.
+            let which = match (stdout_lost, stderr_lost) {
+                (true, true) => "stdout and stderr",
+                (true, false) => "stdout",
+                _ => "stderr",
+            };
+            suffix.push_str(&format!(
+                "[warning: {which} output was lost or incomplete (reader timed out or failed)]"
+            ));
+        }
         match end {
             End::Exited(status) => {
                 if !status.success() {
                     is_error = true;
                     if let Some(code) = status.code() {
-                        suffix = format!("[exit code {code}]");
+                        suffix.push_str(&format!("[exit code {code}]"));
                     } else {
-                        suffix = "[process terminated by signal]".into();
+                        suffix.push_str("[process terminated by signal]");
                     }
                 }
             }
             End::TimedOut => {
                 is_error = true;
-                suffix = format!("[timed out after {timeout}s]");
+                suffix.push_str(&format!("[timed out after {timeout}s]"));
             }
             End::Cancelled => {
                 is_error = true;
-                suffix = "[cancelled]".into();
+                suffix.push_str("[cancelled]");
+            }
+            End::WaitFailed(error) => {
+                is_error = true;
+                suffix.push_str(&format!("[failed to wait for shell: {error}]"));
             }
         }
         output = truncate_command_output(&output);
@@ -449,6 +466,33 @@ impl Tool for BashTool {
                 Some(dir) => format!("bash: {} (in {dir})", first_line(&run_command)),
                 None => format!("bash: {}", first_line(&run_command)),
             },
+        }
+    }
+}
+
+/// Why the shell's tree is being ended. Kill-grace policy keys off this
+/// rather than off whether the cancel token happens to be cancelled.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndReason {
+    /// The user cancelled: escalate to SIGKILL without a grace period.
+    Cancelled,
+    /// The deadline passed: SIGTERM, then SIGKILL after the grace period.
+    TimedOut,
+    /// The shell already finished; only clean up leftover descendants.
+    Finished,
+}
+
+/// Await one reader under the shared drain deadline. The flag is true when
+/// the capture is missing (timeout or reader panic), not merely empty.
+async fn drain_reader(
+    handle: &mut tokio::task::JoinHandle<TailCapture>,
+    deadline: tokio::time::Instant,
+) -> (TailCapture, bool) {
+    match tokio::time::timeout_at(deadline, &mut *handle).await {
+        Ok(Ok(capture)) => (capture, false),
+        _ => {
+            handle.abort();
+            (TailCapture::default(), true)
         }
     }
 }
@@ -663,6 +707,7 @@ async fn terminate_tree(
     group_id: Option<u32>,
     containment: &Containment,
     cancel: &CancellationToken,
+    reason: EndReason,
 ) {
     containment.kill();
     #[cfg(unix)]
@@ -681,7 +726,7 @@ async fn terminate_tree(
             // immediately. Only wait for the grace period when a descendant
             // is still holding the group, avoiding a fixed delay on ordinary
             // successful commands.
-            if process_group_alive(pgid) {
+            if reason != EndReason::Cancelled && process_group_alive(pgid) {
                 tokio::select! {
                     _ = tokio::time::sleep(KILL_GRACE) => {}
                     _ = cancel.cancelled() => {}
@@ -716,6 +761,35 @@ fn error(summary: &str, content: &str) -> ToolOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_reader_flags_timeout_and_panic_as_lost_output() {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(50);
+        let mut stuck = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            TailCapture::default()
+        });
+        let (_, lost) = drain_reader(&mut stuck, deadline).await;
+        assert!(lost, "timed-out drain must be reported");
+
+        let mut panicked = tokio::spawn(async { panic!("reader died") });
+        let (_, lost) = drain_reader(&mut panicked, deadline).await;
+        assert!(lost, "panicked reader must be reported");
+
+        let mut ok = tokio::spawn(async {
+            TailCapture {
+                bytes: b"hi".to_vec(),
+                ..TailCapture::default()
+            }
+        });
+        let (capture, lost) = drain_reader(
+            &mut ok,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+        assert!(!lost);
+        assert_eq!(capture.bytes, b"hi");
+    }
 
     #[cfg(unix)]
     #[test]
