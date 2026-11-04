@@ -474,6 +474,9 @@ pub struct CrossTerm {
     path_completion_cancel: Option<CancellationToken>,
 
     busy: bool,
+    /// True when busyness belongs to a model turn rather than a foreground
+    /// operation, so `OperationFinished` cannot clear a live turn.
+    turn_active: bool,
     activity: Activity,
     operation_label: Option<String>,
     spinner: usize,
@@ -564,6 +567,7 @@ impl CrossTerm {
             path_completion_query: None,
             path_completion_cancel: None,
             busy: false,
+            turn_active: false,
             activity: Activity::Preparing,
             operation_label: None,
             spinner: 0,
@@ -1640,6 +1644,7 @@ impl CrossTerm {
                 .send(InputMessage::Message(text))
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
             self.busy = true;
+            self.turn_active = true;
             self.activity = Activity::Preparing;
             self.spinner = 0;
             self.status(|status| status.start_work());
@@ -1826,6 +1831,7 @@ impl CrossTerm {
             && let Some(activity) = activity
         {
             self.busy = true;
+            self.turn_active = false;
             self.activity = activity;
             self.spinner = 0;
         }
@@ -1846,6 +1852,7 @@ impl CrossTerm {
                     return;
                 }
                 self.busy = true;
+                self.turn_active = true;
                 self.activity = Activity::Working;
                 self.operation_label = None;
                 self.status(|status| status.progress());
@@ -1858,6 +1865,7 @@ impl CrossTerm {
                     return;
                 }
                 self.busy = true;
+                self.turn_active = true;
                 self.activity = Activity::Reasoning;
                 self.operation_label = None;
                 self.status(|status| status.start_work());
@@ -1870,6 +1878,7 @@ impl CrossTerm {
                 summary,
             } => {
                 self.busy = true;
+                self.turn_active = true;
                 self.activity = Activity::Processing;
                 self.operation_label = None;
                 self.status(|status| status.start_work());
@@ -1907,9 +1916,13 @@ impl CrossTerm {
                 output,
                 error,
             } => {
-                self.busy = true;
-                self.activity = Activity::Working;
-                self.operation_label = None;
+                // A finish only reports on a call from a running turn; if the
+                // turn already ended (late event) it must not re-arm the spinner.
+                if self.busy {
+                    self.turn_active = true;
+                    self.activity = Activity::Working;
+                    self.operation_label = None;
+                }
                 // Remove exactly the matching start; unrelated running tools
                 // stay live and keep rendering in the region below.
                 if let Some(position) = self
@@ -1923,10 +1936,13 @@ impl CrossTerm {
                 self.pending.push(Entry::Tool { record });
             }
             UiEvent::Retrying { .. } => {
-                self.busy = true;
-                self.activity = Activity::Retrying;
-                self.operation_label = None;
-                self.status(|status| status.start_work());
+                // Retries only occur inside a live turn; ignore late ones.
+                if self.busy {
+                    self.turn_active = true;
+                    self.activity = Activity::Retrying;
+                    self.operation_label = None;
+                    self.status(|status| status.start_work());
+                }
             }
             UiEvent::Error(error) => {
                 self.finalize_stream();
@@ -1940,6 +1956,7 @@ impl CrossTerm {
                     });
                 }
                 self.busy = false;
+                self.turn_active = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
                 // Failures carry no request id. `ListSessions` is answered
@@ -1956,6 +1973,7 @@ impl CrossTerm {
             UiEvent::AskStarted => {
                 self.dismiss_ask();
                 self.busy = true;
+                self.turn_active = false;
                 self.activity = Activity::Asking;
                 self.operation_label = None;
                 self.spinner = 0;
@@ -1969,17 +1987,25 @@ impl CrossTerm {
                 self.finalize_stream();
                 self.running_tools.clear();
                 self.busy = false;
+                self.turn_active = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
                 self.status(|status| status.finish_turn());
             }
             UiEvent::OperationStarted { label } => {
                 self.busy = true;
+                self.turn_active = false;
+                self.activity = Activity::Preparing;
                 self.operation_label = Some(label);
                 self.spinner = 0;
                 self.status(|status| status.start_work());
             }
             UiEvent::OperationFinished => {
+                // A turn still streaming owns the spinner; its own
+                // TurnFinished/Error will clear it.
+                if self.turn_active {
+                    return;
+                }
                 self.busy = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
@@ -4329,6 +4355,36 @@ mod tests {
             entry,
             Entry::User { text } if text.contains("keep  this question")
         )));
+    }
+
+    #[test]
+    fn late_finish_events_do_not_rearm_busy_and_operation_finish_spares_turn() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::TurnFinished);
+        ui.apply_event(UiEvent::ToolCallFinished {
+            call_id: "x".into(),
+            name: "bash".into(),
+            summary: String::new(),
+            ok: true,
+            duration_ms: 1,
+            output: String::new(),
+            error: None,
+        });
+        ui.apply_event(UiEvent::Retrying {
+            attempt: 1,
+            message: String::new(),
+        });
+        assert!(!ui.busy, "late events must not spin an idle UI");
+
+        ui.apply_event(UiEvent::TextDelta("hi".into()));
+        ui.apply_event(UiEvent::OperationFinished);
+        assert!(ui.busy, "operation end must not clear a running turn");
+        ui.apply_event(UiEvent::TurnFinished);
+        assert!(!ui.busy);
+
+        ui.apply_event(UiEvent::TextDelta("hi".into()));
+        ui.apply_event(UiEvent::OperationStarted { label: "L".into() });
+        assert_eq!(ui.activity, Activity::Preparing);
     }
 
     #[test]
