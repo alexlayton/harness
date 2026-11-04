@@ -658,7 +658,8 @@ impl Session {
 /// Tool-call IDs are globally unique for the life of the log: once an ID has
 /// been used (pending or completed), it is never reused.  `TurnCancelled`
 /// marks the tail explicitly cancelled and clears the pending queue; `Error`
-/// marks it cancelled without clearing so a crash tail stays recoverable.
+/// marks it cancelled without clearing so a crash tail stays recoverable, and
+/// the queue is cleared once a new user/assistant turn follows.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ToolCallTracker {
     /// Call IDs awaiting a result, in emission order.
@@ -712,6 +713,20 @@ impl ToolCallTracker {
     /// lands.  `Error` leaves the queue intact so a crash tail stays
     /// recoverable and `context_messages` can strip the incomplete calls.
     pub(crate) fn record(&mut self, event: &SessionEvent) {
+        // An `Error` tail keeps its pending calls only so an immediate crash
+        // repair or late result still works. Once a new turn begins they can
+        // never be answered in valid provider order (a result after a user
+        // message), so close them instead of letting them block fresh calls.
+        if self.cancelled
+            && matches!(
+                event,
+                SessionEvent::UserMessage { .. }
+                    | SessionEvent::AssistantMessage { .. }
+                    | SessionEvent::ToolCall { .. }
+            )
+        {
+            self.close_pending();
+        }
         match event {
             SessionEvent::AssistantMessage { message } => {
                 for content in &message.content {
@@ -743,8 +758,7 @@ impl ToolCallTracker {
                 }
             }
             SessionEvent::TurnCancelled { .. } => {
-                self.pending.clear();
-                self.pending_calls.clear();
+                self.close_pending();
                 self.cancelled = true;
             }
             SessionEvent::Error { .. } => {
@@ -755,6 +769,13 @@ impl ToolCallTracker {
             }
             _ => {}
         }
+    }
+
+    /// Abandon every pending call. `pending` and `pending_calls` must change
+    /// together or `pending_calls()` would panic.
+    fn close_pending(&mut self) {
+        self.pending.clear();
+        self.pending_calls.clear();
     }
 
     fn push_pending(&mut self, call: StoredToolCall) {
@@ -1991,6 +2012,64 @@ mod tests {
             tool_name: Some("read".into()),
         });
         assert!(validate_events(&session.events).is_err());
+    }
+
+    fn push_error(session: &mut Session) {
+        session.append(SessionEvent::Error {
+            message: "boom".into(),
+        });
+    }
+
+    #[test]
+    fn late_result_after_error_and_user_message_is_rejected() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        push_tool_result(&mut session, "call-1");
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn new_turn_after_error_tail_accepts_fresh_calls() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        push_assistant_call(&mut session, "call-2", "read");
+        push_tool_result(&mut session, "call-2");
+        validate_events(&session.events).unwrap();
+        assert!(session.tracker.pending().is_empty());
+        assert_eq!(session.tracker.pending_calls().count(), 0);
+    }
+
+    #[test]
+    fn compaction_boundary_after_an_error_tail_is_valid_once_a_turn_follows() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        push_assistant(&mut session, "ok");
+        let boundary = session.events.last().unwrap().sequence;
+        session.append(SessionEvent::CompactionSummary {
+            summary: "s".into(),
+            compacted_through: boundary,
+        });
+        validate_events(&session.events).unwrap();
+    }
+
+    #[test]
+    fn result_immediately_after_error_is_still_accepted() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        assert_eq!(session.tracker.pending_calls().count(), 1);
+        push_tool_result(&mut session, "call-1");
+        validate_events(&session.events).unwrap();
     }
 
     #[test]

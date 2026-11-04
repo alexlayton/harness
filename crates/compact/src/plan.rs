@@ -196,9 +196,24 @@ fn valid_cut_points(live: &[&SessionEventRecord]) -> Vec<usize> {
 fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
     let mut pending = Vec::<String>::new();
     let mut cut_points = Vec::new();
+    // Mirrors `session`'s tracker: after an `Error` or cancellation, the next
+    // user/assistant/tool-call event abandons any calls still pending.
+    let mut cancelled = false;
     for (index, record) in live.iter().enumerate() {
+        // Checked before the tail is closed: a boundary at the event that
+        // closes it would still leave the call unresolved for validation.
         if is_cut_point(record) && pending.is_empty() {
             cut_points.push(index);
+        }
+        if cancelled
+            && matches!(
+                record.event,
+                SessionEvent::UserMessage { .. }
+                    | SessionEvent::AssistantMessage { .. }
+                    | SessionEvent::ToolCall { .. }
+            )
+        {
+            pending.clear();
         }
         match &record.event {
             SessionEvent::AssistantMessage { message } => {
@@ -207,17 +222,24 @@ fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
                         pending.push(id.clone());
                     }
                 }
+                cancelled = false;
             }
-            SessionEvent::ToolCall { call } => pending.push(call.id.clone()),
+            SessionEvent::ToolCall { call } => {
+                pending.push(call.id.clone());
+                cancelled = false;
+            }
             SessionEvent::ToolResult { tool_call_id, .. } => {
                 if let Some(position) = pending.iter().position(|id| id == tool_call_id) {
                     pending.remove(position);
                 }
             }
-            SessionEvent::TurnCancelled { .. } => pending.clear(),
+            SessionEvent::TurnCancelled { .. } => {
+                pending.clear();
+                cancelled = true;
+            }
+            SessionEvent::Error { .. } => cancelled = true,
             SessionEvent::UserMessage { .. }
             | SessionEvent::Reasoning { .. }
-            | SessionEvent::Error { .. }
             | SessionEvent::ModelChange { .. }
             | SessionEvent::Usage { .. }
             | SessionEvent::MetadataChange { .. }
@@ -377,6 +399,47 @@ mod tests {
             is_error: false,
             tool_name: None,
         });
+    }
+
+    #[test]
+    fn overflow_compaction_summarizes_after_mid_tool_call_error() {
+        let mut session = new_session();
+        push_user(&mut session, "start");
+        push_tool_call(&mut session, "call-a", "read");
+        session.append(SessionEvent::Error {
+            message: "stream died".into(),
+        });
+        push_user(&mut session, &"z".repeat(400_000));
+        push_assistant(&mut session, "answer");
+        let policy = CompactionPolicy {
+            keep_recent_turns: 1,
+            keep_recent_tokens: 20_000,
+            ..CompactionPolicy::default()
+        };
+        let plan = plan_overflow_compaction(&session, &policy, 500_000)
+            .expect("an error tail must not block overflow compaction");
+        // Never the user message that closes the error tail: validation
+        // still sees the call as unresolved at that boundary.
+        let closing_user = session.events[3].sequence;
+        assert!(plan.boundary > closing_user);
+    }
+
+    #[test]
+    fn bare_error_tail_is_not_compacted() {
+        let mut session = new_session();
+        push_user(&mut session, &"z".repeat(400_000));
+        push_tool_call(&mut session, "call-a", "read");
+        session.append(SessionEvent::Error {
+            message: "stream died".into(),
+        });
+        let policy = CompactionPolicy {
+            keep_recent_turns: 1,
+            keep_recent_tokens: 20_000,
+            ..CompactionPolicy::default()
+        };
+        let live = session.events.iter().collect::<Vec<_>>();
+        assert!(!scan_cut_points(&live).1);
+        assert!(plan_overflow_compaction(&session, &policy, 500_000).is_none());
     }
 
     #[test]
