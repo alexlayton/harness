@@ -199,6 +199,11 @@ fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
     // Mirrors `session`'s tracker: after an `Error` or cancellation, the next
     // user/assistant/tool-call event abandons any calls still pending.
     let mut cancelled = false;
+    // Calls abandoned by that rule, with the index that abandoned them. A
+    // legacy log may still answer one later; a cut between the two would
+    // summarize the call and retain its result.
+    let mut abandoned = Vec::<(String, usize)>::new();
+    let mut late_results = Vec::<(usize, usize)>::new();
     for (index, record) in live.iter().enumerate() {
         // Checked before the tail is closed: a boundary at the event that
         // closes it would still leave the call unresolved for validation.
@@ -213,7 +218,7 @@ fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
                     | SessionEvent::ToolCall { .. }
             )
         {
-            pending.clear();
+            abandoned.extend(pending.drain(..).map(|id| (id, index)));
         }
         match &record.event {
             SessionEvent::AssistantMessage { message } => {
@@ -229,6 +234,9 @@ fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
                 cancelled = false;
             }
             SessionEvent::ToolResult { tool_call_id, .. } => {
+                if let Some((_, closed_at)) = abandoned.iter().find(|(id, _)| id == tool_call_id) {
+                    late_results.push((*closed_at, index));
+                }
                 if let Some(position) = pending.iter().position(|id| id == tool_call_id) {
                     pending.remove(position);
                 }
@@ -247,6 +255,11 @@ fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
             | SessionEvent::Unknown { .. } => {}
         }
     }
+    cut_points.retain(|cut| {
+        !late_results
+            .iter()
+            .any(|(closed_at, result_at)| (*closed_at..=*result_at).contains(cut))
+    });
     let resolved = pending.is_empty();
     (cut_points, resolved)
 }
@@ -362,7 +375,7 @@ mod tests {
     use super::*;
     use llm::Message;
     use serde_json::json;
-    use session::model::{Session, SessionMetadata, StoredMessage, StoredToolCall};
+    use session::model::{EventId, Session, SessionMetadata, StoredMessage, StoredToolCall};
 
     fn new_session() -> Session {
         Session::new(SessionMetadata::new("/tmp/project", None, None))
@@ -422,6 +435,34 @@ mod tests {
         // still sees the call as unresolved at that boundary.
         let closing_user = session.events[3].sequence;
         assert!(plan.boundary > closing_user);
+    }
+
+    #[test]
+    fn legacy_late_result_is_never_split_from_its_call_by_a_cut() {
+        let mut session = new_session();
+        push_user(&mut session, "start");
+        push_tool_call(&mut session, "call-a", "read");
+        session.append(SessionEvent::Error {
+            message: "stream died".into(),
+        });
+        push_user(&mut session, "again");
+        push_assistant(&mut session, "thinking");
+        // Shape written by earlier versions: the result lands after the turn.
+        let sequence = session.events.last().unwrap().sequence + 1;
+        let mut late = session.events[1].clone();
+        late.id = EventId::new();
+        late.sequence = sequence;
+        late.event = SessionEvent::ToolResult {
+            tool_call_id: "call-a".into(),
+            content: "late".into(),
+            is_error: false,
+            tool_name: Some("read".into()),
+        };
+        session.events.push(late);
+        let live = session.events.iter().collect::<Vec<_>>();
+        // user(0) call(1) error(2) user(3) assistant(4) result(5): cuts at
+        // 3 and 4 would split call-a from its result.
+        assert_eq!(scan_cut_points(&live).0, vec![0, 1]);
     }
 
     #[test]
