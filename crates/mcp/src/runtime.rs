@@ -582,6 +582,7 @@ async fn connect_server(
                 ClientLifecycleMode::Initialize,
             )
             .await
+            .map_err(ConnectFailure::into_error)
         }
         McpTransportConfig::Http { url, headers } => {
             let headers = headers
@@ -624,14 +625,8 @@ async fn connect_server(
             // when they receive the newer server/discover method. rmcp's Auto
             // mode can fall back after a JSON-RPC rejection, but not after the
             // transport closes; reconnect before using legacy initialization.
-            if matches!(
-                &result,
-                Err(McpError::Operation {
-                    operation: "initialize",
-                    message,
-                    ..
-                }) if message == "connection closed: discover response"
-            ) && !cancel.is_cancelled()
+            if matches!(&result, Err(ConnectFailure::ClosedDuringDiscovery(_)))
+                && !cancel.is_cancelled()
             {
                 tracing::debug!(
                     server = %server.name,
@@ -645,10 +640,52 @@ async fn connect_server(
                     None,
                     ClientLifecycleMode::Initialize,
                 )
-                .await;
+                .await
+                .map_err(ConnectFailure::into_error);
             }
-            result
+            result.map_err(ConnectFailure::into_error)
         }
+    }
+}
+
+/// Why a connection attempt failed. The discovery-closed case is a distinct
+/// variant so the legacy-HTTP fallback is decided structurally, not by
+/// matching rendered error text.
+enum ConnectFailure {
+    /// The transport closed while waiting for the `server/discover` response.
+    ClosedDuringDiscovery(McpError),
+    Other(McpError),
+}
+
+impl ConnectFailure {
+    fn into_error(self) -> McpError {
+        match self {
+            Self::ClosedDuringDiscovery(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<McpError> for ConnectFailure {
+    fn from(error: McpError) -> Self {
+        Self::Other(error)
+    }
+}
+
+/// Classify an rmcp initialization error by variant.
+fn classify_initialize_error(
+    server: &str,
+    error: rmcp::service::ClientInitializeError,
+) -> ConnectFailure {
+    let closed = matches!(
+        &error,
+        rmcp::service::ClientInitializeError::ConnectionClosed(context)
+            if context == "discover response"
+    );
+    let error = McpError::operation(server, "initialize", error);
+    if closed {
+        ConnectFailure::ClosedDuringDiscovery(error)
+    } else {
+        ConnectFailure::Other(error)
     }
 }
 
@@ -659,7 +696,7 @@ async fn connect_transport<T>(
     transport: T,
     stderr_task: Option<StderrTask>,
     lifecycle: ClientLifecycleMode,
-) -> Result<ConnectedServer, McpError>
+) -> Result<ConnectedServer, ConnectFailure>
 where
     T: Transport<RoleClient> + 'static,
     T::Error: std::error::Error + Send + Sync + 'static,
@@ -668,7 +705,7 @@ where
         Ok(handler) => handler,
         Err(error) => {
             abort_stderr_task(stderr_task).await;
-            return Err(error);
+            return Err(error.into());
         }
     };
     let server_cancel = cancel.child_token();
@@ -686,13 +723,13 @@ where
         _ = server_cancel.cancelled() => {
             server_cancel.cancel();
             abort_stderr_task(stderr_task).await;
-            return Err(McpError::operation(&server.name, "initialize", "cancelled"));
+            return Err(McpError::operation(&server.name, "initialize", "cancelled").into());
         }
         result = &mut initialize => match result {
             Ok(Ok(client)) => client,
             Ok(Err(error)) => {
                 abort_stderr_task(stderr_task).await;
-                return Err(McpError::operation(&server.name, "initialize", error));
+                return Err(classify_initialize_error(&server.name, error));
             }
             Err(_) => {
                 server_cancel.cancel();
@@ -701,7 +738,8 @@ where
                     &server.name,
                     "initialize",
                     "request timed out",
-                ));
+                )
+                .into());
             }
         }
     };
@@ -713,7 +751,7 @@ where
                 let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
             }
             abort_stderr_task(stderr_task).await;
-            return Err(error);
+            return Err(error.into());
         }
     };
     tracing::debug!(server = %server.name, tools = tools.len(), "connected MCP server");
@@ -915,6 +953,15 @@ mod tests {
         let (output, error) = read_guarded(reader).await;
         assert_eq!(output, b"ok\n12345678");
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn only_discover_connection_close_selects_legacy_fallback() {
+        use rmcp::service::ClientInitializeError::ConnectionClosed;
+        let closed = classify_initialize_error("s", ConnectionClosed("discover response".into()));
+        assert!(matches!(closed, ConnectFailure::ClosedDuringDiscovery(_)));
+        let other = classify_initialize_error("s", ConnectionClosed("initialize response".into()));
+        assert!(matches!(other, ConnectFailure::Other(_)));
     }
 
     #[derive(Clone, Default)]
