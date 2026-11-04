@@ -623,9 +623,6 @@ mod tests {
         assert!(auth.refresh().await.is_err());
         assert_eq!(count.load(Ordering::SeqCst), 0);
         // Logged out elsewhere: report it and drop the stale cache.
-        store
-            .save_provider_value("anthropic-subscription", json!(null))
-            .unwrap();
         let _ = std::fs::remove_file(store.path());
         assert!(matches!(
             auth.refresh().await,
