@@ -221,51 +221,40 @@ impl AnthropicSubscriptionAuth {
                 return Err(error);
             }
         };
-        let mut credential = credential_from_token(&value, Some(&old))?;
+        let credential = credential_from_token(&value, Some(&old))?;
         // Compare and save under the auth-file lock. A separate process may
         // have rotated the credential while this exchange was in flight; in
-        // that case never overwrite its newer generation.
-        let mut expected = old;
-        for _ in 0..3 {
-            if self
-                .store
-                .save_anthropic_subscription_if_current(&expected, &credential)?
-            {
-                *self.credential.lock().map_err(|_| {
-                    AuthError::AnthropicSubscription("credential lock poisoned".into())
-                })? = Some(credential.clone());
-                return Ok(credential);
-            }
-            let current = self.store.anthropic_subscription()?.ok_or_else(|| {
-                AuthError::AnthropicSubscription("credential changed during refresh".into())
-            })?;
-            // Only account metadata changed on disk (for example another
-            // process enriched the email or organisation). Its token pair is
-            // the one this exchange just consumed, so adopting it would keep
-            // a dead refresh token. Keep the new tokens, take the newer
-            // metadata, and compare against the value now on disk.
-            if same_tokens(&current, &expected) {
-                credential.account_id = current.account_id.clone();
-                credential.email = current.email.clone();
-                credential.org_id = current.org_id.clone();
-                credential.org_name = current.org_name.clone();
-                expected = current;
-                continue;
-            }
-            // Another process rotated the tokens. Adopt them only if they are
-            // usable and are not the access token the provider just rejected.
-            if !current.is_complete()
-                || current.is_expired()
-                || rejected == Some(current.access.as_str())
-            {
-                return Err(fail("credential changed during refresh; retry login"));
-            }
+        // that case never overwrite its newer generation. Metadata-only
+        // drift is not a new generation: the store keeps the on-disk
+        // metadata and these new tokens win.
+        if self
+            .store
+            .save_anthropic_subscription_if_current(&old, &credential)?
+        {
+            // Cache what was actually written (it may carry merged metadata).
+            let saved = self.store.anthropic_subscription()?.unwrap_or(credential);
             *self.credential.lock().map_err(|_| {
                 AuthError::AnthropicSubscription("credential lock poisoned".into())
-            })? = Some(current.clone());
-            return Ok(current);
+            })? = Some(saved.clone());
+            return Ok(saved);
         }
-        Err(fail("credential kept changing during refresh; try again"))
+        let current = self.store.anthropic_subscription()?.ok_or_else(|| {
+            AuthError::AnthropicSubscription("credential changed during refresh".into())
+        })?;
+        // Another process rotated the tokens. Adopt them only if they are
+        // usable and are not the access token the provider just rejected.
+        if !current.is_complete()
+            || current.is_expired()
+            || rejected == Some(current.access.as_str())
+        {
+            return Err(fail("credential changed during refresh; retry login"));
+        }
+        *self
+            .credential
+            .lock()
+            .map_err(|_| AuthError::AnthropicSubscription("credential lock poisoned".into()))? =
+            Some(current.clone());
+        Ok(current)
     }
     fn persist(&self, credential: AnthropicSubscriptionCredential) -> Result<()> {
         self.store.save_anthropic_subscription(&credential)?;
@@ -344,11 +333,6 @@ impl AnthropicSubscriptionAuth {
 }
 fn fail(message: &str) -> AuthError {
     AuthError::AnthropicSubscription(message.into())
-}
-/// Whether two credentials carry the same token generation, ignoring
-/// account metadata such as email or organisation.
-fn same_tokens(a: &AnthropicSubscriptionCredential, b: &AnthropicSubscriptionCredential) -> bool {
-    a.access == b.access && a.refresh == b.refresh && a.expires == b.expires
 }
 fn credential_from_token(
     value: &Value,

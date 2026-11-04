@@ -212,16 +212,13 @@ impl AnthropicSubscriptionCredential {
     }
 
     /// Returns whether two credentials describe the same persisted Anthropic subscription
-    /// generation. Token values, expiry, and account identity all belong to
-    /// the generation; the credential type is validated separately.
+    /// generation. The generation is the token triple (access, refresh,
+    /// expiry); account id, email, and organisation are metadata and never
+    /// part of identity, matching [`Self::is_newer_generation_than`].
     pub fn has_same_generation(&self, other: &Self) -> bool {
         self.access == other.access
             && self.refresh == other.refresh
             && self.expires == other.expires
-            && self.account_id == other.account_id
-            && self.email == other.email
-            && self.org_id == other.org_id
-            && self.org_name == other.org_name
     }
 
     /// Whether this is a valid generation newer than `previous`.
@@ -237,7 +234,6 @@ impl AnthropicSubscriptionCredential {
             && !self.is_expired()
             && (self.access != previous.access
                 || self.refresh != previous.refresh
-                || self.account_id != previous.account_id
                 || self.expires > previous.expires)
     }
 }
@@ -356,7 +352,7 @@ impl fmt::Debug for RedactedCredential<'_> {
 /// Every provider shares the same locking, private-permission, and
 /// read-modify-write mechanics; only the key, the error text, and the
 /// compare-and-save rule differ, so those are the only things captured here.
-trait StoredCredential: Serialize + DeserializeOwned {
+trait StoredCredential: Serialize + DeserializeOwned + Clone {
     /// Entry name in `auth.json`.
     const PROVIDER_KEY: &'static str;
 
@@ -375,6 +371,12 @@ trait StoredCredential: Serialize + DeserializeOwned {
     /// Whether the persisted `stored` value is still the generation a refresh
     /// started from, so its result may replace it.
     fn is_current(stored: &Self, expected: &Self) -> bool;
+
+    /// Called under the auth-file lock once `stored` is known to be current,
+    /// before `new` replaces it. Lets a provider keep metadata that was
+    /// updated on disk (and untouched by the refresh) while the exchange
+    /// was in flight. Metadata is not part of generation identity.
+    fn carry_over_metadata(_stored: &Self, _expected: &Self, _new: &mut Self) {}
 }
 
 impl StoredCredential for CopilotCredential {
@@ -388,10 +390,13 @@ impl StoredCredential for CopilotCredential {
         AuthError::InvalidCredential("credential is missing its OAuth token fields".into())
     }
 
-    /// Copilot compares only the token pair, not expiry or enrichment such
-    /// as `available_model_ids`.
+    /// The token triple (access, refresh, expiry) is the generation;
+    /// enrichment such as `available_model_ids` is not, so model-list
+    /// updates keep matching.
     fn is_current(stored: &Self, expected: &Self) -> bool {
-        stored.access == expected.access && stored.refresh == expected.refresh
+        stored.access == expected.access
+            && stored.refresh == expected.refresh
+            && stored.expires == expected.expires
     }
 }
 
@@ -416,6 +421,21 @@ impl StoredCredential for AnthropicSubscriptionCredential {
 
     fn is_current(stored: &Self, expected: &Self) -> bool {
         stored.is_complete() && stored.has_same_generation(expected)
+    }
+
+    fn carry_over_metadata(stored: &Self, expected: &Self, new: &mut Self) {
+        if new.account_id == expected.account_id {
+            new.account_id = stored.account_id.clone();
+        }
+        if new.email == expected.email {
+            new.email = stored.email.clone();
+        }
+        if new.org_id == expected.org_id {
+            new.org_id = stored.org_id.clone();
+        }
+        if new.org_name == expected.org_name {
+            new.org_name = stored.org_name.clone();
+        }
     }
 }
 
@@ -607,28 +627,33 @@ impl AuthStore {
         expected: &T,
         credential: &T,
     ) -> Result<bool> {
-        let value = self.encode_provider(credential)?;
-        self.save_provider_value_if_current(T::PROVIDER_KEY, value, |current| {
-            current
+        self.encode_provider(credential)?;
+        self.save_provider_value_if_current(T::PROVIDER_KEY, |current| {
+            let Some(stored) = current
                 .and_then(|value| serde_json::from_value::<T>(value.clone()).ok())
-                .is_some_and(|current| T::is_current(&current, expected))
+                .filter(|stored| T::is_current(stored, expected))
+            else {
+                return Ok(None);
+            };
+            let mut merged = credential.clone();
+            T::carry_over_metadata(&stored, expected, &mut merged);
+            self.encode_provider(&merged).map(Some)
         })
     }
 
     fn save_provider_value_if_current(
         &self,
         provider: &str,
-        value: serde_json::Value,
-        matches: impl FnOnce(Option<&serde_json::Value>) -> bool,
+        replacement: impl FnOnce(Option<&serde_json::Value>) -> Result<Option<serde_json::Value>>,
     ) -> Result<bool> {
         let parent = self.parent_dir();
         private_dir_all(&parent)?;
         ensure_private_directory(&parent)?;
         let _lock = AuthFileLock::acquire(&self.path)?;
         let mut entries = self.load_unlocked()?;
-        if !matches(entries.get(provider)) {
+        let Some(value) = replacement(entries.get(provider))? else {
             return Ok(false);
-        }
+        };
         entries.insert(provider.to_owned(), value);
         self.write_unlocked(&entries)?;
         Ok(true)
@@ -1122,6 +1147,51 @@ mod tests {
         assert!(store.save_copilot_if_current(&old, &current).unwrap());
         assert!(!store.save_copilot_if_current(&old, &stale_result).unwrap());
         assert_eq!(store.copilot().unwrap().unwrap(), current);
+    }
+
+    #[test]
+    fn anthropic_generation_ignores_metadata_and_keeps_disk_metadata_on_save() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let mut old = AnthropicSubscriptionCredential::new("a", "r", u64::MAX - 1, "acct");
+        old.expires = u64::MAX - 1;
+        let mut enriched = old.clone();
+        enriched.email = Some("a@example.com".into());
+        // Same predicate family: metadata is neither "same" breaking nor "newer".
+        assert!(old.has_same_generation(&enriched));
+        assert!(!enriched.is_newer_generation_than(&old));
+
+        store.save_anthropic_subscription(&enriched).unwrap();
+        let mut refreshed = old.clone();
+        refreshed.access = "a2".into();
+        refreshed.refresh = "r2".into();
+        // `old` (no email) is still the generation on disk, so the save wins
+        // and keeps the email another process wrote meanwhile.
+        assert!(
+            store
+                .save_anthropic_subscription_if_current(&old, &refreshed)
+                .unwrap()
+        );
+        let disk = store.anthropic_subscription().unwrap().unwrap();
+        assert_eq!(disk.refresh, "r2");
+        assert_eq!(disk.email.as_deref(), Some("a@example.com"));
+    }
+
+    #[test]
+    fn copilot_compare_and_save_rejects_stale_expiry_but_accepts_enrichment() {
+        let directory = tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        let mut old = credential();
+        old.expires = 1_000;
+        let mut extended = old.clone();
+        extended.expires = 2_000;
+        let mut enriched = old.clone();
+        enriched.available_model_ids = vec!["m".into()];
+        store.save_copilot(&old).unwrap();
+        assert!(store.save_copilot_if_current(&old, &enriched).unwrap());
+        store.save_copilot(&extended).unwrap();
+        assert!(!store.save_copilot_if_current(&old, &enriched).unwrap());
+        assert_eq!(store.copilot().unwrap().unwrap(), extended);
     }
 
     #[test]
