@@ -160,8 +160,16 @@ impl AnthropicSubscriptionAuth {
             .store
             .acquire_refresh_lease(crate::storage::ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY)
             .await?;
-        let mut expired_stored = None;
-        if let Ok(Some(current)) = self.store.anthropic_subscription() {
+        // Reload after taking the lease. Disk read failures propagate and a
+        // missing entry means logged out: neither may fall back to the cache,
+        // whose refresh token another process may already have consumed.
+        let Some(current) = self.store.anthropic_subscription()? else {
+            *self.credential.lock().map_err(|_| {
+                AuthError::AnthropicSubscription("credential lock poisoned".into())
+            })? = None;
+            return Err(AuthError::AnthropicSubscriptionNotAuthenticated);
+        };
+        {
             let cached = self
                 .credential
                 .lock()
@@ -191,17 +199,11 @@ impl AnthropicSubscriptionAuth {
                 })? = Some(current.clone());
                 return Ok(current);
             }
-            // Both copies have expired. The on-disk generation is still
-            // authoritative for the refresh token: another process may
-            // have rotated it since this handle cached its old credential.
-            expired_stored = Some(current);
         }
-        let old = match expired_stored {
-            Some(current) => current,
-            None => self
-                .credential()?
-                .ok_or(AuthError::AnthropicSubscriptionNotAuthenticated)?,
-        };
+        // Both copies have expired. The on-disk generation is authoritative
+        // for the refresh token: another process may have rotated it since
+        // this handle cached its old credential.
+        let old = current;
         // Refresh exchanges use strict status handling like the browser
         // flow: only 2xx with a token payload succeeds.
         let value = self
@@ -598,6 +600,38 @@ mod tests {
                 0o600
             );
         }
+        task.abort();
+    }
+    #[tokio::test]
+    async fn unreadable_or_removed_disk_credential_never_refreshes_the_cached_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        store.save_anthropic_subscription(&old()).unwrap();
+        let (endpoints, count, task) = fixture(
+            200,
+            json!({"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600})
+                .to_string(),
+        )
+        .await;
+        let auth = AnthropicSubscriptionAuth::new(store.clone())
+            .unwrap()
+            .with_endpoints(endpoints);
+        // The cached credential is expired; the disk entry is now damaged.
+        store
+            .save_provider_value("anthropic-subscription", json!({"type":"oauth"}))
+            .unwrap();
+        assert!(auth.refresh().await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // Logged out elsewhere: report it and drop the stale cache.
+        store
+            .save_provider_value("anthropic-subscription", json!(null))
+            .unwrap();
+        let _ = std::fs::remove_file(store.path());
+        assert!(matches!(
+            auth.refresh().await,
+            Err(AuthError::AnthropicSubscriptionNotAuthenticated)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
         task.abort();
     }
     #[tokio::test]
