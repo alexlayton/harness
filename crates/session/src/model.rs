@@ -673,9 +673,23 @@ pub(crate) struct ToolCallTracker {
     completed: HashSet<String>,
     /// True when the tail was explicitly cancelled (`TurnCancelled`/`Error`).
     cancelled: bool,
+    /// Replay mode for logs that already exist on disk: keep calls pending
+    /// across a following turn, as earlier versions did, so a late result
+    /// written by such a version still validates and the file still loads.
+    /// New appends use the default (closing) behavior.
+    legacy_replay: bool,
 }
 
 impl ToolCallTracker {
+    /// Tracker that replays the pre-close-on-new-turn rules, used as a
+    /// fallback when loading so logs written by older versions still load.
+    pub(crate) fn for_legacy_replay() -> Self {
+        Self {
+            legacy_replay: true,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn pending(&self) -> &[String] {
         &self.pending
     }
@@ -718,6 +732,7 @@ impl ToolCallTracker {
         // never be answered in valid provider order (a result after a user
         // message), so close them instead of letting them block fresh calls.
         if self.cancelled
+            && !self.legacy_replay
             && matches!(
                 event,
                 SessionEvent::UserMessage { .. }
@@ -960,8 +975,19 @@ fn events_after_compaction(
 /// reused ID is rejected even after completion or cancellation, because the
 /// durable log has no call-instance identity beyond the ID.
 pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
+    // Loading must accept every log that either this version or an earlier
+    // one could have written. They differ only in what follows an `Error`
+    // tail: now pending calls close when a new turn starts (so fresh calls
+    // can be answered), earlier versions kept them (so a late result after a
+    // user message validated). Accept a log valid under either rule; only
+    // new appends are held to the current one.
+    validate_events_with(events, ToolCallTracker::default()).or_else(|current| {
+        validate_events_with(events, ToolCallTracker::for_legacy_replay()).map_err(|_| current)
+    })
+}
+
+fn validate_events_with(events: &[SessionEventRecord], mut tracker: ToolCallTracker) -> Result<()> {
     let mut ids = HashSet::new();
-    let mut tracker = ToolCallTracker::default();
     let mut compaction_boundary = None;
     for (index, record) in events.iter().enumerate() {
         validate_record(
@@ -2026,14 +2052,44 @@ mod tests {
     }
 
     #[test]
-    fn late_result_after_error_and_user_message_is_rejected() {
+    fn late_result_after_error_and_user_message_is_rejected_for_new_appends_only() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        let record = SessionEventRecord {
+            id: EventId::new(),
+            sequence: session.events.last().unwrap().sequence + 1,
+            timestamp: now_timestamp(),
+            event: SessionEvent::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "late".into(),
+                is_error: false,
+                tool_name: Some("read".into()),
+            },
+        };
+        // A new append is refused...
+        assert!(validate_next_event(&session, &record).is_err());
+        // ...but a log already on disk with that shape (written by an
+        // earlier version) must still validate, or the session would no
+        // longer load.
+        let mut events = session.events.clone();
+        events.push(record);
+        validate_events(&events).unwrap();
+    }
+
+    #[test]
+    fn legacy_log_with_late_result_after_user_message_still_decodes() {
         let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
         push_user(&mut session, "hi");
         push_tool_call(&mut session, "call-1", "read");
         push_error(&mut session);
         push_user(&mut session, "again");
         push_tool_result(&mut session, "call-1");
-        assert!(validate_events(&session.events).is_err());
+        let encoded = crate::codec::encode_session(&session).unwrap();
+        let decoded = crate::codec::decode_session(&encoded, "<memory>").unwrap();
+        assert_eq!(decoded.events, session.events);
     }
 
     #[test]
