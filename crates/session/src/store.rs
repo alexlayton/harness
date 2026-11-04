@@ -309,10 +309,17 @@ impl SessionStore {
             return Ok(());
         };
         self.ensure_path_in_root(path)?;
-        let file = OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|source| io_error("open session for sync", path, source))?;
+        let file = match OpenOptions::new().append(true).open(path) {
+            Ok(file) => file,
+            Err(source) => {
+                // A deleted session has nothing left to flush; keeping its
+                // entry would report a debt that can never be paid.
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    self.deferred_sync.owed().remove(path);
+                }
+                return Err(io_error("open session for sync", path, source));
+            }
+        };
         file.sync_all()
             .map_err(|source| io_error("sync session", path, source))?;
         // Clear only after success so a failed flush stays owed.
@@ -3241,6 +3248,40 @@ mod tests {
         assert!(lease.covers(&session));
         let other = store.create(SessionCreateOptions::default()).unwrap();
         assert!(!lease.covers(&other), "lease guards only its own file");
+        // The lock is real: a second claim is refused until the first drops.
+        assert!(matches!(
+            store.acquire_active(&session),
+            Err(SessionError::AlreadyActive(_))
+        ));
+        drop(lease);
+        assert!(store.acquire_active(&session).is_ok());
+
+        // A memory-only lease holds no lock and guards only file-less sessions.
+        let memory = Session::new(SessionMetadata::new("/workspace", None, None));
+        let memory_lease = store.acquire_active(&memory).unwrap();
+        assert!(!memory_lease.is_file_backed());
+        assert!(memory_lease.covers(&memory));
+        assert!(!memory_lease.covers(&session));
+    }
+
+    #[test]
+    fn sync_debt_is_not_recorded_without_deferred_mode_and_dropped_on_delete() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store.append_event(&mut session, message("one")).unwrap();
+        assert!(!store.sync_owed(&session), "per-event fsync owes nothing");
+
+        let store = store.with_deferred_sync(true);
+        store.append_event(&mut session, message("two")).unwrap();
+        assert!(store.sync_owed(&session));
+        fs::remove_file(session.file_path().unwrap()).unwrap();
+        store.sync_session(&session).expect_err("file is gone");
+        assert!(!store.sync_owed(&session), "vanished file owes nothing");
     }
 
     #[test]
