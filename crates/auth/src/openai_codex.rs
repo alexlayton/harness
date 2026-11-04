@@ -1081,6 +1081,25 @@ mod tests {
         assert!(credential_from_token(&body, Some("refresh-old")).is_err());
     }
 
+    #[tokio::test]
+    async fn login_persist_waits_for_an_in_flight_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        let auth = OpenAiCodexAuth::new(store.clone()).unwrap();
+        let guard = auth.refresh_lock.lock().await;
+        let login = auth.clone();
+        let task = tokio::spawn(async move { login.persist(cached_codex_credential()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "login must queue behind refresh");
+        assert!(store.openai_codex().unwrap().is_none());
+        drop(guard);
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            store.openai_codex().unwrap().unwrap(),
+            cached_codex_credential()
+        );
+    }
+
     fn cached_codex_credential() -> OpenAiCodexCredential {
         OpenAiCodexCredential::new("access-cached", "refresh-cached", u64::MAX - 1, "acct")
     }
