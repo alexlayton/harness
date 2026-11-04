@@ -957,6 +957,50 @@ mod tests {
         assert!(parser.finish().unwrap().is_empty());
     }
 
+    fn assert_call_then_done(events: &[StreamEvent]) {
+        assert_eq!(events.len(), 2, "got {events:?}");
+        assert!(matches!(&events[0], StreamEvent::ToolCallComplete(c) if c.id == "call-1"));
+        assert!(matches!(
+            &events[1],
+            StreamEvent::Done { stop_reason: Some(r), usage: Some(u) }
+                if r == "tool_calls" && u.input_tokens == 3 && u.output_tokens == 4
+        ));
+    }
+
+    #[test]
+    fn usage_in_separate_chunk_after_finish_reason_completes() {
+        let mut parser = ChatStreamParser::new();
+        parser.parse_payload(CALL_DELTA).unwrap();
+        assert!(parser.parse_payload(FINISH_TOOLS).unwrap().is_empty());
+        let events = parser
+            .parse_payload(r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#)
+            .unwrap();
+        assert_call_then_done(&events);
+        assert!(parser.parse_payload("[DONE]").unwrap().is_empty());
+    }
+
+    #[test]
+    fn finish_reason_and_usage_in_same_chunk_completes_without_done_marker() {
+        let mut parser = ChatStreamParser::new();
+        parser.parse_payload(CALL_DELTA).unwrap();
+        let events = parser
+            .parse_payload(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#)
+            .unwrap();
+        assert_call_then_done(&events);
+        assert!(parser.finish().unwrap().is_empty());
+    }
+
+    #[test]
+    fn usage_chunk_with_null_finish_reason_after_finish_completes() {
+        let mut parser = ChatStreamParser::new();
+        parser.parse_payload(CALL_DELTA).unwrap();
+        parser.parse_payload(FINISH_TOOLS).unwrap();
+        let events = parser
+            .parse_payload(r#"{"choices":[{"delta":{},"finish_reason":null}],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#)
+            .unwrap();
+        assert_call_then_done(&events);
+    }
+
     #[test]
     fn stream_error_after_partial_output_remains_an_error() {
         // Partial text followed by a mid-stream provider error payload is
