@@ -196,9 +196,29 @@ fn valid_cut_points(live: &[&SessionEventRecord]) -> Vec<usize> {
 fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
     let mut pending = Vec::<String>::new();
     let mut cut_points = Vec::new();
+    // Mirrors `session`'s tracker: after an `Error` or cancellation, the next
+    // user/assistant/tool-call event abandons any calls still pending.
+    let mut cancelled = false;
+    // Calls abandoned by that rule, with the index that abandoned them. A
+    // legacy log may still answer one later; a cut between the two would
+    // summarize the call and retain its result.
+    let mut abandoned = Vec::<(String, usize)>::new();
+    let mut late_results = Vec::<(usize, usize)>::new();
     for (index, record) in live.iter().enumerate() {
+        // Checked before the tail is closed: a boundary at the event that
+        // closes it would still leave the call unresolved for validation.
         if is_cut_point(record) && pending.is_empty() {
             cut_points.push(index);
+        }
+        if cancelled
+            && matches!(
+                record.event,
+                SessionEvent::UserMessage { .. }
+                    | SessionEvent::AssistantMessage { .. }
+                    | SessionEvent::ToolCall { .. }
+            )
+        {
+            abandoned.extend(pending.drain(..).map(|id| (id, index)));
         }
         match &record.event {
             SessionEvent::AssistantMessage { message } => {
@@ -207,17 +227,27 @@ fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
                         pending.push(id.clone());
                     }
                 }
+                cancelled = false;
             }
-            SessionEvent::ToolCall { call } => pending.push(call.id.clone()),
+            SessionEvent::ToolCall { call } => {
+                pending.push(call.id.clone());
+                cancelled = false;
+            }
             SessionEvent::ToolResult { tool_call_id, .. } => {
+                if let Some((_, closed_at)) = abandoned.iter().find(|(id, _)| id == tool_call_id) {
+                    late_results.push((*closed_at, index));
+                }
                 if let Some(position) = pending.iter().position(|id| id == tool_call_id) {
                     pending.remove(position);
                 }
             }
-            SessionEvent::TurnCancelled { .. } => pending.clear(),
+            SessionEvent::TurnCancelled { .. } => {
+                pending.clear();
+                cancelled = true;
+            }
+            SessionEvent::Error { .. } => cancelled = true,
             SessionEvent::UserMessage { .. }
             | SessionEvent::Reasoning { .. }
-            | SessionEvent::Error { .. }
             | SessionEvent::ModelChange { .. }
             | SessionEvent::Usage { .. }
             | SessionEvent::MetadataChange { .. }
@@ -225,6 +255,11 @@ fn scan_cut_points(live: &[&SessionEventRecord]) -> (Vec<usize>, bool) {
             | SessionEvent::Unknown { .. } => {}
         }
     }
+    cut_points.retain(|cut| {
+        !late_results
+            .iter()
+            .any(|(closed_at, result_at)| (*closed_at..=*result_at).contains(cut))
+    });
     let resolved = pending.is_empty();
     (cut_points, resolved)
 }
@@ -340,7 +375,7 @@ mod tests {
     use super::*;
     use llm::Message;
     use serde_json::json;
-    use session::model::{Session, SessionMetadata, StoredMessage, StoredToolCall};
+    use session::model::{EventId, Session, SessionMetadata, StoredMessage, StoredToolCall};
 
     fn new_session() -> Session {
         Session::new(SessionMetadata::new("/tmp/project", None, None))
@@ -377,6 +412,75 @@ mod tests {
             is_error: false,
             tool_name: None,
         });
+    }
+
+    #[test]
+    fn overflow_compaction_summarizes_after_mid_tool_call_error() {
+        let mut session = new_session();
+        push_user(&mut session, "start");
+        push_tool_call(&mut session, "call-a", "read");
+        session.append(SessionEvent::Error {
+            message: "stream died".into(),
+        });
+        push_user(&mut session, &"z".repeat(400_000));
+        push_assistant(&mut session, "answer");
+        let policy = CompactionPolicy {
+            keep_recent_turns: 1,
+            keep_recent_tokens: 20_000,
+            ..CompactionPolicy::default()
+        };
+        let plan = plan_overflow_compaction(&session, &policy, 500_000)
+            .expect("an error tail must not block overflow compaction");
+        // Never the user message that closes the error tail: validation
+        // still sees the call as unresolved at that boundary.
+        let closing_user = session.events[3].sequence;
+        assert!(plan.boundary > closing_user);
+    }
+
+    #[test]
+    fn legacy_late_result_is_never_split_from_its_call_by_a_cut() {
+        let mut session = new_session();
+        push_user(&mut session, "start");
+        push_tool_call(&mut session, "call-a", "read");
+        session.append(SessionEvent::Error {
+            message: "stream died".into(),
+        });
+        push_user(&mut session, "again");
+        push_assistant(&mut session, "thinking");
+        // Shape written by earlier versions: the result lands after the turn.
+        let sequence = session.events.last().unwrap().sequence + 1;
+        let mut late = session.events[1].clone();
+        late.id = EventId::new();
+        late.sequence = sequence;
+        late.event = SessionEvent::ToolResult {
+            tool_call_id: "call-a".into(),
+            content: "late".into(),
+            is_error: false,
+            tool_name: Some("read".into()),
+        };
+        session.events.push(late);
+        let live = session.events.iter().collect::<Vec<_>>();
+        // user(0) call(1) error(2) user(3) assistant(4) result(5): cuts at
+        // 3 and 4 would split call-a from its result.
+        assert_eq!(scan_cut_points(&live).0, vec![0, 1]);
+    }
+
+    #[test]
+    fn bare_error_tail_is_not_compacted() {
+        let mut session = new_session();
+        push_user(&mut session, &"z".repeat(400_000));
+        push_tool_call(&mut session, "call-a", "read");
+        session.append(SessionEvent::Error {
+            message: "stream died".into(),
+        });
+        let policy = CompactionPolicy {
+            keep_recent_turns: 1,
+            keep_recent_tokens: 20_000,
+            ..CompactionPolicy::default()
+        };
+        let live = session.events.iter().collect::<Vec<_>>();
+        assert!(!scan_cut_points(&live).1);
+        assert!(plan_overflow_compaction(&session, &policy, 500_000).is_none());
     }
 
     #[test]

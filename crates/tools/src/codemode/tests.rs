@@ -61,6 +61,16 @@ fn snippet(code: &str) -> Value {
 }
 
 #[tokio::test]
+async fn nested_entry_point_is_rejected_outside_a_running_workflow() {
+    let (registry, calls) = registry("echo");
+    let (output, _) = registry
+        .execute_codemode_tool("echo", json!({"a": 1}), CancellationToken::new())
+        .await;
+    assert!(output.is_error);
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn structured_dependent_calls_preserve_names_and_hold_gate_once() {
     let (mut registry, calls) = registry("mcp__server__tool-with-dashes");
     let gate = Arc::new(tokio::sync::Mutex::new(()));
@@ -505,6 +515,101 @@ async fn describe_returns_schemas_beyond_tool_result_limits() {
     assert!(!output.is_error, "{}", output.content);
     assert!(
         output.content.contains("(1500, 18446744073709551615)"),
+        "{}",
+        output.content
+    );
+}
+
+/// Records events like the durable log and can refuse selected acknowledgements.
+struct LogExecutor {
+    log: Mutex<Vec<&'static str>>,
+    fail_started: bool,
+    fail_finished: bool,
+}
+
+#[async_trait]
+impl CodemodeExecutor for LogExecutor {
+    async fn call(
+        &self,
+        _name: &str,
+        args: Value,
+        _cancel: CancellationToken,
+    ) -> (ToolOutput, Option<Value>) {
+        (
+            ToolOutput {
+                content: args.to_string(),
+                summary: "echo".into(),
+                is_error: false,
+            },
+            None,
+        )
+    }
+
+    async fn record(&self, event: CodemodeEvent) -> Result<(), String> {
+        // The event is durable even when its acknowledgement is lost.
+        let (kind, fail) = match event {
+            CodemodeEvent::Started { .. } => ("started", self.fail_started),
+            CodemodeEvent::Finished { .. } => ("finished", self.fail_finished),
+        };
+        self.log.lock().unwrap().push(kind);
+        if fail { Err("ack lost".into()) } else { Ok(()) }
+    }
+}
+
+#[tokio::test]
+async fn audit_never_outruns_or_lags_the_recorded_nested_events() {
+    let (registry, _) = registry("echo");
+    for (fail_started, fail_finished) in [(false, true), (true, false)] {
+        let executor = LogExecutor {
+            log: Mutex::new(Vec::new()),
+            fail_started,
+            fail_finished,
+        };
+        let output = registry
+            .execute_codemode(
+                snippet("tools['echo'](value=1)"),
+                CancellationToken::new(),
+                &executor,
+            )
+            .await;
+        assert!(output.is_error);
+        let log = executor.log.lock().unwrap().clone();
+        // One durable start, so the audit must report exactly one started call.
+        assert!(
+            output.content.starts_with("1 nested tool call(s) started"),
+            "{}",
+            output.content
+        );
+        // With no durable result the audit must not claim one.
+        assert!(
+            output
+                .content
+                .contains("1: echo — execution status unknown"),
+            "{log:?} {}",
+            output.content
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancel_during_interpreter_step_keeps_earlier_printed_output() {
+    let (registry, _) = registry("echo");
+    let cancel = CancellationToken::new();
+    let trigger = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        trigger.cancel();
+    });
+    let output = registry
+        .execute(
+            "codemode",
+            snippet("print('printed-before-cancel')\nwhile True:\n    pass"),
+            cancel,
+        )
+        .await;
+    assert!(output.is_error, "{}", output.content);
+    assert!(
+        output.content.contains("printed-before-cancel"),
         "{}",
         output.content
     );

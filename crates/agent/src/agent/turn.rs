@@ -12,6 +12,62 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Which recoverable failure a re-stream is answering. Each kind has its own
+/// budget so a burst of one (say, flaky streams) cannot leave the others
+/// (an empty response, a parse error) with no recovery at all.
+#[derive(Clone, Copy)]
+enum RecoveryKind {
+    Parse,
+    Retryable,
+    Empty,
+}
+
+/// Per-kind counts of recoveries spent this turn, each bounded by
+/// `MAX_TURN_RECOVERIES`.
+#[derive(Default)]
+struct Recoveries {
+    parse: usize,
+    retryable: usize,
+    empty: usize,
+}
+
+impl Recoveries {
+    /// Spend one recovery of `kind`; `false` once that kind's budget is gone.
+    fn take(&mut self, kind: RecoveryKind) -> bool {
+        let used = match kind {
+            RecoveryKind::Parse => &mut self.parse,
+            RecoveryKind::Retryable => &mut self.retryable,
+            RecoveryKind::Empty => &mut self.empty,
+        };
+        if *used < MAX_TURN_RECOVERIES {
+            *used += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Agent {
+    /// Persist a cancellation marker whose text reflects *why* the turn
+    /// stopped: "application shutdown" when the application token fired
+    /// (even if the turn token was cancelled as a consequence), otherwise
+    /// `interrupted`. One chooser keeps the durable record consistent at
+    /// every cancellation site.
+    pub(crate) fn persist_cancelled_for(
+        &mut self,
+        interrupted: &str,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(), TurnError> {
+        let reason = if self.cancel.is_cancelled() {
+            "application shutdown"
+        } else {
+            interrupted
+        };
+        self.persist_cancelled(reason, events)
+    }
+}
+
 impl Agent {
     /// The single shared turn executor used by normal user messages and
     /// skill-invoked messages alike. It owns the whole operation boundary:
@@ -58,6 +114,23 @@ impl Agent {
         control
     }
 
+    /// Append a non-durable note to history and remember it so a compaction
+    /// rebuild can replay it ([`Self::replay_ephemeral_notes`]).
+    pub(crate) fn push_ephemeral_note(&mut self, note: String) {
+        push_recovery_note(&mut self.history, note.clone());
+        self.ephemeral_notes.push(note);
+    }
+
+    /// Re-append the in-memory notes after `history` was rebuilt from the
+    /// session. Without this a mid-turn compaction would drop a recovery
+    /// instruction (or prewalk handoff note) the model still needs while the
+    /// turn's recovery budget stays spent.
+    pub(crate) fn replay_ephemeral_notes(&mut self) {
+        for note in &self.ephemeral_notes {
+            push_recovery_note(&mut self.history, note.clone());
+        }
+    }
+
     /// Turn body: everything `run_turn` historically did, minus token
     /// construction and the deferred-sync flush (both owned by
     /// [`Self::execute_turn`]).
@@ -81,8 +154,8 @@ impl Agent {
         // threaded through the percent notice and `compact_and_reload` so
         // one pre-turn scans the live range a single time (PERF-1).
         if let Some(context) = self.should_auto_compact(&user_text) {
-            let percent = if self.context_window > 0 {
-                ((context as f64 / self.context_window as f64) * 100.0) as u32
+            let percent = if self.context_window.tokens() > 0 {
+                ((context as f64 / self.context_window.tokens() as f64) * 100.0) as u32
             } else {
                 0
             };
@@ -107,10 +180,13 @@ impl Agent {
             }
         }
 
+        // Notes from the previous turn survived the pre-turn rebuild above;
+        // from here on they are ordinary history until the next rebuild.
+        self.ephemeral_notes.clear();
         let user_message = Message::user(user_text);
         self.persist_user_message(&user_message, events)?;
         self.history.push(user_message.clone());
-        let mut recoveries = 0;
+        let mut recoveries = Recoveries::default();
         let mut overflow_recoveries = 0;
         let mut tool_rounds = 0usize;
         loop {
@@ -153,23 +229,23 @@ impl Agent {
                     // failed request can enter its retry path after Esc.
                     biased;
                     _ = self.cancel.cancelled() => {
-                        self.persist_cancelled("application shutdown", events)?;
+                        self.persist_cancelled_for("turn interrupted", events)?;
                         return Err(TurnError::Shutdown);
                     }
                     _ = cancel.cancelled() => break None,
-                    message = input.recv(), if self.input_open => match message {
+                    message = input.recv(), if self.input.open => match message {
                         Some(InputMessage::Interrupt) => {
                             cancel.cancel();
                             break None;
                         }
-                        Some(message) => self.queued.push_back(message),
-                        None => self.input_open = false,
+                        Some(message) => self.input.queued.push_back(message),
+                        None => self.input.open = false,
                     },
                     result = &mut provider_future => break Some(result),
                 }
             };
             let Some(stream_result) = stream_result else {
-                self.persist_cancelled("turn interrupted before response", events)?;
+                self.persist_cancelled_for("turn interrupted before response", events)?;
                 return Ok(());
             };
             let mut stream = match stream_result {
@@ -229,14 +305,14 @@ impl Agent {
                         cancelled = true;
                         break;
                     }
-                    message = input.recv(), if self.input_open => match message {
+                    message = input.recv(), if self.input.open => match message {
                         Some(InputMessage::Interrupt) => {
                             cancel.cancel();
                             cancelled = true;
                             break;
                         }
-                        Some(message) => self.queued.push_back(message),
-                        None => self.input_open = false,
+                        Some(message) => self.input.queued.push_back(message),
+                        None => self.input.open = false,
                     },
                     next = stream.next() => {
                         let Some(next) = next else {
@@ -310,7 +386,7 @@ impl Agent {
                         true,
                     ));
                 }
-                self.persist_cancelled("turn interrupted", events)?;
+                self.persist_cancelled_for("turn interrupted", events)?;
                 if self.cancel.is_cancelled() {
                     return Err(TurnError::Shutdown);
                 }
@@ -364,8 +440,7 @@ impl Agent {
                     // validation failures, not only malformed tool arguments.
                     // Calls from this interrupted round were closed above;
                     // do not blame or repeat calls from completed rounds.
-                    if recoveries < MAX_TURN_RECOVERIES {
-                        recoveries += 1;
+                    if recoveries.take(RecoveryKind::Parse) {
                         // Final-answer-only frontends discard the failed
                         // round, so its text must be given again in full.
                         let answer = match self.stream_recovery {
@@ -375,16 +450,13 @@ impl Agent {
                                  only the missing part."
                             }
                         };
-                        push_recovery_note(
-                            &mut self.history,
-                            format!(
-                                "[system note: the provider response could not be parsed \
+                        self.push_ephemeral_note(format!(
+                            "[system note: the provider response could not be parsed \
                                  ({parse_message}). Continue the task. Check the tool results \
                                  already in the conversation and do not repeat actions that \
                                  completed. If a tool call is still needed, issue it with \
                                  valid arguments.{answer}]"
-                            ),
-                        );
+                        ));
                         retried = true;
                     }
                 } else if error.is_retryable() {
@@ -392,8 +464,7 @@ impl Agent {
                     // frontends discard failed rounds. Match the recovery note
                     // to that contract so retries neither truncate one-shot
                     // answers nor duplicate already-streamed TUI/ACP text.
-                    if recoveries < MAX_TURN_RECOVERIES {
-                        recoveries += 1;
+                    if recoveries.take(RecoveryKind::Retryable) {
                         let instruction = match self.stream_recovery {
                             StreamRecovery::Continue => "continue from where you left off.",
                             StreamRecovery::Replace => {
@@ -402,13 +473,10 @@ impl Agent {
                                  actions that already completed."
                             }
                         };
-                        push_recovery_note(
-                            &mut self.history,
-                            format!(
-                                "[system note: your response stream was interrupted \
+                        self.push_ephemeral_note(format!(
+                            "[system note: your response stream was interrupted \
                                  ({message}); {instruction}]"
-                            ),
-                        );
+                        ));
                         retried = true;
                     }
                 }
@@ -421,11 +489,10 @@ impl Agent {
             if tool_calls.is_empty() {
                 // A turn that produced no text and no tool calls is almost
                 // always a provider stall (reasoning emitted, then nothing).
-                // Nudge once instead of silently ending the turn.
-                if text.trim().is_empty() && recoveries < MAX_TURN_RECOVERIES {
-                    recoveries += 1;
-                    push_recovery_note(
-                        &mut self.history,
+                // Nudge (up to the empty-response budget) instead of
+                // silently ending the turn.
+                if text.trim().is_empty() && recoveries.take(RecoveryKind::Empty) {
+                    self.push_ephemeral_note(
                         "[system note: your previous response produced no output; continue \
                          and complete the task.]"
                             .into(),
@@ -441,6 +508,18 @@ impl Agent {
             // The dispatcher marks the turn-scoped token when tool
             // execution is interrupted. Do not issue another provider
             // request; the shared turn boundary owns TurnFinished.
+            //
+            // The round is durable even when interrupted, so hand off first:
+            // otherwise an interrupted `edit` leaves prewalk armed and the
+            // next prompt plans again on the planning model.
+            if handoff {
+                // Provider switching persists a model-change event; never
+                // start that once the application is shutting down.
+                if self.cancel.is_cancelled() {
+                    return Err(TurnError::Shutdown);
+                }
+                self.prewalk_handoff(events).await?;
+            }
             if cancel.is_cancelled() {
                 return Ok(());
             }
@@ -448,11 +527,6 @@ impl Agent {
             // observed. That exact snapshot no longer describes the next
             // request, so use the complete-history estimator instead.
             self.last_context_tokens = None;
-            // The tool round is durable, so the next request can come from
-            // the prewalk target without splitting a call from its result.
-            if handoff {
-                self.prewalk_handoff(events).await?;
-            }
             // Headless, Python, and ACP runs have no Esc key: a model that
             // keeps calling tools must not run (and spend) without bound.
             // The round is complete, so stopping here leaves valid history;

@@ -95,6 +95,15 @@ pub struct SkillCatalog {
 }
 
 impl SkillCatalog {
+    /// Recompute `read_paths` from `skills`, so a host-supplied catalog whose
+    /// public fields were edited independently cannot advertise a skill the
+    /// `read` tool refuses (or allow paths for a skill that is not listed).
+    /// Registry construction applies this so both come from one source.
+    pub fn with_derived_read_paths(mut self) -> Self {
+        self.read_paths = derive_read_paths(&self.skills);
+        self
+    }
+
     /// Model-invocable skills in deterministic (discovery) order.
     pub fn invocable(&self) -> Vec<&Skill> {
         self.skills
@@ -575,9 +584,20 @@ pub fn discover(roots: &[(PathBuf, SkillMode)]) -> SkillCatalog {
     // path via `Skill::file_path`. Canonicalization matters on macOS,
     // where temp dirs hide behind a `/var` -> `/private/var` symlink: the
     // raw test-constructed paths would otherwise never match at read time.
-    let mut read_paths = Vec::with_capacity(all_skills.len() * 2);
+    let read_paths = derive_read_paths(&all_skills);
+    SkillCatalog {
+        skills: all_skills,
+        diagnostics: all_diagnostics,
+        read_paths,
+    }
+}
+
+/// Read allowlist for exactly these skills: each canonical skill file plus
+/// its canonical base dir, deduped in order.
+fn derive_read_paths(skills: &[Skill]) -> Vec<PathBuf> {
+    let mut read_paths = Vec::with_capacity(skills.len() * 2);
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
-    for skill in &all_skills {
+    for skill in skills {
         for path in [
             fs::canonicalize(&skill.file_path).unwrap_or_else(|_| skill.file_path.clone()),
             fs::canonicalize(&skill.base_dir).unwrap_or_else(|_| skill.base_dir.clone()),
@@ -587,11 +607,7 @@ pub fn discover(roots: &[(PathBuf, SkillMode)]) -> SkillCatalog {
             }
         }
     }
-    SkillCatalog {
-        skills: all_skills,
-        diagnostics: all_diagnostics,
-        read_paths,
-    }
+    read_paths
 }
 
 /// Format skills for the system prompt (Agent Skills XML): intro uses `read`,

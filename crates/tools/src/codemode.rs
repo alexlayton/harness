@@ -11,6 +11,7 @@ use monty_types::{
 };
 use serde_json::{Map, Value, json};
 use std::fmt::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -373,14 +374,14 @@ impl Codemode {
         // until its cooperative compute limit. It cannot dispatch host tools.
         let workflow_cancel = cancel.child_token();
         let _cancel_on_drop = workflow_cancel.clone().drop_guard();
-        let mut printed = String::new();
+        let printed: Printed = Arc::new(Mutex::new(String::new()));
         let mut audit = Vec::new();
         let mut salvaged = Vec::new();
         let deadline = tokio::time::Instant::now() + WALL_LIMIT;
         let result = tokio::select! {
             biased;
             _ = workflow_cancel.cancelled() => Err("cancelled; an unfinished nested call may have applied changes".into()),
-            result = tokio::time::timeout_at(deadline, self.drive(code.to_owned(), &mut printed, &mut audit, &mut salvaged, &workflow_cancel, executor)) => {
+            result = tokio::time::timeout_at(deadline, self.drive(code.to_owned(), &printed, &mut audit, &mut salvaged, &workflow_cancel, executor)) => {
                 result.unwrap_or_else(|_| Err("codemode elapsed-time limit exceeded; an unfinished nested call may have applied changes".into()))
             }
         };
@@ -388,11 +389,16 @@ impl Codemode {
             Ok(value) => value,
             Err(error) => {
                 let error = self.explain(error);
+                // The dropped drive future may have left an interpreter step
+                // running; recover what it had printed so far.
+                let printed = recover_printed(&printed).await;
                 return failure(&format_error(&error, &audit, &salvaged, &printed), summary);
             }
         };
         // Formatting is also computation: shared values can have enormous
         // representations. Keep it off Tokio and stop on the first full write.
+        let printed = recover_printed(&printed).await;
+        let printed_for_error = printed.clone();
         let render = tokio::task::spawn_blocking(move || {
             let mut output = super::python::BoundedOutput::new(String::new());
             if value != MontyObject::none() {
@@ -416,14 +422,17 @@ impl Codemode {
                 is_error: false,
                 summary,
             },
-            Err(error) => failure(&format_error(&error, &audit, &salvaged, ""), summary),
+            Err(error) => failure(
+                &format_error(&error, &audit, &salvaged, &printed_for_error),
+                summary,
+            ),
         }
     }
 
     async fn drive(
         &self,
         code: String,
-        printed: &mut String,
+        printed: &Printed,
         audit: &mut Vec<String>,
         salvaged: &mut Vec<String>,
         cancel: &CancellationToken,
@@ -500,6 +509,15 @@ impl Codemode {
                         };
                         let name = call.function_name.clone();
                         let call_id = call.call_id.to_string();
+                        // The host may persist the start and then lose the
+                        // acknowledgement (cancel/admission race), so the
+                        // audit entry must exist before the record attempt to
+                        // stay a superset of the durable log. Its text claims
+                        // nothing beyond "unknown" until a result is recorded.
+                        audit.push(format!(
+                            "{}: {name} — execution status unknown",
+                            audit.len() + 1
+                        ));
                         executor
                             .record(CodemodeEvent::Started {
                                 call_id: call_id.clone(),
@@ -512,10 +530,6 @@ impl Codemode {
                         if cancel.is_cancelled() {
                             return Err("cancelled before nested tool execution".into());
                         }
-                        audit.push(format!(
-                            "{}: {name} — execution status unknown",
-                            audit.len() + 1
-                        ));
                         let (mut output, structured) =
                             executor.call(&name, arguments, cancel.child_token()).await;
                         if output.content.len() > MAX_VALUE_BYTES {
@@ -563,8 +577,7 @@ impl Codemode {
                         } else {
                             "returned"
                         };
-                        *audit.last_mut().expect("admitted call") =
-                            format!("{}: {name} — {status}", audit.len());
+                        let finished = format!("{}: {name} — {status}", audit.len());
                         executor
                             .record(CodemodeEvent::Finished {
                                 call_id,
@@ -572,6 +585,10 @@ impl Codemode {
                                 output,
                             })
                             .await?;
+                        // Only claim a result once it is durable; if the
+                        // record above fails the log has no result for this
+                        // call, so the entry stays "execution status unknown".
+                        *audit.last_mut().expect("admitted call") = finished;
                         step(printed, move |print| call.resume(result, print)).await?
                     }
                 }
@@ -661,21 +678,67 @@ fn exception(message: &str) -> ExtFunctionResult {
 
 // Only this synchronous phase enters the interpreter. No executor or registry
 // is moved into spawn_blocking, so dropping its caller cannot grant late tools.
+/// Interpreter output shared with the blocking step so that a cancelled or
+/// timed-out workflow can still recover what was printed before it stopped.
+type Printed = Arc<Mutex<String>>;
+
+/// Appends each print fragment to the shared buffer immediately (locking only
+/// per write), so a step that is still computing when the workflow is
+/// cancelled has already made its earlier output visible. Applies the same
+/// byte cap as `PrintWriter::CollectString`.
+struct SharedPrint(Printed);
+
+impl SharedPrint {
+    fn append(&mut self, text: &str) -> Result<(), MontyException> {
+        let mut buffer = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        monty_types::check_print_collect_limit(buffer.len(), text.len(), Some(MAX_VALUE_BYTES))?;
+        buffer.push_str(text);
+        Ok(())
+    }
+}
+
+impl monty_types::PrintWriterCallback for SharedPrint {
+    fn stdout_write(&mut self, output: std::borrow::Cow<'_, str>) -> Result<(), MontyException> {
+        self.append(&output)
+    }
+
+    fn stdout_push(&mut self, end: char) -> Result<(), MontyException> {
+        self.append(end.encode_utf8(&mut [0; 4]))
+    }
+}
+
+/// Take the printed text. The lock is only held per write, so this normally
+/// succeeds at once; a bounded retry and a note guard against a poisoned or
+/// contended buffer.
+async fn recover_printed(printed: &Printed) -> String {
+    for _ in 0..20 {
+        // Scope the lock result so no guard is held across the sleep.
+        let taken = match printed.try_lock() {
+            Ok(mut guard) => Some(std::mem::take(&mut *guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(std::mem::take(&mut *poisoned.into_inner()))
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(text) = taken {
+            return text;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    "[output of the interrupted interpreter step is unavailable]\n".into()
+}
+
 async fn step(
-    printed: &mut String,
+    printed: &Printed,
     run: impl FnOnce(PrintWriter<'_>) -> Result<RunProgress, MontyException> + Send + 'static,
 ) -> Result<RunProgress, String> {
-    let mut output = std::mem::take(printed);
-    let (result, output) = tokio::task::spawn_blocking(move || {
-        let result = run(PrintWriter::CollectString(
-            &mut output,
-            Some(MAX_VALUE_BYTES),
-        ));
-        (result, output)
-    })
-    .await
-    .map_err(|error| format!("interpreter task failed: {error}"))?;
-    *printed = output;
+    let mut sink = SharedPrint(Arc::clone(printed));
+    let result = tokio::task::spawn_blocking(move || run(PrintWriter::Callback(&mut sink)))
+        .await
+        .map_err(|error| format!("interpreter task failed: {error}"))?;
     result.map_err(|error| error.to_string())
 }
 

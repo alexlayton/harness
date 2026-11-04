@@ -219,13 +219,23 @@ pub fn convert_tools(tools: &[ToolDefinition]) -> Vec<Value> {
 
 #[derive(Debug, Default)]
 pub struct ResponsesParser {
-    done: bool,
+    phase: Phase,
     /// Call IDs already observed in this response. IDs are unique per
     /// assistant response; malformed calls are held until the terminal event
     /// so an earlier valid call cannot escape before a later invalid one is
     /// detected.
     seen_ids: std::collections::HashSet<String>,
     pending_calls: Vec<ToolCall>,
+}
+
+/// Lifecycle of one Responses stream. `Done` and `Failed` are distinct so a
+/// stream that errored (e.g. unparsable terminal usage) never looks completed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    #[default]
+    Streaming,
+    Done,
+    Failed,
 }
 
 impl ResponsesParser {
@@ -238,6 +248,26 @@ impl ResponsesParser {
     }
 
     pub fn parse_payload(&mut self, payload: &str) -> Result<Vec<StreamEvent>, LlmError> {
+        if self.phase != Phase::Streaming {
+            // Anything after a terminal event or failure is ignored, so a
+            // duplicate terminal cannot yield a second `Done`.
+            return Ok(Vec::new());
+        }
+        let result = self.parse_inner(payload);
+        match &result {
+            Err(_) => {
+                self.phase = Phase::Failed;
+                self.pending_calls.clear();
+            }
+            Ok(events) if events.iter().any(|e| matches!(e, StreamEvent::Done { .. })) => {
+                self.phase = Phase::Done;
+            }
+            Ok(_) => {}
+        }
+        result
+    }
+
+    fn parse_inner(&mut self, payload: &str) -> Result<Vec<StreamEvent>, LlmError> {
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| LlmError::Parse(format!("Responses SSE payload: {error}")))?;
         let kind = value
@@ -306,7 +336,6 @@ impl ResponsesParser {
                 Ok(Vec::new())
             }
             "response.completed" | "response.incomplete" => {
-                self.done = true;
                 let response = value.get("response").unwrap_or(&Value::Null);
                 let usage = response.get("usage").map(parse_usage).transpose()?;
                 // Preserve the terminal status verbatim: `completed` and
@@ -364,7 +393,7 @@ impl ResponsesParser {
     }
 
     pub fn is_done(&self) -> bool {
-        self.done
+        self.phase != Phase::Streaming
     }
 
     /// Clean transport EOF without `response.completed`/`response.incomplete`
@@ -372,10 +401,11 @@ impl ResponsesParser {
     /// transient `LlmError::StreamInterrupted` so the agent re-streams.
     /// Never manufacture `Done` and never finalize unfinished tool calls here.
     pub fn finish(&mut self) -> Result<Vec<StreamEvent>, LlmError> {
-        if self.done {
+        if self.phase != Phase::Streaming {
             return Ok(Vec::new());
         }
-        self.done = true;
+        self.phase = Phase::Failed;
+        self.pending_calls.clear();
         Err(super::truncated_stream(
             "Responses stream ended without a terminal event (expected response.completed or response.incomplete)",
         ))
@@ -434,6 +464,27 @@ fn event_stream(sse: crate::sse::SseStream, secret: &str) -> EventStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failure_is_terminal_and_duplicate_terminal_is_ignored() {
+        let ok = r#"{"type":"response.completed","response":{"status":"completed"}}"#;
+        let mut parser = ResponsesParser::new();
+        parser
+            .parse_payload(r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"c","name":"n","arguments":"{}"}}"#)
+            .unwrap();
+        assert!(parser.parse_payload("not json").is_err());
+        assert_eq!(parser.phase, Phase::Failed);
+        assert!(parser.pending_calls.is_empty());
+        assert!(parser.is_done());
+        // A later terminal must not flush the discarded call or yield Done.
+        assert!(parser.parse_payload(ok).unwrap().is_empty());
+
+        let mut parser = ResponsesParser::new();
+        let ok = r#"{"type":"response.completed","response":{"status":"completed"}}"#;
+        assert_eq!(parser.parse_payload(ok).unwrap().len(), 1);
+        assert_eq!(parser.phase, Phase::Done);
+        assert!(parser.parse_payload(ok).unwrap().is_empty());
+    }
 
     fn request(reasoning: ReasoningPolicy) -> CompletionRequest {
         CompletionRequest {
@@ -566,7 +617,9 @@ mod tests {
             .parse_payload(r#"{"type":"response.failed","response":{"status":"failed","error":{"message":"boom"}}}"#)
             .unwrap_err();
         assert!(matches!(error, LlmError::Stream(_)), "got {error:?}");
-        assert!(!parser.is_done());
+        // Failed is terminal (same as ChatStreamParser): no more events.
+        assert!(parser.is_done());
+        assert_eq!(parser.phase, Phase::Failed);
     }
 
     #[test]

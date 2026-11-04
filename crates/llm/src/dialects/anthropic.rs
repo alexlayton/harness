@@ -280,6 +280,11 @@ enum BlockKind {
     Text,
     Thinking,
     Tool,
+    /// Block types this parser does not surface (`redacted_thinking`,
+    /// `server_tool_use`, `web_search_tool_result`, ...). Their deltas, such
+    /// as `input_json_delta` on `server_tool_use`, are ignored rather than
+    /// checked against a kind.
+    Other,
 }
 
 #[derive(Debug, Default)]
@@ -308,9 +313,22 @@ impl AnthropicParser {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if self.done {
+            // Anything after the terminal event (duplicate `message_stop`,
+            // trailing blocks) must not yield a second `Done`.
+            tracing::trace!(event_type = kind, "ignored Anthropic event after terminal");
+            return Ok(Vec::new());
+        }
         match kind {
             "content_block_start" => {
-                let index = value.get("index").and_then(as_u64).unwrap_or(0);
+                let index = value.get("index").and_then(as_u64).ok_or_else(|| {
+                    LlmError::Parse("Anthropic content_block_start is missing an index".into())
+                })?;
+                if self.blocks.contains_key(&index) {
+                    return Err(LlmError::Parse(format!(
+                        "duplicate Anthropic content_block_start for open index {index}"
+                    )));
+                }
                 self.current_index = Some(index);
                 let block = value.get("content_block").unwrap_or(&Value::Null);
                 match block.get("type").and_then(Value::as_str) {
@@ -344,20 +362,50 @@ impl AnthropicParser {
                     Some("thinking") => {
                         self.blocks.insert(index, BlockKind::Thinking);
                     }
-                    _ => {
+                    Some("text") | None => {
                         self.blocks.insert(index, BlockKind::Text);
+                    }
+                    Some(_) => {
+                        self.blocks.insert(index, BlockKind::Other);
                     }
                 }
                 Ok(Vec::new())
             }
             "content_block_delta" => {
-                let index = value
-                    .get("index")
-                    .and_then(as_u64)
-                    .or(self.current_index)
-                    .unwrap_or(0);
+                let index = self.block_index(&value, "content_block_delta")?;
                 let delta = value.get("delta").unwrap_or(&Value::Null);
-                match delta.get("type").and_then(Value::as_str) {
+                let delta_type = delta.get("type").and_then(Value::as_str);
+                let expected = match delta_type {
+                    Some("text_delta") => Some((
+                        "text",
+                        matches!(
+                            self.blocks.get(&index),
+                            Some(BlockKind::Text | BlockKind::Other)
+                        ),
+                    )),
+                    Some("thinking_delta") => Some((
+                        "thinking",
+                        matches!(
+                            self.blocks.get(&index),
+                            Some(BlockKind::Thinking | BlockKind::Other)
+                        ),
+                    )),
+                    Some("input_json_delta") => Some((
+                        "tool_use",
+                        matches!(
+                            self.blocks.get(&index),
+                            Some(BlockKind::Tool | BlockKind::Other)
+                        ),
+                    )),
+                    _ => None,
+                };
+                if let Some((block, false)) = expected {
+                    return Err(LlmError::Parse(format!(
+                        "Anthropic {} does not match open block at index {index} (expected {block})",
+                        delta_type.unwrap_or_default()
+                    )));
+                }
+                match delta_type {
                     Some("text_delta") => Ok(delta
                         .get("text")
                         .and_then(Value::as_str)
@@ -383,12 +431,13 @@ impl AnthropicParser {
                 }
             }
             "content_block_stop" => {
-                let index = value
-                    .get("index")
-                    .and_then(as_u64)
-                    .or(self.current_index)
-                    .unwrap_or(0);
-                self.finish_tool(index)
+                let index = self.block_index(&value, "content_block_stop")?;
+                if self.current_index == Some(index) {
+                    self.current_index = None;
+                }
+                let result = self.finish_tool(index);
+                self.blocks.remove(&index);
+                result
             }
             "message_start" => {
                 if let Some(usage) = value
@@ -474,6 +523,16 @@ impl AnthropicParser {
                 Ok(Vec::new())
             }
         }
+    }
+
+    /// Resolve the block index of a delta/stop: the explicit `index`, else
+    /// the most recently started open block. Never defaults to 0.
+    fn block_index(&self, value: &Value, kind: &str) -> Result<u64, LlmError> {
+        value
+            .get("index")
+            .and_then(as_u64)
+            .or(self.current_index)
+            .ok_or_else(|| LlmError::Parse(format!("Anthropic {kind} has no open block index")))
     }
 
     fn finish_tool(&mut self, index: u64) -> Result<Vec<StreamEvent>, LlmError> {
@@ -602,6 +661,195 @@ mod tests {
         let body = build_request_body(&bare);
         assert!(body.get("tools").is_none());
         assert!(body.get("system").is_some());
+    }
+
+    fn start(index: u64, kind: &str) -> String {
+        format!(
+            r#"{{"type":"content_block_start","index":{index},"content_block":{{"type":"{kind}","id":"t{index}","name":"bash"}}}}"#
+        )
+    }
+
+    #[test]
+    fn rejects_duplicate_start_for_open_index() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(&start(0, "tool_use")).unwrap();
+        assert!(matches!(
+            parser.parse_payload(&start(0, "text")),
+            Err(LlmError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn missing_index_is_not_defaulted_to_zero() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(&start(0, "text")).unwrap();
+        parser
+            .parse_payload(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap();
+        // No open block: a stop without an index must not hit block 0.
+        assert!(matches!(
+            parser.parse_payload(r#"{"type":"content_block_stop"}"#),
+            Err(LlmError::Parse(_))
+        ));
+        assert!(matches!(
+            parser
+                .parse_payload(r#"{"type":"content_block_start","content_block":{"type":"text"}}"#),
+            Err(LlmError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_kind_mismatched_delta() {
+        let mut parser = AnthropicParser::new();
+        parser.parse_payload(&start(0, "text")).unwrap();
+        assert!(matches!(
+            parser.parse_payload(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}"#
+            ),
+            Err(LlmError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn events_after_message_stop_are_ignored() {
+        let mut parser = AnthropicParser::new();
+        let first = parser.parse_payload(r#"{"type":"message_stop"}"#).unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(
+            parser
+                .parse_payload(r#"{"type":"message_stop"}"#)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parser.parse_payload(&start(0, "text")).unwrap().is_empty());
+    }
+
+    fn feed(parser: &mut AnthropicParser, payloads: &[&str]) -> Vec<StreamEvent> {
+        payloads
+            .iter()
+            .flat_map(|p| {
+                parser
+                    .parse_payload(p)
+                    .unwrap_or_else(|e| panic!("rejected {p}: {e:?}"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn full_realistic_stream_is_accepted() {
+        let mut parser = AnthropicParser::new();
+        let events = feed(
+            &mut parser,
+            &[
+                r#"{"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"usage":{"input_tokens":25,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}"#,
+                r#"{"type":"ping"}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me"}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"EqQB"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hello"}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"x"}}}"#,
+                r#"{"type":"content_block_stop","index":1}"#,
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_01","name":"bash","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":""}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}"#,
+                r#"{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}"#,
+                r#"{"type":"content_block_stop","index":2}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":15}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ReasoningDelta(t) if t == "Let me"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "Hello"))
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            StreamEvent::ToolCallComplete(c) if c.id == "toolu_01" && c.arguments["cmd"] == "ls"
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(StreamEvent::Done { stop_reason: Some(r), usage: Some(u) })
+                if r == "tool_use" && u.input_tokens == 25 && u.output_tokens == 15
+        ));
+    }
+
+    #[test]
+    fn server_tool_and_redacted_blocks_are_ignored_not_rejected() {
+        let mut parser = AnthropicParser::new();
+        let events = feed(
+            &mut parser,
+            &[
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"abc"}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"rust\"}"}}"#,
+                r#"{"type":"content_block_stop","index":1}"#,
+                r#"{"type":"content_block_start","index":2,"content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1","content":[{"type":"web_search_result","url":"https://x","title":"t","encrypted_content":"e"}]}}"#,
+                r#"{"type":"content_block_stop","index":2}"#,
+                r#"{"type":"content_block_start","index":3,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_delta","index":3,"delta":{"type":"text_delta","text":"ok"}}"#,
+                r#"{"type":"content_block_stop","index":3}"#,
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::ToolCallComplete(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::TextDelta(t) if t == "ok"))
+        );
+        assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    #[test]
+    fn interleaved_indexes_and_empty_text_block_are_accepted() {
+        let mut parser = AnthropicParser::new();
+        let events = feed(
+            &mut parser,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"bash","input":{}}}"#,
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"a\":1}"}}"#,
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}"#,
+                r#"{"type":"content_block_stop","index":0}"#,
+                r#"{"type":"content_block_stop","index":1}"#,
+                r#"{"type":"message_stop"}"#,
+            ],
+        );
+        assert!(events.iter().any(
+            |e| matches!(e, StreamEvent::ToolCallComplete(c) if c.id == "t1" && c.arguments["a"] == 1)
+        ));
+    }
+
+    #[test]
+    fn redacted_block_without_deltas_then_error_event_surfaces_error() {
+        let mut parser = AnthropicParser::new();
+        feed(
+            &mut parser,
+            &[
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"abc"}}"#,
+            ],
+        );
+        let error = parser
+            .parse_payload(
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+            )
+            .unwrap_err();
+        assert!(!matches!(error, LlmError::Parse(_)), "got {error:?}");
     }
 
     #[test]
@@ -850,6 +1098,11 @@ mod tests {
         // error: it surfaces the permanent `LlmError::Stream` and never
         // reaches a terminal `Done`.
         let mut parser = AnthropicParser::new();
+        parser
+            .parse_payload(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"text"}}"#,
+            )
+            .unwrap();
         let events = parser
             .parse_payload(r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#)
             .unwrap();

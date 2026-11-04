@@ -2,9 +2,10 @@
 
 use crate::config::{Cli, Config, build_provider_with_auths, provider_factory};
 use crate::context::project_context_for;
+use crate::turn_output::TurnOutputReducer;
 use agent::assembly::AgentBuilder;
 use agent::{AgentEvent, InputMessage, StreamRecovery};
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use llm::ReasoningPolicy;
 use serde::Deserialize;
 use session::{SessionCreateOptions, SessionStore};
@@ -260,103 +261,30 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
     let sent = input_tx.send(InputMessage::Message(prompt));
     // A closed channel drains this one turn, rather than interrupting its tools.
     drop(input_tx);
-    let mut answer = FinalAnswer::default();
+    let mut answer = TurnOutputReducer::default();
+    let mut interrupted = false;
     while let Some(event) = event_rx.recv().await {
-        answer.observe(event);
+        // A turn that ends while cancelled is not an answer.
+        if matches!(event, AgentEvent::TurnFinished) && cancel.is_cancelled() {
+            answer.discard_pending();
+            interrupted = true;
+        }
+        answer.observe(&event);
     }
     let joined = task.await;
     sent.context("send prompt to agent")?;
     joined.context("Harness agent task failed")?;
-    ensure!(!cancel.is_cancelled(), "Harness run cancelled");
-    answer.finish()
-}
-
-// Match headless output semantics: prose from a tool-bearing model round is
-// intermediate, not part of the final answer. Errors can be followed by a
-// genuine recovery, but usage/lifecycle events must not erase the failure.
-#[derive(Default)]
-struct FinalAnswer {
-    pending: String,
-    text: String,
-    active_tools: usize,
-    error: Option<String>,
-    finished: bool,
-}
-
-impl FinalAnswer {
-    fn observe(&mut self, event: AgentEvent) {
-        match event {
-            AgentEvent::TextDelta(text) => {
-                self.pending.push_str(&text);
-                self.error = None;
-            }
-            AgentEvent::ToolCallStarted { .. } => {
-                self.pending.clear();
-                self.active_tools = self.active_tools.saturating_add(1);
-            }
-            AgentEvent::ToolCallFinished { .. } => {
-                self.active_tools = self.active_tools.saturating_sub(1);
-                if self.active_tools == 0 {
-                    self.pending.clear();
-                }
-            }
-            AgentEvent::Error(message) => {
-                self.pending.clear();
-                self.error = Some(message);
-            }
-            AgentEvent::TurnFinished => {
-                if self.active_tools == 0 {
-                    self.text = std::mem::take(&mut self.pending);
-                }
-                self.finished = true;
-            }
-            _ => {}
-        }
-    }
-
-    fn finish(self) -> Result<String> {
-        if let Some(error) = self.error {
-            return Err(anyhow!(error));
-        }
-        ensure!(self.finished, "Harness stopped before the turn completed");
-        Ok(self.text)
-    }
+    // Cancellation after the turn completed must not discard its answer.
+    ensure!(
+        !interrupted && (answer.finished() || !cancel.is_cancelled()),
+        "Harness run cancelled"
+    );
+    answer.into_result()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn final_answer_excludes_tool_round_text_and_preserves_failure() {
-        let mut answer = FinalAnswer::default();
-        answer.observe(AgentEvent::TextDelta("I'll inspect it.".into()));
-        answer.observe(AgentEvent::ToolCallStarted {
-            call_id: "read-1".into(),
-            name: "read".into(),
-            summary: "read file".into(),
-        });
-        answer.observe(AgentEvent::TextDelta("More intermediate text.".into()));
-        answer.observe(AgentEvent::ToolCallFinished {
-            call_id: "read-1".into(),
-            name: "read".into(),
-            summary: "read file".into(),
-            ok: true,
-            duration_ms: 1,
-            output: "file contents".into(),
-            error: None,
-        });
-        answer.observe(AgentEvent::TextDelta("Final answer.".into()));
-        answer.observe(AgentEvent::TurnFinished);
-        assert_eq!(answer.finish().unwrap(), "Final answer.");
-
-        let mut failed = FinalAnswer::default();
-        failed.observe(AgentEvent::TextDelta("Partial answer".into()));
-        failed.observe(AgentEvent::Error("provider failed".into()));
-        failed.observe(AgentEvent::TurnFinished);
-        assert_eq!(failed.finish().unwrap_err().to_string(), "provider failed");
-        assert!(FinalAnswer::default().finish().is_err());
-    }
 
     #[tokio::test]
     async fn stream_recovery_matches_complete_or_incremental_output() {
@@ -438,18 +366,18 @@ mod tests {
                 builder = builder.with_stream_recovery(mode);
             }
             builder.build().await.unwrap().run(input_rx, event_tx).await;
-            let mut answer = FinalAnswer::default();
+            let mut answer = TurnOutputReducer::default();
             let mut streamed_text = String::new();
             while let Some(event) = event_rx.recv().await {
                 if let AgentEvent::TextDelta(text) = &event {
                     streamed_text.push_str(text);
                 }
-                answer.observe(event);
+                answer.observe(&event);
             }
             assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
             match mode {
                 StreamRecovery::Replace => {
-                    assert_eq!(answer.finish().unwrap(), "The result is 42.")
+                    assert_eq!(answer.into_result().unwrap(), "The result is 42.")
                 }
                 StreamRecovery::Continue => assert_eq!(streamed_text, "The result is 42."),
             }

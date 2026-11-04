@@ -69,28 +69,41 @@ fn run(py: Python<'_>, prompt: String, options_json: &str) -> PyResult<String> {
     // deadline, returns the original exception at once. The task keeps
     // shutting down on the shared runtime in the background.
     py.detach(move || {
-        let mut signal_error = None;
-        let mut cleanup_deadline = None;
+        // The signal error and its cleanup deadline only exist together, so
+        // they are one state rather than two options that must change in step.
+        enum Wait {
+            Running,
+            Interrupted {
+                error: PyErr,
+                deadline: std::time::Instant,
+            },
+        }
+        let mut wait = Wait::Running;
         loop {
             let received = receiver.recv_timeout(Duration::from_millis(50));
             if let Err(error) = Python::attach(|py| py.check_signals()) {
-                if let Some(first) = signal_error.take() {
+                if let Wait::Interrupted { error: first, .. } = wait {
                     // Second signal: stop waiting for cleanup.
                     drop(error);
                     return Err(first);
                 }
                 cancel.cancel();
-                signal_error = Some(error);
-                cleanup_deadline = Some(std::time::Instant::now() + CLEANUP_AFTER_SIGNAL);
+                wait = Wait::Interrupted {
+                    error,
+                    deadline: std::time::Instant::now() + CLEANUP_AFTER_SIGNAL,
+                };
             }
-            if cleanup_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-                && let Some(error) = signal_error.take()
+            if let Wait::Interrupted { deadline, .. } = &wait
+                && std::time::Instant::now() >= *deadline
+                && let Wait::Interrupted { error, .. } = wait
             {
                 return Err(error);
             }
             match received {
                 Ok(result) => {
-                    if let Some(error) = signal_error {
+                    // Cleanup finished: the original signal still wins, since
+                    // the call was cancelled on its behalf.
+                    if let Wait::Interrupted { error, .. } = wait {
                         return Err(error);
                     }
                     return result.map_err(|error| PyRuntimeError::new_err(format!("{error:#}")));
@@ -98,9 +111,12 @@ fn run(py: Python<'_>, prompt: String, options_json: &str) -> PyResult<String> {
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     cancel.cancel();
-                    return Err(signal_error.unwrap_or_else(|| {
-                        PyRuntimeError::new_err("Harness execution task stopped unexpectedly")
-                    }));
+                    return Err(match wait {
+                        Wait::Interrupted { error, .. } => error,
+                        Wait::Running => {
+                            PyRuntimeError::new_err("Harness execution task stopped unexpectedly")
+                        }
+                    });
                 }
             }
         }

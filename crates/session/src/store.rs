@@ -14,18 +14,26 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Shared deferred-sync flag so the store stays [`Clone`] (session handlers
-/// clone it freely). `true` skips per-record `sync_all`.
+/// Deferred-sync state shared by every clone of a store (session handlers
+/// clone it freely). Sharing is deliberate: a per-clone copy let one holder's
+/// appends skip `fsync` while another holder's `sync_session` had no record
+/// of the debt. `deferred` skips per-record `sync_all`; `owed` names the
+/// session files that have unsynced appends and is cleared only by a
+/// successful sync, so a failed flush stays owed.
 #[derive(Debug, Default)]
-struct DeferredSync(AtomicBool);
+struct DeferredSync {
+    deferred: AtomicBool,
+    owed: Mutex<HashSet<PathBuf>>,
+}
 
-impl Clone for DeferredSync {
-    fn clone(&self) -> Self {
-        Self(AtomicBool::new(self.0.load(Ordering::Relaxed)))
+impl DeferredSync {
+    fn owed(&self) -> std::sync::MutexGuard<'_, HashSet<PathBuf>> {
+        self.owed.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -185,7 +193,36 @@ pub struct SessionIndexEntry {
 /// future contenders continue to lock the same inode.
 #[derive(Debug)]
 pub struct SessionActiveLease {
-    file: Option<File>,
+    scope: LeaseScope,
+}
+
+/// What an active lease actually guards. The memory-only case is explicit
+/// rather than a `None` file, so a lease that guards nothing is never
+/// mistaken for one that holds a sidecar lock.
+#[derive(Debug)]
+enum LeaseScope {
+    /// The session has no backing file; there is nothing to lock.
+    MemoryOnly,
+    /// An exclusive lock on the sidecar for this session file.
+    File { lock: File, session_path: PathBuf },
+}
+
+impl SessionActiveLease {
+    /// Whether this lease holds a real file lock (false for a memory-only
+    /// session, which has no durable log to protect).
+    pub fn is_file_backed(&self) -> bool {
+        matches!(self.scope, LeaseScope::File { .. })
+    }
+
+    /// Whether this lease guards `session`: a file lease only guards the
+    /// file it locked; a memory-only lease only guards file-less sessions.
+    pub fn covers(&self, session: &Session) -> bool {
+        match (&self.scope, session.path()) {
+            (LeaseScope::MemoryOnly, None) => true,
+            (LeaseScope::File { session_path, .. }, Some(path)) => session_path == path,
+            _ => false,
+        }
+    }
 }
 
 /// Filesystem-backed session storage.  Sessions are grouped by a stable key
@@ -202,7 +239,7 @@ pub struct SessionStore {
     /// boundaries. Chatty tool loops pay several fsyncs per turn otherwise.
     /// Default is per-event durability: a crash loses at most the in-flight
     /// record. Deferred mode widens that window to the current turn's tail.
-    deferred_sync: DeferredSync,
+    deferred_sync: Arc<DeferredSync>,
 }
 
 impl SessionStore {
@@ -221,20 +258,36 @@ impl SessionStore {
             root,
             workspace_root,
             workspace_dir,
-            deferred_sync: DeferredSync::default(),
+            deferred_sync: Arc::default(),
         })
     }
 
     /// Toggle deferred durability (see the field docs). Returns the store for
     /// chaining.
     pub fn with_deferred_sync(self, deferred: bool) -> Self {
-        self.deferred_sync.0.store(deferred, Ordering::Relaxed);
+        self.deferred_sync
+            .deferred
+            .store(deferred, Ordering::Relaxed);
         self
     }
 
     /// Whether deferred durability is enabled.
     pub fn deferred_sync(&self) -> bool {
-        self.deferred_sync.0.load(Ordering::Relaxed)
+        self.deferred_sync.deferred.load(Ordering::Relaxed)
+    }
+
+    /// Whether `session` has appends not yet made durable by
+    /// [`Self::sync_session`]. Shared by all clones of this store.
+    pub fn sync_owed(&self, session: &Session) -> bool {
+        session
+            .path()
+            .is_some_and(|path| self.deferred_sync.owed().contains(path))
+    }
+
+    fn mark_owed(&self, path: &Path) {
+        if self.deferred_sync() {
+            self.deferred_sync.owed().insert(path.to_path_buf());
+        }
     }
 
     /// Durable flush for deferred-sync sessions: `fsync`s the session file so
@@ -256,12 +309,22 @@ impl SessionStore {
             return Ok(());
         };
         self.ensure_path_in_root(path)?;
-        let file = OpenOptions::new()
-            .append(true)
-            .open(path)
-            .map_err(|source| io_error("open session for sync", path, source))?;
+        let file = match OpenOptions::new().append(true).open(path) {
+            Ok(file) => file,
+            Err(source) => {
+                // A deleted session has nothing left to flush; keeping its
+                // entry would report a debt that can never be paid.
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    self.deferred_sync.owed().remove(path);
+                }
+                return Err(io_error("open session for sync", path, source));
+            }
+        };
         file.sync_all()
-            .map_err(|source| io_error("sync session", path, source))
+            .map_err(|source| io_error("sync session", path, source))?;
+        // Clear only after success so a failed flush stays owed.
+        self.deferred_sync.owed().remove(path);
+        Ok(())
     }
 
     /// Construct the default Harness store.  `HARNESS_SESSION_DIR` is an
@@ -295,7 +358,9 @@ impl SessionStore {
     /// that was loaded earlier, use [`Self::acquire_active_and_reload`].
     pub fn acquire_active(&self, session: &Session) -> Result<SessionActiveLease> {
         let Some(session_path) = session.path() else {
-            return Ok(SessionActiveLease { file: None });
+            return Ok(SessionActiveLease {
+                scope: LeaseScope::MemoryOnly,
+            });
         };
         self.ensure_path_in_root(session_path)?;
         try_lock_active(session_path)
@@ -442,6 +507,7 @@ impl SessionStore {
             validate_next_event(session, &record)?;
             let line = encode_record(session.id(), &record)?;
             let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
+            self.mark_owed(&path);
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
             refresh_identity_after_append(session, &path);
@@ -471,6 +537,7 @@ impl SessionStore {
             validate_next_event(session, &record)?;
             let line = encode_record(session.id(), &record)?;
             let new_size = append_encoded_record(&path, &line, self.deferred_sync(), file_size)?;
+            self.mark_owed(&path);
             session.append_record(record.clone());
             session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
             refresh_identity_after_append(session, &path);
@@ -493,7 +560,7 @@ impl SessionStore {
         if !is_event_prefix(&session.events, &disk_session.events) {
             return Err(SessionError::HistoryDiverged(path.clone()));
         }
-        if recovery.recovered {
+        if recovery.is_recovered() {
             // Repair the incomplete crash tail before appending: truncate to
             // the last valid record so the fragment never becomes a
             // terminated corrupt line.  This keeps the session append-only
@@ -515,6 +582,7 @@ impl SessionStore {
             .map_err(|source| io_error("stat session for append", &path, source))?
             .len();
         let new_size = append_encoded_record(&path, &line, self.deferred_sync(), current_size)?;
+        self.mark_owed(&path);
         disk_session.append_record(record.clone());
         disk_session.validated_bytes = usize::try_from(new_size).unwrap_or(usize::MAX);
         refresh_identity_after_append(&mut disk_session, &path);
@@ -768,7 +836,12 @@ fn try_lock_active(session_path: &Path) -> Result<SessionActiveLease> {
     .map_err(|source| io_error("open active session lease", &path, source))?;
     secure_lock_file(&file, &path)?;
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(SessionActiveLease { file: Some(file) }),
+        Ok(()) => Ok(SessionActiveLease {
+            scope: LeaseScope::File {
+                lock: file,
+                session_path: session_path.to_path_buf(),
+            },
+        }),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
             Err(SessionError::AlreadyActive(session_path.to_path_buf()))
         }
@@ -872,7 +945,7 @@ fn load_session_file_for_append(path: &Path) -> Result<(Session, TailRecovery)> 
     let contents = read_file(path)?;
     let (mut session, recovery) = decode_session_file_bytes(&contents, path)?;
     session.path = Some(path.to_path_buf());
-    session.validated_bytes = recovery.valid_bytes;
+    session.validated_bytes = recovery.valid_bytes();
     session.file_identity = Some(file_identity(path)?);
     Ok((session, recovery))
 }
@@ -885,7 +958,7 @@ fn truncate_to_valid_tail(path: &Path, recovery: &TailRecovery) -> Result<()> {
         .write(true)
         .open(path)
         .map_err(|source| io_error("open session for repair", path, source))?;
-    file.set_len(recovery.valid_bytes as u64)
+    file.set_len(recovery.valid_bytes() as u64)
         .map_err(|source| io_error("truncate incomplete session tail", path, source))?;
     file.sync_all()
         .map_err(|source| io_error("sync repaired session", path, source))
@@ -1816,8 +1889,8 @@ impl Drop for SessionLock {
 
 impl Drop for SessionActiveLease {
     fn drop(&mut self) {
-        if let Some(file) = &self.file {
-            let _ = file.unlock();
+        if let LeaseScope::File { lock, .. } = &self.scope {
+            let _ = lock.unlock();
         }
     }
 }
@@ -2083,6 +2156,35 @@ mod tests {
             elapsed < std::time::Duration::from_secs(1),
             "listing touched the payload: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn in_memory_append_on_persisted_session_cannot_corrupt_the_file() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store.append_event(&mut session, message("one")).unwrap();
+        let path = session.file_path().unwrap().to_path_buf();
+
+        // The cache now runs ahead of the file.
+        session.append(message("phantom"));
+        let result = store.append_event(&mut session, message("two"));
+        assert!(
+            matches!(result, Err(SessionError::HistoryDiverged(_))),
+            "{result:?}"
+        );
+
+        let reloaded = store.load_path(&path).unwrap();
+        let sequences = reloaded
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, [1]);
     }
 
     #[test]
@@ -3108,6 +3210,78 @@ mod tests {
             matches!(error, SessionError::Io { operation, .. } if operation == "sync parent directory"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn deferred_sync_debt_is_shared_by_clones_and_kept_on_failure() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let clone = store.clone();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        // Enabling after cloning must reach every holder.
+        let store = store.with_deferred_sync(true);
+        assert!(clone.deferred_sync());
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        assert!(!store.sync_owed(&session));
+        clone.append_event(&mut session, message("one")).unwrap();
+        assert!(store.sync_owed(&session), "append via a clone is owed");
+        {
+            let _guard = SyncSessionFaultGuard::arm();
+            store.sync_session(&session).expect_err("injected failure");
+        }
+        assert!(clone.sync_owed(&session), "failed sync keeps the debt");
+        clone.sync_session(&session).unwrap();
+        assert!(!store.sync_owed(&session), "success clears the debt");
+    }
+
+    #[test]
+    fn active_lease_scope_is_explicit() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let session = store.create(SessionCreateOptions::default()).unwrap();
+        let lease = store.acquire_active(&session).unwrap();
+        assert!(lease.is_file_backed());
+        assert!(lease.covers(&session));
+        let other = store.create(SessionCreateOptions::default()).unwrap();
+        assert!(!lease.covers(&other), "lease guards only its own file");
+        // The lock is real: a second claim is refused until the first drops.
+        assert!(matches!(
+            store.acquire_active(&session),
+            Err(SessionError::AlreadyActive(_))
+        ));
+        drop(lease);
+        assert!(store.acquire_active(&session).is_ok());
+
+        // A memory-only lease holds no lock and guards only file-less sessions.
+        let memory = Session::new(SessionMetadata::new("/workspace", None, None));
+        let memory_lease = store.acquire_active(&memory).unwrap();
+        assert!(!memory_lease.is_file_backed());
+        assert!(memory_lease.covers(&memory));
+        assert!(!memory_lease.covers(&session));
+    }
+
+    #[test]
+    fn sync_debt_is_not_recorded_without_deferred_mode_and_dropped_on_delete() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store.append_event(&mut session, message("one")).unwrap();
+        assert!(!store.sync_owed(&session), "per-event fsync owes nothing");
+
+        let store = store.with_deferred_sync(true);
+        store.append_event(&mut session, message("two")).unwrap();
+        assert!(store.sync_owed(&session));
+        fs::remove_file(session.file_path().unwrap()).unwrap();
+        store.sync_session(&session).expect_err("file is gone");
+        assert!(!store.sync_owed(&session), "vanished file owes nothing");
     }
 
     #[test]

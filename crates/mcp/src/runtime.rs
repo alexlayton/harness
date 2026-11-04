@@ -1,4 +1,4 @@
-use crate::client::HarnessClient;
+use crate::client::{HarnessClient, ServerHealth, ServerStatus};
 use crate::config::Redactions;
 use crate::config::{MAX_CONCURRENT_MCP_STARTUPS, McpServerConfig, McpTransportConfig};
 use crate::http_client::BoundedHttpClient;
@@ -25,7 +25,6 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -34,6 +33,22 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tools::ToolRegistry;
+
+/// Why the frame reader stopped. Kept distinct so an I/O failure is never
+/// reported as an oversized frame (or vice versa).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FrameFailure {
+    /// A frame exceeded the configured byte limit.
+    Overflow,
+    /// The underlying reader failed.
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+/// Failure shared between the reader and its transport wrapper.
+type FrameFailureSlot = Arc<StdMutex<Option<FrameFailure>>>;
 
 /// A bounded newline-delimited reader for MCP stdio.
 ///
@@ -47,27 +62,42 @@ struct BoundedFrameReader<R> {
     frame_length: usize,
     pending: Vec<u8>,
     pending_start: usize,
-    failed: bool,
-    failure_signal: Arc<AtomicBool>,
+    failed: Option<FrameFailure>,
+    failure_signal: FrameFailureSlot,
     eof: bool,
 }
 
 impl<R> BoundedFrameReader<R> {
     #[cfg(test)]
     fn new(inner: R, max_length: usize) -> Self {
-        Self::new_with_failure(inner, max_length, Arc::new(AtomicBool::new(false)))
+        Self::new_with_failure(inner, max_length, FrameFailureSlot::default())
     }
 
-    fn new_with_failure(inner: R, max_length: usize, failure_signal: Arc<AtomicBool>) -> Self {
+    fn new_with_failure(inner: R, max_length: usize, failure_signal: FrameFailureSlot) -> Self {
         Self {
             inner,
             max_length,
             frame_length: 0,
             pending: Vec::new(),
             pending_start: 0,
-            failed: false,
+            failed: None,
             failure_signal,
             eof: false,
+        }
+    }
+
+    fn fail(&mut self, failure: FrameFailure) {
+        *self.failure_signal.lock().expect("frame failure lock") = Some(failure.clone());
+        self.failed = Some(failure);
+    }
+
+    fn failure_error(&self) -> std::io::Error {
+        match &self.failed {
+            Some(FrameFailure::Io { kind, message }) => std::io::Error::new(*kind, message.clone()),
+            _ => std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MCP frame exceeds {} bytes", self.max_length),
+            ),
         }
     }
 
@@ -95,8 +125,7 @@ impl<R> BoundedFrameReader<R> {
                 // Do not retain the offending byte or any bytes after it. The
                 // already pending prefix is delivered first, then the next
                 // read reports the terminal framing error.
-                self.failed = true;
-                self.failure_signal.store(true, Ordering::Release);
+                self.fail(FrameFailure::Overflow);
                 break;
             } else {
                 self.frame_length += 1;
@@ -119,11 +148,8 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedFrameReader<R> {
             self.copy_pending(buffer);
             return Poll::Ready(Ok(()));
         }
-        if self.failed {
-            return Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("MCP frame exceeds {} bytes", self.max_length),
-            )));
+        if self.failed.is_some() {
+            return Poll::Ready(Err(self.failure_error()));
         }
         if self.eof {
             return Poll::Ready(Ok(()));
@@ -136,8 +162,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedFrameReader<R> {
         match Pin::new(&mut self.inner).poll_read(cx, &mut chunk_buffer) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(error)) => {
-                self.failed = true;
-                self.failure_signal.store(true, Ordering::Release);
+                self.fail(FrameFailure::Io {
+                    kind: error.kind(),
+                    message: error.to_string(),
+                });
                 Poll::Ready(Err(error))
             }
             Poll::Ready(Ok(())) => {
@@ -151,10 +179,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedFrameReader<R> {
                     self.copy_pending(buffer);
                     Poll::Ready(Ok(()))
                 } else {
-                    Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("MCP frame exceeds {} bytes", self.max_length),
-                    )))
+                    Poll::Ready(Err(self.failure_error()))
                 }
             }
         }
@@ -194,12 +219,12 @@ struct BoundedStdioTransport {
     process_group: Option<u32>,
     transport: BoundedMcpTransport,
     pending_requests: Arc<StdMutex<VecDeque<RequestId>>>,
-    frame_failure: Arc<AtomicBool>,
+    frame_failure: FrameFailureSlot,
 }
 
 impl BoundedStdioTransport {
     fn new(child: Child, stdout: ChildStdout, stdin: ChildStdin, scope: ProcessScope) -> Self {
-        let frame_failure = Arc::new(AtomicBool::new(false));
+        let frame_failure = FrameFailureSlot::default();
         let process_group = if cfg!(unix) { child.id() } else { None };
         Self {
             scope,
@@ -235,19 +260,26 @@ impl BoundedStdioTransport {
     }
 
     fn frame_failure_response(&self) -> Option<RxJsonRpcMessage<RoleClient>> {
-        if !self.frame_failure.load(Ordering::Acquire) {
-            return None;
-        }
+        let failure = self
+            .frame_failure
+            .lock()
+            .expect("frame failure lock")
+            .clone()?;
         let id = self
             .pending_requests
             .lock()
             .expect("pending MCP requests lock")
             .pop_front()?;
         Some(JsonRpcMessage::error(
-            ErrorData::invalid_request(
-                format!("MCP frame exceeds {MCP_MAX_FRAME_BYTES} bytes"),
-                None,
-            ),
+            match failure {
+                FrameFailure::Overflow => ErrorData::invalid_request(
+                    format!("MCP frame exceeds {MCP_MAX_FRAME_BYTES} bytes"),
+                    None,
+                ),
+                FrameFailure::Io { message, .. } => {
+                    ErrorData::internal_error(format!("MCP transport read failed: {message}"), None)
+                }
+            },
             Some(id),
         ))
     }
@@ -312,27 +344,49 @@ impl Transport<RoleClient> for BoundedStdioTransport {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        self.transport.close().await?;
+        let transport_result = self.transport.close().await;
+        self.finish_close(transport_result).await
+    }
+}
+
+impl BoundedStdioTransport {
+    /// Reap the child, sweep its process group, and release the scope, given
+    /// the outcome of the transport shutdown. Every cleanup step runs even
+    /// when an earlier one failed: a failed transport shutdown must not leave
+    /// the child, its process group, or the cgroup scope behind. The first
+    /// error is returned. Split out of `close` so tests can inject a failure.
+    async fn finish_close(
+        &mut self,
+        transport_result: Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
         let Some(mut child) = self.child.take() else {
-            return Ok(());
+            release_scope(&mut self.scope);
+            return transport_result;
         };
         let group = self.process_group.take();
-        let result = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        let reap_result = match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
             Ok(result) => result.map(|_| ()),
             Err(_) => {
                 // Signal the group before reaping the leader: an unreaped
                 // leader keeps the group ID from being reused.
                 kill_process_group(group);
-                child.start_kill()?;
-                child.wait().await.map(|_| ())
+                match child.start_kill() {
+                    Ok(()) => child.wait().await.map(|_| ()),
+                    Err(error) => Err(error),
+                }
             }
         };
         // Sweep descendants that outlived a graceful leader exit, including
         // ones that left the process group (cgroup, on Linux).
         kill_process_group(group);
         release_scope(&mut self.scope);
-        result
+        first_error(transport_result, reap_result)
     }
+}
+
+/// Return the first failure of two sequential cleanup steps.
+fn first_error<E>(first: Result<(), E>, second: Result<(), E>) -> Result<(), E> {
+    first.and(second)
 }
 
 impl Drop for BoundedStdioTransport {
@@ -394,6 +448,7 @@ struct ConnectedServer {
     stderr_task: Option<StderrTask>,
     /// Configured secret values removed from this server's tool errors.
     redactions: Redactions,
+    health: Arc<ServerHealth>,
 }
 
 impl McpRuntime {
@@ -486,6 +541,23 @@ impl McpRuntime {
         Ok(connected)
     }
 
+    /// Current status of the named server, or `None` if it is unknown. A
+    /// transport that died since the last call is detected here.
+    pub fn server_status(&self, name: &str) -> Option<ServerStatus> {
+        let server = self.servers.iter().find(|server| server.name == name)?;
+        if server.client.peer().is_transport_closed() {
+            server.health.mark_failed();
+        }
+        Some(server.health.status())
+    }
+
+    /// True when the server sent `tools/list_changed`; the registered tools
+    /// are not refreshed until the session reconnects.
+    pub fn tools_stale(&self, name: &str) -> Option<bool> {
+        let server = self.servers.iter().find(|server| server.name == name)?;
+        Some(server.health.tools_stale())
+    }
+
     /// Register all discovered remote tools into a registry. The caller must
     /// retain this runtime until every resulting agent tool call has completed.
     pub fn register_into(&self, registry: &mut ToolRegistry) -> Result<(), McpError> {
@@ -496,6 +568,7 @@ impl McpRuntime {
                     remote.clone(),
                     server.client.peer().clone(),
                     server.redactions.clone(),
+                    server.health.clone(),
                 )?))?;
             }
         }
@@ -510,6 +583,7 @@ impl McpRuntime {
         // close futures. This also prevents a global shutdown timeout from
         // dropping JoinHandles and detaching stderr tasks.
         for server in &mut servers {
+            server.health.mark_closed();
             if let Some(task) = server.stderr_task.take() {
                 task.abort();
             }
@@ -582,6 +656,7 @@ async fn connect_server(
                 ClientLifecycleMode::Initialize,
             )
             .await
+            .map_err(ConnectFailure::into_error)
         }
         McpTransportConfig::Http { url, headers } => {
             let headers = headers
@@ -624,14 +699,8 @@ async fn connect_server(
             // when they receive the newer server/discover method. rmcp's Auto
             // mode can fall back after a JSON-RPC rejection, but not after the
             // transport closes; reconnect before using legacy initialization.
-            if matches!(
-                &result,
-                Err(McpError::Operation {
-                    operation: "initialize",
-                    message,
-                    ..
-                }) if message == "connection closed: discover response"
-            ) && !cancel.is_cancelled()
+            if matches!(&result, Err(ConnectFailure::ClosedDuringDiscovery(_)))
+                && !cancel.is_cancelled()
             {
                 tracing::debug!(
                     server = %server.name,
@@ -645,10 +714,52 @@ async fn connect_server(
                     None,
                     ClientLifecycleMode::Initialize,
                 )
-                .await;
+                .await
+                .map_err(ConnectFailure::into_error);
             }
-            result
+            result.map_err(ConnectFailure::into_error)
         }
+    }
+}
+
+/// Why a connection attempt failed. The discovery-closed case is a distinct
+/// variant so the legacy-HTTP fallback is decided structurally, not by
+/// matching rendered error text.
+enum ConnectFailure {
+    /// The transport closed while waiting for the `server/discover` response.
+    ClosedDuringDiscovery(McpError),
+    Other(McpError),
+}
+
+impl ConnectFailure {
+    fn into_error(self) -> McpError {
+        match self {
+            Self::ClosedDuringDiscovery(error) | Self::Other(error) => error,
+        }
+    }
+}
+
+impl From<McpError> for ConnectFailure {
+    fn from(error: McpError) -> Self {
+        Self::Other(error)
+    }
+}
+
+/// Classify an rmcp initialization error by variant.
+fn classify_initialize_error(
+    server: &str,
+    error: rmcp::service::ClientInitializeError,
+) -> ConnectFailure {
+    let closed = matches!(
+        &error,
+        rmcp::service::ClientInitializeError::ConnectionClosed(context)
+            if context == "discover response"
+    );
+    let error = McpError::operation(server, "initialize", error);
+    if closed {
+        ConnectFailure::ClosedDuringDiscovery(error)
+    } else {
+        ConnectFailure::Other(error)
     }
 }
 
@@ -659,16 +770,17 @@ async fn connect_transport<T>(
     transport: T,
     stderr_task: Option<StderrTask>,
     lifecycle: ClientLifecycleMode,
-) -> Result<ConnectedServer, McpError>
+) -> Result<ConnectedServer, ConnectFailure>
 where
     T: Transport<RoleClient> + 'static,
     T::Error: std::error::Error + Send + Sync + 'static,
 {
-    let handler = match HarnessClient::new(workspace_root) {
+    let health = Arc::new(ServerHealth::default());
+    let handler = match HarnessClient::new(workspace_root, health.clone()) {
         Ok(handler) => handler,
         Err(error) => {
             abort_stderr_task(stderr_task).await;
-            return Err(error);
+            return Err(error.into());
         }
     };
     let server_cancel = cancel.child_token();
@@ -686,13 +798,13 @@ where
         _ = server_cancel.cancelled() => {
             server_cancel.cancel();
             abort_stderr_task(stderr_task).await;
-            return Err(McpError::operation(&server.name, "initialize", "cancelled"));
+            return Err(McpError::operation(&server.name, "initialize", "cancelled").into());
         }
         result = &mut initialize => match result {
             Ok(Ok(client)) => client,
             Ok(Err(error)) => {
                 abort_stderr_task(stderr_task).await;
-                return Err(McpError::operation(&server.name, "initialize", error));
+                return Err(classify_initialize_error(&server.name, error));
             }
             Err(_) => {
                 server_cancel.cancel();
@@ -701,7 +813,8 @@ where
                     &server.name,
                     "initialize",
                     "request timed out",
-                ));
+                )
+                .into());
             }
         }
     };
@@ -713,7 +826,7 @@ where
                 let _ = client.close_with_timeout(MCP_SHUTDOWN_TIMEOUT).await;
             }
             abort_stderr_task(stderr_task).await;
-            return Err(error);
+            return Err(error.into());
         }
     };
     tracing::debug!(server = %server.name, tools = tools.len(), "connected MCP server");
@@ -723,6 +836,7 @@ where
         tools,
         stderr_task,
         redactions: Redactions::default(),
+        health,
     })
 }
 
@@ -833,6 +947,7 @@ async fn abort_stderr_task(task: Option<StderrTask>) {
 mod tests {
     use super::*;
     use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct ChunkedReader {
         data: Vec<u8>,
@@ -909,12 +1024,60 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
+    #[test]
+    fn first_cleanup_error_wins_and_a_later_error_surfaces_alone() {
+        assert_eq!(first_error::<&str>(Ok(()), Ok(())), Ok(()));
+        assert_eq!(first_error(Err("a"), Err("b")), Err("a"));
+        assert_eq!(first_error(Err("a"), Ok(())), Err("a"));
+        assert_eq!(first_error(Ok(()), Err("b")), Err("b"));
+    }
+
+    struct FailingReader;
+
+    impl AsyncRead for FailingReader {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buffer: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "pipe gone")))
+        }
+    }
+
+    #[tokio::test]
+    async fn io_errors_are_not_reported_as_oversized_frames() {
+        let slot = FrameFailureSlot::default();
+        let mut reader = BoundedFrameReader::new_with_failure(FailingReader, 8, slot.clone());
+        let mut byte = [0u8; 1];
+        for _ in 0..2 {
+            let error = reader.read(&mut byte).await.expect_err("io error");
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(!error.to_string().contains("exceeds"), "{error}");
+        }
+        assert!(matches!(
+            slot.lock().unwrap().clone(),
+            Some(FrameFailure::Io {
+                kind: io::ErrorKind::BrokenPipe,
+                ..
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn valid_frame_before_oversized_frame_is_preserved() {
         let reader = BoundedFrameReader::new(ChunkedReader::new(b"ok\n123456789\n", 3), 8);
         let (output, error) = read_guarded(reader).await;
         assert_eq!(output, b"ok\n12345678");
         assert!(error.is_some());
+    }
+
+    #[test]
+    fn only_discover_connection_close_selects_legacy_fallback() {
+        use rmcp::service::ClientInitializeError::ConnectionClosed;
+        let closed = classify_initialize_error("s", ConnectionClosed("discover response".into()));
+        assert!(matches!(closed, ConnectFailure::ClosedDuringDiscovery(_)));
+        let other = classify_initialize_error("s", ConnectionClosed("initialize response".into()));
+        assert!(matches!(other, ConnectFailure::Other(_)));
     }
 
     #[derive(Clone, Default)]
@@ -1179,6 +1342,10 @@ while IFS= read -r line; do
                     value=$(printf '%s\n' "$line" | sed -n 's/.*"value":\([0-9][0-9]*\).*/\1/p')
                     printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"display must not be parsed"}],"structuredContent":{"next_value":%s}}}\n' "$id" "$((value * 3 + 1))"
                     ;;
+                list-changed)
+                    printf '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n'
+                    printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"ok"}]}}\n' "$id"
+                    ;;
                 call-text-single)
                     single_huge "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"" "\"}]}}"
                     ;;
@@ -1353,6 +1520,117 @@ done
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        }
+
+        #[tokio::test]
+        async fn list_changed_notification_marks_tools_stale() {
+            let runtime = connect_fixture("list-changed")
+                .await
+                .expect("fixture should connect");
+            let mut registry = ToolRegistry::empty();
+            runtime.register_into(&mut registry).unwrap();
+            assert_eq!(runtime.tools_stale("fixture"), Some(false));
+            assert_eq!(runtime.tools_stale("nope"), None);
+            // The fixture sends the notification just before the call result,
+            // so it has been handled by the time the call returns or soon after.
+            let output = registry
+                .execute(
+                    &crate::normalized_tool_name("fixture", "fixture"),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(!output.is_error, "{}", output.content);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while runtime.tools_stale("fixture") != Some(true) {
+                assert!(tokio::time::Instant::now() < deadline, "never marked stale");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            // Staleness is informational; the server stays usable.
+            assert_eq!(runtime.server_status("fixture"), Some(ServerStatus::Ready));
+            runtime.shutdown().await;
+        }
+
+        /// A failed transport shutdown must still sweep descendants that
+        /// outlived the leader and return the transport error.
+        #[tokio::test]
+        async fn failed_transport_close_still_sweeps_process_group() {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("sleep 300 >/dev/null 2>&1 & echo $!; exit 0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .kill_on_drop(true)
+                .process_group(0);
+            let mut child = command.spawn().unwrap();
+            let stdin = child.stdin.take().unwrap();
+            let mut stdout = child.stdout.take().unwrap();
+            let mut line = Vec::new();
+            loop {
+                let mut byte = [0u8; 1];
+                if stdout.read(&mut byte).await.unwrap() == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            let pid: libc::pid_t = String::from_utf8(line).unwrap().trim().parse().unwrap();
+            #[cfg(target_os = "linux")]
+            let scope = None;
+            #[cfg(not(target_os = "linux"))]
+            let scope = ();
+            let mut transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
+            // SAFETY: signal 0 only probes for existence.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "grandchild should run");
+            let error = transport
+                .finish_close(Err(io::Error::new(io::ErrorKind::BrokenPipe, "injected")))
+                .await
+                .expect_err("injected transport error must be returned");
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            assert!(transport.child.is_none());
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            // SAFETY: as above. The killed orphan is reaped by init.
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "descendant survived close"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn dead_server_is_marked_failed_and_calls_fail_fast() {
+            let runtime = connect_fixture("paged")
+                .await
+                .expect("fixture should connect");
+            let mut registry = ToolRegistry::empty();
+            runtime.register_into(&mut registry).unwrap();
+            assert_eq!(runtime.server_status("fixture"), Some(ServerStatus::Ready));
+            // Stop the protocol loop as a crash/EOF would.
+            runtime.servers[0].client.cancellation_token().cancel();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while runtime.server_status("fixture") != Some(ServerStatus::Failed) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "never marked failed"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let output = tokio::time::timeout(
+                Duration::from_secs(2),
+                registry.execute(
+                    &crate::normalized_tool_name("fixture", "first"),
+                    serde_json::json!({}),
+                    CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("call to a dead server must not hang");
+            assert!(output.is_error);
+            assert!(output.content.contains("unavailable"), "{}", output.content);
+            assert_eq!(runtime.server_status("nope"), None);
+            runtime.shutdown().await;
         }
 
         #[tokio::test]

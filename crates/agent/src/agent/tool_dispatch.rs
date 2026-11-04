@@ -757,8 +757,8 @@ impl Agent {
 
             let mut control = ParentDispatchControl::new(
                 input,
-                &mut self.queued,
-                &mut self.input_open,
+                &mut self.input.queued,
+                &mut self.input.open,
                 &self.cancel,
                 cancel,
             );

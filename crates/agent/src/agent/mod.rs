@@ -33,8 +33,8 @@ pub use events::{
 pub use persistence::AgentSessionState;
 pub(crate) use persistence::assistant_session_events;
 use persistence::{ui_snapshot_entries, usage_event};
-use prewalk::PrewalkState;
 pub use prewalk::{PrewalkChange, PrewalkSettings, PrewalkTarget};
+use prewalk::{PrewalkState, RestoreOutcome};
 pub use tool_dispatch::SubagentLimits;
 pub(crate) use tool_dispatch::{
     CancellationControl, DispatchCancellation, MAX_CONCURRENT_PARALLEL_TOOLS,
@@ -102,19 +102,27 @@ pub struct Agent {
     provider_factory: Option<ProviderFactory>,
     /// Input messages received while a turn is running.  They are drained by
     /// `run` before the next turn starts.
-    queued: VecDeque<InputMessage>,
-    /// Whether the input channel has not yet been observed closed.  Once
-    /// closed, the run loop stops selecting on it (a closed `recv` would
-    /// otherwise complete immediately and starve the stream polling).
-    input_open: bool,
+    input: TurnInput,
+    /// In-memory notes (stream/empty-response recovery, prewalk handoff) that
+    /// were appended to `history` but are not durable events. A compaction
+    /// rebuilds `history` from the session, which would silently drop them
+    /// while the per-turn recovery budget still counts them, so they are
+    /// replayed onto the rebuilt history. Cleared once a turn is underway.
+    ephemeral_notes: Vec<String>,
     /// Exact context occupation from the most recent completed request
     /// (`input_tokens + output_tokens` of its `Done` usage). Drives the
     /// pre-turn trigger; `None` before the first request or after a model
     /// switch, when the estimator takes over.
     last_context_tokens: Option<u64>,
     /// Resolved provider context window (config override → model-reported
-    /// `context_length` → generous default).
-    context_window: u64,
+    /// `context_length` → generous default), tagged with where it came from
+    /// so a window learned from an overflow error is not clobbered.
+    context_window: ContextWindow,
+    /// Bumped on every model change. Background metadata responses carry the
+    /// generation they were requested for, so a late response for an earlier
+    /// selection is ignored even when the model name is selected again
+    /// (A → B → A).
+    model_generation: u64,
     /// Token-aware compaction policy.
     compaction: CompactionPolicy,
     /// Rendered project-context block (AGENTS.md / CLAUDE.md), loaded once at
@@ -131,9 +139,107 @@ pub struct Agent {
     /// Channel used by background model metadata requests. Keeping the sender
     /// on the agent lets model changes remain non-blocking while the run loop
     /// applies ready results at every operation boundary.
-    model_metadata_tx: Option<mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>>,
+    model_metadata_tx: Option<mpsc::UnboundedSender<ModelMetadata>>,
     /// One-shot planning-to-implementation model handoff.
     prewalk: PrewalkState,
+}
+
+/// Input-channel state shared by every operation boundary.
+///
+/// Operations that borrow the agent while they run cannot also write these
+/// fields, so they work on an [`InputFork`] and hand it back through
+/// [`TurnInput::absorb`]. Keeping that protocol in one place prevents a new
+/// boundary from dropping buffered messages or forgetting a closed channel.
+struct TurnInput {
+    /// Messages received while an operation was running; drained by `run`
+    /// before it reads the channel again.
+    queued: VecDeque<InputMessage>,
+    /// Whether the channel has not yet been observed closed. Once closed the
+    /// run loop stops selecting on it (a closed `recv` would otherwise
+    /// complete immediately and starve stream polling).
+    open: bool,
+}
+
+impl Default for TurnInput {
+    fn default() -> Self {
+        Self {
+            queued: VecDeque::new(),
+            open: true,
+        }
+    }
+}
+
+/// Scratch input state for an operation that borrows the agent.
+#[must_use = "an input fork must be handed back with TurnInput::absorb"]
+struct InputFork {
+    open: bool,
+    buffered: VecDeque<InputMessage>,
+}
+
+impl InputFork {
+    /// Keep a non-interrupt message in arrival order for later.
+    fn buffer(&mut self, message: InputMessage) {
+        self.buffered.push_back(message);
+    }
+
+    /// Record that the channel closed so it is no longer polled.
+    fn close(&mut self) {
+        self.open = false;
+    }
+}
+
+impl TurnInput {
+    /// Start scratch state mirroring the current open flag.
+    fn fork(&self) -> InputFork {
+        InputFork {
+            open: self.open,
+            buffered: VecDeque::new(),
+        }
+    }
+
+    /// Merge a finished operation's observations back in.
+    fn absorb(&mut self, fork: InputFork) {
+        self.open = fork.open;
+        self.queued.extend(fork.buffered);
+    }
+}
+
+/// A background model-catalogue result: `(generation, provider, model, models)`.
+type ModelMetadata = (u64, String, String, Vec<llm::ModelInfo>);
+
+/// Context window plus its provenance. `Unknown` replaces a zero sentinel;
+/// `Learned` (from a provider overflow error) is the most trustworthy value
+/// for the current model selection and must not be replaced by catalogue
+/// metadata that arrives later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextWindow {
+    /// Not resolved yet (before `run` or `with_compaction`).
+    Unknown,
+    /// Config override, catalogue `context_length`, provider hint, or default.
+    Metadata(u64),
+    /// Bound parsed from a context-overflow rejection.
+    Learned(u64),
+}
+
+impl ContextWindow {
+    /// Token count, or 0 while unknown (callers treat 0 as "no bound").
+    fn tokens(self) -> u64 {
+        match self {
+            Self::Unknown => 0,
+            Self::Metadata(tokens) | Self::Learned(tokens) => tokens,
+        }
+    }
+}
+
+/// How an isolated `/ask` request ended. A bool conflated "finished" with
+/// "interrupted" and "application shutdown"; only shutdown stops the loop.
+enum AskOutcome {
+    /// Answered, or failed with an already-emitted error event.
+    Done,
+    /// The user pressed Esc; the request was dropped but the agent continues.
+    Interrupted,
+    /// The application token was cancelled; the run loop must stop.
+    Shutdown,
 }
 
 impl Agent {
@@ -156,10 +262,11 @@ impl Agent {
             session: None,
             secret_masker: Arc::new(SecretMasker::default()),
             provider_factory: None,
-            queued: VecDeque::new(),
-            input_open: true,
+            input: TurnInput::default(),
+            ephemeral_notes: Vec::new(),
             last_context_tokens: None,
-            context_window: 0,
+            context_window: ContextWindow::Unknown,
+            model_generation: 0,
             compaction: CompactionPolicy::default(),
             project_context: String::new(),
             subagent_limits: SubagentLimits::default(),
@@ -214,8 +321,9 @@ impl Agent {
 
     /// Attach a compaction policy (resolved from `config.toml`).
     pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
-        self.context_window =
-            policy.resolved_window(self.provider.context_window_hint().unwrap_or(0));
+        self.context_window = ContextWindow::Metadata(
+            policy.resolved_window(self.provider.context_window_hint().unwrap_or(0)),
+        );
         self.compaction = policy;
         self
     }
@@ -294,7 +402,7 @@ impl Agent {
         &self,
         question: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> bool {
+    ) -> AskOutcome {
         use futures_util::StreamExt;
         use llm::{CompletionRequest, Message, RetryCallback, StreamEvent};
         use std::sync::Arc;
@@ -321,7 +429,7 @@ impl Agent {
         };
         let stream_result = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => return false,
+            _ = self.cancel.cancelled() => return AskOutcome::Shutdown,
             result = self.provider.stream_with_retry(&request, on_retry) => result,
         };
         let mut stream = match stream_result {
@@ -331,14 +439,14 @@ impl Agent {
                     events,
                     AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
                 );
-                return true;
+                return AskOutcome::Done;
             }
         };
         let mut answer = String::new();
         loop {
             let event = tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return false,
+                _ = self.cancel.cancelled() => return AskOutcome::Shutdown,
                 event = stream.next() => event,
             };
             let Some(event) = event else { break };
@@ -353,7 +461,7 @@ impl Agent {
                         events,
                         AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
                     );
-                    return true;
+                    return AskOutcome::Done;
                 }
             }
         }
@@ -361,7 +469,7 @@ impl Agent {
             events,
             AgentEvent::AskAnswer(self.secret_masker.mask_text(&answer)),
         );
-        true
+        AskOutcome::Done
     }
 
     /// Run until the input channel closes or the application cancellation
@@ -401,10 +509,11 @@ impl Agent {
         // Tests and embedded callers may update the policy directly instead
         // of using the builder; establish the generous/configured value
         // synchronously, without provider I/O.
-        if self.context_window == 0 {
-            self.context_window = self
-                .compaction
-                .resolved_window(self.provider.context_window_hint().unwrap_or(0));
+        if self.context_window == ContextWindow::Unknown {
+            self.context_window = ContextWindow::Metadata(
+                self.compaction
+                    .resolved_window(self.provider.context_window_hint().unwrap_or(0)),
+            );
             self.publish_context_window();
         }
         send(&events, self.context_usage_event());
@@ -422,6 +531,7 @@ impl Agent {
         spawn_model_metadata(
             metadata_tx,
             self.provider.clone(),
+            self.model_generation,
             self.secret_masker.mask_text(self.provider.name()),
             self.model.clone(),
             self.cancel.clone(),
@@ -431,23 +541,23 @@ impl Agent {
             // Apply every result that is already ready before selecting the
             // next queued operation. Otherwise a busy queued-turn stream can
             // starve startup metadata indefinitely.
-            while let Ok((provider, model, models)) = metadata_rx.try_recv() {
-                self.apply_model_metadata(provider, model, models, &events);
+            while let Ok((generation, provider, model, models)) = metadata_rx.try_recv() {
+                self.apply_model_metadata(generation, provider, model, models, &events);
             }
-            let next_message = if let Some(message) = self.queued.pop_front() {
+            let next_message = if let Some(message) = self.input.queued.pop_front() {
                 Some(message)
-            } else if !self.input_open {
+            } else if !self.input.open {
                 None
             } else {
                 tokio::select! {
                     message = input.recv() => {
                         if message.is_none() {
-                            self.input_open = false;
+                            self.input.open = false;
                         }
                         message
                     }
-                    Some((provider, model, models)) = metadata_rx.recv() => {
-                        self.apply_model_metadata(provider, model, models, &events);
+                    Some((generation, provider, model, models)) = metadata_rx.recv() => {
+                        self.apply_model_metadata(generation, provider, model, models, &events);
                         continue;
                     }
                     _ = self.cancel.cancelled() => None,
@@ -479,42 +589,47 @@ impl Agent {
                     // Poll input while the isolated request is opening or
                     // streaming. Dropping the future on Esc stops only this
                     // request; other messages retain their queue order.
-                    let mut buffered = VecDeque::new();
-                    let mut input_open = self.input_open;
-                    let completed = {
+                    let mut fork = self.input.fork();
+                    let outcome = {
                         let operation = self.answer_isolated_question(question, &events);
                         tokio::pin!(operation);
                         loop {
                             tokio::select! {
                                 biased;
-                                _ = self.cancel.cancelled() => break false,
-                                message = input.recv(), if input_open => match message {
-                                    Some(InputMessage::Interrupt) => break true,
-                                    Some(message) => buffered.push_back(message),
-                                    None => input_open = false,
+                                _ = self.cancel.cancelled() => break AskOutcome::Shutdown,
+                                message = input.recv(), if fork.open => match message {
+                                    Some(InputMessage::Interrupt) => break AskOutcome::Interrupted,
+                                    Some(message) => fork.buffer(message),
+                                    None => fork.close(),
                                 },
-                                completed = &mut operation => break completed,
+                                outcome = &mut operation => break outcome,
                             }
                         }
                     };
-                    self.input_open = input_open;
-                    self.queued.extend(buffered);
-                    if !completed {
-                        break;
+                    self.input.absorb(fork);
+                    match outcome {
+                        AskOutcome::Done | AskOutcome::Interrupted => {
+                            send(&events, AgentEvent::OperationFinished);
+                            continue;
+                        }
+                        AskOutcome::Shutdown => break,
                     }
-                    send(&events, AgentEvent::OperationFinished);
-                    continue;
                 }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
                     // After a handoff, a new prewalk cycle starts again from
                     // the planning model unless the user chose another one.
-                    match self.restore_prewalk_for_new_session(&events).await {
-                        TurnControl::Shutdown | TurnControl::Quarantine => break,
-                        TurnControl::Continue => {}
-                    }
+                    let restored = match self.restore_prewalk_for_new_session(&events).await {
+                        RestoreOutcome::Stop(TurnControl::Shutdown | TurnControl::Quarantine) => {
+                            break;
+                        }
+                        RestoreOutcome::Stop(TurnControl::Continue) | RestoreOutcome::Ready => true,
+                        RestoreOutcome::Rejected => false,
+                    };
                     self.handle_new_session(&events);
-                    self.rearm_prewalk_for_new_session(&events);
+                    // A rejected restore leaves us on the target model; arming
+                    // would plan there, so stay disarmed until it succeeds.
+                    self.rearm_prewalk_for_new_session(&events, restored);
                     continue;
                 }
                 InputMessage::LoadSession { selector } => {
@@ -549,7 +664,6 @@ impl Agent {
                     continue;
                 }
                 InputMessage::SetModel { provider, model } => {
-                    self.prewalk.forget_restore();
                     // Model changes persist first and commit atomically;
                     // failures leave parent and subagent selection unchanged
                     // and surface one terminal event via quarantine.
@@ -563,7 +677,6 @@ impl Agent {
                     continue;
                 }
                 InputMessage::SetReasoning { level } => {
-                    self.prewalk.forget_restore();
                     self.handle_set_reasoning(level, &events);
                     continue;
                 }
@@ -3191,10 +3304,101 @@ mod tests {
         });
     }
 
-    /// A response with no text and no tool calls is a provider stall; the
-    /// agent re-streams once with a nudge instead of ending the turn silently.
+    /// Retryable stream failures spend only their own budget: after three of
+    /// them, an empty response must still get its nudge. A single shared
+    /// budget (the old behaviour) ended the turn silently here.
     #[test]
-    fn empty_response_retries_turn_once() {
+    fn retryable_failures_do_not_exhaust_empty_response_budget() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let failing = || vec![Err("connection dropped".to_string())];
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    failing(),
+                    failing(),
+                    failing(),
+                    script(vec![StreamEvent::Done {
+                        stop_reason: None,
+                        usage: None,
+                    }]),
+                    script(vec![
+                        StreamEvent::TextDelta("answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        },
+                    ]),
+                ],
+                error_kind: MockErrorKind::Retryable,
+            });
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx.send(InputMessage::Message("go".into())).unwrap();
+            drop(input_tx);
+            Agent::new(
+                provider.clone(),
+                ToolRegistry::empty(),
+                "demo",
+                CancellationToken::new(),
+            )
+            .run(input_rx, event_tx)
+            .await;
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+            let mut got = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                got.push(event);
+            }
+            assert!(got.contains(&AgentEvent::TextDelta("answer".into())));
+        });
+    }
+
+    /// The cancellation marker names application shutdown whenever the
+    /// application token fired, not only the turn token.
+    #[test]
+    fn cancel_marker_reflects_application_token() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = store.create(SessionCreateOptions::default()).unwrap();
+            let session_id = session.id();
+            let cancel = CancellationToken::new();
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![],
+                error_kind: MockErrorKind::Stream,
+            });
+            let mut agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel.clone())
+                .with_session(store.clone(), session)
+                .unwrap();
+            let (event_tx, _event_rx) = mpsc::unbounded_channel();
+            agent
+                .persist_cancelled_for("turn interrupted", &event_tx)
+                .unwrap();
+            cancel.cancel();
+            agent
+                .persist_cancelled_for("turn interrupted", &event_tx)
+                .unwrap();
+            let reasons: Vec<String> = store
+                .open(&session_id)
+                .unwrap()
+                .events
+                .iter()
+                .filter_map(|record| match &record.event {
+                    SessionEvent::TurnCancelled { reason } => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasons, vec!["turn interrupted", "application shutdown"]);
+        });
+    }
+
+    /// A response with no text and no tool calls is a provider stall; the
+    /// agent re-streams with a nudge instead of ending the turn silently.
+    #[test]
+    fn empty_response_retries_turn_with_nudge() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let provider = Arc::new(MockProvider {
@@ -3228,7 +3432,7 @@ mod tests {
             assert_eq!(
                 provider.calls.load(Ordering::SeqCst),
                 2,
-                "an empty response should re-stream once"
+                "an empty response should re-stream after a nudge"
             );
             let mut got = Vec::new();
             while let Ok(event) = event_rx.try_recv() {
@@ -3876,7 +4080,7 @@ mod tests {
         assert!(turn_cancel.is_cancelled());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
-            agent.queued.pop_front(),
+            agent.input.queued.pop_front(),
             Some(InputMessage::Message(text)) if text == "next message"
         ));
         let loaded = store.open(&session_id).unwrap();
@@ -3884,6 +4088,67 @@ mod tests {
             record.event,
             SessionEvent::CompactionSummary { .. } | SessionEvent::Usage { .. }
         )));
+    }
+
+    /// A recovery note lives only in memory. A mid-turn compaction rebuilds
+    /// history from the session, so the note must be replayed or the model
+    /// loses its instruction while the recovery budget stays spent.
+    #[test]
+    fn compaction_rebuild_preserves_in_memory_recovery_notes() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = populate_session(&store, 12, 12_000);
+            let provider = Arc::new(RecordingProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    // Empty response: queues the "produced no output" note.
+                    script(vec![StreamEvent::Done {
+                        stop_reason: Some("stop".into()),
+                        usage: None,
+                    }]),
+                    // The nudged request then overflows and compacts.
+                    vec![Err("context length exceeded for this request".into())],
+                    summarizer_script(),
+                    script(vec![
+                        StreamEvent::TextDelta("done".into()),
+                        StreamEvent::Done {
+                            stop_reason: Some("stop".into()),
+                            usage: None,
+                        },
+                    ]),
+                ],
+                seen: Mutex::new(Vec::new()),
+            });
+            let (events, provider) = run_session_agent(
+                &store,
+                session,
+                provider,
+                vec![InputMessage::Message("do the work".into())],
+            )
+            .await;
+            assert!(events.contains(&AgentEvent::TextDelta("done".into())));
+            let seen = provider.seen.lock().unwrap();
+            assert_eq!(seen.len(), 4);
+            let mentions_note = |messages: &[Message]| {
+                messages.iter().any(|message| {
+                    message.content.iter().any(|content| {
+                        matches!(content, Content::Text(text) if text.contains("produced no output"))
+                    })
+                })
+            };
+            assert!(mentions_note(&seen[1].1), "nudged request carries the note");
+            assert!(
+                seen[3].1.iter().any(is_summary_message),
+                "final request must use the compacted history"
+            );
+            assert!(
+                mentions_note(&seen[3].1),
+                "the recovery note must survive the compaction rebuild"
+            );
+        });
     }
 
     #[test]
@@ -4484,7 +4749,7 @@ mod tests {
         .with_subagent_runner(runner.clone())
         .with_session(store.clone(), session)
         .unwrap();
-        agent.context_window = 77_777;
+        agent.context_window = ContextWindow::Metadata(77_777);
         agent.last_context_tokens = Some(123);
         agent.model_metadata_tx = Some(metadata_tx);
         let before_session = agent.session.as_ref().unwrap().session.clone();
@@ -4499,7 +4764,7 @@ mod tests {
         assert!(Arc::ptr_eq(&agent.provider, &old_provider));
         assert_eq!(agent.model, "old-model");
         assert_eq!(runner.model_for_test(), "old-model");
-        assert_eq!(agent.context_window, 77_777);
+        assert_eq!(agent.context_window, ContextWindow::Metadata(77_777));
         assert_eq!(agent.last_context_tokens, Some(123));
         assert_eq!(
             agent.session.as_ref().unwrap().session,

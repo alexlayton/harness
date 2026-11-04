@@ -106,19 +106,32 @@ pub fn decode_session(content: &str, source: impl AsRef<Path>) -> Result<Session
 /// `valid_bytes` removes only the incomplete tail fragment; every previously
 /// valid record is preserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TailRecovery {
-    /// True when an unterminated malformed final line was ignored.
-    pub recovered: bool,
-    /// Byte offset after the last valid complete record (`content.len()`
-    /// when nothing was recovered).
-    pub valid_bytes: usize,
+pub enum TailRecovery {
+    /// Nothing was dropped: `valid_bytes` is the whole content length.
+    Clean { valid_bytes: usize },
+    /// An unterminated malformed final line was ignored; `valid_bytes` is
+    /// strictly the offset after the last valid complete record, so the
+    /// fragment (and only it) lies beyond it.
+    Truncated { valid_bytes: usize },
 }
 
 impl TailRecovery {
     fn none(total_bytes: usize) -> Self {
-        Self {
-            recovered: false,
+        Self::Clean {
             valid_bytes: total_bytes,
+        }
+    }
+
+    /// True when an unterminated malformed final line was ignored.
+    pub fn is_recovered(&self) -> bool {
+        matches!(self, Self::Truncated { .. })
+    }
+
+    /// Byte offset after the last valid complete record (the content length
+    /// when nothing was recovered).
+    pub fn valid_bytes(&self) -> usize {
+        match *self {
+            Self::Clean { valid_bytes } | Self::Truncated { valid_bytes } => valid_bytes,
         }
     }
 }
@@ -173,8 +186,7 @@ pub(crate) fn decode_session_file_bytes(
             let (session, _) = decode_session_lines(prefix, source, true)?;
             Ok((
                 session,
-                TailRecovery {
-                    recovered: true,
+                TailRecovery::Truncated {
                     valid_bytes: last_newline + 1,
                 },
             ))
@@ -325,8 +337,7 @@ fn decode_session_lines(
         let mut raw: RawEnvelope = match serde_json::from_str(line) {
             Ok(raw) => raw,
             Err(_) if recover_trailing && has_unterminated_tail && line_number == last_line => {
-                recovery = TailRecovery {
-                    recovered: true,
+                recovery = TailRecovery::Truncated {
                     valid_bytes: consumed_bytes,
                 };
                 break;
@@ -598,8 +609,8 @@ mod tests {
         .unwrap();
         let corrupted = format!("{encoded}{{");
         let (session, recovery) = decode_session_file(&corrupted, "<memory>").unwrap();
-        assert!(recovery.recovered);
-        assert_eq!(recovery.valid_bytes, encoded.len());
+        assert!(recovery.is_recovered());
+        assert_eq!(recovery.valid_bytes(), encoded.len());
         assert_eq!(
             session.events,
             Session::new(SessionMetadata::new(
@@ -622,8 +633,8 @@ mod tests {
         let encoded = encode_session(&session).unwrap();
         let without_newline = encoded.strip_suffix('\n').unwrap();
         let (decoded, recovery) = decode_session_file(without_newline, "<memory>").unwrap();
-        assert!(!recovery.recovered);
-        assert_eq!(recovery.valid_bytes, without_newline.len());
+        assert!(!recovery.is_recovered());
+        assert_eq!(recovery.valid_bytes(), without_newline.len());
         assert_eq!(decoded.events, session.events);
     }
 
@@ -649,11 +660,29 @@ mod tests {
         let partial = "{\"version\":1,\"type\":\"user_message\"";
         let corrupted = format!("{encoded}{partial}");
         let (decoded, recovery) = decode_session_file(&corrupted, "<memory>").unwrap();
-        assert!(recovery.recovered);
-        assert_eq!(recovery.valid_bytes, encoded.len());
+        assert!(recovery.is_recovered());
+        assert_eq!(recovery.valid_bytes(), encoded.len());
         assert_eq!(decoded.events, session.events);
         // Truncating to the reported offset keeps canonical bytes only.
-        assert_eq!(&corrupted[..recovery.valid_bytes], encoded.as_str());
+        assert_eq!(&corrupted[..recovery.valid_bytes()], encoded.as_str());
+    }
+
+    #[test]
+    fn invalid_utf8_crash_tail_keeps_the_last_records_newline() {
+        let mut session = Session::new(SessionMetadata::new("/tmp/project", None, None));
+        session.append(SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user("hello")),
+        });
+        let encoded = encode_session(&session).unwrap();
+        let mut bytes = encoded.clone().into_bytes();
+        // A multi-byte sequence cut off mid-character after the final newline.
+        bytes.extend_from_slice(b"{\"x\":\"\xE2\x82");
+        let (decoded, recovery) = decode_session_file_bytes(&bytes, "<memory>").unwrap();
+        assert!(recovery.is_recovered());
+        assert_eq!(recovery.valid_bytes(), encoded.len());
+        assert_eq!(&bytes[..recovery.valid_bytes()], encoded.as_bytes());
+        assert_eq!(bytes[recovery.valid_bytes() - 1], b'\n');
+        assert_eq!(decoded.events, session.events);
     }
 
     #[test]

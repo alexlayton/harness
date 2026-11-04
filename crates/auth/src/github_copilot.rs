@@ -1033,12 +1033,16 @@ impl CopilotAuth {
                 store.save_copilot(credential)
             })
             .await?;
-        *self
-            .credential
-            .lock()
-            .map_err(|_| AuthError::InvalidCredential("credential lock poisoned".into()))? =
-            Some(credential.clone());
+        self.cache_login(&credential).await?;
         Ok(credential)
+    }
+
+    /// Cache a freshly logged-in credential under the single-flight lock so a
+    /// refresh that started from the previous login cannot cache its result
+    /// over this credential.
+    async fn cache_login(&self, credential: &CopilotCredential) -> Result<()> {
+        let _guard = self.refresh_lock.lock().await;
+        self.cache_credential(credential)
     }
 }
 
@@ -1115,6 +1119,23 @@ fn endpoint_label(endpoint: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn login_cache_waits_for_an_in_flight_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = CopilotAuth::new(AuthStore::new(dir.path().join("auth.json"))).unwrap();
+        let guard = auth.refresh_lock.lock().await;
+        let login = auth.clone();
+        let fresh = CopilotCredential::new("access", "refresh", u64::MAX - 1, None, Vec::new());
+        let expected = fresh.clone();
+        let task = tokio::spawn(async move { login.cache_login(&fresh).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "login must queue behind refresh");
+        assert!(auth.credential.lock().unwrap().is_none());
+        drop(guard);
+        task.await.unwrap().unwrap();
+        assert_eq!(*auth.credential.lock().unwrap(), Some(expected));
+    }
 
     #[test]
     fn normalizes_github_and_enterprise_domains() {

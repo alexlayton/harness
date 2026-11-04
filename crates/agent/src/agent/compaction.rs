@@ -1,13 +1,13 @@
 use super::persistence::usage_event;
 use super::{
-    Agent, AgentEvent, CompactionReason, InputMessage, MAX_OVERFLOW_RECOVERIES, TurnError, send,
+    Agent, AgentEvent, CompactionReason, ContextWindow, InputMessage, MAX_OVERFLOW_RECOVERIES,
+    TurnError, send,
 };
 use compact::{
     SummaryOutcome, plan_compaction, plan_overflow_compaction, summarize as compact_summarize,
 };
 use llm::LlmError;
 use session::{SessionEvent, usage_summary};
-use std::collections::VecDeque;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -19,12 +19,19 @@ impl Agent {
     /// when the result still belongs to the active provider/model.
     pub(crate) fn apply_model_metadata(
         &mut self,
+        generation: u64,
         provider: String,
         model: String,
         models: Vec<llm::ModelInfo>,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
-        if provider == self.secret_masker.mask_text(self.provider.name()) && model == self.model {
+        // The generation check rejects a response requested for an earlier
+        // selection of the same provider/model (A → B → A); the name check
+        // alone cannot tell those apart.
+        if generation == self.model_generation
+            && provider == self.secret_masker.mask_text(self.provider.name())
+            && model == self.model
+        {
             let reported = models
                 .iter()
                 .find(|candidate| {
@@ -33,8 +40,12 @@ impl Agent {
                 .and_then(|candidate| candidate.context_length)
                 .or_else(|| self.provider.context_window_hint())
                 .unwrap_or(0);
-            self.context_window = self.compaction.resolved_window(reported);
-            self.publish_context_window();
+            // A window learned from an overflow error beats catalogue data.
+            if !matches!(self.context_window, ContextWindow::Learned(_)) {
+                self.context_window =
+                    ContextWindow::Metadata(self.compaction.resolved_window(reported));
+                self.publish_context_window();
+            }
             send(events, self.context_usage_event());
         }
         send(events, AgentEvent::ModelList { provider, models });
@@ -46,7 +57,7 @@ impl Agent {
     pub(crate) fn context_usage_event(&self) -> AgentEvent {
         AgentEvent::ContextUsageUpdated {
             used_tokens: self.context_tokens_estimate(0),
-            max_tokens: self.context_window,
+            max_tokens: self.context_window.tokens(),
         }
     }
 
@@ -95,7 +106,7 @@ impl Agent {
         }
         let context = self.context_tokens_estimate(user_text.len());
         self.compaction
-            .should_auto_compact(context, self.context_window)
+            .should_auto_compact(context, self.context_window.tokens())
             .then_some(context)
     }
 
@@ -213,6 +224,7 @@ impl Agent {
                 .map(|message| self.secret_masker.mask_message(message))
                 .collect();
             send(events, usage_event(&state.session.metadata.usage));
+            self.replay_ephemeral_notes();
         }
         self.last_context_tokens = None;
         send(events, self.context_usage_event());
@@ -253,8 +265,7 @@ impl Agent {
         estimated_context: Option<u64>,
     ) -> Result<Option<bool>, TurnError> {
         let application = self.cancel.clone();
-        let mut buffered = VecDeque::new();
-        let mut input_open = self.input_open;
+        let mut fork = self.input.fork();
         let mut interrupted = false;
         let compacted = {
             let mut application_open = true;
@@ -268,34 +279,33 @@ impl Agent {
                         application_open = false;
                         cancel.cancel();
                     }
-                    message = input.recv(), if input_open => match message {
+                    message = input.recv(), if fork.open => match message {
                         Some(InputMessage::Interrupt) => {
                             interrupted = true;
                             cancel.cancel();
                         }
-                        Some(message) => buffered.push_back(message),
-                        None => input_open = false,
+                        Some(message) => fork.buffer(message),
+                        None => fork.close(),
                     },
                     result = &mut compaction => break result,
                 }
             }
         };
-        self.input_open = input_open;
-        self.queued.extend(buffered);
+        self.input.absorb(fork);
         let compacted = match compacted {
             Ok(compacted) => compacted,
             Err(TurnError::Shutdown) => {
-                self.persist_cancelled("application shutdown", events)?;
+                self.persist_cancelled_for("turn interrupted during compaction", events)?;
                 return Err(TurnError::Shutdown);
             }
             Err(error) => return Err(error),
         };
         if application.is_cancelled() {
-            self.persist_cancelled("application shutdown", events)?;
+            self.persist_cancelled_for("turn interrupted during compaction", events)?;
             return Err(TurnError::Shutdown);
         }
         if interrupted || cancel.is_cancelled() {
-            self.persist_cancelled("turn interrupted during compaction", events)?;
+            self.persist_cancelled_for("turn interrupted during compaction", events)?;
             return Ok(None);
         }
         Ok(Some(compacted))
@@ -305,7 +315,7 @@ impl Agent {
     /// requests below it.
     pub(crate) fn publish_context_window(&self) {
         if let Some(runner) = &self.subagent_runner {
-            runner.update_context_window(self.context_window);
+            runner.update_context_window(self.context_window.tokens());
         }
     }
 
@@ -324,8 +334,8 @@ impl Agent {
         let Some(hint) = window_hint_from_overflow(error) else {
             return;
         };
-        if hint < self.context_window {
-            self.context_window = hint;
+        if hint < self.context_window.tokens() {
+            self.context_window = ContextWindow::Learned(hint);
             self.publish_context_window();
             send(
                 events,
@@ -438,8 +448,78 @@ pub(crate) fn is_context_overflow(error: &LlmError) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Agent, AgentEvent, ContextWindow};
     use super::window_hint_from_overflow;
-    use llm::LlmError;
+    use async_trait::async_trait;
+    use llm::{CompletionRequest, EventStream, LlmError, ModelInfo, Provider};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use tools::ToolRegistry;
+
+    struct Named(&'static str);
+
+    #[async_trait]
+    impl Provider for Named {
+        fn name(&self) -> &str {
+            self.0
+        }
+        async fn stream(&self, _request: &CompletionRequest) -> Result<EventStream, LlmError> {
+            Err(LlmError::Stream("unused".into()))
+        }
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn catalogue(model: &str, tokens: u64) -> Vec<ModelInfo> {
+        vec![ModelInfo {
+            id: model.into(),
+            name: None,
+            context_length: Some(tokens),
+        }]
+    }
+
+    fn agent() -> Agent {
+        let mut agent = Agent::new(
+            Arc::new(Named("p")),
+            ToolRegistry::empty(),
+            "a",
+            CancellationToken::new(),
+        );
+        agent.context_window = ContextWindow::Metadata(1_000_000);
+        agent
+    }
+
+    #[test]
+    fn learned_window_survives_later_metadata_for_the_same_model() {
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut agent = agent();
+        agent.context_window = ContextWindow::Learned(50_000);
+        agent.apply_model_metadata(0, "p".into(), "a".into(), catalogue("a", 200_000), &tx);
+        assert_eq!(agent.context_window, ContextWindow::Learned(50_000));
+    }
+
+    #[test]
+    fn metadata_applies_when_nothing_was_learned() {
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut agent = agent();
+        agent.apply_model_metadata(0, "p".into(), "a".into(), catalogue("a", 200_000), &tx);
+        assert_eq!(agent.context_window, ContextWindow::Metadata(200_000));
+    }
+
+    #[test]
+    fn stale_generation_is_ignored_when_the_model_is_selected_again() {
+        let (tx, _rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let mut agent = agent();
+        // A (generation 0) -> B (1) -> A (2): the name check alone would
+        // accept the first response for A.
+        agent.model_generation = 2;
+        agent.apply_model_metadata(0, "p".into(), "a".into(), catalogue("a", 200_000), &tx);
+        assert_eq!(agent.context_window, ContextWindow::Metadata(1_000_000));
+        agent.apply_model_metadata(2, "p".into(), "a".into(), catalogue("a", 200_000), &tx);
+        assert_eq!(agent.context_window, ContextWindow::Metadata(200_000));
+    }
 
     #[test]
     fn overflow_errors_yield_a_safe_window_bound() {

@@ -153,6 +153,18 @@ enum Entry {
     },
 }
 
+/// Lifecycle of an on-demand backend fetch. `Failed` is distinct from `Idle`
+/// so typed refreshes do not re-fire a failing request on every keystroke;
+/// only an explicit Tab retries it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Fetch {
+    #[default]
+    Idle,
+    InFlight,
+    Loaded,
+    Failed,
+}
+
 /// The in-flight assistant message. The stable markdown prefix is drained
 /// into `pending` (as [`Entry::Assistant`]) once it outgrows the live-tail
 /// budget, keeping long responses flowing into scrollback incrementally.
@@ -448,11 +460,12 @@ pub struct CrossTerm {
     /// Configured MCP server names for the header MCP row.
     mcp_servers: Vec<String>,
     update_notice: Option<String>,
-    session_completion_requested: bool,
+    /// Completion-driven `ListSessions` lifecycle.
+    session_fetch: Fetch,
     session_list_display_requested: bool,
-    /// Providers we have already asked the agent to fetch, to avoid duplicate
-    /// `ListModels` requests while typing through a model token.
-    model_list_requested: HashSet<String>,
+    /// Per-provider `ListModels` lifecycle, so typing through a model token
+    /// neither duplicates a request nor hammers a provider that failed.
+    model_fetch: HashMap<String, Fetch>,
     completion: Option<Completion>,
     path_completion_tx: mpsc::UnboundedSender<PathCompletionResult>,
     path_completion_rx: mpsc::UnboundedReceiver<PathCompletionResult>,
@@ -461,6 +474,9 @@ pub struct CrossTerm {
     path_completion_cancel: Option<CancellationToken>,
 
     busy: bool,
+    /// True when busyness belongs to a model turn rather than a foreground
+    /// operation, so `OperationFinished` cannot clear a live turn.
+    turn_active: bool,
     activity: Activity,
     operation_label: Option<String>,
     spinner: usize,
@@ -541,9 +557,9 @@ impl CrossTerm {
             context_files,
             mcp_servers,
             update_notice,
-            session_completion_requested: false,
+            session_fetch: Fetch::Idle,
             session_list_display_requested: false,
-            model_list_requested: HashSet::new(),
+            model_fetch: HashMap::new(),
             completion: None,
             path_completion_tx,
             path_completion_rx,
@@ -551,6 +567,7 @@ impl CrossTerm {
             path_completion_query: None,
             path_completion_cancel: None,
             busy: false,
+            turn_active: false,
             activity: Activity::Preparing,
             operation_label: None,
             spinner: 0,
@@ -1023,11 +1040,24 @@ impl CrossTerm {
         // Recompute completion after any input mutation; refreshing at the
         // end of every handled key keeps the draft's ghost/hint in sync.
         self.refresh_completion();
-        self.request_typed_backend(input_tx)?;
+        self.request_typed_backend(input_tx, false)?;
         Ok(false)
     }
 
+    /// If the input no longer matches the recalled entry, the user edited it:
+    /// adopt the edit as a fresh draft so the next Up/Down keeps it instead of
+    /// overwriting it with a history entry.
+    fn detach_edited_history(&mut self) {
+        if let Some(pos) = self.history_pos
+            && self.history.get(pos) != Some(&self.input)
+        {
+            self.history_pos = None;
+            self.draft.clear();
+        }
+    }
+
     fn history_up(&mut self) {
+        self.detach_edited_history();
         let current = self.input.clone();
         if let Some(value) = history_previous(
             &self.history,
@@ -1041,6 +1071,7 @@ impl CrossTerm {
     }
 
     fn history_down(&mut self) {
+        self.detach_edited_history();
         if let Some(value) = history_next(&self.history, &mut self.history_pos, &self.draft) {
             self.input = value;
             self.cursor = self.input.len();
@@ -1123,9 +1154,7 @@ impl CrossTerm {
             &self.session_candidates,
             &self.skills,
         ) else {
-            self.cancel_path_completion();
-            self.completion = None;
-            self.session_completion_requested = false;
+            self.close_completion();
             return;
         };
 
@@ -1196,7 +1225,7 @@ impl CrossTerm {
     fn close_completion(&mut self) {
         self.cancel_path_completion();
         self.completion = None;
-        self.session_completion_requested = false;
+        self.session_fetch = Fetch::Idle;
     }
 
     /// Apply a candidate to the draft, move the cursor, then recompute the
@@ -1208,7 +1237,9 @@ impl CrossTerm {
         input_tx: &mpsc::UnboundedSender<InputMessage>,
     ) -> Result<()> {
         self.apply_replacement(candidate, context);
-        self.completion = None;
+        // Also cancels any in-flight path scan so a stale result cannot
+        // reopen the popup over the accepted text.
+        self.close_completion();
         // A None-argument command (e.g. `/new`) has no arguments to complete;
         // the refresh below would otherwise keep its own name listed.
         let argument_less = matches!(context.target, CompletionTarget::Command,)
@@ -1217,7 +1248,7 @@ impl CrossTerm {
         if argument_less {
             return Ok(());
         }
-        self.request_backend(input_tx, context, candidate)?;
+        self.request_backend(input_tx, context, candidate, true)?;
         self.refresh_completion();
         Ok(())
     }
@@ -1239,6 +1270,7 @@ impl CrossTerm {
     fn request_typed_backend(
         &mut self,
         input_tx: &mpsc::UnboundedSender<InputMessage>,
+        explicit: bool,
     ) -> Result<()> {
         let Some(context) = self
             .completion
@@ -1264,25 +1296,36 @@ impl CrossTerm {
                 description: String::new(),
                 kind: CandidateKind::Slash,
             },
+            explicit,
         )
     }
 
     /// Send anything the new draft now needs from the agent: a `ListSessions`
     /// for `/load` arguments or a `ListModels` when a `provider:` token was
     /// just completed and its model list is unknown. The dedupe sets keep
-    /// repeated Tab presses from spamming the agent.
+    /// repeated Tab presses from spamming the agent. Typing (`explicit` false)
+    /// only fetches what was never requested; an explicit Tab also retries a
+    /// failed fetch.
     fn request_backend(
         &mut self,
         input_tx: &mpsc::UnboundedSender<InputMessage>,
         context: &CompletionContext,
         candidate: &Candidate,
+        explicit: bool,
     ) -> Result<()> {
         let is_session = matches!(
             context.target,
             CompletionTarget::Argument(ArgumentKind::Session),
         );
-        if is_session && self.session_candidates.is_empty() && !self.session_completion_requested {
-            self.session_completion_requested = true;
+        let session_may_fetch = match self.session_fetch {
+            Fetch::Idle => true,
+            // A list that arrived empty is only re-asked on an explicit Tab,
+            // not on every keystroke.
+            Fetch::Loaded | Fetch::Failed => explicit,
+            Fetch::InFlight => false,
+        };
+        if is_session && self.session_candidates.is_empty() && session_may_fetch {
+            self.session_fetch = Fetch::InFlight;
             input_tx
                 .send(InputMessage::ListSessions)
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
@@ -1303,9 +1346,18 @@ impl CrossTerm {
             .map(str::to_owned);
         if let Some(provider) = provider
             && !self.model_lists.contains_key(&provider)
-            && !self.model_list_requested.contains(provider.as_str())
+            && match self
+                .model_fetch
+                .get(provider.as_str())
+                .copied()
+                .unwrap_or_default()
+            {
+                Fetch::Idle => true,
+                Fetch::Failed => explicit,
+                Fetch::InFlight | Fetch::Loaded => false,
+            }
         {
-            self.model_list_requested.insert(provider.clone());
+            self.model_fetch.insert(provider.clone(), Fetch::InFlight);
             input_tx
                 .send(InputMessage::ListModels {
                     provider: provider.clone(),
@@ -1323,16 +1375,9 @@ impl CrossTerm {
         };
         if completion.candidates.is_empty() {
             // Session/model lists often arrive a beat late; repeat Tab asks
-            // the backend again.
-            self.request_backend(
-                input_tx,
-                &completion.context,
-                &Candidate {
-                    value: String::new(),
-                    description: String::new(),
-                    kind: CandidateKind::Slash,
-                },
-            )?;
+            // the backend again. Use the typed token (not an empty one) so a
+            // `provider:` model catalogue can be re-requested too.
+            self.request_typed_backend(input_tx, true)?;
             return Ok(());
         }
         if completion.candidates.len() == 1 {
@@ -1613,6 +1658,7 @@ impl CrossTerm {
                 .send(InputMessage::Message(text))
                 .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
             self.busy = true;
+            self.turn_active = true;
             self.activity = Activity::Preparing;
             self.spinner = 0;
             self.status(|status| status.start_work());
@@ -1799,6 +1845,7 @@ impl CrossTerm {
             && let Some(activity) = activity
         {
             self.busy = true;
+            self.turn_active = false;
             self.activity = activity;
             self.spinner = 0;
         }
@@ -1819,6 +1866,7 @@ impl CrossTerm {
                     return;
                 }
                 self.busy = true;
+                self.turn_active = true;
                 self.activity = Activity::Working;
                 self.operation_label = None;
                 self.status(|status| status.progress());
@@ -1831,6 +1879,7 @@ impl CrossTerm {
                     return;
                 }
                 self.busy = true;
+                self.turn_active = true;
                 self.activity = Activity::Reasoning;
                 self.operation_label = None;
                 self.status(|status| status.start_work());
@@ -1843,6 +1892,7 @@ impl CrossTerm {
                 summary,
             } => {
                 self.busy = true;
+                self.turn_active = true;
                 self.activity = Activity::Processing;
                 self.operation_label = None;
                 self.status(|status| status.start_work());
@@ -1880,9 +1930,12 @@ impl CrossTerm {
                 output,
                 error,
             } => {
-                self.busy = true;
-                self.activity = Activity::Working;
-                self.operation_label = None;
+                // A finish only reports on a call from a running turn; if the
+                // turn already ended (late event) it must not re-arm the spinner.
+                if self.busy {
+                    self.activity = Activity::Working;
+                    self.operation_label = None;
+                }
                 // Remove exactly the matching start; unrelated running tools
                 // stay live and keep rendering in the region below.
                 if let Some(position) = self
@@ -1896,10 +1949,14 @@ impl CrossTerm {
                 self.pending.push(Entry::Tool { record });
             }
             UiEvent::Retrying { .. } => {
-                self.busy = true;
-                self.activity = Activity::Retrying;
-                self.operation_label = None;
-                self.status(|status| status.start_work());
+                // Retries also occur inside `/ask`, which ends with
+                // `OperationFinished`, so a retry must not claim turn
+                // ownership; `turn_active` stays whatever started the work.
+                if self.busy {
+                    self.activity = Activity::Retrying;
+                    self.operation_label = None;
+                    self.status(|status| status.start_work());
+                }
             }
             UiEvent::Error(error) => {
                 self.finalize_stream();
@@ -1913,14 +1970,24 @@ impl CrossTerm {
                     });
                 }
                 self.busy = false;
+                self.turn_active = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
+                // Failures carry no request id. `ListSessions` is answered
+                // synchronously, so an error while one is in flight is its
+                // reply; drop the display request so a later completion-driven
+                // list is not printed unasked.
+                self.session_list_display_requested = false;
+                if self.session_fetch == Fetch::InFlight {
+                    self.session_fetch = Fetch::Failed;
+                }
                 self.status(|status| status.fail(&error));
                 self.add_error(error);
             }
             UiEvent::AskStarted => {
                 self.dismiss_ask();
                 self.busy = true;
+                self.turn_active = false;
                 self.activity = Activity::Asking;
                 self.operation_label = None;
                 self.spinner = 0;
@@ -1934,17 +2001,25 @@ impl CrossTerm {
                 self.finalize_stream();
                 self.running_tools.clear();
                 self.busy = false;
+                self.turn_active = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
                 self.status(|status| status.finish_turn());
             }
             UiEvent::OperationStarted { label } => {
                 self.busy = true;
+                self.turn_active = false;
+                self.activity = Activity::Preparing;
                 self.operation_label = Some(label);
                 self.spinner = 0;
                 self.status(|status| status.start_work());
             }
             UiEvent::OperationFinished => {
+                // A turn still streaming owns the spinner; its own
+                // TurnFinished/Error will clear it.
+                if self.turn_active {
+                    return;
+                }
                 self.busy = false;
                 self.activity = Activity::Preparing;
                 self.operation_label = None;
@@ -1965,6 +2040,13 @@ impl CrossTerm {
                 self.background_operations.retain(|(key, _)| *key != id);
                 if let Some(error) = error {
                     // A lookup failure must not finalize streamed text or tools.
+                    // Model fetches are the only in-flight background lookups
+                    // keyed here; allow an explicit Tab to retry them.
+                    for state in self.model_fetch.values_mut() {
+                        if *state == Fetch::InFlight {
+                            *state = Fetch::Failed;
+                        }
+                    }
                     self.add_error(error);
                 }
             }
@@ -1986,6 +2068,8 @@ impl CrossTerm {
                 reasoning,
                 change,
             } => {
+                // Armed without a target cannot hand off; never show it armed.
+                let armed = armed && target.is_some();
                 let was_armed = std::mem::replace(&mut self.prewalk_armed, armed);
                 self.prewalk_target = target;
                 self.prewalk_reasoning = reasoning;
@@ -2028,6 +2112,7 @@ impl CrossTerm {
                 self.apply_prewalk_switch("Prewalk planning model", provider, model, reasoning);
             }
             UiEvent::ModelList { provider, models } => {
+                self.model_fetch.insert(provider.clone(), Fetch::Loaded);
                 self.model_lists.insert(provider, models);
                 if commands::is_command_input(&self.input) {
                     self.refresh_completion();
@@ -2135,7 +2220,7 @@ impl CrossTerm {
             }
             UiEvent::SessionList { sessions } => {
                 self.session_candidates = sessions.clone();
-                self.session_completion_requested = false;
+                self.session_fetch = Fetch::Loaded;
                 let total = sessions.len();
                 let mut notice = if sessions.is_empty() {
                     "No sessions for this workspace".to_owned()
@@ -4289,6 +4374,92 @@ mod tests {
     }
 
     #[test]
+    fn accepting_a_candidate_cancels_the_inflight_path_scan() {
+        let mut ui = ui(80, 24);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ui.input = "/ne".into();
+        ui.cursor = ui.input.len();
+        let token = CancellationToken::new();
+        ui.path_completion_cancel = Some(token.clone());
+        let generation = ui.path_completion_generation;
+        let context = CompletionContext {
+            target: CompletionTarget::Command,
+            token_start: 0,
+            token_end: 3,
+            query: "ne".into(),
+        };
+        let candidate = Candidate {
+            value: "new".into(),
+            description: String::new(),
+            kind: CandidateKind::Slash,
+        };
+        ui.accept_candidate(&candidate, &context, &tx).unwrap();
+        assert!(token.is_cancelled());
+        assert_ne!(ui.path_completion_generation, generation);
+        assert!(ui.completion.is_none());
+    }
+
+    #[test]
+    fn editing_a_recalled_history_entry_keeps_the_edit() {
+        let mut ui = ui(80, 24);
+        ui.history = vec!["one".into(), "two".into()];
+        ui.history_up();
+        assert_eq!(ui.input, "two");
+        ui.input.push_str("-edited");
+        ui.cursor = ui.input.len();
+        ui.history_down();
+        assert_eq!(ui.input, "two-edited");
+        ui.history_up();
+        assert_eq!(ui.input, "two");
+        ui.history_down();
+        assert_eq!(ui.input, "two-edited", "edit is the restored draft");
+    }
+
+    #[test]
+    fn late_finish_events_do_not_rearm_busy_and_operation_finish_spares_turn() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::TurnFinished);
+        ui.apply_event(UiEvent::ToolCallFinished {
+            call_id: "x".into(),
+            name: "bash".into(),
+            summary: String::new(),
+            ok: true,
+            duration_ms: 1,
+            output: String::new(),
+            error: None,
+        });
+        ui.apply_event(UiEvent::Retrying {
+            attempt: 1,
+            message: String::new(),
+        });
+        assert!(!ui.busy, "late events must not spin an idle UI");
+
+        ui.apply_event(UiEvent::TextDelta("hi".into()));
+        ui.apply_event(UiEvent::OperationFinished);
+        assert!(ui.busy, "operation end must not clear a running turn");
+        ui.apply_event(UiEvent::TurnFinished);
+        assert!(!ui.busy);
+
+        ui.apply_event(UiEvent::TextDelta("hi".into()));
+        ui.apply_event(UiEvent::OperationStarted { label: "L".into() });
+        assert_eq!(ui.activity, Activity::Preparing);
+    }
+
+    #[test]
+    fn retry_during_ask_does_not_make_it_a_turn() {
+        let mut ui = ui(80, 24);
+        let _rx = begin_ask(&mut ui);
+        ui.apply_event(UiEvent::Retrying {
+            attempt: 1,
+            message: String::new(),
+        });
+        assert!(ui.busy);
+        ui.apply_event(UiEvent::AskAnswer("answer".into()));
+        ui.apply_event(UiEvent::OperationFinished);
+        assert!(!ui.busy, "operation end must clear a retried ask");
+    }
+
+    #[test]
     fn ask_success_completes_busy_and_keeps_answer_out_of_history() {
         let mut ui = ui(80, 24);
         let _rx = begin_ask(&mut ui);
@@ -5531,6 +5702,18 @@ mod tests {
     }
 
     #[test]
+    fn prewalk_is_never_shown_armed_without_a_target() {
+        let mut ui = ui(80, 24);
+        ui.apply_event(UiEvent::PrewalkChanged {
+            armed: true,
+            target: None,
+            reasoning: None,
+            change: PrewalkChange::Session,
+        });
+        assert!(!ui.prewalk_armed);
+    }
+
+    #[test]
     fn finalize_stream_commits_the_live_message() {
         let mut live = ui(80, 24);
         live.stream = Some(StreamState {
@@ -5615,7 +5798,7 @@ mod tests {
         ui.cursor = ui.input.len();
         ui.refresh_completion();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        ui.request_typed_backend(&tx).unwrap();
+        ui.request_typed_backend(&tx, false).unwrap();
         assert_eq!(
             rx.try_recv().ok(),
             Some(InputMessage::ListModels {
@@ -5629,13 +5812,87 @@ mod tests {
         ui2.cursor = ui2.input.len();
         ui2.refresh_completion();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        ui2.request_typed_backend(&tx).unwrap();
+        ui2.request_typed_backend(&tx, false).unwrap();
         assert_eq!(
             rx.try_recv().ok(),
             Some(InputMessage::ListModels {
                 provider: "openrouter".into(),
             })
         );
+    }
+
+    #[test]
+    fn failed_sessions_command_does_not_print_a_later_completion_list() {
+        let mut ui = ui(80, 24);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        ui.submit_command("/sessions", &tx).unwrap();
+        ui.apply_event(UiEvent::Error("could not list sessions: x".into()));
+        ui.apply_event(UiEvent::SessionList {
+            sessions: Vec::new(),
+        });
+        assert!(!ui.pending.iter().any(|entry| matches!(
+            entry,
+            Entry::Notice { text } if text == "No sessions for this workspace"
+        )));
+    }
+
+    fn load_ui() -> CrossTerm {
+        let mut ui = ui(80, 24);
+        ui.input = "/load ".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        ui
+    }
+
+    #[tokio::test]
+    async fn failed_session_fetch_retries_on_tab_not_on_typing() {
+        let mut ui = load_ui();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
+        ui.apply_event(UiEvent::Error("could not list sessions: x".into()));
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
+    }
+
+    #[tokio::test]
+    async fn empty_session_list_is_not_refetched_per_keystroke() {
+        let mut ui = load_ui();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
+        ui.apply_event(UiEvent::SessionList {
+            sessions: Vec::new(),
+        });
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_model_fetch_retries_on_tab_not_on_typing() {
+        let mut ui = ui(80, 24);
+        ui.input = "/model openrouter:".into();
+        ui.cursor = ui.input.len();
+        ui.refresh_completion();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let request = InputMessage::ListModels {
+            provider: "openrouter".into(),
+        };
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(request.clone()));
+        // Still in flight: no duplicate request.
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+        ui.apply_event(UiEvent::BackgroundOperationFinished {
+            id: 1,
+            error: Some("model list failed".into()),
+        });
+        ui.request_typed_backend(&tx, false).unwrap();
+        assert!(rx.try_recv().is_err());
+        ui.handle_tab(&tx).unwrap();
+        assert_eq!(rx.try_recv().ok(), Some(request));
     }
 
     #[tokio::test]

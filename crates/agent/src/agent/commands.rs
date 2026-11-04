@@ -1,11 +1,10 @@
 use super::persistence::{ui_snapshot_entries, usage_event};
 use super::{
-    Agent, AgentEvent, AgentSessionState, CompactionReason, InputMessage, SessionListItem,
-    TurnControl, TurnError, send,
+    Agent, AgentEvent, AgentSessionState, CompactionReason, ContextWindow, InputMessage,
+    ModelMetadata, SessionListItem, TurnControl, TurnError, send,
 };
 use llm::Provider;
 use session::{ExportOptions, Session, SessionCreateOptions, export_jsonl, snapshot_entries};
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -31,6 +30,7 @@ impl Agent {
     pub(crate) fn handle_new_session(&mut self, events: &mpsc::UnboundedSender<AgentEvent>) {
         let Some(store) = self.session.as_ref().map(|state| state.store.clone()) else {
             self.history.clear();
+            self.ephemeral_notes.clear();
             self.last_context_tokens = None;
             send(
                 events,
@@ -77,6 +77,7 @@ impl Agent {
             .as_deref()
             .map(|title| self.secret_masker.mask_text(title));
         self.history.clear();
+        self.ephemeral_notes.clear();
         self.last_context_tokens = None;
         self.session = Some(AgentSessionState {
             store,
@@ -189,6 +190,7 @@ impl Agent {
             .iter()
             .map(|message| self.secret_masker.mask_message(message))
             .collect();
+        self.ephemeral_notes.clear();
         self.last_context_tokens = None;
         let snapshot = ui_snapshot_entries(snapshot_entries(&session), &self.secret_masker);
         self.session = Some(AgentSessionState {
@@ -328,8 +330,7 @@ impl Agent {
     ) -> TurnControl {
         let cancel = self.cancel.child_token();
         let application = self.cancel.clone();
-        let mut buffered = VecDeque::new();
-        let mut input_open = self.input_open;
+        let mut fork = self.input.fork();
         let mut interrupted = false;
         let outcome = {
             let mut application_open = true;
@@ -343,32 +344,22 @@ impl Agent {
                         application_open = false;
                         cancel.cancel();
                     }
-                    message = input.recv(), if input_open => match message {
+                    message = input.recv(), if fork.open => match message {
                         Some(InputMessage::Interrupt) => {
                             interrupted = true;
                             cancel.cancel();
                         }
-                        Some(message) => buffered.push_back(message),
-                        None => input_open = false,
+                        Some(message) => fork.buffer(message),
+                        None => fork.close(),
                     },
                 }
             }
         };
-        self.input_open = input_open;
-        self.queued.extend(buffered);
+        self.input.absorb(fork);
         if self.flush_deferred_sync(events).is_err() {
             return TurnControl::Quarantine;
         }
-        if interrupted && !application.is_cancelled() {
-            // `handle_compact_session` has already observed the cancelled
-            // operation and deliberately persisted no summary.
-            return TurnControl::Continue;
-        }
-        match outcome {
-            Ok(()) => TurnControl::Continue,
-            Err(TurnError::Shutdown) => TurnControl::Shutdown,
-            Err(TurnError::Persist(_)) => TurnControl::Quarantine,
-        }
+        compact_boundary_control(outcome, interrupted, application.is_cancelled())
     }
 
     /// Boundary wrapper for model changes. The append is staged on a cloned
@@ -522,6 +513,10 @@ impl Agent {
                 .expect("staged model change requires a session")
                 .session = staged;
         }
+        // A window learned from overflow belongs to the selection that
+        // produced it; re-selecting the identical provider/model keeps it.
+        let same_selection = self.provider.name() == provider.name() && self.model == model;
+        self.model_generation += 1;
         self.provider = provider;
         self.model = model.clone();
         // Future subagents must follow the parent's active selection; running
@@ -530,6 +525,10 @@ impl Agent {
             runner.update_model(self.provider.clone(), self.model.clone());
         }
         if source == ModelChangeSource::User {
+            // A committed user selection replaces the planning model the
+            // restore point would return to. Rejected commands must not
+            // reach here, so they keep it.
+            self.prewalk.forget_restore();
             send(
                 events,
                 AgentEvent::ModelChanged {
@@ -543,15 +542,19 @@ impl Agent {
         // is fetched in the background so a slow catalogue cannot block the
         // command loop, and one response supplies both UI models and context.
         self.last_context_tokens = None;
-        self.context_window = self
-            .compaction
-            .resolved_window(self.provider.context_window_hint().unwrap_or(0));
+        if !(same_selection && matches!(self.context_window, ContextWindow::Learned(_))) {
+            self.context_window = ContextWindow::Metadata(
+                self.compaction
+                    .resolved_window(self.provider.context_window_hint().unwrap_or(0)),
+            );
+        }
         self.publish_context_window();
         send(events, self.context_usage_event());
         if let Some(metadata_tx) = &self.model_metadata_tx {
             spawn_model_metadata(
                 metadata_tx.clone(),
                 self.provider.clone(),
+                self.model_generation,
                 canonical,
                 self.model.clone(),
                 self.cancel.clone(),
@@ -580,6 +583,7 @@ impl Agent {
         reasoning: llm::ReasoningPolicy,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) {
+        self.prewalk.forget_restore();
         self.set_reasoning_policy(reasoning);
         send(
             events,
@@ -791,15 +795,16 @@ async fn fetch_model_catalogue(
 }
 
 pub(crate) fn spawn_model_metadata(
-    sender: mpsc::UnboundedSender<(String, String, Vec<llm::ModelInfo>)>,
+    sender: mpsc::UnboundedSender<ModelMetadata>,
     provider: Arc<dyn Provider>,
+    generation: u64,
     provider_name: String,
     model: String,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
         if let Some(models) = fetch_model_catalogue(provider, &cancel).await {
-            let _ = sender.send((provider_name, model, models));
+            let _ = sender.send((generation, provider_name, model, models));
         }
     });
 }
@@ -849,4 +854,49 @@ fn spawn_model_list_with_cancel(
             AgentEvent::BackgroundOperationFinished { id, error },
         );
     });
+}
+
+/// Map a manual-compaction outcome to the boundary decision. Persistence
+/// failures are matched first: a user interrupt must not swallow an error
+/// that requires quarantine (the log may be unwritable). Only then does a
+/// plain interrupt, which deliberately persisted no summary, continue.
+fn compact_boundary_control(
+    outcome: Result<(), TurnError>,
+    interrupted: bool,
+    application_cancelled: bool,
+) -> TurnControl {
+    match outcome {
+        Err(TurnError::Persist(_)) => TurnControl::Quarantine,
+        _ if interrupted && !application_cancelled => TurnControl::Continue,
+        Ok(()) => TurnControl::Continue,
+        Err(TurnError::Shutdown) => TurnControl::Shutdown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A persistence failure must quarantine even when the user also
+    /// interrupted; the old ordering returned `Continue` here.
+    #[test]
+    fn interrupt_does_not_swallow_compaction_persist_error() {
+        let persist = || Err(TurnError::Persist("disk full".into()));
+        assert!(matches!(
+            compact_boundary_control(persist(), true, false),
+            TurnControl::Quarantine
+        ));
+        assert!(matches!(
+            compact_boundary_control(persist(), false, false),
+            TurnControl::Quarantine
+        ));
+        assert!(matches!(
+            compact_boundary_control(Ok(()), true, false),
+            TurnControl::Continue
+        ));
+        assert!(matches!(
+            compact_boundary_control(Err(TurnError::Shutdown), true, true),
+            TurnControl::Shutdown
+        ));
+    }
 }

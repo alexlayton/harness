@@ -313,8 +313,17 @@ impl OpenAiCodexAuth {
             .store
             .acquire_refresh_lease(crate::storage::OPENAI_CODEX_PROVIDER_KEY)
             .await?;
-        let mut expired_stored = None;
-        if let Ok(Some(current)) = self.store.openai_codex() {
+        // Reload after taking the lease. Disk read failures propagate and a
+        // missing entry means logged out: neither may fall back to the cache,
+        // whose refresh token another process may already have consumed.
+        let Some(current) = self.store.openai_codex()? else {
+            *self
+                .credential
+                .lock()
+                .map_err(|_| AuthError::OpenAiCodex("credential lock poisoned".into()))? = None;
+            return Err(AuthError::OpenAiCodexNotAuthenticated);
+        };
+        {
             let cached = self
                 .credential
                 .lock()
@@ -348,17 +357,11 @@ impl OpenAiCodexAuth {
                     Some(current.clone());
                 return Ok(current);
             }
-            // Both copies have expired. The on-disk generation is still
-            // authoritative for the refresh token: another process may
-            // have rotated it since this handle cached its old credential.
-            expired_stored = Some(current);
         }
-        let old = match expired_stored {
-            Some(current) => current,
-            None => self
-                .credential()?
-                .ok_or(AuthError::OpenAiCodexNotAuthenticated)?,
-        };
+        // Both copies have expired. The on-disk generation is authoritative
+        // for the refresh token: another process may have rotated it since
+        // this handle cached its old credential.
+        let old = current;
         let old_refresh = old.refresh.clone();
         // Refresh exchanges use strict status handling like the browser
         // flow: only 2xx with a token payload succeeds.
@@ -402,7 +405,10 @@ impl OpenAiCodexAuth {
             Some(current.clone());
         Ok(current)
     }
-    fn persist(&self, credential: OpenAiCodexCredential) -> Result<()> {
+    /// Persist a freshly logged-in credential. Holds the single-flight lock
+    /// so an in-flight refresh cannot save or cache over the new login.
+    async fn persist(&self, credential: OpenAiCodexCredential) -> Result<()> {
+        let _guard = self.refresh_lock.lock().await;
         self.store.save_openai_codex(&credential)?;
         *self
             .credential
@@ -431,7 +437,7 @@ impl OpenAiCodexAuth {
         let code = wait_for_callback(listener, &values.state, cancel).await?;
         let value = self.token_strict(json!({"grant_type":"authorization_code", "client_id":OPENAI_CODEX_CLIENT_ID, "code":code, "code_verifier":values.verifier, "redirect_uri":"http://localhost:1455/auth/callback"}), cancel).await?;
         let credential = credential_from_token(&value, None)?;
-        self.persist(credential.clone())?;
+        self.persist(credential.clone()).await?;
         emit(AuthEvent::Finished);
         Ok(credential)
     }
@@ -520,7 +526,7 @@ impl OpenAiCodexAuth {
                 )
                 .await?;
             let credential = credential_from_token(&value, None)?;
-            self.persist(credential.clone())?;
+            self.persist(credential.clone()).await?;
             emit(AuthEvent::Finished);
             return Ok(credential);
         }
@@ -1075,6 +1081,25 @@ mod tests {
         assert!(credential_from_token(&body, Some("refresh-old")).is_err());
     }
 
+    #[tokio::test]
+    async fn login_persist_waits_for_an_in_flight_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        let auth = OpenAiCodexAuth::new(store.clone()).unwrap();
+        let guard = auth.refresh_lock.lock().await;
+        let login = auth.clone();
+        let task = tokio::spawn(async move { login.persist(cached_codex_credential()).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "login must queue behind refresh");
+        assert!(store.openai_codex().unwrap().is_none());
+        drop(guard);
+        task.await.unwrap().unwrap();
+        assert_eq!(
+            store.openai_codex().unwrap().unwrap(),
+            cached_codex_credential()
+        );
+    }
+
     fn cached_codex_credential() -> OpenAiCodexCredential {
         OpenAiCodexCredential::new("access-cached", "refresh-cached", u64::MAX - 1, "acct")
     }
@@ -1151,6 +1176,27 @@ mod tests {
         assert_eq!(refreshed.refresh, "refresh-next");
         assert_eq!(store.openai_codex().unwrap(), Some(refreshed));
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unreadable_or_removed_disk_credential_never_refreshes_the_cached_token() {
+        let fixture = fixture(vec![(200, success_token_body("refresh-next"))]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(directory.path().join("auth.json"));
+        store
+            .save_openai_codex(&expired_codex_credential())
+            .unwrap();
+        let auth = auth_with_fixture(&directory, &fixture).await;
+        store
+            .save_provider_value("openai-codex", serde_json::json!({"type":"oauth"}))
+            .unwrap();
+        assert!(auth.refresh().await.is_err());
+        std::fs::remove_file(store.path()).unwrap();
+        assert!(matches!(
+            auth.refresh().await,
+            Err(AuthError::OpenAiCodexNotAuthenticated)
+        ));
+        assert!(fixture.seen.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

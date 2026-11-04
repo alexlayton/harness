@@ -577,6 +577,12 @@ impl Session {
             event,
         };
         self.apply_record(record.clone());
+        // The event exists only in memory. Drop the cached file cursor so a
+        // later `SessionStore::append_event` cannot take the fast path and
+        // write the next sequence after a gap; it re-reads the file instead
+        // and reports `HistoryDiverged`.
+        self.validated_bytes = 0;
+        self.file_identity = None;
         record
     }
 
@@ -652,7 +658,8 @@ impl Session {
 /// Tool-call IDs are globally unique for the life of the log: once an ID has
 /// been used (pending or completed), it is never reused.  `TurnCancelled`
 /// marks the tail explicitly cancelled and clears the pending queue; `Error`
-/// marks it cancelled without clearing so a crash tail stays recoverable.
+/// marks it cancelled without clearing so a crash tail stays recoverable, and
+/// the queue is cleared once a new user/assistant turn follows.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct ToolCallTracker {
     /// Call IDs awaiting a result, in emission order.
@@ -666,9 +673,32 @@ pub(crate) struct ToolCallTracker {
     completed: HashSet<String>,
     /// True when the tail was explicitly cancelled (`TurnCancelled`/`Error`).
     cancelled: bool,
+    /// Replay mode for logs that already exist on disk: keep calls pending
+    /// across a following turn, as earlier versions did, so a late result
+    /// written by such a version still validates and the file still loads.
+    /// New appends use the default (closing) behavior.
+    legacy_replay: bool,
 }
 
 impl ToolCallTracker {
+    /// Tracker that replays the pre-close-on-new-turn rules, used as a
+    /// fallback when loading so logs written by older versions still load.
+    pub(crate) fn for_legacy_replay() -> Self {
+        Self {
+            legacy_replay: true,
+            ..Self::default()
+        }
+    }
+
+    /// Fresh tracker using the same replay mode as `self`, so a derived
+    /// check (compaction boundaries) applies the rule the log is loaded under.
+    fn replay_mode(&self) -> Self {
+        Self {
+            legacy_replay: self.legacy_replay,
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn pending(&self) -> &[String] {
         &self.pending
     }
@@ -706,6 +736,21 @@ impl ToolCallTracker {
     /// lands.  `Error` leaves the queue intact so a crash tail stays
     /// recoverable and `context_messages` can strip the incomplete calls.
     pub(crate) fn record(&mut self, event: &SessionEvent) {
+        // An `Error` tail keeps its pending calls only so an immediate crash
+        // repair or late result still works. Once a new turn begins they can
+        // never be answered in valid provider order (a result after a user
+        // message), so close them instead of letting them block fresh calls.
+        if self.cancelled
+            && !self.legacy_replay
+            && matches!(
+                event,
+                SessionEvent::UserMessage { .. }
+                    | SessionEvent::AssistantMessage { .. }
+                    | SessionEvent::ToolCall { .. }
+            )
+        {
+            self.close_pending();
+        }
         match event {
             SessionEvent::AssistantMessage { message } => {
                 for content in &message.content {
@@ -737,8 +782,7 @@ impl ToolCallTracker {
                 }
             }
             SessionEvent::TurnCancelled { .. } => {
-                self.pending.clear();
-                self.pending_calls.clear();
+                self.close_pending();
                 self.cancelled = true;
             }
             SessionEvent::Error { .. } => {
@@ -749,6 +793,13 @@ impl ToolCallTracker {
             }
             _ => {}
         }
+    }
+
+    /// Abandon every pending call. `pending` and `pending_calls` must change
+    /// together or `pending_calls()` would panic.
+    fn close_pending(&mut self) {
+        self.pending.clear();
+        self.pending_calls.clear();
     }
 
     fn push_pending(&mut self, call: StoredToolCall) {
@@ -766,8 +817,13 @@ impl ToolCallTracker {
 pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     let selected = events_after_latest_compaction(events);
     let mut messages = Vec::<Message>::new();
-    let mut call_locations = HashMap::<String, usize>::new();
+    // Every message position that carries each call id. A duplicate id must
+    // not shadow the first occurrence: stripping an incomplete call has to
+    // reach all of them or a dangling call survives in provider context.
+    let mut call_locations = HashMap::<String, Vec<usize>>::new();
     let mut tracker = ToolCallTracker::default();
+    // Calls whose result could not be placed in valid provider order.
+    let mut unanswered = HashSet::<String>::new();
 
     for record in selected {
         match &record.event {
@@ -778,7 +834,7 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                 let index = messages.len();
                 for content in &message.content {
                     if let StoredContent::ToolCall { id, .. } = content {
-                        call_locations.insert(id.clone(), index);
+                        call_locations.entry(id.clone()).or_default().push(index);
                     }
                 }
                 messages.push(message.to_llm());
@@ -810,7 +866,7 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                     messages[index]
                         .content
                         .push(Content::ToolCall(call.clone().into()));
-                    entry.insert(index);
+                    entry.insert(vec![index]);
                 }
             }
             SessionEvent::ToolResult {
@@ -819,6 +875,15 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
                 is_error,
                 ..
             } => {
+                // A result is only provider-valid directly after the
+                // assistant message holding its call (or sibling results).
+                // Legacy logs can hold a late result after a user message;
+                // drop it and the call it answers rather than emit that.
+                if !result_follows_its_call(&messages, &call_locations, tool_call_id) {
+                    unanswered.insert(tool_call_id.clone());
+                    tracker.record(&record.event);
+                    continue;
+                }
                 messages.push(Message::tool_result(
                     tool_call_id.clone(),
                     content.clone(),
@@ -843,16 +908,35 @@ pub fn context_messages(events: &[SessionEventRecord]) -> Vec<Message> {
     // A crash can leave a complete ToolCall line without its result.  Keep the
     // assistant's ordinary text/reasoning, but remove only those calls.  This
     // guarantees the next provider request is structurally valid.
-    for (id, index) in call_locations {
-        if tracker.is_completed(&id) {
+    for (id, indexes) in call_locations {
+        if tracker.is_completed(&id) && !unanswered.contains(&id) {
             continue;
         }
-        if let Some(Message { content, .. }) = messages.get_mut(index) {
-            content.retain(|item| !matches!(item, Content::ToolCall(call) if call.id == id));
+        for index in indexes {
+            if let Some(Message { content, .. }) = messages.get_mut(index) {
+                content.retain(|item| !matches!(item, Content::ToolCall(call) if call.id == id));
+            }
         }
     }
     messages.retain(|message| !message.content.is_empty());
     messages
+}
+
+/// True when the trailing run of tool-result messages in `messages` follows
+/// the assistant message that carries `call_id`.
+fn result_follows_its_call(
+    messages: &[Message],
+    call_locations: &HashMap<String, Vec<usize>>,
+    call_id: &str,
+) -> bool {
+    let run_start = messages
+        .iter()
+        .rposition(|message| message.role != Role::Tool)
+        .map_or(0, |index| index + 1);
+    run_start > 0
+        && call_locations
+            .get(call_id)
+            .is_some_and(|locations| locations.contains(&(run_start - 1)))
 }
 
 /// Find the most recent compaction summary and the sequence boundary it
@@ -928,8 +1012,19 @@ fn events_after_compaction(
 /// reused ID is rejected even after completion or cancellation, because the
 /// durable log has no call-instance identity beyond the ID.
 pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
+    // Loading must accept every log that either this version or an earlier
+    // one could have written. They differ only in what follows an `Error`
+    // tail: now pending calls close when a new turn starts (so fresh calls
+    // can be answered), earlier versions kept them (so a late result after a
+    // user message validated). Accept a log valid under either rule; only
+    // new appends are held to the current one.
+    validate_events_with(events, ToolCallTracker::default()).or_else(|current| {
+        validate_events_with(events, ToolCallTracker::for_legacy_replay()).map_err(|_| current)
+    })
+}
+
+fn validate_events_with(events: &[SessionEventRecord], mut tracker: ToolCallTracker) -> Result<()> {
     let mut ids = HashSet::new();
-    let mut tracker = ToolCallTracker::default();
     let mut compaction_boundary = None;
     for (index, record) in events.iter().enumerate() {
         validate_record(
@@ -945,7 +1040,12 @@ pub(crate) fn validate_events(events: &[SessionEventRecord]) -> Result<()> {
         } = &record.event
         {
             compaction_boundary = Some(*compacted_through);
-            validate_compaction_boundary(events, *compacted_through, record.sequence)?;
+            validate_compaction_boundary(
+                events,
+                *compacted_through,
+                record.sequence,
+                tracker.replay_mode(),
+            )?;
         }
         tracker.record(&record.event);
     }
@@ -974,7 +1074,12 @@ pub(crate) fn validate_next_event(session: &Session, record: &SessionEventRecord
     {
         let mut events = session.events.clone();
         events.push(record.clone());
-        validate_compaction_boundary(&events, *compacted_through, record.sequence)?;
+        validate_compaction_boundary(
+            &events,
+            *compacted_through,
+            record.sequence,
+            ToolCallTracker::default(),
+        )?;
     }
     Ok(())
 }
@@ -1011,7 +1116,12 @@ pub(crate) fn validate_event_suffix(
             boundary = Some(*compacted_through);
             let mut events = session.events.clone();
             events.extend(records.iter().cloned());
-            validate_compaction_boundary(&events, *compacted_through, record.sequence)?;
+            validate_compaction_boundary(
+                &events,
+                *compacted_through,
+                record.sequence,
+                ToolCallTracker::default(),
+            )?;
         }
         tracker.record(&record.event);
         expected = expected.saturating_add(1);
@@ -1235,6 +1345,7 @@ fn validate_compaction_boundary(
     events: &[SessionEventRecord],
     boundary: u64,
     summary_sequence: u64,
+    mut tracker: ToolCallTracker,
 ) -> Result<()> {
     if boundary > 0 && !events.iter().any(|record| record.sequence == boundary) {
         return Err(SessionError::InvalidEvent(format!(
@@ -1242,7 +1353,6 @@ fn validate_compaction_boundary(
         )));
     }
 
-    let mut tracker = ToolCallTracker::default();
     for record in events {
         if record.sequence > boundary {
             break;
@@ -1987,6 +2097,212 @@ mod tests {
         assert!(validate_events(&session.events).is_err());
     }
 
+    fn push_error(session: &mut Session) {
+        session.append(SessionEvent::Error {
+            message: "boom".into(),
+        });
+    }
+
+    #[test]
+    fn late_result_after_error_and_user_message_is_rejected_for_new_appends_only() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        let record = SessionEventRecord {
+            id: EventId::new(),
+            sequence: session.events.last().unwrap().sequence + 1,
+            timestamp: now_timestamp(),
+            event: SessionEvent::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "late".into(),
+                is_error: false,
+                tool_name: Some("read".into()),
+            },
+        };
+        // A new append is refused...
+        assert!(validate_next_event(&session, &record).is_err());
+        // ...but a log already on disk with that shape (written by an
+        // earlier version) must still validate, or the session would no
+        // longer load.
+        let mut events = session.events.clone();
+        events.push(record);
+        validate_events(&events).unwrap();
+    }
+
+    #[test]
+    fn legacy_log_with_late_result_after_user_message_still_decodes() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        push_tool_result(&mut session, "call-1");
+        let encoded = crate::codec::encode_session(&session).unwrap();
+        let decoded = crate::codec::decode_session(&encoded, "<memory>").unwrap();
+        assert_eq!(decoded.events, session.events);
+    }
+
+    /// Legacy shape: user, call A, Error, user, result A, assistant, then a
+    /// summary whose boundary covers everything before it.
+    fn legacy_late_result_log_with_summary() -> Session {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        for event in [
+            SessionEvent::ToolResult {
+                tool_call_id: "call-1".into(),
+                content: "late".into(),
+                is_error: false,
+                tool_name: Some("read".into()),
+            },
+            SessionEvent::AssistantMessage {
+                message: StoredMessage::from_llm(&Message::assistant(vec![Content::Text(
+                    "ok".into(),
+                )])),
+            },
+        ] {
+            let sequence = session.events.last().unwrap().sequence + 1;
+            session.events.push(SessionEventRecord {
+                id: EventId::new(),
+                sequence,
+                timestamp: now_timestamp(),
+                event,
+            });
+        }
+        let boundary = session.events.last().unwrap().sequence;
+        let sequence = boundary + 1;
+        session.events.push(SessionEventRecord {
+            id: EventId::new(),
+            sequence,
+            timestamp: now_timestamp(),
+            event: SessionEvent::CompactionSummary {
+                summary: "s".into(),
+                compacted_through: boundary,
+            },
+        });
+        session
+    }
+
+    #[test]
+    fn legacy_late_result_log_with_later_compaction_still_decodes() {
+        let session = legacy_late_result_log_with_summary();
+        let encoded = crate::codec::encode_session(&session).unwrap();
+        let decoded = crate::codec::decode_session(&encoded, "<memory>").unwrap();
+        assert_eq!(decoded.events, session.events);
+    }
+
+    #[test]
+    fn legacy_late_result_boundary_inside_the_tail_uses_the_legacy_rule() {
+        // Boundary after the user message but before the late result: the
+        // legacy rule sees call-1 still pending and must reject it, the
+        // strict rule rejects the orphan result; either way it is invalid.
+        let mut session = legacy_late_result_log_with_summary();
+        let SessionEvent::CompactionSummary {
+            compacted_through, ..
+        } = &mut session.events.last_mut().unwrap().event
+        else {
+            unreachable!()
+        };
+        *compacted_through = 4;
+        assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn context_messages_for_legacy_late_result_has_valid_role_order() {
+        // Without the summary: user, call, Error, user, late result, assistant.
+        let mut session = legacy_late_result_log_with_summary();
+        session.events.pop();
+        let messages = context_messages(&session.events);
+        assert_valid_tool_order(&messages);
+        assert!(
+            messages.iter().all(|m| m
+                .content
+                .iter()
+                .all(|c| !matches!(c, Content::ToolCall(_) | Content::ToolResult { .. }))),
+            "orphan call/result pair must be dropped: {messages:?}"
+        );
+        // With the summary the live tail is the same events.
+        let with_summary = legacy_late_result_log_with_summary();
+        assert_valid_tool_order(&context_messages(&with_summary.events));
+    }
+
+    fn assert_valid_tool_order(messages: &[Message]) {
+        let mut open: Vec<String> = Vec::new();
+        for message in messages {
+            match message.role {
+                Role::Tool => {
+                    for content in &message.content {
+                        let Content::ToolResult { tool_call_id, .. } = content else {
+                            continue;
+                        };
+                        let index = open
+                            .iter()
+                            .position(|id| id == tool_call_id)
+                            .unwrap_or_else(|| panic!("orphan result {tool_call_id}"));
+                        open.remove(index);
+                    }
+                }
+                _ => {
+                    assert!(
+                        open.is_empty(),
+                        "calls {open:?} unanswered before next message"
+                    );
+                    if message.role == Role::Assistant {
+                        open.extend(message.content.iter().filter_map(|c| match c {
+                            Content::ToolCall(call) => Some(call.id.clone()),
+                            _ => None,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_turn_after_error_tail_accepts_fresh_calls() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        push_assistant_call(&mut session, "call-2", "read");
+        push_tool_result(&mut session, "call-2");
+        validate_events(&session.events).unwrap();
+        assert!(session.tracker.pending().is_empty());
+        assert_eq!(session.tracker.pending_calls().count(), 0);
+    }
+
+    #[test]
+    fn compaction_boundary_after_an_error_tail_is_valid_once_a_turn_follows() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        push_user(&mut session, "again");
+        push_assistant(&mut session, "ok");
+        let boundary = session.events.last().unwrap().sequence;
+        session.append(SessionEvent::CompactionSummary {
+            summary: "s".into(),
+            compacted_through: boundary,
+        });
+        validate_events(&session.events).unwrap();
+    }
+
+    #[test]
+    fn result_immediately_after_error_is_still_accepted() {
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_tool_call(&mut session, "call-1", "read");
+        push_error(&mut session);
+        assert_eq!(session.tracker.pending_calls().count(), 1);
+        push_tool_result(&mut session, "call-1");
+        validate_events(&session.events).unwrap();
+    }
+
     #[test]
     fn cancelled_tool_call_ids_cannot_be_reused() {
         let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
@@ -2023,6 +2339,23 @@ mod tests {
         });
         push_tool_call(&mut session, "call-1", "read");
         assert!(validate_events(&session.events).is_err());
+    }
+
+    #[test]
+    fn duplicate_call_ids_do_not_leave_a_dangling_call_in_context() {
+        // Not a valid log (validation rejects reuse), but reconstruction must
+        // still never emit an unanswered call, whichever occurrence is first.
+        let mut session = Session::new(SessionMetadata::new("/workspace", None, None));
+        push_user(&mut session, "hi");
+        push_assistant_call(&mut session, "dup", "read");
+        push_assistant_call(&mut session, "dup", "read");
+        let dangling = session
+            .context_messages()
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter(|content| matches!(content, Content::ToolCall(call) if call.id == "dup"))
+            .count();
+        assert_eq!(dangling, 0);
     }
 
     #[test]

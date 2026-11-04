@@ -160,8 +160,16 @@ impl AnthropicSubscriptionAuth {
             .store
             .acquire_refresh_lease(crate::storage::ANTHROPIC_SUBSCRIPTION_PROVIDER_KEY)
             .await?;
-        let mut expired_stored = None;
-        if let Ok(Some(current)) = self.store.anthropic_subscription() {
+        // Reload after taking the lease. Disk read failures propagate and a
+        // missing entry means logged out: neither may fall back to the cache,
+        // whose refresh token another process may already have consumed.
+        let Some(current) = self.store.anthropic_subscription()? else {
+            *self.credential.lock().map_err(|_| {
+                AuthError::AnthropicSubscription("credential lock poisoned".into())
+            })? = None;
+            return Err(AuthError::AnthropicSubscriptionNotAuthenticated);
+        };
+        {
             let cached = self
                 .credential
                 .lock()
@@ -191,17 +199,11 @@ impl AnthropicSubscriptionAuth {
                 })? = Some(current.clone());
                 return Ok(current);
             }
-            // Both copies have expired. The on-disk generation is still
-            // authoritative for the refresh token: another process may
-            // have rotated it since this handle cached its old credential.
-            expired_stored = Some(current);
         }
-        let old = match expired_stored {
-            Some(current) => current,
-            None => self
-                .credential()?
-                .ok_or(AuthError::AnthropicSubscriptionNotAuthenticated)?,
-        };
+        // Both copies have expired. The on-disk generation is authoritative
+        // for the refresh token: another process may have rotated it since
+        // this handle cached its old credential.
+        let old = current;
         // Refresh exchanges use strict status handling like the browser
         // flow: only 2xx with a token payload succeeds.
         let value = self
@@ -222,20 +224,29 @@ impl AnthropicSubscriptionAuth {
         let credential = credential_from_token(&value, Some(&old))?;
         // Compare and save under the auth-file lock. A separate process may
         // have rotated the credential while this exchange was in flight; in
-        // that case never overwrite its newer generation.
+        // that case never overwrite its newer generation. Metadata-only
+        // drift is not a new generation: the store keeps the on-disk
+        // metadata and these new tokens win.
         if self
             .store
             .save_anthropic_subscription_if_current(&old, &credential)?
         {
+            // Cache what was actually written (it may carry merged metadata).
+            let saved = self.store.anthropic_subscription()?.unwrap_or(credential);
             *self.credential.lock().map_err(|_| {
                 AuthError::AnthropicSubscription("credential lock poisoned".into())
-            })? = Some(credential.clone());
-            return Ok(credential);
+            })? = Some(saved.clone());
+            return Ok(saved);
         }
         let current = self.store.anthropic_subscription()?.ok_or_else(|| {
             AuthError::AnthropicSubscription("credential changed during refresh".into())
         })?;
-        if current.is_expired() {
+        // Another process rotated the tokens. Adopt them only if they are
+        // usable and are not the access token the provider just rejected.
+        if !current.is_complete()
+            || current.is_expired()
+            || rejected == Some(current.access.as_str())
+        {
             return Err(fail("credential changed during refresh; retry login"));
         }
         *self
@@ -245,7 +256,10 @@ impl AnthropicSubscriptionAuth {
             Some(current.clone());
         Ok(current)
     }
-    fn persist(&self, credential: AnthropicSubscriptionCredential) -> Result<()> {
+    /// Persist a freshly logged-in credential. Holds the single-flight lock
+    /// so an in-flight refresh cannot save or cache over the new login.
+    async fn persist(&self, credential: AnthropicSubscriptionCredential) -> Result<()> {
+        let _guard = self.refresh_lock.lock().await;
         self.store.save_anthropic_subscription(&credential)?;
         *self
             .credential
@@ -276,7 +290,7 @@ impl AnthropicSubscriptionAuth {
         let code = tokio::select! { _=cancel.cancelled()=>return Err(AuthError::Cancelled), result=tokio::time::timeout(Duration::from_secs(600),wait_callback(listener,&values.state))=> result.map_err(|_|fail("browser login timed out"))?? };
         let value=self.token(json!({"grant_type":"authorization_code","client_id":CLIENT_ID,"code":code,"state":values.state,"code_verifier":values.verifier,"redirect_uri":REDIRECT}),cancel).await?;
         let credential = credential_from_token(&value, None)?;
-        self.persist(credential.clone())?;
+        self.persist(credential.clone()).await?;
         emit(AuthEvent::Finished);
         Ok(credential)
     }
@@ -455,6 +469,19 @@ mod tests {
         Arc<AtomicUsize>,
         tokio::task::JoinHandle<()>,
     ) {
+        fixture_with(status, body, None).await
+    }
+    /// Like `fixture`, running `on_request` after the request is read and
+    /// before the response is written, to model a concurrent disk change.
+    async fn fixture_with(
+        status: u16,
+        body: String,
+        on_request: Option<Box<dyn Fn() + Send + Sync>>,
+    ) -> (
+        AnthropicSubscriptionEndpoints,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let count = Arc::new(AtomicUsize::new(0));
@@ -485,6 +512,9 @@ mod tests {
                     }
                 }
                 c.fetch_add(1, Ordering::SeqCst);
+                if let Some(hook) = &on_request {
+                    hook();
+                }
                 s.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
             }
         });
@@ -598,6 +628,79 @@ mod tests {
                 0o600
             );
         }
+        task.abort();
+    }
+    #[tokio::test]
+    async fn login_persist_waits_for_an_in_flight_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        let auth = AnthropicSubscriptionAuth::new(store.clone()).unwrap();
+        let guard = auth.refresh_lock.lock().await;
+        let login = auth.clone();
+        let task = tokio::spawn(async move { login.persist(old()).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!task.is_finished(), "login must queue behind refresh");
+        assert!(store.anthropic_subscription().unwrap().is_none());
+        drop(guard);
+        task.await.unwrap().unwrap();
+        assert_eq!(store.anthropic_subscription().unwrap().unwrap(), old());
+    }
+    #[tokio::test]
+    async fn metadata_only_disk_change_during_refresh_keeps_the_new_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        store.save_anthropic_subscription(&old()).unwrap();
+        let hook_store = store.clone();
+        let (endpoints, count, task) = fixture_with(
+            200,
+            json!({"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600})
+                .to_string(),
+            Some(Box::new(move || {
+                let mut enriched = old();
+                enriched.email = Some("a@example.com".into());
+                hook_store.save_anthropic_subscription(&enriched).unwrap();
+            })),
+        )
+        .await;
+        let auth = AnthropicSubscriptionAuth::new(store.clone())
+            .unwrap()
+            .with_endpoints(endpoints);
+        let refreshed = auth.refresh().await.unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(refreshed.refresh, "new-refresh");
+        assert_eq!(refreshed.email.as_deref(), Some("a@example.com"));
+        // The consumed refresh token must not remain on disk.
+        let disk = store.anthropic_subscription().unwrap().unwrap();
+        assert_eq!(disk, refreshed);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn unreadable_or_removed_disk_credential_never_refreshes_the_cached_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::new(dir.path().join("auth.json"));
+        store.save_anthropic_subscription(&old()).unwrap();
+        let (endpoints, count, task) = fixture(
+            200,
+            json!({"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600})
+                .to_string(),
+        )
+        .await;
+        let auth = AnthropicSubscriptionAuth::new(store.clone())
+            .unwrap()
+            .with_endpoints(endpoints);
+        // The cached credential is expired; the disk entry is now damaged.
+        store
+            .save_provider_value("anthropic-subscription", json!({"type":"oauth"}))
+            .unwrap();
+        assert!(auth.refresh().await.is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // Logged out elsewhere: report it and drop the stale cache.
+        let _ = std::fs::remove_file(store.path());
+        assert!(matches!(
+            auth.refresh().await,
+            Err(AuthError::AnthropicSubscriptionNotAuthenticated)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
         task.abort();
     }
     #[tokio::test]

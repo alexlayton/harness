@@ -9,3 +9,5 @@ pub mod config;
 pub mod context;
 /// One-shot, frontend-independent agent execution.
 pub mod sdk;
+/// Shared final-answer and failure reduction for non-interactive frontends.
+pub mod turn_output;
