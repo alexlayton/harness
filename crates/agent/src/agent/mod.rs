@@ -142,6 +142,17 @@ pub struct Agent {
     prewalk: PrewalkState,
 }
 
+/// How an isolated `/ask` request ended. A bool conflated "finished" with
+/// "interrupted" and "application shutdown"; only shutdown stops the loop.
+enum AskOutcome {
+    /// Answered, or failed with an already-emitted error event.
+    Done,
+    /// The user pressed Esc; the request was dropped but the agent continues.
+    Interrupted,
+    /// The application token was cancelled; the run loop must stop.
+    Shutdown,
+}
+
 impl Agent {
     /// Create an in-memory agent; attach optional policy and session builders
     /// before starting its input loop.
@@ -301,7 +312,7 @@ impl Agent {
         &self,
         question: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> bool {
+    ) -> AskOutcome {
         use futures_util::StreamExt;
         use llm::{CompletionRequest, Message, RetryCallback, StreamEvent};
         use std::sync::Arc;
@@ -328,7 +339,7 @@ impl Agent {
         };
         let stream_result = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => return false,
+            _ = self.cancel.cancelled() => return AskOutcome::Shutdown,
             result = self.provider.stream_with_retry(&request, on_retry) => result,
         };
         let mut stream = match stream_result {
@@ -338,14 +349,14 @@ impl Agent {
                     events,
                     AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
                 );
-                return true;
+                return AskOutcome::Done;
             }
         };
         let mut answer = String::new();
         loop {
             let event = tokio::select! {
                 biased;
-                _ = self.cancel.cancelled() => return false,
+                _ = self.cancel.cancelled() => return AskOutcome::Shutdown,
                 event = stream.next() => event,
             };
             let Some(event) = event else { break };
@@ -360,7 +371,7 @@ impl Agent {
                         events,
                         AgentEvent::Error(self.secret_masker.mask_text(&error.to_string())),
                     );
-                    return true;
+                    return AskOutcome::Done;
                 }
             }
         }
@@ -368,7 +379,7 @@ impl Agent {
             events,
             AgentEvent::AskAnswer(self.secret_masker.mask_text(&answer)),
         );
-        true
+        AskOutcome::Done
     }
 
     /// Run until the input channel closes or the application cancellation
@@ -488,29 +499,31 @@ impl Agent {
                     // request; other messages retain their queue order.
                     let mut buffered = VecDeque::new();
                     let mut input_open = self.input_open;
-                    let completed = {
+                    let outcome = {
                         let operation = self.answer_isolated_question(question, &events);
                         tokio::pin!(operation);
                         loop {
                             tokio::select! {
                                 biased;
-                                _ = self.cancel.cancelled() => break false,
+                                _ = self.cancel.cancelled() => break AskOutcome::Shutdown,
                                 message = input.recv(), if input_open => match message {
-                                    Some(InputMessage::Interrupt) => break true,
+                                    Some(InputMessage::Interrupt) => break AskOutcome::Interrupted,
                                     Some(message) => buffered.push_back(message),
                                     None => input_open = false,
                                 },
-                                completed = &mut operation => break completed,
+                                outcome = &mut operation => break outcome,
                             }
                         }
                     };
                     self.input_open = input_open;
                     self.queued.extend(buffered);
-                    if !completed {
-                        break;
+                    match outcome {
+                        AskOutcome::Done | AskOutcome::Interrupted => {
+                            send(&events, AgentEvent::OperationFinished);
+                            continue;
+                        }
+                        AskOutcome::Shutdown => break,
                     }
-                    send(&events, AgentEvent::OperationFinished);
-                    continue;
                 }
                 InputMessage::Message(_) | InputMessage::Interrupt => continue,
                 InputMessage::NewConversation => {
