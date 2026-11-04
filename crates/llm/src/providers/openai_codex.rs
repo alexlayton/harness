@@ -113,6 +113,14 @@ impl OpenAiCodexProvider {
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses=experimental"),
         );
+        if let Some(value) = request
+            .session_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .and_then(|id| HeaderValue::from_str(id).ok())
+        {
+            headers.insert(HeaderName::from_static("session-id"), value);
+        }
         OpenAiCodexResponsesClient::with_headers(&self.endpoint, credential.access.clone(), headers)
             .stream(request)
             .await

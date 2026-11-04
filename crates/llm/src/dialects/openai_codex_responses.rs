@@ -64,6 +64,9 @@ pub fn build_request_body(request: &CompletionRequest) -> Value {
     if let Some(instructions) = super::openai_responses::request_instructions(request) {
         body["instructions"] = Value::String(instructions);
     }
+    if let Some(session_id) = request.session_id.as_deref().filter(|id| !id.is_empty()) {
+        body["prompt_cache_key"] = Value::String(session_id.to_owned());
+    }
     // The ChatGPT Codex backend rejects `max_output_tokens` and
     // `temperature` as unsupported parameters, which failed every request
     // that set them (for example the compaction summarizer, which always
@@ -278,6 +281,16 @@ mod tests {
         let body = build_request_body(&req);
         assert!(body.get("max_output_tokens").is_none());
         assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn codex_body_sends_session_as_prompt_cache_key() {
+        let mut req = request(ReasoningPolicy::Off);
+        assert!(build_request_body(&req).get("prompt_cache_key").is_none());
+        req.session_id = Some("session-1".into());
+        assert_eq!(build_request_body(&req)["prompt_cache_key"], "session-1");
+        req.session_id = Some(String::new());
+        assert!(build_request_body(&req).get("prompt_cache_key").is_none());
     }
 
     #[test]
