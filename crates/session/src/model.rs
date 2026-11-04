@@ -577,6 +577,12 @@ impl Session {
             event,
         };
         self.apply_record(record.clone());
+        // The event exists only in memory. Drop the cached file cursor so a
+        // later `SessionStore::append_event` cannot take the fast path and
+        // write the next sequence after a gap; it re-reads the file instead
+        // and reports `HistoryDiverged`.
+        self.validated_bytes = 0;
+        self.file_identity = None;
         record
     }
 

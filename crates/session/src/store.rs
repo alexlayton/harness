@@ -2086,6 +2086,35 @@ mod tests {
     }
 
     #[test]
+    fn in_memory_append_on_persisted_session_cannot_corrupt_the_file() {
+        let root = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+        let message = |text: &str| SessionEvent::UserMessage {
+            message: StoredMessage::from_llm(&Message::user(text)),
+        };
+        let mut session = store.create(SessionCreateOptions::default()).unwrap();
+        store.append_event(&mut session, message("one")).unwrap();
+        let path = session.file_path().unwrap().to_path_buf();
+
+        // The cache now runs ahead of the file.
+        session.append(message("phantom"));
+        let result = store.append_event(&mut session, message("two"));
+        assert!(
+            matches!(result, Err(SessionError::HistoryDiverged(_))),
+            "{result:?}"
+        );
+
+        let reloaded = store.load_path(&path).unwrap();
+        let sequences = reloaded
+            .events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, [1]);
+    }
+
+    #[test]
     fn listing_rejects_concatenated_records_on_one_line() {
         let root = tempdir().unwrap();
         let workspace = tempdir().unwrap();
