@@ -286,17 +286,17 @@ impl Agent {
         let compacted = match compacted {
             Ok(compacted) => compacted,
             Err(TurnError::Shutdown) => {
-                self.persist_cancelled("application shutdown", events)?;
+                self.persist_cancelled_for("turn interrupted during compaction", events)?;
                 return Err(TurnError::Shutdown);
             }
             Err(error) => return Err(error),
         };
         if application.is_cancelled() {
-            self.persist_cancelled("application shutdown", events)?;
+            self.persist_cancelled_for("turn interrupted during compaction", events)?;
             return Err(TurnError::Shutdown);
         }
         if interrupted || cancel.is_cancelled() {
-            self.persist_cancelled("turn interrupted during compaction", events)?;
+            self.persist_cancelled_for("turn interrupted during compaction", events)?;
             return Ok(None);
         }
         Ok(Some(compacted))

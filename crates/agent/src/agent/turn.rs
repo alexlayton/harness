@@ -12,6 +12,62 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+/// Which recoverable failure a re-stream is answering. Each kind has its own
+/// budget so a burst of one (say, flaky streams) cannot leave the others
+/// (an empty response, a parse error) with no recovery at all.
+#[derive(Clone, Copy)]
+enum RecoveryKind {
+    Parse,
+    Retryable,
+    Empty,
+}
+
+/// Per-kind counts of recoveries spent this turn, each bounded by
+/// `MAX_TURN_RECOVERIES`.
+#[derive(Default)]
+struct Recoveries {
+    parse: usize,
+    retryable: usize,
+    empty: usize,
+}
+
+impl Recoveries {
+    /// Spend one recovery of `kind`; `false` once that kind's budget is gone.
+    fn take(&mut self, kind: RecoveryKind) -> bool {
+        let used = match kind {
+            RecoveryKind::Parse => &mut self.parse,
+            RecoveryKind::Retryable => &mut self.retryable,
+            RecoveryKind::Empty => &mut self.empty,
+        };
+        if *used < MAX_TURN_RECOVERIES {
+            *used += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Agent {
+    /// Persist a cancellation marker whose text reflects *why* the turn
+    /// stopped: "application shutdown" when the application token fired
+    /// (even if the turn token was cancelled as a consequence), otherwise
+    /// `interrupted`. One chooser keeps the durable record consistent at
+    /// every cancellation site.
+    pub(crate) fn persist_cancelled_for(
+        &mut self,
+        interrupted: &str,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<(), TurnError> {
+        let reason = if self.cancel.is_cancelled() {
+            "application shutdown"
+        } else {
+            interrupted
+        };
+        self.persist_cancelled(reason, events)
+    }
+}
+
 impl Agent {
     /// The single shared turn executor used by normal user messages and
     /// skill-invoked messages alike. It owns the whole operation boundary:
@@ -130,7 +186,7 @@ impl Agent {
         let user_message = Message::user(user_text);
         self.persist_user_message(&user_message, events)?;
         self.history.push(user_message.clone());
-        let mut recoveries = 0;
+        let mut recoveries = Recoveries::default();
         let mut overflow_recoveries = 0;
         let mut tool_rounds = 0usize;
         loop {
@@ -173,7 +229,7 @@ impl Agent {
                     // failed request can enter its retry path after Esc.
                     biased;
                     _ = self.cancel.cancelled() => {
-                        self.persist_cancelled("application shutdown", events)?;
+                        self.persist_cancelled_for("turn interrupted", events)?;
                         return Err(TurnError::Shutdown);
                     }
                     _ = cancel.cancelled() => break None,
@@ -189,7 +245,7 @@ impl Agent {
                 }
             };
             let Some(stream_result) = stream_result else {
-                self.persist_cancelled("turn interrupted before response", events)?;
+                self.persist_cancelled_for("turn interrupted before response", events)?;
                 return Ok(());
             };
             let mut stream = match stream_result {
@@ -330,7 +386,7 @@ impl Agent {
                         true,
                     ));
                 }
-                self.persist_cancelled("turn interrupted", events)?;
+                self.persist_cancelled_for("turn interrupted", events)?;
                 if self.cancel.is_cancelled() {
                     return Err(TurnError::Shutdown);
                 }
@@ -384,8 +440,7 @@ impl Agent {
                     // validation failures, not only malformed tool arguments.
                     // Calls from this interrupted round were closed above;
                     // do not blame or repeat calls from completed rounds.
-                    if recoveries < MAX_TURN_RECOVERIES {
-                        recoveries += 1;
+                    if recoveries.take(RecoveryKind::Parse) {
                         // Final-answer-only frontends discard the failed
                         // round, so its text must be given again in full.
                         let answer = match self.stream_recovery {
@@ -409,8 +464,7 @@ impl Agent {
                     // frontends discard failed rounds. Match the recovery note
                     // to that contract so retries neither truncate one-shot
                     // answers nor duplicate already-streamed TUI/ACP text.
-                    if recoveries < MAX_TURN_RECOVERIES {
-                        recoveries += 1;
+                    if recoveries.take(RecoveryKind::Retryable) {
                         let instruction = match self.stream_recovery {
                             StreamRecovery::Continue => "continue from where you left off.",
                             StreamRecovery::Replace => {
@@ -435,9 +489,9 @@ impl Agent {
             if tool_calls.is_empty() {
                 // A turn that produced no text and no tool calls is almost
                 // always a provider stall (reasoning emitted, then nothing).
-                // Nudge once instead of silently ending the turn.
-                if text.trim().is_empty() && recoveries < MAX_TURN_RECOVERIES {
-                    recoveries += 1;
+                // Nudge (up to the empty-response budget) instead of
+                // silently ending the turn.
+                if text.trim().is_empty() && recoveries.take(RecoveryKind::Empty) {
                     self.push_ephemeral_note(
                         "[system note: your previous response produced no output; continue \
                          and complete the task.]"

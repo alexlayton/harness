@@ -3201,10 +3201,101 @@ mod tests {
         });
     }
 
-    /// A response with no text and no tool calls is a provider stall; the
-    /// agent re-streams once with a nudge instead of ending the turn silently.
+    /// Retryable stream failures spend only their own budget: after three of
+    /// them, an empty response must still get its nudge. A single shared
+    /// budget (the old behaviour) ended the turn silently here.
     #[test]
-    fn empty_response_retries_turn_once() {
+    fn retryable_failures_do_not_exhaust_empty_response_budget() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let failing = || vec![Err("connection dropped".to_string())];
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![
+                    failing(),
+                    failing(),
+                    failing(),
+                    script(vec![StreamEvent::Done {
+                        stop_reason: None,
+                        usage: None,
+                    }]),
+                    script(vec![
+                        StreamEvent::TextDelta("answer".into()),
+                        StreamEvent::Done {
+                            stop_reason: None,
+                            usage: None,
+                        },
+                    ]),
+                ],
+                error_kind: MockErrorKind::Retryable,
+            });
+            let (input_tx, input_rx) = mpsc::unbounded_channel();
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            input_tx.send(InputMessage::Message("go".into())).unwrap();
+            drop(input_tx);
+            Agent::new(
+                provider.clone(),
+                ToolRegistry::empty(),
+                "demo",
+                CancellationToken::new(),
+            )
+            .run(input_rx, event_tx)
+            .await;
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+            let mut got = Vec::new();
+            while let Ok(event) = event_rx.try_recv() {
+                got.push(event);
+            }
+            assert!(got.contains(&AgentEvent::TextDelta("answer".into())));
+        });
+    }
+
+    /// The cancellation marker names application shutdown whenever the
+    /// application token fired, not only the turn token.
+    #[test]
+    fn cancel_marker_reflects_application_token() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let root = tempdir().unwrap();
+            let workspace = tempdir().unwrap();
+            let store = SessionStore::new(root.path(), workspace.path()).unwrap();
+            let session = store.create(SessionCreateOptions::default()).unwrap();
+            let session_id = session.id();
+            let cancel = CancellationToken::new();
+            let provider = Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![],
+                error_kind: MockErrorKind::Stream,
+            });
+            let mut agent = Agent::new(provider, ToolRegistry::empty(), "demo", cancel.clone())
+                .with_session(store.clone(), session)
+                .unwrap();
+            let (event_tx, _event_rx) = mpsc::unbounded_channel();
+            agent
+                .persist_cancelled_for("turn interrupted", &event_tx)
+                .unwrap();
+            cancel.cancel();
+            agent
+                .persist_cancelled_for("turn interrupted", &event_tx)
+                .unwrap();
+            let reasons: Vec<String> = store
+                .open(&session_id)
+                .unwrap()
+                .events
+                .iter()
+                .filter_map(|record| match &record.event {
+                    SessionEvent::TurnCancelled { reason } => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(reasons, vec!["turn interrupted", "application shutdown"]);
+        });
+    }
+
+    /// A response with no text and no tool calls is a provider stall; the
+    /// agent re-streams with a nudge instead of ending the turn silently.
+    #[test]
+    fn empty_response_retries_turn_with_nudge() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let provider = Arc::new(MockProvider {
@@ -3238,7 +3329,7 @@ mod tests {
             assert_eq!(
                 provider.calls.load(Ordering::SeqCst),
                 2,
-                "an empty response should re-stream once"
+                "an empty response should re-stream after a nudge"
             );
             let mut got = Vec::new();
             while let Ok(event) = event_rx.try_recv() {
