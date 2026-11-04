@@ -450,6 +450,7 @@ async fn run_application(
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)
+        .with_reasoning_summary(config.reasoning_summary.unwrap_or_default())
         .with_project_context(context_bundle.rendered)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)

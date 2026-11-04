@@ -15,6 +15,7 @@ fn request() -> CompletionRequest {
         temperature: None,
         reasoning: ReasoningPolicy::Auto,
         session_id: None,
+        reasoning_summary: Default::default(),
     }
 }
 

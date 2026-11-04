@@ -97,13 +97,21 @@ pub fn build_request_body(req: &CompletionRequest, reasoning: ReasoningPolicy) -
     match reasoning {
         ReasoningPolicy::Off => {}
         ReasoningPolicy::Auto => {
-            body.insert("reasoning".into(), json!({ "summary": "auto" }));
+            let mut object = Map::new();
+            if let Some(summary) = req.reasoning_summary.wire_value() {
+                object.insert("summary".into(), json!(summary));
+            }
+            if !object.is_empty() {
+                body.insert("reasoning".into(), Value::Object(object));
+            }
         }
         ReasoningPolicy::Effort(_) => {
-            body.insert(
-                "reasoning".into(),
-                json!({ "effort": openai_reasoning_effort(reasoning), "summary": "auto" }),
-            );
+            let mut object = Map::new();
+            object.insert("effort".into(), json!(openai_reasoning_effort(reasoning)));
+            if let Some(summary) = req.reasoning_summary.wire_value() {
+                object.insert("summary".into(), json!(summary));
+            }
+            body.insert("reasoning".into(), Value::Object(object));
         }
     }
     if let Some(max_tokens) = req.max_tokens {
@@ -496,6 +504,7 @@ mod tests {
             temperature: None,
             reasoning,
             session_id: None,
+            reasoning_summary: Default::default(),
         }
     }
 

@@ -221,6 +221,7 @@ pub async fn run(prompt: String, options: RunOptions, cancel: CancellationToken)
         cancel.clone(),
     )
     .with_reasoning(config.reasoning)
+    .with_reasoning_summary(config.reasoning_summary.unwrap_or_default())
     .with_stream_recovery(StreamRecovery::Replace)
     .with_secret_masker(config.secret_masker.clone())
     .with_compaction(config.compaction.clone())

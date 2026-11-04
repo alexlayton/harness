@@ -65,6 +65,84 @@ pub enum ReasoningEffort {
     Maximum,
 }
 
+/// How much reasoning summary text to request alongside reasoning. Summaries
+/// cost generation time and only matter when something displays them, so
+/// headless runs can ask for none.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReasoningSummary {
+    /// Let the provider choose a summary style.
+    #[default]
+    Auto,
+    /// Request short summaries.
+    Concise,
+    /// Request detailed summaries.
+    Detailed,
+    /// Do not request summaries; the wire field is omitted.
+    None,
+}
+
+impl ReasoningSummary {
+    /// Stable configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+            Self::None => "none",
+        }
+    }
+
+    /// Wire value for the Responses `reasoning.summary` field; `None` omits it.
+    pub const fn wire_value(self) -> Option<&'static str> {
+        match self {
+            Self::None => Option::None,
+            other => Some(other.as_str()),
+        }
+    }
+}
+
+impl fmt::Display for ReasoningSummary {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ReasoningSummary {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "concise" => Ok(Self::Concise),
+            "detailed" => Ok(Self::Detailed),
+            "none" | "off" => Ok(Self::None),
+            _ => Err(format!(
+                "invalid reasoning summary `{value}` (expected auto, concise, detailed, or none)"
+            )),
+        }
+    }
+}
+
+impl Serialize for ReasoningSummary {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ReasoningSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 /// Provider-neutral control over model reasoning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReasoningPolicy {
@@ -146,6 +224,8 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub reasoning: ReasoningPolicy,
+    /// Reasoning summary style for Responses-style providers.
+    pub reasoning_summary: ReasoningSummary,
     /// Stable per-conversation identifier forwarded to providers that scope
     /// usage by conversation (currently OpenCode Go's `x-opencode-session`
     /// header). `None` for ephemeral runs or providers that ignore it. A

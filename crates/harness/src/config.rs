@@ -12,7 +12,7 @@ use llm::providers::{
     AnthropicSubscriptionProvider, GithubCopilotProvider, OpenAiCodexProvider, OpenCodeGoProvider,
     OpenRouterProvider,
 };
-use llm::{Provider, ReasoningPolicy};
+use llm::{Provider, ReasoningPolicy, ReasoningSummary};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -451,6 +451,11 @@ pub struct FileConfig {
     /// Portable reasoning effort for normal agent and subagent requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningPolicy>,
+    /// Reasoning summary style (`auto`, `concise`, `detailed`, `none`). When
+    /// unset, interactive frontends use `auto` and headless runs use `none`
+    /// unless verbose, since nobody reads the summaries otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_summary: Option<ReasoningSummary>,
     /// Opt-in RTK integration: rewrite supported bash commands to their
     /// token-optimized `rtk` equivalents before execution. Off unless the
     /// user explicitly sets `rtk = true`.
@@ -502,6 +507,7 @@ impl PartialEq for FileConfig {
         self.provider == other.provider
             && self.model == other.model
             && self.reasoning_effort == other.reasoning_effort
+            && self.reasoning_summary == other.reasoning_summary
             && self.rtk == other.rtk
             && self.program_status == other.program_status
             && self.compaction == other.compaction
@@ -1285,6 +1291,8 @@ pub struct Config {
     pub custom_providers: CustomProviders,
     pub model: String,
     pub reasoning: ReasoningPolicy,
+    /// Configured summary style; `None` lets each frontend pick its default.
+    pub reasoning_summary: Option<ReasoningSummary>,
     pub rtk: bool,
     pub compaction: CompactionPolicy,
     /// Resolved subagent bounds (file `[subagents]` over defaults).
@@ -1537,6 +1545,7 @@ impl Config {
                 .reasoning_effort
                 .or(file.reasoning_effort)
                 .unwrap_or_default(),
+            reasoning_summary: file.reasoning_summary,
             rtk: file.rtk,
             compaction: file
                 .compaction
@@ -2103,6 +2112,7 @@ mod tests {
             provider: Some("opencode-go".into()),
             model: Some("demo".into()),
             reasoning_effort: Some(ReasoningPolicy::Effort(llm::ReasoningEffort::High)),
+            reasoning_summary: Some(ReasoningSummary::None),
             rtk: true,
             program_status: Some(false),
             compaction: Some(CompactConfig {

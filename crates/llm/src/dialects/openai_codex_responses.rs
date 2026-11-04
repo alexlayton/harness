@@ -36,6 +36,13 @@ impl OpenAiCodexResponsesClient {
         Ok(event_stream(stream_response(response), &self.http.api_key))
     }
 }
+/// Add `reasoning.summary` unless the request opted out of summaries.
+fn set_summary(body: &mut Value, request: &CompletionRequest) {
+    if let Some(summary) = request.reasoning_summary.wire_value() {
+        body["reasoning"]["summary"] = Value::String(summary.to_owned());
+    }
+}
+
 /// Convert neutral harness history to the subset accepted by Codex.
 pub fn build_request_body(request: &CompletionRequest) -> Value {
     let mut body = json!({
@@ -50,14 +57,15 @@ pub fn build_request_body(request: &CompletionRequest) -> Value {
         ReasoningPolicy::Off => {}
         ReasoningPolicy::Auto => {
             // Preserve the subscription endpoint's historical default.
-            body["reasoning"] = json!({ "effort": "medium", "summary": "auto" });
+            body["reasoning"] = json!({ "effort": "medium" });
+            set_summary(&mut body, request);
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
         ReasoningPolicy::Effort(_) => {
             body["reasoning"] = json!({
                 "effort": openai_reasoning_effort(request.reasoning),
-                "summary": "auto"
             });
+            set_summary(&mut body, request);
             body["include"] = json!(["reasoning.encrypted_content"]);
         }
     }
@@ -270,6 +278,7 @@ mod tests {
             temperature: None,
             reasoning,
             session_id: None,
+            reasoning_summary: Default::default(),
         }
     }
 
@@ -291,6 +300,19 @@ mod tests {
         assert_eq!(build_request_body(&req)["prompt_cache_key"], "session-1");
         req.session_id = Some(String::new());
         assert!(build_request_body(&req).get("prompt_cache_key").is_none());
+    }
+
+    #[test]
+    fn reasoning_summary_none_omits_codex_summary() {
+        let mut req = request(ReasoningPolicy::Effort(crate::ReasoningEffort::Medium));
+        assert_eq!(build_request_body(&req)["reasoning"]["summary"], "auto");
+        req.reasoning_summary = crate::ReasoningSummary::Concise;
+        assert_eq!(build_request_body(&req)["reasoning"]["summary"], "concise");
+        req.reasoning_summary = crate::ReasoningSummary::None;
+        let body = build_request_body(&req);
+        assert!(body["reasoning"].get("summary").is_none());
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
     }
 
     #[test]

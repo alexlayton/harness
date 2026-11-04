@@ -558,6 +558,11 @@ async fn run_headless_resolved(
     let mut builder = AgentBuilder::new(provider, config.model.clone(), tools, cancel.clone())
         .with_secret_masker(config.secret_masker.clone())
         .with_reasoning(config.reasoning)
+        .with_reasoning_summary(config.reasoning_summary.unwrap_or(if args.verbose {
+            llm::ReasoningSummary::Auto
+        } else {
+            llm::ReasoningSummary::None
+        }))
         .with_stream_recovery(StreamRecovery::Replace)
         .with_compaction(config.compaction.clone())
         .with_subagents(config.subagents, config.rtk)

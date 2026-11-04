@@ -605,6 +605,7 @@ impl SubagentRunnerImpl {
                 temperature: None,
                 reasoning,
                 session_id: session.as_ref().map(|child| child.id().to_string()),
+                reasoning_summary: llm::ReasoningSummary::None,
             };
             // Standard initial-request retry policy, same as the parent: a
             // transient 429/5xx while *obtaining* the stream must not
