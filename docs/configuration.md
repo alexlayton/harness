@@ -37,6 +37,16 @@ portable preference: supported models translate it to their native control,
 while providers may reject levels unavailable for a selected model. The TUI
 `/reasoning` command displays or changes the active value and persists changes.
 
+`reasoning_summary` controls the reasoning summaries that OpenAI Responses and
+Codex models stream back. It accepts `auto`, `concise`, `detailed`, and `none`.
+When it is not set, the TUI, ACP, and SDK use `auto`, and `harness prompt` uses
+`none` unless `-v` is passed, because nothing shows the summaries otherwise.
+Other providers ignore this setting.
+
+```toml
+reasoning_summary = "concise"
+```
+
 Harness requires a provider choice rather than assuming one from an API key.
 When no provider is configured, startup lists the available providers and their
 setup commands. A successful OAuth login selects that provider only when this
