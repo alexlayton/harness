@@ -530,6 +530,7 @@ impl SubagentRunnerImpl {
                 reasoning,
                 &secret_masker,
                 context_window,
+                &description,
                 &mut history,
                 &mut session,
                 cancel,
@@ -590,11 +591,12 @@ impl SubagentRunnerImpl {
         reasoning: ReasoningPolicy,
         secret_masker: &Arc<SecretMasker>,
         context_window: u64,
+        description: &str,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
-        let run_description = last_user_line(history);
+        let run_description = description.to_owned();
         let model_for_log = model.to_owned();
         let mut turns = 0usize;
         loop {
@@ -745,7 +747,17 @@ impl SubagentRunnerImpl {
                 // No retry ladder here: the parent turn already has recovery
                 // machinery, and a failed subagent surfaces as an errored
                 // tool result the parent can choose to re-delegate.
-                return Err(format!("provider stream interrupted: {error}"));
+                let partial = text.trim();
+                if partial.is_empty() {
+                    return Err(format!("provider stream interrupted: {error}"));
+                }
+                // Hand back what arrived so the parent can use or re-delegate
+                // the partial findings instead of losing them.
+                return Err(format!(
+                    "provider stream interrupted: {error}. Partial output before the \
+                     interruption: {}",
+                    truncate_utf8(partial, REPORT_MAX_BYTES)
+                ));
             }
 
             if tool_calls.is_empty() {
@@ -754,10 +766,17 @@ impl SubagentRunnerImpl {
                     // continue within budget. An empty reply adds no
                     // assistant message, so fold the note into a trailing
                     // user message instead of creating two adjacent ones.
-                    push_request_note(
-                        history,
-                        "[system note: your previous response produced no output; continue \
-                         and complete the task.]",
+                    const NUDGE: &str = "[system note: your previous response produced no output; \
+                                         continue and complete the task.]";
+                    push_request_note(history, NUDGE);
+                    // Record what the model actually saw, so the durable
+                    // transcript explains the retried turn.
+                    Self::persist(
+                        &self.store,
+                        session,
+                        session::SessionEvent::UserMessage {
+                            message: session::StoredMessage::from_llm(&Message::user(NUDGE)),
+                        },
                     );
                     continue;
                 }
@@ -921,29 +940,6 @@ impl SubagentRunner for SubagentRunnerImpl {
         )
         .await
     }
-}
-
-/// Last user message line, used as best-effort context in retry logs (never
-/// the full prompt).
-fn last_user_line(history: &[Message]) -> String {
-    history
-        .iter()
-        .rev()
-        .find_map(|message| {
-            (message.role == Role::User).then(|| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text(text) => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-        })
-        .map(|text| truncate_utf8(&text, 80).to_owned())
-        .unwrap_or_default()
 }
 
 /// Add a request-local instruction while preserving provider role
