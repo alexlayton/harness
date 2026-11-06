@@ -45,6 +45,13 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// The provider this one decorates, when it is a pure wrapper (for
+    /// example secret masking). Lets a host replace a decorator instead of
+    /// stacking a second one on top of it.
+    fn wrapped_provider(&self) -> Option<Arc<dyn Provider>> {
+        None
+    }
+
     /// Fetch the current subscription allowance, when this provider has a
     /// usage endpoint. Providers without subscription allowances return `None`.
     async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {
