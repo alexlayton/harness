@@ -313,7 +313,26 @@ fn syntax_theme() -> Option<tui_md::SyntaxTheme> {
 /// Map the semantic palette onto the markdown renderer's styles. Fenced code
 /// with a known language is syntax-highlighted; other code keeps the
 /// palette's single code style.
-fn markdown_theme(theme: Theme) -> tui_md::Theme {
+///
+/// Built once per palette: it allocates symbol strings and clones the syntax
+/// theme, and every streamed render needs it.
+fn markdown_theme(theme: Theme) -> std::sync::Arc<tui_md::Theme> {
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Option<(Theme, Arc<tui_md::Theme>)>> = Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached, styles)) = cache.as_ref()
+        && *cached == theme
+    {
+        return Arc::clone(styles);
+    }
+    let styles = Arc::new(build_markdown_theme(theme));
+    *cache = Some((theme, Arc::clone(&styles)));
+    styles
+}
+
+fn build_markdown_theme(theme: Theme) -> tui_md::Theme {
     let code = fg(theme.primary_text).bg(theme.code_background);
     let mut styles = tui_md::Theme {
         // Plain `-` bullets as before; the other glyphs keep the renderer's
