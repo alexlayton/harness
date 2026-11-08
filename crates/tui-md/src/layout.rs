@@ -182,7 +182,8 @@ impl Layout<'_> {
                 Inline::FootnoteRef(label) => {
                     push(out, &format!("[{label}]"), patch(style, theme.footnote))
                 }
-                Inline::Html(html) => push(out, html, patch(style, theme.html)),
+                // Inline HTML stays on one row; a newline would add one.
+                Inline::Html(html) => push(out, &html.replace('\n', " "), patch(style, theme.html)),
                 Inline::SoftBreak => push(out, " ", style),
                 Inline::HardBreak => push(out, "\n", style),
             }
@@ -575,6 +576,12 @@ fn hang(rows: Vec<Row>, first: Row, indent: usize) -> Vec<Row> {
         .map(|(index, content)| {
             if index == 0 {
                 let mut row = first.clone();
+                if content.is_empty()
+                    && let Some(last) = row.runs.last_mut()
+                {
+                    // Empty item: no trailing gap after the marker.
+                    last.text.truncate(last.text.trim_end().len());
+                }
                 row.extend(content);
                 row
             } else if content.is_empty() {
@@ -904,6 +911,48 @@ mod tests {
         let theme = Theme::default();
         assert_eq!(rows[0].runs[0].style, patch(theme.text, theme.strong));
         assert_eq!(rows[0].runs[2].style, patch(theme.text, theme.code));
+    }
+
+    #[test]
+    fn tiny_widths_keep_all_text() {
+        let strip = |rows: Vec<String>| {
+            rows.concat()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>()
+        };
+        for source in [
+            "> text",
+            "- abc",
+            "1. abc",
+            "> [!NOTE]\n> hi",
+            "[^1]: note\n\n[^1]",
+        ] {
+            for width in 1..=4 {
+                let got = strip(lines(source, width));
+                for word in ["text", "abc", "hi"] {
+                    if source.contains(word) {
+                        assert!(got.contains(word), "{source:?} @ {width}: {got:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_item_has_no_trailing_space_and_html_stays_on_one_row() {
+        assert_eq!(lines("- \n- b", 20), ["•", "• b"]);
+        assert_eq!(lines("a <span\nx> b", 40).len(), 1);
+    }
+
+    #[test]
+    fn empty_highlighted_fence_keeps_one_row() {
+        let theme = Theme {
+            syntax_theme: Some(SyntaxTheme::default()),
+            ..Theme::default()
+        };
+        let plain = render_str("```rust\n```", &Theme::default(), 20).len();
+        assert_eq!(render_str("```rust\n```", &theme, 20).len(), plain);
     }
 
     #[test]
