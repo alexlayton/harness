@@ -806,14 +806,32 @@ pub(crate) fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Ve
     wrap_text(&text, width, Style::default())
 }
 
+#[cfg(test)]
 pub(crate) fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+    markdown_lines_continued(markdown, theme, width, false)
+}
+
+/// Like [`markdown_lines`]; when `continued`, the text continues a message
+/// whose first chunk is already in scrollback, so it is indented without a
+/// second `‹` marker.
+pub(crate) fn markdown_lines_continued(
+    markdown: &str,
+    theme: Theme,
+    width: usize,
+    continued: bool,
+) -> Vec<Line<'static>> {
     let text = table::fit_tables(
         owned_markdown(markdown, theme),
         message_content_width(width),
     );
+    let prefix = if continued {
+        " ".repeat(UnicodeWidthStr::width(ASSISTANT_PREFIX))
+    } else {
+        ASSISTANT_PREFIX.to_owned()
+    };
     prefix_message_lines(
         wrap_text(&text, message_content_width(width), assistant_style(theme)),
-        ASSISTANT_PREFIX,
+        &prefix,
         theme,
         width,
     )

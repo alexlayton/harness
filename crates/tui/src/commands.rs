@@ -67,6 +67,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::Path,
     },
     CommandSpec {
+        name: "/copy",
+        description: "Copy the last reply (or its last code block) as plain text",
+        usage: "/copy [code]",
+        argument_kind: ArgumentKind::None,
+    },
+    CommandSpec {
         name: "/compact",
         description: "Compact older local session context",
         usage: "/compact",
@@ -180,6 +186,10 @@ pub enum ParsedCommand {
         destination: Option<String>,
     },
     Compact,
+    /// Copy the last assistant reply, or only its last fenced code block.
+    Copy {
+        code: bool,
+    },
     SetModel {
         provider: Option<String>,
         model: String,
@@ -284,6 +294,11 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 })
             }
         }
+        "/copy" => match words.collect::<Vec<_>>().as_slice() {
+            [] => Ok(ParsedCommand::Copy { code: false }),
+            [arg] if arg.eq_ignore_ascii_case("code") => Ok(ParsedCommand::Copy { code: true }),
+            _ => Err("usage: /copy [code]".into()),
+        },
         "/compact" => {
             if words.next().is_some() {
                 Err("usage: /compact".into())

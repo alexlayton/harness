@@ -63,7 +63,7 @@ use crate::commands::{
     self, ArgumentKind, Candidate, CandidateKind, CompletionContext, CompletionResult,
     CompletionTarget, ParsedCommand,
 };
-use crate::commit::SplitScanner;
+use crate::commit::{SplitScanner, last_fenced_code_block};
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
 use crate::paths::{self, AtPrefix};
@@ -137,6 +137,9 @@ enum Entry {
     Assistant {
         markdown: String,
         reasoning: String,
+        /// True when this entry continues a message whose earlier chunk was
+        /// already committed, so it gets no `‹` prefix of its own.
+        continued: bool,
     },
     Tool {
         record: ToolRecord,
@@ -172,6 +175,9 @@ enum Fetch {
 struct StreamState {
     reasoning: String,
     markdown: String,
+    /// Markdown of this message was already committed to scrollback, so the
+    /// remaining text continues it instead of opening a new `‹` block.
+    markdown_continued: bool,
     /// Incremental stable-split scan over `markdown`; reset when it is
     /// drained.
     split: SplitScanner,
@@ -225,6 +231,28 @@ const EVENT_DRAIN_BUDGET: Duration = Duration::from_millis(8);
 
 /// Quiet time after the last resize event before the window is repainted.
 const RESIZE_SETTLE: Duration = Duration::from_millis(40);
+
+/// Largest payload `/copy` sends; terminals commonly cap OSC 52 near 1 MB.
+const MAX_COPY_BYTES: usize = 512 * 1024;
+
+/// OSC 52 clipboard-set sequence for `text`, wrapped in tmux's passthrough
+/// envelope when running inside tmux.
+fn clipboard_sequence(text: &str, tmux: bool) -> String {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::STANDARD.encode(text);
+    let osc = format!("\u{1b}]52;c;{payload}\u{07}");
+    if tmux {
+        format!("\u{1b}Ptmux;\u{1b}{osc}\u{1b}\\")
+    } else {
+        osc
+    }
+}
+
+/// Opens every frame: begin synchronized update (DEC 2026) and disable
+/// autowrap (DECAWM). Terminals without 2026 ignore it.
+const FRAME_BEGIN: &str = "\u{1b}[?2026h\u{1b}[?7l";
+/// Closes every frame in the same write, so autowrap is never left off.
+const FRAME_END: &str = "\u{1b}[?7h\u{1b}[?2026l";
 
 /// The visual rows of the input line plus the cursor's position within them.
 struct InputLayout {
@@ -495,6 +523,9 @@ pub struct CrossTerm {
 
     /// OSC 7501 program-status tracker; `None` when reporting is off.
     program_status: Option<program_status::Tracker>,
+    /// A clipboard (OSC 52) sequence queued by `/copy`, written at the start
+    /// of the next frame so it never splits one.
+    clipboard_osc: Option<String>,
 }
 
 impl CrossTerm {
@@ -574,6 +605,7 @@ impl CrossTerm {
             cursor_col: 0,
             activity_region_row: None,
             program_status: None,
+            clipboard_osc: None,
             terminal: Arc::new(Mutex::new(TerminalState {
                 backend: Box::new(CrosstermBackend),
                 modes: TerminalModes::default(),
@@ -883,7 +915,7 @@ impl CrossTerm {
             self.spinner,
             theme,
         );
-        let mut buffer = String::new();
+        let mut buffer = String::from(FRAME_BEGIN);
         let up = self.cursor_row.saturating_sub(row);
         if up > 0 {
             let _ = write!(buffer, "{}", MoveUp(up as u16));
@@ -898,6 +930,7 @@ impl CrossTerm {
         if col > 0 {
             let _ = write!(buffer, "{}", MoveRight(col));
         }
+        buffer.push_str(FRAME_END);
         self.out
             .write_all(buffer.as_bytes())
             .context("write activity")?;
@@ -1783,6 +1816,10 @@ impl CrossTerm {
                 InputMessage::ListSessions
             }
             ParsedCommand::Export { destination } => InputMessage::ExportSession { destination },
+            ParsedCommand::Copy { code } => {
+                self.copy_last_reply(code);
+                return Ok(());
+            }
             ParsedCommand::Compact => InputMessage::CompactSession,
             ParsedCommand::SetModel { provider, model } => {
                 InputMessage::SetModel { provider, model }
@@ -2190,6 +2227,7 @@ impl CrossTerm {
                         } => Entry::Assistant {
                             markdown,
                             reasoning,
+                            continued: false,
                         },
                         SessionSnapshotEntry::Tool {
                             name,
@@ -2314,7 +2352,8 @@ impl CrossTerm {
             return;
         }
         let chunk = stream.markdown[source_offset..stable_offset].to_owned();
-        let rendered = render::markdown_lines(&chunk, theme, width);
+        let continued = stream.markdown_continued || source_offset > 0;
+        let rendered = render::markdown_lines_continued(&chunk, theme, width, continued);
         if let Some(cache) = self.stream_markdown_cache.as_mut() {
             cache.lines.extend(rendered);
             cache.source_offset = stable_offset;
@@ -2335,7 +2374,76 @@ impl CrossTerm {
         self.pending.push(Entry::Assistant {
             markdown: stream.markdown,
             reasoning: stream.reasoning,
+            continued: stream.markdown_continued,
         });
+    }
+
+    /// Source markdown of the newest completed assistant reply. A long reply
+    /// committed in chunks is rejoined, so the copy is the model's text rather
+    /// than the wrapped, indented rows shown on screen.
+    fn last_reply_markdown(&self) -> Option<String> {
+        let entries: Vec<&Entry> = self.transcript.iter().chain(&self.pending).collect();
+        let mut index = entries.iter().rposition(
+            |entry| matches!(entry, Entry::Assistant { markdown, .. } if !markdown.is_empty()),
+        )?;
+        let mut chunks = Vec::new();
+        loop {
+            let Entry::Assistant {
+                markdown,
+                continued,
+                ..
+            } = entries[index]
+            else {
+                break;
+            };
+            if !markdown.is_empty() {
+                chunks.push(markdown.as_str());
+                if !continued {
+                    break;
+                }
+            }
+            if index == 0 {
+                break;
+            }
+            index -= 1;
+        }
+        chunks.reverse();
+        Some(chunks.concat().trim_end().to_owned())
+    }
+
+    /// Queue the last reply (or its last fenced code block) for the system
+    /// clipboard through OSC 52 and report what happened.
+    fn copy_last_reply(&mut self, code: bool) {
+        let Some(markdown) = self.last_reply_markdown() else {
+            self.add_error("nothing to copy yet");
+            return;
+        };
+        let text = if code {
+            match last_fenced_code_block(&markdown) {
+                Some(code) => code,
+                None => {
+                    self.add_error("the last reply has no code block");
+                    return;
+                }
+            }
+        } else {
+            markdown
+        };
+        if text.len() > MAX_COPY_BYTES {
+            self.add_error("reply is too large to copy through the terminal");
+            return;
+        }
+        self.clipboard_osc = Some(clipboard_sequence(
+            &text,
+            std::env::var_os("TMUX").is_some(),
+        ));
+        let lines = text.lines().count();
+        self.add_notice(format!(
+            "Copied {} {}{}",
+            lines,
+            if lines == 1 { "line" } else { "lines" },
+            if code { " of code" } else { "" }
+        ));
     }
 
     fn add_notice(&mut self, text: impl Into<String>) {
@@ -2639,15 +2747,21 @@ impl CrossTerm {
             {
                 let mut rendered = cache.lines.clone();
                 if cache.source_offset < stream.markdown.len() {
-                    rendered.extend(render::markdown_lines(
+                    rendered.extend(render::markdown_lines_continued(
                         &stream.markdown[cache.source_offset..],
                         self.theme,
                         width,
+                        stream.markdown_continued || cache.source_offset > 0,
                     ));
                 }
                 rendered
             } else {
-                render::markdown_lines(&stream.markdown, self.theme, width)
+                render::markdown_lines_continued(
+                    &stream.markdown,
+                    self.theme,
+                    width,
+                    stream.markdown_continued,
+                )
             };
             lines.extend(markdown);
         }
@@ -2683,6 +2797,25 @@ impl CrossTerm {
             return;
         };
         if stream.markdown.is_empty() {
+            // A reasoning-only stream would otherwise show just its newest
+            // rows until the turn ends, leaving the rest absent from
+            // scrollback. Commit whole paragraphs once they outgrow the tail.
+            let trimmed = stream.reasoning.trim_end_matches(['\r', '\n']);
+            let Some(boundary) = trimmed.rfind("\n\n") else {
+                return;
+            };
+            let head = trimmed[..boundary].trim_end_matches(['\r', '\n']);
+            if head.is_empty() || render::reasoning_lines(head, theme, width).len() <= budget {
+                return;
+            }
+            let head = head.to_owned();
+            stream.reasoning.drain(..boundary + 2);
+            *stream.reasoning_render.borrow_mut() = None;
+            self.pending.push(Entry::Assistant {
+                markdown: String::new(),
+                reasoning: head,
+                continued: false,
+            });
             return;
         }
         let Some(offset) = stream.split.split_offset(&stream.markdown) else {
@@ -2694,6 +2827,7 @@ impl CrossTerm {
         let prefix = Entry::Assistant {
             markdown: stream.markdown[..offset].to_owned(),
             reasoning: stream.reasoning.clone(),
+            continued: stream.markdown_continued,
         };
         let prefix_height = entry_lines(&prefix, width, theme, self.tools_expanded).len();
         if prefix_height <= budget {
@@ -2701,7 +2835,9 @@ impl CrossTerm {
         }
         self.pending.push(prefix);
         stream.reasoning.clear();
+        *stream.reasoning_render.borrow_mut() = None;
         stream.markdown.drain(..offset);
+        stream.markdown_continued = true;
         stream.split = SplitScanner::default();
         // The source origin moved; cached offsets are no longer meaningful.
         self.stream_markdown_cache = None;
@@ -2775,7 +2911,17 @@ impl CrossTerm {
 
         let mut above: Vec<Line<'static>> = Vec::new();
         if clear_all {
-            let keep = (self.height as usize).saturating_sub(build.rows.len());
+            // The separator row between history and the region counts too:
+            // without it the frame is one row taller than the screen and its
+            // top row scrolls into native scrollback on every full repaint.
+            let gap = if build.rows.is_empty() {
+                0
+            } else {
+                render::SECTION_GAP
+            };
+            let keep = (self.height as usize)
+                .saturating_sub(build.rows.len())
+                .saturating_sub(gap);
             above = history_window(&self.transcript, keep, content, theme, self.tools_expanded);
         } else {
             for (index, entry) in self.pending.iter().enumerate() {
@@ -2801,8 +2947,24 @@ impl CrossTerm {
         if let Some(report) = self.program_status.as_mut().and_then(|s| s.take_report()) {
             buffer.push_str(&report);
         }
+        // Synchronized output keeps a tall frame from tearing, and autowrap is
+        // off while it is written: a row the terminal measures wider than we
+        // do is clipped instead of wrapping into an untracked row, which would
+        // desynchronize the region bookkeeping and strand stale rows.
+        if let Some(copy) = self.clipboard_osc.take() {
+            buffer.push_str(&copy);
+        }
+        buffer.push_str(FRAME_BEGIN);
         if clear_all {
-            let _ = write!(buffer, "{}{}", Clear(ClearType::All), MoveTo(0, 0));
+            // ED 0 from home rather than ED 2: several terminals push the
+            // whole screen into scrollback on ED 2, duplicating the visible
+            // window above the repaint on every resize or Ctrl+O.
+            let _ = write!(
+                buffer,
+                "{}{}",
+                MoveTo(0, 0),
+                Clear(ClearType::FromCursorDown)
+            );
         } else if !self.region.is_empty() {
             // Walk the cursor up to the top of the previously painted region.
             // The cursor sits at `cursor_row` inside the region, so exactly
@@ -2844,6 +3006,7 @@ impl CrossTerm {
             let col = build.cursor_col.min(u16::MAX as usize) as u16;
             let _ = write!(buffer, "{}", MoveRight(col));
         }
+        buffer.push_str(FRAME_END);
 
         self.out
             .write_all(buffer.as_bytes())
@@ -3019,6 +3182,7 @@ fn entry_bytes(entry: &Entry) -> usize {
         Entry::Assistant {
             markdown,
             reasoning,
+            ..
         } => markdown.len() + reasoning.len(),
         Entry::Tool { record } => {
             record.name.len()
@@ -3248,6 +3412,7 @@ fn entry_lines(
         Entry::Assistant {
             markdown,
             reasoning,
+            continued,
         } => {
             let mut lines = Vec::new();
             if !reasoning.is_empty() {
@@ -3257,7 +3422,9 @@ fn entry_lines(
                 if !lines.is_empty() {
                     render::push_blank(&mut lines, render::BLOCK_GAP);
                 }
-                lines.extend(render::markdown_lines(markdown, theme, width));
+                lines.extend(render::markdown_lines_continued(
+                    markdown, theme, width, *continued,
+                ));
             }
             lines
         }
@@ -5715,6 +5882,69 @@ mod tests {
     }
 
     #[test]
+    fn continued_chunks_do_not_repeat_the_assistant_marker() {
+        let mut ui = ui(80, 8);
+        ui.stream = Some(StreamState {
+            markdown: format!("{}\n\nsecond\n\nthird", "word ".repeat(100)),
+            ..StreamState::default()
+        });
+        let input = ui.input_layout();
+        ui.commit_stream_prefix(input.rows.len());
+        ui.finalize_stream();
+        let rows: Vec<String> = ui
+            .pending
+            .iter()
+            .flat_map(|entry| entry_lines(entry, 76, ui.theme, false))
+            .map(|line| row_text(&line))
+            .collect();
+        assert_eq!(rows.iter().filter(|row| row.starts_with('‹')).count(), 1);
+        assert!(rows.iter().any(|row| row.trim() == "third"));
+    }
+
+    #[test]
+    fn long_reasoning_streams_into_scrollback_by_paragraph() {
+        let mut ui = ui(80, 8);
+        let paragraph = "think ".repeat(60);
+        ui.stream = Some(StreamState {
+            reasoning: format!("{paragraph}\n\n{paragraph}\n\nlast"),
+            ..StreamState::default()
+        });
+        let input = ui.input_layout();
+        ui.commit_stream_prefix(input.rows.len());
+        assert!(!ui.pending.is_empty());
+        let rest = &ui.stream.as_ref().expect("stream").reasoning;
+        assert!(rest.ends_with("last"));
+        assert!(
+            rest.matches("think").count() <= 60,
+            "committed paragraphs left the stream"
+        );
+    }
+
+    #[test]
+    fn copy_returns_rejoined_reply_or_last_code_block() {
+        let mut ui = ui(80, 24);
+        ui.pending.push(Entry::Assistant {
+            markdown: "intro\n\n```rs\nlet a = 1;\n```\n\n".into(),
+            reasoning: String::new(),
+            continued: false,
+        });
+        ui.pending.push(Entry::Assistant {
+            markdown: "tail".into(),
+            reasoning: String::new(),
+            continued: true,
+        });
+        assert_eq!(
+            ui.last_reply_markdown().as_deref(),
+            Some("intro\n\n```rs\nlet a = 1;\n```\n\ntail")
+        );
+        ui.copy_last_reply(true);
+        let osc = ui.clipboard_osc.take().expect("queued");
+        assert_eq!(osc, clipboard_sequence("let a = 1;", false));
+        assert!(osc.contains("bGV0IGEgPSAxOw=="));
+        assert!(clipboard_sequence("x", true).starts_with("\u{1b}Ptmux;"));
+    }
+
+    #[test]
     fn prewalk_is_never_shown_armed_without_a_target() {
         let mut ui = ui(80, 24);
         ui.apply_event(UiEvent::PrewalkChanged {
@@ -5740,6 +5970,7 @@ mod tests {
             Entry::Assistant {
                 markdown,
                 reasoning,
+                ..
             } => {
                 assert_eq!(markdown, "answer");
                 assert_eq!(reasoning, "thinking");

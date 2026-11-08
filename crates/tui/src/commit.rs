@@ -77,6 +77,40 @@ impl SplitScanner {
     }
 }
 
+/// Contents of the last fenced code block in `markdown` (an unclosed final
+/// fence counts), without the fence lines. `None` when there is no fence.
+pub(crate) fn last_fenced_code_block(markdown: &str) -> Option<String> {
+    let mut fence: Option<(char, usize)> = None;
+    let mut current: Vec<&str> = Vec::new();
+    let mut last: Option<Vec<&str>> = None;
+    for line in markdown.lines() {
+        match fence {
+            Some((character, length)) => {
+                if fence_run(line).is_some_and(|(found, run, rest)| {
+                    found == character && run >= length && rest.trim().is_empty()
+                }) {
+                    fence = None;
+                    last = Some(std::mem::take(&mut current));
+                } else {
+                    current.push(line);
+                }
+            }
+            None => {
+                if let Some((character, run, rest)) = fence_run(line)
+                    && !(character == '`' && rest.contains('`'))
+                {
+                    fence = Some((character, run));
+                    current.clear();
+                }
+            }
+        }
+    }
+    if fence.is_some() {
+        last = Some(current);
+    }
+    last.map(|lines| lines.join("\n"))
+}
+
 /// A fence run at the start of `line`: its character, length (at least 3),
 /// and the text after it. Indentation of four or more spaces is code, not a
 /// fence.
@@ -94,6 +128,20 @@ fn fence_run(line: &str) -> Option<(char, usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_fenced_code_block_returns_inner_text_only() {
+        assert_eq!(last_fenced_code_block("no code"), None);
+        let md = "a\n\n```rust\nfn a() {}\n```\n\ntext\n\n````\n```\nnested\n```\n````\n";
+        assert_eq!(
+            last_fenced_code_block(md).as_deref(),
+            Some("```\nnested\n```")
+        );
+        assert_eq!(
+            last_fenced_code_block("```sh\nls\n  -la").as_deref(),
+            Some("ls\n  -la")
+        );
+    }
 
     #[test]
     fn stable_split_ends_before_the_last_completed_paragraph() {
