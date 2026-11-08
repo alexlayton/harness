@@ -79,8 +79,8 @@ use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::style::{
@@ -248,6 +248,11 @@ fn clipboard_sequence(text: &str, tmux: bool) -> String {
     }
 }
 
+/// OSC 133 prompt start asking for click reports (kitty `click_events`).
+const PROMPT_START: &str = "\u{1b}]133;A;click_events=1\u{07}";
+/// OSC 133 output start, closing the prompt after the input rows.
+const PROMPT_END: &str = "\u{1b}]133;C\u{07}";
+
 /// Opens every frame: begin synchronized update (DEC 2026) and disable
 /// autowrap (DECAWM). Terminals without 2026 ignore it.
 const FRAME_BEGIN: &str = "\u{1b}[?2026h\u{1b}[?7l";
@@ -314,6 +319,19 @@ struct RegionBuild {
     /// Index of the activity row inside `rows` when this frame paints one;
     /// `None` otherwise. Lets spinner ticks rewrite only that row.
     activity_row: Option<usize>,
+    /// Where the input text sits, for mapping mouse clicks back to the draft.
+    input: Option<InputSpan>,
+}
+
+/// Position of the visible input rows inside a frame's live region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputSpan {
+    /// Region row of the first visible input row.
+    first_row: usize,
+    /// Layout row (before clipping) shown on that region row.
+    layout_start: usize,
+    /// Visible text rows, excluding the completion hint row.
+    rows: usize,
 }
 
 /// The active-tool section of a frame: its rendered lines and total row
@@ -328,6 +346,11 @@ struct RunningRegion {
 /// protocol depend on a different terminal implementation.
 trait TerminalBackend: Send {
     fn size(&self) -> io::Result<(u16, u16)>;
+    /// Cursor `(column, row)`, when the terminal answers the query. Used once
+    /// at startup to locate the live region for click-to-position.
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        None
+    }
     fn enable_raw_mode(&mut self) -> io::Result<()>;
     fn disable_raw_mode(&mut self) -> io::Result<()>;
     fn enable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()>;
@@ -345,6 +368,10 @@ struct CrosstermBackend;
 impl TerminalBackend for CrosstermBackend {
     fn size(&self) -> io::Result<(u16, u16)> {
         terminal::size()
+    }
+
+    fn cursor_position(&self) -> Option<(u16, u16)> {
+        crossterm::cursor::position().ok()
     }
 
     fn enable_raw_mode(&mut self) -> io::Result<()> {
@@ -519,6 +546,15 @@ pub struct CrossTerm {
     /// that row instead of the whole region.
     activity_region_row: Option<usize>,
 
+    /// Screen row where the next incremental frame begins (the first row of
+    /// `region`), when known. `None` after a height-only resize, until the
+    /// next full repaint re-establishes it.
+    region_top: Option<usize>,
+    /// Cursor row when the terminal was set up, seeding `region_top`.
+    start_row: Option<usize>,
+    /// Input location in the painted region, for click handling.
+    input_span: Option<InputSpan>,
+
     terminal: Arc<Mutex<TerminalState>>,
 
     /// OSC 7501 program-status tracker; `None` when reporting is off.
@@ -604,6 +640,9 @@ impl CrossTerm {
             cursor_row: 0,
             cursor_col: 0,
             activity_region_row: None,
+            region_top: None,
+            start_row: None,
+            input_span: None,
             program_status: None,
             clipboard_osc: None,
             terminal: Arc::new(Mutex::new(TerminalState {
@@ -706,6 +745,11 @@ impl CrossTerm {
             return self.setup_failed(error);
         }
         lock_terminal(&self.terminal).modes.raw_mode = true;
+        self.start_row = lock_terminal(&self.terminal)
+            .backend
+            .cursor_position()
+            .map(|(_, row)| usize::from(row));
+        self.region_top = self.start_row;
 
         let bracketed_result = {
             let mut terminal = lock_terminal(&self.terminal);
@@ -951,6 +995,8 @@ impl CrossTerm {
         if width_changed || self.region.len() > height as usize {
             self.repaint_all()
         } else {
+            // The terminal may have moved the region on a height change.
+            self.region_top = None;
             self.paint()
         }
     }
@@ -962,6 +1008,16 @@ impl CrossTerm {
         cancel: &CancellationToken,
     ) -> Result<bool> {
         let Event::Key(key) = event else {
+            if let Event::Mouse(mouse) = event {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && let Some(cursor) = self.click_to_cursor(mouse.column, mouse.row)
+                {
+                    self.cursor = cursor;
+                    self.history_pos = self.history_pos.filter(|_| false);
+                    self.refresh_completion();
+                }
+                return Ok(false);
+            }
             if let Event::Paste(text) = event {
                 let text = render::sanitize_terminal_text(&normalize_paste_newlines(text));
                 insert_text(&mut self.input, &mut self.cursor, &text);
@@ -1069,6 +1125,26 @@ impl CrossTerm {
         self.refresh_completion();
         self.request_typed_backend(input_tx, false)?;
         Ok(false)
+    }
+
+    /// Map a left click to a byte offset in the draft. Terminals that honor
+    /// the OSC 133 `click_events` mark report clicks on the prompt as SGR
+    /// mouse events without capturing the mouse, so native selection and
+    /// scrollback keep working.
+    fn click_to_cursor(&self, column: u16, row: u16) -> Option<usize> {
+        let span = self.input_span?;
+        let top = self.region_top?;
+        let region_row = usize::from(row).checked_sub(top)?;
+        let visible = region_row.checked_sub(span.first_row)?;
+        if visible >= span.rows || self.input.is_empty() {
+            return None;
+        }
+        let gutter = render::horizontal_pad(self.width) as usize;
+        let col = usize::from(column).saturating_sub(gutter + INPUT_PREFIX_WIDTH);
+        let width = render::content_width(self.width)
+            .saturating_sub(INPUT_PREFIX_WIDTH)
+            .max(1);
+        input_offset_at(&self.input, width, span.layout_start + visible, col)
     }
 
     /// If the input no longer matches the recalled entry, the user edited it:
@@ -2387,15 +2463,12 @@ impl CrossTerm {
             |entry| matches!(entry, Entry::Assistant { markdown, .. } if !markdown.is_empty()),
         )?;
         let mut chunks = Vec::new();
-        loop {
-            let Entry::Assistant {
-                markdown,
-                continued,
-                ..
-            } = entries[index]
-            else {
-                break;
-            };
+        while let Entry::Assistant {
+            markdown,
+            continued,
+            ..
+        } = entries[index]
+        {
             if !markdown.is_empty() {
                 chunks.push(markdown.as_str());
                 if !continued {
@@ -2523,7 +2596,7 @@ impl CrossTerm {
         // Reserve at least one answer row even for a large
         // draft. The final height guard still covers degenerate terminals.
         let answer_reserve = usize::from(self.ask_answer.is_some());
-        let (input_rows, input_cursor_row) = clip_input(
+        let (input_rows, input_cursor_row, input_layout_start) = clip_input(
             input,
             self.height as usize,
             self.busy,
@@ -2580,6 +2653,11 @@ impl CrossTerm {
             render::push_blank(&mut rows, section_gap);
         }
         let mut cursor_row = rows.len() + input_cursor_row;
+        let mut input_span = Some(InputSpan {
+            first_row: rows.len(),
+            layout_start: input_layout_start,
+            rows: input_rows.len(),
+        });
         rows.extend(input_rows);
         // Every producer has a local budget, but keep one final guard here so
         // newly added metadata/tool rows cannot invalidate terminal geometry.
@@ -2596,6 +2674,18 @@ impl CrossTerm {
             rows.drain(..dropped);
             cursor_row = cursor_row.saturating_sub(dropped).min(rows.len() - 1);
             activity_row_index = activity_row_index.and_then(|row| row.checked_sub(dropped));
+            input_span = input_span.and_then(|span| match span.first_row.checked_sub(dropped) {
+                Some(first_row) => Some(InputSpan { first_row, ..span }),
+                None => {
+                    // Top input rows were cut off-screen; skip them.
+                    let cut = dropped - span.first_row;
+                    (span.rows > cut).then(|| InputSpan {
+                        first_row: 0,
+                        layout_start: span.layout_start + cut,
+                        rows: span.rows - cut,
+                    })
+                }
+            });
         }
 
         let gutter = render::horizontal_pad(self.width) as usize;
@@ -2609,6 +2699,7 @@ impl CrossTerm {
             cursor_row,
             cursor_col,
             activity_row: activity_row_index,
+            input: input_span,
         }
     }
 
@@ -2974,8 +3065,23 @@ impl CrossTerm {
             }
         }
 
+        // OSC 133 marks tell the terminal which rows are the prompt and ask it
+        // to report clicks there (`click_events`), which `click_to_cursor`
+        // maps back to the draft. Terminals without it ignore the marks.
+        let region_start = total - build.rows.len();
+        let prompt = build.input.map(|span| {
+            (
+                region_start + span.first_row,
+                region_start + span.first_row + span.rows,
+            )
+        });
         for (index, line) in rows.iter().enumerate() {
             let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
+            match prompt {
+                Some((first, _)) if index == first => buffer.push_str(PROMPT_START),
+                Some((_, end)) if index == end => buffer.push_str(PROMPT_END),
+                _ => {}
+            }
             write_row(&mut buffer, line, gutter, self.width as usize);
             if index + 1 < total {
                 buffer.push('\n');
@@ -3012,6 +3118,16 @@ impl CrossTerm {
             .write_all(buffer.as_bytes())
             .context("write frame")?;
         self.out.flush().context("flush frame")?;
+
+        // Where the region begins on screen: the frame prints from the old
+        // region top (or home after a clear), and growth past the bottom
+        // scrolls the terminal so the frame ends on the last row.
+        let top = if clear_all { Some(0) } else { self.region_top };
+        self.region_top = top.map(|top| {
+            let last = (top + total - 1).min(self.height.saturating_sub(1) as usize);
+            (last + 1).saturating_sub(build.rows.len())
+        });
+        self.input_span = build.input;
 
         // Bookkeeping: the printed `above` rows are now immutable scrollback.
         commit_to_transcript(&mut self.transcript, &mut self.pending);
@@ -3936,6 +4052,60 @@ fn byte_index_at_char(input: &str, column: usize) -> usize {
         .unwrap_or(input.len())
 }
 
+/// Byte offset in `input` for a click on layout row `row` (counted exactly as
+/// [`input_layout_with_row_width`] wraps) at display column `col` within the
+/// text area. A click past the end of a row lands at its end; rows beyond the
+/// text (such as the completion hint) yield `None`.
+fn input_offset_at(input: &str, width: usize, row: usize, col: usize) -> Option<usize> {
+    let width = width.max(1);
+    let mut rows_seen = 0usize;
+    let mut base = 0usize;
+    for logical in input.split('\n') {
+        // (byte offset, width) per cluster, greedily wrapped like the layout.
+        let mut visual: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
+        let mut used = 0usize;
+        let mut offset = base;
+        for cluster in logical.graphemes(true) {
+            let cluster_width = render::grapheme_width(cluster);
+            if cluster_width > width {
+                offset += cluster.len();
+                continue;
+            }
+            if cluster_width > 0 && used + cluster_width > width {
+                visual.push(Vec::new());
+                used = 0;
+            }
+            visual
+                .last_mut()
+                .expect("one row")
+                .push((offset, cluster_width));
+            used += cluster_width;
+            offset += cluster.len();
+        }
+        if row < rows_seen + visual.len() {
+            let cells = &visual[row - rows_seen];
+            let mut acc = 0usize;
+            for &(start, cell) in cells {
+                if col < acc + cell.max(1) {
+                    return Some(start);
+                }
+                acc += cell;
+            }
+            // Past the last cluster: end of this visual row.
+            return Some(cells.last().map_or(offset, |_| {
+                if row - rows_seen + 1 < visual.len() {
+                    visual[row - rows_seen + 1][0].0
+                } else {
+                    offset
+                }
+            }));
+        }
+        rows_seen += visual.len();
+        base += logical.len() + 1;
+    }
+    None
+}
+
 /// Clip the input rows to a window containing the cursor when the draft is
 /// taller than the screen can show. Returns the visible rows and the cursor
 /// row within them.
@@ -3944,12 +4114,12 @@ fn clip_input(
     height: usize,
     busy: bool,
     tool_rows: usize,
-) -> (Vec<Line<'static>>, usize) {
+) -> (Vec<Line<'static>>, usize, usize) {
     let cap = height
         .saturating_sub(usize::from(busy) + tool_rows + 2)
         .max(1);
     if input.rows.len() <= cap {
-        return (input.rows.clone(), input.cursor_row);
+        return (input.rows.clone(), input.cursor_row, 0);
     }
     // Window pinned so the cursor row stays visible, biased toward showing
     // as much above it as fits.
@@ -3960,6 +4130,7 @@ fn clip_input(
     (
         input.rows[start..start + cap].to_vec(),
         input.cursor_row - start,
+        start,
     )
 }
 
@@ -5942,6 +6113,65 @@ mod tests {
         assert_eq!(osc, clipboard_sequence("let a = 1;", false));
         assert!(osc.contains("bGV0IGEgPSAxOw=="));
         assert!(clipboard_sequence("x", true).starts_with("\u{1b}Ptmux;"));
+    }
+
+    #[test]
+    fn input_offset_at_inverts_the_layout_cursor() {
+        let theme = Theme::default();
+        let input = "héllo wörld 你好 wide\nsecond line that wraps around\n\nend";
+        for width in [5usize, 8, 13, 40] {
+            for cursor in input
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain([input.len()])
+            {
+                let layout = input_layout(input, cursor, width, theme, "", "", "");
+                // A cursor parked at a full row's end sits on a fresh row
+                // that has no text to click, so only check mid-row cursors.
+                let at_end = cursor == input.len();
+                if at_end {
+                    continue;
+                }
+                let got = input_offset_at(input, width, layout.cursor_row, layout.cursor_col);
+                assert_eq!(got, Some(cursor), "width {width} cursor {cursor}");
+            }
+        }
+        assert_eq!(input_offset_at("ab", 10, 0, 99), Some(2));
+        assert_eq!(input_offset_at("ab", 10, 1, 0), None);
+    }
+
+    #[test]
+    fn clicking_the_prompt_moves_the_cursor() {
+        let mut ui = ui(80, 24);
+        ui.input = "hello world".into();
+        ui.cursor = ui.input.len();
+        ui.region_top = Some(10);
+        let input = ui.input_layout();
+        let build = ui.build_region(&input);
+        ui.input_span = build.input;
+        let first = 10 + build.input.expect("span").first_row;
+        // Gutter 2 + prefix 2, then column 6 of the text.
+        assert_eq!(ui.click_to_cursor(4 + 6, first as u16), Some(6));
+        assert_eq!(ui.click_to_cursor(4 + 6, (first + 3) as u16), None);
+        ui.region_top = None;
+        assert_eq!(ui.click_to_cursor(10, first as u16), None);
+    }
+
+    #[test]
+    fn region_top_follows_scrolling_growth() {
+        let mut ui = ui(80, 10);
+        ui.region_top = Some(9);
+        ui.add_notice("scrolls the terminal");
+        let input = ui.input_layout();
+        let build = ui.build_region(&input);
+        let rows = build.rows.len();
+        ui.write_frame(build, false).expect("frame");
+        assert_eq!(ui.region_top, Some(10 - rows));
+        let input = ui.input_layout();
+        let build = ui.build_region(&input);
+        ui.write_frame(build, true).expect("frame");
+        // Short history: notice, gap, then the one-row region.
+        assert_eq!(ui.region_top, Some(2));
     }
 
     #[test]
