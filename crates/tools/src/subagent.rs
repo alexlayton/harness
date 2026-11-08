@@ -199,6 +199,11 @@ impl Tool for SubagentTool {
     /// mode classifies as Exclusive so an invalid call can never join a
     /// concurrent batch; `execute` turns it into an errored result.
     fn concurrency(&self, args: &Value) -> Concurrency {
+        // Anything `execute` would reject (unknown keys, non-object args)
+        // must not join a concurrent batch.
+        if parse_args(args).is_err() {
+            return Concurrency::Exclusive;
+        }
         match args.get("mode") {
             None => Concurrency::Parallel,
             Some(Value::String(raw)) => match SubagentMode::parse(Some(raw)) {
@@ -335,6 +340,10 @@ mod tests {
         );
         assert_eq!(
             tool().concurrency(&json!({"mode": 3})),
+            Concurrency::Exclusive
+        );
+        assert_eq!(
+            tool().concurrency(&json!({"prompt": "p", "bogus": 1})),
             Concurrency::Exclusive
         );
     }

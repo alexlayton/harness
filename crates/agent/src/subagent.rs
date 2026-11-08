@@ -77,10 +77,36 @@ fn child_context_budget(context_window: u64) -> u64 {
     cap.saturating_sub(CHILD_FINAL_REPORT_RESERVE_TOKENS.min(cap / 4))
 }
 
+/// Bytes reserved for the truncation marker so a cut result stays within
+/// [`CHILD_TOOL_EVIDENCE_MAX_BYTES`] and is not cut (and re-marked) again.
+const TRUNCATION_MARKER_RESERVE_BYTES: usize = 200;
+
+/// Cut `text` to at most `max_bytes` including an explicit marker telling the
+/// child how much was dropped, so it can re-read a narrower range instead of
+/// silently reasoning over partial evidence. Text already within the bound
+/// yields `None`, which makes the cut idempotent across turns.
+fn truncate_with_marker(text: &str, max_bytes: usize) -> Option<String> {
+    if text.len() <= max_bytes {
+        return None;
+    }
+    let kept = llm::truncate_utf8_prefix(
+        text,
+        max_bytes.saturating_sub(TRUNCATION_MARKER_RESERVE_BYTES),
+    );
+    Some(format!(
+        "{kept}\n[truncated {} of {} bytes to fit the subagent context budget; \
+         re-read a narrower range if you need the rest]",
+        text.len() - kept.len(),
+        text.len()
+    ))
+}
+
 /// Bound a child's live provider history without rewriting its durable
-/// transcript. Tool evidence is truncated first; then complete old exchanges
-/// are removed while preserving the original user request and the newest
-/// evidence for synthesis.
+/// transcript. Nothing changes while the history fits: full tool output is
+/// the point of delegation. Over budget, the bound degrades in stages:
+/// oversized tool evidence is cut oldest first, then complete old exchanges
+/// are removed, and finally the original prompt is trimmed. The original user
+/// request and the newest exchange are preserved for synthesis.
 fn bound_child_history(
     history: &mut Vec<Message>,
     system: &str,
@@ -90,20 +116,31 @@ fn bound_child_history(
     let definitions = registry.definitions();
     let estimate =
         |history: &[Message]| estimate_provider_context_tokens(Some(system), &definitions, history);
-    for message in history.iter_mut() {
-        for content in &mut message.content {
+    if estimate(history) <= max_tokens {
+        return;
+    }
+
+    // Stage 1: cut oversized tool evidence, oldest first, stopping as soon
+    // as the history fits. The newest exchange is therefore cut last.
+    for index in 0..history.len() {
+        let mut changed = false;
+        for content in &mut history[index].content {
             if let Content::ToolResult { content, .. } = content
-                && content.len() > CHILD_TOOL_EVIDENCE_MAX_BYTES
+                && let Some(cut) = truncate_with_marker(content, CHILD_TOOL_EVIDENCE_MAX_BYTES)
             {
-                *content = truncate_utf8(content, CHILD_TOOL_EVIDENCE_MAX_BYTES);
+                *content = cut;
+                changed = true;
             }
+        }
+        if changed && estimate(history) <= max_tokens {
+            return;
         }
     }
 
-    // Drop whole units: an assistant message plus its tool results and any
-    // interstitial request notes, up to the next assistant message. That keeps
-    // `history[1]` an assistant (never two adjacent user messages) and never
-    // removes the newest assistant exchange, which synthesis depends on.
+    // Stage 2: drop whole units: an assistant message plus its tool results
+    // and any interstitial request notes, up to the next assistant message.
+    // That keeps `history[1]` an assistant (never two adjacent user messages)
+    // and never removes the newest assistant exchange.
     while estimate(history) > max_tokens {
         let Some(newest) = history.iter().rposition(|m| m.role == Role::Assistant) else {
             break;
@@ -118,15 +155,16 @@ fn bound_child_history(
         history.drain(1..end);
     }
 
-    // A very large initial prompt can exceed the bound by itself. Preserve its
-    // role and trim only its text as a final fallback rather than producing an
-    // empty provider request.
+    // Stage 3: a very large initial prompt can exceed the bound by itself.
+    // Preserve its role and trim only its text rather than send nothing.
     if estimate(history) > max_tokens
         && let Some(message) = history.first_mut()
     {
         for content in &mut message.content {
-            if let Content::Text(text) = content {
-                *text = truncate_utf8(text, CHILD_TOOL_EVIDENCE_MAX_BYTES);
+            if let Content::Text(text) = content
+                && let Some(cut) = truncate_with_marker(text, CHILD_TOOL_EVIDENCE_MAX_BYTES)
+            {
+                *text = cut;
             }
         }
     }
@@ -492,6 +530,7 @@ impl SubagentRunnerImpl {
                 reasoning,
                 &secret_masker,
                 context_window,
+                &description,
                 &mut history,
                 &mut session,
                 cancel,
@@ -552,11 +591,12 @@ impl SubagentRunnerImpl {
         reasoning: ReasoningPolicy,
         secret_masker: &Arc<SecretMasker>,
         context_window: u64,
+        description: &str,
         history: &mut Vec<Message>,
         session: &mut Option<session::Session>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
-        let run_description = last_user_line(history);
+        let run_description = description.to_owned();
         let model_for_log = model.to_owned();
         let mut turns = 0usize;
         loop {
@@ -707,7 +747,17 @@ impl SubagentRunnerImpl {
                 // No retry ladder here: the parent turn already has recovery
                 // machinery, and a failed subagent surfaces as an errored
                 // tool result the parent can choose to re-delegate.
-                return Err(format!("provider stream interrupted: {error}"));
+                let partial = text.trim();
+                if partial.is_empty() {
+                    return Err(format!("provider stream interrupted: {error}"));
+                }
+                // Hand back what arrived so the parent can use or re-delegate
+                // the partial findings instead of losing them.
+                return Err(format!(
+                    "provider stream interrupted: {error}. Partial output before the \
+                     interruption: {}",
+                    truncate_utf8(partial, REPORT_MAX_BYTES)
+                ));
             }
 
             if tool_calls.is_empty() {
@@ -716,10 +766,17 @@ impl SubagentRunnerImpl {
                     // continue within budget. An empty reply adds no
                     // assistant message, so fold the note into a trailing
                     // user message instead of creating two adjacent ones.
-                    push_request_note(
-                        history,
-                        "[system note: your previous response produced no output; continue \
-                         and complete the task.]",
+                    const NUDGE: &str = "[system note: your previous response produced no output; \
+                                         continue and complete the task.]";
+                    push_request_note(history, NUDGE);
+                    // Record what the model actually saw, so the durable
+                    // transcript explains the retried turn.
+                    Self::persist(
+                        &self.store,
+                        session,
+                        session::SessionEvent::UserMessage {
+                            message: session::StoredMessage::from_llm(&Message::user(NUDGE)),
+                        },
                     );
                     continue;
                 }
@@ -883,29 +940,6 @@ impl SubagentRunner for SubagentRunnerImpl {
         )
         .await
     }
-}
-
-/// Last user message line, used as best-effort context in retry logs (never
-/// the full prompt).
-fn last_user_line(history: &[Message]) -> String {
-    history
-        .iter()
-        .rev()
-        .find_map(|message| {
-            (message.role == Role::User).then(|| {
-                message
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::Text(text) => Some(text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-        })
-        .map(|text| truncate_utf8(&text, 80).to_owned())
-        .unwrap_or_default()
 }
 
 /// Add a request-local instruction while preserving provider role
@@ -1169,6 +1203,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_stream_returns_partial_output() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![
+            Ok(StreamEvent::TextDelta("found 2 issues so far".into())),
+            Err("connection reset".into()),
+        ]]));
+        let error = runner_with(provider)
+            .run(
+                "audit",
+                "scan the crate",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("provider stream interrupted"), "{error}");
+        assert!(error.contains("connection reset"), "{error}");
+        assert!(
+            error.contains("Partial output before the interruption: found 2 issues so far"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_without_text_has_no_partial_suffix() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![Err(
+            "connection reset".into()
+        )]]));
+        let error = runner_with(provider)
+            .run(
+                "audit",
+                "scan the crate",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("provider stream interrupted"), "{error}");
+        assert!(!error.contains("Partial output"), "{error}");
+    }
+
+    #[tokio::test]
     async fn text_only_reply_is_the_report() {
         let provider = Arc::new(ScriptProvider::new(vec![vec![
             Ok(StreamEvent::TextDelta("found 3 issues".into())),
@@ -1280,6 +1355,45 @@ mod tests {
         ));
         assert_eq!(history[0].content.len(), 1);
         assert!(history.len() < 13);
+    }
+
+    #[test]
+    fn history_within_budget_keeps_full_tool_output() {
+        let registry = ToolRegistry::empty();
+        let big = "x".repeat(20_000);
+        let mut history = vec![
+            Message::user("task"),
+            assistant_call(0),
+            Message::tool_result("call-0", big.clone(), false),
+        ];
+        bound_child_history(&mut history, "system", &registry, 100_000);
+        assert!(matches!(
+            history[2].content.as_slice(),
+            [Content::ToolResult { content, .. }] if *content == big
+        ));
+    }
+
+    #[test]
+    fn over_budget_cuts_oldest_evidence_first_with_a_marker() {
+        let registry = ToolRegistry::empty();
+        let mut history = vec![Message::user("task")];
+        for index in 0..2 {
+            history.push(assistant_call(index));
+            history.push(Message::tool_result(
+                format!("call-{index}"),
+                "x".repeat(20_000),
+                false,
+            ));
+        }
+        // Fits only once the oldest result is cut.
+        bound_child_history(&mut history, "system", &registry, 7_000);
+        let text = |i: usize| match history[i].content.as_slice() {
+            [Content::ToolResult { content, .. }] => content.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert!(text(2).contains("[truncated"), "{}", text(2));
+        assert!(text(2).len() <= CHILD_TOOL_EVIDENCE_MAX_BYTES);
+        assert_eq!(text(4).len(), 20_000);
     }
 
     fn assistant_call(index: usize) -> Message {

@@ -527,8 +527,11 @@ struct MaskingProvider {
     masker: Arc<SecretMasker>,
 }
 
-/// Attach exact-value masking to a provider.
+/// Attach exact-value masking to a provider. An existing masking layer is
+/// replaced rather than wrapped, so repeated policy updates neither stack
+/// decorators nor keep enforcing a masker that has since been superseded.
 pub fn mask_provider(inner: Arc<dyn Provider>, masker: Arc<SecretMasker>) -> Arc<dyn Provider> {
+    let inner = inner.wrapped_provider().unwrap_or(inner);
     if masker.is_empty() {
         inner
     } else {
@@ -540,6 +543,10 @@ pub fn mask_provider(inner: Arc<dyn Provider>, masker: Arc<SecretMasker>) -> Arc
 impl Provider for MaskingProvider {
     fn name(&self) -> &str {
         self.inner.name()
+    }
+
+    fn wrapped_provider(&self) -> Option<Arc<dyn Provider>> {
+        Some(self.inner.clone())
     }
 
     async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
@@ -756,6 +763,34 @@ mod tests {
 
         let masked = mask_provider(Arc::new(Hinted), Arc::new(masker()));
         assert_eq!(masked.context_window_hint(), Some(8192));
+    }
+
+    #[test]
+    fn remasking_replaces_the_existing_layer_instead_of_stacking() {
+        struct Plain;
+
+        #[async_trait::async_trait]
+        impl Provider for Plain {
+            fn name(&self) -> &str {
+                "plain"
+            }
+            async fn stream(&self, _: &CompletionRequest) -> Result<EventStream, LlmError> {
+                unreachable!("not streamed")
+            }
+            async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
+                Ok(Vec::new())
+            }
+        }
+
+        let plain: Arc<dyn Provider> = Arc::new(Plain);
+        let once = mask_provider(plain.clone(), Arc::new(masker()));
+        let twice = mask_provider(once, Arc::new(masker()));
+        // One decorator deep: unwrapping once reaches the bare provider.
+        let inner = twice.wrapped_provider().expect("masking layer");
+        assert!(inner.wrapped_provider().is_none());
+        // A now-empty policy removes masking entirely.
+        let cleared = mask_provider(twice, Arc::new(SecretMasker::default()));
+        assert!(cleared.wrapped_provider().is_none());
     }
 
     #[test]
