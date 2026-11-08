@@ -48,6 +48,12 @@ pub trait Provider: Send + Sync {
     /// The provider this one decorates, when it is a pure wrapper (for
     /// example secret masking). Lets a host replace a decorator instead of
     /// stacking a second one on top of it.
+    ///
+    /// Callers such as `agent::secrets::mask_provider` discard the layer that
+    /// returns `Some` and re-wrap its inner provider, so only decorators that
+    /// are safe to drop and rebuild should implement this. Behavioral
+    /// wrappers (retries, logging, rate limiting) must keep the default
+    /// `None`, or re-masking would silently remove them.
     fn wrapped_provider(&self) -> Option<Arc<dyn Provider>> {
         None
     }

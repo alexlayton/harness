@@ -1203,6 +1203,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_stream_returns_partial_output() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![
+            Ok(StreamEvent::TextDelta("found 2 issues so far".into())),
+            Err("connection reset".into()),
+        ]]));
+        let error = runner_with(provider)
+            .run(
+                "audit",
+                "scan the crate",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("provider stream interrupted"), "{error}");
+        assert!(error.contains("connection reset"), "{error}");
+        assert!(
+            error.contains("Partial output before the interruption: found 2 issues so far"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_without_text_has_no_partial_suffix() {
+        let provider = Arc::new(ScriptProvider::new(vec![vec![Err(
+            "connection reset".into()
+        )]]));
+        let error = runner_with(provider)
+            .run(
+                "audit",
+                "scan the crate",
+                SubagentMode::ReadOnly,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("provider stream interrupted"), "{error}");
+        assert!(!error.contains("Partial output"), "{error}");
+    }
+
+    #[tokio::test]
     async fn text_only_reply_is_the_report() {
         let provider = Arc::new(ScriptProvider::new(vec![vec![
             Ok(StreamEvent::TextDelta("found 3 issues".into())),
