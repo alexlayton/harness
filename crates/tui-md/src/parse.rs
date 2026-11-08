@@ -4,7 +4,8 @@ use std::iter::Peekable;
 use std::ops::Range;
 
 use pulldown_cmark::{
-    Alignment as CmAlignment, BlockQuoteKind, CodeBlockKind, Event, Options, Parser, Tag, TagEnd,
+    Alignment as CmAlignment, BlockQuoteKind, BrokenLink, CodeBlockKind, Event, Options, Parser,
+    Tag, TagEnd,
 };
 
 use crate::doc::{AlertKind, Alignment, Block, BlockKind, Cell, Document, Inline, ListItem};
@@ -19,15 +20,36 @@ pub fn parse(source: &str) -> Document {
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_MATH);
     options.insert(Options::ENABLE_GFM);
+    // Unresolved `[text][ref]` / `[ref]` / `[^note]` stay literal text, but a
+    // definition arriving later would turn them into links, so remember
+    // where the first one is (see `Document::stable_len`).
+    // The parser does not report undefined footnote references, so treat
+    // any `[^` as potentially unresolved (conservative, and rare).
+    let first_unresolved = std::cell::Cell::new(source.find("[^"));
+    let mut note = |link: BrokenLink<'_>| {
+        let start = link.span.start;
+        first_unresolved.set(Some(first_unresolved.get().map_or(start, |s| s.min(start))));
+        None
+    };
     let mut builder = Builder {
-        events: Parser::new_ext(source, options)
+        events: Parser::new_with_broken_link_callback(source, options, Some(&mut note))
             .into_offset_iter()
             .peekable(),
         items: Vec::new(),
         containers: 0,
     };
+    let blocks = builder.blocks();
+    drop(builder);
+    // The block holding the first unresolved reference can still change.
+    let unstable_from = first_unresolved.get().and_then(|offset| {
+        blocks
+            .iter()
+            .rfind(|block| block.range.start <= offset)
+            .map(|block| block.range.start)
+    });
     Document {
-        blocks: builder.blocks(),
+        blocks,
+        unstable_from,
     }
 }
 
@@ -483,5 +505,15 @@ mod tests {
         let doc = parse(source);
         assert_eq!(&source[doc.stable_len()..], "thr");
         assert_eq!(parse("").stable_len(), 0);
+    }
+
+    #[test]
+    fn unresolved_references_hold_back_their_block() {
+        let source = "[docs][ref]\n\nAnother paragraph\n\nlast";
+        assert_eq!(parse(source).stable_len(), 0);
+        let source = "ok\n\nsee [^1]\n\nlast";
+        assert_eq!(&source[parse(source).stable_len()..], "see [^1]\n\nlast");
+        let resolved = "[docs][ref]\n\nmore\n\n[ref]: https://x.y\n\nlast";
+        assert!(parse(resolved).stable_len() > 0);
     }
 }

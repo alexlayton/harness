@@ -11,6 +11,9 @@ use std::ops::Range;
 pub struct Document {
     /// Top-level blocks in source order.
     pub blocks: Vec<Block>,
+    /// Start of the first block holding an unresolved reference, which a
+    /// later definition could still turn into a link.
+    pub(crate) unstable_from: Option<usize>,
 }
 
 impl Document {
@@ -21,8 +24,13 @@ impl Document {
     /// setext heading, a list or table may grow). A streaming caller can
     /// commit the rows of all blocks before this offset and re-render only
     /// the tail.
+    ///
+    /// Blocks containing an unresolved reference (`[text][ref]`, `[ref]`,
+    /// `[^note]`) are also withheld, because a definition arriving later in
+    /// the stream turns them into links or footnotes.
     pub fn stable_len(&self) -> usize {
-        self.blocks.last().map_or(0, |block| block.range.start)
+        let last = self.blocks.last().map_or(0, |block| block.range.start);
+        self.unstable_from.map_or(last, |from| from.min(last))
     }
 }
 
