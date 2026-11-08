@@ -8,8 +8,7 @@ use std::fmt::Write as _;
 
 use crossterm::Command;
 use crossterm::style::{
-    Attribute, ContentStyle, SetAttribute, SetBackgroundColor, SetForegroundColor,
-    SetUnderlineColor,
+    ContentStyle, SetAttributes, SetBackgroundColor, SetForegroundColor, SetUnderlineColor,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -179,18 +178,6 @@ pub fn str_width(text: &str) -> usize {
     text.graphemes(true).map(UnicodeWidthStr::width).sum()
 }
 
-const ATTRIBUTES: &[Attribute] = &[
-    Attribute::Bold,
-    Attribute::Dim,
-    Attribute::Italic,
-    Attribute::Underlined,
-    Attribute::SlowBlink,
-    Attribute::RapidBlink,
-    Attribute::Reverse,
-    Attribute::Hidden,
-    Attribute::CrossedOut,
-];
-
 fn style_prefix(style: &ContentStyle) -> String {
     let mut out = String::new();
     if let Some(color) = style.foreground_color {
@@ -202,17 +189,27 @@ fn style_prefix(style: &ContentStyle) -> String {
     if let Some(color) = style.underline_color {
         let _ = SetUnderlineColor(color).write_ansi(&mut out);
     }
-    for attribute in ATTRIBUTES {
-        if style.attributes.has(*attribute) {
-            let _ = write!(out, "{}", SetAttribute(*attribute));
-        }
-    }
+    // Every attribute set on the style, not a hand-picked subset.
+    let _ = SetAttributes(style.attributes).write_ansi(&mut out);
     out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ansi_covers_every_attribute_and_underline_colour() {
+        use crossterm::style::{Attribute, Color};
+        let mut style = ContentStyle::default();
+        style.attributes.set(Attribute::OverLined);
+        style.attributes.set(Attribute::DoubleUnderlined);
+        style.underline_color = Some(Color::Red);
+        let ansi = Row::from(Run::new("x", style)).to_ansi();
+        assert!(ansi.contains("\u{1b}[53m"), "{ansi:?}");
+        assert!(ansi.contains("\u{1b}[4:2m"), "{ansi:?}");
+        assert!(ansi.contains("58;"), "{ansi:?}");
+    }
     use crossterm::style::{Color, Stylize};
 
     #[test]
