@@ -60,6 +60,9 @@ pub(crate) fn theme_names() -> Vec<&'static str> {
 /// Highlight `code`, returning one run list per source line (no trailing
 /// newlines). `None` if the language or theme is unknown, so the caller can
 /// fall back to plain rendering. Text is returned unsanitized.
+///
+/// Nothing is cached: a streaming caller re-highlights the growing block on
+/// every render, which is bounded by `MAX_LINES` and fine in practice.
 pub(crate) fn highlight(lang: &str, code: &str, theme: &SyntaxTheme) -> Option<Vec<Vec<Run>>> {
     if code.len() > MAX_LINES * 80
         || code.lines().take(MAX_LINES + 1).count() > MAX_LINES
@@ -90,6 +93,10 @@ pub(crate) fn highlight(lang: &str, code: &str, theme: &SyntaxTheme) -> Option<V
             }
         }
         lines.push(runs);
+    }
+    if lines.is_empty() {
+        // An empty block still occupies one row, like the plain path.
+        lines.push(Vec::new());
     }
     Some(lines)
 }
