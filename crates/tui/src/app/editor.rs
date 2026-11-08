@@ -297,37 +297,60 @@ pub(super) fn byte_index_at_char(input: &str, column: usize) -> usize {
 }
 
 /// Byte offset in `input` for a click on layout row `row` (counted exactly as
-/// [`input_layout_with_row_width`] wraps) at display column `col` within the
-/// text area. A click past the end of a row lands at its end; rows beyond the
-/// text (such as the completion hint) yield `None`.
-pub(super) fn input_offset_at(input: &str, width: usize, row: usize, col: usize) -> Option<usize> {
+/// [`input_layout_with_row_width`] wraps for the same `cursor`) at display
+/// column `col` within the text area. A click past the end of a row lands at
+/// its end; rows beyond the text (such as the completion hint) yield `None`.
+///
+/// `cursor` matters because the layout adds an empty row for a cursor parked
+/// at the end of a logical line that exactly fills the wrap width; hit testing
+/// must count that row too or every row below it would be off by one.
+pub(super) fn input_offset_at(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    row: usize,
+    col: usize,
+) -> Option<usize> {
     let width = width.max(1);
+    let cursor = cursor.min(input.len());
     let mut rows_seen = 0usize;
     let mut base = 0usize;
     for logical in input.split('\n') {
-        // (byte offset, width) per cluster, greedily wrapped like the layout.
-        let mut visual: Vec<Vec<(usize, usize)>> = vec![Vec::new()];
+        let line_end = base + logical.len();
+        // Per visual row: (byte offset, width) per cluster plus the byte
+        // offset just past the row, greedily wrapped like the layout.
+        let mut visual: Vec<(Vec<(usize, usize)>, usize)> = Vec::new();
+        let mut current: Vec<(usize, usize)> = Vec::new();
         let mut used = 0usize;
         let mut offset = base;
         for cluster in logical.graphemes(true) {
             let cluster_width = render::grapheme_width(cluster);
             if cluster_width > width {
+                // The layout drops oversized clusters and breaks the row.
+                if !current.is_empty() {
+                    visual.push((std::mem::take(&mut current), offset));
+                    used = 0;
+                }
                 offset += cluster.len();
                 continue;
             }
             if cluster_width > 0 && used + cluster_width > width {
-                visual.push(Vec::new());
+                visual.push((std::mem::take(&mut current), offset));
                 used = 0;
             }
-            visual
-                .last_mut()
-                .expect("one row")
-                .push((offset, cluster_width));
+            current.push((offset, cluster_width));
             used += cluster_width;
             offset += cluster.len();
         }
+        let last_full = used >= width && !current.is_empty();
+        visual.push((current, line_end));
+        if last_full && cursor == line_end {
+            // Cursor-only row, mirroring the layout.
+            visual.push((Vec::new(), line_end));
+        }
         if row < rows_seen + visual.len() {
-            let cells = &visual[row - rows_seen];
+            let index = row - rows_seen;
+            let (cells, row_end) = &visual[index];
             let mut acc = 0usize;
             for &(start, cell) in cells {
                 if col < acc + cell.max(1) {
@@ -335,17 +358,16 @@ pub(super) fn input_offset_at(input: &str, width: usize, row: usize, col: usize)
                 }
                 acc += cell;
             }
-            // Past the last cluster: end of this visual row.
-            return Some(cells.last().map_or(offset, |_| {
-                if row - rows_seen + 1 < visual.len() {
-                    visual[row - rows_seen + 1][0].0
-                } else {
-                    offset
-                }
-            }));
+            // Past the last cluster: end of this visual row, which for a
+            // wrapped row is where the next row's text begins.
+            let next_start = visual
+                .get(index + 1)
+                .and_then(|(next, _)| next.first())
+                .map(|&(start, _)| start);
+            return Some(next_start.unwrap_or(*row_end));
         }
         rows_seen += visual.len();
-        base += logical.len() + 1;
+        base = line_end + 1;
     }
     None
 }

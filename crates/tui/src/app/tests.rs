@@ -1680,12 +1680,53 @@ fn input_offset_at_inverts_the_layout_cursor() {
             if at_end {
                 continue;
             }
-            let got = input_offset_at(input, width, layout.cursor_row, layout.cursor_col);
+            let got = input_offset_at(input, cursor, width, layout.cursor_row, layout.cursor_col);
             assert_eq!(got, Some(cursor), "width {width} cursor {cursor}");
         }
     }
-    assert_eq!(input_offset_at("ab", 10, 0, 99), Some(2));
-    assert_eq!(input_offset_at("ab", 10, 1, 0), None);
+    assert_eq!(input_offset_at("ab", 0, 10, 0, 99), Some(2));
+    assert_eq!(input_offset_at("ab", 0, 10, 1, 0), None);
+}
+
+#[test]
+fn input_offset_at_counts_the_cursor_only_row() {
+    // `abcd` fills width 4, so a cursor at its end gets an extra empty row
+    // and `x` renders on row 2.
+    let input = "abcd\nx";
+    let layout = input_layout(input, 4, 4, Theme::default(), "", "", "");
+    assert_eq!(layout.cursor_row, 1);
+    assert_eq!(input_offset_at(input, 4, 4, 1, 0), Some(4));
+    assert_eq!(input_offset_at(input, 4, 4, 2, 0), Some(5));
+    assert_eq!(input_offset_at(input, 4, 4, 3, 0), None);
+    // With the cursor elsewhere there is no extra row.
+    assert_eq!(input_offset_at(input, 6, 4, 1, 0), Some(5));
+}
+
+#[test]
+fn copy_rejoins_reply_chunks_across_interleaved_notices() {
+    let mut ui = ui(80, 24);
+    ui.pending.push(Entry::Assistant {
+        markdown: "earlier".into(),
+        reasoning: String::new(),
+        continued: false,
+    });
+    ui.pending.push(Entry::Assistant {
+        markdown: "```rs\nlet a = 1;\n```\n\n".into(),
+        reasoning: String::new(),
+        continued: false,
+    });
+    ui.pending.push(Entry::Notice {
+        text: "help".into(),
+    });
+    ui.pending.push(Entry::Assistant {
+        markdown: "tail".into(),
+        reasoning: String::new(),
+        continued: true,
+    });
+    assert_eq!(
+        ui.last_reply_markdown().as_deref(),
+        Some("```rs\nlet a = 1;\n```\n\ntail")
+    );
 }
 
 #[test]

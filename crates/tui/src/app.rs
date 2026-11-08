@@ -1017,7 +1017,13 @@ impl CrossTerm {
         let width = render::content_width(self.width)
             .saturating_sub(INPUT_PREFIX_WIDTH)
             .max(1);
-        input_offset_at(&self.input, width, span.layout_start + visible, col)
+        input_offset_at(
+            &self.input,
+            self.cursor,
+            width,
+            span.layout_start + visible,
+            col,
+        )
     }
 
     /// If the input no longer matches the recalled entry, the user edited it:
@@ -1789,17 +1795,25 @@ impl CrossTerm {
             |entry| matches!(entry, Entry::Assistant { markdown, .. } if !markdown.is_empty()),
         )?;
         let mut chunks = Vec::new();
-        while let Entry::Assistant {
-            markdown,
-            continued,
-            ..
-        } = entries[index]
-        {
-            if !markdown.is_empty() {
-                chunks.push(markdown.as_str());
-                if !continued {
-                    break;
+        loop {
+            match entries[index] {
+                Entry::Assistant {
+                    markdown,
+                    continued,
+                    ..
+                } => {
+                    if !markdown.is_empty() {
+                        chunks.push(markdown.as_str());
+                        if !continued {
+                            break;
+                        }
+                    }
                 }
+                // Local commands (such as `/help`) run mid-stream can commit
+                // notices between two chunks of the same reply; step over
+                // them so the copy still covers the whole message.
+                Entry::Notice { .. } | Entry::Error { .. } => {}
+                _ => break,
             }
             if index == 0 {
                 break;
