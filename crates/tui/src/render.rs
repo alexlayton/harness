@@ -228,24 +228,22 @@ pub(crate) fn welcome_lines(
     // The banner opens scrollback immediately below whatever the shell left
     // on screen; give the title the design system's breathing room.
     push_blank(&mut lines, SECTION_GAP);
-    let title = title_order.fitting_title(width);
-    let rendered_title_height = title.map_or(1, |title| title.len());
-    let available_padding = WELCOME_TITLE_HEIGHT.saturating_sub(rendered_title_height);
-    let padding_above = available_padding / 2;
-    let padding_below = available_padding - padding_above;
+    // When no wordmark fits, skip the title block entirely: a lone plain-text
+    // name floating in reserved padding reads as a rendering glitch.
+    if let Some(title) = title_order.fitting_title(width) {
+        let available_padding = WELCOME_TITLE_HEIGHT.saturating_sub(title.len());
+        let padding_above = available_padding / 2;
+        let padding_below = available_padding - padding_above;
 
-    // Reserve the tallest wordmark's height so the footer and metadata remain
-    // stable, centering shorter wordmarks within the available rows.
-    push_blank(&mut lines, padding_above);
-    if let Some(title) = title {
+        // Reserve the tallest wordmark's height so the footer and metadata
+        // remain stable, centering shorter wordmarks within the available rows.
+        push_blank(&mut lines, padding_above);
         lines.extend(title.iter().map(|line| line_with_style(*line, title_style)));
-    } else {
-        lines.push(line_with_style("Harness", title_style));
+        push_blank(&mut lines, padding_below);
+        push_blank(&mut lines, BLOCK_GAP);
     }
-    push_blank(&mut lines, padding_below);
     // Keep the discoverability footer close to the wordmark, then end the
     // banner so workspace metadata and the transcript continue below.
-    push_blank(&mut lines, BLOCK_GAP);
     let footer = format!(
         "v{}  /help for commands · Ctrl+O shows or hides tool details",
         env!("CARGO_PKG_VERSION")
@@ -1364,7 +1362,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_title_uses_plain_text_when_no_font_fits() {
+    fn welcome_title_is_skipped_when_no_font_fits() {
         let minimum_width = WELCOME_TITLES
             .iter()
             .map(|title| title_width(title))
@@ -1373,11 +1371,15 @@ mod tests {
         let order = WelcomeTitleOrder((0..WELCOME_TITLES.len()).collect());
         let lines = welcome_lines(minimum_width - 1, Theme::default(), &order);
 
-        let padding_above = (WELCOME_TITLE_HEIGHT - 1) / 2;
-        assert_eq!(
-            span_contents(&lines[SECTION_GAP + padding_above]),
-            "Harness"
+        // Only the leading gap and the footer remain.
+        assert_eq!(lines.len(), SECTION_GAP + 1);
+        assert!(
+            lines[..SECTION_GAP]
+                .iter()
+                .all(|line| span_contents(line).is_empty())
         );
+        assert!(span_contents(&lines[SECTION_GAP]).starts_with('v'));
+        assert!(lines.iter().all(|line| span_contents(line) != "Harness"));
     }
 
     #[test]
@@ -1411,14 +1413,6 @@ mod tests {
             assert_eq!(span_contents(&lines[SECTION_GAP + padding_above]), title[0]);
             assert_eq!(lines.len() - 1, footer_index);
         }
-
-        let fallback = welcome_lines(0, Theme::default(), &WelcomeTitleOrder(vec![0]));
-        let fallback_padding_above = (WELCOME_TITLE_HEIGHT - 1) / 2;
-        assert_eq!(
-            span_contents(&fallback[SECTION_GAP + fallback_padding_above]),
-            "Harness"
-        );
-        assert_eq!(fallback.len() - 1, footer_index);
     }
 
     #[test]
