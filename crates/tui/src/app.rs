@@ -63,7 +63,7 @@ use crate::commands::{
     self, ArgumentKind, Candidate, CandidateKind, CompletionContext, CompletionResult,
     CompletionTarget, ParsedCommand,
 };
-use crate::commit::SplitScanner;
+use crate::commit::{SplitScanner, last_fenced_code_block};
 use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
 use crate::paths::{self, AtPrefix};
@@ -79,8 +79,8 @@ use anyhow::{Context, Result};
 use crossterm::cursor::{MoveDown, MoveRight, MoveTo, MoveUp};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::style::{
@@ -137,6 +137,9 @@ enum Entry {
     Assistant {
         markdown: String,
         reasoning: String,
+        /// True when this entry continues a message whose earlier chunk was
+        /// already committed, so it gets no `‹` prefix of its own.
+        continued: bool,
     },
     Tool {
         record: ToolRecord,
@@ -172,6 +175,9 @@ enum Fetch {
 struct StreamState {
     reasoning: String,
     markdown: String,
+    /// Markdown of this message was already committed to scrollback, so the
+    /// remaining text continues it instead of opening a new `‹` block.
+    markdown_continued: bool,
     /// Incremental stable-split scan over `markdown`; reset when it is
     /// drained.
     split: SplitScanner,
@@ -226,12 +232,32 @@ const EVENT_DRAIN_BUDGET: Duration = Duration::from_millis(8);
 /// Quiet time after the last resize event before the window is repainted.
 const RESIZE_SETTLE: Duration = Duration::from_millis(40);
 
-/// The visual rows of the input line plus the cursor's position within them.
-struct InputLayout {
-    rows: Vec<Line<'static>>,
-    cursor_row: usize,
-    cursor_col: usize,
+/// Largest payload `/copy` sends; terminals commonly cap OSC 52 near 1 MB.
+const MAX_COPY_BYTES: usize = 512 * 1024;
+
+/// OSC 52 clipboard-set sequence for `text`, wrapped in tmux's passthrough
+/// envelope when running inside tmux.
+fn clipboard_sequence(text: &str, tmux: bool) -> String {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::STANDARD.encode(text);
+    let osc = format!("\u{1b}]52;c;{payload}\u{07}");
+    if tmux {
+        format!("\u{1b}Ptmux;\u{1b}{osc}\u{1b}\\")
+    } else {
+        osc
+    }
 }
+
+/// OSC 133 prompt start asking for click reports (kitty `click_events`).
+const PROMPT_START: &str = "\u{1b}]133;A;click_events=1\u{07}";
+/// OSC 133 output start, closing the prompt after the input rows.
+const PROMPT_END: &str = "\u{1b}]133;C\u{07}";
+
+/// Opens every frame: begin synchronized update (DEC 2026) and disable
+/// autowrap (DECAWM). Terminals without 2026 ignore it.
+const FRAME_BEGIN: &str = "\u{1b}[?2026h\u{1b}[?7l";
+/// Closes every frame in the same write, so autowrap is never left off.
+const FRAME_END: &str = "\u{1b}[?7h\u{1b}[?2026l";
 
 /// Token usage reported by [`UiEvent::UsageUpdated`], kept for the inline
 /// counter trailer on the input placeholder row.
@@ -248,35 +274,6 @@ struct ContextUsage {
     max_tokens: u64,
 }
 
-/// An open completion list driving the fish-style ghost preview, the Tab
-/// accept, and the one-row hint below the input.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Completion {
-    context: CompletionContext,
-    candidates: Vec<Candidate>,
-    selected: usize,
-    kind: CompletionKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CompletionKind {
-    Slash,
-    Model,
-    Path,
-}
-
-/// A debounced path-completion scan result delivered back over the run-loop
-/// channel so a large directory tree never blocks the UI thread. `at_prefix`
-/// is set when the scan was for an `@` file reference rather than a command
-/// argument.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct PathCompletionResult {
-    generation: u64,
-    context: CompletionContext,
-    candidates: Vec<Candidate>,
-    at_prefix: Option<AtPrefix>,
-}
-
 /// One frame's live region: the rows to paint and where the terminal cursor
 /// belongs inside them.
 struct RegionBuild {
@@ -286,6 +283,19 @@ struct RegionBuild {
     /// Index of the activity row inside `rows` when this frame paints one;
     /// `None` otherwise. Lets spinner ticks rewrite only that row.
     activity_row: Option<usize>,
+    /// Where the input text sits, for mapping mouse clicks back to the draft.
+    input: Option<InputSpan>,
+}
+
+/// Position of the visible input rows inside a frame's live region.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputSpan {
+    /// Region row of the first visible input row.
+    first_row: usize,
+    /// Layout row (before clipping) shown on that region row.
+    layout_start: usize,
+    /// Visible text rows, excluding the completion hint row.
+    rows: usize,
 }
 
 /// The active-tool section of a frame: its rendered lines and total row
@@ -293,88 +303,6 @@ struct RegionBuild {
 struct RunningRegion {
     lines: Vec<Line<'static>>,
     rows: usize,
-}
-
-/// Operations needed to change terminal state. Keeping this small seam here
-/// makes setup and cleanup testable without making the rendering or input
-/// protocol depend on a different terminal implementation.
-trait TerminalBackend: Send {
-    fn size(&self) -> io::Result<(u16, u16)>;
-    fn enable_raw_mode(&mut self) -> io::Result<()>;
-    fn disable_raw_mode(&mut self) -> io::Result<()>;
-    fn enable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()>;
-    fn disable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()>;
-    fn push_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()>;
-    fn pop_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()>;
-    fn write_newline(&mut self, out: &mut Stdout) -> io::Result<()>;
-}
-
-/// The production terminal operation layer. Crossterm is deliberately kept
-/// behind [`TerminalBackend`], so mode bookkeeping can be tested independently
-/// of the process terminal and its platform-specific implementation.
-struct CrosstermBackend;
-
-impl TerminalBackend for CrosstermBackend {
-    fn size(&self) -> io::Result<(u16, u16)> {
-        terminal::size()
-    }
-
-    fn enable_raw_mode(&mut self) -> io::Result<()> {
-        terminal::enable_raw_mode()
-    }
-
-    fn disable_raw_mode(&mut self) -> io::Result<()> {
-        terminal::disable_raw_mode()
-    }
-
-    fn enable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()> {
-        execute!(out, EnableBracketedPaste)
-    }
-
-    fn disable_bracketed_paste(&mut self, out: &mut Stdout) -> io::Result<()> {
-        execute!(out, DisableBracketedPaste)
-    }
-
-    fn push_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()> {
-        execute!(
-            out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )
-    }
-
-    fn pop_keyboard_flags(&mut self, out: &mut Stdout) -> io::Result<()> {
-        execute!(out, PopKeyboardEnhancementFlags)
-    }
-
-    fn write_newline(&mut self, out: &mut Stdout) -> io::Result<()> {
-        writeln!(out)
-    }
-}
-
-/// Terminal modes successfully enabled by one UI instance. Cleanup only
-/// reverses modes recorded here, so a partial setup cannot pop another
-/// component's keyboard state. Failed cleanup remains recorded until a later
-/// retry succeeds.
-#[derive(Default)]
-struct TerminalModes {
-    raw_mode: bool,
-    bracketed_paste: bool,
-    keyboard_flags: bool,
-    newline_written: bool,
-}
-
-struct TerminalState {
-    backend: Box<dyn TerminalBackend>,
-    modes: TerminalModes,
-}
-
-impl TerminalState {
-    fn is_restored(&self) -> bool {
-        !self.modes.raw_mode
-            && !self.modes.bracketed_paste
-            && !self.modes.keyboard_flags
-            && self.modes.newline_written
-    }
 }
 
 /// The direct-crossterm UI. See the module docs for the screen model; the
@@ -491,10 +419,22 @@ pub struct CrossTerm {
     /// that row instead of the whole region.
     activity_region_row: Option<usize>,
 
+    /// Screen row where the next incremental frame begins (the first row of
+    /// `region`), when known. `None` after a height-only resize, until the
+    /// next full repaint re-establishes it.
+    region_top: Option<usize>,
+    /// Cursor row when the terminal was set up, seeding `region_top`.
+    start_row: Option<usize>,
+    /// Input location in the painted region, for click handling.
+    input_span: Option<InputSpan>,
+
     terminal: Arc<Mutex<TerminalState>>,
 
     /// OSC 7501 program-status tracker; `None` when reporting is off.
     program_status: Option<program_status::Tracker>,
+    /// A clipboard (OSC 52) sequence queued by `/copy`, written at the start
+    /// of the next frame so it never splits one.
+    clipboard_osc: Option<String>,
 }
 
 impl CrossTerm {
@@ -573,7 +513,11 @@ impl CrossTerm {
             cursor_row: 0,
             cursor_col: 0,
             activity_region_row: None,
+            region_top: None,
+            start_row: None,
+            input_span: None,
             program_status: None,
+            clipboard_osc: None,
             terminal: Arc::new(Mutex::new(TerminalState {
                 backend: Box::new(CrosstermBackend),
                 modes: TerminalModes::default(),
@@ -674,6 +618,11 @@ impl CrossTerm {
             return self.setup_failed(error);
         }
         lock_terminal(&self.terminal).modes.raw_mode = true;
+        self.start_row = lock_terminal(&self.terminal)
+            .backend
+            .cursor_position()
+            .map(|(_, row)| usize::from(row));
+        self.region_top = self.start_row;
 
         let bracketed_result = {
             let mut terminal = lock_terminal(&self.terminal);
@@ -883,7 +832,7 @@ impl CrossTerm {
             self.spinner,
             theme,
         );
-        let mut buffer = String::new();
+        let mut buffer = String::from(FRAME_BEGIN);
         let up = self.cursor_row.saturating_sub(row);
         if up > 0 {
             let _ = write!(buffer, "{}", MoveUp(up as u16));
@@ -898,6 +847,7 @@ impl CrossTerm {
         if col > 0 {
             let _ = write!(buffer, "{}", MoveRight(col));
         }
+        buffer.push_str(FRAME_END);
         self.out
             .write_all(buffer.as_bytes())
             .context("write activity")?;
@@ -918,6 +868,8 @@ impl CrossTerm {
         if width_changed || self.region.len() > height as usize {
             self.repaint_all()
         } else {
+            // The terminal may have moved the region on a height change.
+            self.region_top = None;
             self.paint()
         }
     }
@@ -929,6 +881,16 @@ impl CrossTerm {
         cancel: &CancellationToken,
     ) -> Result<bool> {
         let Event::Key(key) = event else {
+            if let Event::Mouse(mouse) = event {
+                if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                    && let Some(cursor) = self.click_to_cursor(mouse.column, mouse.row)
+                {
+                    self.cursor = cursor;
+                    self.history_pos = self.history_pos.filter(|_| false);
+                    self.refresh_completion();
+                }
+                return Ok(false);
+            }
             if let Event::Paste(text) = event {
                 let text = render::sanitize_terminal_text(&normalize_paste_newlines(text));
                 insert_text(&mut self.input, &mut self.cursor, &text);
@@ -1038,6 +1000,32 @@ impl CrossTerm {
         Ok(false)
     }
 
+    /// Map a left click to a byte offset in the draft. Terminals that honor
+    /// the OSC 133 `click_events` mark report clicks on the prompt as SGR
+    /// mouse events without capturing the mouse, so native selection and
+    /// scrollback keep working.
+    fn click_to_cursor(&self, column: u16, row: u16) -> Option<usize> {
+        let span = self.input_span?;
+        let top = self.region_top?;
+        let region_row = usize::from(row).checked_sub(top)?;
+        let visible = region_row.checked_sub(span.first_row)?;
+        if visible >= span.rows || self.input.is_empty() {
+            return None;
+        }
+        let gutter = render::horizontal_pad(self.width) as usize;
+        let col = usize::from(column).saturating_sub(gutter + INPUT_PREFIX_WIDTH);
+        let width = render::content_width(self.width)
+            .saturating_sub(INPUT_PREFIX_WIDTH)
+            .max(1);
+        input_offset_at(
+            &self.input,
+            self.cursor,
+            width,
+            span.layout_start + visible,
+            col,
+        )
+    }
+
     /// If the input no longer matches the recalled entry, the user edited it:
     /// adopt the edit as a fresh draft so the next Up/Down keeps it instead of
     /// overwriting it with a history entry.
@@ -1083,553 +1071,6 @@ impl CrossTerm {
             }
             None => false,
         }
-    }
-
-    // ------------------------------------------------------------------
-    // Inline completion
-    // ------------------------------------------------------------------
-
-    /// Rebuild the completion list for the current draft and cursor. Cheap
-    /// except for path completion, which spawns a debounced blocking scan and
-    /// delivers results over `path_completion_rx`. Pure callers (tests) drive
-    /// this directly; the run loop calls it after every input mutation.
-    fn refresh_completion(&mut self) {
-        if commands::is_command_input(&self.input) {
-            self.refresh_command_completion();
-            return;
-        }
-        // Outside slash commands, an active `@` token completes file
-        // references against a debounced workspace scan.
-        let Some(prefix) = paths::extract_at_prefix(&self.input, self.cursor_char_col()) else {
-            self.close_completion();
-            return;
-        };
-        // Seed the request with the open list so the hint never blanks out
-        // while the debounced scan for the refined query is in flight; the
-        // fresh results replace them on arrival.
-        let (initial, preferred) = self
-            .completion
-            .as_ref()
-            .filter(|completion| completion.kind == CompletionKind::Path)
-            .map(|completion| {
-                let preferred = completion.candidates.get(completion.selected).cloned();
-                (completion.candidates.clone(), preferred)
-            })
-            .unwrap_or_default();
-        self.request_path_completion(
-            CompletionContext {
-                target: CompletionTarget::Argument(ArgumentKind::Path),
-                token_start: prefix.token_start,
-                token_end: prefix.token_end,
-                query: prefix.query.clone(),
-            },
-            initial,
-            preferred.map(|candidate| candidate.value),
-            Some(prefix),
-        );
-    }
-
-    /// [`Self::refresh_completion`] half that handles `/command` drafts:
-    /// static candidates plus, for path arguments, a debounced scan.
-    fn refresh_command_completion(&mut self) {
-        let old_value = self.completion.as_ref().and_then(|completion| {
-            completion
-                .candidates
-                .get(completion.selected)
-                .map(|candidate| candidate.value.clone())
-        });
-        let cursor_col = self.cursor_char_col();
-        let Some(result) = commands::candidates_at_cursor(
-            &self.input,
-            cursor_col,
-            &self.providers,
-            &self.model_lists,
-            &self.provider,
-            &self.session_candidates,
-            &self.skills,
-        ) else {
-            self.close_completion();
-            return;
-        };
-
-        // Path arguments scan the filesystem on a debounced task. Do not
-        // cancel first: `request_path_completion` keeps the current scan and
-        // its results when the token context is unchanged (as `@` paths do),
-        // so Tab after the results arrive accepts them instead of clearing
-        // them and starting again.
-        if matches!(
-            result.context.target,
-            CompletionTarget::Argument(ArgumentKind::Path | ArgumentKind::Session),
-        ) {
-            self.request_path_completion(result.context, result.candidates, old_value, None);
-            return;
-        }
-        self.cancel_path_completion();
-        // Session arguments use the path-completion scan above.
-        let kind = match result.context.target {
-            CompletionTarget::Argument(ArgumentKind::Model) => CompletionKind::Model,
-            _ => CompletionKind::Slash,
-        };
-        self.set_completion(kind, result, old_value);
-    }
-
-    fn set_completion(
-        &mut self,
-        kind: CompletionKind,
-        result: CompletionResult,
-        old_value: Option<String>,
-    ) {
-        if result.candidates.is_empty() {
-            // Keep a model list open (empty) so Tab can request it; close
-            // everything else.
-            if kind == CompletionKind::Model {
-                self.completion = Some(Completion {
-                    context: result.context,
-                    candidates: Vec::new(),
-                    selected: 0,
-                    kind,
-                });
-            } else {
-                self.completion = None;
-            }
-            return;
-        }
-        let selected = old_value
-            .as_deref()
-            .and_then(|value| {
-                result
-                    .candidates
-                    .iter()
-                    .position(|candidate| candidate.value == value)
-            })
-            .unwrap_or(0)
-            .min(result.candidates.len().saturating_sub(1));
-        self.completion = Some(Completion {
-            context: result.context,
-            candidates: result.candidates,
-            selected,
-            kind,
-        });
-    }
-
-    fn cursor_char_col(&self) -> usize {
-        self.input[..self.cursor].chars().count()
-    }
-
-    fn close_completion(&mut self) {
-        self.cancel_path_completion();
-        self.completion = None;
-        self.session_fetch = Fetch::Idle;
-    }
-
-    /// Apply a candidate to the draft, move the cursor, then recompute the
-    /// list and fire any on-demand backend fetch (sessions / model lists).
-    fn accept_candidate(
-        &mut self,
-        candidate: &Candidate,
-        context: &CompletionContext,
-        input_tx: &mpsc::UnboundedSender<InputMessage>,
-    ) -> Result<()> {
-        self.apply_replacement(candidate, context);
-        // Also cancels any in-flight path scan so a stale result cannot
-        // reopen the popup over the accepted text.
-        self.close_completion();
-        // A None-argument command (e.g. `/new`) has no arguments to complete;
-        // the refresh below would otherwise keep its own name listed.
-        let argument_less = matches!(context.target, CompletionTarget::Command,)
-            && commands::command_spec(&candidate.value)
-                .is_some_and(|spec| spec.argument_kind == ArgumentKind::None);
-        if argument_less {
-            return Ok(());
-        }
-        self.request_backend(input_tx, context, candidate, true)?;
-        self.refresh_completion();
-        Ok(())
-    }
-
-    fn apply_replacement(&mut self, candidate: &Candidate, context: &CompletionContext) {
-        let cursor_col = self.cursor_char_col();
-        let Some((replacement, new_cursor_col)) =
-            commands::apply_completion(&self.input, cursor_col, context, candidate, &self.skills)
-        else {
-            return;
-        };
-        self.input = replacement;
-        self.cursor = byte_index_at_char(&self.input, new_cursor_col);
-    }
-
-    /// Request backend data for a directly typed model provider prefix or a
-    /// session/path command. Candidate acceptance already calls
-    /// [`Self::request_backend`]; this covers the equivalent typed form.
-    fn request_typed_backend(
-        &mut self,
-        input_tx: &mpsc::UnboundedSender<InputMessage>,
-        explicit: bool,
-    ) -> Result<()> {
-        let Some(context) = self
-            .completion
-            .as_ref()
-            .map(|completion| completion.context.clone())
-        else {
-            return Ok(());
-        };
-        let CompletionTarget::Argument(kind) = context.target else {
-            return Ok(());
-        };
-        if !matches!(kind, ArgumentKind::Model | ArgumentKind::Session) {
-            return Ok(());
-        }
-        let start = context.token_start;
-        let end = context.token_end.min(self.input.len());
-        let value = self.input[start..end].to_owned();
-        self.request_backend(
-            input_tx,
-            &context,
-            &Candidate {
-                value,
-                description: String::new(),
-                kind: CandidateKind::Slash,
-            },
-            explicit,
-        )
-    }
-
-    /// Send anything the new draft now needs from the agent: a `ListSessions`
-    /// for `/load` arguments or a `ListModels` when a `provider:` token was
-    /// just completed and its model list is unknown. The dedupe sets keep
-    /// repeated Tab presses from spamming the agent. Typing (`explicit` false)
-    /// only fetches what was never requested; an explicit Tab also retries a
-    /// failed fetch.
-    fn request_backend(
-        &mut self,
-        input_tx: &mpsc::UnboundedSender<InputMessage>,
-        context: &CompletionContext,
-        candidate: &Candidate,
-        explicit: bool,
-    ) -> Result<()> {
-        let is_session = matches!(
-            context.target,
-            CompletionTarget::Argument(ArgumentKind::Session),
-        );
-        let session_may_fetch = match self.session_fetch {
-            Fetch::Idle => true,
-            // A list that arrived empty is only re-asked on an explicit Tab,
-            // not on every keystroke.
-            Fetch::Loaded | Fetch::Failed => explicit,
-            Fetch::InFlight => false,
-        };
-        if is_session && self.session_candidates.is_empty() && session_may_fetch {
-            self.session_fetch = Fetch::InFlight;
-            input_tx
-                .send(InputMessage::ListSessions)
-                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
-        }
-        // A bare `provider:` token requests the catalogue; so does a
-        // partially typed `provider:model` token whose provider part is
-        // known but uncached — the user is clearly addressing that
-        // provider's catalogue even before Tab-accepting the prefix.
-        let typed = candidate.value.as_str();
-        let provider = typed
-            .strip_suffix(':')
-            .or_else(|| typed.split_once(':').map(|(provider, _)| provider))
-            .filter(|name| {
-                self.providers
-                    .iter()
-                    .any(|known| known.eq_ignore_ascii_case(name))
-            })
-            .map(str::to_owned);
-        if let Some(provider) = provider
-            && !self.model_lists.contains_key(&provider)
-            && match self
-                .model_fetch
-                .get(provider.as_str())
-                .copied()
-                .unwrap_or_default()
-            {
-                Fetch::Idle => true,
-                Fetch::Failed => explicit,
-                Fetch::InFlight | Fetch::Loaded => false,
-            }
-        {
-            self.model_fetch.insert(provider.clone(), Fetch::InFlight);
-            input_tx
-                .send(InputMessage::ListModels {
-                    provider: provider.clone(),
-                })
-                .map_err(|_| anyhow::anyhow!("agent input channel closed"))?;
-        }
-        Ok(())
-    }
-
-    /// The Tab handler for completion.
-    fn handle_tab(&mut self, input_tx: &mpsc::UnboundedSender<InputMessage>) -> Result<()> {
-        self.refresh_completion();
-        let Some(completion) = self.completion.as_ref().cloned() else {
-            return Ok(());
-        };
-        if completion.candidates.is_empty() {
-            // Session/model lists often arrive a beat late; repeat Tab asks
-            // the backend again. Use the typed token (not an empty one) so a
-            // `provider:` model catalogue can be re-requested too.
-            self.request_typed_backend(input_tx, true)?;
-            return Ok(());
-        }
-        if completion.candidates.len() == 1 {
-            let candidate = completion.candidates[0].clone();
-            self.accept_candidate(&candidate, &completion.context, input_tx)?;
-            return Ok(());
-        }
-        // File and model references rank fuzzily, so a shared prefix is often
-        // meaningless (`luna` may rank `openrouter:openai/gpt-5.6-luna`
-        // first). Tab accepts the highlighted candidate — the top-ranked
-        // match on the first press — rather than becoming a no-op merely
-        // because the typed query is not a literal prefix.
-        if matches!(
-            completion.kind,
-            CompletionKind::Path | CompletionKind::Model
-        ) {
-            let mut selected = completion.selected;
-            let token = &self.input[completion.context.token_start
-                ..completion.context.token_end.min(self.input.len())];
-            if completion.candidates[selected].value == token {
-                selected = (selected + 1) % completion.candidates.len();
-            }
-            let candidate = completion.candidates[selected].clone();
-            self.accept_candidate(&candidate, &completion.context, input_tx)?;
-            return Ok(());
-        }
-        // Multiple candidates: extend the shared prefix, or cycle among them
-        // once the token already matches the common prefix.
-        let prefix = commands::common_prefix(&completion.candidates);
-        if prefix.is_empty() {
-            return Ok(());
-        }
-        let token = &self.input
-            [completion.context.token_start..completion.context.token_end.min(self.input.len())];
-        if token == prefix {
-            let selected = (completion.selected + 1) % completion.candidates.len();
-            let candidate = completion.candidates[selected].clone();
-            self.accept_candidate(&candidate, &completion.context, input_tx)?;
-        } else {
-            let prefix_candidate = Candidate {
-                value: prefix,
-                description: String::new(),
-                kind: CandidateKind::Slash,
-            };
-            // Extend to the common prefix and keep the list open.
-            self.apply_replacement(&prefix_candidate, &completion.context);
-            self.refresh_completion();
-        }
-        Ok(())
-    }
-
-    // Path completion helpers -------------------------------------------------
-
-    fn cancel_path_completion(&mut self) {
-        if let Some(cancel) = self.path_completion_cancel.take() {
-            cancel.cancel();
-        }
-        self.path_completion_query = None;
-        self.path_completion_generation = self.path_completion_generation.wrapping_add(1);
-        if self
-            .completion
-            .as_ref()
-            .is_some_and(|completion| completion.kind == CompletionKind::Path)
-        {
-            self.completion = None;
-        }
-    }
-
-    fn request_path_completion(
-        &mut self,
-        context: CompletionContext,
-        initial: Vec<Candidate>,
-        preferred: Option<String>,
-        at_prefix: Option<AtPrefix>,
-    ) {
-        let query = context.query.clone();
-        if self.path_completion_query.as_deref() == Some(query.as_str())
-            && self.completion.as_ref().is_some_and(|completion| {
-                completion.kind == CompletionKind::Path && completion.context == context
-            })
-        {
-            return;
-        }
-        self.cancel_path_completion();
-        let generation = self.path_completion_generation;
-        let cancel = CancellationToken::new();
-        let scan_cancel = cancel.clone();
-        let root = self.environment.cwd.clone();
-        let sender = self.path_completion_tx.clone();
-        let scan_query = query.clone();
-        let selected = preferred
-            .as_deref()
-            .and_then(|value| initial.iter().position(|c| c.value == value))
-            .unwrap_or(0)
-            .min(initial.len().saturating_sub(1));
-        self.path_completion_cancel = Some(cancel.clone());
-        self.path_completion_query = Some(query.clone());
-        self.completion = Some(Completion {
-            context: context.clone(),
-            candidates: initial,
-            selected,
-            kind: CompletionKind::Path,
-        });
-        tokio::spawn(async move {
-            // Debounce so a burst of typing triggers one scan, not many.
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            if cancel.is_cancelled() {
-                return;
-            }
-            // `@` references walk the whole workspace; command arguments list
-            // one directory.
-            let at = at_prefix.is_some();
-            let scan = move |root: &Path, query: &str, cancel: &CancellationToken| {
-                if at {
-                    paths::find_candidates(root, query, cancel)
-                } else {
-                    paths::find_path_candidates(root, query, cancel)
-                }
-            };
-            let candidates =
-                tokio::task::spawn_blocking(move || scan(&root, &scan_query, &scan_cancel))
-                    .await
-                    .unwrap_or_default();
-            if cancel.is_cancelled() {
-                return;
-            }
-            let _ = sender.send(PathCompletionResult {
-                generation,
-                context,
-                candidates,
-                at_prefix,
-            });
-        });
-    }
-
-    fn apply_path_completion(&mut self, result: PathCompletionResult) {
-        if result.generation != self.path_completion_generation {
-            return;
-        }
-        let cursor_col = self.cursor_char_col();
-        // The draft must still be on the same token the scan was started for.
-        let context_now = match &result.at_prefix {
-            Some(prefix) => paths::extract_at_prefix(&self.input, cursor_col)
-                .filter(|now| now.token_start == prefix.token_start)
-                .map(|now| now.into_context()),
-            None => commands::completion_context(&self.input, cursor_col),
-        };
-        let Some(context_now) = context_now else {
-            return;
-        };
-        if result.context != context_now {
-            return;
-        }
-        self.path_completion_cancel = None;
-        let old_value = self
-            .completion
-            .as_ref()
-            .and_then(|completion| completion.candidates.get(completion.selected))
-            .map(|candidate| candidate.value.as_str());
-        // Merge static candidates (sessions for `/load`, providers/models for
-        // `/model`) with the scanned filesystem results.
-        let static_candidates = commands::candidates_at_cursor(
-            &self.input,
-            cursor_col,
-            &self.providers,
-            &self.model_lists,
-            &self.provider,
-            &self.session_candidates,
-            &self.skills,
-        )
-        .map(|result| result.candidates)
-        .unwrap_or_default();
-        let merged = merge_candidates(static_candidates, result.candidates);
-        if merged.is_empty() {
-            self.completion = None;
-            return;
-        }
-        let selected = old_value
-            .and_then(|value| merged.iter().position(|c| c.value == value))
-            .unwrap_or(0)
-            .min(merged.len().saturating_sub(1));
-        self.completion = Some(Completion {
-            context: result.context,
-            candidates: merged,
-            selected,
-            kind: CompletionKind::Path,
-        });
-    }
-
-    /// The dim ghost suffix drawn after the cursor when the input matches a
-    /// single untyped completion (or the shared prefix of several).
-    fn ghost_text(&self) -> String {
-        let Some(completion) = self.completion.as_ref() else {
-            return String::new();
-        };
-        // Ghost only previews at the very end of the draft.
-        if self.cursor != self.input.len() {
-            return String::new();
-        }
-        let cursor_col = self.cursor_char_col();
-        if completion.candidates.is_empty() {
-            return String::new();
-        }
-        // Path completions preview the highlighted candidate — exactly what
-        // the next Tab inserts — as the untyped remainder of the token. A
-        // fuzzy match (`agent.rs` → `crates/agent/src/agent.rs`) shares no
-        // literal prefix, so there is nothing honest to dim inline; the hint
-        // row below the input carries those suggestions instead.
-        if completion.kind == CompletionKind::Path {
-            let candidate = &completion.candidates[completion.selected];
-            let token_end = completion.context.token_end.min(self.input.len());
-            let typed = &self.input[completion.context.token_start..token_end];
-            return candidate
-                .value
-                .strip_prefix(typed)
-                .map(str::to_owned)
-                .unwrap_or_default();
-        }
-        if completion.candidates.len() == 1 {
-            return commands::candidate_suffix(
-                &self.input,
-                cursor_col,
-                &completion.context,
-                &completion.candidates[0],
-            );
-        }
-        let prefix = commands::common_prefix(&completion.candidates);
-        if prefix.is_empty() {
-            return String::new();
-        }
-        // Already at the shared prefix: the list hint stands in for the ghost.
-        if self.input
-            [completion.context.token_start..completion.context.token_end.min(self.input.len())]
-            == prefix
-        {
-            return String::new();
-        }
-        let prefix_candidate = Candidate {
-            value: prefix,
-            description: String::new(),
-            kind: CandidateKind::Slash,
-        };
-        commands::candidate_suffix(
-            &self.input,
-            cursor_col,
-            &completion.context,
-            &prefix_candidate,
-        )
-    }
-
-    /// One dim hint row below the input. It is fitted to the actual content
-    /// width so long provider-qualified model IDs can never soft-wrap behind
-    /// the region bookkeeping and leave apparent duplicate suggestion rows.
-    fn completion_hint(&self, width: usize) -> String {
-        let Some(completion) = self.completion.as_ref() else {
-            return String::new();
-        };
-        fit_completion_hint(&completion.candidates, completion.selected, width)
     }
 
     fn submit(&mut self, input_tx: &mpsc::UnboundedSender<InputMessage>) -> Result<()> {
@@ -1783,6 +1224,10 @@ impl CrossTerm {
                 InputMessage::ListSessions
             }
             ParsedCommand::Export { destination } => InputMessage::ExportSession { destination },
+            ParsedCommand::Copy { code } => {
+                self.copy_last_reply(code);
+                return Ok(());
+            }
             ParsedCommand::Compact => InputMessage::CompactSession,
             ParsedCommand::SetModel { provider, model } => {
                 InputMessage::SetModel { provider, model }
@@ -2190,6 +1635,7 @@ impl CrossTerm {
                         } => Entry::Assistant {
                             markdown,
                             reasoning,
+                            continued: false,
                         },
                         SessionSnapshotEntry::Tool {
                             name,
@@ -2314,7 +1760,8 @@ impl CrossTerm {
             return;
         }
         let chunk = stream.markdown[source_offset..stable_offset].to_owned();
-        let rendered = render::markdown_lines(&chunk, theme, width);
+        let continued = stream.markdown_continued || source_offset > 0;
+        let rendered = render::markdown_lines_continued(&chunk, theme, width, continued);
         if let Some(cache) = self.stream_markdown_cache.as_mut() {
             cache.lines.extend(rendered);
             cache.source_offset = stable_offset;
@@ -2335,7 +1782,81 @@ impl CrossTerm {
         self.pending.push(Entry::Assistant {
             markdown: stream.markdown,
             reasoning: stream.reasoning,
+            continued: stream.markdown_continued,
         });
+    }
+
+    /// Source markdown of the newest completed assistant reply. A long reply
+    /// committed in chunks is rejoined, so the copy is the model's text rather
+    /// than the wrapped, indented rows shown on screen.
+    fn last_reply_markdown(&self) -> Option<String> {
+        let entries: Vec<&Entry> = self.transcript.iter().chain(&self.pending).collect();
+        let mut index = entries.iter().rposition(
+            |entry| matches!(entry, Entry::Assistant { markdown, .. } if !markdown.is_empty()),
+        )?;
+        let mut chunks = Vec::new();
+        loop {
+            match entries[index] {
+                Entry::Assistant {
+                    markdown,
+                    continued,
+                    ..
+                } => {
+                    if !markdown.is_empty() {
+                        chunks.push(markdown.as_str());
+                        if !continued {
+                            break;
+                        }
+                    }
+                }
+                // Local commands (such as `/help`) run mid-stream can commit
+                // notices between two chunks of the same reply; step over
+                // them so the copy still covers the whole message.
+                Entry::Notice { .. } | Entry::Error { .. } => {}
+                _ => break,
+            }
+            if index == 0 {
+                break;
+            }
+            index -= 1;
+        }
+        chunks.reverse();
+        Some(chunks.concat().trim_end().to_owned())
+    }
+
+    /// Queue the last reply (or its last fenced code block) for the system
+    /// clipboard through OSC 52 and report what happened.
+    fn copy_last_reply(&mut self, code: bool) {
+        let Some(markdown) = self.last_reply_markdown() else {
+            self.add_error("nothing to copy yet");
+            return;
+        };
+        let text = if code {
+            match last_fenced_code_block(&markdown) {
+                Some(code) => code,
+                None => {
+                    self.add_error("the last reply has no code block");
+                    return;
+                }
+            }
+        } else {
+            markdown
+        };
+        if text.len() > MAX_COPY_BYTES {
+            self.add_error("reply is too large to copy through the terminal");
+            return;
+        }
+        self.clipboard_osc = Some(clipboard_sequence(
+            &text,
+            std::env::var_os("TMUX").is_some(),
+        ));
+        let lines = text.lines().count();
+        self.add_notice(format!(
+            "Copied {} {}{}",
+            lines,
+            if lines == 1 { "line" } else { "lines" },
+            if code { " of code" } else { "" }
+        ));
     }
 
     fn add_notice(&mut self, text: impl Into<String>) {
@@ -2415,7 +1936,7 @@ impl CrossTerm {
         // Reserve at least one answer row even for a large
         // draft. The final height guard still covers degenerate terminals.
         let answer_reserve = usize::from(self.ask_answer.is_some());
-        let (input_rows, input_cursor_row) = clip_input(
+        let (input_rows, input_cursor_row, input_layout_start) = clip_input(
             input,
             self.height as usize,
             self.busy,
@@ -2472,6 +1993,11 @@ impl CrossTerm {
             render::push_blank(&mut rows, section_gap);
         }
         let mut cursor_row = rows.len() + input_cursor_row;
+        let mut input_span = Some(InputSpan {
+            first_row: rows.len(),
+            layout_start: input_layout_start,
+            rows: input_rows.len(),
+        });
         rows.extend(input_rows);
         // Every producer has a local budget, but keep one final guard here so
         // newly added metadata/tool rows cannot invalidate terminal geometry.
@@ -2488,6 +2014,18 @@ impl CrossTerm {
             rows.drain(..dropped);
             cursor_row = cursor_row.saturating_sub(dropped).min(rows.len() - 1);
             activity_row_index = activity_row_index.and_then(|row| row.checked_sub(dropped));
+            input_span = input_span.and_then(|span| match span.first_row.checked_sub(dropped) {
+                Some(first_row) => Some(InputSpan { first_row, ..span }),
+                None => {
+                    // Top input rows were cut off-screen; skip them.
+                    let cut = dropped - span.first_row;
+                    (span.rows > cut).then(|| InputSpan {
+                        first_row: 0,
+                        layout_start: span.layout_start + cut,
+                        rows: span.rows - cut,
+                    })
+                }
+            });
         }
 
         let gutter = render::horizontal_pad(self.width) as usize;
@@ -2501,6 +2039,7 @@ impl CrossTerm {
             cursor_row,
             cursor_col,
             activity_row: activity_row_index,
+            input: input_span,
         }
     }
 
@@ -2639,15 +2178,21 @@ impl CrossTerm {
             {
                 let mut rendered = cache.lines.clone();
                 if cache.source_offset < stream.markdown.len() {
-                    rendered.extend(render::markdown_lines(
+                    rendered.extend(render::markdown_lines_continued(
                         &stream.markdown[cache.source_offset..],
                         self.theme,
                         width,
+                        stream.markdown_continued || cache.source_offset > 0,
                     ));
                 }
                 rendered
             } else {
-                render::markdown_lines(&stream.markdown, self.theme, width)
+                render::markdown_lines_continued(
+                    &stream.markdown,
+                    self.theme,
+                    width,
+                    stream.markdown_continued,
+                )
             };
             lines.extend(markdown);
         }
@@ -2683,6 +2228,25 @@ impl CrossTerm {
             return;
         };
         if stream.markdown.is_empty() {
+            // A reasoning-only stream would otherwise show just its newest
+            // rows until the turn ends, leaving the rest absent from
+            // scrollback. Commit whole paragraphs once they outgrow the tail.
+            let trimmed = stream.reasoning.trim_end_matches(['\r', '\n']);
+            let Some(boundary) = trimmed.rfind("\n\n") else {
+                return;
+            };
+            let head = trimmed[..boundary].trim_end_matches(['\r', '\n']);
+            if head.is_empty() || render::reasoning_lines(head, theme, width).len() <= budget {
+                return;
+            }
+            let head = head.to_owned();
+            stream.reasoning.drain(..boundary + 2);
+            *stream.reasoning_render.borrow_mut() = None;
+            self.pending.push(Entry::Assistant {
+                markdown: String::new(),
+                reasoning: head,
+                continued: false,
+            });
             return;
         }
         let Some(offset) = stream.split.split_offset(&stream.markdown) else {
@@ -2694,6 +2258,7 @@ impl CrossTerm {
         let prefix = Entry::Assistant {
             markdown: stream.markdown[..offset].to_owned(),
             reasoning: stream.reasoning.clone(),
+            continued: stream.markdown_continued,
         };
         let prefix_height = entry_lines(&prefix, width, theme, self.tools_expanded).len();
         if prefix_height <= budget {
@@ -2701,7 +2266,9 @@ impl CrossTerm {
         }
         self.pending.push(prefix);
         stream.reasoning.clear();
+        *stream.reasoning_render.borrow_mut() = None;
         stream.markdown.drain(..offset);
+        stream.markdown_continued = true;
         stream.split = SplitScanner::default();
         // The source origin moved; cached offsets are no longer meaningful.
         self.stream_markdown_cache = None;
@@ -2775,7 +2342,17 @@ impl CrossTerm {
 
         let mut above: Vec<Line<'static>> = Vec::new();
         if clear_all {
-            let keep = (self.height as usize).saturating_sub(build.rows.len());
+            // The separator row between history and the region counts too:
+            // without it the frame is one row taller than the screen and its
+            // top row scrolls into native scrollback on every full repaint.
+            let gap = if build.rows.is_empty() {
+                0
+            } else {
+                render::SECTION_GAP
+            };
+            let keep = (self.height as usize)
+                .saturating_sub(build.rows.len())
+                .saturating_sub(gap);
             above = history_window(&self.transcript, keep, content, theme, self.tools_expanded);
         } else {
             for (index, entry) in self.pending.iter().enumerate() {
@@ -2801,8 +2378,24 @@ impl CrossTerm {
         if let Some(report) = self.program_status.as_mut().and_then(|s| s.take_report()) {
             buffer.push_str(&report);
         }
+        // Synchronized output keeps a tall frame from tearing, and autowrap is
+        // off while it is written: a row the terminal measures wider than we
+        // do is clipped instead of wrapping into an untracked row, which would
+        // desynchronize the region bookkeeping and strand stale rows.
+        if let Some(copy) = self.clipboard_osc.take() {
+            buffer.push_str(&copy);
+        }
+        buffer.push_str(FRAME_BEGIN);
         if clear_all {
-            let _ = write!(buffer, "{}{}", Clear(ClearType::All), MoveTo(0, 0));
+            // ED 0 from home rather than ED 2: several terminals push the
+            // whole screen into scrollback on ED 2, duplicating the visible
+            // window above the repaint on every resize or Ctrl+O.
+            let _ = write!(
+                buffer,
+                "{}{}",
+                MoveTo(0, 0),
+                Clear(ClearType::FromCursorDown)
+            );
         } else if !self.region.is_empty() {
             // Walk the cursor up to the top of the previously painted region.
             // The cursor sits at `cursor_row` inside the region, so exactly
@@ -2812,8 +2405,23 @@ impl CrossTerm {
             }
         }
 
+        // OSC 133 marks tell the terminal which rows are the prompt and ask it
+        // to report clicks there (`click_events`), which `click_to_cursor`
+        // maps back to the draft. Terminals without it ignore the marks.
+        let region_start = total - build.rows.len();
+        let prompt = build.input.map(|span| {
+            (
+                region_start + span.first_row,
+                region_start + span.first_row + span.rows,
+            )
+        });
         for (index, line) in rows.iter().enumerate() {
             let _ = write!(buffer, "\r{}", Clear(ClearType::UntilNewLine));
+            match prompt {
+                Some((first, _)) if index == first => buffer.push_str(PROMPT_START),
+                Some((_, end)) if index == end => buffer.push_str(PROMPT_END),
+                _ => {}
+            }
             write_row(&mut buffer, line, gutter, self.width as usize);
             if index + 1 < total {
                 buffer.push('\n');
@@ -2844,11 +2452,22 @@ impl CrossTerm {
             let col = build.cursor_col.min(u16::MAX as usize) as u16;
             let _ = write!(buffer, "{}", MoveRight(col));
         }
+        buffer.push_str(FRAME_END);
 
         self.out
             .write_all(buffer.as_bytes())
             .context("write frame")?;
         self.out.flush().context("flush frame")?;
+
+        // Where the region begins on screen: the frame prints from the old
+        // region top (or home after a clear), and growth past the bottom
+        // scrolls the terminal so the frame ends on the last row.
+        let top = if clear_all { Some(0) } else { self.region_top };
+        self.region_top = top.map(|top| {
+            let last = (top + total - 1).min(self.height.saturating_sub(1) as usize);
+            (last + 1).saturating_sub(build.rows.len())
+        });
+        self.input_span = build.input;
 
         // Bookkeeping: the printed `above` rows are now immutable scrollback.
         commit_to_transcript(&mut self.transcript, &mut self.pending);
@@ -2868,3477 +2487,30 @@ impl CrossTerm {
     }
 }
 
-/// Restore every state component that still needs work. An operation that
-/// fails remains recorded, allowing a later call from `run`, `Drop`, or a
-/// panic path to retry it. All operations are attempted before the first
-/// error is returned.
-fn restore_terminal(state: &mut TerminalState, out: &mut Stdout) -> Result<()> {
-    if state.is_restored() {
-        return Ok(());
-    }
-
-    let mut first_error = None;
-    if state.modes.raw_mode {
-        if let Err(error) = state
-            .backend
-            .disable_raw_mode()
-            .context("restore terminal raw mode")
-        {
-            first_error.get_or_insert(error);
-        } else {
-            state.modes.raw_mode = false;
-        }
-    }
-    if state.modes.bracketed_paste {
-        if let Err(error) = state
-            .backend
-            .disable_bracketed_paste(out)
-            .context("restore bracketed paste")
-        {
-            first_error.get_or_insert(error);
-        } else {
-            state.modes.bracketed_paste = false;
-        }
-    }
-    if state.modes.keyboard_flags {
-        if let Err(error) = state
-            .backend
-            .pop_keyboard_flags(out)
-            .context("restore keyboard enhancement flags")
-        {
-            first_error.get_or_insert(error);
-        } else {
-            state.modes.keyboard_flags = false;
-        }
-    }
-    if !state.modes.newline_written {
-        if let Err(error) = state.backend.write_newline(out).context("leave terminal") {
-            first_error.get_or_insert(error);
-        } else {
-            state.modes.newline_written = true;
-        }
-    }
-
-    match first_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
-}
-
 impl Drop for CrossTerm {
     fn drop(&mut self) {
         let _ = self.restore();
     }
 }
 
-/// Merge two candidate lists, deduplicating by value while preserving the
-/// first list's order. Used to combine static session candidates with the
-/// scanned path results for command arguments.
-fn merge_candidates(primary: Vec<Candidate>, secondary: Vec<Candidate>) -> Vec<Candidate> {
-    let mut seen = HashSet::new();
-    primary
-        .into_iter()
-        .chain(secondary)
-        .filter(|candidate| seen.insert(candidate.value.clone()))
-        .collect()
-}
+// Submodules: each owns a seam of the screen model described above.
+mod usage;
+use usage::*;
 
-/// Keep the session-global chrome when a conversation switch replaces the
-/// transcript: the startup banner, metadata lines, and the most recent
-/// boundary separator. Everything else was already printed into scrollback;
-/// it only loses its place in the resize-repaint source, not on screen.
-fn retain_chrome(transcript: &mut Vec<Entry>) {
-    let last_separator = transcript
-        .iter()
-        .rposition(|entry| matches!(entry, Entry::Separator { .. }));
-    let mut index = 0usize;
-    transcript.retain(|entry| {
-        let keep = match entry {
-            Entry::Banner { .. } | Entry::Metadata { .. } => true,
-            Entry::Separator { .. } => Some(index) == last_separator,
-            _ => false,
-        };
-        index += 1;
-        keep
-    });
-}
+mod ansi;
+use ansi::*;
 
-/// Many terminals deliver pasted line breaks as CR (or CRLF). The sanitizer
-/// drops CR as a control character, which joined every pasted line into
-/// one; turn both forms into LF first.
-fn normalize_paste_newlines(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
+mod editor;
+use editor::*;
 
-/// Lock the shared terminal state. A panic while the lock was held must not
-/// stop later restoration, so a poisoned lock is recovered: the state only
-/// records which modes still need to be undone.
-fn lock_terminal(terminal: &Mutex<TerminalState>) -> MutexGuard<'_, TerminalState> {
-    terminal.lock().unwrap_or_else(PoisonError::into_inner)
-}
+mod transcript;
+use transcript::*;
 
-/// Restore the terminal when the UI thread panics.
-///
-/// The hook is process-global, but only a panic on the thread that owns the
-/// UI may restore it. Tokio catches panics in spawned tasks (for example the
-/// agent task) and the UI keeps running; restoring cooked mode there would
-/// break the live TUI. The hook holds a `Weak` reference, so it does nothing
-/// after the UI is dropped, and it uses `try_lock` because the panic can
-/// happen while the UI thread holds the terminal lock.
-/// Byte budget for `transcript`. It is only the source for resize and Ctrl+O
-/// repaints, which show one screen of history; older entries are already in
-/// terminal scrollback. Without a bound a long session keeps every message
-/// and tool result in memory.
-const TRANSCRIPT_BUDGET_BYTES: usize = 4 * 1024 * 1024;
+mod modes;
+use modes::*;
 
-/// Approximate retained bytes of one entry.
-fn entry_bytes(entry: &Entry) -> usize {
-    match entry {
-        Entry::Banner { .. } => 0,
-        Entry::Metadata {
-            cwd,
-            branch,
-            provider,
-            model,
-            context_files,
-            mcp_servers,
-            skills,
-        } => {
-            cwd.len()
-                + branch.as_ref().map_or(0, String::len)
-                + provider.len()
-                + model.len()
-                + context_files
-                    .iter()
-                    .chain(mcp_servers)
-                    .chain(skills)
-                    .map(String::len)
-                    .sum::<usize>()
-        }
-        Entry::User { text } | Entry::Notice { text } | Entry::Error { text } => text.len(),
-        Entry::Assistant {
-            markdown,
-            reasoning,
-        } => markdown.len() + reasoning.len(),
-        Entry::Tool { record } => {
-            record.name.len()
-                + record.summary.len()
-                + record.output.len()
-                + record.error.as_ref().map_or(0, String::len)
-        }
-        Entry::Separator { label } => label.len(),
-    }
-}
-
-/// Move printed entries into the transcript, then drop the oldest
-/// conversation entries while it exceeds [`TRANSCRIPT_BUDGET_BYTES`]. The
-/// banner, metadata, and the newest entry are always kept.
-fn commit_to_transcript(transcript: &mut Vec<Entry>, pending: &mut Vec<Entry>) {
-    if pending.is_empty() {
-        return;
-    }
-    transcript.append(pending);
-    trim_transcript(transcript, TRANSCRIPT_BUDGET_BYTES);
-}
-
-fn trim_transcript(transcript: &mut Vec<Entry>, budget: usize) {
-    let mut total = transcript.iter().map(entry_bytes).sum::<usize>();
-    if total <= budget {
-        return;
-    }
-    let last = transcript.len().saturating_sub(1);
-    let mut index = 0usize;
-    transcript.retain(|entry| {
-        let keep = total <= budget
-            || index == last
-            || matches!(entry, Entry::Banner { .. } | Entry::Metadata { .. });
-        if !keep {
-            total = total.saturating_sub(entry_bytes(entry));
-        }
-        index += 1;
-        keep
-    });
-}
-
-/// Snapshot entries that fit the budget, newest last.
-struct SnapshotWindow {
-    kept: Vec<SessionSnapshotEntry>,
-    dropped: usize,
-}
-
-fn snapshot_entry_bytes(entry: &SessionSnapshotEntry) -> usize {
-    match entry {
-        SessionSnapshotEntry::User { text } => text.len(),
-        SessionSnapshotEntry::Assistant {
-            markdown,
-            reasoning,
-        } => markdown.len() + reasoning.len(),
-        SessionSnapshotEntry::Tool {
-            name,
-            summary,
-            output,
-            error,
-            ..
-        } => {
-            name.len()
-                + summary.len()
-                + output
-                    .len()
-                    .min(crate::state::MAX_RETAINED_TOOL_OUTPUT_BYTES)
-                + error.as_ref().map_or(0, |error| {
-                    error.len().min(crate::state::MAX_RETAINED_TOOL_ERROR_BYTES)
-                })
-        }
-    }
-}
-
-/// Keep the newest snapshot entries whose retained size fits `budget` (at
-/// least one entry), in their original order.
-fn newest_snapshot_entries(entries: Vec<SessionSnapshotEntry>, budget: usize) -> SnapshotWindow {
-    let mut total = 0usize;
-    let mut start = entries.len();
-    while start > 0 {
-        let bytes = snapshot_entry_bytes(&entries[start - 1]);
-        if start < entries.len() && total.saturating_add(bytes) > budget {
-            break;
-        }
-        total = total.saturating_add(bytes);
-        start -= 1;
-    }
-    let dropped = start;
-    SnapshotWindow {
-        kept: entries.into_iter().skip(dropped).collect(),
-        dropped,
-    }
-}
-
-fn install_panic_hook(terminal: &Arc<Mutex<TerminalState>>) {
-    let terminal = Arc::downgrade(terminal);
-    let ui_thread = std::thread::current().id();
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic| {
-        if std::thread::current().id() == ui_thread
-            && let Some(terminal) = terminal.upgrade()
-        {
-            let guard = match terminal.try_lock() {
-                Ok(guard) => Some(guard),
-                Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
-                Err(TryLockError::WouldBlock) => None,
-            };
-            if let Some(mut guard) = guard {
-                let mut stdout = io::stdout();
-                // Panic hooks cannot report a cleanup error without obscuring
-                // the original panic, but they still use the same best-effort
-                // operation layer. A caught panic or a later Drop can retry
-                // anything that failed.
-                let _ = restore_terminal(&mut guard, &mut stdout);
-            }
-        }
-        previous(panic);
-    }));
-}
-
-// ---------------------------------------------------------------------------
-// Entry rendering
-// ---------------------------------------------------------------------------
-
-/// Build the wrapped rows for one final or in-flight entry. Shared by the
-/// pending path (print above the region) and the resize repaint (window of
-/// history), which is why entries are stored at the source level.
-/// `tools_expanded` is the global Ctrl+O state; committed entries render
-/// collapsed unless the toggle is on, and the progress snapshot used the
-/// same global for its in-flight tool line so both agree after a repaint.
-/// Render only the newest history rows that can fit above the live region.
-///
-/// A resize used to render every transcript entry and discard almost all of
-/// it afterward. Walking backward lets a large session stop as soon as the
-/// viewport is full. The marker intentionally does not claim an exact hidden
-/// row count: discovering that count would require the full-history pass this
-/// helper is designed to avoid.
-fn history_window(
-    entries: &[Entry],
-    budget: usize,
-    width: usize,
-    theme: Theme,
-    tools_expanded: bool,
-) -> Vec<Line<'static>> {
-    if budget == 0 || entries.is_empty() {
-        return Vec::new();
-    }
-
-    let mut newest_first = Vec::<Vec<Line<'static>>>::new();
-    let mut used = 0usize;
-    let mut hidden = false;
-    for (index, entry) in entries.iter().enumerate().rev() {
-        let lines = entry_lines(entry, width, theme, tools_expanded);
-        let gap = usize::from(!newest_first.is_empty()) * render::SECTION_GAP;
-        if used.saturating_add(gap).saturating_add(lines.len()) <= budget {
-            used = used.saturating_add(gap).saturating_add(lines.len());
-            newest_first.push(lines);
-            continue;
-        }
-
-        // A single entry can be taller than the viewport. Keep its newest
-        // rows rather than rendering older entries that cannot be visible.
-        let available = budget.saturating_sub(used.saturating_add(gap));
-        let entry_had_lines = !lines.is_empty();
-        if available > 0 {
-            let start = lines.len().saturating_sub(available);
-            let mut suffix = Vec::with_capacity(available.min(lines.len()));
-            suffix.extend(lines.into_iter().skip(start));
-            newest_first.push(suffix);
-        }
-        hidden = index > 0 || entry_had_lines;
-        break;
-    }
-
-    let mut result = Vec::new();
-    for (index, lines) in newest_first.iter().rev().enumerate() {
-        if index > 0 {
-            render::push_blank(&mut result, render::SECTION_GAP);
-        }
-        result.extend(lines.iter().cloned());
-    }
-    if hidden {
-        let marker = Line::from(Span::styled(
-            "… older rows above",
-            Style::default()
-                .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
-        ));
-        if result.len() >= budget {
-            result.drain(..result.len() - budget.saturating_sub(1));
-        }
-        result.insert(0, marker);
-    }
-    result
-}
-
-fn entry_lines(
-    entry: &Entry,
-    width: usize,
-    theme: Theme,
-    tools_expanded: bool,
-) -> Vec<Line<'static>> {
-    let width = width.max(1);
-    match entry {
-        Entry::Banner { title_order } => render::welcome_lines(width, theme, title_order),
-        Entry::Metadata {
-            cwd,
-            branch,
-            provider,
-            model,
-            context_files,
-            mcp_servers,
-            skills,
-        } => metadata_lines(
-            cwd,
-            branch.as_deref(),
-            provider,
-            model,
-            context_files,
-            mcp_servers,
-            skills,
-            theme,
-        )
-        .into_iter()
-        .map(|line| render::fit_line_to_width(&line, width))
-        .collect(),
-        Entry::User { text } => render::user_lines(text, theme, width),
-        Entry::Assistant {
-            markdown,
-            reasoning,
-        } => {
-            let mut lines = Vec::new();
-            if !reasoning.is_empty() {
-                lines.extend(render::reasoning_lines(reasoning, theme, width));
-            }
-            if !markdown.is_empty() {
-                if !lines.is_empty() {
-                    render::push_blank(&mut lines, render::BLOCK_GAP);
-                }
-                lines.extend(render::markdown_lines(markdown, theme, width));
-            }
-            lines
-        }
-        Entry::Tool { record } => tool_lines(record, tools_expanded, width, theme),
-        Entry::Notice { text } => render::notice_lines(text, theme, width),
-        Entry::Error { text } => render::error_lines(text, theme, width),
-        Entry::Separator { label } => vec![separator_line(label, width, theme)],
-    }
-}
-
-/// The simplified tool call: one line with the tool type and its primary
-/// parameter — `$ git status`, `read file.txt` — plus a duration on success
-/// or a `✗` error preview on failure. Collapsed this is the compact line;
-/// expanded it adds the bounded output tail, later error lines, and a
-/// `running…` marker, each indented two spaces.
-fn tool_lines(
-    record: &ToolRecord,
-    expanded: bool,
-    width: usize,
-    theme: Theme,
-) -> Vec<Line<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    // Agent summaries read `bash: <command>` / `read <path>` / …; bash reads
-    // as a shell line, every other tool as `<verb> <param>` with the verb in
-    // the same accent as the `$` so all tool lines share one signature.
-    let marker_style = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let command = record
-        .summary
-        .strip_prefix("bash:")
-        .map(|rest| rest.trim_start())
-        .filter(|rest| !rest.is_empty());
-    match command {
-        Some(command) => {
-            spans.push(Span::styled("$ ", marker_style));
-            spans.push(Span::styled(
-                command.to_owned(),
-                Style::default().fg(theme.primary_text),
-            ));
-        }
-        None => {
-            let summary = record.summary.trim();
-            let (verb, rest) = summary.split_once(' ').unwrap_or((summary, ""));
-            spans.push(Span::styled(verb.to_owned(), marker_style));
-            if !rest.is_empty() {
-                spans.push(Span::styled(
-                    format!(" {rest}"),
-                    Style::default().fg(theme.primary_text),
-                ));
-            }
-        }
-    }
-    match record.status {
-        ToolStatus::Running => {}
-        ToolStatus::Success => spans.push(Span::styled(
-            format!(" · {}", render::duration_text(record.duration_ms)),
-            Style::default()
-                .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
-        )),
-        ToolStatus::Failure => {
-            let preview = record
-                .error
-                .as_deref()
-                .and_then(|error| error.lines().next())
-                .unwrap_or("failed");
-            spans.push(Span::styled("  ✗ ", Style::default().fg(theme.error)));
-            spans.push(Span::styled(
-                preview.to_owned(),
-                Style::default().fg(theme.error),
-            ));
-        }
-    }
-    // The marker/verb is part of the spans, so no extra message prefix is
-    // applied; the wrapper only reflows the line to the available width.
-    let summary_lines = render::wrap_text(
-        &Text::from(Line::from(spans)),
-        width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
-        Style::default(),
-    );
-    if !expanded {
-        return summary_lines;
-    }
-
-    // Expanded: the compact line, then the bounded output tail, later error
-    // lines, and a trailing `running…` marker, each indented two spaces
-    // and dimmed so they read as details under the summary.
-    let dim_style = Style::default()
-        .fg(theme.dim_text)
-        .add_modifier(Modifier::DIM);
-    let mut lines = summary_lines;
-    if !record.output.is_empty() {
-        for tail in render::output_tail_after(&record.output, record.omitted_lines) {
-            push_detail_line(&mut lines, &tail, dim_style, width);
-        }
-    }
-    if let Some(error) = record.error.as_deref() {
-        for detail in error.lines().skip(1).take(render::DEFAULT_TAIL_LINES) {
-            push_detail_line(&mut lines, detail, Style::default().fg(theme.error), width);
-        }
-    }
-    if matches!(record.status, ToolStatus::Running) {
-        push_detail_line(&mut lines, "running…", dim_style, width);
-    }
-    lines
-}
-
-/// One indented detail row under an expanded tool line, wrapped to the
-/// content width with the given style applied to every span.
-fn push_detail_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style, width: usize) {
-    for wrapped in render::wrap_text(
-        &Text::from(Line::from(Span::styled(text.to_owned(), style))),
-        width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
-        Style::default(),
-    ) {
-        lines.push(Line::from(
-            std::iter::once(Span::raw("  "))
-                .chain(wrapped.spans)
-                .collect::<Vec<_>>(),
-        ));
-    }
-}
-
-/// How many context/MCP/skill entries each header row shows before folding into
-/// `+N more`. Skills are cheap to accumulate (one per directory), so the cap
-/// keeps a skill-heavy workspace from pushing the transcript out of view.
-const METADATA_MAX_ENTRIES: usize = 4;
-
-fn fold_entries(entries: &[String]) -> Option<String> {
-    if entries.is_empty() {
-        return None;
-    }
-    let shown = entries.len().min(METADATA_MAX_ENTRIES);
-    let mut text = entries[..shown]
-        .iter()
-        .map(|entry| render::sanitize_terminal_text(entry))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let hidden = entries.len() - shown;
-    if hidden > 0 {
-        let _ = write!(text, " · +{hidden} more");
-    }
-    Some(text)
-}
-
-/// An accent bar and aligned, muted labels make startup details easy to scan.
-/// Values use the terminal's normal text colour; optional context, skill, and
-/// MCP rows remain capped at [`METADATA_MAX_ENTRIES`] names.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the renderer keeps each metadata row explicit for focused tests"
-)]
-fn metadata_lines(
-    cwd: &str,
-    branch: Option<&str>,
-    provider: &str,
-    model: &str,
-    context_files: &[String],
-    mcp_servers: &[String],
-    skills: &[String],
-    theme: Theme,
-) -> Vec<Line<'static>> {
-    let cwd = render::sanitize_terminal_text(cwd);
-    let cwd = match branch.map(render::sanitize_terminal_text) {
-        Some(branch) => format!("{cwd}  ({branch})"),
-        None => cwd,
-    };
-    let mut lines = vec![
-        metadata_row("cwd", cwd, theme),
-        metadata_row("provider", render::sanitize_terminal_text(provider), theme),
-        metadata_row("model", render::sanitize_terminal_text(model), theme),
-    ];
-    for (label, entries) in [
-        ("context", context_files),
-        ("skills", skills),
-        ("mcps", mcp_servers),
-    ] {
-        if let Some(text) = fold_entries(entries) {
-            lines.push(metadata_row(label, text, theme));
-        }
-    }
-    lines
-}
-
-fn metadata_row(label: &str, value: String, theme: Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(theme.accent)),
-        Span::styled(
-            format!("{label:<8}  "),
-            Style::default()
-                .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
-        ),
-        Span::styled(value, Style::default().fg(theme.primary_text)),
-    ])
-}
-
-/// A left-oriented rule marking a session boundary. An empty label is the
-/// unlabelled initial boundary below the full startup header.
-fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'static> {
-    let label = render::sanitize_terminal_text(label);
-    let text = if label.is_empty() {
-        "─".repeat(width)
-    } else {
-        let prefix = format!("── {label} ");
-        let prefix = ghost_to_width(&prefix, width);
-        let remaining = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
-        format!("{prefix}{}", "─".repeat(remaining))
-    };
-    Line::from(Span::styled(
-        text,
-        Style::default()
-            .fg(theme.dim_text)
-            .add_modifier(Modifier::DIM),
-    ))
-}
-
-/// The busy indicator row: an animated marker plus the activity label.
-fn activity_line_with_label(label: &str, spinner: usize, theme: Theme) -> Line<'static> {
-    let marker = render::ACTIVITY_FRAMES[spinner % render::ACTIVITY_FRAMES.len()];
-    Line::from(vec![
-        Span::styled(format!("{marker} "), Style::default().fg(theme.accent)),
-        Span::styled(
-            label.to_owned(),
-            Style::default()
-                .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
-        ),
-    ])
-}
-
-// ---------------------------------------------------------------------------
-// Input line layout
-// ---------------------------------------------------------------------------
-
-/// Wrap the input draft into visual rows (first row prefixed with `› `,
-/// continuations indented to match) and locate the cursor inside them. The
-/// real terminal cursor is placed at `cursor_col` columns into `cursor_row`.
-///
-/// `usage_trailer` is appended, dim, to the empty-input placeholder row;
-/// nothing is shown while typing (the counter reappears after a submit
-/// because the input empties again). `ghost` is the fish-style dim suffix
-/// preview painted after the cursor (only at end-of-input, clamped to the row
-/// width), and `completion_hint` is one dim candidate row below the input.
-#[cfg(test)]
-fn input_layout(
-    input: &str,
-    cursor: usize,
-    width: usize,
-    theme: Theme,
-    usage_trailer: &str,
-    ghost: &str,
-    completion_hint: &str,
-) -> InputLayout {
-    input_layout_with_row_width(
-        input,
-        cursor,
-        width,
-        width.saturating_add(INPUT_PREFIX_WIDTH),
-        theme,
-        usage_trailer,
-        ghost,
-        completion_hint,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn input_layout_with_row_width(
-    input: &str,
-    cursor: usize,
-    width: usize,
-    row_width: usize,
-    theme: Theme,
-    usage_trailer: &str,
-    ghost: &str,
-    completion_hint: &str,
-) -> InputLayout {
-    let width = width.max(1);
-    let row_width = row_width.max(1);
-    let cursor = cursor.min(input.len());
-    let prefix_style = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let text_style = Style::default().fg(theme.primary_text);
-    let dim_style = Style::default()
-        .fg(theme.dim_text)
-        .add_modifier(Modifier::DIM);
-
-    if input.is_empty() {
-        // Placeholder row; the terminal cursor sits right after the prefix.
-        // When usage is available the counter trailer trails it, dim.
-        let mut spans = vec![
-            Span::styled(INPUT_PREFIX, prefix_style),
-            Span::styled(PLACEHOLDER, dim_style),
-        ];
-        if !usage_trailer.is_empty() {
-            spans.push(Span::styled(usage_trailer.to_owned(), dim_style));
-        }
-        let mut rows = vec![render::fit_line_to_width(&Line::from(spans), row_width)];
-        if !completion_hint.is_empty() {
-            rows.push(render::fit_line_to_width(
-                &Line::from(vec![
-                    Span::raw(INPUT_CONTINUATION),
-                    Span::styled(completion_hint.to_owned(), dim_style),
-                ]),
-                row_width,
-            ));
-        }
-        return InputLayout {
-            rows,
-            cursor_row: 0,
-            cursor_col: 0,
-        };
-    }
-
-    let mut rows: Vec<Line<'static>> = Vec::new();
-    let mut cursor_row = 0usize;
-    let mut cursor_col = 0usize;
-
-    let mut byte_base = 0usize;
-    for logical in input.split('\n') {
-        let line_end = byte_base + logical.len();
-        let cursor_here = cursor >= byte_base && cursor <= line_end;
-        // Layout units are grapheme clusters, matching editing and wrap.
-        let chars: Vec<(&str, usize)> = logical
-            .graphemes(true)
-            .map(|cluster| (cluster, render::grapheme_width(cluster)))
-            .collect();
-        let cursor_char = if cursor_here {
-            Some(input[byte_base..cursor].graphemes(true).count())
-        } else {
-            None
-        };
-
-        // Greedy wrap; rows are append-stable, so the cursor can be located
-        // afterwards by walking the row boundaries.
-        let mut visual: Vec<Vec<(&str, usize)>> = Vec::new();
-        let mut current: Vec<(&str, usize)> = Vec::new();
-        let mut current_width = 0usize;
-        for &(character, character_width) in &chars {
-            if character_width > width {
-                if !current.is_empty() {
-                    visual.push(std::mem::take(&mut current));
-                    current_width = 0;
-                }
-                continue;
-            }
-            if character_width > 0 && current_width + character_width > width {
-                visual.push(std::mem::take(&mut current));
-                current_width = 0;
-            }
-            current.push((character, character_width));
-            current_width += character_width;
-        }
-        visual.push(current);
-
-        if let Some(cursor_char) = cursor_char {
-            if cursor_char >= chars.len() {
-                // End of this logical line. A row filled to exactly the wrap
-                // width gets a fresh row for the cursor, mirroring
-                // `render::prompt_layout`.
-                let last = visual.len() - 1;
-                let last_width: usize = visual[last].iter().map(|(_, w)| *w).sum();
-                if last_width >= width && !visual[last].is_empty() {
-                    cursor_row = rows.len() + visual.len();
-                    cursor_col = 0;
-                    visual.push(Vec::new());
-                } else {
-                    cursor_row = rows.len() + last;
-                    cursor_col = last_width;
-                }
-            } else {
-                let mut index = 0usize;
-                for (row_index, row) in visual.iter().enumerate() {
-                    if index + row.len() > cursor_char {
-                        cursor_row = rows.len() + row_index;
-                        cursor_col = row.iter().take(cursor_char - index).map(|(_, w)| *w).sum();
-                        break;
-                    }
-                    index += row.len();
-                }
-            }
-        }
-
-        for (row_index, row) in visual.iter().enumerate() {
-            let text: String = row.iter().map(|(c, _)| *c).collect();
-            let lead = if rows.is_empty() && row_index == 0 {
-                Span::styled(INPUT_PREFIX, prefix_style)
-            } else {
-                Span::raw(INPUT_CONTINUATION)
-            };
-            rows.push(render::fit_line_to_width(
-                &Line::from(vec![lead, Span::styled(text, text_style)]),
-                row_width,
-            ));
-        }
-
-        byte_base = line_end + 1;
-    }
-
-    if rows.is_empty() {
-        rows.push(Line::from(Span::styled(INPUT_PREFIX, prefix_style)));
-    }
-
-    // The list hint sits below the draft so opening completion never moves
-    // the input or its real terminal cursor.
-    if !completion_hint.is_empty() {
-        rows.push(render::fit_line_to_width(
-            &Line::from(vec![
-                Span::raw(INPUT_CONTINUATION),
-                Span::styled(completion_hint.to_owned(), dim_style),
-            ]),
-            row_width,
-        ));
-    }
-    // Ghost preview: append the dim suffix after the typed text on the
-    // cursor's row. Only at end-of-input, clamped to the remaining width so
-    // the row never overflows; the cursor position is untouched.
-    if !ghost.is_empty()
-        && cursor >= input.len()
-        && let Some(row) = rows.get_mut(cursor_row)
-    {
-        let used = row
-            .spans
-            .iter()
-            .map(|span| render::text_width(span.content.as_ref()))
-            .sum();
-        let available = row_width.saturating_sub(used);
-        let fits = ghost_to_width(ghost, available);
-        if !fits.is_empty() {
-            row.spans.push(Span::styled(fits, dim_style));
-        }
-    }
-
-    InputLayout {
-        rows,
-        cursor_row,
-        cursor_col,
-    }
-}
-
-/// Fit completion values onto exactly one visual row. Candidates begin at the
-/// highlighted item and wrap around, so the value Tab will accept is never
-/// hidden behind the `… +N` counter.
-fn fit_completion_hint(candidates: &[Candidate], selected: usize, width: usize) -> String {
-    if candidates.is_empty() || width == 0 {
-        return String::new();
-    }
-    let selected = selected.min(candidates.len() - 1);
-    let values = candidates[selected..]
-        .iter()
-        .chain(&candidates[..selected])
-        .map(|candidate| candidate.value.as_str())
-        .collect::<Vec<_>>();
-
-    let mut best = String::new();
-    for shown in 1..=values.len() {
-        let mut hint = values[..shown].join(" · ");
-        let hidden = values.len() - shown;
-        if hidden > 0 {
-            let _ = write!(hint, " … +{hidden}");
-        }
-        if UnicodeWidthStr::width(hint.as_str()) > width {
-            break;
-        }
-        best = hint;
-    }
-    if !best.is_empty() {
-        return best;
-    }
-
-    // Even one provider-qualified ID can be wider than a small terminal.
-    // Reserve the last cell for an ellipsis rather than letting the terminal
-    // soft-wrap a row the live-region model intentionally counts as one.
-    if width == 1 {
-        return "…".into();
-    }
-    let mut hint = ghost_to_width(values[0], width - 1);
-    hint.push('…');
-    hint
-}
-
-/// Truncate `text` (in display columns) to fit `width`, only ever cutting at
-/// whole characters. Returns empty when nothing fits.
-fn ghost_to_width(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    let mut result = String::new();
-    let mut used = 0usize;
-    for cluster in text.graphemes(true) {
-        let cluster_width = render::grapheme_width(cluster).max(1);
-        if used + cluster_width > width {
-            break;
-        }
-        result.push_str(cluster);
-        used += cluster_width;
-    }
-    result
-}
-
-/// The byte offset of the `column`-th character (0-based) into `input`.
-fn byte_index_at_char(input: &str, column: usize) -> usize {
-    input
-        .char_indices()
-        .nth(column)
-        .map(|(index, _)| index)
-        .unwrap_or(input.len())
-}
-
-/// Clip the input rows to a window containing the cursor when the draft is
-/// taller than the screen can show. Returns the visible rows and the cursor
-/// row within them.
-fn clip_input(
-    input: &InputLayout,
-    height: usize,
-    busy: bool,
-    tool_rows: usize,
-) -> (Vec<Line<'static>>, usize) {
-    let cap = height
-        .saturating_sub(usize::from(busy) + tool_rows + 2)
-        .max(1);
-    if input.rows.len() <= cap {
-        return (input.rows.clone(), input.cursor_row);
-    }
-    // Window pinned so the cursor row stays visible, biased toward showing
-    // as much above it as fits.
-    let start = input
-        .cursor_row
-        .saturating_sub(cap - 1)
-        .min(input.rows.len() - cap);
-    (
-        input.rows[start..start + cap].to_vec(),
-        input.cursor_row - start,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Input editing (pure helpers over `String` + byte cursor)
-// ---------------------------------------------------------------------------
-
-/// Insert text at the cursor, normalizing CRLF/CR paste payloads to `\n`.
-fn insert_text(input: &mut String, cursor: &mut usize, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    let text = if text.contains('\r') {
-        text.replace("\r\n", "\n").replace('\r', "\n")
-    } else {
-        text.to_owned()
-    };
-    input.insert_str(*cursor, &text);
-    *cursor += text.len();
-}
-
-// Editing moves and deletes whole grapheme clusters (a family emoji, a
-// flag, an accented letter with a combining mark), never part of one.
-
-fn delete_backward(input: &mut String, cursor: &mut usize) {
-    if let Some(cluster) = input[..*cursor].graphemes(true).next_back() {
-        let len = cluster.len();
-        *cursor -= len;
-        input.drain(*cursor..*cursor + len);
-    }
-}
-
-fn delete_forward(input: &mut String, cursor: &mut usize) {
-    if let Some(len) = input[*cursor..].graphemes(true).next().map(str::len) {
-        input.drain(*cursor..*cursor + len);
-    }
-}
-
-fn move_left(input: &str, cursor: &mut usize) {
-    if let Some(cluster) = input[..*cursor].graphemes(true).next_back() {
-        *cursor -= cluster.len();
-    }
-}
-
-fn move_right(input: &str, cursor: &mut usize) {
-    if let Some(len) = input[*cursor..].graphemes(true).next().map(str::len) {
-        *cursor += len;
-    }
-}
-
-/// Byte offsets of the start and end of the logical line containing `cursor`.
-fn line_bounds(input: &str, cursor: usize) -> (usize, usize) {
-    let start = input[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let end = input[cursor..]
-        .find('\n')
-        .map(|i| cursor + i)
-        .unwrap_or(input.len());
-    (start, end)
-}
-
-/// Move the cursor one logical line up (`delta < 0`) or down, preserving the
-/// character column. Returns `None` at the outer edges.
-fn vertical_move(input: &str, cursor: usize, delta: i32) -> Option<usize> {
-    let before = &input[..cursor];
-    let line_start = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let column = before[line_start..].graphemes(true).count();
-    let line_index = before.matches('\n').count() as i32;
-    let total_lines = input.matches('\n').count() as i32 + 1;
-    let target = line_index + delta;
-    if target < 0 || target >= total_lines {
-        return None;
-    }
-    let mut position = 0usize;
-    for _ in 0..target {
-        position += input[position..].find('\n').expect("target line exists") + 1;
-    }
-    let line_end = input[position..]
-        .find('\n')
-        .map(|i| position + i)
-        .unwrap_or(input.len());
-    let byte_column: usize = input[position..line_end]
-        .graphemes(true)
-        .take(column)
-        .map(str::len)
-        .sum();
-    Some(position + byte_column)
-}
-
-/// Compact token counts the way the context-length formatter does: `1_234`
-/// renders as `1.2k`, `1_000_000` as `1M`.
-fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
-        let value = n as f64 / 1_000_000.0;
-        if value.fract() == 0.0 {
-            format!("{}M", value as u64)
-        } else {
-            format!("{value:.1}M")
-        }
-    } else if n >= 1_000 {
-        let value = n as f64 / 1_000.0;
-        if value.fract() == 0.0 {
-            format!("{}k", value as u64)
-        } else {
-            format!("{value:.1}k")
-        }
-    } else {
-        n.to_string()
-    }
-}
-
-fn format_subscription_usage(provider: &str, usage: &SubscriptionUsage) -> String {
-    format_subscription_usage_at(provider, usage, OffsetDateTime::now_utc().unix_timestamp())
-}
-
-fn format_subscription_usage_at(
-    provider: &str,
-    usage: &SubscriptionUsage,
-    now_timestamp: i64,
-) -> String {
-    let mut output = format!("{provider} subscription usage");
-    if let Some(plan) = usage.plan.as_deref().filter(|plan| !plan.is_empty()) {
-        let _ = write!(output, " · {plan}");
-    }
-    let label_width = usage
-        .windows
-        .iter()
-        .map(|window| window.label.chars().count())
-        .max()
-        .unwrap_or_default();
-    for window in &usage.windows {
-        let _ = write!(
-            output,
-            "\n{:<label_width$}  {:>3}% used",
-            window.label, window.used_percent
-        );
-        if let Some(status) = window
-            .status
-            .as_deref()
-            .filter(|status| !status.eq_ignore_ascii_case("ok"))
-        {
-            let _ = write!(output, " · {status}");
-        }
-        if let Some(reset) = format_subscription_reset(window, now_timestamp) {
-            let _ = write!(output, " · {reset}");
-        }
-    }
-    output
-}
-
-fn format_subscription_reset(
-    window: &SubscriptionUsageWindow,
-    now_timestamp: i64,
-) -> Option<String> {
-    if let Some(seconds) = window.resets_after_seconds {
-        return Some(format!("resets in {}", format_duration(seconds)));
-    }
-    let value = window.resets_at.as_deref()?;
-    if let Some(reset_timestamp) = parse_reset_timestamp(value) {
-        let remaining = reset_timestamp.saturating_sub(now_timestamp);
-        return Some(if remaining <= 0 {
-            "reset due".into()
-        } else {
-            format!("resets in {}", format_duration(remaining as u64))
-        });
-    }
-    Some(format!("resets at {}", friendly_reset_time(value)))
-}
-
-fn parse_reset_timestamp(value: &str) -> Option<i64> {
-    value.parse::<i64>().ok().or_else(|| {
-        OffsetDateTime::parse(value, &Rfc3339)
-            .ok()
-            .map(|timestamp| timestamp.unix_timestamp())
-    })
-}
-
-fn format_duration(seconds: u64) -> String {
-    let units = [
-        (7 * 86_400, "w"),
-        (86_400, "d"),
-        (3_600, "h"),
-        (60, "m"),
-        (1, "s"),
-    ];
-    let mut remaining = seconds;
-    let mut parts = Vec::new();
-    for (size, suffix) in units {
-        let count = remaining / size;
-        if count > 0 || (size == 1 && parts.is_empty()) {
-            parts.push(format!("{count}{suffix}"));
-            remaining %= size;
-            if parts.len() == 2 {
-                break;
-            }
-        }
-    }
-    parts.join(" ")
-}
-
-/// Make an unparseable RFC 3339-shaped timestamp compact as a fallback.
-fn friendly_reset_time(value: &str) -> String {
-    let Some((date, time)) = value.split_once('T') else {
-        return value.to_owned();
-    };
-    let time = time
-        .strip_suffix('Z')
-        .unwrap_or(time)
-        .split('.')
-        .next()
-        .unwrap_or(time);
-    format!("{date} {time}Z")
-}
-
-// ---------------------------------------------------------------------------
-// ANSI output
-// ---------------------------------------------------------------------------
-
-/// Serialize one styled ratatui line to ANSI. Ratatui styles describe each
-/// span independently, while terminal attributes persist until reset, so a
-/// reset is required when adjacent effective styles differ. Without it the
-/// input prefix's bold attribute leaks into the first text row even though
-/// continuation rows correctly use normal weight.
-pub(crate) fn line_to_ansi(line: &Line<'_>) -> String {
-    let mut out = String::new();
-    let mut previous = None;
-    let mut styled = false;
-    for span in &line.spans {
-        let content = render::sanitize_terminal_text(span.content.as_ref());
-        if content.is_empty() {
-            continue;
-        }
-        let style = line.style.patch(span.style);
-        if previous.is_some_and(|previous| previous != style) {
-            out.push_str("\u{1b}[0m");
-            styled = true;
-        }
-        if previous != Some(style) {
-            let prefix = style_prefix(&style);
-            styled |= !prefix.is_empty();
-            out.push_str(&prefix);
-        }
-        out.push_str(&content);
-        previous = Some(style);
-    }
-    if styled {
-        out.push_str("\u{1b}[0m");
-    }
-    out
-}
-
-fn style_prefix(style: &Style) -> String {
-    let mut out = String::new();
-    if let Some(color) = style.fg {
-        let _ = write!(out, "{}", SetForegroundColor(ansi_color(color)));
-    }
-    if let Some(color) = style.bg {
-        let _ = write!(out, "{}", SetBackgroundColor(ansi_color(color)));
-    }
-    for (modifier, attribute) in MODIFIER_ATTRIBUTES {
-        if style.add_modifier.contains(*modifier) {
-            let _ = write!(out, "{}", SetAttribute(*attribute));
-        }
-    }
-    out
-}
-
-/// ratatui → crossterm modifier pairs for [`style_prefix`].
-const MODIFIER_ATTRIBUTES: &[(Modifier, Attribute)] = &[
-    (Modifier::BOLD, Attribute::Bold),
-    (Modifier::DIM, Attribute::Dim),
-    (Modifier::ITALIC, Attribute::Italic),
-    (Modifier::UNDERLINED, Attribute::Underlined),
-    (Modifier::SLOW_BLINK, Attribute::SlowBlink),
-    (Modifier::RAPID_BLINK, Attribute::RapidBlink),
-    (Modifier::REVERSED, Attribute::Reverse),
-    (Modifier::HIDDEN, Attribute::Hidden),
-    (Modifier::CROSSED_OUT, Attribute::CrossedOut),
-];
-
-/// ratatui-core → crossterm color mapping, mirroring ratatui's own
-/// crossterm-backend mapping so the theme renders identically.
-fn ansi_color(color: ratatui_core::style::Color) -> AnsiColor {
-    use ratatui_core::style::Color as CoreColor;
-    match color {
-        CoreColor::Reset => AnsiColor::Reset,
-        CoreColor::Black => AnsiColor::Black,
-        CoreColor::Red => AnsiColor::DarkRed,
-        CoreColor::Green => AnsiColor::DarkGreen,
-        CoreColor::Yellow => AnsiColor::DarkYellow,
-        CoreColor::Blue => AnsiColor::DarkBlue,
-        CoreColor::Magenta => AnsiColor::DarkMagenta,
-        CoreColor::Cyan => AnsiColor::DarkCyan,
-        CoreColor::Gray => AnsiColor::Grey,
-        CoreColor::DarkGray => AnsiColor::DarkGrey,
-        CoreColor::LightRed => AnsiColor::Red,
-        CoreColor::LightGreen => AnsiColor::Green,
-        CoreColor::LightYellow => AnsiColor::Yellow,
-        CoreColor::LightBlue => AnsiColor::Blue,
-        CoreColor::LightMagenta => AnsiColor::Magenta,
-        CoreColor::LightCyan => AnsiColor::Cyan,
-        CoreColor::White => AnsiColor::White,
-        CoreColor::Rgb(r, g, b) => AnsiColor::Rgb { r, g, b },
-        CoreColor::Indexed(value) => AnsiColor::AnsiValue(value),
-    }
-}
-
-/// Write one row: the shared left gutter plus the line's ANSI serialization.
-/// Blank rows become gutter-width space runs, which render identically.
-fn write_row(buffer: &mut String, line: &Line<'_>, gutter: usize, width: usize) {
-    if gutter > 0 {
-        buffer.push_str(&" ".repeat(gutter.min(width)));
-    }
-    let content_width = width.saturating_sub(gutter);
-    let line = render::fit_line_to_width(line, content_width);
-    buffer.push_str(&line_to_ansi(&line));
-}
+mod completion;
+use completion::*;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::KeyEvent;
-    use std::panic::AssertUnwindSafe;
-    use std::sync::OnceLock;
-
-    fn ui(width: u16, height: u16) -> CrossTerm {
-        CrossTerm::base(
-            "test-model",
-            "test-provider",
-            vec!["opencode-go".into(), "openrouter".into()],
-            StartupEntries::default(),
-            PathBuf::from("."),
-            width,
-            height,
-        )
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    enum TerminalOperation {
-        EnableRaw,
-        DisableRaw,
-        EnableBracketed,
-        DisableBracketed,
-        PushKeyboard,
-        PopKeyboard,
-        Newline,
-    }
-
-    #[derive(Clone, Default)]
-    struct MockTerminal {
-        calls: Arc<Mutex<Vec<TerminalOperation>>>,
-        failures: Arc<Mutex<HashMap<TerminalOperation, usize>>>,
-    }
-
-    impl MockTerminal {
-        fn fail_next(&self, operation: TerminalOperation) {
-            self.failures.lock().unwrap().insert(operation, 1);
-        }
-
-        fn calls(&self) -> Vec<TerminalOperation> {
-            self.calls.lock().unwrap().clone()
-        }
-
-        fn run(&self, operation: TerminalOperation) -> io::Result<()> {
-            self.calls.lock().unwrap().push(operation);
-            let mut failures = self.failures.lock().unwrap();
-            let Some(remaining) = failures.get_mut(&operation) else {
-                return Ok(());
-            };
-            if *remaining == 0 {
-                return Ok(());
-            }
-            *remaining -= 1;
-            Err(io::Error::other(format!("mock {operation:?}")))
-        }
-    }
-
-    impl TerminalBackend for MockTerminal {
-        fn size(&self) -> io::Result<(u16, u16)> {
-            Ok((80, 24))
-        }
-
-        fn enable_raw_mode(&mut self) -> io::Result<()> {
-            self.run(TerminalOperation::EnableRaw)
-        }
-
-        fn disable_raw_mode(&mut self) -> io::Result<()> {
-            self.run(TerminalOperation::DisableRaw)
-        }
-
-        fn enable_bracketed_paste(&mut self, _out: &mut Stdout) -> io::Result<()> {
-            self.run(TerminalOperation::EnableBracketed)
-        }
-
-        fn disable_bracketed_paste(&mut self, _out: &mut Stdout) -> io::Result<()> {
-            self.run(TerminalOperation::DisableBracketed)
-        }
-
-        fn push_keyboard_flags(&mut self, _out: &mut Stdout) -> io::Result<()> {
-            self.run(TerminalOperation::PushKeyboard)
-        }
-
-        fn pop_keyboard_flags(&mut self, _out: &mut Stdout) -> io::Result<()> {
-            self.run(TerminalOperation::PopKeyboard)
-        }
-
-        fn write_newline(&mut self, _out: &mut Stdout) -> io::Result<()> {
-            self.run(TerminalOperation::Newline)
-        }
-    }
-
-    fn terminal_ui(backend: MockTerminal) -> CrossTerm {
-        CrossTerm::with_backend(ui(80, 24), Box::new(backend))
-    }
-
-    fn successful_terminal_ui(backend: &MockTerminal) -> CrossTerm {
-        let mut ui = terminal_ui(backend.clone());
-        ui.setup_terminal().unwrap();
-        ui
-    }
-
-    fn row_text(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>()
-    }
-
-    fn row_width(line: &Line<'_>) -> usize {
-        line.spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-            .sum()
-    }
-
-    #[test]
-    fn transcript_and_snapshot_keep_newest_entries_within_budget() {
-        let big = "z".repeat(TRANSCRIPT_BUDGET_BYTES / 3);
-        let mut transcript = vec![Entry::Banner {
-            title_order: render::WelcomeTitleOrder::random(),
-        }];
-        let mut pending = (0..6)
-            .map(|index| Entry::User {
-                text: format!("{index}{big}"),
-            })
-            .collect::<Vec<_>>();
-        commit_to_transcript(&mut transcript, &mut pending);
-        assert!(transcript.iter().map(entry_bytes).sum::<usize>() <= TRANSCRIPT_BUDGET_BYTES);
-        assert!(matches!(transcript[0], Entry::Banner { .. }));
-        assert!(matches!(transcript.last(), Some(Entry::User { text }) if text.starts_with('5')));
-
-        let entries = (0..6)
-            .map(|index| SessionSnapshotEntry::User {
-                text: format!("{index}{big}"),
-            })
-            .collect::<Vec<_>>();
-        let window = newest_snapshot_entries(entries, TRANSCRIPT_BUDGET_BYTES);
-        assert!(window.dropped > 0);
-        assert_eq!(window.dropped + window.kept.len(), 6);
-        assert!(matches!(
-            window.kept.last(),
-            Some(SessionSnapshotEntry::User { text }) if text.starts_with('5')
-        ));
-        // A single entry larger than the budget is still shown.
-        let window = newest_snapshot_entries(
-            vec![SessionSnapshotEntry::User {
-                text: "w".repeat(TRANSCRIPT_BUDGET_BYTES + 1),
-            }],
-            TRANSCRIPT_BUDGET_BYTES,
-        );
-        assert_eq!((window.kept.len(), window.dropped), (1, 0));
-    }
-
-    #[test]
-    fn editing_moves_and_deletes_whole_grapheme_clusters() {
-        // Family emoji (ZWJ sequence), a flag, and e + combining acute.
-        for cluster in ["👨‍👩‍👧", "🇳🇿", "e\u{301}", "❤️"] {
-            let mut input = format!("a{cluster}b");
-            let mut cursor = 1 + cluster.len();
-            move_left(&input, &mut cursor);
-            assert_eq!(cursor, 1, "{cluster:?}");
-            move_right(&input, &mut cursor);
-            assert_eq!(cursor, 1 + cluster.len(), "{cluster:?}");
-            delete_backward(&mut input, &mut cursor);
-            assert_eq!(input, "ab", "{cluster:?}");
-            let mut input = format!("a{cluster}b");
-            let mut cursor = 1;
-            delete_forward(&mut input, &mut cursor);
-            assert_eq!(input, "ab", "{cluster:?}");
-        }
-    }
-
-    #[test]
-    fn wrapped_rows_never_split_a_grapheme_cluster() {
-        let text = "ab👨‍👩‍👧cd🇳🇿e\u{301}";
-        for width in 1..8 {
-            let rows = render::wrap_text(&Text::from(text.to_owned()), width, Style::default());
-            let joined = rows
-                .iter()
-                .flat_map(|row| row.spans.iter().map(|span| span.content.to_string()))
-                .collect::<String>();
-            // Clusters wider than the row are dropped whole, never split:
-            // every emitted cluster is one of the original clusters.
-            let originals = text
-                .graphemes(true)
-                .collect::<std::collections::HashSet<_>>();
-            for row in &rows {
-                let row_text = row
-                    .spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>();
-                for cluster in row_text.graphemes(true) {
-                    assert!(originals.contains(cluster), "width {width}: {cluster:?}");
-                }
-            }
-            assert!(!joined.is_empty());
-        }
-    }
-
-    #[test]
-    fn pasted_cr_line_breaks_are_kept() {
-        assert_eq!(normalize_paste_newlines("a\rb\r\nc\n"), "a\nb\nc\n");
-        assert_eq!(
-            render::sanitize_terminal_text(&normalize_paste_newlines("one\rtwo")),
-            "one\ntwo"
-        );
-    }
-
-    #[test]
-    fn event_drain_is_bounded_while_the_queue_stays_full() {
-        // A producer that keeps the channel non-empty must not hold the loop
-        // away from terminal input for longer than one bounded drain.
-        let mut first = ui(80, 24);
-        let (tx, mut rx) = mpsc::channel(EVENT_DRAIN_MAX_EVENTS * 4);
-        for _ in 0..(EVENT_DRAIN_MAX_EVENTS * 4) {
-            tx.try_send(UiEvent::TextDelta("x".into())).unwrap();
-        }
-        let applied = first.drain_queued_events(UiEvent::TextDelta("x".into()), &mut rx);
-        assert!(applied <= EVENT_DRAIN_MAX_EVENTS);
-        assert!(rx.try_recv().is_ok(), "the drain must leave work queued");
-        // Merged deltas keep every byte, in order.
-        assert_eq!(first.stream.as_ref().unwrap().markdown, "x".repeat(applied));
-        let (tx, mut rx) = mpsc::channel(8);
-        let mut ui = ui(80, 24);
-        for event in [
-            UiEvent::TextDelta("b".into()),
-            UiEvent::ReasoningDelta("r".into()),
-            UiEvent::TextDelta("c".into()),
-        ] {
-            tx.try_send(event).unwrap();
-        }
-        ui.drain_queued_events(UiEvent::TextDelta("a".into()), &mut rx);
-        let stream = ui.stream.as_ref().unwrap();
-        assert_eq!(
-            (stream.markdown.as_str(), stream.reasoning.as_str()),
-            ("abc", "r")
-        );
-    }
-
-    fn begin_ask(ui: &mut CrossTerm) -> mpsc::UnboundedReceiver<InputMessage> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        ui.submit_command("/ASK  keep  this question", &tx).unwrap();
-        assert!(ui.busy);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(InputMessage::Ask { question }) if question == "keep  this question"
-        ));
-        rx
-    }
-
-    fn assert_ask_not_retained(ui: &CrossTerm) {
-        let retained = format!("{:?}{:?}", ui.transcript, ui.pending);
-        assert!(!retained.contains("keep  this question"));
-        assert!(!retained.contains("one-shot result"));
-        assert!(ui.transcript.iter().all(|entry| !matches!(
-            entry,
-            Entry::User { text } if text.contains("keep  this question")
-        )));
-    }
-
-    #[test]
-    fn accepting_a_candidate_cancels_the_inflight_path_scan() {
-        let mut ui = ui(80, 24);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        ui.input = "/ne".into();
-        ui.cursor = ui.input.len();
-        let token = CancellationToken::new();
-        ui.path_completion_cancel = Some(token.clone());
-        let generation = ui.path_completion_generation;
-        let context = CompletionContext {
-            target: CompletionTarget::Command,
-            token_start: 0,
-            token_end: 3,
-            query: "ne".into(),
-        };
-        let candidate = Candidate {
-            value: "new".into(),
-            description: String::new(),
-            kind: CandidateKind::Slash,
-        };
-        ui.accept_candidate(&candidate, &context, &tx).unwrap();
-        assert!(token.is_cancelled());
-        assert_ne!(ui.path_completion_generation, generation);
-        assert!(ui.completion.is_none());
-    }
-
-    #[test]
-    fn editing_a_recalled_history_entry_keeps_the_edit() {
-        let mut ui = ui(80, 24);
-        ui.history = vec!["one".into(), "two".into()];
-        ui.history_up();
-        assert_eq!(ui.input, "two");
-        ui.input.push_str("-edited");
-        ui.cursor = ui.input.len();
-        ui.history_down();
-        assert_eq!(ui.input, "two-edited");
-        ui.history_up();
-        assert_eq!(ui.input, "two");
-        ui.history_down();
-        assert_eq!(ui.input, "two-edited", "edit is the restored draft");
-    }
-
-    #[test]
-    fn late_finish_events_do_not_rearm_busy_and_operation_finish_spares_turn() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(UiEvent::TurnFinished);
-        ui.apply_event(UiEvent::ToolCallFinished {
-            call_id: "x".into(),
-            name: "bash".into(),
-            summary: String::new(),
-            ok: true,
-            duration_ms: 1,
-            output: String::new(),
-            error: None,
-        });
-        ui.apply_event(UiEvent::Retrying {
-            attempt: 1,
-            message: String::new(),
-        });
-        assert!(!ui.busy, "late events must not spin an idle UI");
-
-        ui.apply_event(UiEvent::TextDelta("hi".into()));
-        ui.apply_event(UiEvent::OperationFinished);
-        assert!(ui.busy, "operation end must not clear a running turn");
-        ui.apply_event(UiEvent::TurnFinished);
-        assert!(!ui.busy);
-
-        ui.apply_event(UiEvent::TextDelta("hi".into()));
-        ui.apply_event(UiEvent::OperationStarted { label: "L".into() });
-        assert_eq!(ui.activity, Activity::Preparing);
-    }
-
-    #[test]
-    fn retry_during_ask_does_not_make_it_a_turn() {
-        let mut ui = ui(80, 24);
-        let _rx = begin_ask(&mut ui);
-        ui.apply_event(UiEvent::Retrying {
-            attempt: 1,
-            message: String::new(),
-        });
-        assert!(ui.busy);
-        ui.apply_event(UiEvent::AskAnswer("answer".into()));
-        ui.apply_event(UiEvent::OperationFinished);
-        assert!(!ui.busy, "operation end must clear a retried ask");
-    }
-
-    #[test]
-    fn ask_success_completes_busy_and_keeps_answer_out_of_history() {
-        let mut ui = ui(80, 24);
-        let _rx = begin_ask(&mut ui);
-        ui.apply_event(UiEvent::AskAnswer("one-shot result".into()));
-        assert!(ui.busy, "answer delivery precedes operation completion");
-        ui.apply_event(UiEvent::OperationFinished);
-        assert!(!ui.busy);
-        assert_ask_not_retained(&ui);
-        assert_eq!(ui.ask_answer.as_deref(), Some("one-shot result"));
-    }
-
-    #[test]
-    fn queued_ask_start_restores_busy_so_esc_interrupts_the_request() {
-        let mut ui = ui(80, 24);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        ui.apply_event(UiEvent::AskAnswer("previous answer".into()));
-        ui.apply_event(UiEvent::OperationFinished);
-        ui.apply_event(UiEvent::AskStarted);
-        assert!(ui.busy);
-        assert!(ui.ask_answer.is_none());
-        ui.handle_input(
-            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
-            &tx,
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(rx.try_recv().unwrap(), InputMessage::Interrupt);
-        assert!(!cancel.is_cancelled());
-    }
-
-    #[test]
-    fn multiline_ask_submission_never_becomes_a_conversation_message() {
-        let mut ui = ui(80, 24);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        ui.input = "/ASK Explain this passage:\n  The moon rose over the sea.".into();
-        ui.cursor = ui.input.len();
-        ui.submit(&tx).unwrap();
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            InputMessage::Ask {
-                question: "Explain this passage:\n  The moon rose over the sea.".into(),
-            }
-        );
-        assert!(ui.busy);
-        assert!(ui.pending.is_empty());
-        assert!(ui.transcript.is_empty());
-    }
-
-    #[test]
-    fn ask_answer_renders_inline_at_full_height_and_esc_dismisses_it() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let mut ui = ui(60, 24);
-        let answer = (0..6)
-            .map(|row| format!("\x1b[31mrow {row} of the answer\x1b[0m"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        ui.apply_event(UiEvent::AskAnswer(answer));
-        let input = ui.input_layout();
-        ui.commit_oversized_ask(input.rows.len(), 0);
-        let build = ui.build_region(&input);
-        let text = build.rows.iter().map(row_text).collect::<Vec<_>>();
-        for row in 0..6 {
-            assert!(
-                text.iter()
-                    .any(|line| line.contains(&format!("row {row} of")))
-            );
-        }
-        assert!(
-            !text
-                .iter()
-                .any(|line| line.contains("PgUp") || line.contains("/ask ·")),
-            "no pager chrome: {text:?}"
-        );
-        assert!(text.iter().all(|line| !line.contains('\x1b')));
-
-        // Page keys do nothing; Esc closes the answer without touching history.
-        for code in [KeyCode::PageDown, KeyCode::PageUp] {
-            ui.handle_input(
-                &Event::Key(KeyEvent::new(code, KeyModifiers::empty())),
-                &tx,
-                &cancel,
-            )
-            .unwrap();
-            assert!(ui.ask_answer.is_some());
-        }
-        ui.handle_input(
-            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())),
-            &tx,
-            &cancel,
-        )
-        .unwrap();
-        assert!(ui.ask_answer.is_none());
-        assert!(ui.pending.is_empty());
-        assert!(ui.transcript.is_empty());
-        assert!(rx.try_recv().is_err());
-        assert!(!cancel.is_cancelled());
-    }
-
-    #[test]
-    fn full_repaint_defers_a_newly_oversized_answer_instead_of_dropping_it() {
-        let mut ui = ui(80, 24);
-        let answer = (0..14)
-            .map(|row| format!("line {row}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        ui.apply_event(UiEvent::AskAnswer(answer));
-        // The terminal shrinks so the visible answer no longer fits.
-        ui.height = 8;
-        let (build, oversized) = ui.stage_full_repaint();
-        assert!(build.rows.len() <= 8);
-        let text = oversized.expect("answer is handed back for incremental printing");
-        assert!(text.contains("line 0") && text.contains("line 13"));
-        // It must not have been moved into the transcript unprinted.
-        assert!(!format!("{:?}", ui.transcript).contains("line 0"));
-        assert!(ui.ask_answer.is_none());
-    }
-
-    #[test]
-    fn ask_answer_taller_than_the_screen_flows_into_scrollback() {
-        let mut ui = ui(40, 8);
-        let answer = (0..30)
-            .map(|row| format!("line {row}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        ui.apply_event(UiEvent::AskAnswer(answer));
-        let input = ui.input_layout();
-        ui.commit_oversized_ask(input.rows.len(), 0);
-        assert!(ui.ask_answer.is_none());
-        let printed = format!("{:?}", ui.pending);
-        assert!(printed.contains("line 0") && printed.contains("line 29"));
-        let build = ui.build_region(&ui.input_layout());
-        assert!(build.rows.len() <= 8);
-    }
-
-    #[test]
-    fn ask_answer_is_cleared_when_session_changes_or_snapshot_loads() {
-        let mut ui = ui(80, 24);
-        ui.ask_answer = Some("answer from prior conversation".into());
-        ui.apply_event(UiEvent::SessionChanged {
-            id: "session-123".into(),
-            title: None,
-            loaded: true,
-        });
-        assert_eq!(ui.ask_answer, None);
-
-        ui.ask_answer = Some("answer before snapshot".into());
-        ui.apply_event(UiEvent::SessionSnapshot {
-            entries: Vec::new(),
-        });
-        assert_eq!(ui.ask_answer, None);
-    }
-
-    #[test]
-    fn ask_provider_open_error_completes_busy_without_retaining_question() {
-        let mut ui = ui(80, 24);
-        ui.ask_answer = Some("previous answer".into());
-        let _rx = begin_ask(&mut ui);
-        assert!(ui.ask_answer.is_none());
-        ui.apply_event(UiEvent::Error("provider open failed".into()));
-        ui.apply_event(UiEvent::OperationFinished);
-        assert!(!ui.busy);
-        assert!(ui.ask_answer.is_none());
-        assert_ask_not_retained(&ui);
-    }
-
-    #[test]
-    fn ask_mid_stream_error_completes_busy_without_retaining_question_or_partial_result() {
-        let mut ui = ui(80, 24);
-        let _rx = begin_ask(&mut ui);
-        ui.apply_event(UiEvent::Error("provider stream failed".into()));
-        ui.apply_event(UiEvent::OperationFinished);
-        assert!(!ui.busy);
-        assert_ask_not_retained(&ui);
-    }
-
-    fn record(status: ToolStatus) -> ToolRecord {
-        ToolRecord {
-            name: "bash".into(),
-            summary: "bash: cargo test".into(),
-            ok: !matches!(status, ToolStatus::Failure),
-            duration_ms: 1_200,
-            output: String::new(),
-            omitted_lines: 0,
-            error: matches!(status, ToolStatus::Failure).then(|| "boom\ntrace".into()),
-            status,
-        }
-    }
-
-    fn start(id: &str, summary: &str) -> UiEvent {
-        UiEvent::ToolCallStarted {
-            call_id: id.into(),
-            name: "subagent".into(),
-            summary: summary.into(),
-        }
-    }
-
-    fn finish(id: &str, summary: &str) -> UiEvent {
-        UiEvent::ToolCallFinished {
-            call_id: id.into(),
-            name: "subagent".into(),
-            summary: summary.into(),
-            ok: true,
-            duration_ms: 10,
-            output: "report".into(),
-            error: None,
-        }
-    }
-
-    fn active_summaries(ui: &CrossTerm) -> Vec<String> {
-        ui.running_tools
-            .iter()
-            .map(|running| running.record.summary.clone())
-            .collect()
-    }
-
-    #[test]
-    fn terminal_setup_restores_each_partial_prefix_without_popping_unset_modes() {
-        let raw_failure = MockTerminal::default();
-        raw_failure.fail_next(TerminalOperation::EnableRaw);
-        let mut ui = terminal_ui(raw_failure.clone());
-        let error = ui.setup_terminal().unwrap_err();
-        assert!(format!("{error:#}").contains("mock EnableRaw"));
-        assert_eq!(
-            raw_failure.calls(),
-            vec![TerminalOperation::EnableRaw, TerminalOperation::Newline]
-        );
-
-        let bracketed_failure = MockTerminal::default();
-        bracketed_failure.fail_next(TerminalOperation::EnableBracketed);
-        let mut ui = terminal_ui(bracketed_failure.clone());
-        let error = ui.setup_terminal().unwrap_err();
-        assert!(format!("{error:#}").contains("mock EnableBracketed"));
-        assert_eq!(
-            bracketed_failure.calls(),
-            vec![
-                TerminalOperation::EnableRaw,
-                TerminalOperation::EnableBracketed,
-                TerminalOperation::DisableRaw,
-                TerminalOperation::Newline,
-            ]
-        );
-
-        // Kitty keyboard enhancement is optional. A failed push is not marked
-        // as enabled, so cleanup never pops a stack belonging to another UI.
-        let keyboard_failure = MockTerminal::default();
-        keyboard_failure.fail_next(TerminalOperation::PushKeyboard);
-        let mut ui = terminal_ui(keyboard_failure.clone());
-        ui.setup_terminal().unwrap();
-        {
-            let terminal = ui.terminal.lock().unwrap();
-            assert!(terminal.modes.raw_mode);
-            assert!(terminal.modes.bracketed_paste);
-            assert!(!terminal.modes.keyboard_flags);
-            assert!(!terminal.modes.newline_written);
-        }
-        ui.restore().unwrap();
-        assert_eq!(
-            keyboard_failure.calls(),
-            vec![
-                TerminalOperation::EnableRaw,
-                TerminalOperation::EnableBracketed,
-                TerminalOperation::PushKeyboard,
-                TerminalOperation::DisableRaw,
-                TerminalOperation::DisableBracketed,
-                TerminalOperation::Newline,
-            ]
-        );
-    }
-
-    #[test]
-    fn terminal_cleanup_attempts_every_operation_and_retries_failures() {
-        let cleanup_operations = [
-            TerminalOperation::DisableRaw,
-            TerminalOperation::DisableBracketed,
-            TerminalOperation::PopKeyboard,
-            TerminalOperation::Newline,
-        ];
-
-        for failed_operation in cleanup_operations {
-            let backend = MockTerminal::default();
-            let mut ui = successful_terminal_ui(&backend);
-            backend.fail_next(failed_operation);
-
-            let error = ui.restore().unwrap_err();
-            assert!(
-                format!("{error:#}").contains(&format!("mock {failed_operation:?}")),
-                "first cleanup error was not reported: {error:#}"
-            );
-            let calls = backend.calls();
-            for operation in cleanup_operations {
-                assert_eq!(
-                    calls.iter().filter(|called| **called == operation).count(),
-                    1,
-                    "cleanup did not attempt {operation:?} after {failed_operation:?} failed"
-                );
-            }
-
-            // The one-shot failure was consumed. Successful operations are no
-            // longer retried, while the failed operation remains tracked.
-            ui.restore().unwrap();
-            let calls = backend.calls();
-            assert_eq!(
-                calls.last(),
-                Some(&failed_operation),
-                "cleanup did not retry {failed_operation:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_cleanup_reports_the_first_error_after_all_attempts() {
-        let backend = MockTerminal::default();
-        let mut ui = successful_terminal_ui(&backend);
-        backend.fail_next(TerminalOperation::DisableRaw);
-        backend.fail_next(TerminalOperation::DisableBracketed);
-
-        let error = ui.restore().unwrap_err();
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("mock DisableRaw"));
-        assert!(!rendered.contains("mock DisableBracketed"));
-        let calls = backend.calls();
-        assert!(calls.contains(&TerminalOperation::DisableRaw));
-        assert!(calls.contains(&TerminalOperation::DisableBracketed));
-        assert!(calls.contains(&TerminalOperation::PopKeyboard));
-        assert!(calls.contains(&TerminalOperation::Newline));
-
-        // Both failed modes remain tracked and can be restored on a later
-        // attempt; the already restored modes are not touched again.
-        ui.restore().unwrap();
-        let calls = backend.calls();
-        assert_eq!(
-            &calls[calls.len() - 2..],
-            [
-                TerminalOperation::DisableRaw,
-                TerminalOperation::DisableBracketed
-            ]
-        );
-    }
-
-    #[test]
-    fn panic_cleanup_attempts_all_modes_and_drop_retries_unfinished_cleanup() {
-        static PANIC_HOOK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let _hook_guard = PANIC_HOOK_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap();
-
-        let backend = MockTerminal::default();
-        let ui = successful_terminal_ui(&backend);
-        for operation in [
-            TerminalOperation::DisableRaw,
-            TerminalOperation::DisableBracketed,
-            TerminalOperation::PopKeyboard,
-            TerminalOperation::Newline,
-        ] {
-            backend.fail_next(operation);
-        }
-
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        install_panic_hook(&ui.terminal);
-        // A panic on another thread (for example a Tokio task whose panic is
-        // caught) must leave the live UI's terminal modes alone.
-        let worker = std::thread::spawn(|| panic!("simulated worker panic"));
-        assert!(worker.join().is_err());
-        assert!(
-            backend.calls().iter().all(|called| !matches!(
-                called,
-                TerminalOperation::DisableRaw
-                    | TerminalOperation::DisableBracketed
-                    | TerminalOperation::PopKeyboard
-                    | TerminalOperation::Newline
-            )),
-            "a worker-thread panic restored the UI terminal"
-        );
-        let panic_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            panic!("simulated terminal panic");
-        }));
-        std::panic::set_hook(previous);
-        assert!(panic_result.is_err());
-
-        let calls = backend.calls();
-        for operation in [
-            TerminalOperation::DisableRaw,
-            TerminalOperation::DisableBracketed,
-            TerminalOperation::PopKeyboard,
-            TerminalOperation::Newline,
-        ] {
-            assert_eq!(
-                calls.iter().filter(|called| **called == operation).count(),
-                1
-            );
-        }
-
-        // Drop is a second cleanup boundary. The failed operations were not
-        // cleared by the panic hook, so this retry completes all restoration.
-        drop(ui);
-        let calls = backend.calls();
-        for operation in [
-            TerminalOperation::DisableRaw,
-            TerminalOperation::DisableBracketed,
-            TerminalOperation::PopKeyboard,
-            TerminalOperation::Newline,
-        ] {
-            assert_eq!(
-                calls.iter().filter(|called| **called == operation).count(),
-                2
-            );
-        }
-    }
-
-    #[test]
-    fn ctrl_c_clears_a_draft_before_closing_harness() {
-        let mut ui = ui(80, 24);
-        ui.input = "unfinished prompt".into();
-        ui.cursor = ui.input.len();
-        ui.history_pos = Some(0);
-        ui.draft = "older draft".into();
-        ui.busy = true;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let ctrl_c = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
-
-        assert!(!ui.handle_input(&ctrl_c, &tx, &cancel).unwrap());
-        assert!(ui.input.is_empty());
-        assert_eq!(ui.cursor, 0);
-        assert_eq!(ui.history_pos, None);
-        assert!(ui.draft.is_empty());
-        assert!(!cancel.is_cancelled());
-        assert!(
-            rx.try_recv().is_err(),
-            "clearing must not interrupt the turn"
-        );
-
-        assert!(ui.handle_input(&ctrl_c, &tx, &cancel).unwrap());
-        assert!(cancel.is_cancelled());
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn shift_enter_inserts_a_newline_without_submitting() {
-        let mut ui = ui(80, 24);
-        ui.input = "first line".into();
-        ui.cursor = ui.input.len();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let shift_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-
-        assert!(!ui.handle_input(&shift_enter, &tx, &cancel).unwrap());
-        assert_eq!(ui.input, "first line\n");
-        assert_eq!(ui.cursor, ui.input.len());
-        assert!(rx.try_recv().is_err());
-
-        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        assert!(!ui.handle_input(&enter, &tx, &cancel).unwrap());
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            InputMessage::Message("first line\n".into())
-        );
-    }
-
-    #[test]
-    fn slash_background_results_do_not_finish_an_active_turn() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(UiEvent::TextDelta("partial answer".into()));
-        ui.apply_event(start("tool", "reading file"));
-        ui.apply_event(UiEvent::TextDelta("more answer".into()));
-        for id in [1, 2] {
-            ui.apply_event(UiEvent::BackgroundOperationStarted {
-                id,
-                label: format!("Lookup {id}..."),
-            });
-        }
-        ui.apply_event(UiEvent::BackgroundOperationFinished {
-            id: 1,
-            error: Some("usage request failed".into()),
-        });
-        assert!(ui.busy);
-        assert_eq!(ui.stream.as_ref().unwrap().markdown, "more answer");
-        assert_eq!(ui.running_tools.len(), 1);
-        assert_eq!(ui.background_operations.len(), 1);
-        assert_eq!(ui.background_operations[0].0, 2);
-        assert!(
-            ui.running_region()
-                .lines
-                .iter()
-                .any(|line| row_text(line).contains("Lookup 2"))
-        );
-        ui.apply_event(UiEvent::TurnFinished);
-        assert!(!ui.busy);
-        assert_eq!(ui.background_operations.len(), 1);
-        ui.apply_event(UiEvent::BackgroundOperationFinished { id: 2, error: None });
-        assert!(ui.background_operations.is_empty());
-    }
-
-    #[test]
-    fn slash_compact_and_skill_show_activity_before_output() {
-        for command in ["/compact", "/skill review"] {
-            let mut ui = ui(80, 24);
-            ui.skills.push(SkillEntry {
-                name: "review".into(),
-                description: "Review code".into(),
-            });
-            let (tx, _rx) = mpsc::unbounded_channel();
-            ui.submit_command(command, &tx).unwrap();
-            assert!(ui.busy);
-            ui.apply_event(UiEvent::OperationFinished);
-            assert!(!ui.busy);
-            // A command queued during another turn gets fresh progress at dispatch.
-            ui.apply_event(UiEvent::OperationStarted {
-                label: "Compacting session...".into(),
-            });
-            let region = ui.build_region(&ui.input_layout());
-            assert!(
-                region
-                    .rows
-                    .iter()
-                    .any(|line| row_text(line).contains("Compacting session"))
-            );
-            ui.apply_event(UiEvent::OperationFinished);
-            assert!(!ui.busy);
-        }
-    }
-
-    #[test]
-    fn slash_session_completion_is_silent_but_sessions_command_reports_empty_list() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(UiEvent::SessionList {
-            sessions: Vec::new(),
-        });
-        assert!(ui.pending.is_empty());
-        let (tx, _rx) = mpsc::unbounded_channel();
-        ui.submit_command("/sessions", &tx).unwrap();
-        ui.apply_event(UiEvent::SessionList {
-            sessions: Vec::new(),
-        });
-        assert!(ui.pending.iter().any(|entry| matches!(entry, Entry::Notice { text } if text == "No sessions for this workspace")));
-    }
-
-    #[test]
-    fn slash_empty_skills_still_show_discovery_errors() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(UiEvent::SkillsLoaded {
-            skills: Vec::new(),
-            diagnostics: vec!["review/SKILL.md: invalid frontmatter".into()],
-            empty: true,
-        });
-        assert!(
-            matches!(&ui.pending[0], Entry::Notice { text } if text.contains("no skills discovered") && text.contains("invalid frontmatter"))
-        );
-    }
-
-    #[test]
-    fn slash_skill_alias_is_echoed_once() {
-        let mut ui = ui(80, 24);
-        ui.skills.push(SkillEntry {
-            name: "review".into(),
-            description: "Review code".into(),
-        });
-        let (tx, _rx) = mpsc::unbounded_channel();
-        ui.submit_command("/review", &tx).unwrap();
-        assert_eq!(ui.pending.len(), 1);
-        assert!(
-            matches!(&ui.pending[0], Entry::Notice { text } if text == "/review · skill: review")
-        );
-    }
-
-    #[test]
-    fn reasoning_command_reports_current_value_and_sends_changes() {
-        let mut ui = ui(80, 24);
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        ui.submit_command("/reasoning", &tx).unwrap();
-        assert!(rx.try_recv().is_err());
-        assert!(matches!(
-            ui.pending.last(),
-            Some(Entry::Notice { text }) if text.contains("current: auto")
-        ));
-
-        ui.submit_command("/reasoning high", &tx).unwrap();
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            InputMessage::SetReasoning {
-                level: "high".into()
-            }
-        );
-        ui.apply_event(UiEvent::ReasoningChanged {
-            level: "high".into(),
-        });
-        ui.submit_command("/reasoning", &tx).unwrap();
-        assert!(matches!(
-            ui.pending.last(),
-            Some(Entry::Notice { text }) if text.contains("current: high")
-        ));
-    }
-
-    #[test]
-    fn concurrent_starts_accumulate_and_finishes_remove_by_call_id() {
-        let mut ui = ui(80, 24);
-        // Two same-name subagents with similar summaries — correlation must
-        // be by call id, not by name or FIFO position.
-        ui.apply_event(start("a", "subagent: audit one"));
-        ui.apply_event(start("b", "subagent: audit two"));
-        assert_eq!(
-            active_summaries(&ui),
-            vec!["subagent: audit one", "subagent: audit two"]
-        );
-
-        // Finish out of order: B first, A second.
-        ui.apply_event(finish("b", "subagent: audit two"));
-        assert_eq!(active_summaries(&ui), vec!["subagent: audit one"]);
-        ui.apply_event(finish("a", "subagent: audit one"));
-        assert!(ui.running_tools.is_empty());
-
-        // Both completions were committed as tool entries.
-        let committed = ui
-            .pending
-            .iter()
-            .filter(|entry| matches!(entry, Entry::Tool { .. }))
-            .count();
-        assert_eq!(committed, 2);
-    }
-
-    #[test]
-    fn duplicate_start_updates_in_place_instead_of_duplicating() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(start("a", "first"));
-        ui.apply_event(start("a", "second"));
-        assert_eq!(active_summaries(&ui), vec!["second"]);
-    }
-
-    #[test]
-    fn error_drains_all_active_tools_as_failed_and_turn_finished_clears() {
-        let mut failing = ui(80, 24);
-        failing.apply_event(start("a", "one"));
-        failing.apply_event(start("b", "two"));
-        failing.apply_event(UiEvent::Error("turn blew up".into()));
-        assert!(failing.running_tools.is_empty());
-        let failed = failing
-            .pending
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::Tool { record } => Some(record),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(failed.len(), 2);
-        assert!(
-            failed
-                .iter()
-                .all(|record| record.status == ToolStatus::Failure)
-        );
-
-        // TurnFinished clears any remaining actives without committing them.
-        let mut fresh = ui(80, 24);
-        fresh.apply_event(start("a", "one"));
-        fresh.apply_event(UiEvent::TurnFinished);
-        assert!(fresh.running_tools.is_empty());
-    }
-
-    #[test]
-    fn region_renders_every_active_tool_plus_overflow_line() {
-        let mut ui = ui(80, 24);
-        for index in 0..6 {
-            ui.apply_event(start(
-                &format!("call-{index}"),
-                &format!("subagent: task {index}"),
-            ));
-        }
-        let input = ui.input_layout();
-        let build = ui.build_region(&input);
-        let text = build
-            .rows
-            .iter()
-            .map(row_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        // Four visible in launch order, the rest folded into the overflow.
-        assert!(text.contains("subagent: task 0"));
-        assert!(text.contains("subagent: task 3"));
-        assert!(text.contains("… 2 more running"));
-        // The whole region still fits the terminal height.
-        assert!(build.rows.len() <= 24);
-    }
-
-    #[test]
-    fn format_tokens_uses_k_and_m_units() {
-        assert_eq!(format_tokens(0), "0");
-        assert_eq!(format_tokens(999), "999");
-        assert_eq!(format_tokens(1_000), "1k");
-        assert_eq!(format_tokens(1_234), "1.2k");
-        assert_eq!(format_tokens(12_345), "12.3k");
-        assert_eq!(format_tokens(1_000_000), "1M");
-        assert_eq!(format_tokens(1_500_000), "1.5M");
-    }
-
-    #[test]
-    fn placeholder_row_stays_bare_without_usage() {
-        let layout = input_layout("", 0, 60, Theme::default(), "", "", "");
-        assert_eq!(row_text(&layout.rows[0]), "› Type your message...");
-    }
-
-    #[test]
-    fn usage_updated_is_kept_for_the_placeholder_counter() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(UiEvent::UsageUpdated {
-            input_tokens: 1_234,
-            output_tokens: 3_456,
-            cached_tokens: 5,
-            reasoning_tokens: 2,
-            cost: "$0.01".into(),
-        });
-        ui.apply_event(UiEvent::ContextUsageUpdated {
-            used_tokens: 24_000,
-            max_tokens: 128_000,
-        });
-        let layout = ui.input_layout();
-        assert_eq!(
-            row_text(&layout.rows[0]),
-            "› Type your message...   ↑ 1.2k ↓ 3.5k · 24k/128k ctx"
-        );
-    }
-
-    #[test]
-    fn formats_subscription_usage_windows_and_resets() {
-        let usage = SubscriptionUsage {
-            plan: Some("Go".into()),
-            windows: vec![
-                SubscriptionUsageWindow {
-                    label: "rolling".into(),
-                    used_percent: 0,
-                    status: Some("ok".into()),
-                    resets_at: Some("2026-08-25T14:48:50.201Z".into()),
-                    resets_after_seconds: None,
-                },
-                SubscriptionUsageWindow {
-                    label: "monthly".into(),
-                    used_percent: 54,
-                    status: Some("limited".into()),
-                    resets_at: None,
-                    resets_after_seconds: Some(553_554),
-                },
-            ],
-        };
-        let now = parse_reset_timestamp("2026-08-25T10:00:00Z").unwrap();
-        assert_eq!(
-            format_subscription_usage_at("opencode-go", &usage, now),
-            "opencode-go subscription usage · Go\nrolling    0% used · resets in 4h 48m\nmonthly   54% used · limited · resets in 6d 9h"
-        );
-    }
-
-    #[test]
-    fn input_layout_wraps_and_places_the_cursor() {
-        // "abcdefgh" at width 4 wraps into two full rows; a cursor at the
-        // very end lands on a fresh third row (mirrors prompt_layout).
-        let layout = input_layout("abcdefgh", 8, 4, Theme::default(), "", "", "");
-        let values: Vec<String> = layout.rows.iter().map(row_text).collect();
-        assert_eq!(values, vec!["› abcd", "  efgh", "  "]);
-        assert_eq!(layout.cursor_row, 2);
-        assert_eq!(layout.cursor_col, 0);
-
-        // Cursor mid-word stays on the first row at the right column.
-        let layout = input_layout("abcdef", 2, 4, Theme::default(), "", "", "");
-        assert_eq!(layout.cursor_row, 0);
-        assert_eq!(layout.cursor_col, 2);
-    }
-
-    #[test]
-    fn input_layout_handles_multiline_drafts() {
-        // Two logical lines, cursor at the end of the second: continuation
-        // rows are indented to line up under the prefix.
-        let layout = input_layout("ab\ncd", 5, 10, Theme::default(), "", "", "");
-        let values: Vec<String> = layout.rows.iter().map(row_text).collect();
-        assert_eq!(values, vec!["› ab", "  cd"]);
-        assert_eq!(layout.cursor_row, 1);
-        assert_eq!(layout.cursor_col, 2);
-
-        // Empty input shows the placeholder with the cursor after `› `.
-        let layout = input_layout("", 0, 10, Theme::default(), "", "", "");
-        assert_eq!(row_text(&layout.rows[0]), "› Type your ");
-        assert_eq!(layout.cursor_row, 0);
-        assert_eq!(layout.cursor_col, 0);
-    }
-
-    #[test]
-    fn input_layout_counts_wide_characters_by_display_width() {
-        // Two CJK characters fill a width-4 row; the cursor after the first
-        // sits at display column 2, not byte offset 3.
-        let layout = input_layout("你好", 3, 4, Theme::default(), "", "", "");
-        assert_eq!(layout.cursor_row, 0);
-        assert_eq!(layout.cursor_col, 2);
-    }
-
-    #[test]
-    fn tool_lines_are_one_shell_style_line() {
-        // Running: just the command with the `$` marker.
-        let lines = tool_lines(&record(ToolStatus::Running), false, 60, Theme::default());
-        assert_eq!(lines.len(), 1);
-        assert_eq!(row_text(&lines[0]), "$ cargo test");
-
-        // Success: duration suffix.
-        let lines = tool_lines(&record(ToolStatus::Success), false, 60, Theme::default());
-        assert_eq!(row_text(&lines[0]), "$ cargo test · 1.2s");
-
-        // Failure: cross and the first error line only.
-        let lines = tool_lines(&record(ToolStatus::Failure), false, 60, Theme::default());
-        assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
-
-        // Non-bash tools keep their `tool param` summary shape, with the
-        // verb accented like the `$` marker.
-        let mut read = record(ToolStatus::Success);
-        read.summary = "read src/main.rs".into();
-        let lines = tool_lines(&read, false, 60, Theme::default());
-        assert_eq!(row_text(&lines[0]), "read src/main.rs · 1.2s");
-        assert!(matches!(
-            lines[0].spans[0],
-            Span { .. }
-            if lines[0].spans[0].style.fg == Some(Theme::default().accent)
-        ));
-        assert_eq!(lines[0].spans[0].content, "read");
-        assert_eq!(lines[0].spans[1].content, " src/main.rs");
-
-        // A single-word summary (no parameter) is all accent, no crash.
-        let mut bare = record(ToolStatus::Running);
-        bare.summary = "compact".into();
-        let lines = tool_lines(&bare, false, 60, Theme::default());
-        assert_eq!(row_text(&lines[0]), "compact");
-        assert_eq!(lines[0].spans.len(), 1);
-    }
-
-    #[test]
-    fn tool_lines_expanded_show_output_tail_and_error() {
-        // A finished tool with output and an error: expanded shows the
-        // bounded tail plus later diagnostic lines, indented without repeating
-        // the first preview line.
-        let mut failed = record(ToolStatus::Failure);
-        failed.output = (0..10)
-            .map(|i| format!("out line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let lines = tool_lines(&failed, true, 60, Theme::default());
-        // 1 summary + 4 tail lines (… N above + last 4) + 1 error line.
-        assert_eq!(lines.len(), 1 + 5 + 1);
-        assert_eq!(row_text(&lines[0]), "$ cargo test  ✗ boom");
-        assert_eq!(row_text(&lines[1]), "  … 6 lines above");
-        assert_eq!(row_text(&lines[5]), "  out line 9");
-        assert_eq!(row_text(&lines[6]), "  trace");
-
-        // Collapsed stays compact regardless of retained output.
-        let collapsed = tool_lines(&failed, false, 60, Theme::default());
-        assert_eq!(collapsed.len(), 1);
-
-        // A running tool gains a trailing `running…` marker when expanded.
-        let lines = tool_lines(&record(ToolStatus::Running), true, 60, Theme::default());
-        assert_eq!(row_text(lines.last().unwrap()), "  running…");
-    }
-
-    #[test]
-    fn startup_update_notice_is_rendered_after_header_metadata() {
-        let mut state = CrossTerm::base(
-            "model",
-            "provider",
-            Vec::new(),
-            StartupEntries {
-                update_notice: Some("New version available: v1.2.3 (run `harness update`)".into()),
-                ..StartupEntries::default()
-            },
-            PathBuf::from("."),
-            80,
-            24,
-        );
-        state.enqueue_welcome();
-        assert!(
-            matches!(state.pending.last(), Some(Entry::Notice { text }) if text.contains("v1.2.3"))
-        );
-    }
-
-    #[test]
-    fn metadata_header_shows_context_mcp_and_skill_rows_capped() {
-        let theme = Theme::default();
-        let lines = metadata_lines(
-            "~/proj",
-            Some("feature"),
-            "p",
-            "m",
-            &["AGENTS.md".into(), "~/.harness/AGENTS.md".into()],
-            &["github".into(), "filesystem".into()],
-            &["alpha".into(), "beta".into()],
-            theme,
-        );
-        assert_eq!(lines.len(), 6);
-        assert_eq!(row_text(&lines[0]), "│ cwd       ~/proj  (feature)");
-        assert_eq!(row_text(&lines[1]), "│ provider  p");
-        assert_eq!(row_text(&lines[2]), "│ model     m");
-        assert_eq!(
-            row_text(&lines[3]),
-            "│ context   AGENTS.md, ~/.harness/AGENTS.md"
-        );
-        assert_eq!(row_text(&lines[4]), "│ skills    alpha, beta");
-        assert_eq!(row_text(&lines[5]), "│ mcps      github, filesystem");
-        for line in &lines {
-            assert_eq!(line.spans[0].style.fg, Some(theme.accent));
-            assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
-            assert_eq!(line.spans[2].style.fg, Some(theme.primary_text));
-            assert!(!line.spans[2].style.add_modifier.contains(Modifier::DIM));
-        }
-
-        // More than the cap folds into `+N more`.
-        let many = (0..6).map(|index| format!("s{index}")).collect::<Vec<_>>();
-        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &many, theme);
-        assert_eq!(lines.len(), 4);
-        assert_eq!(row_text(&lines[3]), "│ skills    s0, s1, s2, s3 · +2 more");
-
-        // Nothing loaded: no extra rows.
-        let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &[], theme);
-        assert_eq!(lines.len(), 3);
-    }
-
-    #[test]
-    fn long_metadata_rows_fit_narrow_widths() {
-        // TUI-2: header metadata (cwd/branch/provider/model/context/skills)
-        // goes through `entry_lines` → `fit_line_to_width`, so even
-        // pathological inputs fit widths 1–3 as well as normal widths.
-        let long_cwd = "/very/long/working/directory/that/keeps/going/and/going";
-        let long_branch = "feature/extremely-long-branch-name-that-never-ends";
-        let long_model = "some-provider-model-with-an-absurdly-long-identifier-v99";
-        let many_context: Vec<String> = (0..10)
-            .map(|index| format!("/deep/path/to/AGENTS-{index}.md"))
-            .collect();
-        let many_mcps: Vec<String> = (0..10).map(|index| format!("mcp-server-{index}")).collect();
-        let many_skills: Vec<String> = (0..10)
-            .map(|index| format!("skill-number-{index}"))
-            .collect();
-        for width in [1usize, 2, 3, 10, 40, 80] {
-            let lines = metadata_lines(
-                long_cwd,
-                Some(long_branch),
-                "provider-with-a-long-name",
-                long_model,
-                &many_context,
-                &many_mcps,
-                &many_skills,
-                Theme::default(),
-            );
-            // Mirror the `entry_lines` Metadata path: fit every row.
-            let fitted: Vec<_> = lines
-                .iter()
-                .map(|line| crate::render::fit_line_to_width(line, width))
-                .collect();
-            assert!(
-                fitted.iter().all(|line| row_width(line) <= width),
-                "width {width}: {:?}",
-                fitted.iter().map(row_text).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn line_to_ansi_sanitizes_untrusted_content_but_keeps_generated_styles() {
-        let line = Line::from(Span::styled(
-            "safe\t\u{1b}[2J\u{1b}]52;c;secret\u{07}done",
-            Style::default().fg(Theme::default().accent),
-        ));
-        let ansi = line_to_ansi(&line);
-        assert!(ansi.contains("safe    done"), "{ansi:?}");
-        assert!(!ansi.contains("secret"), "OSC payload leaked: {ansi:?}");
-        assert!(!ansi.contains("[2J"), "CSI payload leaked: {ansi:?}");
-        assert!(
-            ansi.contains("\u{1b}["),
-            "generated style is missing: {ansi:?}"
-        );
-    }
-
-    #[test]
-    fn line_to_ansi_emits_style_codes_only_for_styled_spans() {
-        let styled = Line::from(Span::styled(
-            "hi",
-            Style::default()
-                .fg(Theme::default().accent)
-                .add_modifier(Modifier::BOLD),
-        ));
-        let ansi = line_to_ansi(&styled);
-        assert!(ansi.contains("\u{1b}["));
-        assert!(ansi.ends_with("\u{1b}[0m"));
-
-        let plain = Line::from("plain");
-        assert_eq!(line_to_ansi(&plain), "plain");
-    }
-
-    #[test]
-    fn line_to_ansi_resets_bold_between_the_input_prefix_and_text() {
-        let layout = input_layout("first\nsecond", 12, 40, Theme::default(), "", "", "");
-        let first = line_to_ansi(&layout.rows[0]);
-        let second = line_to_ansi(&layout.rows[1]);
-
-        // The bold prefix is followed by a reset before normal input text;
-        // both logical input rows therefore render at the same weight.
-        assert!(first.contains("› \u{1b}[0m"));
-        assert!(!second.contains(&format!("{}", SetAttribute(Attribute::Bold))));
-    }
-
-    #[test]
-    fn editor_helpers_respect_char_boundaries() {
-        let mut input = String::new();
-        let mut cursor = 0usize;
-        insert_text(&mut input, &mut cursor, "aé你");
-        assert_eq!(cursor, 1 + 2 + 3);
-
-        delete_backward(&mut input, &mut cursor);
-        assert_eq!(input, "aé");
-        assert_eq!(cursor, 3);
-
-        move_left(&input, &mut cursor);
-        assert_eq!(cursor, 1);
-        move_right(&input, &mut cursor);
-        assert_eq!(cursor, 3);
-        delete_forward(&mut input, &mut cursor);
-        assert_eq!(input, "aé");
-
-        // CRLF paste payloads normalize to a single newline.
-        let mut input = String::new();
-        let mut cursor = 0usize;
-        insert_text(&mut input, &mut cursor, "a\r\nb");
-        assert_eq!(input, "a\nb");
-    }
-
-    #[test]
-    fn vertical_move_crosses_logical_lines_and_preserves_columns() {
-        let input = "abc\ndefghi\nx";
-        // Cursor 7 sits after "def" (column 3): moving up lands after "abc".
-        assert_eq!(vertical_move(input, 7, -1), Some(3));
-        assert_eq!(vertical_move(input, 1, 1), Some(5)); // after "a" → "d|efghi"
-        assert_eq!(vertical_move(input, 1, -1), None); // already on the first line
-        assert_eq!(vertical_move(input, input.len(), 1), None); // last line
-    }
-
-    #[test]
-    fn narrow_build_regions_keep_rows_and_cursor_bounded() {
-        for width in 1..=3 {
-            let mut ui = ui(width, 4);
-            ui.input = "你好\ttext".into();
-            ui.cursor = ui.input.len();
-            ui.busy = true;
-            let input = ui.input_layout();
-            let build = ui.build_region(&input);
-            assert!(build.rows.len() <= 4);
-            assert!(
-                build
-                    .rows
-                    .iter()
-                    .all(|line| row_width(line) <= render::content_width(width))
-            );
-            assert!(build.cursor_row < build.rows.len());
-            assert!(build.cursor_col < width as usize);
-        }
-    }
-
-    #[test]
-    fn activity_row_is_cleared_when_height_clipping_drops_it() {
-        for height in [1, 2] {
-            let mut ui = ui(20, height);
-            ui.busy = true;
-            let input = ui.input_layout();
-            let build = ui.build_region(&input);
-            assert_eq!(build.activity_row, None, "height {height}");
-            ui.region = build.rows;
-            ui.activity_region_row = build.activity_row;
-            assert!(!ui.repaint_activity_only().unwrap());
-        }
-    }
-
-    #[test]
-    fn plain_home_and_end_match_ctrl_a_and_ctrl_e() {
-        let (input_tx, _input_rx) = mpsc::unbounded_channel();
-        let cancel = CancellationToken::new();
-        let mut ui = ui(40, 10);
-        ui.input = "first\nsecond".into();
-        ui.cursor = ui.input.len();
-
-        ui.handle_input(
-            &Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
-            &input_tx,
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(ui.cursor, "first\n".len());
-        ui.handle_input(
-            &Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)),
-            &input_tx,
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(ui.cursor, ui.input.len());
-
-        ui.cursor = ui.input.len();
-        ui.handle_input(
-            &Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
-            &input_tx,
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(ui.cursor, "first\n".len());
-        ui.handle_input(
-            &Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
-            &input_tx,
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(ui.cursor, ui.input.len());
-    }
-
-    #[test]
-    fn stream_caches_completed_markdown_blocks() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(UiEvent::TextDelta("first\n\nsecond".into()));
-        let first_cache = ui.stream_markdown_cache.as_ref().unwrap();
-        assert_eq!(first_cache.source_offset, "first\n\n".len());
-        assert_eq!(first_cache.rendered_blocks, 1);
-        let first_lines = first_cache.lines.clone();
-        ui.apply_event(UiEvent::TextDelta(" more".into()));
-        let cache = ui.stream_markdown_cache.as_ref().unwrap();
-        assert_eq!(cache.source_offset, "first\n\n".len());
-        assert_eq!(cache.rendered_blocks, 1);
-        assert_eq!(cache.lines, first_lines);
-        let rendered = ui.stream_tail_lines(render::content_width(ui.width));
-        assert!(row_text(rendered.last().unwrap()).contains("second"));
-    }
-
-    #[test]
-    fn history_window_visits_newest_entries_and_marks_hidden_rows() {
-        let entries = vec![
-            Entry::User { text: "old".into() },
-            Entry::User {
-                text: "middle".into(),
-            },
-            Entry::User { text: "new".into() },
-        ];
-        let rows = history_window(&entries, 3, 80, Theme::default(), false);
-        assert_eq!(rows.len(), 3);
-        assert!(row_text(&rows[0]).contains("older rows"));
-        assert!(row_text(&rows[2]).contains("new"));
-    }
-
-    #[test]
-    fn build_region_clips_the_streaming_tail_to_the_screen() {
-        let mut ui = ui(80, 10);
-        ui.stream = Some(StreamState {
-            reasoning: String::new(),
-            // One giant single block: no stable split, so the display clip is
-            // the only bound. The full text prints when the message
-            // finalizes.
-            markdown: (0..60).map(|i| format!("line {i}\n")).collect(),
-            ..StreamState::default()
-        });
-        let input = ui.input_layout();
-        let build = ui.build_region(&input);
-        assert!(build.rows.len() <= 10, "region must fit the screen");
-        // The newest rows are visible and the input line is at the bottom.
-        let last = row_text(build.rows.last().expect("input row"));
-        assert_eq!(last, format!("› {PLACEHOLDER}"));
-        let text: String = build
-            .rows
-            .iter()
-            .map(row_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("line 59"));
-        assert!(!text.contains("line 0"));
-    }
-
-    #[test]
-    fn build_region_clips_huge_input_around_the_cursor() {
-        let mut ui = ui(80, 10);
-        ui.input = (0..50)
-            .map(|i| format!("row{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        ui.cursor = ui.input.len();
-        let input = ui.input_layout();
-        assert!(input.rows.len() > 10);
-        let build = ui.build_region(&input);
-        assert!(build.rows.len() <= 10);
-        // The cursor (at the end of the draft) stays inside the window.
-        assert!(build.cursor_row < build.rows.len());
-        let last = row_text(build.rows.last().expect("clipped input"));
-        assert_eq!(last, "  row49");
-    }
-
-    #[test]
-    fn commit_stream_prefix_moves_stable_blocks_into_pending() {
-        let mut ui = ui(80, 8);
-        // A first paragraph tall enough to outgrow the height-8 tail budget
-        // (~4 rows), followed by an unfinished second paragraph.
-        let tall = format!("{}\n\n", "word ".repeat(100));
-        ui.stream = Some(StreamState {
-            reasoning: String::new(),
-            markdown: tall.clone() + &"second ".repeat(30),
-            ..StreamState::default()
-        });
-        let input = ui.input_layout();
-        ui.commit_stream_prefix(input.rows.len());
-        // The stable first paragraph was committed and drained from the live
-        // stream.
-        assert_eq!(ui.pending.len(), 1);
-        assert_eq!(
-            ui.stream.as_ref().expect("tail remains").markdown,
-            "second ".repeat(30)
-        );
-        match &ui.pending[0] {
-            Entry::Assistant { markdown, .. } => assert_eq!(markdown, &tall),
-            other => panic!("expected assistant prefix entry, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn full_repaint_prints_a_stream_prefix_committed_during_the_repaint() {
-        // A full repaint prints only `transcript`. A prefix committed after
-        // pending entries moved there was never printed.
-        let mut ui = ui(80, 8);
-        let tall = format!("{}\n\n", "word ".repeat(100));
-        ui.stream = Some(StreamState {
-            reasoning: String::new(),
-            markdown: tall.clone() + &"second ".repeat(30),
-            ..StreamState::default()
-        });
-        let (_build, _oversized) = ui.stage_full_repaint();
-        assert!(ui.pending.is_empty());
-        let prefixes = ui
-            .transcript
-            .iter()
-            .filter(|entry| matches!(entry, Entry::Assistant { markdown, .. } if *markdown == tall))
-            .count();
-        assert_eq!(prefixes, 1);
-    }
-
-    #[test]
-    fn commit_stream_prefix_keeps_short_blocks_live() {
-        let mut ui = ui(80, 24);
-        ui.stream = Some(StreamState {
-            reasoning: String::new(),
-            markdown: "short\n\nanswer".into(),
-            ..StreamState::default()
-        });
-        let input = ui.input_layout();
-        ui.commit_stream_prefix(input.rows.len());
-        assert!(ui.pending.is_empty());
-        assert_eq!(
-            ui.stream.as_ref().expect("stream remains").markdown,
-            "short\n\nanswer"
-        );
-    }
-
-    #[test]
-    fn prewalk_is_never_shown_armed_without_a_target() {
-        let mut ui = ui(80, 24);
-        ui.apply_event(UiEvent::PrewalkChanged {
-            armed: true,
-            target: None,
-            reasoning: None,
-            change: PrewalkChange::Session,
-        });
-        assert!(!ui.prewalk_armed);
-    }
-
-    #[test]
-    fn finalize_stream_commits_the_live_message() {
-        let mut live = ui(80, 24);
-        live.stream = Some(StreamState {
-            reasoning: "thinking".into(),
-            markdown: "answer".into(),
-            ..StreamState::default()
-        });
-        live.finalize_stream();
-        assert!(live.stream.is_none());
-        match &live.pending[0] {
-            Entry::Assistant {
-                markdown,
-                reasoning,
-            } => {
-                assert_eq!(markdown, "answer");
-                assert_eq!(reasoning, "thinking");
-            }
-            other => panic!("expected assistant entry, got {other:?}"),
-        }
-
-        // An empty stream finalizes to nothing.
-        let mut empty = ui(80, 24);
-        empty.stream = Some(StreamState::default());
-        empty.finalize_stream();
-        assert!(empty.pending.is_empty());
-    }
-
-    #[test]
-    fn session_events_reset_the_transcript_and_queue_a_separator() {
-        let mut loaded_ui = ui(80, 24);
-        loaded_ui
-            .transcript
-            .push(Entry::User { text: "old".into() });
-        loaded_ui.stream = Some(StreamState {
-            reasoning: String::new(),
-            markdown: "live".into(),
-            ..StreamState::default()
-        });
-        loaded_ui.apply_event(UiEvent::SessionChanged {
-            id: "abcd1234efgh".into(),
-            title: None,
-            loaded: true,
-        });
-        assert!(loaded_ui.transcript.is_empty());
-        assert!(loaded_ui.stream.is_none());
-        // The live message finalizes first, then the separator follows it.
-        assert!(matches!(&loaded_ui.pending[0], Entry::Assistant { .. }));
-        assert!(
-            matches!(&loaded_ui.pending[1], Entry::Separator { label } if label == "Loaded Session abcd1234")
-        );
-
-        let mut startup = ui(80, 24);
-        startup.apply_event(UiEvent::SessionChanged {
-            id: "initial".into(),
-            title: None,
-            loaded: false,
-        });
-        assert!(matches!(&startup.pending[0], Entry::Separator { label } if label.is_empty()));
-        startup.apply_event(UiEvent::SessionChanged {
-            id: "next".into(),
-            title: None,
-            loaded: false,
-        });
-        assert!(
-            matches!(&startup.pending[1], Entry::Separator { label } if label == "New Session")
-        );
-
-        let mut minimal = ui(80, 24);
-        minimal.minimal = true;
-        minimal.apply_event(UiEvent::SessionChanged {
-            id: "initial".into(),
-            title: None,
-            loaded: false,
-        });
-        assert!(minimal.pending.is_empty());
-    }
-
-    #[test]
-    fn direct_provider_prefix_requests_its_model_catalogue() {
-        let mut ui = ui(80, 24);
-        ui.input = "/model openrouter:".into();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(InputMessage::ListModels {
-                provider: "openrouter".into(),
-            })
-        );
-        // A partially typed `provider:model` token addresses the same
-        // catalogue even before the prefix is Tab-accepted.
-        let mut ui2 = tests::ui(80, 24);
-        ui2.input = "/model openrouter:anthropic/claude".into();
-        ui2.cursor = ui2.input.len();
-        ui2.refresh_completion();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        ui2.request_typed_backend(&tx, false).unwrap();
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(InputMessage::ListModels {
-                provider: "openrouter".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn failed_sessions_command_does_not_print_a_later_completion_list() {
-        let mut ui = ui(80, 24);
-        let (tx, _rx) = mpsc::unbounded_channel();
-        ui.submit_command("/sessions", &tx).unwrap();
-        ui.apply_event(UiEvent::Error("could not list sessions: x".into()));
-        ui.apply_event(UiEvent::SessionList {
-            sessions: Vec::new(),
-        });
-        assert!(!ui.pending.iter().any(|entry| matches!(
-            entry,
-            Entry::Notice { text } if text == "No sessions for this workspace"
-        )));
-    }
-
-    fn load_ui() -> CrossTerm {
-        let mut ui = ui(80, 24);
-        ui.input = "/load ".into();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        ui
-    }
-
-    #[tokio::test]
-    async fn failed_session_fetch_retries_on_tab_not_on_typing() {
-        let mut ui = load_ui();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
-        ui.apply_event(UiEvent::Error("could not list sessions: x".into()));
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert!(rx.try_recv().is_err());
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
-    }
-
-    #[tokio::test]
-    async fn empty_session_list_is_not_refetched_per_keystroke() {
-        let mut ui = load_ui();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert_eq!(rx.try_recv().ok(), Some(InputMessage::ListSessions));
-        ui.apply_event(UiEvent::SessionList {
-            sessions: Vec::new(),
-        });
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn failed_model_fetch_retries_on_tab_not_on_typing() {
-        let mut ui = ui(80, 24);
-        ui.input = "/model openrouter:".into();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let request = InputMessage::ListModels {
-            provider: "openrouter".into(),
-        };
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert_eq!(rx.try_recv().ok(), Some(request.clone()));
-        // Still in flight: no duplicate request.
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert!(rx.try_recv().is_err());
-        ui.apply_event(UiEvent::BackgroundOperationFinished {
-            id: 1,
-            error: Some("model list failed".into()),
-        });
-        ui.request_typed_backend(&tx, false).unwrap();
-        assert!(rx.try_recv().is_err());
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(rx.try_recv().ok(), Some(request));
-    }
-
-    #[tokio::test]
-    async fn load_completion_combines_session_and_filesystem_context() {
-        let mut ui = ui(80, 24);
-        ui.input = "/load ./".into();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let completion = ui.completion.as_ref().expect("load completion");
-        assert_eq!(completion.kind, CompletionKind::Path);
-        assert_eq!(
-            completion.context.target,
-            CompletionTarget::Argument(ArgumentKind::Session)
-        );
-        assert_eq!(completion.context.query, "./");
-        // The debounced scan merges filesystem candidates with the static
-        // session-ID candidates (TUI-3: `/load` completes both).
-        let scanned = crate::paths::find_path_candidates(
-            &ui.environment.cwd,
-            "./",
-            &CancellationToken::new(),
-        );
-        let merged = merge_candidates(
-            commands::candidates_at_cursor(
-                &ui.input,
-                ui.cursor_char_col(),
-                &ui.providers,
-                &ui.model_lists,
-                &ui.provider,
-                &ui.session_candidates,
-                &ui.skills,
-            )
-            .map(|result| result.candidates)
-            .unwrap_or_default(),
-            scanned,
-        );
-        assert!(
-            !merged.is_empty(),
-            "`/load ./...` must produce filesystem candidates"
-        );
-        // And session IDs survive the merge when present: an empty query
-        // (`/load ` with no prefix) matches every cached session.
-        ui.input = "/load ".into();
-        ui.cursor = ui.input.len();
-        ui.session_candidates = vec![SessionListEntry {
-            id: "abc123-full".into(),
-            short_id: "abc123".into(),
-            title: None,
-            updated_at: "2026-08-13 12:00".into(),
-            workspace: "/workspace".into(),
-            provider: None,
-            model: None,
-        }];
-        let merged_with_session = merge_candidates(
-            commands::candidates_at_cursor(
-                &ui.input,
-                ui.cursor_char_col(),
-                &ui.providers,
-                &ui.model_lists,
-                &ui.provider,
-                &ui.session_candidates,
-                &ui.skills,
-            )
-            .map(|result| result.candidates)
-            .unwrap_or_default(),
-            Vec::new(),
-        );
-        assert!(
-            merged_with_session
-                .iter()
-                .any(|candidate| candidate.value.contains("abc123")),
-            "session IDs must survive alongside path candidates"
-        );
-    }
-
-    #[test]
-    fn completion_tab_accepts_the_best_ranked_provider() {
-        let mut ui = ui(80, 24);
-        ui.input = "/model open".to_owned();
-        ui.cursor = ui.input.len();
-        let (tx, mut rx) = mpsc::unbounded_channel::<InputMessage>();
-        // Provider completion is fuzzy-ranked; Tab accepts the best match.
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(ui.input, "/model openrouter:");
-        // Accepting the provider requested its model list on demand.
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(InputMessage::ListModels {
-                provider: "openrouter".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn fuzzy_model_tab_accepts_a_provider_qualified_match() {
-        let mut ui = ui(80, 24);
-        ui.model_lists.insert(
-            "openrouter".into(),
-            vec![ModelEntry {
-                id: "anthropic/claude-sonnet-4".into(),
-                name: Some("Claude Sonnet 4".into()),
-                context_length: Some(200_000),
-            }],
-        );
-        ui.input = "/model cs4".to_owned();
-        ui.cursor = ui.input.len();
-        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(ui.input, "/model openrouter:anthropic/claude-sonnet-4");
-    }
-
-    #[test]
-    fn ghost_previews_a_single_candidate_suffix() {
-        let mut ui = ui(80, 24);
-        ui.input = "/model openc".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        // Only `opencode-go:` matches "openc", so the ghost shows its untyped
-        // remainder.
-        assert_eq!(ui.ghost_text(), "ode-go:");
-    }
-
-    #[tokio::test]
-    async fn at_reference_opens_a_file_completion_context() {
-        let mut ui = ui(80, 24);
-        ui.input = "see @src/ma".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        // The `@` token opens a path completion even though the draft is not
-        // a slash command; the scan starts from the token's query.
-        let completion = ui.completion.as_ref().expect("@ opens completion");
-        assert_eq!(completion.kind, CompletionKind::Path);
-        assert_eq!(completion.context.token_start, 4);
-        assert_eq!(completion.context.query, "src/ma");
-        assert_eq!(ui.path_completion_query.as_deref(), Some("src/ma"));
-
-        // Moving the cursor off the token (e.g. after a space) closes it.
-        ui.input.push(' ');
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        assert!(ui.completion.is_none());
-    }
-
-    #[tokio::test]
-    async fn at_reference_scan_results_replace_the_candidate_list() {
-        let mut ui = ui(80, 24);
-        ui.input = "look at @Re".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let generation = ui.path_completion_generation;
-        let context = ui.completion.as_ref().unwrap().context.clone();
-        ui.apply_path_completion(PathCompletionResult {
-            generation,
-            context,
-            candidates: vec![Candidate {
-                value: "@src/README.md".into(),
-                description: "file".into(),
-                kind: CandidateKind::File,
-            }],
-            at_prefix: paths::extract_at_prefix("look at @Re", 11),
-        });
-        let completion = ui.completion.as_ref().expect("candidates applied");
-        assert_eq!(completion.candidates[0].value, "@src/README.md");
-        // A fuzzy match (`Re` → README) shares no literal prefix with the
-        // typed token, so there is no ghost to preview.
-        assert_eq!(ui.ghost_text(), "");
-        // Tab accepts the candidate and appends a trailing space.
-        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(ui.input, "look at @src/README.md ");
-    }
-
-    #[tokio::test]
-    async fn tab_accepts_scanned_export_and_load_paths() {
-        for command in ["/export ", "/load "] {
-            let mut ui = ui(80, 24);
-            ui.input = format!("{command}notes");
-            ui.cursor = ui.input.len();
-            ui.refresh_completion();
-            let generation = ui.path_completion_generation;
-            let context = ui
-                .completion
-                .as_ref()
-                .expect("path scan started")
-                .context
-                .clone();
-            ui.apply_path_completion(PathCompletionResult {
-                generation,
-                context,
-                candidates: vec![Candidate {
-                    value: "notes/today.md".into(),
-                    description: "file".into(),
-                    kind: CandidateKind::File,
-                }],
-                at_prefix: None,
-            });
-            // Tab refreshes completion first; unchanged context must keep the
-            // scanned result instead of clearing it.
-            let (tx, _rx) = mpsc::unbounded_channel::<InputMessage>();
-            ui.handle_tab(&tx).unwrap();
-            assert!(
-                ui.input.starts_with(&format!("{command}notes/today.md")),
-                "{}",
-                ui.input
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn tab_accepts_the_top_ranked_at_candidate_then_cycles() {
-        let mut ui = ui(80, 24);
-        ui.input = "look at @REA".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let generation = ui.path_completion_generation;
-        let context = ui.completion.as_ref().unwrap().context.clone();
-        // Ranking put the root README first (see the paths tests).
-        ui.apply_path_completion(PathCompletionResult {
-            generation,
-            context,
-            candidates: vec![
-                Candidate {
-                    value: "@README.md".into(),
-                    description: "file".into(),
-                    kind: CandidateKind::File,
-                },
-                Candidate {
-                    value: "@crates/agent/README.md".into(),
-                    description: "file".into(),
-                    kind: CandidateKind::File,
-                },
-            ],
-            at_prefix: paths::extract_at_prefix("look at @REA", 11),
-        });
-
-        // The ghost previews exactly what Tab will insert.
-        assert_eq!(ui.ghost_text(), "DME.md");
-
-        // First Tab accepts the top-ranked candidate; the trailing space ends
-        // the token so typing continues on a fresh one.
-        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(ui.input, "look at @README.md ");
-    }
-
-    #[tokio::test]
-    async fn fuzzy_at_tab_accepts_the_ranked_match_and_a_repeat_cycles() {
-        let mut ui = ui(80, 24);
-        ui.input = "@agent.rs".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let generation = ui.path_completion_generation;
-        let context = ui.completion.as_ref().unwrap().context.clone();
-        ui.apply_path_completion(PathCompletionResult {
-            generation,
-            context,
-            candidates: vec![
-                Candidate {
-                    value: "@crates/agent/src/agent.rs".into(),
-                    description: "file".into(),
-                    kind: CandidateKind::File,
-                },
-                Candidate {
-                    value: "@crates/tui/src/app.rs".into(),
-                    description: "file".into(),
-                    kind: CandidateKind::File,
-                },
-            ],
-            at_prefix: paths::extract_at_prefix("@agent.rs", 9),
-        });
-
-        // No literal extension of `@agent.rs` exists, so nothing is dimmed
-        // inline — but Tab still completes to the ranked match.
-        assert_eq!(ui.ghost_text(), "");
-        let (tx, _) = mpsc::unbounded_channel::<InputMessage>();
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(ui.input, "@crates/agent/src/agent.rs ");
-
-        // The accepted file closes the list; re-opening on the same token and
-        // pressing Tab again cycles to the next candidate.
-        ui.cursor = "@crates/agent/src/agent.rs".len();
-        ui.refresh_completion();
-        let generation = ui.path_completion_generation;
-        let context = ui.completion.as_ref().unwrap().context.clone();
-        ui.apply_path_completion(PathCompletionResult {
-            generation,
-            context,
-            candidates: vec![
-                Candidate {
-                    value: "@crates/agent/src/agent.rs".into(),
-                    description: "file".into(),
-                    kind: CandidateKind::File,
-                },
-                Candidate {
-                    value: "@crates/tui/src/app.rs".into(),
-                    description: "file".into(),
-                    kind: CandidateKind::File,
-                },
-            ],
-            at_prefix: paths::extract_at_prefix("@crates/agent/src/agent.rs", 26),
-        });
-        ui.handle_tab(&tx).unwrap();
-        assert_eq!(ui.input, "@crates/tui/src/app.rs ");
-    }
-
-    #[tokio::test]
-    async fn enter_still_submits_while_an_at_list_is_open() {
-        let mut ui = ui(80, 24);
-        ui.input = "look at @Re".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let generation = ui.path_completion_generation;
-        let context = ui.completion.as_ref().unwrap().context.clone();
-        ui.apply_path_completion(PathCompletionResult {
-            generation,
-            context,
-            candidates: vec![Candidate {
-                value: "@README.md".into(),
-                description: "file".into(),
-                kind: CandidateKind::File,
-            }],
-            at_prefix: paths::extract_at_prefix("look at @Re", 11),
-        });
-
-        // Enter is submit-only: completion stays a Tab affair.
-        let (tx, mut rx) = mpsc::unbounded_channel::<InputMessage>();
-        let cancel = CancellationToken::new();
-        let enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
-        ui.handle_input(&enter, &tx, &cancel).unwrap();
-        assert_eq!(
-            rx.try_recv().ok(),
-            Some(InputMessage::Message("look at @Re".into()))
-        );
-    }
-
-    #[tokio::test]
-    async fn refining_an_at_query_keeps_the_previous_candidates_visible() {
-        let mut ui = ui(80, 24);
-        ui.input = "look at @Re".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let generation = ui.path_completion_generation;
-        let context = ui.completion.as_ref().unwrap().context.clone();
-        ui.apply_path_completion(PathCompletionResult {
-            generation,
-            context,
-            candidates: vec![Candidate {
-                value: "@README.md".into(),
-                description: "file".into(),
-                kind: CandidateKind::File,
-            }],
-            at_prefix: paths::extract_at_prefix("look at @Re", 11),
-        });
-
-        // Keep typing: the refined scan is still in flight, but the open
-        // list must not blank out while waiting for it.
-        ui.input.push('a');
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let completion = ui.completion.as_ref().expect("list stays open");
-        assert_eq!(completion.candidates.len(), 1);
-        assert_eq!(completion.candidates[0].value, "@README.md");
-        assert_eq!(ui.path_completion_query.as_deref(), Some("Rea"));
-    }
-
-    #[tokio::test]
-    async fn stale_at_scan_results_are_ignored() {
-        let mut ui = ui(80, 24);
-        ui.input = "@a".to_owned();
-        ui.cursor = ui.input.len();
-        ui.refresh_completion();
-        let generation = ui.path_completion_generation;
-        let context = ui.completion.as_ref().unwrap().context.clone();
-        // The user kept typing before the scan landed: the result is stale.
-        ui.input = "@ab".to_owned();
-        ui.cursor = ui.input.len();
-        ui.apply_path_completion(PathCompletionResult {
-            generation,
-            context,
-            candidates: vec![Candidate {
-                value: "@a.txt".into(),
-                description: "file".into(),
-                kind: CandidateKind::File,
-            }],
-            at_prefix: paths::extract_at_prefix("@a", 2),
-        });
-        let completion = ui.completion.as_ref().expect("still open for @ab");
-        assert!(completion.candidates.is_empty());
-    }
-
-    #[test]
-    fn completion_hint_is_always_one_bounded_visual_row() {
-        let candidates = vec![
-            Candidate {
-                value: "openrouter:anthropic/claude-sonnet-4-very-long-name".into(),
-                description: String::new(),
-                kind: CandidateKind::Slash,
-            },
-            Candidate {
-                value: "github-copilot:claude-sonnet-4".into(),
-                description: String::new(),
-                kind: CandidateKind::Slash,
-            },
-        ];
-        let hint = fit_completion_hint(&candidates, 0, 24);
-        assert!(UnicodeWidthStr::width(hint.as_str()) <= 24);
-        assert!(hint.ends_with('…'));
-        assert!(!hint.contains(['\n', '\r']));
-
-        // The selected candidate leads even when it is not index zero.
-        let hint = fit_completion_hint(&candidates, 1, 80);
-        assert!(hint.starts_with("github-copilot:"));
-    }
-
-    #[test]
-    fn input_layout_renders_ghost_and_hint_rows() {
-        // Ghost suffix follows the typed text on the input row.
-        let layout = input_layout("/model openc", 12, 60, Theme::default(), "", "ode-go:", "");
-        assert_eq!(row_text(&layout.rows[0]), "› /model opencode-go:");
-        assert_eq!(layout.cursor_row, 0);
-
-        // The completion hint row sits below the input without moving it.
-        let layout = input_layout(
-            "/model",
-            6,
-            60,
-            Theme::default(),
-            "",
-            "",
-            "opencode-go: · openrouter:",
-        );
-        assert_eq!(row_text(&layout.rows[0]), "› /model");
-        assert_eq!(row_text(&layout.rows[1]), "  opencode-go: · openrouter:");
-        assert_eq!(layout.cursor_row, 0);
-    }
-}
+mod tests;
