@@ -2479,31 +2479,7 @@ impl Drop for CrossTerm {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry rendering
-// ---------------------------------------------------------------------------
-
-/// An accent bar and aligned, muted labels make startup details easy to scan.
-/// Values use the terminal's normal text colour; optional context, skill, and
-/// MCP rows remain capped at [`METADATA_MAX_ENTRIES`] names.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the renderer keeps each metadata row explicit for focused tests"
-)]
-// ---------------------------------------------------------------------------
-// Input line layout
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Input editing (pure helpers over `String` + byte cursor)
-// ---------------------------------------------------------------------------
-
-// Editing moves and deletes whole grapheme clusters (a family emoji, a
-// flag, an accented letter with a combining mark), never part of one.
-
-// ---------------------------------------------------------------------------
-// ANSI output
-// ---------------------------------------------------------------------------
+// Submodules: each owns a seam of the screen model described above.
 mod usage;
 use usage::*;
 

@@ -432,6 +432,13 @@ pub(super) fn fold_entries(entries: &[String]) -> Option<String> {
     Some(text)
 }
 
+/// An accent bar and aligned, muted labels make startup details easy to scan.
+/// Values use the terminal's normal text colour; optional context, skill, and
+/// MCP rows remain capped at [`METADATA_MAX_ENTRIES`] names.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the renderer keeps each metadata row explicit for focused tests"
+)]
 pub(super) fn metadata_lines(
     cwd: &str,
     branch: Option<&str>,
