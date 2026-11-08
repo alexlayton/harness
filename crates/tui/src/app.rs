@@ -68,7 +68,7 @@ use crate::environment::EnvironmentInfo;
 use crate::input::{history_next, history_previous, push_history};
 use crate::paths::{self, AtPrefix};
 use crate::program_status;
-use crate::render::{self, Theme};
+use crate::render::{self, StyleExt as _, Theme};
 use crate::state::{ToolRecord, ToolStatus};
 use crate::{
     ContextFileEntry, InputMessage, ModelEntry, PrewalkChange, SessionListEntry,
@@ -83,13 +83,9 @@ use crossterm::event::{
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::style::{
-    Attribute, Color as AnsiColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
+use crossterm::style::{Attribute, ContentStyle};
 use crossterm::terminal::{self, Clear, ClearType};
 use futures_util::StreamExt;
-use ratatui_core::style::{Modifier, Style};
-use ratatui_core::text::{Line, Span, Text};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{self, Stdout, Write};
@@ -100,6 +96,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tui_md::{Row, Run};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -192,7 +189,7 @@ struct ReasoningRender {
     width: usize,
     theme: Theme,
     len: usize,
-    lines: Vec<Line<'static>>,
+    lines: Vec<Row>,
 }
 
 /// Cached rendering for completed markdown blocks in the live stream. The
@@ -202,7 +199,7 @@ struct StreamMarkdownCache {
     width: usize,
     theme: Theme,
     source_offset: usize,
-    lines: Vec<Line<'static>>,
+    lines: Vec<Row>,
     /// Number of completed source chunks parsed into the cache. Besides being
     /// useful when profiling, this guards the incremental-rendering invariant
     /// in colocated tests.
@@ -277,7 +274,7 @@ struct ContextUsage {
 /// One frame's live region: the rows to paint and where the terminal cursor
 /// belongs inside them.
 struct RegionBuild {
-    rows: Vec<Line<'static>>,
+    rows: Vec<Row>,
     cursor_row: usize,
     cursor_col: usize,
     /// Index of the activity row inside `rows` when this frame paints one;
@@ -301,7 +298,7 @@ struct InputSpan {
 /// The active-tool section of a frame: its rendered lines and total row
 /// count (including any overflow row) for the sizing budgets.
 struct RunningRegion {
-    lines: Vec<Line<'static>>,
+    lines: Vec<Row>,
     rows: usize,
 }
 
@@ -409,7 +406,7 @@ pub struct CrossTerm {
     spinner: usize,
 
     /// Rows we believe are painted on screen and may rewrite in place.
-    region: Vec<Line<'static>>,
+    region: Vec<Row>,
     /// Cursor position within `region` (row is 0-based from the region top).
     cursor_row: usize,
     cursor_col: usize,
@@ -576,6 +573,8 @@ impl CrossTerm {
         ui.reasoning = reasoning.to_owned();
         ui.minimal = minimal;
         ui.enqueue_welcome();
+        // Loading grammars costs tens of ms; keep it off the first code block.
+        std::thread::spawn(tui_md::warm_up);
         install_panic_hook(&ui.terminal);
         ui.setup_terminal()?;
         Ok(ui)
@@ -1943,7 +1942,7 @@ impl CrossTerm {
             running.rows + answer_reserve,
         );
 
-        let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
         let mut activity_row_index: Option<usize> = None;
         // Small screens prioritize answer text over gaps.
         let section_gap = if self.ask_answer.is_some() && self.height < 6 {
@@ -2065,11 +2064,11 @@ impl CrossTerm {
             ));
         }
         if hidden > 0 {
-            lines.push(Line::from(Span::styled(
+            lines.push(Row::from(Run::new(
                 format!("… {hidden} more running"),
-                Style::default()
+                ContentStyle::default()
                     .fg(theme.dim_text)
-                    .add_modifier(Modifier::DIM),
+                    .add_modifier(Attribute::Dim),
             )));
         }
         for (_, label) in self
@@ -2084,7 +2083,7 @@ impl CrossTerm {
             .len()
             .saturating_sub(MAX_VISIBLE_RUNNING_TOOLS);
         if hidden_lookups > 0 {
-            lines.push(Line::from(format!(
+            lines.push(Row::plain(format!(
                 "… {hidden_lookups} more lookups running"
             )));
         }
@@ -2098,12 +2097,12 @@ impl CrossTerm {
 
     /// Split and wrap sanitized source before producing terminal rows. The
     /// complete result stays in this transient inline view, never in the transcript.
-    fn ask_lines(&self, width: usize) -> Vec<Line<'static>> {
+    fn ask_lines(&self, width: usize) -> Vec<Row> {
         let answer = render::sanitize_terminal_text(self.ask_answer.as_deref().unwrap_or(""));
         render::wrap_text(
-            &Text::from(answer),
+            &[Row::plain(answer)],
             width,
-            Style::default().fg(self.theme.assistant_text),
+            ContentStyle::default().fg(self.theme.assistant_text),
         )
     }
 
@@ -2143,7 +2142,7 @@ impl CrossTerm {
 
     /// Rendered rows of the in-flight assistant message (reasoning block,
     /// then markdown). Re-rendered from source on every frame.
-    fn stream_tail_lines(&self, width: usize) -> Vec<Line<'static>> {
+    fn stream_tail_lines(&self, width: usize) -> Vec<Row> {
         let Some(stream) = &self.stream else {
             return Vec::new();
         };
@@ -2340,7 +2339,7 @@ impl CrossTerm {
         let content = render::content_width(self.width);
         let gutter = render::horizontal_pad(self.width) as usize;
 
-        let mut above: Vec<Line<'static>> = Vec::new();
+        let mut above: Vec<Row> = Vec::new();
         if clear_all {
             // The separator row between history and the region counts too:
             // without it the frame is one row taller than the screen and its

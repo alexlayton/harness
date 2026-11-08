@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/agent", "crates/auth", "crates/compact", "crates/harness", "crates/llm", "crates/mcp", "crates/python", "crates/session", "crates/tui", "crates/tools"]
+members = ["crates/agent", "crates/auth", "crates/compact", "crates/harness", "crates/llm", "crates/mcp", "crates/python", "crates/session", "crates/tui", "crates/tui-md", "crates/tools"]
 default-members = ["crates/harness", "crates/agent"]
 
 # Release ships lean: symbol tables are stripped, with cross-crate DCE via fat
@@ -26,6 +26,22 @@ codegen-units = 16
 [profile.dev]
 debug = "line-tables-only"
 
+# tui-md highlights code with syntect/fancy-regex, which are pathologically
+# slow unoptimised; keep them fast in dev builds and tests. Profile settings
+# only apply from the workspace root.
+[profile.dev.package.syntect]
+opt-level = 3
+[profile.dev.package.fancy-regex]
+opt-level = 3
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.flate2]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.bincode]
+opt-level = 3
+
 [workspace.package]
 version = "0.10.2"
 edition = "2024"
@@ -40,6 +56,7 @@ mcp = { path = "crates/mcp" }
 session = { path = "crates/session" }
 tools = { path = "crates/tools" }
 tui = { path = "crates/tui" }
+tui-md = { path = "crates/tui-md" }
 # The exact tokio feature set the harness binary needs — `full` used to pull in
 # `net` (unused) and bloated the feature union. Library crates keep their own
 # precise declarations.

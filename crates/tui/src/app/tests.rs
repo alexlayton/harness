@@ -3,6 +3,11 @@ use crossterm::event::KeyEvent;
 use std::panic::AssertUnwindSafe;
 use std::sync::OnceLock;
 
+/// ANSI for one row as the frame writer produces it: sanitized, then styled.
+fn ansi_of(line: &Row) -> String {
+    render::fit_line_to_width(line, usize::MAX).to_ansi()
+}
+
 fn ui(width: u16, height: u16) -> CrossTerm {
     CrossTerm::base(
         "test-model",
@@ -99,17 +104,17 @@ fn successful_terminal_ui(backend: &MockTerminal) -> CrossTerm {
     ui
 }
 
-fn row_text(line: &Line<'_>) -> String {
-    line.spans
+fn row_text(line: &Row) -> String {
+    line.runs
         .iter()
-        .map(|span| span.content.as_ref())
+        .map(|span| span.text.as_str())
         .collect::<String>()
 }
 
-fn row_width(line: &Line<'_>) -> usize {
-    line.spans
+fn row_width(line: &Row) -> usize {
+    line.runs
         .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .map(|span| UnicodeWidthStr::width(span.text.as_str()))
         .sum()
 }
 
@@ -174,10 +179,10 @@ fn editing_moves_and_deletes_whole_grapheme_clusters() {
 fn wrapped_rows_never_split_a_grapheme_cluster() {
     let text = "ab👨‍👩‍👧cd🇳🇿e\u{301}";
     for width in 1..8 {
-        let rows = render::wrap_text(&Text::from(text.to_owned()), width, Style::default());
+        let rows = render::wrap_text(&[Row::plain(text)], width, ContentStyle::default());
         let joined = rows
             .iter()
-            .flat_map(|row| row.spans.iter().map(|span| span.content.to_string()))
+            .flat_map(|row| row.runs.iter().map(|span| span.text.to_string()))
             .collect::<String>();
         // Clusters wider than the row are dropped whole, never split:
         // every emitted cluster is one of the original clusters.
@@ -186,9 +191,9 @@ fn wrapped_rows_never_split_a_grapheme_cluster() {
             .collect::<std::collections::HashSet<_>>();
         for row in &rows {
             let row_text = row
-                .spans
+                .runs
                 .iter()
-                .map(|span| span.content.as_ref())
+                .map(|span| span.text.as_str())
                 .collect::<String>();
             for cluster in row_text.graphemes(true) {
                 assert!(originals.contains(cluster), "width {width}: {cluster:?}");
@@ -1162,20 +1167,19 @@ fn tool_lines_are_one_shell_style_line() {
     read.summary = "read src/main.rs".into();
     let lines = tool_lines(&read, false, 60, Theme::default());
     assert_eq!(row_text(&lines[0]), "read src/main.rs · 1.2s");
-    assert!(matches!(
-        lines[0].spans[0],
-        Span { .. }
-        if lines[0].spans[0].style.fg == Some(Theme::default().accent)
-    ));
-    assert_eq!(lines[0].spans[0].content, "read");
-    assert_eq!(lines[0].spans[1].content, " src/main.rs");
+    assert_eq!(
+        lines[0].runs[0].style.foreground_color,
+        Some(Theme::default().accent)
+    );
+    assert_eq!(lines[0].runs[0].text, "read");
+    assert_eq!(lines[0].runs[1].text, " src/main.rs");
 
     // A single-word summary (no parameter) is all accent, no crash.
     let mut bare = record(ToolStatus::Running);
     bare.summary = "compact".into();
     let lines = tool_lines(&bare, false, 60, Theme::default());
     assert_eq!(row_text(&lines[0]), "compact");
-    assert_eq!(lines[0].spans.len(), 1);
+    assert_eq!(lines[0].runs.len(), 1);
 }
 
 #[test]
@@ -1249,10 +1253,13 @@ fn metadata_header_shows_context_mcp_and_skill_rows_capped() {
     assert_eq!(row_text(&lines[4]), "│ skills    alpha, beta");
     assert_eq!(row_text(&lines[5]), "│ mcps      github, filesystem");
     for line in &lines {
-        assert_eq!(line.spans[0].style.fg, Some(theme.accent));
-        assert!(line.spans[1].style.add_modifier.contains(Modifier::DIM));
-        assert_eq!(line.spans[2].style.fg, Some(theme.primary_text));
-        assert!(!line.spans[2].style.add_modifier.contains(Modifier::DIM));
+        assert_eq!(line.runs[0].style.foreground_color, Some(theme.accent));
+        assert!(line.runs[1].style.attributes.has(Attribute::Dim));
+        assert_eq!(
+            line.runs[2].style.foreground_color,
+            Some(theme.primary_text)
+        );
+        assert!(!line.runs[2].style.attributes.has(Attribute::Dim));
     }
 
     // More than the cap folds into `+N more`.
@@ -1307,11 +1314,11 @@ fn long_metadata_rows_fit_narrow_widths() {
 
 #[test]
 fn line_to_ansi_sanitizes_untrusted_content_but_keeps_generated_styles() {
-    let line = Line::from(Span::styled(
+    let line = Row::from(Run::new(
         "safe\t\u{1b}[2J\u{1b}]52;c;secret\u{07}done",
-        Style::default().fg(Theme::default().accent),
+        ContentStyle::default().fg(Theme::default().accent),
     ));
-    let ansi = line_to_ansi(&line);
+    let ansi = ansi_of(&line);
     assert!(ansi.contains("safe    done"), "{ansi:?}");
     assert!(!ansi.contains("secret"), "OSC payload leaked: {ansi:?}");
     assert!(!ansi.contains("[2J"), "CSI payload leaked: {ansi:?}");
@@ -1323,30 +1330,33 @@ fn line_to_ansi_sanitizes_untrusted_content_but_keeps_generated_styles() {
 
 #[test]
 fn line_to_ansi_emits_style_codes_only_for_styled_spans() {
-    let styled = Line::from(Span::styled(
+    let styled = Row::from(Run::new(
         "hi",
-        Style::default()
+        ContentStyle::default()
             .fg(Theme::default().accent)
-            .add_modifier(Modifier::BOLD),
+            .add_modifier(Attribute::Bold),
     ));
-    let ansi = line_to_ansi(&styled);
+    let ansi = ansi_of(&styled);
     assert!(ansi.contains("\u{1b}["));
     assert!(ansi.ends_with("\u{1b}[0m"));
 
-    let plain = Line::from("plain");
-    assert_eq!(line_to_ansi(&plain), "plain");
+    let plain = Row::plain("plain");
+    assert_eq!(ansi_of(&plain), "plain");
 }
 
 #[test]
 fn line_to_ansi_resets_bold_between_the_input_prefix_and_text() {
     let layout = input_layout("first\nsecond", 12, 40, Theme::default(), "", "", "");
-    let first = line_to_ansi(&layout.rows[0]);
-    let second = line_to_ansi(&layout.rows[1]);
+    let first = ansi_of(&layout.rows[0]);
+    let second = ansi_of(&layout.rows[1]);
 
     // The bold prefix is followed by a reset before normal input text;
     // both logical input rows therefore render at the same weight.
     assert!(first.contains("› \u{1b}[0m"));
-    assert!(!second.contains(&format!("{}", SetAttribute(Attribute::Bold))));
+    assert!(!second.contains(&format!(
+        "{}",
+        crossterm::style::SetAttribute(Attribute::Bold)
+    )));
 }
 
 #[test]

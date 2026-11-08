@@ -1,10 +1,38 @@
-use ratatui_core::style::{Color, Modifier, Style};
-use ratatui_core::text::{Line, Span, Text};
-use tui_markdown::{AlertKind, Options, StyleSheet, from_str_with_options};
+use crossterm::style::{Attribute, Color, ContentStyle};
+use tui_md::{Row, Run};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-mod table;
+/// Builder-style helpers over crossterm's [`ContentStyle`], so style
+/// construction reads the same everywhere in the crate.
+pub(crate) trait StyleExt: Sized {
+    fn fg(self, color: Color) -> Self;
+    fn bg(self, color: Color) -> Self;
+    fn add_modifier(self, attribute: Attribute) -> Self;
+    /// Overlay `over`: its colours win and attributes accumulate.
+    fn patch(self, over: ContentStyle) -> ContentStyle;
+}
+
+impl StyleExt for ContentStyle {
+    fn fg(mut self, color: Color) -> Self {
+        self.foreground_color = Some(color);
+        self
+    }
+
+    fn bg(mut self, color: Color) -> Self {
+        self.background_color = Some(color);
+        self
+    }
+
+    fn add_modifier(mut self, attribute: Attribute) -> Self {
+        self.attributes.set(attribute);
+        self
+    }
+
+    fn patch(self, over: ContentStyle) -> ContentStyle {
+        tui_md::patch(self, over)
+    }
+}
 
 /// The semantic palette used by every renderer. Keeping these roles together
 /// prevents individual widgets from slowly acquiring unrelated colours.
@@ -33,10 +61,10 @@ impl Default for Theme {
             dim_text: Color::Reset,
             // ANSI palette index 2 follows the terminal's configured green
             // slot rather than imposing an RGB colour of our own.
-            accent: Color::Indexed(2),
+            accent: Color::AnsiValue(2),
             code_background: Color::Reset,
-            success: Color::Green,
-            error: Color::Red,
+            success: Color::DarkGreen,
+            error: Color::DarkRed,
         }
     }
 }
@@ -193,9 +221,9 @@ pub(crate) fn welcome_lines(
     width: usize,
     theme: Theme,
     title_order: &WelcomeTitleOrder,
-) -> Vec<Line<'static>> {
+) -> Vec<Row> {
     // Same role as the prompt activity marker / message accents.
-    let title_style = Style::default().fg(theme.accent);
+    let title_style = ContentStyle::default().fg(theme.accent);
     let mut lines = Vec::new();
     // The banner opens scrollback immediately below whatever the shell left
     // on screen; give the title the design system's breathing room.
@@ -268,142 +296,138 @@ fn fit_single_line(text: &str, width: usize) -> String {
     result
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct MarkdownTheme {
-    theme: Theme,
+/// Green TextMate theme for fenced code, matching the accent used elsewhere.
+/// Only its foreground colours and font styles are used; backgrounds stay
+/// with the terminal.
+const SYNTAX_THEME_SOURCE: &str = include_str!("render/harness-green.tmTheme");
+
+/// The parsed syntax theme. Parsing is cheap, but the same theme value keeps
+/// repeated renders from re-reading the XML for every message.
+fn syntax_theme() -> Option<tui_md::SyntaxTheme> {
+    static THEME: std::sync::OnceLock<Option<tui_md::SyntaxTheme>> = std::sync::OnceLock::new();
+    THEME
+        .get_or_init(|| tui_md::SyntaxTheme::from_tmtheme(SYNTAX_THEME_SOURCE).ok())
+        .clone()
 }
 
-impl StyleSheet for MarkdownTheme {
-    fn heading(&self, _level: u8) -> Style {
-        fg(self.theme.accent).add_modifier(Modifier::BOLD)
+/// Map the semantic palette onto the markdown renderer's styles. Fenced code
+/// with a known language is syntax-highlighted; other code keeps the
+/// palette's single code style.
+///
+/// Built once per palette: it allocates symbol strings and clones the syntax
+/// theme, and every streamed render needs it.
+fn markdown_theme(theme: Theme) -> std::sync::Arc<tui_md::Theme> {
+    use std::sync::{Arc, Mutex};
+    static CACHE: Mutex<Option<(Theme, Arc<tui_md::Theme>)>> = Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((cached, styles)) = cache.as_ref()
+        && *cached == theme
+    {
+        return Arc::clone(styles);
     }
+    let styles = Arc::new(build_markdown_theme(theme));
+    *cache = Some((theme, Arc::clone(&styles)));
+    styles
+}
 
-    fn code(&self) -> Style {
-        fg(self.theme.primary_text).bg(self.theme.code_background)
-    }
-
-    fn link(&self) -> Style {
-        fg(self.theme.accent).add_modifier(Modifier::UNDERLINED)
-    }
-
-    fn blockquote(&self) -> Style {
-        muted_style(self.theme)
-    }
-
-    fn heading_meta(&self) -> Style {
-        dim_style(self.theme)
-    }
-
-    fn metadata_block(&self) -> Style {
-        muted_style(self.theme)
-    }
-
-    fn html(&self) -> Style {
-        dim_style(self.theme)
-    }
-
-    fn math_inline(&self) -> Style {
-        fg(self.theme.accent).add_modifier(Modifier::ITALIC)
-    }
-
-    fn math_display(&self) -> Style {
-        fg(self.theme.accent)
-    }
-
-    fn table_header(&self) -> Style {
-        fg(self.theme.primary_text).add_modifier(Modifier::BOLD)
-    }
-
-    fn table_cell(&self) -> Style {
-        fg(self.theme.assistant_text)
-    }
-
-    fn table_border(&self) -> Style {
-        dim_style(self.theme)
-    }
-
-    fn image_alt(&self) -> Style {
-        dim_style(self.theme).add_modifier(Modifier::ITALIC)
-    }
-
-    fn alert(&self, kind: AlertKind) -> Style {
-        let color = match kind {
-            AlertKind::Note => self.theme.accent,
-            AlertKind::Tip => self.theme.success,
-            AlertKind::Important => self.theme.accent,
-            AlertKind::Warning => Color::Yellow,
-            AlertKind::Caution => self.theme.error,
-        };
-        fg(color)
-    }
+fn build_markdown_theme(theme: Theme) -> tui_md::Theme {
+    let code = fg(theme.primary_text).bg(theme.code_background);
+    let mut styles = tui_md::Theme {
+        // Plain `-` bullets as before; the other glyphs keep the renderer's
+        // defaults (set `Symbols::classic()` for `##` headings and fences too).
+        symbols: tui_md::Symbols {
+            bullets: vec!["-".into()],
+            ..tui_md::Symbols::default()
+        },
+        text: assistant_style(theme),
+        code,
+        // A background pads every code row to the full width, which copies
+        // as trailing spaces; only pay that when the palette sets one.
+        code_block: if theme.code_background == Color::Reset {
+            fg(theme.primary_text)
+        } else {
+            code
+        },
+        syntax_theme: syntax_theme(),
+        link_url: dim_style(theme),
+        quote: muted_style(theme),
+        html: dim_style(theme),
+        math: fg(theme.accent).add_modifier(Attribute::Italic),
+        table_border: dim_style(theme),
+        table_header: fg(theme.primary_text).add_modifier(Attribute::Bold),
+        image: dim_style(theme).add_modifier(Attribute::Italic),
+        task_done: fg(theme.success),
+        task_todo: dim_style(theme),
+        rule: dim_style(theme),
+        footnote: dim_style(theme),
+        alert_note: fg(theme.accent),
+        alert_tip: fg(theme.success),
+        alert_important: fg(theme.accent),
+        alert_warning: fg(Color::DarkYellow),
+        alert_caution: fg(theme.error),
+        ..tui_md::Theme::default()
+    };
+    // Headings are bold (no underline); headings, links, and list markers
+    // share the green accent.
+    styles.heading = [fg(theme.accent).add_modifier(Attribute::Bold); 6];
+    styles.link = ContentStyle::default().add_modifier(Attribute::Underlined);
+    let mut styles = styles.with_accent(theme.accent);
+    // The quote bar stays muted like the quoted text.
+    styles.quote_marker = dim_style(theme);
+    styles
 }
 
 /// Convenience shorthand for the theme styles above.
-fn fg(color: Color) -> Style {
-    Style::default().fg(color)
+fn fg(color: Color) -> ContentStyle {
+    ContentStyle::default().fg(color)
 }
 
-fn dim_style(theme: Theme) -> Style {
-    Style::default()
+fn dim_style(theme: Theme) -> ContentStyle {
+    ContentStyle::default()
         .fg(theme.dim_text)
-        .add_modifier(Modifier::DIM)
+        .add_modifier(Attribute::Dim)
 }
 
-fn muted_style(theme: Theme) -> Style {
-    Style::default()
+fn muted_style(theme: Theme) -> ContentStyle {
+    ContentStyle::default()
         .fg(theme.muted_text)
-        .add_modifier(Modifier::DIM)
+        .add_modifier(Attribute::Dim)
 }
 
-fn primary_style(theme: Theme) -> Style {
-    Style::default().fg(theme.primary_text)
+fn primary_style(theme: Theme) -> ContentStyle {
+    ContentStyle::default().fg(theme.primary_text)
 }
 
-fn assistant_style(theme: Theme) -> Style {
-    Style::default().fg(theme.assistant_text)
+fn assistant_style(theme: Theme) -> ContentStyle {
+    ContentStyle::default().fg(theme.assistant_text)
 }
 
-fn message_prefix_style(theme: Theme) -> Style {
-    Style::default()
+fn message_prefix_style(theme: Theme) -> ContentStyle {
+    ContentStyle::default()
         .fg(theme.accent)
-        .add_modifier(Modifier::BOLD)
+        .add_modifier(Attribute::Bold)
 }
 
-fn error_style(theme: Theme) -> Style {
-    Style::default().fg(theme.error)
+fn error_style(theme: Theme) -> ContentStyle {
+    ContentStyle::default().fg(theme.error)
 }
 
-fn blank_line() -> Line<'static> {
-    Line::from("")
+fn blank_line() -> Row {
+    Row::new()
 }
 
-pub(crate) fn push_blank(lines: &mut Vec<Line<'static>>, count: usize) {
+pub(crate) fn push_blank(lines: &mut Vec<Row>, count: usize) {
     lines.extend(std::iter::repeat_with(blank_line).take(count));
 }
 
-fn push_span(line: &mut Vec<Span<'static>>, value: impl Into<String>, style: Style) {
-    let value = value.into();
-    if value.is_empty() {
-        return;
-    }
-    if let Some(last) = line.last_mut()
-        && last.style == style
-    {
-        last.content.to_mut().push_str(&value);
-        return;
-    }
-    line.push(Span::styled(value, style));
+fn line_with_style(value: impl Into<String>, style: ContentStyle) -> Row {
+    Row::from(Run::new(value.into(), style))
 }
 
-fn line_with_style(value: impl Into<String>, style: Style) -> Line<'static> {
-    Line::from(Span::styled(value.into(), style))
-}
-
-fn line_width(line: &Line<'_>) -> usize {
-    line.spans
-        .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
-        .sum()
+fn line_width(line: &Row) -> usize {
+    line.width()
 }
 
 /// Fit a styled row to a terminal-column budget without leaking controls or
@@ -411,11 +435,11 @@ fn line_width(line: &Line<'_>) -> usize {
 /// physical row: a line break inside the content (for example in a model,
 /// branch, or separator label) becomes a space, because layout counts this
 /// row once and an extra row would move the cursor off its position.
-pub(crate) fn fit_line_to_width(line: &Line<'_>, width: usize) -> Line<'static> {
+pub(crate) fn fit_line_to_width(line: &Row, width: usize) -> Row {
     let mut spans = Vec::new();
     let mut used = 0usize;
-    for span in &line.spans {
-        let content = sanitize_terminal_text(span.content.as_ref()).replace('\n', " ");
+    for span in &line.runs {
+        let content = sanitize_terminal_text(&span.text).replace('\n', " ");
         let mut kept = String::new();
         for cluster in content.graphemes(true) {
             let cluster_width = grapheme_width(cluster);
@@ -426,56 +450,44 @@ pub(crate) fn fit_line_to_width(line: &Line<'_>, width: usize) -> Line<'static> 
             used = used.saturating_add(cluster_width);
         }
         if !kept.is_empty() {
-            spans.push(Span::styled(kept, span.style));
+            spans.push(Run::new(kept, span.style));
         }
         if used >= width {
             break;
         }
     }
-    Line::from(spans).style(line.style)
+    Row::from(spans)
 }
 
 fn fit_text_to_width(text: &str, width: usize) -> String {
-    let line = Line::from(text.to_owned());
-    let fitted = fit_line_to_width(&line, width);
-    fitted
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect()
+    fit_line_to_width(&Row::plain(text), width).text()
 }
 
-/// Wrap a styled Ratatui text value while preserving span styles. Text is
+/// Wrap styled rows while preserving run styles. Text is
 /// wrapped at whitespace when possible; a single word is split only when it
 /// is wider than the available line. This is the common measurement/rendering
 /// path for Markdown and transcript scrolling.
 ///
-/// The wrapping logic deliberately lives here rather than in ratatui.  ratatui
-/// 0.29 keeps its styled reflow machinery private (`widgets::reflow` is a
-/// private `mod`, exposing `WordWrapper`/`LineComposer` only internally), and
-/// `Paragraph::line_count`/`wrap` are gated behind
-/// `#[instability::unstable(feature = "rendered-line-info")]` with the design
-/// explicitly marked "not stable".  A hand-rolled wrapper is also required
-/// because the transcript renderer needs the wrapped `Line`s up front to
-/// compute scroll heights, not at render time.
+/// The transcript renderer needs the wrapped rows up front to compute
+/// scroll heights, not at paint time, so wrapping is an explicit step here.
 ///
 /// The break logic is pinned to `textwrap`'s greedy first-fit algorithm by a
 /// differential test; the intentional differences are whitespace handling:
 /// leading whitespace is preserved (and can occupy its own row), internal
 /// whitespace runs are preserved, and trailing whitespace is dropped at a
 /// wrap boundary or the end of the line.
-pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static>> {
+pub fn wrap_text(text: &[Row], width: usize, base: ContentStyle) -> Vec<Row> {
     let width = width.max(1);
     let mut result = Vec::new();
     let source_lines = split_embedded_newlines(text);
 
     for source_line in &source_lines {
-        let line_base = base.patch(source_line.style);
+        let line_base = base;
         // Wrap unit: one grapheme cluster with its style and width.
-        let mut source_chars = Vec::<(String, Style, usize)>::new();
-        for source_span in &source_line.spans {
+        let mut source_chars = Vec::<(String, ContentStyle, usize)>::new();
+        for source_span in &source_line.runs {
             let style = line_base.patch(source_span.style);
-            let content = sanitize_terminal_text(source_span.content.as_ref());
+            let content = sanitize_terminal_text(&source_span.text);
             source_chars.extend(
                 content
                     .graphemes(true)
@@ -484,13 +496,13 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
         }
 
         if source_chars.is_empty() {
-            result.push(Line::from("").style(line_base));
+            result.push(Row::new());
             continue;
         }
 
-        let mut current = Vec::<(String, Style, usize)>::new();
+        let mut current = Vec::<(String, ContentStyle, usize)>::new();
         let mut current_width = 0usize;
-        let mut pending_whitespace = Vec::<(String, Style, usize)>::new();
+        let mut pending_whitespace = Vec::<(String, ContentStyle, usize)>::new();
         let mut pending_width = 0usize;
         let mut index = 0usize;
 
@@ -569,14 +581,14 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
         // Trailing whitespace is not visible and should not create an extra
         // whitespace-only row when it happens to land at the wrap boundary.
         if current.is_empty() {
-            result.push(Line::from("").style(line_base));
+            result.push(Row::new());
         } else {
             result.push(wrapped_line(current));
         }
     }
 
     if result.is_empty() {
-        result.push(Line::from("").style(base));
+        result.push(Row::new());
     }
     result
 }
@@ -586,33 +598,33 @@ pub fn wrap_text(text: &Text<'_>, width: usize, base: Style) -> Vec<Line<'static
 /// it as a physical terminal row that the caller did not count. Keeping the
 /// split here makes height measurement and emission agree for tool paths,
 /// metadata, pasted text, and other untrusted single-line values.
-fn split_embedded_newlines(text: &Text<'_>) -> Vec<Line<'static>> {
+fn split_embedded_newlines(text: &[Row]) -> Vec<Row> {
     let mut lines = Vec::new();
-    for source_line in &text.lines {
+    for source_line in text {
         let mut spans = Vec::new();
-        for source_span in &source_line.spans {
-            let content = sanitize_terminal_text(source_span.content.as_ref());
+        for source_span in &source_line.runs {
+            let content = sanitize_terminal_text(&source_span.text);
             let parts = content.split('\n').collect::<Vec<_>>();
             for (index, part) in parts.iter().enumerate() {
                 if !part.is_empty() {
-                    spans.push(Span::styled((*part).to_owned(), source_span.style));
+                    spans.push(Run::new((*part).to_owned(), source_span.style));
                 }
                 if index + 1 < parts.len() {
-                    lines.push(Line::from(std::mem::take(&mut spans)).style(source_line.style));
+                    lines.push(Row::from(std::mem::take(&mut spans)));
                 }
             }
         }
-        lines.push(Line::from(spans).style(source_line.style));
+        lines.push(Row::from(spans));
     }
     lines
 }
 
-fn wrapped_line(clusters: Vec<(String, Style, usize)>) -> Line<'static> {
-    let mut spans = Vec::new();
+fn wrapped_line(clusters: Vec<(String, ContentStyle, usize)>) -> Row {
+    let mut row = Row::new();
     for (cluster, style, _) in clusters {
-        push_span(&mut spans, cluster, style);
+        row.push(cluster, style);
     }
-    Line::from(spans)
+    row
 }
 
 fn is_whitespace_cluster(cluster: &str) -> bool {
@@ -724,43 +736,19 @@ fn skip_string_sequence(chars: &[char], index: &mut usize) {
     }
 }
 
-fn plain_text(value: &str, style: Style) -> Text<'static> {
-    let value = sanitize_terminal_text(value);
-    Text::from(
-        value
-            .split('\n')
-            .map(|line| line_with_style(line.to_owned(), style))
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn owned_markdown(markdown: &str, theme: Theme) -> Text<'static> {
-    let markdown = sanitize_terminal_text(markdown);
-    let options = Options::new(MarkdownTheme { theme });
-    let rendered = from_str_with_options(&markdown, &options);
-    let lines = rendered
-        .lines
-        .iter()
-        .map(|line| {
-            let mut owned = Line::from(
-                line.spans
-                    .iter()
-                    .map(|span| Span::styled(span.content.to_string(), span.style))
-                    .collect::<Vec<_>>(),
-            );
-            owned.style = line.style;
-            owned
-        })
-        .collect::<Vec<_>>();
-    Text::from(lines)
+fn plain_text(value: &str, style: ContentStyle) -> Vec<Row> {
+    sanitize_terminal_text(value)
+        .split('\n')
+        .map(|line| line_with_style(line.to_owned(), style))
+        .collect()
 }
 
 pub(crate) fn prefix_message_lines(
-    lines: Vec<Line<'static>>,
+    lines: Vec<Row>,
     prefix: &str,
     theme: Theme,
     width: usize,
-) -> Vec<Line<'static>> {
+) -> Vec<Row> {
     let prefix_style = message_prefix_style(theme);
     // A terminal narrower than the normal two-column prefix gets a shortened
     // prefix rather than an over-wide row. Content is fitted after the prefix
@@ -776,15 +764,15 @@ pub(crate) fn prefix_message_lines(
                 return line;
             }
             let prefix = if has_prefix {
-                Span::raw(continuation.clone())
+                Run::plain(continuation.clone())
             } else {
                 has_prefix = true;
-                Span::styled(prefix.clone(), prefix_style)
+                Run::new(prefix.clone(), prefix_style)
             };
             let content = fit_line_to_width(&line, width.saturating_sub(prefix_width));
-            Line::from(
+            Row::from(
                 std::iter::once(prefix)
-                    .chain(content.spans)
+                    .chain(content.runs)
                     .collect::<Vec<_>>(),
             )
         })
@@ -795,19 +783,22 @@ fn message_content_width(width: usize) -> usize {
     width.saturating_sub(UnicodeWidthStr::width(USER_PREFIX))
 }
 
-pub(crate) fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn reasoning_lines(reasoning: &str, theme: Theme, width: usize) -> Vec<Row> {
     // Providers can end thinking with blank lines. Let the UI own spacing
     // between blocks without changing signed state or internal paragraphs.
     let reasoning = reasoning.trim_end_matches(['\r', '\n']);
     if reasoning.is_empty() {
         return Vec::new();
     }
-    let text = plain_text(reasoning, muted_style(theme).add_modifier(Modifier::ITALIC));
-    wrap_text(&text, width, Style::default())
+    let text = plain_text(
+        reasoning,
+        muted_style(theme).add_modifier(Attribute::Italic),
+    );
+    wrap_text(&text, width, ContentStyle::default())
 }
 
 #[cfg(test)]
-pub(crate) fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn markdown_lines(markdown: &str, theme: Theme, width: usize) -> Vec<Row> {
     markdown_lines_continued(markdown, theme, width, false)
 }
 
@@ -819,9 +810,12 @@ pub(crate) fn markdown_lines_continued(
     theme: Theme,
     width: usize,
     continued: bool,
-) -> Vec<Line<'static>> {
-    let text = table::fit_tables(
-        owned_markdown(markdown, theme),
+) -> Vec<Row> {
+    // Untrusted model text is sanitized before parsing; the renderer then
+    // lays out blocks, tables, and wrapping at the content width itself.
+    let rows = tui_md::render_str(
+        &sanitize_terminal_text(markdown),
+        &markdown_theme(theme),
         message_content_width(width),
     );
     let prefix = if continued {
@@ -829,20 +823,15 @@ pub(crate) fn markdown_lines_continued(
     } else {
         ASSISTANT_PREFIX.to_owned()
     };
-    prefix_message_lines(
-        wrap_text(&text, message_content_width(width), assistant_style(theme)),
-        &prefix,
-        theme,
-        width,
-    )
+    prefix_message_lines(rows, &prefix, theme, width)
 }
 
-pub(crate) fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Row> {
     prefix_message_lines(
         wrap_text(
             &plain_text(input, primary_style(theme)),
             message_content_width(width),
-            Style::default(),
+            ContentStyle::default(),
         ),
         USER_PREFIX,
         theme,
@@ -850,32 +839,40 @@ pub(crate) fn user_lines(input: &str, theme: Theme, width: usize) -> Vec<Line<'s
     )
 }
 
-pub(crate) fn notice_lines(notice: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn notice_lines(notice: &str, theme: Theme, width: usize) -> Vec<Row> {
     let text = plain_text(notice, dim_style(theme));
-    wrap_text(&text, width.saturating_sub(2).max(1), Style::default())
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix = if index == 0 { "· " } else { "  " };
-            let mut spans = vec![Span::styled(prefix, dim_style(theme))];
-            spans.extend(line.spans);
-            fit_line_to_width(&Line::from(spans), width)
-        })
-        .collect()
+    wrap_text(
+        &text,
+        width.saturating_sub(2).max(1),
+        ContentStyle::default(),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(index, line)| {
+        let prefix = if index == 0 { "· " } else { "  " };
+        let mut spans = vec![Run::new(prefix, dim_style(theme))];
+        spans.extend(line.runs);
+        fit_line_to_width(&Row::from(spans), width)
+    })
+    .collect()
 }
 
-pub(crate) fn error_lines(error: &str, theme: Theme, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn error_lines(error: &str, theme: Theme, width: usize) -> Vec<Row> {
     let text = plain_text(error, error_style(theme));
-    wrap_text(&text, width.saturating_sub(2).max(1), Style::default())
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let prefix = if index == 0 { "✗ " } else { "  " };
-            let mut spans = vec![Span::styled(prefix, error_style(theme))];
-            spans.extend(line.spans);
-            fit_line_to_width(&Line::from(spans), width)
-        })
-        .collect()
+    wrap_text(
+        &text,
+        width.saturating_sub(2).max(1),
+        ContentStyle::default(),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(index, line)| {
+        let prefix = if index == 0 { "✗ " } else { "  " };
+        let mut spans = vec![Run::new(prefix, error_style(theme))];
+        spans.extend(line.runs);
+        fit_line_to_width(&Row::from(spans), width)
+    })
+    .collect()
 }
 
 pub(crate) fn duration_text(duration_ms: u64) -> String {
@@ -1095,8 +1092,8 @@ mod tests {
 
     #[test]
     fn rendered_content_is_sanitized_before_markdown_and_measurement() {
-        let plain = plain_text("a\tb\u{1b}[2Jc", Style::default());
-        assert_eq!(span_contents(&plain.lines[0]), "a    bc");
+        let plain = plain_text("a\tb\u{1b}[2Jc", ContentStyle::default());
+        assert_eq!(span_contents(&plain[0]), "a    bc");
         let markdown = markdown_lines("**safe\u{1b}]52;c;secret\u{07}**", Theme::default(), 40);
         let value: String = markdown.iter().map(span_contents).collect();
         assert!(value.contains("safe"));
@@ -1116,7 +1113,8 @@ mod tests {
             let values = lines.iter().map(span_contents).collect::<Vec<_>>();
             assert!(values.iter().any(|line| line.contains("Before")) || width < 8);
             assert!(values.iter().any(|line| line.contains("After")) || width < 7);
-            if width == 9 {
+            // Tables too narrow for a box stack into `Header: value` records.
+            if (2..=18).contains(&width) && width >= 9 {
                 assert!(
                     values.iter().any(|line| line.contains("Name:")),
                     "{values:?}"
@@ -1126,7 +1124,7 @@ mod tests {
                     "{values:?}"
                 );
             }
-            if width >= 11 {
+            if width >= 30 {
                 let borders = values
                     .iter()
                     .filter(|line| line.contains('┌') || line.contains('├') || line.contains('└'))
@@ -1162,38 +1160,57 @@ mod tests {
         let lines = markdown_lines(source, Theme::default(), 19);
         let values = lines.iter().map(span_contents).collect::<Vec<_>>();
         assert!(lines.iter().all(|line| line_width(line) <= 19));
-        assert!(values.iter().any(|line| line.contains("- ┌")), "{values:?}");
+        assert!(
+            values.iter().any(|line| line.contains("- Item:")),
+            "{values:?}"
+        );
         assert!(
             values.iter().any(|line| line.contains("long")),
             "{values:?}"
         );
         assert!(values.iter().any(|line| line.contains("42")), "{values:?}");
-        assert!(values.iter().any(|line| line.contains('┘')), "{values:?}");
+        // Stacked records keep the item's hang indent under the marker.
+        assert!(
+            values.iter().any(|line| line.contains("Count: 42")),
+            "{values:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_code_uses_the_green_syntax_theme() {
+        assert!(syntax_theme().is_some(), "the bundled theme must parse");
+        let rows = markdown_lines(
+            "```rust\n// note\nfn main() { let s = \"hi\"; }\n```\n",
+            Theme::default(),
+            60,
+        );
+        let colours = rows
+            .iter()
+            .flat_map(|row| row.runs.iter())
+            .filter_map(|run| match run.style.foreground_color {
+                Some(Color::Rgb { r, g, b }) => Some((r, g, b)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(colours.len() > 3, "code should be highlighted: {rows:?}");
+        // Every highlighted colour leans green (or is the near-white default).
+        assert!(colours.iter().all(|&(r, g, b)| g >= r && g >= b));
     }
 
     #[test]
     fn markdown_preserves_formatting_styles() {
-        let text = owned_markdown("**bold** *italic* `code`", Theme::default());
-        let styles = text
-            .lines
+        let rows = markdown_lines("**bold** *italic* `code`", Theme::default(), 40);
+        let styles = rows
             .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.style)
+            .flat_map(|line| line.runs.iter())
+            .map(|run| run.style)
             .collect::<Vec<_>>();
+        assert!(styles.iter().any(|s| s.attributes.has(Attribute::Bold)));
+        assert!(styles.iter().any(|s| s.attributes.has(Attribute::Italic)));
         assert!(
             styles
                 .iter()
-                .any(|style| style.add_modifier.contains(Modifier::BOLD))
-        );
-        assert!(
-            styles
-                .iter()
-                .any(|style| style.add_modifier.contains(Modifier::ITALIC))
-        );
-        assert!(
-            styles
-                .iter()
-                .any(|style| style.bg == Some(Theme::default().code_background))
+                .any(|s| s.background_color == Some(Theme::default().code_background))
         );
     }
 
@@ -1204,18 +1221,18 @@ mod tests {
         let user_values = user
             .iter()
             .map(|line| {
-                line.spans
+                line.runs
                     .iter()
-                    .map(|span| span.content.as_ref())
+                    .map(|span| span.text.as_str())
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
         let assistant_values = assistant
             .iter()
             .map(|line| {
-                line.spans
+                line.runs
                     .iter()
-                    .map(|span| span.content.as_ref())
+                    .map(|span| span.text.as_str())
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
@@ -1226,8 +1243,8 @@ mod tests {
     #[test]
     fn narrow_rows_never_exceed_their_display_budget() {
         for width in 1..=3 {
-            let text = Text::from(Line::from("   \t你好👨‍👩‍👧‍👦"));
-            let lines = wrap_text(&text, width, Style::default());
+            let text = vec![Row::plain("   \t你好👨‍👩‍👧‍👦")];
+            let lines = wrap_text(&text, width, ContentStyle::default());
             assert!(
                 lines.iter().all(|line| line_width(line) <= width),
                 "width {width}: {lines:?}"
@@ -1274,7 +1291,7 @@ mod tests {
         for width in [1usize, 2, 3, 5, 10, 40, 80] {
             for sample in samples {
                 for lines in [
-                    wrap_text(&Text::from(Line::from(sample)), width, Style::default()),
+                    wrap_text(&[Row::plain(sample)], width, ContentStyle::default()),
                     user_lines(sample, Theme::default(), width),
                     markdown_lines(sample, Theme::default(), width),
                     notice_lines(sample, Theme::default(), width),
@@ -1291,12 +1308,12 @@ mod tests {
 
     #[test]
     fn fitted_rows_never_contain_line_breaks() {
-        let line = Line::from(vec![Span::raw("model\nname"), Span::raw("\r\nbranch")]);
+        let line = Row::from(vec![Run::plain("model\nname"), Run::plain("\r\nbranch")]);
         let fitted = fit_line_to_width(&line, 80);
         let text = fitted
-            .spans
+            .runs
             .iter()
-            .map(|span| span.content.as_ref())
+            .map(|span| span.text.as_str())
             .collect::<String>();
         assert!(!text.contains('\n') && !text.contains('\r'), "{text:?}");
         assert!(!fit_single_line("a\nb", 80).contains('\n'));
@@ -1304,11 +1321,11 @@ mod tests {
 
     #[test]
     fn fit_line_preserves_styles_while_dropping_wide_overflow() {
-        let style = Style::default().fg(Theme::default().accent);
-        let line = fit_line_to_width(&Line::from(Span::styled("a你b", style)), 2);
+        let style = ContentStyle::default().fg(Theme::default().accent);
+        let line = fit_line_to_width(&Row::from(Run::new("a你b", style)), 2);
         assert_eq!(line_width(&line), 2);
         assert_eq!(span_contents(&line), "ab");
-        assert_eq!(line.spans[0].style, style);
+        assert_eq!(line.runs[0].style, style);
     }
 
     #[test]
@@ -1322,15 +1339,12 @@ mod tests {
         assert_eq!(content_width(2), 2);
     }
 
-    fn span_contents(line: &Line<'_>) -> String {
-        line.spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect()
+    fn span_contents(line: &Row) -> String {
+        line.runs.iter().map(|span| span.text.as_str()).collect()
     }
 
     fn wrapped_values(text: &str, width: usize) -> Vec<String> {
-        wrap_text(&Text::from(text), width, Style::default())
+        wrap_text(&[Row::plain(text)], width, ContentStyle::default())
             .iter()
             .map(span_contents)
             .collect()
@@ -1409,22 +1423,22 @@ mod tests {
 
     #[test]
     fn embedded_newlines_become_measured_rows() {
-        let text = Text::from(vec![Line::from(Span::raw("before\nafter"))]);
-        let lines = wrap_text(&text, 40, Style::default());
+        let text = vec![Row::from(Run::plain("before\nafter"))];
+        let lines = wrap_text(&text, 40, ContentStyle::default());
         assert_eq!(lines.len(), 2);
         assert_eq!(span_contents(&lines[0]), "before");
         assert_eq!(span_contents(&lines[1]), "after");
         assert!(
             lines
                 .iter()
-                .all(|line| { line.spans.iter().all(|span| !span.content.contains('\n')) })
+                .all(|line| { line.runs.iter().all(|span| !span.text.contains('\n')) })
         );
     }
 
     #[test]
     fn wrap_text_preserves_leading_and_internal_whitespace_but_drops_trailing() {
         // Leading and internal runs survive; the trailing space is dropped.
-        let lines = wrap_text(&Text::from("  a  b "), 40, Style::default());
+        let lines = wrap_text(&[Row::plain("  a  b ")], 40, ContentStyle::default());
         assert_eq!(span_contents(&lines[0]), "  a  b");
         assert_eq!(lines.len(), 1);
     }
@@ -1457,7 +1471,7 @@ mod tests {
         // regardless of where the breaks land.
         for input in ["👨‍👩‍👧‍👦", "café\u{301}", "日本語テキスト", "aeiou"]
         {
-            let lines = wrap_text(&Text::from(input), 3, Style::default());
+            let lines = wrap_text(&[Row::plain(input)], 3, ContentStyle::default());
             let joined: String = lines.iter().map(span_contents).collect();
             assert_eq!(joined, input, "round-trip failed for {input:?}");
         }
@@ -1465,8 +1479,8 @@ mod tests {
 
     proptest! {
         /// Differential test against textwrap's greedy first-fit wrapping.
-        /// ratatui's reflow machinery is private, so this pins the custom
-        /// wrapper's break positions to a battle-tested reference.  The domain
+        /// This pins the hand-rolled wrapper's break positions to a
+        /// battle-tested reference.  The domain
         /// is restricted to single-space-separated words (no leading or
         /// trailing whitespace) because whitespace handling is an intentional,
         /// separately-tested difference.

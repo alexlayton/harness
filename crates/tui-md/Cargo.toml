@@ -1,0 +1,20 @@
+[package]
+name = "tui-md"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+description = "Render Markdown to styled terminal lines using crossterm types (no ratatui)"
+
+[dependencies]
+crossterm = { version = "0.29", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false }
+unicode-width = "0.2"
+unicode-segmentation = "1"
+syntect = { version = "5", optional = true, default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+
+[features]
+default = ["highlight", "custom-themes"]
+## Syntax highlighting of fenced code blocks via syntect (pure-Rust regex engine).
+highlight = ["dep:syntect"]
+## Load custom `.tmTheme` syntax themes (adds the plist/XML parser).
+custom-themes = ["highlight", "syntect/plist-load"]

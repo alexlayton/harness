@@ -181,12 +181,12 @@ pub(super) fn history_window(
     width: usize,
     theme: Theme,
     tools_expanded: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<Row> {
     if budget == 0 || entries.is_empty() {
         return Vec::new();
     }
 
-    let mut newest_first = Vec::<Vec<Line<'static>>>::new();
+    let mut newest_first = Vec::<Vec<Row>>::new();
     let mut used = 0usize;
     let mut hidden = false;
     for (index, entry) in entries.iter().enumerate().rev() {
@@ -220,11 +220,11 @@ pub(super) fn history_window(
         result.extend(lines.iter().cloned());
     }
     if hidden {
-        let marker = Line::from(Span::styled(
+        let marker = Row::from(Run::new(
             "… older rows above",
-            Style::default()
+            ContentStyle::default()
                 .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
+                .add_modifier(Attribute::Dim),
         ));
         if result.len() >= budget {
             result.drain(..result.len() - budget.saturating_sub(1));
@@ -239,7 +239,7 @@ pub(super) fn entry_lines(
     width: usize,
     theme: Theme,
     tools_expanded: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<Row> {
     let width = width.max(1);
     match entry {
         Entry::Banner { title_order } => render::welcome_lines(width, theme, title_order),
@@ -301,14 +301,14 @@ pub(super) fn tool_lines(
     expanded: bool,
     width: usize,
     theme: Theme,
-) -> Vec<Line<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
+) -> Vec<Row> {
+    let mut spans: Vec<Run> = Vec::new();
     // Agent summaries read `bash: <command>` / `read <path>` / …; bash reads
     // as a shell line, every other tool as `<verb> <param>` with the verb in
     // the same accent as the `$` so all tool lines share one signature.
-    let marker_style = Style::default()
+    let marker_style = ContentStyle::default()
         .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
+        .add_modifier(Attribute::Bold);
     let command = record
         .summary
         .strip_prefix("bash:")
@@ -316,31 +316,31 @@ pub(super) fn tool_lines(
         .filter(|rest| !rest.is_empty());
     match command {
         Some(command) => {
-            spans.push(Span::styled("$ ", marker_style));
-            spans.push(Span::styled(
+            spans.push(Run::new("$ ", marker_style));
+            spans.push(Run::new(
                 command.to_owned(),
-                Style::default().fg(theme.primary_text),
+                ContentStyle::default().fg(theme.primary_text),
             ));
         }
         None => {
             let summary = record.summary.trim();
             let (verb, rest) = summary.split_once(' ').unwrap_or((summary, ""));
-            spans.push(Span::styled(verb.to_owned(), marker_style));
+            spans.push(Run::new(verb.to_owned(), marker_style));
             if !rest.is_empty() {
-                spans.push(Span::styled(
+                spans.push(Run::new(
                     format!(" {rest}"),
-                    Style::default().fg(theme.primary_text),
+                    ContentStyle::default().fg(theme.primary_text),
                 ));
             }
         }
     }
     match record.status {
         ToolStatus::Running => {}
-        ToolStatus::Success => spans.push(Span::styled(
+        ToolStatus::Success => spans.push(Run::new(
             format!(" · {}", render::duration_text(record.duration_ms)),
-            Style::default()
+            ContentStyle::default()
                 .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
+                .add_modifier(Attribute::Dim),
         )),
         ToolStatus::Failure => {
             let preview = record
@@ -348,19 +348,19 @@ pub(super) fn tool_lines(
                 .as_deref()
                 .and_then(|error| error.lines().next())
                 .unwrap_or("failed");
-            spans.push(Span::styled("  ✗ ", Style::default().fg(theme.error)));
-            spans.push(Span::styled(
+            spans.push(Run::new("  ✗ ", ContentStyle::default().fg(theme.error)));
+            spans.push(Run::new(
                 preview.to_owned(),
-                Style::default().fg(theme.error),
+                ContentStyle::default().fg(theme.error),
             ));
         }
     }
     // The marker/verb is part of the spans, so no extra message prefix is
     // applied; the wrapper only reflows the line to the available width.
     let summary_lines = render::wrap_text(
-        &Text::from(Line::from(spans)),
+        &[Row::from(spans)],
         width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
-        Style::default(),
+        ContentStyle::default(),
     );
     if !expanded {
         return summary_lines;
@@ -369,9 +369,9 @@ pub(super) fn tool_lines(
     // Expanded: the compact line, then the bounded output tail, later error
     // lines, and a trailing `running…` marker, each indented two spaces
     // and dimmed so they read as details under the summary.
-    let dim_style = Style::default()
+    let dim_style = ContentStyle::default()
         .fg(theme.dim_text)
-        .add_modifier(Modifier::DIM);
+        .add_modifier(Attribute::Dim);
     let mut lines = summary_lines;
     if !record.output.is_empty() {
         for tail in render::output_tail_after(&record.output, record.omitted_lines) {
@@ -380,7 +380,12 @@ pub(super) fn tool_lines(
     }
     if let Some(error) = record.error.as_deref() {
         for detail in error.lines().skip(1).take(render::DEFAULT_TAIL_LINES) {
-            push_detail_line(&mut lines, detail, Style::default().fg(theme.error), width);
+            push_detail_line(
+                &mut lines,
+                detail,
+                ContentStyle::default().fg(theme.error),
+                width,
+            );
         }
     }
     if matches!(record.status, ToolStatus::Running) {
@@ -392,19 +397,19 @@ pub(super) fn tool_lines(
 /// One indented detail row under an expanded tool line, wrapped to the
 /// content width with the given style applied to every span.
 pub(super) fn push_detail_line(
-    lines: &mut Vec<Line<'static>>,
+    lines: &mut Vec<Row>,
     text: &str,
-    style: Style,
+    style: ContentStyle,
     width: usize,
 ) {
     for wrapped in render::wrap_text(
-        &Text::from(Line::from(Span::styled(text.to_owned(), style))),
+        &[Row::from(Run::new(text.to_owned(), style))],
         width.saturating_sub(INPUT_PREFIX_WIDTH).max(1),
-        Style::default(),
+        ContentStyle::default(),
     ) {
-        lines.push(Line::from(
-            std::iter::once(Span::raw("  "))
-                .chain(wrapped.spans)
+        lines.push(Row::from(
+            std::iter::once(Run::plain("  "))
+                .chain(wrapped.runs)
                 .collect::<Vec<_>>(),
         ));
     }
@@ -448,7 +453,7 @@ pub(super) fn metadata_lines(
     mcp_servers: &[String],
     skills: &[String],
     theme: Theme,
-) -> Vec<Line<'static>> {
+) -> Vec<Row> {
     let cwd = render::sanitize_terminal_text(cwd);
     let cwd = match branch.map(render::sanitize_terminal_text) {
         Some(branch) => format!("{cwd}  ({branch})"),
@@ -471,22 +476,22 @@ pub(super) fn metadata_lines(
     lines
 }
 
-pub(super) fn metadata_row(label: &str, value: String, theme: Theme) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("│ ", Style::default().fg(theme.accent)),
-        Span::styled(
+pub(super) fn metadata_row(label: &str, value: String, theme: Theme) -> Row {
+    Row::from(vec![
+        Run::new("│ ", ContentStyle::default().fg(theme.accent)),
+        Run::new(
             format!("{label:<8}  "),
-            Style::default()
+            ContentStyle::default()
                 .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
+                .add_modifier(Attribute::Dim),
         ),
-        Span::styled(value, Style::default().fg(theme.primary_text)),
+        Run::new(value, ContentStyle::default().fg(theme.primary_text)),
     ])
 }
 
 /// A left-oriented rule marking a session boundary. An empty label is the
 /// unlabelled initial boundary below the full startup header.
-pub(super) fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'static> {
+pub(super) fn separator_line(label: &str, width: usize, theme: Theme) -> Row {
     let label = render::sanitize_terminal_text(label);
     let text = if label.is_empty() {
         "─".repeat(width)
@@ -496,24 +501,27 @@ pub(super) fn separator_line(label: &str, width: usize, theme: Theme) -> Line<'s
         let remaining = width.saturating_sub(UnicodeWidthStr::width(prefix.as_str()));
         format!("{prefix}{}", "─".repeat(remaining))
     };
-    Line::from(Span::styled(
+    Row::from(Run::new(
         text,
-        Style::default()
+        ContentStyle::default()
             .fg(theme.dim_text)
-            .add_modifier(Modifier::DIM),
+            .add_modifier(Attribute::Dim),
     ))
 }
 
 /// The busy indicator row: an animated marker plus the activity label.
-pub(super) fn activity_line_with_label(label: &str, spinner: usize, theme: Theme) -> Line<'static> {
+pub(super) fn activity_line_with_label(label: &str, spinner: usize, theme: Theme) -> Row {
     let marker = render::ACTIVITY_FRAMES[spinner % render::ACTIVITY_FRAMES.len()];
-    Line::from(vec![
-        Span::styled(format!("{marker} "), Style::default().fg(theme.accent)),
-        Span::styled(
+    Row::from(vec![
+        Run::new(
+            format!("{marker} "),
+            ContentStyle::default().fg(theme.accent),
+        ),
+        Run::new(
             label.to_owned(),
-            Style::default()
+            ContentStyle::default()
                 .fg(theme.dim_text)
-                .add_modifier(Modifier::DIM),
+                .add_modifier(Attribute::Dim),
         ),
     ])
 }
