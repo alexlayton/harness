@@ -5,7 +5,7 @@ use super::*;
 
 /// The visual rows of the input line plus the cursor's position within them.
 pub(super) struct InputLayout {
-    pub(super) rows: Vec<Line<'static>>,
+    pub(super) rows: Vec<Row>,
     pub(super) cursor_row: usize,
     pub(super) cursor_col: usize,
 }
@@ -62,30 +62,30 @@ pub(super) fn input_layout_with_row_width(
     let width = width.max(1);
     let row_width = row_width.max(1);
     let cursor = cursor.min(input.len());
-    let prefix_style = Style::default()
+    let prefix_style = ContentStyle::default()
         .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-    let text_style = Style::default().fg(theme.primary_text);
-    let dim_style = Style::default()
+        .add_modifier(Attribute::Bold);
+    let text_style = ContentStyle::default().fg(theme.primary_text);
+    let dim_style = ContentStyle::default()
         .fg(theme.dim_text)
-        .add_modifier(Modifier::DIM);
+        .add_modifier(Attribute::Dim);
 
     if input.is_empty() {
         // Placeholder row; the terminal cursor sits right after the prefix.
         // When usage is available the counter trailer trails it, dim.
         let mut spans = vec![
-            Span::styled(INPUT_PREFIX, prefix_style),
-            Span::styled(PLACEHOLDER, dim_style),
+            Run::new(INPUT_PREFIX, prefix_style),
+            Run::new(PLACEHOLDER, dim_style),
         ];
         if !usage_trailer.is_empty() {
-            spans.push(Span::styled(usage_trailer.to_owned(), dim_style));
+            spans.push(Run::new(usage_trailer.to_owned(), dim_style));
         }
-        let mut rows = vec![render::fit_line_to_width(&Line::from(spans), row_width)];
+        let mut rows = vec![render::fit_line_to_width(&Row::from(spans), row_width)];
         if !completion_hint.is_empty() {
             rows.push(render::fit_line_to_width(
-                &Line::from(vec![
-                    Span::raw(INPUT_CONTINUATION),
-                    Span::styled(completion_hint.to_owned(), dim_style),
+                &Row::from(vec![
+                    Run::plain(INPUT_CONTINUATION),
+                    Run::new(completion_hint.to_owned(), dim_style),
                 ]),
                 row_width,
             ));
@@ -97,7 +97,7 @@ pub(super) fn input_layout_with_row_width(
         };
     }
 
-    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     let mut cursor_row = 0usize;
     let mut cursor_col = 0usize;
 
@@ -169,12 +169,12 @@ pub(super) fn input_layout_with_row_width(
         for (row_index, row) in visual.iter().enumerate() {
             let text: String = row.iter().map(|(c, _)| *c).collect();
             let lead = if rows.is_empty() && row_index == 0 {
-                Span::styled(INPUT_PREFIX, prefix_style)
+                Run::new(INPUT_PREFIX, prefix_style)
             } else {
-                Span::raw(INPUT_CONTINUATION)
+                Run::plain(INPUT_CONTINUATION)
             };
             rows.push(render::fit_line_to_width(
-                &Line::from(vec![lead, Span::styled(text, text_style)]),
+                &Row::from(vec![lead, Run::new(text, text_style)]),
                 row_width,
             ));
         }
@@ -183,16 +183,16 @@ pub(super) fn input_layout_with_row_width(
     }
 
     if rows.is_empty() {
-        rows.push(Line::from(Span::styled(INPUT_PREFIX, prefix_style)));
+        rows.push(Row::from(Run::new(INPUT_PREFIX, prefix_style)));
     }
 
     // The list hint sits below the draft so opening completion never moves
     // the input or its real terminal cursor.
     if !completion_hint.is_empty() {
         rows.push(render::fit_line_to_width(
-            &Line::from(vec![
-                Span::raw(INPUT_CONTINUATION),
-                Span::styled(completion_hint.to_owned(), dim_style),
+            &Row::from(vec![
+                Run::plain(INPUT_CONTINUATION),
+                Run::new(completion_hint.to_owned(), dim_style),
             ]),
             row_width,
         ));
@@ -205,14 +205,14 @@ pub(super) fn input_layout_with_row_width(
         && let Some(row) = rows.get_mut(cursor_row)
     {
         let used = row
-            .spans
+            .runs
             .iter()
-            .map(|span| render::text_width(span.content.as_ref()))
+            .map(|span| render::text_width(span.text.as_str()))
             .sum();
         let available = row_width.saturating_sub(used);
         let fits = ghost_to_width(ghost, available);
         if !fits.is_empty() {
-            row.spans.push(Span::styled(fits, dim_style));
+            row.runs.push(Run::new(fits, dim_style));
         }
     }
 
@@ -380,7 +380,7 @@ pub(super) fn clip_input(
     height: usize,
     busy: bool,
     tool_rows: usize,
-) -> (Vec<Line<'static>>, usize, usize) {
+) -> (Vec<Row>, usize, usize) {
     let cap = height
         .saturating_sub(usize::from(busy) + tool_rows + 2)
         .max(1);

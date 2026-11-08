@@ -12,8 +12,7 @@ fastrand = "2"
 futures-util = "0.3"
 ignore = "0.4"
 memchr = "2"
-ratatui-core = "0.1"
-tui-markdown = "0.3"
+tui-md = { workspace = true }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
