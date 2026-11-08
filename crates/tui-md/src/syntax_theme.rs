@@ -78,7 +78,7 @@ impl SyntaxTheme {
     pub fn is_available(&self) -> bool {
         match &self.0 {
             #[cfg(feature = "highlight")]
-            Inner::Named(name) => crate::highlight::theme_names().contains(&name.as_str()),
+            Inner::Named(name) => crate::highlight::builtin_theme(name).is_some(),
             #[cfg(not(feature = "highlight"))]
             Inner::Named(_) => false,
             #[cfg(feature = "custom-themes")]
