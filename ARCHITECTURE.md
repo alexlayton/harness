@@ -22,7 +22,7 @@ harness-python ── harness ──┬── agent ──┬── compact ─�
                            │           ├── mcp ────── tools, llm
                            │           ├── tools ──── llm
                            │           └── llm ────── auth
-                           └── tui
+                           └── tui ───── tui-md
 ```
 
 | Crate | Responsibility |
@@ -31,6 +31,7 @@ harness-python ── harness ──┬── agent ──┬── compact ─�
 | `harness-python` | PyO3 binding, process-lifetime Tokio runtime, Python signal handling, and result/error conversion. |
 | `agent` | Frontend-independent runtime assembly, agent loop, events, retries, tool dispatch, persistence integration, MCP lifecycle, and subagents. |
 | `tui` | Terminal rendering, input, slash commands, and path completion. It must not depend on `agent`. |
+| `tui-md` | Markdown to width-aware, styled terminal rows with crossterm types: parsing, layout, tables, and syntax highlighting. It has no `agent` or `ratatui` dependency. |
 | `compact` | Token estimation, compaction policy and planning, and summary generation. |
 | `session` | Append-only JSONL format, locking, replay, export, and provider-history reconstruction. |
 | `llm` | Provider-neutral types, provider clients, retry behavior, SSE handling, and wire-format dialects. |
