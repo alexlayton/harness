@@ -42,7 +42,11 @@ pub fn wrap(runs: &[Run], width: usize) -> Vec<Row> {
 }
 
 fn is_space(cluster: &Cluster<'_>) -> bool {
-    cluster.text.chars().all(char::is_whitespace)
+    // Non-breaking spaces are whitespace but must not be a break point.
+    cluster
+        .text
+        .chars()
+        .all(|c| c.is_whitespace() && !matches!(c, '\u{a0}' | '\u{2007}' | '\u{202f}'))
 }
 
 fn wrap_line(line: &[Cluster<'_>], width: usize, rows: &mut Vec<Row>) {
@@ -155,6 +159,11 @@ mod tests {
         for row in wrap(&[Run::plain("     abc")], 2) {
             assert!(row.width() <= 2);
         }
+    }
+
+    #[test]
+    fn non_breaking_space_is_not_a_break_point() {
+        assert_eq!(texts("a\u{a0}b c", 3), ["a\u{a0}b", "c"]);
     }
 
     #[test]
