@@ -379,6 +379,14 @@ impl Codemode {
             render_roster(&entries),
             render_index(&entries, &signatures)
         );
+        let mut guidelines = vec![
+            "Use codemode instead of bash for Python computation; batch dependent tool calls into one snippet and return only what the answer needs. Do not blindly replay a failed snippet: earlier calls may have changed state.".to_owned(),
+        ];
+        if entries.iter().any(|entry| entry.origin.is_some()) {
+            guidelines.push(
+                "When the user names a tool, service or MCP server, or a task fits one in the MCP server roster, call it via codemode (`tools[...]`) instead of a shell CLI of the same name. If unsure, inspect `TOOLS` before using bash.".to_owned(),
+            );
+        }
         let spec = ToolSpec {
             definition: ToolDefinition {
                 name: CODEMODE_TOOL_NAME.into(),
@@ -408,9 +416,7 @@ impl Codemode {
             },
             prompt: ToolPrompt::new(
                 "Run Python that calls selected tools as functions (see its description)",
-                [
-                    "Use codemode instead of bash for Python computation; batch dependent tool calls into one snippet and return only what the answer needs. Do not blindly replay a failed snippet: earlier calls may have changed state.",
-                ],
+                guidelines,
             ),
         };
         Ok(Self {

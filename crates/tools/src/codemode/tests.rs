@@ -677,3 +677,16 @@ fn roster_stays_bounded_and_names_every_server() {
         assert!(roster.contains(name.as_str()), "{name} missing: {roster}");
     }
 }
+
+#[test]
+fn mcp_guidance_is_added_only_when_mcp_tools_exist() {
+    let spec = mcp_spec("srv", "t");
+    let origin = McpOrigin {
+        server: "srv".into(),
+        tool: "t".into(),
+    };
+    let with = Codemode::new([(&spec, None, Some(origin))]).unwrap();
+    let without = Codemode::new([(&spec, None, None)]).unwrap();
+    assert_eq!(with.spec().prompt.guidelines.len(), 2);
+    assert_eq!(without.spec().prompt.guidelines.len(), 1);
+}
