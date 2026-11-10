@@ -37,6 +37,8 @@ pub struct ToolRegistry {
     file_search_index: Option<Arc<super::FileSearchIndex>>,
     execution_gate: Option<ToolExecutionGate>,
     codemode: Option<super::codemode::Codemode>,
+    /// MCP servers known to the host, including ones that failed to start.
+    mcp_servers: Vec<super::McpServerInfo>,
     /// Number of `execute_codemode` workflows currently owning the gate;
     /// nested ungated calls are only admitted while this is non-zero.
     codemode_active: std::sync::atomic::AtomicUsize,
@@ -76,6 +78,7 @@ impl ToolRegistry {
             file_search_index: None,
             execution_gate: None,
             codemode: None,
+            mcp_servers: Vec::new(),
             codemode_active: std::sync::atomic::AtomicUsize::new(0),
         };
         for tool in tools {
@@ -168,6 +171,13 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Record a connected (or failed) MCP server so codemode can name it and
+    /// show its instructions. Call before [`Self::enable_codemode`].
+    pub fn register_mcp_server(&mut self, info: super::McpServerInfo) {
+        self.mcp_servers.retain(|known| known.name != info.name);
+        self.mcp_servers.push(info);
+    }
+
     /// Fold selected tools into one model-facing `codemode` catalogue. An
     /// empty selection includes all tools except shell and orchestration tools.
     /// Underlying executors stay private to this registry, preserving child
@@ -199,7 +209,8 @@ impl ToolRegistry {
                     tool.tool.mcp_origin(),
                 )
             });
-        self.codemode = Some(super::codemode::Codemode::new(tools).map_err(error)?);
+        self.codemode =
+            Some(super::codemode::Codemode::new(tools, &self.mcp_servers).map_err(error)?);
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 //! Bounded, fresh-state Monty orchestration. Only the async host driver can
 //! admit tool calls; a detached interpreter step has no host authority.
 
-use super::{McpOrigin, ToolOutput, ToolPrompt, ToolSpec};
+use super::{McpOrigin, McpServerInfo, ToolOutput, ToolPrompt, ToolSpec};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use monty::{MontyRun, RunProgress};
@@ -80,6 +80,7 @@ pub trait CodemodeExecutor: Send + Sync {
 pub(crate) struct Codemode {
     pub(crate) names: Vec<String>,
     entries: Vec<Entry>,
+    servers: Vec<McpServerInfo>,
     spec: ToolSpec,
 }
 
@@ -102,6 +103,7 @@ const MAX_SIGNATURE_PARAMS: usize = 8;
 /// Globals resolved lazily by the host when a snippet first uses the name.
 const GLOBAL_TOOLS: &str = "TOOLS";
 const GLOBAL_MODULES: &str = "MODULES";
+const GLOBAL_SERVERS: &str = "SERVERS";
 const GLOBAL_DESCRIBE: &str = "describe";
 
 /// First sentence of a tool description, without the generated MCP prefix.
@@ -175,21 +177,53 @@ fn server_groups(entries: &[Entry]) -> Vec<(&str, Vec<usize>)> {
     groups
 }
 
-/// One roster line naming every MCP server, independent of the index
-/// budgets so a large server cannot hide a small one. Empty without MCP tools.
-fn render_roster(entries: &[Entry]) -> String {
-    let groups = server_groups(entries);
-    if groups.is_empty() {
-        return String::new();
+/// First line of untrusted server text, stripped of control characters and
+/// capped, for the one-line roster.
+fn roster_reason(text: &str) -> String {
+    let line: String = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let line = line.trim();
+    if line.chars().count() <= 120 {
+        line.to_owned()
+    } else {
+        let cut: String = line.chars().take(119).collect();
+        format!("{}…", cut.trim_end())
     }
+}
+
+/// One roster line naming every MCP server, independent of the index
+/// budgets so a large server cannot hide a small one. Servers that failed to
+/// start are listed with the reason. Empty without any MCP server.
+fn render_roster(entries: &[Entry], servers: &[McpServerInfo]) -> String {
+    let groups = server_groups(entries);
     let short = |name: &str, count: usize| {
         format!("{name} ({count} tool{})", if count == 1 { "" } else { "s" })
     };
+    let failed: Vec<String> = servers
+        .iter()
+        .filter_map(|server| {
+            let reason = server.failure.as_deref()?;
+            Some(format!(
+                "{} (failed to start: {})",
+                server.name,
+                roster_reason(reason)
+            ))
+        })
+        .collect();
+    if groups.is_empty() && failed.is_empty() {
+        return String::new();
+    }
     // Reserve room for the short form of servers not yet rendered.
     let mut reserve: usize = groups
         .iter()
         .map(|(name, members)| short(name, members.len()).len() + 2)
-        .sum();
+        .sum::<usize>()
+        + failed.iter().map(|part| part.len() + 2).sum::<usize>();
     let mut parts = Vec::new();
     let mut used = "MCP servers: \n".len();
     for (name, members) in &groups {
@@ -211,6 +245,7 @@ fn render_roster(entries: &[Entry]) -> String {
         used += part.len() + 2;
         parts.push(part);
     }
+    parts.extend(failed);
     format!("MCP servers: {}\n", parts.join(", "))
 }
 
@@ -339,6 +374,7 @@ fn render_index(entries: &[Entry], parameters: &[String]) -> String {
 impl Codemode {
     pub(crate) fn new<'a>(
         tools: impl IntoIterator<Item = (&'a ToolSpec, Option<Value>, Option<McpOrigin>)>,
+        servers: &[McpServerInfo],
     ) -> Result<Self, String> {
         let mut names = Vec::new();
         let mut entries = Vec::new();
@@ -376,7 +412,7 @@ impl Codemode {
         }
         let index = format!(
             "{}{}",
-            render_roster(&entries),
+            render_roster(&entries, servers),
             render_index(&entries, &signatures)
         );
         let mut guidelines = vec![
@@ -396,7 +432,7 @@ impl Codemode {
                         "Put dependent calls, loops and filtering in ONE snippet. Call tools[\"name\"](**kwargs): keyword arguments only, synchronous, no await. ",
                         "Structured tools return dict/list/scalars, others return str; a failed tool raises RuntimeError. ",
                         "The last expression is the result; print() output also enters context, so return only the facts needed. ",
-                        "Globals: TOOLS (name -> summary), describe(name) (full description, parameters and output schema; use it when arguments are unclear), MODULES (importable and unavailable modules). ",
+                        "Globals: TOOLS (name -> summary), SERVERS (MCP server -> instructions, tools, status), describe(name) (full description, parameters and output schema; use it when arguments are unclear), MODULES (importable and unavailable modules). ",
                         "No file, env, network or OS access, no third-party packages, no state between calls. ",
                         "Limits: 32 KiB code, 50 tool calls, 50 KiB per value, 5 s compute, 120 s total. ",
                         "Completed tool calls are not rolled back on failure; inspect before replaying. ",
@@ -422,8 +458,49 @@ impl Codemode {
         Ok(Self {
             names,
             entries,
+            servers: servers.to_vec(),
             spec,
         })
+    }
+
+    /// `SERVERS`: server name -> `{instructions, tools, status}`. Instructions
+    /// are server-supplied text, already capped and sanitized by the host.
+    fn servers_global(&self) -> MontyObject {
+        let mut names: Vec<&str> = server_groups(&self.entries)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for server in &self.servers {
+            if !names.contains(&server.name.as_str()) {
+                names.push(&server.name);
+            }
+        }
+        MontyObject::dict(names.into_iter().map(|name| {
+            let info = self.servers.iter().find(|server| server.name == name);
+            let tools = self
+                .entries
+                .iter()
+                .filter(|entry| entry.origin.as_ref().is_some_and(|o| o.server == name))
+                .map(|entry| MontyObject::string(&entry.name));
+            let status = match info.and_then(|info| info.failure.as_deref()) {
+                Some(reason) => format!("failed to start: {}", roster_reason(reason)),
+                None => "ready".to_owned(),
+            };
+            (
+                MontyObject::string(name),
+                MontyObject::dict([
+                    (
+                        MontyObject::string("instructions"),
+                        MontyObject::string(
+                            info.and_then(|info| info.instructions.as_deref())
+                                .unwrap_or(""),
+                        ),
+                    ),
+                    (MontyObject::string("tools"), MontyObject::list(tools)),
+                    (MontyObject::string("status"), MontyObject::string(&status)),
+                ]),
+            )
+        }))
     }
 
     /// Value for a lazily resolved sandbox global, or `None` if undefined.
@@ -435,6 +512,7 @@ impl Codemode {
                     MontyObject::string(&entry.summary),
                 )
             }))),
+            GLOBAL_SERVERS => Some(self.servers_global()),
             GLOBAL_MODULES => {
                 let list =
                     |text: &str| MontyObject::list(text.split(", ").map(MontyObject::string));

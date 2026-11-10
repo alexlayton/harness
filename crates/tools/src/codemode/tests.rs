@@ -646,6 +646,7 @@ fn mcp_index(servers: &[(&str, usize)]) -> String {
         specs
             .iter()
             .map(|(spec, origin)| (spec, None, Some(origin.clone()))),
+        &[],
     )
     .unwrap();
     codemode.spec().definition.description.clone()
@@ -685,8 +686,38 @@ fn mcp_guidance_is_added_only_when_mcp_tools_exist() {
         server: "srv".into(),
         tool: "t".into(),
     };
-    let with = Codemode::new([(&spec, None, Some(origin))]).unwrap();
-    let without = Codemode::new([(&spec, None, None)]).unwrap();
+    let with = Codemode::new([(&spec, None, Some(origin))], &[]).unwrap();
+    let without = Codemode::new([(&spec, None, None)], &[]).unwrap();
     assert_eq!(with.spec().prompt.guidelines.len(), 2);
     assert_eq!(without.spec().prompt.guidelines.len(), 1);
+}
+
+#[test]
+fn failed_server_is_named_with_its_reason_and_servers_global_lists_instructions() {
+    let spec = mcp_spec("srv", "t");
+    let origin = McpOrigin {
+        server: "srv".into(),
+        tool: "t".into(),
+    };
+    let servers = [
+        McpServerInfo {
+            name: "srv".into(),
+            instructions: Some("Search the DB first.".into()),
+            failure: None,
+        },
+        McpServerInfo {
+            name: "tinysearch".into(),
+            instructions: None,
+            failure: Some("No .tinysearch/ found\nmore\u{1b}[0m".into()),
+        },
+    ];
+    let codemode = Codemode::new([(&spec, None, Some(origin))], &servers).unwrap();
+    let description = &codemode.spec().definition.description;
+    assert!(
+        description.contains("tinysearch (failed to start: No .tinysearch/ found)"),
+        "{description}"
+    );
+    let global = format!("{:?}", codemode.global(GLOBAL_SERVERS).unwrap());
+    assert!(global.contains("Search the DB first."), "{global}");
+    assert!(global.contains("failed to start"), "{global}");
 }

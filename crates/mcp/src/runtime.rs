@@ -445,6 +445,8 @@ struct ConnectedServer {
     name: String,
     client: RunningService<RoleClient, HarnessClient>,
     tools: Vec<RemoteTool>,
+    /// Server-supplied usage guidance, raw; bounded when registered.
+    instructions: Option<String>,
     stderr_task: Option<StderrTask>,
     /// Configured secret values removed from this server's tool errors.
     redactions: Redactions,
@@ -562,6 +564,19 @@ impl McpRuntime {
     /// retain this runtime until every resulting agent tool call has completed.
     pub fn register_into(&self, registry: &mut ToolRegistry) -> Result<(), McpError> {
         for server in &self.servers {
+            // Server text is untrusted: strip control characters, cap it, and
+            // remove configured secrets before it reaches the model.
+            let instructions = server
+                .instructions
+                .as_deref()
+                .map(|text| crate::tool::truncate(&crate::tool::sanitize_description(text), 1024))
+                .map(|text| server.redactions.apply(&text))
+                .filter(|text| !text.trim().is_empty());
+            registry.register_mcp_server(tools::McpServerInfo {
+                name: server.name.clone(),
+                instructions,
+                failure: None,
+            });
             for remote in &server.tools {
                 registry.register(Box::new(McpTool::new(
                     &server.name,
@@ -830,10 +845,14 @@ where
         }
     };
     tracing::debug!(server = %server.name, tools = tools.len(), "connected MCP server");
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone());
     Ok(ConnectedServer {
         name: server.name.clone(),
         client,
         tools,
+        instructions,
         stderr_task,
         redactions: Redactions::default(),
         health,

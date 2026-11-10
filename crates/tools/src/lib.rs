@@ -100,6 +100,18 @@ pub struct McpOrigin {
     pub tool: String,
 }
 
+/// Server-level facts for the codemode roster and `SERVERS` global. A server
+/// with a `failure` has no tools but must still be visible to the model so it
+/// can tell the user instead of silently falling back to a shell CLI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// Bounded, sanitized `instructions` from the initialize result.
+    pub instructions: Option<String>,
+    /// Why the server did not start, when it failed.
+    pub failure: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutput {
     pub content: String,

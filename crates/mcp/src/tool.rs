@@ -198,7 +198,7 @@ fn truncate_name(value: &str) -> String {
 /// Keep line breaks and tabs in an untrusted description, normalize CRLF and
 /// lone CR to LF, and drop every other control character (escape sequences
 /// must not reach the prompt or a terminal).
-fn sanitize_description(description: &str) -> String {
+pub(crate) fn sanitize_description(description: &str) -> String {
     description
         .replace("\r\n", "\n")
         .replace('\r', "\n")
@@ -428,7 +428,7 @@ fn execution_output(result: CallToolResult, summary: String) -> (ToolOutput, Opt
     (output, structured)
 }
 
-fn truncate(value: &str, maximum: usize) -> String {
+pub(crate) fn truncate(value: &str, maximum: usize) -> String {
     if value.len() <= maximum {
         value.into()
     } else {
