@@ -204,17 +204,15 @@ fn render_roster(entries: &[Entry], servers: &[McpServerInfo]) -> String {
     let short = |name: &str, count: usize| {
         format!("{name} ({count} tool{})", if count == 1 { "" } else { "s" })
     };
-    let failed: Vec<String> = servers
+    // (name, reason) for servers that failed to start.
+    let failed: Vec<(&str, String)> = servers
         .iter()
         .filter_map(|server| {
             let reason = server.failure.as_deref()?;
-            Some(format!(
-                "{} (failed to start: {})",
-                server.name,
-                roster_reason(reason)
-            ))
+            Some((server.name.as_str(), roster_reason(reason)))
         })
         .collect();
+    let failed_short = |name: &str| format!("{name} (failed to start)");
     if groups.is_empty() && failed.is_empty() {
         return String::new();
     }
@@ -223,7 +221,10 @@ fn render_roster(entries: &[Entry], servers: &[McpServerInfo]) -> String {
         .iter()
         .map(|(name, members)| short(name, members.len()).len() + 2)
         .sum::<usize>()
-        + failed.iter().map(|part| part.len() + 2).sum::<usize>();
+        + failed
+            .iter()
+            .map(|(name, _)| failed_short(name).len() + 2)
+            .sum::<usize>();
     let mut parts = Vec::new();
     let mut used = "MCP servers: \n".len();
     for (name, members) in &groups {
@@ -245,7 +246,18 @@ fn render_roster(entries: &[Entry], servers: &[McpServerInfo]) -> String {
         used += part.len() + 2;
         parts.push(part);
     }
-    parts.extend(failed);
+    for (name, reason) in &failed {
+        let short_form = failed_short(name);
+        reserve -= short_form.len() + 2;
+        let detailed = format!("{name} (failed to start: {reason})");
+        let part = if used + detailed.len() + 2 + reserve <= ROSTER_BUDGET {
+            detailed
+        } else {
+            short_form
+        };
+        used += part.len() + 2;
+        parts.push(part);
+    }
     format!("MCP servers: {}\n", parts.join(", "))
 }
 

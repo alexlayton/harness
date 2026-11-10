@@ -721,3 +721,30 @@ fn failed_server_is_named_with_its_reason_and_servers_global_lists_instructions(
     assert!(global.contains("Search the DB first."), "{global}");
     assert!(global.contains("failed to start"), "{global}");
 }
+
+#[test]
+fn many_failed_servers_keep_the_roster_bounded() {
+    let spec = mcp_spec("srv", "t");
+    let origin = McpOrigin {
+        server: "srv".into(),
+        tool: "t".into(),
+    };
+    let servers: Vec<McpServerInfo> = (0..20)
+        .map(|n| McpServerInfo {
+            name: format!("failing{n:02}"),
+            instructions: None,
+            failure: Some("x".repeat(500)),
+        })
+        .collect();
+    let codemode = Codemode::new([(&spec, None, Some(origin))], &servers).unwrap();
+    let description = &codemode.spec().definition.description;
+    let roster = description
+        .lines()
+        .find(|line| line.starts_with("MCP servers: "))
+        .unwrap();
+    assert!(roster.len() <= ROSTER_BUDGET, "{} bytes", roster.len());
+    assert!(
+        roster.contains("failing19") && roster.contains("srv ("),
+        "{roster}"
+    );
+}
