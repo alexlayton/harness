@@ -199,6 +199,9 @@ impl AgentBuilder {
             .await
             .map_err(|error| anyhow::anyhow!(self.secret_masker.mask_text(&error.to_string())))
             .context("connect MCP servers")?;
+            for failure in runtime.failures() {
+                tracing::warn!(server = %failure.name, "optional MCP server unavailable");
+            }
             if let Err(error) = runtime.register_into(&mut self.tools) {
                 runtime.shutdown().await;
                 return Err(anyhow::anyhow!(
@@ -312,6 +315,21 @@ pub struct AssembledAgent {
 }
 
 impl AssembledAgent {
+    /// Startup problems the frontend should show: optional MCP servers that
+    /// failed to start and are therefore unavailable this session.
+    pub fn warnings(&self) -> Vec<String> {
+        self.mcp
+            .iter()
+            .flat_map(|mcp| mcp.failures())
+            .map(|failure| {
+                format!(
+                    "MCP server `{}` failed to start and is unavailable: {}",
+                    failure.name, failure.message
+                )
+            })
+            .collect()
+    }
+
     /// Run the contained agent, then close every MCP server and reap children.
     pub async fn run(
         self,

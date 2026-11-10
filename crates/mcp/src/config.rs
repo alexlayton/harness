@@ -25,6 +25,10 @@ impl fmt::Debug for McpConfig {
 pub struct McpServerConfig {
     /// Stable local name used for diagnostics and tool namespacing.
     pub name: String,
+    /// When true, a failure to start this server aborts startup. Otherwise
+    /// the failure is recorded and the remaining servers still connect.
+    #[serde(default)]
+    pub required: bool,
     /// Transport and its non-secret connection settings.
     #[serde(flatten)]
     pub transport: McpTransportConfig,
@@ -34,6 +38,7 @@ impl fmt::Debug for McpServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpServerConfig")
             .field("name", &self.name)
+            .field("required", &self.required)
             .field("transport", &self.transport)
             .finish()
     }
@@ -394,6 +399,7 @@ mod tests {
     fn resolves_environment_without_touching_process_state() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
                     command: "server".into(),
@@ -422,6 +428,7 @@ mod tests {
         let config = McpConfig {
             servers: vec![
                 McpServerConfig {
+                    required: false,
                     name: "remote".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://${HOST}/mcp?token=${TOKEN}".into(),
@@ -431,6 +438,7 @@ mod tests {
                     },
                 },
                 McpServerConfig {
+                    required: false,
                     name: "local".into(),
                     transport: McpTransportConfig::Stdio {
                         command: "server".into(),
@@ -467,6 +475,7 @@ mod tests {
         let configs = [
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "args".into(),
                     transport: McpTransportConfig::Stdio {
                         command: "server".into(),
@@ -477,6 +486,7 @@ mod tests {
             },
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "env".into(),
                     transport: McpTransportConfig::Stdio {
                         command: "server".into(),
@@ -489,6 +499,7 @@ mod tests {
             },
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "headers".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://example.test/mcp".into(),
@@ -500,6 +511,7 @@ mod tests {
             },
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "url".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://${TOKEN}/mcp".into(),
@@ -523,6 +535,7 @@ mod tests {
     fn rejects_oversized_pre_resolved_configuration_before_cloning() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
                     command: "server".into(),
@@ -546,6 +559,7 @@ mod tests {
     fn rejects_aggregate_size_after_expansion() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
                     command: "server".into(),
@@ -574,6 +588,7 @@ mod tests {
     fn rejects_nul_introduced_by_expansion_during_final_validation() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
                     command: "server".into(),
@@ -600,6 +615,7 @@ mod tests {
         ] {
             let config = McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "remote".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://example.test/mcp".into(),
@@ -614,6 +630,7 @@ mod tests {
     #[test]
     fn debug_redacts_http_credentials_query_and_fragment() {
         let config = McpServerConfig {
+            required: false,
             name: "remote".into(),
             transport: McpTransportConfig::Http {
                 url: "https://user:password@example.test/path?token=resolved-secret#fragment"
@@ -631,6 +648,7 @@ mod tests {
     #[test]
     fn diagnostics_redact_configured_header_and_url_secrets() {
         let config = McpServerConfig {
+            required: false,
             name: "remote".into(),
             transport: McpTransportConfig::Http {
                 url: "https://user:password@example.test/path?token=resolved-secret".into(),
@@ -658,6 +676,7 @@ mod tests {
     #[test]
     fn debug_redacts_unparseable_urls() {
         let config = McpServerConfig {
+            required: false,
             name: "remote".into(),
             transport: McpTransportConfig::Http {
                 url: "https://[not-a-url]?secret=raw".into(),
@@ -672,6 +691,7 @@ mod tests {
     #[test]
     fn rejects_duplicate_servers_and_missing_environment() {
         let server = McpServerConfig {
+            required: false,
             name: "same".into(),
             transport: McpTransportConfig::Stdio {
                 command: "server".into(),
@@ -692,6 +712,7 @@ mod tests {
     fn rejects_excessive_server_count_and_control_names() {
         let servers = (0..65)
             .map(|index| McpServerConfig {
+                required: false,
                 name: format!("server-{index}"),
                 transport: McpTransportConfig::Stdio {
                     command: "server".into(),
@@ -713,6 +734,7 @@ mod tests {
 
         let invalid = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "bad\nname".into(),
                 transport: McpTransportConfig::Stdio {
                     command: "server".into(),

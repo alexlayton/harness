@@ -570,6 +570,10 @@ async fn run_application(
         }
         pending.finish(&ui_event_tx).await;
     });
+    // Surface optional MCP servers that failed to start as UI notices.
+    for warning in agent.warnings() {
+        let _ = runtime_event_tx.send(AgentEvent::Notice(warning));
+    }
     let agent_task = tokio::spawn(agent.run(runtime_input_rx, runtime_event_tx));
 
     // The crossterm frontend drives the same agent as headless mode and

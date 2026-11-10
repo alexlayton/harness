@@ -918,6 +918,7 @@ fn add_mcp_server_at(path: &Path, name: &str, command: &[String], enabled: bool)
         .split_first()
         .ok_or_else(|| anyhow!("an MCP server command is required"))?;
     let candidate = mcp::McpServerConfig {
+        required: false,
         name: name.to_owned(),
         transport: mcp::McpTransportConfig::Stdio {
             command: executable.into(),
@@ -962,6 +963,7 @@ fn add_http_mcp_server_at(
     enabled: bool,
 ) -> Result<()> {
     let candidate = mcp::McpServerConfig {
+        required: false,
         name: name.to_owned(),
         transport: mcp::McpTransportConfig::Http {
             url: url.to_owned(),
@@ -2653,6 +2655,7 @@ future_server_key = "keep"
         assert!(resolved.mcp_servers.is_empty());
 
         let servers = vec![mcp::McpServerConfig {
+            required: false,
             name: "replacement".into(),
             transport: mcp::McpTransportConfig::Http {
                 url: "https://example.test/mcp".into(),

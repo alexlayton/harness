@@ -1394,6 +1394,7 @@ fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
         .iter()
         .map(|server| match server {
             McpServer::Stdio(server) => Ok(mcp::McpServerConfig {
+                required: false,
                 name: server.name.clone(),
                 transport: mcp::McpTransportConfig::Stdio {
                     command: server.command.clone(),
@@ -1406,6 +1407,7 @@ fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
                 },
             }),
             McpServer::Http(server) => Ok(mcp::McpServerConfig {
+                required: false,
                 name: server.name.clone(),
                 transport: mcp::McpTransportConfig::Http {
                     url: server.url.clone(),
@@ -2034,6 +2036,7 @@ while IFS= read -r line; do
 done
 "#;
         mcp::McpServerConfig {
+            required: false,
             name: "delayed".into(),
             transport: mcp::McpTransportConfig::Stdio {
                 command: "/bin/sh".into(),
@@ -2237,6 +2240,7 @@ done
         let server_script = format!("echo $$ > {}; exec sleep 60", pid_path.display());
         let task = tokio::spawn(async move {
             let server = mcp::McpServerConfig {
+                required: false,
                 name: "initializing".into(),
                 transport: mcp::McpTransportConfig::Stdio {
                     command: "/bin/sh".into(),
