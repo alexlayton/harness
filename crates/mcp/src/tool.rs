@@ -291,6 +291,13 @@ impl Tool for McpTool {
         self.output_schema.clone()
     }
 
+    fn mcp_origin(&self) -> Option<tools::McpOrigin> {
+        Some(tools::McpOrigin {
+            server: self.server.clone(),
+            tool: self.original_name.clone(),
+        })
+    }
+
     async fn execute(&self, args: Value, cancel: CancellationToken) -> ToolOutput {
         self.execute_structured(args, cancel).await.0
     }

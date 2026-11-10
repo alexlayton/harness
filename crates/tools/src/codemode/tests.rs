@@ -614,3 +614,66 @@ async fn cancel_during_interpreter_step_keeps_earlier_printed_output() {
         output.content
     );
 }
+
+fn mcp_spec(server: &str, tool: &str) -> ToolSpec {
+    ToolSpec {
+        definition: ToolDefinition {
+            name: format!("mcp__{server}__{tool}__abcd1234"),
+            description: format!("MCP tool `{tool}` from server `{server}`. Does {tool} things."),
+            parameters: json!({"type": "object", "properties": {"q": {"type": "string"}}}),
+        },
+        prompt: ToolPrompt::default(),
+    }
+}
+
+fn mcp_index(servers: &[(&str, usize)]) -> String {
+    let specs: Vec<(ToolSpec, McpOrigin)> = servers
+        .iter()
+        .flat_map(|(server, count)| {
+            (0..*count).map(move |n| {
+                let tool = format!("{server}_tool_{n}");
+                (
+                    mcp_spec(server, &tool),
+                    McpOrigin {
+                        server: (*server).into(),
+                        tool,
+                    },
+                )
+            })
+        })
+        .collect();
+    let codemode = Codemode::new(
+        specs
+            .iter()
+            .map(|(spec, origin)| (spec, None, Some(origin.clone()))),
+    )
+    .unwrap();
+    codemode.spec().definition.description.clone()
+}
+
+#[test]
+fn small_server_after_a_large_one_is_named_and_gets_full_lines() {
+    let description = mcp_index(&[("safari", 90), ("tinysearch", 4)]);
+    assert!(description.contains("safari (90 tools)"), "{description}");
+    assert!(description.contains("tinysearch (4: tinysearch_tool_0,"));
+    assert!(
+        description.contains("- mcp__tinysearch__tinysearch_tool_0__abcd1234(q?) - Does"),
+        "{description}"
+    );
+    assert!(description.contains("- mcp__safari__safari_tool_0__abcd1234(q?)"));
+}
+
+#[test]
+fn roster_stays_bounded_and_names_every_server() {
+    let names: Vec<String> = (0..20).map(|n| format!("server{n:02}")).collect();
+    let servers: Vec<(&str, usize)> = names.iter().map(|name| (name.as_str(), 6)).collect();
+    let description = mcp_index(&servers);
+    let roster = description
+        .lines()
+        .find(|line| line.starts_with("MCP servers: "))
+        .unwrap();
+    assert!(roster.len() <= ROSTER_BUDGET, "{} bytes", roster.len());
+    for name in &names {
+        assert!(roster.contains(name.as_str()), "{name} missing: {roster}");
+    }
+}

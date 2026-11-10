@@ -192,7 +192,13 @@ impl ToolRegistry {
             .tools
             .iter()
             .filter(|tool| eligible(&tool.name) && (names.is_empty() || names.contains(&tool.name)))
-            .map(|tool| (&tool.spec, tool.tool.output_schema()));
+            .map(|tool| {
+                (
+                    &tool.spec,
+                    tool.tool.output_schema(),
+                    tool.tool.mcp_origin(),
+                )
+            });
         self.codemode = Some(super::codemode::Codemode::new(tools).map_err(error)?);
         Ok(())
     }

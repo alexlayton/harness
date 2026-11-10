@@ -91,6 +91,15 @@ pub struct ToolSpec {
     pub prompt: ToolPrompt,
 }
 
+/// Which MCP server a tool came from, and its name on that server. Codemode
+/// uses it to group tools per server so one large server cannot hide a small
+/// one; deriving it from the tool avoids parsing normalized names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpOrigin {
+    pub server: String,
+    pub tool: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutput {
     pub content: String,
@@ -146,6 +155,12 @@ pub trait Tool: Send + Sync {
 
     /// Return the JSON schema for structured results, when available.
     fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
+    /// The MCP server and remote tool name behind this tool; `None` for
+    /// built-in and other local tools.
+    fn mcp_origin(&self) -> Option<McpOrigin> {
         None
     }
 
