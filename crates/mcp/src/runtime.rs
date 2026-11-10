@@ -670,7 +670,12 @@ async fn connect_server(
     cancel: CancellationToken,
 ) -> Result<ConnectedServer, McpError> {
     match &server.transport {
-        McpTransportConfig::Stdio { command, args, env } => {
+        McpTransportConfig::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
             let mut command = tokio::process::Command::new(command);
             // Own a process group so close and drop can stop the whole tree.
             #[cfg(unix)]
@@ -697,7 +702,12 @@ async fn connect_server(
             command
                 .kill_on_drop(true)
                 .args(args)
-                .current_dir(workspace_root)
+                // Relative paths resolve against the workspace; an absolute
+                // `cwd` replaces it under `join`.
+                .current_dir(match cwd {
+                    Some(cwd) => workspace_root.join(cwd),
+                    None => workspace_root.to_path_buf(),
+                })
                 .envs(env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1526,6 +1536,7 @@ done
                 required: true,
                 name: "fixture".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec!["-c".into(), FIXTURE.into()],
                     env: BTreeMap::from([(String::from("MCP_TEST_MODE"), mode.into())]),
@@ -1538,6 +1549,7 @@ done
                 required,
                 name: name.into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec![
                         "-c".into(),
@@ -1567,6 +1579,29 @@ done
                 failures[0].message
             );
             runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn stdio_cwd_is_resolved_against_the_workspace_root() {
+            let server = McpServerConfig {
+                required: false,
+                name: "probe".into(),
+                transport: McpTransportConfig::Stdio {
+                    cwd: Some("src".into()),
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), "pwd >&2; exit 3".into()],
+                    env: BTreeMap::new(),
+                },
+            };
+            let runtime = McpRuntime::connect(
+                &[server],
+                &std::env::current_dir().expect("test workspace should exist"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let message = &runtime.failures()[0].message;
+            assert!(message.contains("mcp/src"), "{message}");
         }
 
         #[tokio::test]
@@ -1643,6 +1678,7 @@ done
                 required: false,
                 name: "fixture".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec!["-c".into(), script],
                     env: BTreeMap::from([(String::from("MCP_TEST_MODE"), "plain".into())]),
@@ -1691,6 +1727,7 @@ done
                 required: false,
                 name: "fixture".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec!["-c".into(), script],
                     env: BTreeMap::from([(String::from("MCP_TEST_MODE"), "plain".into())]),

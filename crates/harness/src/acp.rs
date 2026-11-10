@@ -1397,6 +1397,7 @@ fn acp_mcp_servers(servers: &[McpServer]) -> Result<Vec<mcp::McpServerConfig>> {
                 required: false,
                 name: server.name.clone(),
                 transport: mcp::McpTransportConfig::Stdio {
+                    cwd: None,
                     command: server.command.clone(),
                     args: server.args.clone(),
                     env: server
@@ -2039,6 +2040,7 @@ done
             required: false,
             name: "delayed".into(),
             transport: mcp::McpTransportConfig::Stdio {
+                cwd: None,
                 command: "/bin/sh".into(),
                 args: vec!["-c".into(), script.into()],
                 env: BTreeMap::from([
@@ -2243,6 +2245,7 @@ done
                 required: false,
                 name: "initializing".into(),
                 transport: mcp::McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec!["-c".into(), server_script],
                     env: Default::default(),

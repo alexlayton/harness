@@ -55,6 +55,10 @@ pub enum McpTransportConfig {
         args: Vec<String>,
         #[serde(default)]
         env: BTreeMap<String, String>,
+        /// Working directory for the server process. Relative paths resolve
+        /// against the workspace root, which is also the default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
     },
     /// Streamable HTTP endpoint and headers applied to every request.
     Http {
@@ -67,9 +71,15 @@ pub enum McpTransportConfig {
 impl fmt::Debug for McpTransportConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Stdio { command, args, env } => f
+            Self::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => f
                 .debug_struct("Stdio")
                 .field("command", command)
+                .field("cwd", cwd)
                 .field("args", &format_args!("<{} entries redacted>", args.len()))
                 .field("env", &format_args!("<{} entries redacted>", env.len()))
                 .finish(),
@@ -206,7 +216,21 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
         return Err(invalid("server names must be unique"));
     }
     match &server.transport {
-        McpTransportConfig::Stdio { command, args, env } => {
+        McpTransportConfig::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
+            if let Some(cwd) = cwd
+                && (cwd.as_os_str().is_empty()
+                    || cwd.to_string_lossy().contains('\0')
+                    || cwd.as_os_str().len() > MAX_MCP_FIELD_BYTES)
+            {
+                return Err(invalid(
+                    "cwd must be non-empty, contain no NUL, and fit the field limit",
+                ));
+            }
             if command.as_os_str().is_empty() || command.to_string_lossy().contains('\0') {
                 return Err(invalid("command must be non-empty and contain no NUL"));
             }
@@ -402,6 +426,7 @@ mod tests {
                 required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: vec!["${TOKEN}".into()],
                     env: [("AUTH".into(), "Bearer ${TOKEN}".into())]
@@ -441,6 +466,7 @@ mod tests {
                     required: false,
                     name: "local".into(),
                     transport: McpTransportConfig::Stdio {
+                        cwd: None,
                         command: "server".into(),
                         args: vec!["--token=${TOKEN}".into()],
                         env: [("AUTH".into(), "${TOKEN}".into())].into_iter().collect(),
@@ -478,6 +504,7 @@ mod tests {
                     required: false,
                     name: "args".into(),
                     transport: McpTransportConfig::Stdio {
+                        cwd: None,
                         command: "server".into(),
                         args: vec!["${TOKEN}".into()],
                         env: BTreeMap::new(),
@@ -489,6 +516,7 @@ mod tests {
                     required: false,
                     name: "env".into(),
                     transport: McpTransportConfig::Stdio {
+                        cwd: None,
                         command: "server".into(),
                         args: Vec::new(),
                         env: [("TOKEN_VALUE".into(), "${TOKEN}".into())]
@@ -538,6 +566,7 @@ mod tests {
                 required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: (0..16).map(|_| "x".repeat(MAX_MCP_FIELD_BYTES)).collect(),
                     env: BTreeMap::new(),
@@ -562,6 +591,7 @@ mod tests {
                 required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: (0..16).map(|_| "${TOKEN}".into()).collect(),
                     env: BTreeMap::new(),
@@ -591,6 +621,7 @@ mod tests {
                 required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: vec!["${TOKEN}".into()],
                     env: BTreeMap::new(),
@@ -694,6 +725,7 @@ mod tests {
             required: false,
             name: "same".into(),
             transport: McpTransportConfig::Stdio {
+                cwd: None,
                 command: "server".into(),
                 args: vec!["${MISSING}".into()],
                 env: BTreeMap::new(),
@@ -715,6 +747,7 @@ mod tests {
                 required: false,
                 name: format!("server-{index}"),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: Vec::new(),
                     env: BTreeMap::new(),
@@ -737,6 +770,7 @@ mod tests {
                 required: false,
                 name: "bad\nname".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: Vec::new(),
                     env: BTreeMap::new(),
