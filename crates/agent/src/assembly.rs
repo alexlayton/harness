@@ -191,7 +191,7 @@ impl AgentBuilder {
         let mcp = if self.mcp_servers.is_empty() {
             None
         } else {
-            let runtime = mcp::McpRuntime::connect(
+            let mut runtime = mcp::McpRuntime::connect(
                 &self.mcp_servers,
                 self.tools.workspace_root(),
                 self.cancel.clone(),
@@ -199,6 +199,10 @@ impl AgentBuilder {
             .await
             .map_err(|error| anyhow::anyhow!(self.secret_masker.mask_text(&error.to_string())))
             .context("connect MCP servers")?;
+            // Server-supplied failure text and instructions reach the model
+            // and the frontend; mask configured secrets the runtime's own
+            // per-server redaction cannot know about.
+            runtime.mask_diagnostics(|text| self.secret_masker.mask_text(text));
             for failure in runtime.failures() {
                 tracing::warn!(server = %failure.name, "optional MCP server unavailable");
             }

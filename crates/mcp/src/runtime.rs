@@ -525,7 +525,7 @@ impl McpRuntime {
                             if required || startup_cancel.is_cancelled() {
                                 failure = Some(error);
                             } else {
-                                tracing::warn!(server = %name, %error, "optional MCP server failed to start");
+                                tracing::warn!(server = %name, "optional MCP server failed to start");
                                 connected.failures.push(McpServerFailure {
                                     name,
                                     message: failure_message(&error),
@@ -566,6 +566,18 @@ impl McpRuntime {
             .failures
             .sort_by(|left, right| left.name.cmp(&right.name));
         Ok(connected)
+    }
+
+    /// Apply an extra text filter (the host's secret masker) to everything
+    /// server-supplied that later reaches the model or the user. Call before
+    /// [`Self::register_into`].
+    pub fn mask_diagnostics(&mut self, mask: impl Fn(&str) -> String) {
+        for failure in &mut self.failures {
+            failure.message = mask(&failure.message);
+        }
+        for server in &mut self.servers {
+            server.instructions = server.instructions.take().map(|text| mask(&text));
+        }
     }
 
     /// Optional servers that failed to start, in name order.
@@ -723,7 +735,7 @@ async fn connect_server(
             })?;
             let stderr = child.stderr.take();
             let transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
-            let tail = StderrTail::default();
+            let tail = StderrTail::new(Redactions::for_server(server));
             let stderr_task =
                 stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr, tail.clone()));
             connect_transport(
@@ -940,7 +952,16 @@ struct StderrTask(Option<JoinHandle<()>>);
 /// Last few stderr lines of a stdio server, kept so a startup failure can
 /// say why (e.g. "No .tinysearch/ found") rather than just "closed".
 #[derive(Clone, Default)]
-struct StderrTail(Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+struct StderrTail {
+    lines: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Applied to each complete line before any display truncation, so a
+    /// limit can never cut a secret in half and slip past exact-match redaction.
+    redactions: Redactions,
+}
+
+/// Longest stderr line inspected. A longer line is dropped whole rather than
+/// truncated, because a truncated secret would not match its redaction.
+const STDERR_LINE_MAX_BYTES: usize = 8 * 1024;
 
 const STDERR_TAIL_LINES: usize = 5;
 const STDERR_TAIL_LINE_CHARS: usize = 200;
@@ -948,8 +969,21 @@ const STDERR_TAIL_LINE_CHARS: usize = 200;
 const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 impl StderrTail {
-    fn push_line(&self, bytes: &[u8]) {
-        let text: String = String::from_utf8_lossy(bytes)
+    fn new(redactions: Redactions) -> Self {
+        Self {
+            lines: Arc::default(),
+            redactions,
+        }
+    }
+
+    /// Record one line; `overflowed` means bytes past the cap were dropped.
+    fn push_line(&self, bytes: &[u8], overflowed: bool) {
+        let redacted = if overflowed {
+            "[stderr line too long]".to_owned()
+        } else {
+            self.redactions.apply(&String::from_utf8_lossy(bytes))
+        };
+        let text: String = redacted
             .chars()
             .filter(|c| !c.is_control())
             .take(STDERR_TAIL_LINE_CHARS)
@@ -958,7 +992,7 @@ impl StderrTail {
         if text.is_empty() {
             return;
         }
-        let mut lines = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
         if lines.len() == STDERR_TAIL_LINES {
             lines.pop_front();
         }
@@ -966,7 +1000,7 @@ impl StderrTail {
     }
 
     fn render(&self) -> Option<String> {
-        let lines = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
         (!lines.is_empty()).then(|| lines.iter().cloned().collect::<Vec<_>>().join(" | "))
     }
 }
@@ -1016,6 +1050,7 @@ fn spawn_stderr_reader(
         let mut buffer = [0u8; MCP_STDERR_CHUNK_BYTES];
         let mut bytes = 0usize;
         let mut line = Vec::new();
+        let mut overflowed = false;
         while let Ok(read) = stderr.read(&mut buffer).await {
             if read == 0 {
                 break;
@@ -1023,14 +1058,17 @@ fn spawn_stderr_reader(
             bytes = bytes.saturating_add(read);
             for &byte in &buffer[..read] {
                 if byte == b'\n' {
-                    tail.push_line(&line);
+                    tail.push_line(&line, overflowed);
                     line.clear();
-                } else if line.len() < 4 * STDERR_TAIL_LINE_CHARS {
+                    overflowed = false;
+                } else if line.len() < STDERR_LINE_MAX_BYTES {
                     line.push(byte);
+                } else {
+                    overflowed = true;
                 }
             }
         }
-        tail.push_line(&line);
+        tail.push_line(&line, overflowed);
         if bytes > 0 {
             tracing::debug!(server = %name, bytes, "MCP server emitted stderr");
         }
@@ -1578,6 +1616,13 @@ done
                 "{}",
                 failures[0].message
             );
+            let mut runtime = runtime;
+            runtime.mask_diagnostics(|text| text.replace("tinysearch", "[masked]"));
+            assert!(
+                runtime.failures()[0]
+                    .message
+                    .contains("No .[masked]/ found")
+            );
             runtime.shutdown().await;
         }
 
@@ -1602,6 +1647,32 @@ done
             .unwrap();
             let message = &runtime.failures()[0].message;
             assert!(message.contains("mcp/src"), "{message}");
+        }
+
+        #[tokio::test]
+        async fn stderr_secrets_are_redacted_even_near_the_display_limit() {
+            // A secret straddling the 200-char display cut must not leak a prefix.
+            let secret = "s3cr3t-token-value";
+            let script = format!("printf '%0190d%s\\n' 0 \"$TOKEN\" >&2; exit 3");
+            let server = McpServerConfig {
+                required: false,
+                name: "leaky".into(),
+                transport: McpTransportConfig::Stdio {
+                    cwd: None,
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), script],
+                    env: BTreeMap::from([("TOKEN".to_owned(), secret.to_owned())]),
+                },
+            };
+            let runtime = McpRuntime::connect(
+                &[server],
+                &std::env::current_dir().expect("test workspace should exist"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let message = &runtime.failures()[0].message;
+            assert!(!message.contains("s3cr3t"), "{message}");
         }
 
         #[tokio::test]
