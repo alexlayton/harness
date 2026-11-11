@@ -57,6 +57,49 @@ preserves configuration keys that it does not know when it saves these values.
 Use `harness --resume-session ID` to reopen a persisted interactive session;
 headless runs use `harness prompt --resume ID PROMPT`.
 
+## Workspace configuration and `/reload`
+
+A `.harness/config.toml` in the directory you launch from overrides the global
+config for that directory only, so a project can pick its own model, provider,
+or MCP servers without touching `~/.config/harness/config.toml`. It only needs
+the keys it changes:
+
+```toml
+# ~/Documents/personal-workspace/.harness/config.toml
+model = "claude-opus-5-5"
+
+[[mcp.servers]]
+name = "safari"
+transport = "http"
+url = "http://127.0.0.1:9225/mcp"
+```
+
+Tables merge key by key. `[[mcp.servers]]` entries match by `name`: an entry
+replaces the global one completely (fields are not mixed), new names are added,
+and `enabled = false` switches a global server off for this directory.
+
+**Trust.** A workspace file can start MCP servers and redefine providers, so a
+cloned repository must not be able to apply one on its own. It is ignored
+unless you launch with `harness --trust`, or set this in the *global* file to
+trust every directory:
+
+```toml
+trust_workspace_config = true
+```
+
+A workspace file cannot grant itself trust. The launch header shows a `config`
+row saying whether the override was applied or skipped. Herdr resume commands
+repeat `--trust`. Settings saved by commands such as `/model` still go to the
+global file.
+
+**`/reload`** re-reads both files mid-session and applies the provider, model,
+and reasoning effort to the running agent without saving them (a workspace
+value is never written to the global config). It then reprints the header.
+MCP servers, `rtk`, and codemode are fixed when the session starts, as are
+discovered skills and `AGENTS.md` context; edits to MCP servers, `rtk`, or
+codemode are reported as needing a restart, naming the servers added or
+removed.
+
 ## Herdr TUI integration
 
 This is for the original Herdr TUI. The Herdr desktop app uses
