@@ -1230,6 +1230,25 @@ fn startup_update_notice_is_rendered_after_header_metadata() {
 }
 
 #[test]
+fn metadata_header_shows_workspace_config_before_the_first_prompt() {
+    let lines = metadata_lines(
+        "~/proj",
+        None,
+        "p",
+        "m",
+        &[],
+        &[],
+        Some(".harness/config.toml found, not loaded: pass --trust"),
+        &[],
+        Theme::default(),
+    );
+    assert_eq!(
+        row_text(&lines[3]),
+        "│ config    .harness/config.toml found, not loaded: pass --trust"
+    );
+}
+
+#[test]
 fn metadata_header_shows_context_mcp_and_skill_rows_capped() {
     let theme = Theme::default();
     let lines = metadata_lines(
@@ -1239,6 +1258,7 @@ fn metadata_header_shows_context_mcp_and_skill_rows_capped() {
         "m",
         &["AGENTS.md".into(), "~/.harness/AGENTS.md".into()],
         &["github".into(), "filesystem".into()],
+        None,
         &["alpha".into(), "beta".into()],
         theme,
     );
@@ -1264,12 +1284,12 @@ fn metadata_header_shows_context_mcp_and_skill_rows_capped() {
 
     // More than the cap folds into `+N more`.
     let many = (0..6).map(|index| format!("s{index}")).collect::<Vec<_>>();
-    let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &many, theme);
+    let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], None, &many, theme);
     assert_eq!(lines.len(), 4);
     assert_eq!(row_text(&lines[3]), "│ skills    s0, s1, s2, s3 · +2 more");
 
     // Nothing loaded: no extra rows.
-    let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], &[], theme);
+    let lines = metadata_lines("~/proj", None, "p", "m", &[], &[], None, &[], theme);
     assert_eq!(lines.len(), 3);
 }
 
@@ -1296,6 +1316,7 @@ fn long_metadata_rows_fit_narrow_widths() {
             long_model,
             &many_context,
             &many_mcps,
+            None,
             &many_skills,
             Theme::default(),
         );

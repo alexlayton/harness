@@ -125,6 +125,8 @@ enum Entry {
         context_files: Vec<String>,
         /// Configured MCP server names.
         mcp_servers: Vec<String>,
+        /// Workspace config status line, shown before the first prompt.
+        workspace_config: Option<String>,
         /// Discovered skill names.
         skills: Vec<String>,
     },
@@ -383,6 +385,8 @@ pub struct CrossTerm {
     context_files: Vec<ContextFileEntry>,
     /// Configured MCP server names for the header MCP row.
     mcp_servers: Vec<String>,
+    /// Header text about a workspace config file.
+    workspace_config: Option<String>,
     update_notice: Option<String>,
     /// Completion-driven `ListSessions` lifecycle.
     session_fetch: Fetch,
@@ -452,6 +456,7 @@ impl CrossTerm {
             skills,
             context_files,
             mcp_servers,
+            workspace_config,
             update_notice,
         } = startup;
         let (path_completion_tx, path_completion_rx) = mpsc::unbounded_channel();
@@ -491,6 +496,7 @@ impl CrossTerm {
             skills,
             context_files,
             mcp_servers,
+            workspace_config,
             update_notice,
             session_fetch: Fetch::Idle,
             session_list_display_requested: false,
@@ -1898,6 +1904,7 @@ impl CrossTerm {
                 .map(|file| file.path.clone())
                 .collect(),
             mcp_servers: self.mcp_servers.clone(),
+            workspace_config: self.workspace_config.clone(),
             skills: self.skills.iter().map(|skill| skill.name.clone()).collect(),
         }
     }

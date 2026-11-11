@@ -263,8 +263,11 @@ Normal configuration is in `~/.config/harness/config.toml`, with
 directory is merged over it on raw TOML before parsing: tables merge key by
 key, `[[mcp.servers]]` entries merge by `name` and replace wholesale (so
 `enabled = false` can switch a global server off), and other values replace.
-`--no-context-files` skips it because it is repository-supplied and can start
-MCP servers. Settings saved by commands such as `/model` still go to the
+It is ignored unless the launch passes `--trust` or the global file sets
+`trust_workspace_config = true` (a workspace file cannot grant itself trust),
+because it is repository-supplied and can start MCP servers or redefine
+providers. The TUI header shows a `config` row saying whether it was applied
+or skipped, and Herdr resume commands repeat `--trust`. Settings saved by commands such as `/model` still go to the
 global file. `/reload` re-resolves configuration through a host-supplied
 `Reloader` and applies provider, model, and reasoning to the live agent;
 MCP servers, `rtk`, and codemode are wired at build time, so edits to them

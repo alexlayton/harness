@@ -608,6 +608,10 @@ async fn run_headless_resolved(
         model: config.model.clone(),
         reasoning: config.reasoning.as_str().into(),
         no_context_files,
+        trust: matches!(
+            config.workspace_config,
+            crate::config::WorkspaceConfigState::Loaded(_)
+        ),
         defer_session_sync,
         worktree: herdr_tui_worktree,
         mcp: config.mcp_requested.clone(),

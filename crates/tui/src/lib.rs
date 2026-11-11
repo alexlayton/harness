@@ -113,6 +113,8 @@ pub struct StartupEntries {
     pub context_files: Vec<ContextFileEntry>,
     /// Configured MCP server names.
     pub mcp_servers: Vec<String>,
+    /// Header text about a workspace `.harness/config.toml`, when one exists.
+    pub workspace_config: Option<String>,
     /// Optional non-blocking GitHub release update notice.
     pub update_notice: Option<String>,
 }

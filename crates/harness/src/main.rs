@@ -440,6 +440,7 @@ async fn run_application(
                 .iter()
                 .map(|server| server.name.clone())
                 .collect(),
+            workspace_config: config.workspace_config.display(),
             update_notice,
         },
         config.reasoning.as_str(),
@@ -480,6 +481,10 @@ async fn run_application(
         model: config.model.clone(),
         reasoning: config.reasoning.as_str().into(),
         no_context_files: cli.no_context_files,
+        trust: matches!(
+            config.workspace_config,
+            config::WorkspaceConfigState::Loaded(_)
+        ),
         defer_session_sync: cli.defer_session_sync,
         worktree: herdr_tui_worktree,
         mcp: config.mcp_requested.clone(),

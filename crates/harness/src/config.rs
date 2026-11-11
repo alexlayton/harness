@@ -486,6 +486,11 @@ pub struct FileConfig {
     /// `enabled = false` connect only when a launch passes `--mcp <NAME>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<FileMcpConfig>,
+    /// Always apply `.harness/config.toml` from the launch directory, as if
+    /// every launch passed `--trust`. Only honoured in the global file: a
+    /// workspace file cannot grant itself trust.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub trust_workspace_config: bool,
     /// Terminal UI presentation settings (`[tui]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tui: Option<TuiConfig>,
@@ -515,6 +520,7 @@ impl PartialEq for FileConfig {
             && self.codemode == other.codemode
             && self.secrets == other.secrets
             && self.mcp == other.mcp
+            && self.trust_workspace_config == other.trust_workspace_config
             && self.tui == other.tui
             && self.prewalk == other.prewalk
             && self.providers == other.providers
@@ -583,10 +589,35 @@ fn load_file_config_with_mcp(
     path: &Path,
     servers: Option<&[mcp::McpServerConfig]>,
 ) -> Result<FileConfig> {
-    load_layered_file_config(path, None, servers)
+    load_layered_file_config(path, None, false, servers).map(|(config, _)| config)
 }
 
-/// Load `global`, then apply the optional `workspace` file over it.
+/// What happened to the workspace override for this launch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum WorkspaceConfigState {
+    /// No `.harness/config.toml` in the launch directory.
+    #[default]
+    Absent,
+    /// The file exists and was merged over the global config.
+    Loaded(PathBuf),
+    /// The file exists but was ignored because the workspace is not trusted.
+    Untrusted(PathBuf),
+}
+
+impl WorkspaceConfigState {
+    /// One-line header text, or `None` when there is nothing to report.
+    pub fn display(&self) -> Option<String> {
+        let relative = format!("{WORKSPACE_CONFIG_DIR}/config.toml");
+        match self {
+            Self::Absent => None,
+            Self::Loaded(_) => Some(format!("{relative} (workspace override applied)")),
+            Self::Untrusted(_) => Some(format!("{relative} found, not loaded: pass --trust")),
+        }
+    }
+}
+
+/// Load `global`, then apply the optional `workspace` file over it when
+/// `trust` (or the global `trust_workspace_config`) allows.
 ///
 /// Layering happens on raw TOML tables, before deserialization, so an override
 /// only needs to name the keys it changes. See [`merge_config_tables`] for the
@@ -594,14 +625,27 @@ fn load_file_config_with_mcp(
 fn load_layered_file_config(
     global: &Path,
     workspace: Option<&Path>,
+    trust: bool,
     servers: Option<&[mcp::McpServerConfig]>,
-) -> Result<FileConfig> {
+) -> Result<(FileConfig, WorkspaceConfigState)> {
     let mut document = read_config_table(global)?;
-    if let Some(workspace) = workspace {
-        let overlay = read_config_table(workspace)?;
-        if !overlay.is_empty() {
+    // Read from the global layer only, before any overlay is applied.
+    let trusted = trust
+        || document
+            .get("trust_workspace_config")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+    let mut state = WorkspaceConfigState::Absent;
+    if let Some(workspace) = workspace.filter(|path| path.is_file()) {
+        if trusted {
+            let mut overlay = read_config_table(workspace)?;
+            overlay.remove("trust_workspace_config");
             tracing::debug!(path = %workspace.display(), "applying workspace config");
             merge_config_tables(&mut document, overlay);
+            state = WorkspaceConfigState::Loaded(workspace.to_owned());
+        } else {
+            tracing::warn!(path = %workspace.display(), "workspace config ignored: not trusted");
+            state = WorkspaceConfigState::Untrusted(workspace.to_owned());
         }
     }
     if let Some(servers) = servers {
@@ -616,7 +660,7 @@ fn load_layered_file_config(
         .try_into()
         .with_context(|| format!("parse config file {}", global.display()))?;
     config.validate()?;
-    Ok(config)
+    Ok((config, state))
 }
 
 fn read_config_table(path: &Path) -> Result<toml::Table> {
@@ -1240,6 +1284,12 @@ pub struct Cli {
     #[arg(long = "prewalk-reasoning-effort", value_name = "LEVEL", global = true)]
     pub prewalk_reasoning_effort: Option<ReasoningPolicy>,
 
+    /// Apply `.harness/config.toml` from the launch directory. It can start
+    /// MCP servers and redefine providers, so it is ignored unless trusted
+    /// here or by `trust_workspace_config = true` in the global config.
+    #[arg(long = "trust", default_value_t = false, global = true)]
+    pub trust: bool,
+
     /// Disable AGENTS.md / CLAUDE.md project-context injection.
     #[arg(long = "no-context-files", default_value_t = false, global = true)]
     pub no_context_files: bool,
@@ -1454,6 +1504,9 @@ pub struct Config {
     pub codex_auth: Option<Arc<OpenAiCodexAuth>>,
     /// Shared subscription credential lifecycle (loaded only for this provider).
     pub anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
+    /// Whether a workspace `.harness/config.toml` was applied, ignored as
+    /// untrusted, or absent. Shown in the TUI header.
+    pub workspace_config: WorkspaceConfigState,
 }
 
 impl Config {
@@ -1512,16 +1565,11 @@ impl Config {
     /// before validating or expanding the persisted MCP section and never saved.
     pub fn resolve_with_mcp(cli: &Cli, servers: Option<&[mcp::McpServerConfig]>) -> Result<Self> {
         let path = config_path();
-        // `--no-context-files` also skips the workspace override: both are
-        // repository-supplied inputs, and the override can start MCP servers.
-        let workspace = if cli.no_context_files {
-            None
-        } else {
-            std::env::current_dir()
-                .ok()
-                .map(|dir| workspace_config_path(&dir))
-        };
-        let file = load_layered_file_config(&path, workspace.as_deref(), servers)?;
+        let workspace = std::env::current_dir()
+            .ok()
+            .map(|dir| workspace_config_path(&dir));
+        let (file, workspace_config) =
+            load_layered_file_config(&path, workspace.as_deref(), cli.trust, servers)?;
         // One credential read serves both the entitled-model default below
         // and the provider/agent construction in `main`. Loaded only when the
         // *effective* provider (CLI override wins) is Copilot, matching the
@@ -1539,6 +1587,7 @@ impl Config {
             .then(|| OpenAiCodexAuth::from_default().map(Arc::new))
             .transpose()?;
         let mut config = Self::resolve_from_file(cli, &file, path, env_api_key)?;
+        config.workspace_config = workspace_config;
         config.copilot_auth = copilot_auth;
         config.codex_auth = codex_auth;
         config.anthropic_auth = (effective_provider == Some(ProviderArg::AnthropicSubscription))
@@ -1714,6 +1763,7 @@ impl Config {
             .transpose()
             .map_err(|error| anyhow!(error))?;
         Ok(Self {
+            workspace_config: WorkspaceConfigState::Absent,
             provider,
             custom_providers: Arc::new(file.providers.clone()),
             model,
@@ -2303,6 +2353,7 @@ mod tests {
             secrets: None,
             mcp: None,
             tui: Some(TuiConfig { minimal: true }),
+            trust_workspace_config: true,
             prewalk: None,
             providers: [(
                 "lmstudio".to_owned(),
@@ -2943,7 +2994,9 @@ reserve_tokens = 1000
         let workspace = workspace_config_path(&directory.path().join("project"));
         write(&workspace, "model = \"local/model\"\n");
 
-        let config = load_layered_file_config(&global, Some(&workspace), None).unwrap();
+        let config = load_layered_file_config(&global, Some(&workspace), true, None)
+            .unwrap()
+            .0;
         assert_eq!(config.provider.as_deref(), Some("openrouter"));
         assert_eq!(config.model.as_deref(), Some("local/model"));
         assert!(config.rtk);
@@ -2991,7 +3044,9 @@ command = "/bin/echo"
 "#,
         );
 
-        let config = load_layered_file_config(&global, Some(&workspace), None).unwrap();
+        let config = load_layered_file_config(&global, Some(&workspace), true, None)
+            .unwrap()
+            .0;
         let servers = config.mcp.unwrap().servers;
         let names: Vec<_> = servers
             .iter()
@@ -3012,7 +3067,9 @@ command = "/bin/echo"
         let global = directory.path().join("global.toml");
         write(&global, "model = \"global/model\"\n");
         let workspace = workspace_config_path(directory.path());
-        let config = load_layered_file_config(&global, Some(&workspace), None).unwrap();
+        let config = load_layered_file_config(&global, Some(&workspace), true, None)
+            .unwrap()
+            .0;
         assert_eq!(config.model.as_deref(), Some("global/model"));
     }
 
@@ -3022,7 +3079,7 @@ command = "/bin/echo"
         let global = directory.path().join("global.toml");
         let workspace = workspace_config_path(directory.path());
         write(&workspace, "model = [");
-        let error = load_layered_file_config(&global, Some(&workspace), None).unwrap_err();
+        let error = load_layered_file_config(&global, Some(&workspace), true, None).unwrap_err();
         assert!(
             format!("{error:#}").contains(".harness/config.toml"),
             "{error:#}"
@@ -3049,5 +3106,64 @@ command = "/bin/echo"
             with_rtk.reload_settings(&running).notice.as_deref(),
             Some("Restart harness to apply: rtk")
         );
+    }
+
+    fn trust_fixture(global: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let global_path = directory.path().join("global.toml");
+        write(&global_path, global);
+        let workspace = workspace_config_path(&directory.path().join("project"));
+        write(&workspace, "model = \"local/model\"\n");
+        (directory, global_path, workspace)
+    }
+
+    #[test]
+    fn untrusted_workspace_config_is_ignored_and_reported() {
+        let (_dir, global, workspace) = trust_fixture("model = \"global/model\"\n");
+        let (config, state) =
+            load_layered_file_config(&global, Some(&workspace), false, None).unwrap();
+        assert_eq!(config.model.as_deref(), Some("global/model"));
+        assert_eq!(state, WorkspaceConfigState::Untrusted(workspace));
+        assert!(state.display().unwrap().contains("--trust"));
+    }
+
+    #[test]
+    fn trust_flag_or_global_setting_applies_the_workspace_config() {
+        let (_dir, global, workspace) = trust_fixture("model = \"global/model\"\n");
+        let (config, state) =
+            load_layered_file_config(&global, Some(&workspace), true, None).unwrap();
+        assert_eq!(config.model.as_deref(), Some("local/model"));
+        assert_eq!(state, WorkspaceConfigState::Loaded(workspace));
+
+        let (_dir, global, workspace) =
+            trust_fixture("model = \"global/model\"\ntrust_workspace_config = true\n");
+        let (config, state) =
+            load_layered_file_config(&global, Some(&workspace), false, None).unwrap();
+        assert_eq!(config.model.as_deref(), Some("local/model"));
+        assert!(matches!(state, WorkspaceConfigState::Loaded(_)));
+    }
+
+    #[test]
+    fn workspace_config_cannot_grant_itself_trust() {
+        let (_dir, global, workspace) = trust_fixture("model = \"global/model\"\n");
+        write(
+            &workspace,
+            "trust_workspace_config = true\nmodel = \"local/model\"\n",
+        );
+        let (_, state) = load_layered_file_config(&global, Some(&workspace), false, None).unwrap();
+        assert!(matches!(state, WorkspaceConfigState::Untrusted(_)));
+        // And a trusted load does not leak the key into the resolved config.
+        let (config, _) = load_layered_file_config(&global, Some(&workspace), true, None).unwrap();
+        assert!(!config.trust_workspace_config);
+    }
+
+    #[test]
+    fn absent_workspace_config_reports_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global.toml");
+        let missing = workspace_config_path(directory.path());
+        let (_, state) = load_layered_file_config(&global, Some(&missing), true, None).unwrap();
+        assert_eq!(state, WorkspaceConfigState::Absent);
+        assert_eq!(state.display(), None);
     }
 }
