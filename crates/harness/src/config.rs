@@ -568,6 +568,14 @@ pub fn load_file_config(path: &Path) -> Result<FileConfig> {
     load_file_config_with_mcp(path, None)
 }
 
+/// Directory name that holds workspace-local Harness settings.
+pub const WORKSPACE_CONFIG_DIR: &str = ".harness";
+
+/// Path of the optional workspace override file for `workspace`.
+pub fn workspace_config_path(workspace: &Path) -> PathBuf {
+    workspace.join(WORKSPACE_CONFIG_DIR).join("config.toml")
+}
+
 // Replace the entire persisted MCP section before deserialization, validation,
 // and environment expansion. An explicit empty list must be able to disable
 // stale servers, including entries whose credentials are no longer available.
@@ -575,6 +583,43 @@ fn load_file_config_with_mcp(
     path: &Path,
     servers: Option<&[mcp::McpServerConfig]>,
 ) -> Result<FileConfig> {
+    load_layered_file_config(path, None, servers)
+}
+
+/// Load `global`, then apply the optional `workspace` file over it.
+///
+/// Layering happens on raw TOML tables, before deserialization, so an override
+/// only needs to name the keys it changes. See [`merge_config_tables`] for the
+/// merge rules. A missing file in either layer is an empty layer.
+fn load_layered_file_config(
+    global: &Path,
+    workspace: Option<&Path>,
+    servers: Option<&[mcp::McpServerConfig]>,
+) -> Result<FileConfig> {
+    let mut document = read_config_table(global)?;
+    if let Some(workspace) = workspace {
+        let overlay = read_config_table(workspace)?;
+        if !overlay.is_empty() {
+            tracing::debug!(path = %workspace.display(), "applying workspace config");
+            merge_config_tables(&mut document, overlay);
+        }
+    }
+    if let Some(servers) = servers {
+        document.insert(
+            "mcp".into(),
+            toml::Value::try_from(mcp::McpConfig {
+                servers: servers.to_vec(),
+            })?,
+        );
+    }
+    let config: FileConfig = document
+        .try_into()
+        .with_context(|| format!("parse config file {}", global.display()))?;
+    config.validate()?;
+    Ok(config)
+}
+
+fn read_config_table(path: &Path) -> Result<toml::Table> {
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -582,22 +627,56 @@ fn load_file_config_with_mcp(
             return Err(error).with_context(|| format!("read config file {}", path.display()));
         }
     };
-    let Some(servers) = servers else {
-        return parse_file_config(&contents, path);
-    };
-    let mut document: toml::Table = toml::from_str(&contents)
-        .with_context(|| format!("parse config file {}", path.display()))?;
-    document.insert(
-        "mcp".into(),
-        toml::Value::try_from(mcp::McpConfig {
-            servers: servers.to_vec(),
-        })?,
-    );
-    let config: FileConfig = document
-        .try_into()
-        .with_context(|| format!("parse config file {}", path.display()))?;
-    config.validate()?;
-    Ok(config)
+    toml::from_str(&contents).with_context(|| format!("parse config file {}", path.display()))
+}
+
+/// Merge a workspace `overlay` into the global `base`.
+///
+/// Tables merge key by key, recursively; any other value in the overlay
+/// replaces the base value. The one exception is `mcp.servers`: entries are
+/// matched by `name`, and an overlay entry replaces the whole base entry
+/// (merging fields would mix a stdio `command` with an http `url`). Overlay
+/// servers with new names are appended. This lets a workspace add a server,
+/// swap one out, or turn a global one off with `enabled = false`.
+fn merge_config_tables(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base)), toml::Value::Table(overlay)) => {
+                if key == "mcp" {
+                    merge_mcp_tables(base, overlay);
+                } else {
+                    merge_config_tables(base, overlay);
+                }
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+fn merge_mcp_tables(base: &mut toml::Table, mut overlay: toml::Table) {
+    if let Some(toml::Value::Array(overlay_servers)) = overlay.remove("servers") {
+        let base_servers = match base.entry("servers") {
+            toml::map::Entry::Occupied(entry) => entry.into_mut(),
+            toml::map::Entry::Vacant(entry) => entry.insert(toml::Value::Array(Vec::new())),
+        };
+        if let toml::Value::Array(base_servers) = base_servers {
+            for server in overlay_servers {
+                let name = server.get("name").and_then(toml::Value::as_str);
+                let existing = name.and_then(|name| {
+                    base_servers.iter().position(|candidate| {
+                        candidate.get("name").and_then(toml::Value::as_str) == Some(name)
+                    })
+                });
+                match existing {
+                    Some(index) => base_servers[index] = server,
+                    None => base_servers.push(server),
+                }
+            }
+        }
+    }
+    merge_config_tables(base, overlay);
 }
 
 fn parse_file_config(contents: &str, path: &Path) -> Result<FileConfig> {
@@ -1400,7 +1479,16 @@ impl Config {
     /// before validating or expanding the persisted MCP section and never saved.
     pub fn resolve_with_mcp(cli: &Cli, servers: Option<&[mcp::McpServerConfig]>) -> Result<Self> {
         let path = config_path();
-        let file = load_file_config_with_mcp(&path, servers)?;
+        // `--no-context-files` also skips the workspace override: both are
+        // repository-supplied inputs, and the override can start MCP servers.
+        let workspace = if cli.no_context_files {
+            None
+        } else {
+            std::env::current_dir()
+                .ok()
+                .map(|dir| workspace_config_path(&dir))
+        };
+        let file = load_layered_file_config(&path, workspace.as_deref(), servers)?;
         // One credential read serves both the entitled-model default below
         // and the provider/agent construction in `main`. Loaded only when the
         // *effective* provider (CLI override wins) is Copilot, matching the
@@ -2797,5 +2885,114 @@ future_server_key = "keep"
         assert_eq!(tail.len(), 8);
         assert!(tail.chars().all(|ch| ch.is_ascii_hexdigit()));
         assert_eq!(first.parent(), second.parent());
+    }
+
+    fn write(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn workspace_config_overrides_only_the_keys_it_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global.toml");
+        write(
+            &global,
+            r#"
+provider = "openrouter"
+model = "global/model"
+rtk = true
+
+[compaction]
+reserve_tokens = 1000
+"#,
+        );
+        let workspace = workspace_config_path(&directory.path().join("project"));
+        write(&workspace, "model = \"local/model\"\n");
+
+        let config = load_layered_file_config(&global, Some(&workspace), None).unwrap();
+        assert_eq!(config.provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.model.as_deref(), Some("local/model"));
+        assert!(config.rtk);
+        assert!(config.compaction.is_some());
+    }
+
+    #[test]
+    fn workspace_mcp_servers_merge_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global.toml");
+        write(
+            &global,
+            r#"
+[[mcp.servers]]
+name = "safari"
+transport = "stdio"
+command = "bunx"
+args = ["safari-mcp"]
+
+[[mcp.servers]]
+name = "docs"
+transport = "http"
+url = "http://127.0.0.1:1/mcp"
+"#,
+        );
+        let workspace = workspace_config_path(&directory.path().join("project"));
+        write(
+            &workspace,
+            r#"
+[[mcp.servers]]
+name = "safari"
+transport = "http"
+url = "http://127.0.0.1:9225/mcp"
+
+[[mcp.servers]]
+name = "docs"
+transport = "http"
+url = "http://127.0.0.1:1/mcp"
+enabled = false
+
+[[mcp.servers]]
+name = "extra"
+transport = "stdio"
+command = "/bin/echo"
+"#,
+        );
+
+        let config = load_layered_file_config(&global, Some(&workspace), None).unwrap();
+        let servers = config.mcp.unwrap().servers;
+        let names: Vec<_> = servers
+            .iter()
+            .map(|server| server.config.name.as_str())
+            .collect();
+        assert_eq!(names, ["safari", "docs", "extra"]);
+        // The safari entry was replaced wholesale, not field-merged.
+        assert!(matches!(
+            servers[0].config.transport,
+            mcp::McpTransportConfig::Http { .. }
+        ));
+        assert!(!servers[1].enabled);
+    }
+
+    #[test]
+    fn missing_workspace_config_leaves_global_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global.toml");
+        write(&global, "model = \"global/model\"\n");
+        let workspace = workspace_config_path(directory.path());
+        let config = load_layered_file_config(&global, Some(&workspace), None).unwrap();
+        assert_eq!(config.model.as_deref(), Some("global/model"));
+    }
+
+    #[test]
+    fn invalid_workspace_config_names_its_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("global.toml");
+        let workspace = workspace_config_path(directory.path());
+        write(&workspace, "model = [");
+        let error = load_layered_file_config(&global, Some(&workspace), None).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(".harness/config.toml"),
+            "{error:#}"
+        );
     }
 }
