@@ -46,15 +46,24 @@ impl McpServerConfig {
     /// is indistinguishable from a subcommand, so callers should also apply
     /// their own secret masker.
     pub fn describe(&self) -> String {
+        self.describe_with(|text| text.to_owned())
+    }
+
+    /// Like [`Self::describe`], additionally running every argument through
+    /// `mask` (the caller's exact-value secret masker). Masking happens
+    /// before any shortening: an exact-value masker cannot recognise a secret
+    /// that has already been cut short, which would leave its prefix visible.
+    pub fn describe_with(&self, mask: impl Fn(&str) -> String) -> String {
         match &self.transport {
             McpTransportConfig::Stdio { command, args, .. } => {
-                let mut parts = vec![command.display().to_string()];
+                let redactions = Redactions::for_server(self);
+                let clean = |text: &str| redactions.apply(&mask(text));
+                let mut parts = vec![clean(&command.display().to_string())];
                 let mut hide_next = false;
                 for arg in args {
-                    parts.push(describe_arg(arg, &mut hide_next));
+                    parts.push(describe_arg(&clean(arg), &mut hide_next));
                 }
-                let line = Redactions::for_server(self).apply(&parts.join(" "));
-                format!("stdio: {}", truncate_display(&line, 200))
+                format!("stdio: {}", truncate_display(&parts.join(" "), 200))
             }
             McpTransportConfig::Http { url, .. } => format!("http: {}", redact_url(url)),
         }
@@ -536,6 +545,23 @@ mod tests {
         assert!(!text.contains("env-secret-value"), "{text}");
         let long = "x".repeat(500);
         assert!(stdio(&[&long], &[]).describe().chars().count() < 260);
+    }
+
+    #[test]
+    fn describe_masks_before_it_truncates() {
+        // A secret longer than the per-argument cap must not leave a prefix.
+        let secret = "s3cr3t-".repeat(20);
+        let server = stdio(&[&secret], &[]);
+        let text = server.describe_with(|text| text.replace(&secret, "{{masked}}"));
+        assert!(!text.contains("s3cr3t"), "{text}");
+        assert!(text.contains("{{masked}}"), "{text}");
+        // And the same for a long value that only appears in the server's env.
+        let server = stdio(&[&secret], &[("T", &secret)]);
+        assert!(
+            !server.describe().contains("s3cr3t"),
+            "{}",
+            server.describe()
+        );
     }
 
     #[test]

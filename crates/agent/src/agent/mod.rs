@@ -1508,7 +1508,9 @@ done
                 headers: [("Authorization".to_owned(), "Bearer secret".to_owned())].into(),
             },
         };
-        let summary = super::reload::mcp_summary(&[], &[http, stdio_server("docs", false)]);
+        let summary = super::reload::mcp_summary(&[], &[http, stdio_server("docs", false)], &|t| {
+            t.to_owned()
+        });
         assert!(summary.contains("+web (http: https://"), "{summary}");
         assert!(summary.contains("@example.test/mcp)"), "{summary}");
         assert!(
@@ -1598,6 +1600,21 @@ done
         let notice = notice.as_deref().unwrap();
         assert!(!notice.contains("positional-secret"), "{notice}");
         assert!(notice.contains("+docs"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn reload_notice_masks_a_long_secret_before_it_is_shortened() {
+        let secret = "long-secret-".repeat(12);
+        let masker = Arc::new(
+            crate::secrets::SecretMasker::new([("TOKEN".into(), secret.clone())]).unwrap(),
+        );
+        let mut server = stdio_server("docs", false);
+        if let mcp::McpTransportConfig::Stdio { args, .. } = &mut server.transport {
+            args.push(secret.clone());
+        }
+        let summary = super::reload::mcp_summary(&[], &[server], &|t| masker.mask_text(t));
+        assert!(!summary.contains("long-secret"), "{summary}");
+        assert!(summary.contains("+docs"), "{summary}");
     }
 
     #[tokio::test]

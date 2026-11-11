@@ -91,7 +91,10 @@ impl Agent {
             let old = swap_runtime(&self.mcp, new_runtime);
             shutdown_runtime(old).await;
             let before = std::mem::replace(&mut self.mcp_configs, servers.to_vec());
-            notes.insert(0, mcp_summary(&before, servers));
+            notes.insert(
+                0,
+                mcp_summary(&before, servers, &|text| self.secret_masker.mask_text(text)),
+            );
         }
         Ok(())
     }
@@ -130,6 +133,7 @@ async fn shutdown_runtime(runtime: Option<mcp::McpRuntime>) {
 pub(super) fn mcp_summary(
     before: &[mcp::McpServerConfig],
     after: &[mcp::McpServerConfig],
+    mask: &dyn Fn(&str) -> String,
 ) -> String {
     let known = |servers: &[mcp::McpServerConfig], name: &str| {
         servers.iter().any(|server| server.name == name)
@@ -137,7 +141,7 @@ pub(super) fn mcp_summary(
     let mut changes: Vec<String> = after
         .iter()
         .filter(|server| !known(before, &server.name))
-        .map(|server| format!("+{} ({})", server.name, server.describe()))
+        .map(|server| format!("+{} ({})", server.name, server.describe_with(mask)))
         .chain(
             before
                 .iter()
