@@ -1391,7 +1391,10 @@ mod tests {
         assert_eq!(skills.len(), 1);
         let notice = notice.as_deref().unwrap();
         assert!(notice.contains("MCP servers reconnected"), "{notice}");
-        assert!(notice.contains("+docs"), "{notice}");
+        assert!(
+            notice.contains("+docs (stdio: /nonexistent/mcp-server)"),
+            "{notice}"
+        );
         assert!(notice.contains("`docs` is unavailable"), "{notice}");
     }
 
@@ -1493,6 +1496,27 @@ done
         agent.reload_mcp(&[], None, &mut notes).await.unwrap();
         assert!(!has(&agent, "tool_b"));
         assert!(agent.mcp.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn reload_notice_shows_what_an_added_server_runs_without_secrets() {
+        let http = mcp::McpServerConfig {
+            name: "web".into(),
+            required: false,
+            transport: mcp::McpTransportConfig::Http {
+                url: "https://user:pass@example.test/mcp?token=abc#frag".into(),
+                headers: [("Authorization".to_owned(), "Bearer secret".to_owned())].into(),
+            },
+        };
+        let summary = super::reload::mcp_summary(&[], &[http, stdio_server("docs", false)]);
+        assert!(summary.contains("+web (http: https://"), "{summary}");
+        assert!(summary.contains("@example.test/mcp)"), "{summary}");
+        assert!(
+            !summary.contains("pass") && !summary.contains("abc"),
+            "{summary}"
+        );
+        assert!(!summary.contains("secret"), "{summary}");
+        assert!(!summary.contains("user:"), "{summary}");
     }
 
     #[tokio::test]

@@ -121,22 +121,34 @@ async fn shutdown_runtime(runtime: Option<mcp::McpRuntime>) {
     }
 }
 
-/// `MCP: +docs, -safari` style line, or a plain reconnect line when only
+/// `MCP: +docs (cmd), -safari` style line, or a plain reconnect line when only
 /// settings of existing servers changed.
-fn mcp_summary(before: &[mcp::McpServerConfig], after: &[mcp::McpServerConfig]) -> String {
-    let names = |servers: &[mcp::McpServerConfig]| -> Vec<String> {
-        servers.iter().map(|server| server.name.clone()).collect()
+///
+/// Each added server is shown with what it will run or contact. A reload can
+/// follow an edit the user did not make (the model can write a trusted
+/// workspace config), so the notice must not hide the command being started.
+pub(super) fn mcp_summary(
+    before: &[mcp::McpServerConfig],
+    after: &[mcp::McpServerConfig],
+) -> String {
+    let known = |servers: &[mcp::McpServerConfig], name: &str| {
+        servers.iter().any(|server| server.name == name)
     };
-    let (before, after) = (names(before), names(after));
     let mut changes: Vec<String> = after
         .iter()
-        .filter(|name| !before.contains(name))
-        .map(|name| format!("+{name}"))
+        .filter(|server| !known(before, &server.name))
+        .map(|server| {
+            format!(
+                "+{} ({})",
+                server.name,
+                describe_transport(&server.transport)
+            )
+        })
         .chain(
             before
                 .iter()
-                .filter(|name| !after.contains(name))
-                .map(|name| format!("-{name}")),
+                .filter(|server| !known(after, &server.name))
+                .map(|server| format!("-{}", server.name)),
         )
         .collect();
     if changes.is_empty() {
@@ -147,4 +159,18 @@ fn mcp_summary(before: &[mcp::McpServerConfig], after: &[mcp::McpServerConfig]) 
         after.len(),
         changes.join(", ")
     )
+}
+
+/// What a server will launch or connect to, without environment values or
+/// header values. Only the command line and URL are shown, and the URL goes
+/// through `mcp::redact_url`, which drops credentials, query and fragment.
+fn describe_transport(transport: &mcp::McpTransportConfig) -> String {
+    match transport {
+        mcp::McpTransportConfig::Stdio { command, args, .. } => {
+            let mut parts = vec![command.display().to_string()];
+            parts.extend(args.iter().cloned());
+            format!("stdio: {}", parts.join(" "))
+        }
+        mcp::McpTransportConfig::Http { url, .. } => format!("http: {}", mcp::redact_url(url)),
+    }
 }
