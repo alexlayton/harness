@@ -62,6 +62,8 @@ pub enum InputMessage {
     SubscriptionUsage,
     /// Ask the agent for the discovered-skill view (see [`UiEvent::SkillsLoaded`]).
     ListSkills,
+    /// Re-read configuration and apply provider, model, and reasoning.
+    Reload,
 }
 
 /// What a [`UiEvent::PrewalkChanged`] reports, for its confirmation notice.
@@ -216,6 +218,14 @@ pub enum UiEvent {
     /// Confirmed portable reasoning policy.
     ReasoningChanged {
         level: String,
+    },
+    /// A `/reload` finished. Unlike `ModelChanged`, one notice reports the
+    /// active selections and any `notice` detail from the host.
+    Reloaded {
+        provider: String,
+        model: String,
+        reasoning: String,
+        notice: Option<String>,
     },
     /// Prewalk arm state and `[<provider>:]<model>` target.
     PrewalkChanged {

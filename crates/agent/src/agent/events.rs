@@ -45,6 +45,9 @@ pub enum InputMessage {
     SubscriptionUsage,
     /// Return the discovered-skill view.
     ListSkills,
+    /// Re-read configuration through the host's [`crate::Reloader`] and apply
+    /// what can change in flight: provider, model, and reasoning.
+    Reload,
 }
 
 /// Events emitted by the agent for frontend rendering and lifecycle tracking.
@@ -115,6 +118,17 @@ pub enum AgentEvent {
         /// Target reasoning; `None` keeps the active policy.
         reasoning: Option<String>,
         change: PrewalkChange,
+    },
+    /// Configuration was reloaded and these are the active selections. Like a
+    /// prewalk handoff, this is not a user selection, so hosts must not
+    /// persist it: the values may come from a workspace-local override.
+    /// `notice` carries host-supplied detail, such as settings that still
+    /// need a restart.
+    Reloaded {
+        provider: String,
+        model: String,
+        reasoning: String,
+        notice: Option<String>,
     },
     /// Prewalk switched the active model and, when `reasoning` is present,
     /// the reasoning policy. Unlike [`AgentEvent::ModelChanged`] and

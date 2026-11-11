@@ -109,6 +109,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         argument_kind: ArgumentKind::PrewalkReasoning,
     },
     CommandSpec {
+        name: "/reload",
+        description: "Re-read config.toml (including .harness/config.toml) and apply model settings",
+        usage: "/reload",
+        argument_kind: ArgumentKind::None,
+    },
+    CommandSpec {
         name: "/usage",
         description: "Show active subscription allowance usage",
         usage: "/usage",
@@ -211,6 +217,7 @@ pub enum ParsedCommand {
         level: Option<String>,
     },
     Usage,
+    Reload,
     Skills,
     /// `/skill <name>` or a bare `/<name>` alias. `name` is the skill's
     /// catalog name (without the leading slash); `alias` distinguishes the
@@ -304,6 +311,13 @@ pub fn parse_command(text: &str) -> Result<ParsedCommand, String> {
                 Err("usage: /compact".into())
             } else {
                 Ok(ParsedCommand::Compact)
+            }
+        }
+        "/reload" => {
+            if words.next().is_some() {
+                Err("usage: /reload".into())
+            } else {
+                Ok(ParsedCommand::Reload)
             }
         }
         "/usage" => {
@@ -1563,6 +1577,8 @@ mod tests {
         );
         assert_eq!(parse_command("/compact"), Ok(ParsedCommand::Compact));
         assert_eq!(parse_command("/usage"), Ok(ParsedCommand::Usage));
+        assert_eq!(parse_command("/reload"), Ok(ParsedCommand::Reload));
+        assert_eq!(parse_command("/reload now"), Err("usage: /reload".into()));
         assert_eq!(parse_command("/USAGE"), Ok(ParsedCommand::Usage));
         assert_eq!(parse_command("/usage now"), Err("usage: /usage".into()));
         assert_eq!(

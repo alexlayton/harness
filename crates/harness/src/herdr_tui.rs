@@ -334,6 +334,17 @@ impl Reporter {
                 options.reasoning = level.clone();
                 self.resume_options(options);
             }
+            AgentEvent::Reloaded {
+                provider,
+                model,
+                reasoning,
+                ..
+            } => {
+                options.provider = provider.clone();
+                options.model = model.clone();
+                options.reasoning = reasoning.clone();
+                self.resume_options(options);
+            }
             AgentEvent::TextDelta(_)
             | AgentEvent::ReasoningDelta(_)
             | AgentEvent::ToolCallStarted { .. }

@@ -56,6 +56,7 @@ pub struct AgentBuilder {
     provider_factory: Option<ProviderFactory>,
     secret_masker: Arc<SecretMasker>,
     mcp_servers: Vec<mcp::McpServerConfig>,
+    reloader: Option<crate::Reloader>,
     codemode: Option<Vec<String>>,
     prewalk: PrewalkSettings,
 }
@@ -84,6 +85,7 @@ impl AgentBuilder {
             provider_factory: None,
             secret_masker: Arc::new(SecretMasker::default()),
             mcp_servers: Vec::new(),
+            reloader: None,
             codemode: None,
             prewalk: PrewalkSettings::default(),
         }
@@ -147,6 +149,12 @@ impl AgentBuilder {
     /// Attach host-owned provider construction for `/model` and `/models`.
     pub fn with_provider_factory(mut self, factory: ProviderFactory) -> Self {
         self.provider_factory = Some(factory);
+        self
+    }
+
+    /// Attach the host callback behind `/reload`.
+    pub fn with_reloader(mut self, reloader: crate::Reloader) -> Self {
+        self.reloader = Some(reloader);
         self
     }
 
@@ -292,6 +300,9 @@ impl AgentBuilder {
             .with_prewalk(self.prewalk);
         if let Some(factory) = self.provider_factory {
             agent = agent.with_provider_factory(factory);
+        }
+        if let Some(reloader) = self.reloader {
+            agent = agent.with_reloader(reloader);
         }
         if let Some(runner) = runner {
             agent = agent.with_subagent_runner(runner);

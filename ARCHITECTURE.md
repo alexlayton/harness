@@ -259,7 +259,16 @@ See [`crates/session/README.md`](./crates/session/README.md) for the format and
 ## Configuration and secrets
 
 Normal configuration is in `~/.config/harness/config.toml`, with
-`HARNESS_CONFIG_DIR` as an override. OAuth credentials are stored separately in
+`HARNESS_CONFIG_DIR` as an override. A `.harness/config.toml` in the launch
+directory is merged over it on raw TOML before parsing: tables merge key by
+key, `[[mcp.servers]]` entries merge by `name` and replace wholesale (so
+`enabled = false` can switch a global server off), and other values replace.
+`--no-context-files` skips it because it is repository-supplied and can start
+MCP servers. Settings saved by commands such as `/model` still go to the
+global file. `/reload` re-resolves configuration through a host-supplied
+`Reloader` and applies provider, model, and reasoning to the live agent;
+MCP servers, `rtk`, and codemode are wired at build time, so edits to them
+are reported as needing a restart. OAuth credentials are stored separately in
 `auth.json`; API keys remain environment variables. Session roots can be
 changed with `HARNESS_SESSION_DIR` or `HARNESS_STATE_DIR`. `HARNESS_LOG` enables
 file-only tracing.

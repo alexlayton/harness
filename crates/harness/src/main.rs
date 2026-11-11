@@ -457,7 +457,19 @@ async fn run_application(
         .with_mcp_servers(config.mcp_servers.clone())
         .with_session(session_store, session)
         .with_prewalk(config.prewalk.settings(cli.resume.is_some())?)
-        .with_provider_factory(provider_factory);
+        .with_provider_factory(provider_factory)
+        .with_reloader({
+            // Re-resolves from disk with the launch flags, so `--model` and
+            // friends still win. Compared against the startup config to flag
+            // edits that only a restart can apply.
+            let cli = cli.clone();
+            let running = config.clone();
+            Arc::new(move || {
+                Config::resolve(&cli)
+                    .map(|fresh| fresh.reload_settings(&running))
+                    .map_err(|error| format!("{error:#}"))
+            })
+        });
     if let Some(tools) = &config.codemode {
         builder = builder.with_codemode(tools.clone());
     }

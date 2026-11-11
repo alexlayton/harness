@@ -1264,6 +1264,7 @@ impl CrossTerm {
             }
             ParsedCommand::SetPrewalkReasoning { level: None } => unreachable!("handled above"),
             ParsedCommand::Usage => InputMessage::SubscriptionUsage,
+            ParsedCommand::Reload => InputMessage::Reload,
             ParsedCommand::InvokeSkill { name, .. } => InputMessage::InvokeSkill { name },
             ParsedCommand::Skills => {
                 // Filled asynchronously by the agent's SkillsLoaded event.
@@ -1498,6 +1499,25 @@ impl CrossTerm {
             UiEvent::ReasoningChanged { level } => {
                 self.reasoning = level;
                 self.add_notice(format!("Reasoning effort: {}", self.reasoning));
+            }
+            UiEvent::Reloaded {
+                provider,
+                model,
+                reasoning,
+                notice,
+            } => {
+                self.provider = provider;
+                self.model = model;
+                self.reasoning = reasoning;
+                let mut text = format!(
+                    "Config reloaded: {} · {} · reasoning {}",
+                    self.provider, self.model, self.reasoning
+                );
+                if let Some(notice) = notice {
+                    text.push('\n');
+                    text.push_str(&notice);
+                }
+                self.add_notice(text);
             }
             UiEvent::PrewalkChanged {
                 armed,

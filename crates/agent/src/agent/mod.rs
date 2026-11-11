@@ -26,7 +26,7 @@ mod tool_dispatch;
 mod turn;
 
 use commands::spawn_model_metadata;
-pub use commands::{ProviderFactory, spawn_model_list};
+pub use commands::{ProviderFactory, ReloadSettings, Reloader, spawn_model_list};
 pub use events::{
     AgentEvent, CompactionReason, InputMessage, SessionListItem, SessionSnapshotEntry, TurnError,
 };
@@ -104,6 +104,8 @@ pub struct Agent {
     pub(crate) secret_masker: Arc<SecretMasker>,
     /// Host-supplied provider construction used by `/model` and `/models`.
     provider_factory: Option<ProviderFactory>,
+    /// Host-supplied configuration reload for `/reload`.
+    reloader: Option<Reloader>,
     /// Input messages received while a turn is running.  They are drained by
     /// `run` before the next turn starts.
     input: TurnInput,
@@ -268,6 +270,7 @@ impl Agent {
             session: None,
             secret_masker: Arc::new(SecretMasker::default()),
             provider_factory: None,
+            reloader: None,
             input: TurnInput::default(),
             ephemeral_notes: Vec::new(),
             last_context_tokens: None,
@@ -361,6 +364,12 @@ impl Agent {
             .iter()
             .map(|message| self.secret_masker.mask_message(message))
             .collect();
+        self
+    }
+
+    /// Attach the host callback that `/reload` uses to re-read configuration.
+    pub fn with_reloader(mut self, reloader: Reloader) -> Self {
+        self.reloader = Some(reloader);
         self
     }
 
@@ -684,6 +693,13 @@ impl Agent {
                         .handle_set_model_boundary(provider, model, &events)
                         .await
                     {
+                        TurnControl::Shutdown | TurnControl::Quarantine => break,
+                        TurnControl::Continue => {}
+                    }
+                    continue;
+                }
+                InputMessage::Reload => {
+                    match self.handle_reload_boundary(&events).await {
                         TurnControl::Shutdown | TurnControl::Quarantine => break,
                         TurnControl::Continue => {}
                     }
@@ -1231,6 +1247,81 @@ mod tests {
             }
             events
         })
+    }
+
+    async fn run_reload(reloader: Option<Reloader>) -> Vec<AgentEvent> {
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx.send(InputMessage::Reload).unwrap();
+        drop(input_tx);
+        let provider = MockProvider {
+            calls: AtomicUsize::new(0),
+            scripts: vec![],
+            error_kind: MockErrorKind::Stream,
+        };
+        let mut agent = Agent::new(
+            Arc::new(provider),
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        );
+        if let Some(reloader) = reloader {
+            agent = agent.with_reloader(reloader);
+        }
+        agent.run(input_rx, event_tx).await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn reload_applies_settings_without_a_user_selection_event() {
+        let reloader: Reloader = Arc::new(|| {
+            Ok(ReloadSettings {
+                provider: "mock".into(),
+                model: "demo".into(),
+                reasoning: "high".into(),
+                notice: Some("Restart harness to apply: MCP servers".into()),
+            })
+        });
+        let events = run_reload(Some(reloader)).await;
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AgentEvent::Reloaded { reasoning, notice: Some(notice), .. }
+                    if reasoning == "high" && notice.contains("MCP servers")
+            )),
+            "{events:?}"
+        );
+        // A reload may carry a workspace-local value; the host must never
+        // persist it as the user's own selection.
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ModelChanged { .. } | AgentEvent::ReasoningChanged { .. }
+        )));
+    }
+
+    #[tokio::test]
+    async fn failed_or_missing_reload_reports_an_error() {
+        let failing: Reloader = Arc::new(|| Err("parse config file x".into()));
+        let events = run_reload(Some(failing)).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(message) if message.contains("reload failed: parse config file x")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Reloaded { .. }))
+        );
+
+        let events = run_reload(None).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(message) if message.contains("reload is unavailable")
+        )));
     }
 
     /// Execution interval of one probe invocation, for overlap assertions.

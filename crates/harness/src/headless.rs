@@ -336,6 +336,15 @@ async fn drive_headless_events_core(
                     writeln!(stderr, "reasoning → {level}")?;
                 }
             }
+            // Headless runs never submit `/reload`; report it like a model
+            // change if a host ever does.
+            AgentEvent::Reloaded {
+                provider, model, ..
+            } => {
+                if verbose {
+                    writeln!(stderr, "reloaded → {provider} · {model}")?;
+                }
+            }
             AgentEvent::PrewalkChanged { armed, target, .. } => {
                 if verbose
                     && *armed

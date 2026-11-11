@@ -1456,6 +1456,39 @@ pub struct Config {
     pub anthropic_auth: Option<Arc<AnthropicSubscriptionAuth>>,
 }
 
+impl Config {
+    /// Settings that differ from `running` but cannot change without a
+    /// restart: they are wired into the registry or MCP connections when the
+    /// agent is built. `/reload` reports them instead of silently ignoring
+    /// an edit.
+    pub fn restart_required(&self, running: &Config) -> Vec<&'static str> {
+        let mut changed = Vec::new();
+        if self.mcp_servers != running.mcp_servers {
+            changed.push("MCP servers");
+        }
+        if self.rtk != running.rtk {
+            changed.push("rtk");
+        }
+        if self.codemode != running.codemode {
+            changed.push("codemode");
+        }
+        changed
+    }
+
+    /// The selections `/reload` can apply to a live agent, plus a notice for
+    /// anything that needs a restart.
+    pub fn reload_settings(&self, running: &Config) -> agent::ReloadSettings {
+        let restart = self.restart_required(running);
+        agent::ReloadSettings {
+            provider: self.provider.to_string(),
+            model: self.model.clone(),
+            reasoning: self.reasoning.as_str().to_owned(),
+            notice: (!restart.is_empty())
+                .then(|| format!("Restart harness to apply: {}", restart.join(", "))),
+        }
+    }
+}
+
 /// The saved model, when it applies to the effective `provider`: the file
 /// names no provider, or the same one.
 fn file_model_for(
@@ -2993,6 +3026,28 @@ command = "/bin/echo"
         assert!(
             format!("{error:#}").contains(".harness/config.toml"),
             "{error:#}"
+        );
+    }
+
+    #[test]
+    fn reload_flags_only_settings_that_need_a_restart() {
+        let file = |toml: &str| -> Config {
+            let file: FileConfig = toml::from_str(toml).unwrap();
+            Config::resolve_from_file(&Cli::default(), &file, PathBuf::from("/tmp/c.toml"), |_| {
+                Some("key".into())
+            })
+            .unwrap()
+        };
+        let running = file("provider = \"openrouter\"\nmodel = \"a\"\n");
+        let same_but_model = file("provider = \"openrouter\"\nmodel = \"b\"\n");
+        let settings = same_but_model.reload_settings(&running);
+        assert_eq!(settings.model, "b");
+        assert_eq!(settings.notice, None);
+
+        let with_rtk = file("provider = \"openrouter\"\nmodel = \"a\"\nrtk = true\n");
+        assert_eq!(
+            with_rtk.reload_settings(&running).notice.as_deref(),
+            Some("Restart harness to apply: rtk")
         );
     }
 }

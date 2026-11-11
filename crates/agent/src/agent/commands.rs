@@ -17,6 +17,9 @@ use tools::SkillEntry;
 enum ModelChangeSource {
     User,
     Prewalk,
+    /// A config reload: the selection is real but not a user choice, so it
+    /// neither announces `ModelChanged` nor is persisted by the host.
+    Reload,
 }
 
 struct PendingModelChange {
@@ -372,6 +375,80 @@ impl Agent {
         model: String,
         events: &mpsc::UnboundedSender<AgentEvent>,
     ) -> TurnControl {
+        self.set_model_boundary(provider, model, ModelChangeSource::User, events)
+            .await
+    }
+
+    /// Reload configuration from the host and apply provider, model, and
+    /// reasoning. A failed reload leaves every live setting unchanged.
+    pub(crate) async fn handle_reload_boundary(
+        &mut self,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> TurnControl {
+        let Some(reloader) = self.reloader.clone() else {
+            send(events, AgentEvent::Error("reload is unavailable".into()));
+            return TurnControl::Continue;
+        };
+        let settings = match crate::blocking::blocking_io(|| reloader()) {
+            Ok(settings) => settings,
+            Err(error) => {
+                send(
+                    events,
+                    AgentEvent::Error(format!(
+                        "reload failed: {}",
+                        self.secret_masker.mask_text(&error)
+                    )),
+                );
+                return TurnControl::Continue;
+            }
+        };
+        let reasoning = match settings.reasoning.parse::<llm::ReasoningPolicy>() {
+            Ok(reasoning) => reasoning,
+            Err(error) => {
+                send(events, AgentEvent::Error(format!("reload failed: {error}")));
+                return TurnControl::Continue;
+            }
+        };
+        let unchanged = self
+            .provider
+            .name()
+            .eq_ignore_ascii_case(&settings.provider)
+            && self.model == settings.model;
+        if !unchanged {
+            match self
+                .set_model_boundary(
+                    Some(settings.provider),
+                    settings.model,
+                    ModelChangeSource::Reload,
+                    events,
+                )
+                .await
+            {
+                TurnControl::Continue => {}
+                control => return control,
+            }
+        }
+        self.prewalk.forget_restore();
+        self.set_reasoning_policy(reasoning);
+        send(
+            events,
+            AgentEvent::Reloaded {
+                provider: self.provider.name().to_owned(),
+                model: self.model.clone(),
+                reasoning: self.reasoning.to_string(),
+                notice: settings.notice,
+            },
+        );
+        TurnControl::Continue
+    }
+
+    async fn set_model_boundary(
+        &mut self,
+        provider: Option<String>,
+        model: String,
+        source: ModelChangeSource,
+        events: &mpsc::UnboundedSender<AgentEvent>,
+    ) -> TurnControl {
         let outcome = self.handle_set_model(provider, model, events).await;
         let pending = match outcome {
             Ok(Some(pending)) => pending,
@@ -410,7 +487,7 @@ impl Agent {
             }
         }
 
-        self.commit_model_change(pending, ModelChangeSource::User, events);
+        self.commit_model_change(pending, source, events);
         TurnControl::Continue
     }
 
@@ -524,11 +601,13 @@ impl Agent {
         if let Some(runner) = &self.subagent_runner {
             runner.update_model(self.provider.clone(), self.model.clone());
         }
-        if source == ModelChangeSource::User {
-            // A committed user selection replaces the planning model the
-            // restore point would return to. Rejected commands must not
-            // reach here, so they keep it.
+        if source != ModelChangeSource::Prewalk {
+            // A committed selection replaces the planning model the restore
+            // point would return to. Rejected commands must not reach here,
+            // so they keep it.
             self.prewalk.forget_restore();
+        }
+        if source == ModelChangeSource::User {
             send(
                 events,
                 AgentEvent::ModelChanged {
@@ -771,6 +850,21 @@ fn start_background_operation(events: &mpsc::UnboundedSender<AgentEvent>, label:
 }
 
 const USAGE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Selections a host resolved from freshly read configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReloadSettings {
+    pub provider: String,
+    pub model: String,
+    /// Portable reasoning policy, as accepted by `/reasoning`.
+    pub reasoning: String,
+    /// Extra detail for the user, such as settings that need a restart.
+    pub notice: Option<String>,
+}
+
+/// Host-owned configuration reload used by `/reload`. It runs on a blocking
+/// thread and must not mutate persisted configuration.
+pub type Reloader = Arc<dyn Fn() -> Result<ReloadSettings, String> + Send + Sync + 'static>;
 
 /// Host-owned provider construction used for model selection commands.
 pub type ProviderFactory =
