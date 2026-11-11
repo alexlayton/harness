@@ -91,6 +91,27 @@ pub struct ToolSpec {
     pub prompt: ToolPrompt,
 }
 
+/// Which MCP server a tool came from, and its name on that server. Codemode
+/// uses it to group tools per server so one large server cannot hide a small
+/// one; deriving it from the tool avoids parsing normalized names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpOrigin {
+    pub server: String,
+    pub tool: String,
+}
+
+/// Server-level facts for the codemode roster and `SERVERS` global. A server
+/// with a `failure` has no tools but must still be visible to the model so it
+/// can tell the user instead of silently falling back to a shell CLI.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct McpServerInfo {
+    pub name: String,
+    /// Bounded, sanitized `instructions` from the initialize result.
+    pub instructions: Option<String>,
+    /// Why the server did not start, when it failed.
+    pub failure: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolOutput {
     pub content: String,
@@ -146,6 +167,12 @@ pub trait Tool: Send + Sync {
 
     /// Return the JSON schema for structured results, when available.
     fn output_schema(&self) -> Option<Value> {
+        None
+    }
+
+    /// The MCP server and remote tool name behind this tool; `None` for
+    /// built-in and other local tools.
+    fn mcp_origin(&self) -> Option<McpOrigin> {
         None
     }
 

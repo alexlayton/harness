@@ -426,6 +426,16 @@ fn kill_process_group(_group: Option<u32>) {}
 /// child-process lifetimes; tools only retain cloneable request handles.
 pub struct McpRuntime {
     servers: Vec<ConnectedServer>,
+    failures: Vec<McpServerFailure>,
+}
+
+/// An optional (`required = false`) server that failed to start. The runtime
+/// keeps going without it so one broken server cannot block every session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpServerFailure {
+    pub name: String,
+    /// Redacted failure text, including the tail of the server's stderr.
+    pub message: String,
 }
 
 impl Drop for McpRuntime {
@@ -445,6 +455,8 @@ struct ConnectedServer {
     name: String,
     client: RunningService<RoleClient, HarnessClient>,
     tools: Vec<RemoteTool>,
+    /// Server-supplied usage guidance, raw; bounded when registered.
+    instructions: Option<String>,
     stderr_task: Option<StderrTask>,
     /// Configured secret values removed from this server's tool errors.
     redactions: Redactions,
@@ -471,6 +483,7 @@ impl McpRuntime {
         let mut tasks = tokio::task::JoinSet::new();
         let mut connected = Self {
             servers: Vec::with_capacity(servers.len()),
+            failures: Vec::new(),
         };
         let mut failure = None;
         loop {
@@ -479,6 +492,7 @@ impl McpRuntime {
             // started; sorting and validation happened before any launch.
             while tasks.len() < MAX_CONCURRENT_MCP_STARTUPS && !startup_cancel.is_cancelled() {
                 let Some(server) = pending.next() else { break };
+                let required = server.required;
                 let workspace_root = workspace_root.to_path_buf();
                 let server_cancel = startup_cancel.clone();
                 tasks.spawn(async move {
@@ -489,7 +503,7 @@ impl McpRuntime {
                             connected.redactions = redactions.clone();
                             (server.name.clone(), connected)
                         })
-                        .map_err(|error| error.redact(&redactions))
+                        .map_err(|error| (server.name.clone(), required, error.redact(&redactions)))
                 });
             }
             if startup_cancel.is_cancelled() {
@@ -507,7 +521,17 @@ impl McpRuntime {
                 result = tasks.join_next() => {
                     match result.expect("active connection task") {
                         Ok(Ok((_, server))) => connected.servers.push(server),
-                        Ok(Err(error)) => failure = Some(error),
+                        Ok(Err((name, required, error))) => {
+                            if required || startup_cancel.is_cancelled() {
+                                failure = Some(error);
+                            } else {
+                                tracing::warn!(server = %name, "optional MCP server failed to start");
+                                connected.failures.push(McpServerFailure {
+                                    name,
+                                    message: failure_message(&error),
+                                });
+                            }
+                        }
                         Err(error) => {
                             failure = Some(McpError::operation(
                                 "<mcp>",
@@ -538,7 +562,27 @@ impl McpRuntime {
         connected
             .servers
             .sort_by(|left, right| left.name.cmp(&right.name));
+        connected
+            .failures
+            .sort_by(|left, right| left.name.cmp(&right.name));
         Ok(connected)
+    }
+
+    /// Apply an extra text filter (the host's secret masker) to everything
+    /// server-supplied that later reaches the model or the user. Call before
+    /// [`Self::register_into`].
+    pub fn mask_diagnostics(&mut self, mask: impl Fn(&str) -> String) {
+        for failure in &mut self.failures {
+            failure.message = mask(&failure.message);
+        }
+        for server in &mut self.servers {
+            server.instructions = server.instructions.take().map(|text| mask(&text));
+        }
+    }
+
+    /// Optional servers that failed to start, in name order.
+    pub fn failures(&self) -> &[McpServerFailure] {
+        &self.failures
     }
 
     /// Current status of the named server, or `None` if it is unknown. A
@@ -561,7 +605,27 @@ impl McpRuntime {
     /// Register all discovered remote tools into a registry. The caller must
     /// retain this runtime until every resulting agent tool call has completed.
     pub fn register_into(&self, registry: &mut ToolRegistry) -> Result<(), McpError> {
+        for failure in &self.failures {
+            registry.register_mcp_server(tools::McpServerInfo {
+                name: failure.name.clone(),
+                instructions: None,
+                failure: Some(failure.message.clone()),
+            });
+        }
         for server in &self.servers {
+            // Server text is untrusted: strip control characters, cap it, and
+            // remove configured secrets before it reaches the model.
+            let instructions = server
+                .instructions
+                .as_deref()
+                .map(|text| crate::tool::truncate(&crate::tool::sanitize_description(text), 1024))
+                .map(|text| server.redactions.apply(&text))
+                .filter(|text| !text.trim().is_empty());
+            registry.register_mcp_server(tools::McpServerInfo {
+                name: server.name.clone(),
+                instructions,
+                failure: None,
+            });
             for remote in &server.tools {
                 registry.register(Box::new(McpTool::new(
                     &server.name,
@@ -597,13 +661,33 @@ impl McpRuntime {
     }
 }
 
+/// Failure text for a skipped server: the operation message without the
+/// repeated server prefix, so it reads well in the roster.
+fn failure_message(error: &McpError) -> String {
+    match error {
+        McpError::Operation {
+            operation, message, ..
+        } => match message.split_once("; stderr: ") {
+            // Lead with what the server said: that is the actionable part.
+            Some((rest, stderr)) => format!("{stderr} ({operation}: {rest})"),
+            None => format!("{operation}: {message}"),
+        },
+        other => other.to_string(),
+    }
+}
+
 async fn connect_server(
     server: &McpServerConfig,
     workspace_root: &Path,
     cancel: CancellationToken,
 ) -> Result<ConnectedServer, McpError> {
     match &server.transport {
-        McpTransportConfig::Stdio { command, args, env } => {
+        McpTransportConfig::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
             let mut command = tokio::process::Command::new(command);
             // Own a process group so close and drop can stop the whole tree.
             #[cfg(unix)]
@@ -630,7 +714,12 @@ async fn connect_server(
             command
                 .kill_on_drop(true)
                 .args(args)
-                .current_dir(workspace_root)
+                // Relative paths resolve against the workspace; an absolute
+                // `cwd` replaces it under `join`.
+                .current_dir(match cwd {
+                    Some(cwd) => workspace_root.join(cwd),
+                    None => workspace_root.to_path_buf(),
+                })
                 .envs(env)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -646,7 +735,9 @@ async fn connect_server(
             })?;
             let stderr = child.stderr.take();
             let transport = BoundedStdioTransport::new(child, stdout, stdin, scope);
-            let stderr_task = stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr));
+            let tail = StderrTail::new(Redactions::for_server(server));
+            let stderr_task =
+                stderr.map(|stderr| spawn_stderr_reader(server.name.clone(), stderr, tail.clone()));
             connect_transport(
                 server,
                 workspace_root,
@@ -656,7 +747,15 @@ async fn connect_server(
                 ClientLifecycleMode::Initialize,
             )
             .await
-            .map_err(ConnectFailure::into_error)
+            .map_err(|failure| {
+                let mut error = failure.into_error();
+                if let (McpError::Operation { message, .. }, Some(tail)) =
+                    (&mut error, tail.render())
+                {
+                    message.push_str(&format!("; stderr: {tail}"));
+                }
+                error
+            })
         }
         McpTransportConfig::Http { url, headers } => {
             let headers = headers
@@ -803,7 +902,7 @@ where
         result = &mut initialize => match result {
             Ok(Ok(client)) => client,
             Ok(Err(error)) => {
-                abort_stderr_task(stderr_task).await;
+                drain_stderr_task(stderr_task).await;
                 return Err(classify_initialize_error(&server.name, error));
             }
             Err(_) => {
@@ -830,10 +929,14 @@ where
         }
     };
     tracing::debug!(server = %server.name, tools = tools.len(), "connected MCP server");
+    let instructions = client
+        .peer_info()
+        .and_then(|info| info.instructions.clone());
     Ok(ConnectedServer {
         name: server.name.clone(),
         client,
         tools,
+        instructions,
         stderr_task,
         redactions: Redactions::default(),
         health,
@@ -846,7 +949,76 @@ where
 /// descendant holding the pipe would keep it alive.
 struct StderrTask(Option<JoinHandle<()>>);
 
+/// Last few stderr lines of a stdio server, kept so a startup failure can
+/// say why (e.g. "No .tinysearch/ found") rather than just "closed".
+#[derive(Clone, Default)]
+struct StderrTail {
+    lines: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// Applied to each complete line before any display truncation, so a
+    /// limit can never cut a secret in half and slip past exact-match redaction.
+    redactions: Redactions,
+}
+
+/// Longest stderr line inspected. A longer line is dropped whole rather than
+/// truncated, because a truncated secret would not match its redaction.
+const STDERR_LINE_MAX_BYTES: usize = 8 * 1024;
+
+const STDERR_TAIL_LINES: usize = 5;
+const STDERR_TAIL_LINE_CHARS: usize = 200;
+/// How long a failed startup waits for the dying child's stderr to drain.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(250);
+
+impl StderrTail {
+    fn new(redactions: Redactions) -> Self {
+        Self {
+            lines: Arc::default(),
+            redactions,
+        }
+    }
+
+    /// Record one line; `overflowed` means bytes past the cap were dropped.
+    fn push_line(&self, bytes: &[u8], overflowed: bool) {
+        let redacted = if overflowed {
+            "[stderr line too long]".to_owned()
+        } else {
+            self.redactions.apply(&String::from_utf8_lossy(bytes))
+        };
+        let text: String = redacted
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(STDERR_TAIL_LINE_CHARS)
+            .collect();
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        if lines.len() == STDERR_TAIL_LINES {
+            lines.pop_front();
+        }
+        lines.push_back(text.to_owned());
+    }
+
+    fn render(&self) -> Option<String> {
+        let lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        (!lines.is_empty()).then(|| lines.iter().cloned().collect::<Vec<_>>().join(" | "))
+    }
+}
+
 impl StderrTask {
+    /// Give the reader a short grace period to reach EOF (the child is
+    /// usually already dead), then stop it.
+    async fn drain_then_stop(mut self) {
+        if let Some(mut task) = self.0.take()
+            && tokio::time::timeout(STDERR_DRAIN_GRACE, &mut task)
+                .await
+                .is_err()
+        {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     fn abort(mut self) {
         if let Some(task) = self.0.take() {
             task.abort();
@@ -869,16 +1041,34 @@ impl Drop for StderrTask {
     }
 }
 
-fn spawn_stderr_reader(name: String, mut stderr: tokio::process::ChildStderr) -> StderrTask {
+fn spawn_stderr_reader(
+    name: String,
+    mut stderr: tokio::process::ChildStderr,
+    tail: StderrTail,
+) -> StderrTask {
     StderrTask(Some(tokio::spawn(async move {
         let mut buffer = [0u8; MCP_STDERR_CHUNK_BYTES];
         let mut bytes = 0usize;
+        let mut line = Vec::new();
+        let mut overflowed = false;
         while let Ok(read) = stderr.read(&mut buffer).await {
             if read == 0 {
                 break;
             }
             bytes = bytes.saturating_add(read);
+            for &byte in &buffer[..read] {
+                if byte == b'\n' {
+                    tail.push_line(&line, overflowed);
+                    line.clear();
+                    overflowed = false;
+                } else if line.len() < STDERR_LINE_MAX_BYTES {
+                    line.push(byte);
+                } else {
+                    overflowed = true;
+                }
+            }
         }
+        tail.push_line(&line, overflowed);
         if bytes > 0 {
             tracing::debug!(server = %name, bytes, "MCP server emitted stderr");
         }
@@ -934,6 +1124,12 @@ async fn list_tools_bounded(
         if cursor.is_none() {
             return Ok(tools);
         }
+    }
+}
+
+async fn drain_stderr_task(task: Option<StderrTask>) {
+    if let Some(task) = task {
+        task.drain_then_stop().await;
     }
 }
 
@@ -1133,6 +1329,7 @@ mod tests {
         });
         let configs = (0..server_count)
             .map(|index| McpServerConfig {
+                required: false,
                 name: format!("http-fixture-{index}"),
                 transport: McpTransportConfig::Http {
                     url: format!("http://{address}/mcp"),
@@ -1176,6 +1373,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, router).await });
         let configs = (0..MAX_CONCURRENT_MCP_STARTUPS + 3)
             .map(|index| McpServerConfig {
+                required: true,
                 name: format!("server-{index}"),
                 transport: McpTransportConfig::Http {
                     url: format!("http://{address}/server-{index}"),
@@ -1372,13 +1570,124 @@ done
 
         fn fixture_server(mode: &str) -> McpServerConfig {
             McpServerConfig {
+                // Fixture tests assert atomic failure behaviour.
+                required: true,
                 name: "fixture".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec!["-c".into(), FIXTURE.into()],
                     env: BTreeMap::from([(String::from("MCP_TEST_MODE"), mode.into())]),
                 },
             }
+        }
+
+        fn failing_server(name: &str, required: bool) -> McpServerConfig {
+            McpServerConfig {
+                required,
+                name: name.into(),
+                transport: McpTransportConfig::Stdio {
+                    cwd: None,
+                    command: "/bin/sh".into(),
+                    args: vec![
+                        "-c".into(),
+                        "echo 'No .tinysearch/ found in cwd' >&2; exit 3".into(),
+                    ],
+                    env: BTreeMap::new(),
+                },
+            }
+        }
+
+        #[tokio::test]
+        async fn optional_server_failure_is_recorded_with_stderr_and_others_connect() {
+            let runtime = McpRuntime::connect(
+                &[failing_server("broken", false), fixture_server("normal")],
+                &std::env::current_dir().expect("test workspace should exist"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("optional failure must not abort startup");
+            assert_eq!(runtime.server_status("fixture"), Some(ServerStatus::Ready));
+            let failures = runtime.failures();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].name, "broken");
+            assert!(
+                failures[0].message.contains("No .tinysearch/ found"),
+                "{}",
+                failures[0].message
+            );
+            let mut runtime = runtime;
+            runtime.mask_diagnostics(|text| text.replace("tinysearch", "[masked]"));
+            assert!(
+                runtime.failures()[0]
+                    .message
+                    .contains("No .[masked]/ found")
+            );
+            runtime.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn stdio_cwd_is_resolved_against_the_workspace_root() {
+            let server = McpServerConfig {
+                required: false,
+                name: "probe".into(),
+                transport: McpTransportConfig::Stdio {
+                    cwd: Some("src".into()),
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), "pwd >&2; exit 3".into()],
+                    env: BTreeMap::new(),
+                },
+            };
+            let runtime = McpRuntime::connect(
+                &[server],
+                &std::env::current_dir().expect("test workspace should exist"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let message = &runtime.failures()[0].message;
+            assert!(message.contains("mcp/src"), "{message}");
+        }
+
+        #[tokio::test]
+        async fn stderr_secrets_are_redacted_even_near_the_display_limit() {
+            // A secret straddling the 200-char display cut must not leak a prefix.
+            let secret = "s3cr3t-token-value";
+            let script = "printf '%0190d%s\\n' 0 \"$TOKEN\" >&2; exit 3".to_owned();
+            let server = McpServerConfig {
+                required: false,
+                name: "leaky".into(),
+                transport: McpTransportConfig::Stdio {
+                    cwd: None,
+                    command: "/bin/sh".into(),
+                    args: vec!["-c".into(), script],
+                    env: BTreeMap::from([("TOKEN".to_owned(), secret.to_owned())]),
+                },
+            };
+            let runtime = McpRuntime::connect(
+                &[server],
+                &std::env::current_dir().expect("test workspace should exist"),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            let message = &runtime.failures()[0].message;
+            assert!(!message.contains("s3cr3t"), "{message}");
+        }
+
+        #[tokio::test]
+        async fn required_server_failure_keeps_startup_atomic() {
+            let result = McpRuntime::connect(
+                &[failing_server("broken", true), fixture_server("normal")],
+                &std::env::current_dir().expect("test workspace should exist"),
+                CancellationToken::new(),
+            )
+            .await;
+            let error = result.err().expect("required failure must abort startup");
+            assert!(
+                error.to_string().contains("No .tinysearch/ found"),
+                "{error}"
+            );
         }
 
         async fn connect_fixture(mode: &str) -> Result<McpRuntime, McpError> {
@@ -1437,8 +1746,10 @@ done
                 pid_file.display()
             );
             let server = McpServerConfig {
+                required: false,
                 name: "fixture".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec!["-c".into(), script],
                     env: BTreeMap::from([(String::from("MCP_TEST_MODE"), "plain".into())]),
@@ -1484,8 +1795,10 @@ done
                 pid_file.display()
             );
             let server = McpServerConfig {
+                required: false,
                 name: "fixture".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "/bin/sh".into(),
                     args: vec!["-c".into(), script],
                     env: BTreeMap::from([(String::from("MCP_TEST_MODE"), "plain".into())]),

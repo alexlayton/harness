@@ -587,6 +587,13 @@ async fn run_headless_resolved(
         Err(_) if cancel.is_cancelled() => return Ok(ExitCode::from(130)),
         Err(error) => return Err(error),
     };
+    // Headless chatter stays behind `-v`; the failure is still visible to
+    // the model through the codemode roster.
+    if args.verbose {
+        for warning in agent.warnings() {
+            eprintln!("warning: {warning}");
+        }
+    }
     let herdr_tui_options = crate::herdr_tui::ResumeOptions {
         provider: config.provider.to_string(),
         model: config.model.clone(),

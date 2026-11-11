@@ -14,7 +14,7 @@ mod tool;
 pub use client::ServerStatus;
 pub use config::{McpConfig, McpServerConfig, McpTransportConfig, redact_url};
 pub use names::normalized_tool_name;
-pub use runtime::McpRuntime;
+pub use runtime::{McpRuntime, McpServerFailure};
 
 use std::path::PathBuf;
 use std::time::Duration;

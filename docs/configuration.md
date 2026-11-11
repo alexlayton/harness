@@ -413,6 +413,7 @@ harness mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem .
 harness mcp add remote --url https://example.com/mcp
 harness mcp add private --url https://example.com/mcp \
   --header 'Authorization=Bearer ${MCP_TOKEN}'
+harness mcp add tinysearch --cwd docs --env TS_LOG=warn --required -- tinysearch mcp
 harness mcp delete filesystem
 harness mcp add email --disabled --url https://example.com/mail-mcp
 harness mcp enable email
@@ -424,6 +425,10 @@ the `--` separates Harness options from flags passed unchanged to the server
 executable. Servers are launched directly, so add the executable and each
 argument as a separate command-line value rather than supplying one shell
 command string. Repeat `--header NAME=VALUE` to configure HTTP request headers.
+For stdio servers, repeat `--env KEY=VALUE` to set environment variables and use
+`--cwd DIR` to choose the working directory (relative paths resolve against the
+workspace root). `--required` makes a startup failure of this server abort the
+session; see [Startup failures](#startup-failures).
 The commands update `config.toml` atomically and preserve unrelated settings.
 
 ### Per-session servers
@@ -462,6 +467,10 @@ transport = "stdio"
 command = "/absolute/path/to/mcp-server"
 args = ["--root", "."]
 
+# Optional: working directory (default: the workspace root) and startup policy.
+cwd = "tools"
+required = false
+
 [mcp.servers.env]
 LOG_LEVEL = "warn"
 TOKEN = "${MCP_TOKEN}"
@@ -486,8 +495,28 @@ secrets are not written back to configuration or session history. Prefer
 variables rather than literal configuration values.
 
 Servers run directly, not through a shell, and use the workspace as their
-working directory. Server stdout is reserved for MCP framing. Server stderr
-does not enter headless or ACP stdout.
+working directory unless `cwd` is set. Server stdout is reserved for MCP
+framing. Server stderr does not enter headless or ACP stdout.
+
+### Startup failures
+
+By default (`required = false`) a server that fails to start (for example, it
+exits immediately because it needs a database in the working directory) does not
+block the session. Harness records the failure, appends the last few lines of
+the server's stderr to it, prints a `warning:` on stderr in headless mode or a
+notice in the TUI, and lists the server as `failed to start` in the codemode
+roster so the model can tell you instead of falling back to a shell CLI. Set
+`required = true` to keep the stricter behaviour: any failure of that server
+stops startup and shuts down the servers already connected.
+
+### Discoverability in codemode
+
+When codemode is enabled, its description starts with a roster naming every
+MCP server (with tool counts and, for small servers, tool names), and the
+index budget is shared fairly between servers so a large server cannot hide a
+small one. The sandbox global `SERVERS` maps each server name to its
+`instructions` (capped at 1 KiB, control characters stripped), tool names, and
+`status`.
 
 MCP tools are discovered when the session starts. Reconnect to apply server
 tool-list changes. Calls are serialized as exclusive operations and run

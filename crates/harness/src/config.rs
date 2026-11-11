@@ -908,21 +908,45 @@ fn select_provider_after_login_at(path: &Path, provider: ProviderArg) -> Result<
     Ok(selected.get())
 }
 
-/// Add one stdio MCP server while retaining unrelated and unknown settings.
-pub fn add_mcp_server(name: &str, command: &[String], enabled: bool) -> Result<()> {
-    add_mcp_server_at(&config_path(), name, command, enabled)
+/// Optional settings for `harness mcp add`.
+#[derive(Clone, Debug, Default)]
+pub struct McpAddOptions {
+    /// Fail startup when this server cannot connect.
+    pub required: bool,
+    /// Environment for a stdio server.
+    pub env: BTreeMap<String, String>,
+    /// Working directory for a stdio server.
+    pub cwd: Option<PathBuf>,
 }
 
-fn add_mcp_server_at(path: &Path, name: &str, command: &[String], enabled: bool) -> Result<()> {
+/// Add one stdio MCP server while retaining unrelated and unknown settings.
+pub fn add_mcp_server(
+    name: &str,
+    command: &[String],
+    enabled: bool,
+    options: &McpAddOptions,
+) -> Result<()> {
+    add_mcp_server_at(&config_path(), name, command, enabled, options)
+}
+
+fn add_mcp_server_at(
+    path: &Path,
+    name: &str,
+    command: &[String],
+    enabled: bool,
+    options: &McpAddOptions,
+) -> Result<()> {
     let (executable, args) = command
         .split_first()
         .ok_or_else(|| anyhow!("an MCP server command is required"))?;
     let candidate = mcp::McpServerConfig {
+        required: options.required,
         name: name.to_owned(),
         transport: mcp::McpTransportConfig::Stdio {
             command: executable.into(),
             args: args.to_vec(),
-            env: BTreeMap::new(),
+            env: options.env.clone(),
+            cwd: options.cwd.clone(),
         },
     };
     mcp::McpConfig {
@@ -938,6 +962,19 @@ fn add_mcp_server_at(path: &Path, name: &str, command: &[String], enabled: bool)
     let mut arguments = toml_edit::Array::new();
     arguments.extend(args.iter().map(String::as_str));
     server["args"] = toml_edit::value(arguments);
+    if let Some(cwd) = &options.cwd {
+        server["cwd"] = toml_edit::value(cwd.to_string_lossy().as_ref());
+    }
+    if !options.env.is_empty() {
+        let mut env = toml_edit::Table::new();
+        for (key, value) in &options.env {
+            env[key] = toml_edit::value(value);
+        }
+        server["env"] = toml_edit::Item::Table(env);
+    }
+    if options.required {
+        server["required"] = toml_edit::value(true);
+    }
     if !enabled {
         server["enabled"] = toml_edit::value(false);
     }
@@ -950,8 +987,9 @@ pub fn add_http_mcp_server(
     url: &str,
     headers: &BTreeMap<String, String>,
     enabled: bool,
+    options: &McpAddOptions,
 ) -> Result<()> {
-    add_http_mcp_server_at(&config_path(), name, url, headers, enabled)
+    add_http_mcp_server_at(&config_path(), name, url, headers, enabled, options)
 }
 
 fn add_http_mcp_server_at(
@@ -960,8 +998,10 @@ fn add_http_mcp_server_at(
     url: &str,
     headers: &BTreeMap<String, String>,
     enabled: bool,
+    options: &McpAddOptions,
 ) -> Result<()> {
     let candidate = mcp::McpServerConfig {
+        required: options.required,
         name: name.to_owned(),
         transport: mcp::McpTransportConfig::Http {
             url: url.to_owned(),
@@ -984,6 +1024,9 @@ fn add_http_mcp_server_at(
             header_table[header] = toml_edit::value(value);
         }
         server["headers"] = toml_edit::Item::Table(header_table);
+    }
+    if options.required {
+        server["required"] = toml_edit::value(true);
     }
     if !enabled {
         server["enabled"] = toml_edit::value(false);
@@ -1194,6 +1237,18 @@ pub struct McpAddArgs {
     /// HTTP header as NAME=VALUE. Values may contain `${ENV_VAR}` placeholders.
     #[arg(long, value_name = "NAME=VALUE", requires = "url")]
     pub header: Vec<String>,
+    /// Environment variable for the server process as KEY=VALUE. Values may
+    /// contain `${ENV_VAR}` placeholders.
+    #[arg(long, value_name = "KEY=VALUE", conflicts_with = "url")]
+    pub env: Vec<String>,
+    /// Working directory for the server process. Relative paths resolve
+    /// against the workspace root, which is the default.
+    #[arg(long, value_name = "DIR", conflicts_with = "url")]
+    pub cwd: Option<PathBuf>,
+    /// Abort startup if this server fails. By default a failing server is
+    /// skipped with a warning.
+    #[arg(long)]
+    pub required: bool,
     /// Executable followed by its arguments. Use `--` before flags intended for the executable.
     #[arg(
         required_unless_present = "url",
@@ -2336,6 +2391,26 @@ future_server_key = "keep"
     }
 
     #[test]
+    fn mcp_add_writes_env_cwd_and_required() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let options = McpAddOptions {
+            required: true,
+            env: BTreeMap::from([("KEY".to_owned(), "value".to_owned())]),
+            cwd: Some("docs".into()),
+        };
+        add_mcp_server_at(&path, "ts", &["tinysearch".into()], true, &options).unwrap();
+        let loaded = load_file_config(&path).unwrap();
+        let server = &loaded.mcp.unwrap().servers[0].config;
+        assert!(server.required);
+        let mcp::McpTransportConfig::Stdio { env, cwd, .. } = &server.transport else {
+            panic!("expected stdio server")
+        };
+        assert_eq!(env["KEY"], "value");
+        assert_eq!(cwd.as_deref(), Some(Path::new("docs")));
+    }
+
+    #[test]
     fn mcp_mutators_preserve_unknown_fields_and_reject_missing_names() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.toml");
@@ -2350,9 +2425,19 @@ future_server_key = "keep"
             "filesystem",
             &["npx".into(), "-y".into(), "server-filesystem".into()],
             true,
+            &McpAddOptions::default(),
         )
         .unwrap();
-        assert!(add_mcp_server_at(&path, "filesystem", &["other".into()], true).is_err());
+        assert!(
+            add_mcp_server_at(
+                &path,
+                "filesystem",
+                &["other".into()],
+                true,
+                &McpAddOptions::default()
+            )
+            .is_err()
+        );
         let loaded = load_file_config(&path).unwrap();
         let servers = &loaded.mcp.unwrap().servers;
         assert_eq!(servers.len(), 2);
@@ -2388,8 +2473,15 @@ future_server_key = "keep"
             ("X-Tenant".into(), "acme".into()),
         ]);
 
-        add_http_mcp_server_at(&path, "remote", "https://example.test/mcp", &headers, true)
-            .unwrap();
+        add_http_mcp_server_at(
+            &path,
+            "remote",
+            "https://example.test/mcp",
+            &headers,
+            true,
+            &McpAddOptions::default(),
+        )
+        .unwrap();
         let loaded = load_file_config(&path).unwrap();
         let server = &loaded.mcp.unwrap().servers[0];
         let mcp::McpTransportConfig::Http { url, headers } = &server.config.transport else {
@@ -2405,9 +2497,23 @@ future_server_key = "keep"
         let directory = tempdir().unwrap();
         let path = directory.path().join("config.toml");
         let headers = BTreeMap::from([("X-Tenant".into(), "acme".into())]);
-        add_http_mcp_server_at(&path, "email", "https://example.test/mcp", &headers, false)
-            .unwrap();
-        add_mcp_server_at(&path, "local", &["server".into()], true).unwrap();
+        add_http_mcp_server_at(
+            &path,
+            "email",
+            "https://example.test/mcp",
+            &headers,
+            false,
+            &McpAddOptions::default(),
+        )
+        .unwrap();
+        add_mcp_server_at(
+            &path,
+            "local",
+            &["server".into()],
+            true,
+            &McpAddOptions::default(),
+        )
+        .unwrap();
 
         let enabled = |path: &Path, name: &str| {
             load_file_config(path)
@@ -2653,6 +2759,7 @@ future_server_key = "keep"
         assert!(resolved.mcp_servers.is_empty());
 
         let servers = vec![mcp::McpServerConfig {
+            required: false,
             name: "replacement".into(),
             transport: mcp::McpTransportConfig::Http {
                 url: "https://example.test/mcp".into(),

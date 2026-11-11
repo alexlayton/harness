@@ -25,6 +25,10 @@ impl fmt::Debug for McpConfig {
 pub struct McpServerConfig {
     /// Stable local name used for diagnostics and tool namespacing.
     pub name: String,
+    /// When true, a failure to start this server aborts startup. Otherwise
+    /// the failure is recorded and the remaining servers still connect.
+    #[serde(default)]
+    pub required: bool,
     /// Transport and its non-secret connection settings.
     #[serde(flatten)]
     pub transport: McpTransportConfig,
@@ -34,6 +38,7 @@ impl fmt::Debug for McpServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpServerConfig")
             .field("name", &self.name)
+            .field("required", &self.required)
             .field("transport", &self.transport)
             .finish()
     }
@@ -50,6 +55,10 @@ pub enum McpTransportConfig {
         args: Vec<String>,
         #[serde(default)]
         env: BTreeMap<String, String>,
+        /// Working directory for the server process. Relative paths resolve
+        /// against the workspace root, which is also the default.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
     },
     /// Streamable HTTP endpoint and headers applied to every request.
     Http {
@@ -62,9 +71,15 @@ pub enum McpTransportConfig {
 impl fmt::Debug for McpTransportConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Stdio { command, args, env } => f
+            Self::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => f
                 .debug_struct("Stdio")
                 .field("command", command)
+                .field("cwd", cwd)
                 .field("args", &format_args!("<{} entries redacted>", args.len()))
                 .field("env", &format_args!("<{} entries redacted>", env.len()))
                 .finish(),
@@ -201,7 +216,21 @@ fn validate_server(server: &McpServerConfig, names: &mut BTreeSet<String>) -> Re
         return Err(invalid("server names must be unique"));
     }
     match &server.transport {
-        McpTransportConfig::Stdio { command, args, env } => {
+        McpTransportConfig::Stdio {
+            command,
+            args,
+            env,
+            cwd,
+        } => {
+            if let Some(cwd) = cwd
+                && (cwd.as_os_str().is_empty()
+                    || cwd.to_string_lossy().contains('\0')
+                    || cwd.as_os_str().len() > MAX_MCP_FIELD_BYTES)
+            {
+                return Err(invalid(
+                    "cwd must be non-empty, contain no NUL, and fit the field limit",
+                ));
+            }
             if command.as_os_str().is_empty() || command.to_string_lossy().contains('\0') {
                 return Err(invalid("command must be non-empty and contain no NUL"));
             }
@@ -394,8 +423,10 @@ mod tests {
     fn resolves_environment_without_touching_process_state() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: vec!["${TOKEN}".into()],
                     env: [("AUTH".into(), "Bearer ${TOKEN}".into())]
@@ -422,6 +453,7 @@ mod tests {
         let config = McpConfig {
             servers: vec![
                 McpServerConfig {
+                    required: false,
                     name: "remote".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://${HOST}/mcp?token=${TOKEN}".into(),
@@ -431,8 +463,10 @@ mod tests {
                     },
                 },
                 McpServerConfig {
+                    required: false,
                     name: "local".into(),
                     transport: McpTransportConfig::Stdio {
+                        cwd: None,
                         command: "server".into(),
                         args: vec!["--token=${TOKEN}".into()],
                         env: [("AUTH".into(), "${TOKEN}".into())].into_iter().collect(),
@@ -467,8 +501,10 @@ mod tests {
         let configs = [
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "args".into(),
                     transport: McpTransportConfig::Stdio {
+                        cwd: None,
                         command: "server".into(),
                         args: vec!["${TOKEN}".into()],
                         env: BTreeMap::new(),
@@ -477,8 +513,10 @@ mod tests {
             },
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "env".into(),
                     transport: McpTransportConfig::Stdio {
+                        cwd: None,
                         command: "server".into(),
                         args: Vec::new(),
                         env: [("TOKEN_VALUE".into(), "${TOKEN}".into())]
@@ -489,6 +527,7 @@ mod tests {
             },
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "headers".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://example.test/mcp".into(),
@@ -500,6 +539,7 @@ mod tests {
             },
             McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "url".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://${TOKEN}/mcp".into(),
@@ -523,8 +563,10 @@ mod tests {
     fn rejects_oversized_pre_resolved_configuration_before_cloning() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: (0..16).map(|_| "x".repeat(MAX_MCP_FIELD_BYTES)).collect(),
                     env: BTreeMap::new(),
@@ -546,8 +588,10 @@ mod tests {
     fn rejects_aggregate_size_after_expansion() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: (0..16).map(|_| "${TOKEN}".into()).collect(),
                     env: BTreeMap::new(),
@@ -574,8 +618,10 @@ mod tests {
     fn rejects_nul_introduced_by_expansion_during_final_validation() {
         let config = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "server".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: vec!["${TOKEN}".into()],
                     env: BTreeMap::new(),
@@ -600,6 +646,7 @@ mod tests {
         ] {
             let config = McpConfig {
                 servers: vec![McpServerConfig {
+                    required: false,
                     name: "remote".into(),
                     transport: McpTransportConfig::Http {
                         url: "https://example.test/mcp".into(),
@@ -614,6 +661,7 @@ mod tests {
     #[test]
     fn debug_redacts_http_credentials_query_and_fragment() {
         let config = McpServerConfig {
+            required: false,
             name: "remote".into(),
             transport: McpTransportConfig::Http {
                 url: "https://user:password@example.test/path?token=resolved-secret#fragment"
@@ -631,6 +679,7 @@ mod tests {
     #[test]
     fn diagnostics_redact_configured_header_and_url_secrets() {
         let config = McpServerConfig {
+            required: false,
             name: "remote".into(),
             transport: McpTransportConfig::Http {
                 url: "https://user:password@example.test/path?token=resolved-secret".into(),
@@ -658,6 +707,7 @@ mod tests {
     #[test]
     fn debug_redacts_unparseable_urls() {
         let config = McpServerConfig {
+            required: false,
             name: "remote".into(),
             transport: McpTransportConfig::Http {
                 url: "https://[not-a-url]?secret=raw".into(),
@@ -672,8 +722,10 @@ mod tests {
     #[test]
     fn rejects_duplicate_servers_and_missing_environment() {
         let server = McpServerConfig {
+            required: false,
             name: "same".into(),
             transport: McpTransportConfig::Stdio {
+                cwd: None,
                 command: "server".into(),
                 args: vec!["${MISSING}".into()],
                 env: BTreeMap::new(),
@@ -692,8 +744,10 @@ mod tests {
     fn rejects_excessive_server_count_and_control_names() {
         let servers = (0..65)
             .map(|index| McpServerConfig {
+                required: false,
                 name: format!("server-{index}"),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: Vec::new(),
                     env: BTreeMap::new(),
@@ -713,8 +767,10 @@ mod tests {
 
         let invalid = McpConfig {
             servers: vec![McpServerConfig {
+                required: false,
                 name: "bad\nname".into(),
                 transport: McpTransportConfig::Stdio {
+                    cwd: None,
                     command: "server".into(),
                     args: Vec::new(),
                     env: BTreeMap::new(),

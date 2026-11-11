@@ -1,7 +1,7 @@
 //! Bounded, fresh-state Monty orchestration. Only the async host driver can
 //! admit tool calls; a detached interpreter step has no host authority.
 
-use super::{ToolOutput, ToolPrompt, ToolSpec};
+use super::{McpOrigin, McpServerInfo, ToolOutput, ToolPrompt, ToolSpec};
 use async_trait::async_trait;
 use llm::ToolDefinition;
 use monty::{MontyRun, RunProgress};
@@ -80,6 +80,7 @@ pub trait CodemodeExecutor: Send + Sync {
 pub(crate) struct Codemode {
     pub(crate) names: Vec<String>,
     entries: Vec<Entry>,
+    servers: Vec<McpServerInfo>,
     spec: ToolSpec,
 }
 
@@ -88,6 +89,7 @@ struct Entry {
     name: String,
     summary: String,
     full: Value,
+    origin: Option<McpOrigin>,
 }
 
 /// Bytes of the model-facing index spent on `name(args) - summary` lines.
@@ -101,6 +103,7 @@ const MAX_SIGNATURE_PARAMS: usize = 8;
 /// Globals resolved lazily by the host when a snippet first uses the name.
 const GLOBAL_TOOLS: &str = "TOOLS";
 const GLOBAL_MODULES: &str = "MODULES";
+const GLOBAL_SERVERS: &str = "SERVERS";
 const GLOBAL_DESCRIBE: &str = "describe";
 
 /// First sentence of a tool description, without the generated MCP prefix.
@@ -151,38 +154,229 @@ fn signature(name: &str, parameters: &Value) -> String {
     format!("{name}({})", parts.join(", "))
 }
 
-/// Render the model-facing index within its byte budgets.
-fn render_index(entries: &[Entry], parameters: &[String]) -> String {
-    let mut out = String::new();
-    let mut tail: Vec<&str> = Vec::new();
-    for (entry, signature) in entries.iter().zip(parameters) {
-        let line = if entry.summary.is_empty() {
-            format!("- {signature}\n")
-        } else {
-            format!("- {signature} - {}\n", entry.summary)
+/// Bytes for the whole server roster line; every server always appears.
+const ROSTER_BUDGET: usize = 1024;
+/// Most tool names (and bytes) listed for one server in the roster.
+const ROSTER_MAX_NAMES: usize = 8;
+const ROSTER_SERVER_BUDGET: usize = 300;
+/// Full index lines every MCP server may show regardless of its fair share.
+const MIN_LINES_PER_SERVER: usize = 3;
+
+/// Servers in first-seen order with their entry indexes.
+fn server_groups(entries: &[Entry]) -> Vec<(&str, Vec<usize>)> {
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(origin) = &entry.origin else {
+            continue;
         };
-        if tail.is_empty() && out.len() + line.len() <= INDEX_BUDGET {
-            out.push_str(&line);
-        } else {
-            tail.push(&entry.name);
+        match groups.iter_mut().find(|(name, _)| *name == origin.server) {
+            Some((_, members)) => members.push(index),
+            None => groups.push((&origin.server, vec![index])),
         }
     }
-    if !tail.is_empty() {
-        let mut names = String::new();
-        let mut shown = 0;
-        for name in &tail {
-            if names.len() + name.len() + 2 > INDEX_TAIL_BUDGET {
+    groups
+}
+
+/// First line of untrusted server text, stripped of control characters and
+/// capped, for the one-line roster.
+fn roster_reason(text: &str) -> String {
+    let line: String = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let line = line.trim();
+    if line.chars().count() <= 120 {
+        line.to_owned()
+    } else {
+        let cut: String = line.chars().take(119).collect();
+        format!("{}…", cut.trim_end())
+    }
+}
+
+/// One roster line naming every MCP server, independent of the index
+/// budgets so a large server cannot hide a small one. Servers that failed to
+/// start are listed with the reason. Empty without any MCP server.
+fn render_roster(entries: &[Entry], servers: &[McpServerInfo]) -> String {
+    let groups = server_groups(entries);
+    let short = |name: &str, count: usize| {
+        format!("{name} ({count} tool{})", if count == 1 { "" } else { "s" })
+    };
+    // (name, reason) for servers that failed to start.
+    let failed: Vec<(&str, String)> = servers
+        .iter()
+        .filter_map(|server| {
+            let reason = server.failure.as_deref()?;
+            Some((server.name.as_str(), roster_reason(reason)))
+        })
+        .collect();
+    let failed_short = |name: &str| format!("{name} (failed to start)");
+    if groups.is_empty() && failed.is_empty() {
+        return String::new();
+    }
+    // Reserve room for the short form of servers not yet rendered.
+    let mut reserve: usize = groups
+        .iter()
+        .map(|(name, members)| short(name, members.len()).len() + 2)
+        .sum::<usize>()
+        + failed
+            .iter()
+            .map(|(name, _)| failed_short(name).len() + 2)
+            .sum::<usize>();
+    let mut parts = Vec::new();
+    let mut used = "MCP servers: \n".len();
+    for (name, members) in &groups {
+        let short_form = short(name, members.len());
+        reserve -= short_form.len() + 2;
+        let names: Vec<&str> = members
+            .iter()
+            .filter_map(|&index| entries[index].origin.as_ref().map(|o| o.tool.as_str()))
+            .collect();
+        let detailed = format!("{name} ({}: {})", members.len(), names.join(", "));
+        let part = if members.len() <= ROSTER_MAX_NAMES
+            && detailed.len() <= ROSTER_SERVER_BUDGET
+            && used + detailed.len() + 2 + reserve <= ROSTER_BUDGET
+        {
+            detailed
+        } else {
+            short_form
+        };
+        used += part.len() + 2;
+        parts.push(part);
+    }
+    for (name, reason) in &failed {
+        let short_form = failed_short(name);
+        reserve -= short_form.len() + 2;
+        let detailed = format!("{name} (failed to start: {reason})");
+        let part = if used + detailed.len() + 2 + reserve <= ROSTER_BUDGET {
+            detailed
+        } else {
+            short_form
+        };
+        used += part.len() + 2;
+        parts.push(part);
+    }
+    format!("MCP servers: {}\n", parts.join(", "))
+}
+
+/// Render the model-facing index within its byte budgets. Built-ins come
+/// first; each MCP server then gets a fair share of the budget before any one
+/// server may use the remainder, and the names-only tail interleaves servers.
+fn render_index(entries: &[Entry], parameters: &[String]) -> String {
+    let lines: Vec<String> = entries
+        .iter()
+        .zip(parameters)
+        .map(|(entry, signature)| {
+            if entry.summary.is_empty() {
+                format!("- {signature}\n")
+            } else {
+                format!("- {signature} - {}\n", entry.summary)
+            }
+        })
+        .collect();
+    // Bucket 0 holds built-ins; the rest are MCP servers in first-seen order.
+    let mut buckets: Vec<Vec<usize>> = vec![
+        (0..entries.len())
+            .filter(|&index| entries[index].origin.is_none())
+            .collect(),
+    ];
+    buckets.extend(
+        server_groups(entries)
+            .into_iter()
+            .map(|(_, members)| members),
+    );
+    let mut shown = vec![false; entries.len()];
+    // Next unconsidered position in each bucket.
+    let mut next = vec![0usize; buckets.len()];
+    let mut total = 0usize;
+    // Pass 1: guaranteed shares. Built-ins may use half the budget so they
+    // cannot starve servers; each server gets an equal slice of the rest.
+    let servers = buckets.len() - 1;
+    for (bucket, members) in buckets.iter().enumerate() {
+        let share = if bucket == 0 {
+            INDEX_BUDGET / 2
+        } else {
+            INDEX_BUDGET.saturating_sub(total) / (servers - bucket + 1)
+        };
+        let (mut used, mut count) = (0usize, 0usize);
+        while let Some(&index) = members.get(next[bucket]) {
+            let len = lines[index].len();
+            let within = used + len <= share || (bucket > 0 && count < MIN_LINES_PER_SERVER);
+            if !within || total + len > INDEX_BUDGET {
                 break;
             }
-            if shown > 0 {
-                names.push_str(", ");
+            shown[index] = true;
+            used += len;
+            total += len;
+            count += 1;
+            next[bucket] += 1;
+        }
+    }
+    // Pass 2: round-robin one line at a time until nothing else fits.
+    let mut done = vec![false; buckets.len()];
+    while done.iter().any(|done| !done) {
+        for (bucket, members) in buckets.iter().enumerate() {
+            if done[bucket] {
+                continue;
             }
-            names.push_str(name);
-            shown += 1;
+            match members.get(next[bucket]) {
+                Some(&index) if total + lines[index].len() <= INDEX_BUDGET => {
+                    shown[index] = true;
+                    total += lines[index].len();
+                    next[bucket] += 1;
+                }
+                _ => done[bucket] = true,
+            }
+        }
+    }
+    let mut out = String::new();
+    for members in &buckets {
+        for &index in members {
+            if shown[index] {
+                out.push_str(&lines[index]);
+            }
+        }
+    }
+    // Tail: remaining names, interleaved per bucket.
+    let rest: Vec<Vec<&str>> = buckets
+        .iter()
+        .map(|members| {
+            members
+                .iter()
+                .filter(|&&index| !shown[index])
+                .map(|&index| entries[index].name.as_str())
+                .collect()
+        })
+        .collect();
+    let tail_len: usize = rest.iter().map(Vec::len).sum();
+    if tail_len > 0 {
+        let mut names = String::new();
+        let mut count = 0;
+        'fill: for round in 0.. {
+            let mut any = false;
+            for bucket in &rest {
+                let Some(name) = bucket.get(round) else {
+                    continue;
+                };
+                any = true;
+                if names.len() + name.len() + 2 > INDEX_TAIL_BUDGET {
+                    break 'fill;
+                }
+                if count > 0 {
+                    names.push_str(", ");
+                }
+                names.push_str(name);
+                count += 1;
+            }
+            if !any {
+                break;
+            }
         }
         out.push_str(&format!("More (names only; use describe): {names}"));
-        if shown < tail.len() {
-            out.push_str(&format!(" and {} more in TOOLS", tail.len() - shown));
+        if count < tail_len {
+            out.push_str(&format!(" and {} more in TOOLS", tail_len - count));
         }
         out.push('\n');
     }
@@ -191,13 +385,14 @@ fn render_index(entries: &[Entry], parameters: &[String]) -> String {
 
 impl Codemode {
     pub(crate) fn new<'a>(
-        tools: impl IntoIterator<Item = (&'a ToolSpec, Option<Value>)>,
+        tools: impl IntoIterator<Item = (&'a ToolSpec, Option<Value>, Option<McpOrigin>)>,
+        servers: &[McpServerInfo],
     ) -> Result<Self, String> {
         let mut names = Vec::new();
         let mut entries = Vec::new();
         let mut signatures = Vec::new();
         let mut total = 0usize;
-        for (spec, output_schema) in tools {
+        for (spec, output_schema, origin) in tools {
             let definition = &spec.definition;
             if definition.name == GLOBAL_DESCRIBE {
                 return Err(format!(
@@ -220,13 +415,26 @@ impl Codemode {
                 name: definition.name.clone(),
                 summary: first_sentence(&definition.description),
                 full,
+                origin,
             });
             names.push(definition.name.clone());
         }
         if names.is_empty() {
             return Err("no eligible tools selected".into());
         }
-        let index = render_index(&entries, &signatures);
+        let index = format!(
+            "{}{}",
+            render_roster(&entries, servers),
+            render_index(&entries, &signatures)
+        );
+        let mut guidelines = vec![
+            "Use codemode instead of bash for Python computation; batch dependent tool calls into one snippet and return only what the answer needs. Do not blindly replay a failed snippet: earlier calls may have changed state.".to_owned(),
+        ];
+        if entries.iter().any(|entry| entry.origin.is_some()) {
+            guidelines.push(
+                "When the user names a tool, service or MCP server, or a task fits one in the MCP server roster, call it via codemode (`tools[...]`) instead of a shell CLI of the same name. If unsure, inspect `TOOLS` before using bash.".to_owned(),
+            );
+        }
         let spec = ToolSpec {
             definition: ToolDefinition {
                 name: CODEMODE_TOOL_NAME.into(),
@@ -236,7 +444,7 @@ impl Codemode {
                         "Put dependent calls, loops and filtering in ONE snippet. Call tools[\"name\"](**kwargs): keyword arguments only, synchronous, no await. ",
                         "Structured tools return dict/list/scalars, others return str; a failed tool raises RuntimeError. ",
                         "The last expression is the result; print() output also enters context, so return only the facts needed. ",
-                        "Globals: TOOLS (name -> summary), describe(name) (full description, parameters and output schema; use it when arguments are unclear), MODULES (importable and unavailable modules). ",
+                        "Globals: TOOLS (name -> summary), SERVERS (MCP server -> instructions, tools, status), describe(name) (full description, parameters and output schema; use it when arguments are unclear), MODULES (importable and unavailable modules). ",
                         "No file, env, network or OS access, no third-party packages, no state between calls. ",
                         "Limits: 32 KiB code, 50 tool calls, 50 KiB per value, 5 s compute, 120 s total. ",
                         "Completed tool calls are not rolled back on failure; inspect before replaying. ",
@@ -256,16 +464,55 @@ impl Codemode {
             },
             prompt: ToolPrompt::new(
                 "Run Python that calls selected tools as functions (see its description)",
-                [
-                    "Use codemode instead of bash for Python computation; batch dependent tool calls into one snippet and return only what the answer needs. Do not blindly replay a failed snippet: earlier calls may have changed state.",
-                ],
+                guidelines,
             ),
         };
         Ok(Self {
             names,
             entries,
+            servers: servers.to_vec(),
             spec,
         })
+    }
+
+    /// `SERVERS`: server name -> `{instructions, tools, status}`. Instructions
+    /// are server-supplied text, already capped and sanitized by the host.
+    fn servers_global(&self) -> MontyObject {
+        let mut names: Vec<&str> = server_groups(&self.entries)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        for server in &self.servers {
+            if !names.contains(&server.name.as_str()) {
+                names.push(&server.name);
+            }
+        }
+        MontyObject::dict(names.into_iter().map(|name| {
+            let info = self.servers.iter().find(|server| server.name == name);
+            let tools = self
+                .entries
+                .iter()
+                .filter(|entry| entry.origin.as_ref().is_some_and(|o| o.server == name))
+                .map(|entry| MontyObject::string(&entry.name));
+            let status = match info.and_then(|info| info.failure.as_deref()) {
+                Some(reason) => format!("failed to start: {}", roster_reason(reason)),
+                None => "ready".to_owned(),
+            };
+            (
+                MontyObject::string(name),
+                MontyObject::dict([
+                    (
+                        MontyObject::string("instructions"),
+                        MontyObject::string(
+                            info.and_then(|info| info.instructions.as_deref())
+                                .unwrap_or(""),
+                        ),
+                    ),
+                    (MontyObject::string("tools"), MontyObject::list(tools)),
+                    (MontyObject::string("status"), MontyObject::string(&status)),
+                ]),
+            )
+        }))
     }
 
     /// Value for a lazily resolved sandbox global, or `None` if undefined.
@@ -277,6 +524,7 @@ impl Codemode {
                     MontyObject::string(&entry.summary),
                 )
             }))),
+            GLOBAL_SERVERS => Some(self.servers_global()),
             GLOBAL_MODULES => {
                 let list =
                     |text: &str| MontyObject::list(text.split(", ").map(MontyObject::string));

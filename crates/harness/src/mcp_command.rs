@@ -1,6 +1,6 @@
 use crate::config::{
-    McpArgs, McpCommand, add_http_mcp_server, add_mcp_server, config_path, delete_mcp_server,
-    load_file_config, set_mcp_server_enabled,
+    McpAddOptions, McpArgs, McpCommand, add_http_mcp_server, add_mcp_server, config_path,
+    delete_mcp_server, load_file_config, set_mcp_server_enabled,
 };
 use anyhow::{Result, anyhow};
 use mcp::McpTransportConfig;
@@ -11,11 +11,16 @@ use std::process::ExitCode;
 pub fn run(args: &McpArgs) -> Result<ExitCode> {
     match &args.command {
         Some(McpCommand::Add(args)) => {
+            let options = McpAddOptions {
+                required: args.required,
+                env: parse_env(&args.env)?,
+                cwd: args.cwd.clone(),
+            };
             if let Some(url) = &args.url {
                 let headers = parse_headers(&args.header)?;
-                add_http_mcp_server(&args.name, url, &headers, !args.disabled)?;
+                add_http_mcp_server(&args.name, url, &headers, !args.disabled, &options)?;
             } else {
-                add_mcp_server(&args.name, &args.command, !args.disabled)?;
+                add_mcp_server(&args.name, &args.command, !args.disabled, &options)?;
             }
             println!("Added MCP server `{}`.", args.name);
             if args.disabled {
@@ -37,6 +42,21 @@ pub fn run(args: &McpArgs) -> Result<ExitCode> {
         Some(McpCommand::List) | None => list()?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn parse_env(pairs: &[String]) -> Result<BTreeMap<String, String>> {
+    pairs
+        .iter()
+        .map(|pair| {
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| anyhow!("environment variable must use KEY=VALUE syntax"))?;
+            if key.is_empty() {
+                return Err(anyhow!("environment variable name must not be empty"));
+            }
+            Ok((key.to_owned(), value.to_owned()))
+        })
+        .collect()
 }
 
 fn parse_headers(headers: &[String]) -> Result<BTreeMap<String, String>> {
