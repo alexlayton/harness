@@ -437,6 +437,7 @@ impl Agent {
                 model: self.model.clone(),
                 reasoning: self.reasoning.to_string(),
                 notice: settings.notice,
+                workspace_config: settings.workspace_config,
             },
         );
         TurnControl::Continue
@@ -860,6 +861,9 @@ pub struct ReloadSettings {
     pub reasoning: String,
     /// Extra detail for the user, such as settings that need a restart.
     pub notice: Option<String>,
+    /// Opaque header text about workspace config, refreshed with the rest of
+    /// the startup header.
+    pub workspace_config: Option<String>,
 }
 
 /// Host-owned configuration reload used by `/reload`. It runs on a blocking

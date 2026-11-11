@@ -228,6 +228,7 @@ pub enum UiEvent {
         model: String,
         reasoning: String,
         notice: Option<String>,
+        workspace_config: Option<String>,
     },
     /// Prewalk arm state and `[<provider>:]<model>` target.
     PrewalkChanged {

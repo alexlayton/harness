@@ -1511,10 +1511,20 @@ impl CrossTerm {
                 model,
                 reasoning,
                 notice,
+                workspace_config,
             } => {
                 self.provider = provider;
                 self.model = model;
                 self.reasoning = reasoning;
+                self.workspace_config = workspace_config;
+                // Re-print the startup header so the new state is visible.
+                // Skills, context files and MCP servers show what is live:
+                // those are wired at startup, and anything pending is named in
+                // the notice below.
+                self.environment = EnvironmentInfo::discover(self.environment.cwd.clone());
+                if !self.minimal {
+                    self.pending.push(self.metadata_entry());
+                }
                 let mut text = format!(
                     "Config reloaded: {} · {} · reasoning {}",
                     self.provider, self.model, self.reasoning

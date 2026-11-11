@@ -1284,6 +1284,7 @@ mod tests {
                 model: "demo".into(),
                 reasoning: "high".into(),
                 notice: Some("Restart harness to apply: MCP servers".into()),
+                workspace_config: None,
             })
         });
         let events = run_reload(Some(reloader)).await;

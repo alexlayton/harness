@@ -124,11 +124,13 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
             model,
             reasoning,
             notice,
+            workspace_config,
         } => tui::UiEvent::Reloaded {
             provider,
             model,
             reasoning,
             notice,
+            workspace_config,
         },
         AgentEvent::PrewalkHandoff {
             provider,

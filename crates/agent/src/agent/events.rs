@@ -129,6 +129,7 @@ pub enum AgentEvent {
         model: String,
         reasoning: String,
         notice: Option<String>,
+        workspace_config: Option<String>,
     },
     /// Prewalk switched the active model and, when `reasoning` is present,
     /// the reasoning policy. Unlike [`AgentEvent::ModelChanged`] and

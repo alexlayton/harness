@@ -307,6 +307,26 @@ fn editing_a_recalled_history_entry_keeps_the_edit() {
 }
 
 #[test]
+fn reload_reprints_the_header_with_the_new_state() {
+    let mut ui = ui(80, 24);
+    ui.apply_event(UiEvent::Reloaded {
+        provider: "p2".into(),
+        model: "m2".into(),
+        reasoning: "high".into(),
+        notice: Some("Restart harness to apply: rtk".into()),
+        workspace_config: Some(".harness/config.toml (workspace override applied)".into()),
+    });
+    assert_eq!((ui.provider.as_str(), ui.model.as_str()), ("p2", "m2"));
+    let printed = format!("{:?}", ui.pending);
+    assert!(printed.contains("Metadata"), "{printed}");
+    assert!(printed.contains("workspace override applied"), "{printed}");
+    assert!(
+        printed.contains("Restart harness to apply: rtk"),
+        "{printed}"
+    );
+}
+
+#[test]
 fn late_finish_events_do_not_rearm_busy_and_operation_finish_spares_turn() {
     let mut ui = ui(80, 24);
     ui.apply_event(UiEvent::TurnFinished);

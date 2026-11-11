@@ -1514,16 +1514,35 @@ impl Config {
     /// restart: they are wired into the registry or MCP connections when the
     /// agent is built. `/reload` reports them instead of silently ignoring
     /// an edit.
-    pub fn restart_required(&self, running: &Config) -> Vec<&'static str> {
+    pub fn restart_required(&self, running: &Config) -> Vec<String> {
         let mut changed = Vec::new();
         if self.mcp_servers != running.mcp_servers {
-            changed.push("MCP servers");
+            let names = |config: &Config| -> Vec<String> {
+                config.mcp_servers.iter().map(|s| s.name.clone()).collect()
+            };
+            let (now, before) = (names(self), names(running));
+            let mut detail: Vec<String> = now
+                .iter()
+                .filter(|name| !before.contains(name))
+                .map(|name| format!("+{name}"))
+                .chain(
+                    before
+                        .iter()
+                        .filter(|name| !now.contains(name))
+                        .map(|name| format!("-{name}")),
+                )
+                .collect();
+            // Same names but different settings (command, url, env).
+            if detail.is_empty() {
+                detail.push("settings changed".into());
+            }
+            changed.push(format!("MCP servers ({})", detail.join(", ")));
         }
         if self.rtk != running.rtk {
-            changed.push("rtk");
+            changed.push("rtk".into());
         }
         if self.codemode != running.codemode {
-            changed.push("codemode");
+            changed.push("codemode".into());
         }
         changed
     }
@@ -1538,6 +1557,7 @@ impl Config {
             reasoning: self.reasoning.as_str().to_owned(),
             notice: (!restart.is_empty())
                 .then(|| format!("Restart harness to apply: {}", restart.join(", "))),
+            workspace_config: self.workspace_config.display(),
         }
     }
 }
@@ -3165,5 +3185,27 @@ command = "/bin/echo"
         let (_, state) = load_layered_file_config(&global, Some(&missing), true, None).unwrap();
         assert_eq!(state, WorkspaceConfigState::Absent);
         assert_eq!(state.display(), None);
+    }
+
+    #[test]
+    fn reload_notice_names_the_mcp_servers_that_need_a_restart() {
+        let file = |toml: &str| -> Config {
+            let file: FileConfig = toml::from_str(toml).unwrap();
+            Config::resolve_from_file(&Cli::default(), &file, PathBuf::from("/tmp/c.toml"), |_| {
+                Some("key".into())
+            })
+            .unwrap()
+        };
+        let server = |name: &str| {
+            format!(
+                "provider = \"openrouter\"\nmodel = \"m\"\n[[mcp.servers]]\nname = \"{name}\"\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\n"
+            )
+        };
+        let running = file(&server("safari"));
+        let fresh = file(&format!("{}{}", server("docs"), ""));
+        assert_eq!(
+            fresh.restart_required(&running),
+            ["MCP servers (+docs, -safari)"]
+        );
     }
 }
