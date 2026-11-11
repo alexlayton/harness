@@ -696,10 +696,13 @@ async fn connect_server(
             .await;
 
             // Some legacy Streamable HTTP servers close a stateless request
-            // when they receive the newer server/discover method. rmcp's Auto
-            // mode can fall back after a JSON-RPC rejection, but not after the
-            // transport closes; reconnect before using legacy initialization.
-            if matches!(&result, Err(ConnectFailure::ClosedDuringDiscovery(_)))
+            // when they receive the newer server/discover method; others
+            // reject it at the HTTP layer (for example safari-mcp answers a
+            // sessionless non-initialize request with `400 No valid session`).
+            // rmcp's Auto mode can fall back after a JSON-RPC rejection, but
+            // not after either of these; reconnect before using legacy
+            // initialization.
+            if matches!(&result, Err(ConnectFailure::DiscoveryUnsupported(_)))
                 && !cancel.is_cancelled()
             {
                 tracing::debug!(
@@ -726,15 +729,17 @@ async fn connect_server(
 /// variant so the legacy-HTTP fallback is decided structurally, not by
 /// matching rendered error text.
 enum ConnectFailure {
-    /// The transport closed while waiting for the `server/discover` response.
-    ClosedDuringDiscovery(McpError),
+    /// The server closed the transport or rejected the HTTP request for
+    /// `server/discover`, which marks a legacy server that only understands
+    /// `initialize`.
+    DiscoveryUnsupported(McpError),
     Other(McpError),
 }
 
 impl ConnectFailure {
     fn into_error(self) -> McpError {
         match self {
-            Self::ClosedDuringDiscovery(error) | Self::Other(error) => error,
+            Self::DiscoveryUnsupported(error) | Self::Other(error) => error,
         }
     }
 }
@@ -750,16 +755,47 @@ fn classify_initialize_error(
     server: &str,
     error: rmcp::service::ClientInitializeError,
 ) -> ConnectFailure {
-    let closed = matches!(
-        &error,
-        rmcp::service::ClientInitializeError::ConnectionClosed(context)
-            if context == "discover response"
-    );
+    let unsupported = discovery_unsupported(&error);
     let error = McpError::operation(server, "initialize", error);
-    if closed {
-        ConnectFailure::ClosedDuringDiscovery(error)
+    if unsupported {
+        ConnectFailure::DiscoveryUnsupported(error)
     } else {
         ConnectFailure::Other(error)
+    }
+}
+
+/// Whether a failed `server/discover` exchange means the server only speaks
+/// the legacy `initialize` lifecycle: the connection closed while awaiting
+/// the response, or the HTTP layer rejected the request with a client error.
+/// Legacy servers commonly refuse any sessionless request other than
+/// `initialize` with a 4xx whose body is not a correlatable JSON-RPC error
+/// (`"id": null`), which the HTTP client surfaces as an unexpected response.
+/// Falling back is cheap and safe: if the server is genuinely broken, the
+/// legacy attempt fails too and reports its own error.
+fn discovery_unsupported(error: &rmcp::service::ClientInitializeError) -> bool {
+    use rmcp::service::ClientInitializeError;
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    match error {
+        ClientInitializeError::ConnectionClosed(context) => context == "discover response",
+        ClientInitializeError::TransportError { error, context }
+            if context == "send discover request" =>
+        {
+            match error
+                .error
+                .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+            {
+                Some(StreamableHttpError::HttpStatus(status)) => {
+                    (400..500).contains(&status.status)
+                }
+                // The HTTP client renders rejected responses as
+                // `HTTP <code> <reason>: <body>`; only 4xx implies "unsupported".
+                Some(StreamableHttpError::UnexpectedServerResponse(text)) => {
+                    text.starts_with("HTTP 4")
+                }
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -1075,9 +1111,63 @@ mod tests {
     fn only_discover_connection_close_selects_legacy_fallback() {
         use rmcp::service::ClientInitializeError::ConnectionClosed;
         let closed = classify_initialize_error("s", ConnectionClosed("discover response".into()));
-        assert!(matches!(closed, ConnectFailure::ClosedDuringDiscovery(_)));
+        assert!(matches!(closed, ConnectFailure::DiscoveryUnsupported(_)));
         let other = classify_initialize_error("s", ConnectionClosed("initialize response".into()));
         assert!(matches!(other, ConnectFailure::Other(_)));
+    }
+
+    fn http_transport_error(
+        error: rmcp::transport::streamable_http_client::StreamableHttpError<reqwest::Error>,
+        context: &'static str,
+    ) -> rmcp::service::ClientInitializeError {
+        rmcp::service::ClientInitializeError::TransportError {
+            error: rmcp::transport::DynamicTransportError::from_parts(
+                "http",
+                std::any::TypeId::of::<()>(),
+                Box::new(error),
+            ),
+            context: context.into(),
+        }
+    }
+
+    #[test]
+    fn http_rejection_of_discover_selects_legacy_fallback() {
+        use rmcp::transport::streamable_http_client::{HttpStatusError, StreamableHttpError};
+        // safari-mcp: `400 {"jsonrpc":"2.0","error":{...},"id":null}`.
+        let rejected = || {
+            StreamableHttpError::UnexpectedServerResponse(
+                r#"HTTP 400 Bad Request: {"error":{"message":"No valid session"},"id":null}"#
+                    .into(),
+            )
+        };
+        let discover = classify_initialize_error(
+            "s",
+            http_transport_error(rejected(), "send discover request"),
+        );
+        assert!(matches!(discover, ConnectFailure::DiscoveryUnsupported(_)));
+        let status = classify_initialize_error(
+            "s",
+            http_transport_error(
+                StreamableHttpError::HttpStatus(HttpStatusError::new(404, None)),
+                "send discover request",
+            ),
+        );
+        assert!(matches!(status, ConnectFailure::DiscoveryUnsupported(_)));
+
+        // Server faults and non-discover requests do not trigger the fallback.
+        let server_fault = classify_initialize_error(
+            "s",
+            http_transport_error(
+                StreamableHttpError::HttpStatus(HttpStatusError::new(503, None)),
+                "send discover request",
+            ),
+        );
+        assert!(matches!(server_fault, ConnectFailure::Other(_)));
+        let initialize = classify_initialize_error(
+            "s",
+            http_transport_error(rejected(), "send initialize request"),
+        );
+        assert!(matches!(initialize, ConnectFailure::Other(_)));
     }
 
     #[derive(Clone, Default)]
