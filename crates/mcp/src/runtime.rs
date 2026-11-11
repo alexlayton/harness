@@ -1653,7 +1653,7 @@ done
         async fn stderr_secrets_are_redacted_even_near_the_display_limit() {
             // A secret straddling the 200-char display cut must not leak a prefix.
             let secret = "s3cr3t-token-value";
-            let script = format!("printf '%0190d%s\\n' 0 \"$TOKEN\" >&2; exit 3");
+            let script = "printf '%0190d%s\\n' 0 \"$TOKEN\" >&2; exit 3".to_owned();
             let server = McpServerConfig {
                 required: false,
                 name: "leaky".into(),
