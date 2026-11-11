@@ -130,6 +130,12 @@ pub enum AgentEvent {
         reasoning: String,
         notice: Option<String>,
         workspace_config: Option<String>,
+        /// Project-instruction files now in the prompt (display paths).
+        context_files: Vec<String>,
+        /// Configured MCP server names.
+        mcp_servers: Vec<String>,
+        /// Skills now available.
+        skills: Vec<SkillEntry>,
     },
     /// Prewalk switched the active model and, when `reasoning` is present,
     /// the reasoning policy. Unlike [`AgentEvent::ModelChanged`] and

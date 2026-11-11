@@ -229,6 +229,12 @@ pub enum UiEvent {
         reasoning: String,
         notice: Option<String>,
         workspace_config: Option<String>,
+        /// Project-instruction files now loaded (display paths).
+        context_files: Vec<String>,
+        /// Configured MCP server names.
+        mcp_servers: Vec<String>,
+        /// Skills now available.
+        skills: Vec<SkillEntry>,
     },
     /// Prewalk arm state and `[<provider>:]<model>` target.
     PrewalkChanged {

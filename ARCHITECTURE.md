@@ -269,9 +269,13 @@ because it is repository-supplied and can start MCP servers or redefine
 providers. The TUI header shows a `config` row saying whether it was applied
 or skipped, and Herdr resume commands repeat `--trust`. Settings saved by commands such as `/model` still go to the
 global file. `/reload` re-resolves configuration through a host-supplied
-`Reloader` and applies provider, model, and reasoning to the live agent;
-MCP servers, `rtk`, and codemode are wired at build time, so edits to them
-are reported as needing a restart. OAuth credentials are stored separately in
+`Reloader` and applies it to the live agent: provider, model and reasoning,
+plus MCP servers, codemode, skills and project context. The agent connects the
+new MCP runtime before touching the registry, swaps tools via
+`ToolRegistry::remove_mcp_tools`, rebuilds codemode, and rolls back to the old
+runtime on failure; the runtime lives in a slot shared with `AssembledAgent` so
+shutdown closes whichever is current. Only `rtk` still needs a restart, and
+subagents keep their startup skills and context. OAuth credentials are stored separately in
 `auth.json`; API keys remain environment variables. Session roots can be
 changed with `HARNESS_SESSION_DIR` or `HARNESS_STATE_DIR`. `HARNESS_LOG` enables
 file-only tracing.

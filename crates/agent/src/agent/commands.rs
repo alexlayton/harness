@@ -417,8 +417,8 @@ impl Agent {
         if !unchanged {
             match self
                 .set_model_boundary(
-                    Some(settings.provider),
-                    settings.model,
+                    Some(settings.provider.clone()),
+                    settings.model.clone(),
                     ModelChangeSource::Reload,
                     events,
                 )
@@ -430,14 +430,23 @@ impl Agent {
         }
         self.prewalk.forget_restore();
         self.set_reasoning_policy(reasoning);
+        let notes = self.reload_external(&settings).await;
+        let notice = settings.notice.into_iter().chain(notes).collect::<Vec<_>>();
         send(
             events,
             AgentEvent::Reloaded {
                 provider: self.provider.name().to_owned(),
                 model: self.model.clone(),
                 reasoning: self.reasoning.to_string(),
-                notice: settings.notice,
+                notice: (!notice.is_empty()).then(|| notice.join("\n")),
                 workspace_config: settings.workspace_config,
+                context_files: settings.context_files,
+                mcp_servers: settings
+                    .mcp_servers
+                    .iter()
+                    .map(|server| server.name.clone())
+                    .collect(),
+                skills: settings.skills.entries(),
             },
         );
         TurnControl::Continue
@@ -852,8 +861,8 @@ fn start_background_operation(events: &mpsc::UnboundedSender<AgentEvent>, label:
 
 const USAGE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Selections a host resolved from freshly read configuration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What a host resolved from freshly read configuration for `/reload`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReloadSettings {
     pub provider: String,
     pub model: String,
@@ -864,6 +873,19 @@ pub struct ReloadSettings {
     /// Opaque header text about workspace config, refreshed with the rest of
     /// the startup header.
     pub workspace_config: Option<String>,
+    /// The MCP servers the session should be running. When they differ from
+    /// the running set, every server is reconnected; a failed reconnect keeps
+    /// the previous tools.
+    pub mcp_servers: Vec<mcp::McpServerConfig>,
+    /// The codemode tool selection (`Some(vec![])` means all eligible tools),
+    /// or `None` when codemode is off.
+    pub codemode: Option<Vec<String>>,
+    /// Rendered project instructions for the system prompt.
+    pub project_context: String,
+    /// Display paths of the files behind `project_context`.
+    pub context_files: Vec<String>,
+    /// Freshly discovered skills.
+    pub skills: tools::SkillCatalog,
 }
 
 /// Host-owned configuration reload used by `/reload`. It runs on a blocking

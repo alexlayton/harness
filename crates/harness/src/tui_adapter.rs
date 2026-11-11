@@ -125,12 +125,24 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
             reasoning,
             notice,
             workspace_config,
+            context_files,
+            mcp_servers,
+            skills,
         } => tui::UiEvent::Reloaded {
             provider,
             model,
             reasoning,
             notice,
             workspace_config,
+            context_files,
+            mcp_servers,
+            skills: skills
+                .into_iter()
+                .map(|skill| tui::SkillEntry {
+                    name: skill.name,
+                    description: skill.description,
+                })
+                .collect(),
         },
         AgentEvent::PrewalkHandoff {
             provider,

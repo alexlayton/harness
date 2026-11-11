@@ -424,6 +424,7 @@ async fn run_application(
     // Construct the terminal before assembling the agent or claiming the
     // Herdr TUI pane, so setup errors leave neither running MCPs nor a report.
     let update_notice = update::check_latest().await;
+    let reload_root = workspace_root.clone();
     let mut ui = CrossTerm::new(
         &config.model,
         &provider_name,
@@ -465,10 +466,14 @@ async fn run_application(
             // edits that only a restart can apply.
             let cli = cli.clone();
             let running = config.clone();
+            let root = reload_root;
             Arc::new(move || {
-                Config::resolve(&cli)
-                    .map(|fresh| fresh.reload_settings(&running))
-                    .map_err(|error| format!("{error:#}"))
+                let fresh = Config::resolve(&cli).map_err(|error| format!("{error:#}"))?;
+                // Context files and skills are re-read here, on the blocking
+                // thread the agent runs this closure on.
+                let context = context::load_context_bundle(&root, cli.no_context_files, true);
+                let skills = tools::discover_skills(&root);
+                Ok(fresh.reload_settings(&running, context, skills))
             })
         });
     if let Some(tools) = &config.codemode {

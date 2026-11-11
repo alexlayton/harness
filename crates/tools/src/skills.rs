@@ -84,7 +84,7 @@ pub enum SkillSeverity {
 }
 
 /// The result of discovering skills from a set of root directories.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SkillCatalog {
     pub skills: Vec<Skill>,
     pub diagnostics: Vec<SkillDiagnostic>,

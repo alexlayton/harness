@@ -92,13 +92,22 @@ row saying whether the override was applied or skipped. Herdr resume commands
 repeat `--trust`. Settings saved by commands such as `/model` still go to the
 global file.
 
-**`/reload`** re-reads both files mid-session and applies the provider, model,
-and reasoning effort to the running agent without saving them (a workspace
-value is never written to the global config). It then reprints the header.
-MCP servers, `rtk`, and codemode are fixed when the session starts, as are
-discovered skills and `AGENTS.md` context; edits to MCP servers, `rtk`, or
-codemode are reported as needing a restart, naming the servers added or
-removed.
+**`/reload`** re-reads both files mid-session and applies the result to the
+running agent, so you can add or change an MCP server without restarting:
+
+- provider, model, and reasoning effort (not saved: a workspace value is never
+  written to the global config);
+- MCP servers: when the set changed, every server is reconnected and the tool
+  list rebuilt. The new servers connect first, so a required server that fails
+  to start leaves the previous ones running and the reload notice says why. An
+  optional server that fails is listed as unavailable;
+- codemode on/off and its tool selection, skills, and `AGENTS.md` context.
+
+It then reprints the header and a notice such as
+`MCP servers reconnected (2 running): +docs, -safari`. `rtk` is baked into the
+`bash` tool at startup, so changing it is reported as needing a restart.
+Subagents keep the skills and context they started with. Reloading waits for
+the current turn to finish; connecting servers can take a few seconds.
 
 ## Herdr TUI integration
 

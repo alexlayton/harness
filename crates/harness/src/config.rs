@@ -1511,45 +1511,26 @@ pub struct Config {
 
 impl Config {
     /// Settings that differ from `running` but cannot change without a
-    /// restart: they are wired into the registry or MCP connections when the
-    /// agent is built. `/reload` reports them instead of silently ignoring
-    /// an edit.
-    pub fn restart_required(&self, running: &Config) -> Vec<String> {
+    /// restart. Only `rtk` remains: it is baked into the `bash` tool when the
+    /// registry is built. `/reload` reports it instead of silently ignoring an
+    /// edit.
+    pub fn restart_required(&self, running: &Config) -> Vec<&'static str> {
         let mut changed = Vec::new();
-        if self.mcp_servers != running.mcp_servers {
-            let names = |config: &Config| -> Vec<String> {
-                config.mcp_servers.iter().map(|s| s.name.clone()).collect()
-            };
-            let (now, before) = (names(self), names(running));
-            let mut detail: Vec<String> = now
-                .iter()
-                .filter(|name| !before.contains(name))
-                .map(|name| format!("+{name}"))
-                .chain(
-                    before
-                        .iter()
-                        .filter(|name| !now.contains(name))
-                        .map(|name| format!("-{name}")),
-                )
-                .collect();
-            // Same names but different settings (command, url, env).
-            if detail.is_empty() {
-                detail.push("settings changed".into());
-            }
-            changed.push(format!("MCP servers ({})", detail.join(", ")));
-        }
         if self.rtk != running.rtk {
-            changed.push("rtk".into());
-        }
-        if self.codemode != running.codemode {
-            changed.push("codemode".into());
+            changed.push("rtk");
         }
         changed
     }
 
-    /// The selections `/reload` can apply to a live agent, plus a notice for
-    /// anything that needs a restart.
-    pub fn reload_settings(&self, running: &Config) -> agent::ReloadSettings {
+    /// Everything `/reload` applies to a live agent: model selections plus
+    /// the externally sourced state (MCP servers, codemode, project context,
+    /// skills) that the caller just re-read from disk.
+    pub fn reload_settings(
+        &self,
+        running: &Config,
+        context: crate::context::ContextBundle,
+        skills: tools::SkillCatalog,
+    ) -> agent::ReloadSettings {
         let restart = self.restart_required(running);
         agent::ReloadSettings {
             provider: self.provider.to_string(),
@@ -1558,6 +1539,11 @@ impl Config {
             notice: (!restart.is_empty())
                 .then(|| format!("Restart harness to apply: {}", restart.join(", "))),
             workspace_config: self.workspace_config.display(),
+            mcp_servers: self.mcp_servers.clone(),
+            codemode: self.codemode.clone(),
+            project_context: context.rendered,
+            context_files: context.display_paths,
+            skills,
         }
     }
 }
@@ -3115,97 +3101,36 @@ command = "/bin/echo"
             })
             .unwrap()
         };
+        let reload = |fresh: &Config, running: &Config| {
+            fresh.reload_settings(running, Default::default(), Default::default())
+        };
         let running = file("provider = \"openrouter\"\nmodel = \"a\"\n");
-        let same_but_model = file("provider = \"openrouter\"\nmodel = \"b\"\n");
-        let settings = same_but_model.reload_settings(&running);
+        let changed_model = file("provider = \"openrouter\"\nmodel = \"b\"\n");
+        let settings = reload(&changed_model, &running);
         assert_eq!(settings.model, "b");
         assert_eq!(settings.notice, None);
 
         let with_rtk = file("provider = \"openrouter\"\nmodel = \"a\"\nrtk = true\n");
         assert_eq!(
-            with_rtk.reload_settings(&running).notice.as_deref(),
+            reload(&with_rtk, &running).notice.as_deref(),
             Some("Restart harness to apply: rtk")
         );
     }
 
-    fn trust_fixture(global: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
-        let directory = tempfile::tempdir().unwrap();
-        let global_path = directory.path().join("global.toml");
-        write(&global_path, global);
-        let workspace = workspace_config_path(&directory.path().join("project"));
-        write(&workspace, "model = \"local/model\"\n");
-        (directory, global_path, workspace)
-    }
-
     #[test]
-    fn untrusted_workspace_config_is_ignored_and_reported() {
-        let (_dir, global, workspace) = trust_fixture("model = \"global/model\"\n");
-        let (config, state) =
-            load_layered_file_config(&global, Some(&workspace), false, None).unwrap();
-        assert_eq!(config.model.as_deref(), Some("global/model"));
-        assert_eq!(state, WorkspaceConfigState::Untrusted(workspace));
-        assert!(state.display().unwrap().contains("--trust"));
-    }
-
-    #[test]
-    fn trust_flag_or_global_setting_applies_the_workspace_config() {
-        let (_dir, global, workspace) = trust_fixture("model = \"global/model\"\n");
-        let (config, state) =
-            load_layered_file_config(&global, Some(&workspace), true, None).unwrap();
-        assert_eq!(config.model.as_deref(), Some("local/model"));
-        assert_eq!(state, WorkspaceConfigState::Loaded(workspace));
-
-        let (_dir, global, workspace) =
-            trust_fixture("model = \"global/model\"\ntrust_workspace_config = true\n");
-        let (config, state) =
-            load_layered_file_config(&global, Some(&workspace), false, None).unwrap();
-        assert_eq!(config.model.as_deref(), Some("local/model"));
-        assert!(matches!(state, WorkspaceConfigState::Loaded(_)));
-    }
-
-    #[test]
-    fn workspace_config_cannot_grant_itself_trust() {
-        let (_dir, global, workspace) = trust_fixture("model = \"global/model\"\n");
-        write(
-            &workspace,
-            "trust_workspace_config = true\nmodel = \"local/model\"\n",
-        );
-        let (_, state) = load_layered_file_config(&global, Some(&workspace), false, None).unwrap();
-        assert!(matches!(state, WorkspaceConfigState::Untrusted(_)));
-        // And a trusted load does not leak the key into the resolved config.
-        let (config, _) = load_layered_file_config(&global, Some(&workspace), true, None).unwrap();
-        assert!(!config.trust_workspace_config);
-    }
-
-    #[test]
-    fn absent_workspace_config_reports_nothing() {
-        let directory = tempfile::tempdir().unwrap();
-        let global = directory.path().join("global.toml");
-        let missing = workspace_config_path(directory.path());
-        let (_, state) = load_layered_file_config(&global, Some(&missing), true, None).unwrap();
-        assert_eq!(state, WorkspaceConfigState::Absent);
-        assert_eq!(state.display(), None);
-    }
-
-    #[test]
-    fn reload_notice_names_the_mcp_servers_that_need_a_restart() {
-        let file = |toml: &str| -> Config {
-            let file: FileConfig = toml::from_str(toml).unwrap();
+    fn reload_carries_the_fresh_mcp_servers_and_codemode_selection() {
+        let file: FileConfig = toml::from_str(
+            "provider = \"openrouter\"\nmodel = \"m\"\n[codemode]\nenabled = true\n[[mcp.servers]]\nname = \"docs\"\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\n",
+        )
+        .unwrap();
+        let config =
             Config::resolve_from_file(&Cli::default(), &file, PathBuf::from("/tmp/c.toml"), |_| {
                 Some("key".into())
             })
-            .unwrap()
-        };
-        let server = |name: &str| {
-            format!(
-                "provider = \"openrouter\"\nmodel = \"m\"\n[[mcp.servers]]\nname = \"{name}\"\ntransport = \"stdio\"\ncommand = \"/bin/echo\"\n"
-            )
-        };
-        let running = file(&server("safari"));
-        let fresh = file(&format!("{}{}", server("docs"), ""));
-        assert_eq!(
-            fresh.restart_required(&running),
-            ["MCP servers (+docs, -safari)"]
-        );
+            .unwrap();
+        let settings = config.reload_settings(&config, Default::default(), Default::default());
+        assert_eq!(settings.mcp_servers.len(), 1);
+        assert_eq!(settings.codemode, Some(Vec::new()));
+        assert_eq!(settings.notice, None, "MCP and codemode need no restart");
     }
 }

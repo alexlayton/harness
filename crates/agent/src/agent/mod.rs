@@ -22,6 +22,7 @@ mod compaction;
 mod events;
 mod persistence;
 mod prewalk;
+mod reload;
 mod tool_dispatch;
 mod turn;
 
@@ -106,6 +107,11 @@ pub struct Agent {
     provider_factory: Option<ProviderFactory>,
     /// Host-supplied configuration reload for `/reload`.
     reloader: Option<Reloader>,
+    /// The connected MCP runtime, shared with [`crate::assembly::AssembledAgent`]
+    /// so a reload can replace it and shutdown still closes the current one.
+    mcp: McpSlot,
+    /// The MCP server configuration `mcp` was connected with.
+    mcp_configs: Vec<mcp::McpServerConfig>,
     /// Input messages received while a turn is running.  They are drained by
     /// `run` before the next turn starts.
     input: TurnInput,
@@ -149,6 +155,9 @@ pub struct Agent {
     /// One-shot planning-to-implementation model handoff.
     prewalk: PrewalkState,
 }
+
+/// Slot holding the connected MCP runtime, if any.
+pub(crate) type McpSlot = Arc<std::sync::Mutex<Option<mcp::McpRuntime>>>;
 
 /// Input-channel state shared by every operation boundary.
 ///
@@ -271,6 +280,8 @@ impl Agent {
             secret_masker: Arc::new(SecretMasker::default()),
             provider_factory: None,
             reloader: None,
+            mcp: McpSlot::default(),
+            mcp_configs: Vec::new(),
             input: TurnInput::default(),
             ephemeral_notes: Vec::new(),
             last_context_tokens: None,
@@ -364,6 +375,13 @@ impl Agent {
             .iter()
             .map(|message| self.secret_masker.mask_message(message))
             .collect();
+        self
+    }
+
+    /// Share the MCP runtime slot and the configuration it was built from.
+    pub(crate) fn with_mcp(mut self, slot: McpSlot, configs: Vec<mcp::McpServerConfig>) -> Self {
+        self.mcp = slot;
+        self.mcp_configs = configs;
         self
     }
 
@@ -699,9 +717,16 @@ impl Agent {
                     continue;
                 }
                 InputMessage::Reload => {
+                    // Reconnecting MCP servers can take a while; show it.
+                    send(
+                        &events,
+                        AgentEvent::OperationStarted {
+                            label: "Reloading config...".into(),
+                        },
+                    );
                     match self.handle_reload_boundary(&events).await {
                         TurnControl::Shutdown | TurnControl::Quarantine => break,
-                        TurnControl::Continue => {}
+                        TurnControl::Continue => send(&events, AgentEvent::OperationFinished),
                     }
                     continue;
                 }
@@ -1284,7 +1309,7 @@ mod tests {
                 model: "demo".into(),
                 reasoning: "high".into(),
                 notice: Some("Restart harness to apply: MCP servers".into()),
-                workspace_config: None,
+                ..Default::default()
             })
         });
         let events = run_reload(Some(reloader)).await;
@@ -1302,6 +1327,196 @@ mod tests {
             event,
             AgentEvent::ModelChanged { .. } | AgentEvent::ReasoningChanged { .. }
         )));
+    }
+
+    fn stdio_server(name: &str, required: bool) -> mcp::McpServerConfig {
+        mcp::McpServerConfig {
+            name: name.into(),
+            required,
+            transport: mcp::McpTransportConfig::Stdio {
+                command: "/nonexistent/mcp-server".into(),
+                args: Vec::new(),
+                env: Default::default(),
+                cwd: None,
+            },
+        }
+    }
+
+    fn reload_with(settings: ReloadSettings) -> Reloader {
+        Arc::new(move || Ok(settings.clone()))
+    }
+
+    fn reloaded(events: &[AgentEvent]) -> &AgentEvent {
+        events
+            .iter()
+            .find(|event| matches!(event, AgentEvent::Reloaded { .. }))
+            .unwrap_or_else(|| panic!("no Reloaded event in {events:?}"))
+    }
+
+    #[tokio::test]
+    async fn reload_reports_new_skills_context_and_an_unavailable_optional_server() {
+        let skills = tools::SkillCatalog {
+            skills: vec![tools::Skill {
+                name: "triage".into(),
+                description: "sort the inbox".into(),
+                file_path: "/tmp/triage/SKILL.md".into(),
+                base_dir: "/tmp/triage".into(),
+                instructions: "go".into(),
+                disable_model_invocation: false,
+            }],
+            ..Default::default()
+        };
+        let events = run_reload(Some(reload_with(ReloadSettings {
+            provider: "mock".into(),
+            model: "demo".into(),
+            reasoning: "auto".into(),
+            mcp_servers: vec![stdio_server("docs", false)],
+            context_files: vec!["AGENTS.md".into()],
+            skills,
+            ..Default::default()
+        })))
+        .await;
+        let AgentEvent::Reloaded {
+            notice,
+            context_files,
+            mcp_servers,
+            skills,
+            ..
+        } = reloaded(&events)
+        else {
+            unreachable!()
+        };
+        assert_eq!(context_files, &["AGENTS.md"]);
+        assert_eq!(mcp_servers, &["docs"]);
+        assert_eq!(skills.len(), 1);
+        let notice = notice.as_deref().unwrap();
+        assert!(notice.contains("MCP servers reconnected"), "{notice}");
+        assert!(notice.contains("+docs"), "{notice}");
+        assert!(notice.contains("`docs` is unavailable"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn failed_required_mcp_server_keeps_the_previous_setup() {
+        let events = run_reload(Some(reload_with(ReloadSettings {
+            provider: "mock".into(),
+            model: "demo".into(),
+            reasoning: "auto".into(),
+            mcp_servers: vec![stdio_server("docs", true)],
+            ..Default::default()
+        })))
+        .await;
+        let AgentEvent::Reloaded { notice, .. } = reloaded(&events) else {
+            unreachable!()
+        };
+        let notice = notice.as_deref().unwrap();
+        assert!(
+            notice.contains("MCP reload failed, keeping previous servers"),
+            "{notice}"
+        );
+        assert!(!notice.contains("reconnected"), "{notice}");
+    }
+
+    const MCP_FIXTURE: &str = r#"
+while IFS= read -r line; do
+    id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+    [ -n "$id" ] || continue
+    case "$line" in
+        *'"method":"initialize"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-03-26","capabilities":{"tools":{}},"serverInfo":{"name":"fx","version":"1"}}}\n' "$id" ;;
+        *'"method":"tools/list"'*)
+            printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"%s","inputSchema":{"type":"object"}}]}}\n' "$id" "$TOOL" ;;
+    esac
+done
+"#;
+
+    fn fixture_server(name: &str, tool: &str) -> mcp::McpServerConfig {
+        mcp::McpServerConfig {
+            name: name.into(),
+            required: true,
+            transport: mcp::McpTransportConfig::Stdio {
+                command: "/bin/sh".into(),
+                args: vec!["-c".into(), MCP_FIXTURE.into()],
+                env: [("TOOL".to_owned(), tool.to_owned())].into(),
+                cwd: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_swaps_mcp_tools_and_a_failed_reload_keeps_them() {
+        let log: ProbeLog = Arc::default();
+        let mut agent = Agent::new(
+            Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![],
+                error_kind: MockErrorKind::Stream,
+            }),
+            ToolRegistry::try_new(vec![Box::new(ProbeTool::read_only("probe_a", &log))]).unwrap(),
+            "demo",
+            CancellationToken::new(),
+        );
+        let tool_names = |agent: &Agent| -> Vec<String> {
+            agent
+                .tools
+                .definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        };
+        let has =
+            |agent: &Agent, needle: &str| tool_names(agent).iter().any(|n| n.contains(needle));
+        let mut notes = Vec::new();
+
+        // Adding a server needs no restart.
+        let first = vec![fixture_server("alpha", "tool_a")];
+        agent.reload_mcp(&first, None, &mut notes).await.unwrap();
+        assert!(has(&agent, "tool_a"), "{:?}", tool_names(&agent));
+        assert!(has(&agent, "probe_a"), "built-ins stay");
+
+        // Replacing it removes the old tool and adds the new one.
+        let second = vec![fixture_server("beta", "tool_b")];
+        agent.reload_mcp(&second, None, &mut notes).await.unwrap();
+        assert!(!has(&agent, "tool_a"), "{:?}", tool_names(&agent));
+        assert!(has(&agent, "tool_b"));
+
+        // A required server that cannot start leaves the previous one running.
+        let broken = vec![stdio_server("gamma", true)];
+        let error = agent
+            .reload_mcp(&broken, None, &mut notes)
+            .await
+            .unwrap_err();
+        assert!(error.contains("keeping previous servers"), "{error}");
+        assert!(has(&agent, "tool_b") && !has(&agent, "gamma"));
+        assert_eq!(agent.mcp_configs, second);
+
+        // Removing every server drops its tools.
+        agent.reload_mcp(&[], None, &mut notes).await.unwrap();
+        assert!(!has(&agent, "tool_b"));
+        assert!(agent.mcp.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn reload_can_turn_codemode_on_and_off() {
+        let mut agent = Agent::new(
+            Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![],
+                error_kind: MockErrorKind::Stream,
+            }),
+            {
+                let log: ProbeLog = Arc::default();
+                ToolRegistry::try_new(vec![Box::new(ProbeTool::read_only("probe_a", &log))])
+                    .unwrap()
+            },
+            "demo",
+            CancellationToken::new(),
+        );
+        let mut notes = Vec::new();
+        agent.reload_mcp(&[], Some(&[]), &mut notes).await.unwrap();
+        assert!(agent.tools.codemode_enabled());
+        agent.reload_mcp(&[], None, &mut notes).await.unwrap();
+        assert!(!agent.tools.codemode_enabled());
+        assert!(notes.is_empty());
     }
 
     #[tokio::test]

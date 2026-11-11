@@ -315,6 +315,12 @@ fn reload_reprints_the_header_with_the_new_state() {
         reasoning: "high".into(),
         notice: Some("Restart harness to apply: rtk".into()),
         workspace_config: Some(".harness/config.toml (workspace override applied)".into()),
+        context_files: vec!["AGENTS.md".into()],
+        mcp_servers: vec!["docs".into()],
+        skills: vec![SkillEntry {
+            name: "triage".into(),
+            description: "sort the inbox".into(),
+        }],
     });
     assert_eq!((ui.provider.as_str(), ui.model.as_str()), ("p2", "m2"));
     let printed = format!("{:?}", ui.pending);

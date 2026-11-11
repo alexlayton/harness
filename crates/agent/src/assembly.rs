@@ -226,12 +226,15 @@ impl AgentBuilder {
         // Every remaining fallible step lives in `assemble`, so the running
         // MCP servers are shut down in exactly one place on any failure
         // instead of on each early-return path.
+        let mcp_configs = self.mcp_servers.clone();
+        let slot: crate::agent::McpSlot = Arc::new(std::sync::Mutex::new(mcp));
         match self.assemble(active_lease) {
-            Ok(agent) => Ok(AssembledAgent { agent, mcp }),
+            Ok(agent) => Ok(AssembledAgent {
+                agent: agent.with_mcp(slot.clone(), mcp_configs),
+                mcp: slot,
+            }),
             Err(error) => {
-                if let Some(mcp) = mcp {
-                    mcp.shutdown().await;
-                }
+                shutdown_slot(&slot).await;
                 Err(error)
             }
         }
@@ -321,19 +324,35 @@ impl AgentBuilder {
     }
 }
 
+/// Close whichever MCP runtime a slot currently holds. A reload may have
+/// replaced the one connected at assembly, so shutdown must read the slot.
+async fn shutdown_slot(slot: &crate::agent::McpSlot) {
+    let runtime = match slot.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(runtime) = runtime {
+        runtime.shutdown().await;
+    }
+}
+
 /// An agent plus the external MCP runtime whose handles its tools use.
 /// Calling [`Self::run`] guarantees an orderly server shutdown after the
 /// frontend closes the agent input channel.
 pub struct AssembledAgent {
     agent: Agent,
-    mcp: Option<mcp::McpRuntime>,
+    mcp: crate::agent::McpSlot,
 }
 
 impl AssembledAgent {
     /// Startup problems the frontend should show: optional MCP servers that
     /// failed to start and are therefore unavailable this session.
     pub fn warnings(&self) -> Vec<String> {
-        self.mcp
+        let guard = match self.mcp.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
             .iter()
             .flat_map(|mcp| mcp.failures())
             .map(|failure| {
@@ -352,16 +371,12 @@ impl AssembledAgent {
         events: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
     ) {
         self.agent.run(input, events).await;
-        if let Some(mcp) = self.mcp {
-            mcp.shutdown().await;
-        }
+        shutdown_slot(&self.mcp).await;
     }
 
     /// Shut down MCP services when assembly completes but the frontend cannot
     /// take ownership of the resulting agent.
     pub async fn shutdown(self) {
-        if let Some(mcp) = self.mcp {
-            mcp.shutdown().await;
-        }
+        shutdown_slot(&self.mcp).await;
     }
 }
