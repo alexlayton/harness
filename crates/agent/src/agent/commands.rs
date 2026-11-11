@@ -377,6 +377,7 @@ impl Agent {
     ) -> TurnControl {
         self.set_model_boundary(provider, model, ModelChangeSource::User, events)
             .await
+            .0
     }
 
     /// Reload configuration from the host and apply provider, model, and
@@ -415,17 +416,32 @@ impl Agent {
             .eq_ignore_ascii_case(&settings.provider)
             && self.model == settings.model;
         if !unchanged {
-            match self
+            let (control, switched) = self
                 .set_model_boundary(
                     Some(settings.provider.clone()),
                     settings.model.clone(),
                     ModelChangeSource::Reload,
                     events,
                 )
-                .await
-            {
-                TurnControl::Continue => {}
-                control => return control,
+                .await;
+            if control != TurnControl::Continue {
+                return control;
+            }
+            if !switched {
+                // The switch was rejected and its reason already reported, for
+                // example a custom provider whose API key is unset. Stop here:
+                // continuing would announce success with the old model and
+                // apply reasoning, skills and MCP changes the user was told
+                // had failed.
+                send(
+                    events,
+                    AgentEvent::Error(
+                        "reload failed: the provider/model switch was rejected; \
+                         nothing was changed"
+                            .into(),
+                    ),
+                );
+                return TurnControl::Continue;
             }
         }
         self.prewalk.forget_restore();
@@ -438,7 +454,10 @@ impl Agent {
                 provider: self.provider.name().to_owned(),
                 model: self.model.clone(),
                 reasoning: self.reasoning.to_string(),
-                notice: (!notice.is_empty()).then(|| notice.join("\n")),
+                // The notice carries resolved MCP arguments, so apply the
+                // configured masker to everything in it.
+                notice: (!notice.is_empty())
+                    .then(|| self.secret_masker.mask_text(&notice.join("\n"))),
                 workspace_config: settings.workspace_config,
                 context_files: settings.context_files,
                 mcp_servers: settings
@@ -458,26 +477,27 @@ impl Agent {
         model: String,
         source: ModelChangeSource,
         events: &mpsc::UnboundedSender<AgentEvent>,
-    ) -> TurnControl {
+    ) -> (TurnControl, bool) {
         let outcome = self.handle_set_model(provider, model, events).await;
         let pending = match outcome {
             Ok(Some(pending)) => pending,
             Ok(None) => {
+                // Rejected (and already reported): nothing was committed.
                 return if self.flush_deferred_sync(events).is_err() {
-                    TurnControl::Quarantine
+                    (TurnControl::Quarantine, false)
                 } else {
-                    TurnControl::Continue
+                    (TurnControl::Continue, false)
                 };
             }
             Err(error) => {
                 // Preserve the boundary flush for an append/provider error;
                 // no model-change state has been committed in this branch.
                 if self.flush_deferred_sync(events).is_err() {
-                    return TurnControl::Quarantine;
+                    return (TurnControl::Quarantine, false);
                 }
                 return match error {
-                    TurnError::Shutdown => TurnControl::Shutdown,
-                    TurnError::Persist(_) => TurnControl::Quarantine,
+                    TurnError::Shutdown => (TurnControl::Shutdown, false),
+                    TurnError::Persist(_) => (TurnControl::Quarantine, false),
                 };
             }
         };
@@ -487,18 +507,18 @@ impl Agent {
         // failed fsync therefore cannot leak a model switch into live state.
         if let Some(staged) = pending.staged_session.as_ref() {
             let Some(state) = self.session.as_ref() else {
-                return TurnControl::Quarantine;
+                return (TurnControl::Quarantine, false);
             };
             if self
                 .flush_deferred_sync_session(&state.store, staged, events)
                 .is_err()
             {
-                return TurnControl::Quarantine;
+                return (TurnControl::Quarantine, false);
             }
         }
 
         self.commit_model_change(pending, source, events);
-        TurnControl::Continue
+        (TurnControl::Continue, true)
     }
 
     /// Switch models inside a turn for a prewalk handoff. Returns `false`

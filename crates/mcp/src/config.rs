@@ -34,6 +34,76 @@ pub struct McpServerConfig {
     pub transport: McpTransportConfig,
 }
 
+impl McpServerConfig {
+    /// One line saying what this server launches or contacts, safe to show a
+    /// user: `stdio: <command> <args>` or `http: <url>`.
+    ///
+    /// Arguments are resolved (`${VAR}` already expanded), so a token passed
+    /// as an argument would otherwise appear verbatim. Values after `=`, the
+    /// value following a flag that names a credential, and any configured
+    /// environment value are replaced. Positional arguments are kept so the
+    /// user can still see what runs. Not a guarantee: a bare positional secret
+    /// is indistinguishable from a subcommand, so callers should also apply
+    /// their own secret masker.
+    pub fn describe(&self) -> String {
+        match &self.transport {
+            McpTransportConfig::Stdio { command, args, .. } => {
+                let mut parts = vec![command.display().to_string()];
+                let mut hide_next = false;
+                for arg in args {
+                    parts.push(describe_arg(arg, &mut hide_next));
+                }
+                let line = Redactions::for_server(self).apply(&parts.join(" "));
+                format!("stdio: {}", truncate_display(&line, 200))
+            }
+            McpTransportConfig::Http { url, .. } => format!("http: {}", redact_url(url)),
+        }
+    }
+}
+
+/// Flag names that suggest the next argument is a credential.
+fn is_sensitive_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [
+        "token",
+        "key",
+        "secret",
+        "password",
+        "passwd",
+        "auth",
+        "credential",
+        "cookie",
+    ]
+    .iter()
+    .any(|word| name.contains(word))
+}
+
+fn describe_arg(arg: &str, hide_next: &mut bool) -> String {
+    if std::mem::take(hide_next) {
+        return "<redacted>".into();
+    }
+    if let Some((name, _)) = arg.split_once('=')
+        && !name.is_empty()
+        && !name.contains(char::is_whitespace)
+        && !name.contains('/')
+    {
+        return format!("{name}=<redacted>");
+    }
+    if arg.starts_with('-') && is_sensitive_name(arg) {
+        *hide_next = true;
+    }
+    truncate_display(arg, 80)
+}
+
+fn truncate_display(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut shortened: String = text.chars().take(max).collect();
+    shortened.push('…');
+    shortened
+}
+
 impl fmt::Debug for McpServerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("McpServerConfig")
@@ -418,6 +488,70 @@ fn append_bounded(output: &mut String, value: &str, limit: usize) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stdio(args: &[&str], env: &[(&str, &str)]) -> McpServerConfig {
+        McpServerConfig {
+            name: "s".into(),
+            required: false,
+            transport: McpTransportConfig::Stdio {
+                command: "bunx".into(),
+                args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                env: env
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+                cwd: None,
+            },
+        }
+    }
+
+    #[test]
+    fn describe_keeps_what_runs_but_hides_argument_values() {
+        let server = stdio(
+            &[
+                "safari-mcp",
+                "--token=abc123secret",
+                "--api-key",
+                "hunter2hunter2",
+                "KEY=value-here",
+                "--port",
+                "9225",
+            ],
+            &[("OTHER", "env-secret-value")],
+        );
+        let text = server.describe();
+        assert_eq!(
+            text,
+            "stdio: bunx safari-mcp --token=<redacted> --api-key <redacted> KEY=<redacted> --port 9225"
+        );
+    }
+
+    #[test]
+    fn describe_redacts_environment_values_and_truncates() {
+        let text = stdio(
+            &["positional-env-secret-value"],
+            &[("T", "positional-env-secret-value")],
+        )
+        .describe();
+        assert!(!text.contains("env-secret-value"), "{text}");
+        let long = "x".repeat(500);
+        assert!(stdio(&[&long], &[]).describe().chars().count() < 260);
+    }
+
+    #[test]
+    fn describe_redacts_http_url_credentials_and_query() {
+        let server = McpServerConfig {
+            name: "w".into(),
+            required: false,
+            transport: McpTransportConfig::Http {
+                url: "https://user:pw@example.test/mcp?token=abc".into(),
+                headers: BTreeMap::new(),
+            },
+        };
+        let text = server.describe();
+        assert!(text.starts_with("http: https://"), "{text}");
+        assert!(!text.contains("pw") && !text.contains("abc"), "{text}");
+    }
 
     #[test]
     fn resolves_environment_without_touching_process_state() {

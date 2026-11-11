@@ -137,13 +137,7 @@ pub(super) fn mcp_summary(
     let mut changes: Vec<String> = after
         .iter()
         .filter(|server| !known(before, &server.name))
-        .map(|server| {
-            format!(
-                "+{} ({})",
-                server.name,
-                describe_transport(&server.transport)
-            )
-        })
+        .map(|server| format!("+{} ({})", server.name, server.describe()))
         .chain(
             before
                 .iter()
@@ -159,18 +153,4 @@ pub(super) fn mcp_summary(
         after.len(),
         changes.join(", ")
     )
-}
-
-/// What a server will launch or connect to, without environment values or
-/// header values. Only the command line and URL are shown, and the URL goes
-/// through `mcp::redact_url`, which drops credentials, query and fragment.
-fn describe_transport(transport: &mcp::McpTransportConfig) -> String {
-    match transport {
-        mcp::McpTransportConfig::Stdio { command, args, .. } => {
-            let mut parts = vec![command.display().to_string()];
-            parts.extend(args.iter().cloned());
-            format!("stdio: {}", parts.join(" "))
-        }
-        mcp::McpTransportConfig::Http { url, .. } => format!("http: {}", mcp::redact_url(url)),
-    }
 }

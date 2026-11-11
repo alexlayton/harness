@@ -1520,6 +1520,87 @@ done
     }
 
     #[tokio::test]
+    async fn rejected_model_switch_stops_the_reload_without_announcing_success() {
+        // No provider factory is attached, so selecting another provider is
+        // rejected (the same path as a custom provider with a missing key).
+        let skills = tools::SkillCatalog {
+            skills: vec![tools::Skill {
+                name: "triage".into(),
+                description: "d".into(),
+                file_path: "/tmp/t/SKILL.md".into(),
+                base_dir: "/tmp/t".into(),
+                instructions: "go".into(),
+                disable_model_invocation: false,
+            }],
+            ..Default::default()
+        };
+        let events = run_reload(Some(reload_with(ReloadSettings {
+            provider: "other".into(),
+            model: "new-model".into(),
+            reasoning: "high".into(),
+            mcp_servers: vec![stdio_server("docs", false)],
+            skills,
+            ..Default::default()
+        })))
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Reloaded { .. })),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::Error(message) if message.contains("nothing was changed")
+        )));
+    }
+
+    #[tokio::test]
+    async fn reload_notice_applies_the_configured_secret_masker() {
+        let masker = Arc::new(
+            crate::secrets::SecretMasker::new([("TOKEN".into(), "positional-secret".into())])
+                .unwrap(),
+        );
+        let (input_tx, input_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        input_tx.send(InputMessage::Reload).unwrap();
+        drop(input_tx);
+        let mut server = stdio_server("docs", false);
+        if let mcp::McpTransportConfig::Stdio { args, .. } = &mut server.transport {
+            args.push("positional-secret".into());
+        }
+        let agent = Agent::new(
+            Arc::new(MockProvider {
+                calls: AtomicUsize::new(0),
+                scripts: vec![],
+                error_kind: MockErrorKind::Stream,
+            }),
+            ToolRegistry::empty(),
+            "demo",
+            CancellationToken::new(),
+        )
+        .with_secret_masker(masker)
+        .with_reloader(reload_with(ReloadSettings {
+            provider: "mock".into(),
+            model: "demo".into(),
+            reasoning: "auto".into(),
+            mcp_servers: vec![server],
+            ..Default::default()
+        }));
+        agent.run(input_rx, event_tx).await;
+        let mut events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            events.push(event);
+        }
+        let AgentEvent::Reloaded { notice, .. } = reloaded(&events) else {
+            unreachable!()
+        };
+        let notice = notice.as_deref().unwrap();
+        assert!(!notice.contains("positional-secret"), "{notice}");
+        assert!(notice.contains("+docs"), "{notice}");
+    }
+
+    #[tokio::test]
     async fn reload_can_turn_codemode_on_and_off() {
         let mut agent = Agent::new(
             Arc::new(MockProvider {
