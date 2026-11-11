@@ -30,8 +30,8 @@ pub use outline::OutlineTool;
 pub use python::PythonTool;
 pub use read::ReadTool;
 pub use registry::{
-    ToolExecutionGate, ToolPromptContext, ToolPromptEntry, ToolRegistry, ToolRegistryError,
-    ToolRegistrySnapshot,
+    CodemodeSnapshot, ToolExecutionGate, ToolPromptContext, ToolPromptEntry, ToolRegistry,
+    ToolRegistryError, ToolRegistrySnapshot,
 };
 pub use skills::{
     Skill, SkillCatalog, SkillDiagnostic, SkillEntry, SkillMode, SkillSeverity, discover,
@@ -417,6 +417,37 @@ pub(crate) fn project_context_dirs(start: &Path) -> Vec<PathBuf> {
     vec![start.to_path_buf()]
 }
 
+/// Discover skills for a workspace the way registry construction does, for a
+/// host that wants a fresh catalogue to pass to [`reload_skills`].
+pub fn discover_skills(workspace_root: &Path) -> SkillCatalog {
+    discover_skills_for_config(workspace_root).with_derived_read_paths()
+}
+
+/// Swap a registry's skill catalogue for a fresh one. The `read` tool's skill
+/// allowlist is fixed when the tool is built, so it is rebuilt too; otherwise
+/// the model could be told about a skill whose file `read` refuses.
+pub fn reload_skills(
+    registry: &mut ToolRegistry,
+    skills: SkillCatalog,
+    repeat_read_notes: bool,
+) -> Result<(), ToolInitError> {
+    let workspace_root = registry.workspace_root().to_path_buf();
+    let skills = skills.with_derived_read_paths();
+    let workspace_fs = Arc::new(WorkspaceFs::open_root(&workspace_root).map_err(|source| {
+        ToolInitError::Workspace {
+            path: workspace_root.clone(),
+            source,
+        }
+    })?);
+    registry.replace_tool(Box::new(
+        ReadTool::with_workspace_fs(&workspace_root, workspace_fs)
+            .with_repeat_notes(repeat_read_notes)
+            .with_allowed_paths(skills.read_paths.clone()),
+    ))?;
+    registry.set_skills(skills);
+    Ok(())
+}
+
 pub(crate) fn discover_skills_for_config(workspace_root: &Path) -> SkillCatalog {
     // Project roots: cwd up to the git repo root (only cwd outside a repo).
     let mut roots: Vec<(PathBuf, SkillMode)> = Vec::new();
@@ -690,6 +721,46 @@ mod tests {
             call_summary("python", &serde_json::json!({"code": "1 + 1"})),
             "python"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_skills_replaces_the_catalogue_and_keeps_skill_files_readable() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("SKILL.md");
+        std::fs::write(&file, "---\nname: s\ndescription: d\n---\nbody\n").unwrap();
+        let mut registry = default_registry(ToolConfig::new(workspace.path(), false).with_skills(
+            SkillCatalog {
+                skills: Vec::new(),
+                diagnostics: Vec::new(),
+                read_paths: Vec::new(),
+            },
+        ))
+        .unwrap();
+        assert!(registry.skills().unwrap().entries().is_empty());
+
+        let catalog = SkillCatalog {
+            skills: vec![Skill {
+                name: "s".into(),
+                description: "d".into(),
+                file_path: file.clone(),
+                base_dir: outside.path().to_path_buf(),
+                instructions: "body".into(),
+                disable_model_invocation: false,
+            }],
+            diagnostics: Vec::new(),
+            read_paths: Vec::new(),
+        };
+        reload_skills(&mut registry, catalog, true).unwrap();
+        assert_eq!(registry.skills().unwrap().entries().len(), 1);
+        let allowed = registry
+            .execute(
+                "read",
+                serde_json::json!({"path": file.to_string_lossy()}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(!allowed.is_error, "{}", allowed.content);
     }
 
     #[tokio::test]

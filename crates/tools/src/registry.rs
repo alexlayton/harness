@@ -37,11 +37,20 @@ pub struct ToolRegistry {
     file_search_index: Option<Arc<super::FileSearchIndex>>,
     execution_gate: Option<ToolExecutionGate>,
     codemode: Option<super::codemode::Codemode>,
+    /// The tool selection codemode was enabled with (empty means all), kept so
+    /// the catalogue can be rebuilt after the tool set changes.
+    codemode_selection: Option<Vec<String>>,
     /// MCP servers known to the host, including ones that failed to start.
     mcp_servers: Vec<super::McpServerInfo>,
     /// Number of `execute_codemode` workflows currently owning the gate;
     /// nested ungated calls are only admitted while this is non-zero.
     codemode_active: std::sync::atomic::AtomicUsize,
+}
+
+/// Opaque codemode state taken by [`ToolRegistry::disable_codemode`].
+pub struct CodemodeSnapshot {
+    codemode: Option<super::codemode::Codemode>,
+    selection: Option<Vec<String>>,
 }
 
 /// Guard returned by [`ToolRegistry::enter_codemode_scope`].
@@ -78,6 +87,7 @@ impl ToolRegistry {
             file_search_index: None,
             execution_gate: None,
             codemode: None,
+            codemode_selection: None,
             mcp_servers: Vec::new(),
             codemode_active: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -211,7 +221,54 @@ impl ToolRegistry {
             });
         self.codemode =
             Some(super::codemode::Codemode::new(tools, &self.mcp_servers).map_err(error)?);
+        self.codemode_selection = Some(names.to_vec());
         Ok(())
+    }
+
+    /// The selection codemode was enabled with, or `None` when it is off.
+    pub fn codemode_selection(&self) -> Option<&[String]> {
+        self.codemode_selection.as_deref()
+    }
+
+    /// Turn codemode off and return what it held, so a failed rebuild can put
+    /// it back with [`Self::restore_codemode`].
+    pub fn disable_codemode(&mut self) -> CodemodeSnapshot {
+        CodemodeSnapshot {
+            codemode: self.codemode.take(),
+            selection: self.codemode_selection.take(),
+        }
+    }
+
+    /// Reinstate codemode exactly as [`Self::disable_codemode`] left it.
+    pub fn restore_codemode(&mut self, snapshot: CodemodeSnapshot) {
+        self.codemode = snapshot.codemode;
+        self.codemode_selection = snapshot.selection;
+    }
+
+    /// Drop every MCP-backed tool and server record, for a host that is about
+    /// to register a fresh set. Built-in tools are untouched. Any codemode
+    /// catalogue that folded the removed tools is stale until rebuilt.
+    pub fn remove_mcp_tools(&mut self) {
+        self.tools.retain(|tool| tool.tool.mcp_origin().is_none());
+        self.mcp_servers.clear();
+    }
+
+    /// Replace the registered tool with the same name, or register it when
+    /// there is none. Keeps registration order for a replacement.
+    pub fn replace_tool(&mut self, tool: Box<dyn Tool>) -> Result<(), ToolRegistryError> {
+        let spec = tool.spec();
+        let name = spec.definition.name.clone();
+        match self
+            .tools
+            .iter_mut()
+            .find(|registered| registered.name == name)
+        {
+            Some(registered) => {
+                *registered = RegisteredTool { name, spec, tool };
+                Ok(())
+            }
+            None => self.register(tool),
+        }
     }
 
     /// Whether this registry exposes codemode to its owning agent.
@@ -590,6 +647,94 @@ mod tests {
                 summary: "block".into(),
             }
         }
+    }
+
+    struct RemoteTool(&'static str);
+
+    #[async_trait]
+    impl Tool for RemoteTool {
+        fn spec(&self) -> super::super::ToolSpec {
+            TestTool { name: self.0 }.spec()
+        }
+
+        fn concurrency(&self, _: &Value) -> super::super::Concurrency {
+            super::super::Concurrency::ReadOnly
+        }
+
+        fn mcp_origin(&self) -> Option<super::super::McpOrigin> {
+            Some(super::super::McpOrigin {
+                server: "srv".into(),
+                tool: self.0.into(),
+            })
+        }
+
+        async fn execute(&self, _: Value, _: CancellationToken) -> ToolOutput {
+            TestTool { name: self.0 }
+                .execute(Value::Null, CancellationToken::new())
+                .await
+        }
+    }
+
+    fn names(registry: &ToolRegistry) -> Vec<String> {
+        registry.definitions().into_iter().map(|d| d.name).collect()
+    }
+
+    #[test]
+    fn remove_mcp_tools_keeps_built_ins_and_clears_server_records() {
+        let mut registry = ToolRegistry::new(vec![
+            Box::new(TestTool { name: "read" }),
+            Box::new(RemoteTool("mcp__srv__a")),
+        ]);
+        registry.register_mcp_server(crate::McpServerInfo {
+            name: "srv".into(),
+            instructions: None,
+            failure: None,
+        });
+        registry.remove_mcp_tools();
+        assert_eq!(names(&registry), ["read"]);
+        // The name is free again for a fresh registration.
+        registry
+            .register(Box::new(RemoteTool("mcp__srv__a")))
+            .unwrap();
+    }
+
+    #[test]
+    fn replace_tool_keeps_position_and_registers_when_missing() {
+        let mut registry = ToolRegistry::new(vec![
+            Box::new(TestTool { name: "a" }),
+            Box::new(TestTool { name: "b" }),
+        ]);
+        registry
+            .replace_tool(Box::new(TestTool { name: "a" }))
+            .unwrap();
+        registry
+            .replace_tool(Box::new(TestTool { name: "c" }))
+            .unwrap();
+        assert_eq!(names(&registry), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn codemode_can_be_rebuilt_after_the_tool_set_changes() {
+        let mut registry = ToolRegistry::new(vec![
+            Box::new(TestTool { name: "read" }),
+            Box::new(RemoteTool("mcp__srv__a")),
+        ]);
+        registry.enable_codemode(&[]).unwrap();
+        assert_eq!(registry.codemode_selection(), Some(&[][..]));
+        let snapshot = registry.disable_codemode();
+        assert!(!registry.codemode_enabled());
+        assert_eq!(registry.codemode_selection(), None);
+        registry.restore_codemode(snapshot);
+        assert!(registry.codemode_enabled());
+
+        let snapshot = registry.disable_codemode();
+        registry.remove_mcp_tools();
+        registry
+            .register(Box::new(RemoteTool("mcp__srv__b")))
+            .unwrap();
+        registry.enable_codemode(&[]).unwrap();
+        drop(snapshot);
+        assert!(registry.codemode_enabled());
     }
 
     #[test]
