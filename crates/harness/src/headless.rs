@@ -336,6 +336,15 @@ async fn drive_headless_events_core(
                     writeln!(stderr, "reasoning → {level}")?;
                 }
             }
+            // Headless runs never submit `/reload`; report it like a model
+            // change if a host ever does.
+            AgentEvent::Reloaded {
+                provider, model, ..
+            } => {
+                if verbose {
+                    writeln!(stderr, "reloaded → {provider} · {model}")?;
+                }
+            }
             AgentEvent::PrewalkChanged { armed, target, .. } => {
                 if verbose
                     && *armed
@@ -599,6 +608,10 @@ async fn run_headless_resolved(
         model: config.model.clone(),
         reasoning: config.reasoning.as_str().into(),
         no_context_files,
+        trust: matches!(
+            config.workspace_config,
+            crate::config::WorkspaceConfigState::Loaded(_)
+        ),
         defer_session_sync,
         worktree: herdr_tui_worktree,
         mcp: config.mcp_requested.clone(),

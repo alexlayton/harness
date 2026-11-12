@@ -33,6 +33,9 @@ pub(crate) struct ResumeOptions {
     pub model: String,
     pub reasoning: String,
     pub no_context_files: bool,
+    /// A workspace config was applied, so a resumed session must trust it
+    /// again or it would silently start with different settings.
+    pub trust: bool,
     pub defer_session_sync: bool,
     pub worktree: Option<WorktreeResume>,
     /// Opt-in MCP servers connected by this process, so a resumed session
@@ -57,6 +60,9 @@ impl ResumeOptions {
         ];
         if self.no_context_files {
             argv.push("--no-context-files".into());
+        }
+        if self.trust {
+            argv.push("--trust".into());
         }
         if self.defer_session_sync {
             argv.push("--defer-session-sync".into());
@@ -334,6 +340,17 @@ impl Reporter {
                 options.reasoning = level.clone();
                 self.resume_options(options);
             }
+            AgentEvent::Reloaded {
+                provider,
+                model,
+                reasoning,
+                ..
+            } => {
+                options.provider = provider.clone();
+                options.model = model.clone();
+                options.reasoning = reasoning.clone();
+                self.resume_options(options);
+            }
             AgentEvent::TextDelta(_)
             | AgentEvent::ReasoningDelta(_)
             | AgentEvent::ToolCallStarted { .. }
@@ -402,6 +419,7 @@ mod tests {
             model: "model-x".into(),
             reasoning: "low".into(),
             no_context_files: false,
+            trust: false,
             defer_session_sync: true,
             worktree: None,
             mcp: Vec::new(),
@@ -454,6 +472,14 @@ mod tests {
     }
 
     #[test]
+    fn resume_argv_repeats_trust_so_workspace_config_survives() {
+        let mut options = options();
+        assert!(!options.argv("id").unwrap().contains(&"--trust".into()));
+        options.trust = true;
+        assert!(options.argv("id").unwrap().contains(&"--trust".into()));
+    }
+
+    #[test]
     fn resume_argv_obeys_herdr_tui_limits() {
         assert!(valid_resume_argv(&[
             "harness".into(),
@@ -491,6 +517,7 @@ mod tests {
             model: "model-a".into(),
             reasoning: "high".into(),
             no_context_files: true,
+            trust: false,
             defer_session_sync: false,
             worktree: None,
             mcp: Vec::new(),

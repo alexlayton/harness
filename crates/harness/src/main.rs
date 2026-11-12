@@ -424,6 +424,7 @@ async fn run_application(
     // Construct the terminal before assembling the agent or claiming the
     // Herdr TUI pane, so setup errors leave neither running MCPs nor a report.
     let update_notice = update::check_latest().await;
+    let reload_root = workspace_root.clone();
     let mut ui = CrossTerm::new(
         &config.model,
         &provider_name,
@@ -440,6 +441,7 @@ async fn run_application(
                 .iter()
                 .map(|server| server.name.clone())
                 .collect(),
+            workspace_config: config.workspace_config.display(),
             update_notice,
         },
         config.reasoning.as_str(),
@@ -457,7 +459,23 @@ async fn run_application(
         .with_mcp_servers(config.mcp_servers.clone())
         .with_session(session_store, session)
         .with_prewalk(config.prewalk.settings(cli.resume.is_some())?)
-        .with_provider_factory(provider_factory);
+        .with_provider_factory(provider_factory)
+        .with_reloader({
+            // Re-resolves from disk with the launch flags, so `--model` and
+            // friends still win. Compared against the startup config to flag
+            // edits that only a restart can apply.
+            let cli = cli.clone();
+            let running = config.clone();
+            let root = reload_root;
+            Arc::new(move || {
+                let fresh = Config::resolve(&cli).map_err(|error| format!("{error:#}"))?;
+                // Context files and skills are re-read here, on the blocking
+                // thread the agent runs this closure on.
+                let context = context::load_context_bundle(&root, cli.no_context_files, true);
+                let skills = tools::discover_skills(&root);
+                Ok(fresh.reload_settings(&running, context, skills))
+            })
+        });
     if let Some(tools) = &config.codemode {
         builder = builder.with_codemode(tools.clone());
     }
@@ -468,6 +486,10 @@ async fn run_application(
         model: config.model.clone(),
         reasoning: config.reasoning.as_str().into(),
         no_context_files: cli.no_context_files,
+        trust: matches!(
+            config.workspace_config,
+            config::WorkspaceConfigState::Loaded(_)
+        ),
         defer_session_sync: cli.defer_session_sync,
         worktree: herdr_tui_worktree,
         mcp: config.mcp_requested.clone(),

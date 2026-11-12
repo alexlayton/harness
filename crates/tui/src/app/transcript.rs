@@ -48,9 +48,11 @@ pub(super) fn entry_bytes(entry: &Entry) -> usize {
             model,
             context_files,
             mcp_servers,
+            workspace_config,
             skills,
         } => {
             cwd.len()
+                + workspace_config.as_ref().map_or(0, String::len)
                 + branch.as_ref().map_or(0, String::len)
                 + provider.len()
                 + model.len()
@@ -250,6 +252,7 @@ pub(super) fn entry_lines(
             model,
             context_files,
             mcp_servers,
+            workspace_config,
             skills,
         } => metadata_lines(
             cwd,
@@ -258,6 +261,7 @@ pub(super) fn entry_lines(
             model,
             context_files,
             mcp_servers,
+            workspace_config.as_deref(),
             skills,
             theme,
         )
@@ -451,6 +455,7 @@ pub(super) fn metadata_lines(
     model: &str,
     context_files: &[String],
     mcp_servers: &[String],
+    workspace_config: Option<&str>,
     skills: &[String],
     theme: Theme,
 ) -> Vec<Row> {
@@ -464,6 +469,14 @@ pub(super) fn metadata_lines(
         metadata_row("provider", render::sanitize_terminal_text(provider), theme),
         metadata_row("model", render::sanitize_terminal_text(model), theme),
     ];
+    // Directly under the model so it is seen before the first prompt.
+    if let Some(config) = workspace_config {
+        lines.push(metadata_row(
+            "config",
+            render::sanitize_terminal_text(config),
+            theme,
+        ));
+    }
     for (label, entries) in [
         ("context", context_files),
         ("skills", skills),

@@ -62,6 +62,8 @@ pub enum InputMessage {
     SubscriptionUsage,
     /// Ask the agent for the discovered-skill view (see [`UiEvent::SkillsLoaded`]).
     ListSkills,
+    /// Re-read configuration and apply provider, model, and reasoning.
+    Reload,
 }
 
 /// What a [`UiEvent::PrewalkChanged`] reports, for its confirmation notice.
@@ -111,6 +113,8 @@ pub struct StartupEntries {
     pub context_files: Vec<ContextFileEntry>,
     /// Configured MCP server names.
     pub mcp_servers: Vec<String>,
+    /// Header text about a workspace `.harness/config.toml`, when one exists.
+    pub workspace_config: Option<String>,
     /// Optional non-blocking GitHub release update notice.
     pub update_notice: Option<String>,
 }
@@ -216,6 +220,21 @@ pub enum UiEvent {
     /// Confirmed portable reasoning policy.
     ReasoningChanged {
         level: String,
+    },
+    /// A `/reload` finished. Unlike `ModelChanged`, one notice reports the
+    /// active selections and any `notice` detail from the host.
+    Reloaded {
+        provider: String,
+        model: String,
+        reasoning: String,
+        notice: Option<String>,
+        workspace_config: Option<String>,
+        /// Project-instruction files now loaded (display paths).
+        context_files: Vec<String>,
+        /// Configured MCP server names.
+        mcp_servers: Vec<String>,
+        /// Skills now available.
+        skills: Vec<SkillEntry>,
     },
     /// Prewalk arm state and `[<provider>:]<model>` target.
     PrewalkChanged {

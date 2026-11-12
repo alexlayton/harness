@@ -29,6 +29,7 @@ pub fn into_agent_input(message: tui::InputMessage) -> InputMessage {
         tui::InputMessage::InvokeSkill { name } => InputMessage::InvokeSkill { name },
         tui::InputMessage::SubscriptionUsage => InputMessage::SubscriptionUsage,
         tui::InputMessage::ListSkills => InputMessage::ListSkills,
+        tui::InputMessage::Reload => InputMessage::Reload,
     }
 }
 
@@ -117,6 +118,31 @@ pub fn into_ui_event(event: AgentEvent) -> tui::UiEvent {
                 PrewalkChange::Target => tui::PrewalkChange::Target,
                 PrewalkChange::Reasoning => tui::PrewalkChange::Reasoning,
             },
+        },
+        AgentEvent::Reloaded {
+            provider,
+            model,
+            reasoning,
+            notice,
+            workspace_config,
+            context_files,
+            mcp_servers,
+            skills,
+        } => tui::UiEvent::Reloaded {
+            provider,
+            model,
+            reasoning,
+            notice,
+            workspace_config,
+            context_files,
+            mcp_servers,
+            skills: skills
+                .into_iter()
+                .map(|skill| tui::SkillEntry {
+                    name: skill.name,
+                    description: skill.description,
+                })
+                .collect(),
         },
         AgentEvent::PrewalkHandoff {
             provider,

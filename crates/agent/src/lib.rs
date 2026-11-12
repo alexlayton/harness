@@ -8,6 +8,6 @@ pub mod subagent;
 
 pub use agent::{
     Agent, AgentEvent, CompactionReason, InputMessage, PrewalkChange, PrewalkSettings,
-    PrewalkTarget, ProviderFactory, SessionListItem, SessionSnapshotEntry, StreamRecovery,
-    SubagentLimits, TurnError, spawn_model_list,
+    PrewalkTarget, ProviderFactory, ReloadSettings, Reloader, SessionListItem,
+    SessionSnapshotEntry, StreamRecovery, SubagentLimits, TurnError, spawn_model_list,
 };

@@ -259,7 +259,23 @@ See [`crates/session/README.md`](./crates/session/README.md) for the format and
 ## Configuration and secrets
 
 Normal configuration is in `~/.config/harness/config.toml`, with
-`HARNESS_CONFIG_DIR` as an override. OAuth credentials are stored separately in
+`HARNESS_CONFIG_DIR` as an override. A `.harness/config.toml` in the launch
+directory is merged over it on raw TOML before parsing: tables merge key by
+key, `[[mcp.servers]]` entries merge by `name` and replace wholesale (so
+`enabled = false` can switch a global server off), and other values replace.
+It is ignored unless the launch passes `--trust` or the global file sets
+`trust_workspace_config = true` (a workspace file cannot grant itself trust),
+because it is repository-supplied and can start MCP servers or redefine
+providers. The TUI header shows a `config` row saying whether it was applied
+or skipped, and Herdr resume commands repeat `--trust`. Settings saved by commands such as `/model` still go to the
+global file. `/reload` re-resolves configuration through a host-supplied
+`Reloader` and applies it to the live agent: provider, model and reasoning,
+plus MCP servers, codemode, skills and project context. The agent connects the
+new MCP runtime before touching the registry, swaps tools via
+`ToolRegistry::remove_mcp_tools`, rebuilds codemode, and rolls back to the old
+runtime on failure; the runtime lives in a slot shared with `AssembledAgent` so
+shutdown closes whichever is current. Only `rtk` still needs a restart, and
+subagents keep their startup skills and context. OAuth credentials are stored separately in
 `auth.json`; API keys remain environment variables. Session roots can be
 changed with `HARNESS_SESSION_DIR` or `HARNESS_STATE_DIR`. `HARNESS_LOG` enables
 file-only tracing.

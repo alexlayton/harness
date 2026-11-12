@@ -125,6 +125,8 @@ enum Entry {
         context_files: Vec<String>,
         /// Configured MCP server names.
         mcp_servers: Vec<String>,
+        /// Workspace config status line, shown before the first prompt.
+        workspace_config: Option<String>,
         /// Discovered skill names.
         skills: Vec<String>,
     },
@@ -383,6 +385,8 @@ pub struct CrossTerm {
     context_files: Vec<ContextFileEntry>,
     /// Configured MCP server names for the header MCP row.
     mcp_servers: Vec<String>,
+    /// Header text about a workspace config file.
+    workspace_config: Option<String>,
     update_notice: Option<String>,
     /// Completion-driven `ListSessions` lifecycle.
     session_fetch: Fetch,
@@ -452,6 +456,7 @@ impl CrossTerm {
             skills,
             context_files,
             mcp_servers,
+            workspace_config,
             update_notice,
         } = startup;
         let (path_completion_tx, path_completion_rx) = mpsc::unbounded_channel();
@@ -491,6 +496,7 @@ impl CrossTerm {
             skills,
             context_files,
             mcp_servers,
+            workspace_config,
             update_notice,
             session_fetch: Fetch::Idle,
             session_list_display_requested: false,
@@ -1264,6 +1270,7 @@ impl CrossTerm {
             }
             ParsedCommand::SetPrewalkReasoning { level: None } => unreachable!("handled above"),
             ParsedCommand::Usage => InputMessage::SubscriptionUsage,
+            ParsedCommand::Reload => InputMessage::Reload,
             ParsedCommand::InvokeSkill { name, .. } => InputMessage::InvokeSkill { name },
             ParsedCommand::Skills => {
                 // Filled asynchronously by the agent's SkillsLoaded event.
@@ -1498,6 +1505,42 @@ impl CrossTerm {
             UiEvent::ReasoningChanged { level } => {
                 self.reasoning = level;
                 self.add_notice(format!("Reasoning effort: {}", self.reasoning));
+            }
+            UiEvent::Reloaded {
+                provider,
+                model,
+                reasoning,
+                notice,
+                workspace_config,
+                context_files,
+                mcp_servers,
+                skills,
+            } => {
+                self.provider = provider;
+                self.model = model;
+                self.reasoning = reasoning;
+                self.workspace_config = workspace_config;
+                self.context_files = context_files
+                    .into_iter()
+                    .map(|path| ContextFileEntry { path })
+                    .collect();
+                self.mcp_servers = mcp_servers;
+                // Also refreshes `/skill` completion.
+                self.skills = skills;
+                // Re-print the startup header so the new state is visible.
+                self.environment = EnvironmentInfo::discover(self.environment.cwd.clone());
+                if !self.minimal {
+                    self.pending.push(self.metadata_entry());
+                }
+                let mut text = format!(
+                    "Config reloaded: {} · {} · reasoning {}",
+                    self.provider, self.model, self.reasoning
+                );
+                if let Some(notice) = notice {
+                    text.push('\n');
+                    text.push_str(&notice);
+                }
+                self.add_notice(text);
             }
             UiEvent::PrewalkChanged {
                 armed,
@@ -1878,6 +1921,7 @@ impl CrossTerm {
                 .map(|file| file.path.clone())
                 .collect(),
             mcp_servers: self.mcp_servers.clone(),
+            workspace_config: self.workspace_config.clone(),
             skills: self.skills.iter().map(|skill| skill.name.clone()).collect(),
         }
     }
