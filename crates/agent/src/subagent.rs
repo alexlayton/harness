@@ -2069,8 +2069,7 @@ mod tests {
             // Pend forever once cancelled so the *only* way this future can
             // resolve is the loop's cancel branch — no completion-order race.
             self.cancel_probe.cancelled().await;
-            let never: std::convert::Infallible = std::future::pending().await;
-            match never {}
+            std::future::pending::<Result<EventStream, LlmError>>().await
         }
 
         async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
