@@ -570,15 +570,16 @@ small one. The sandbox global `SERVERS` maps each server name to its
 `instructions` (capped at 1 KiB, control characters stripped), tool names, and
 `status`.
 
-MCP tools are discovered when the session starts. Reconnect to apply server
-tool-list changes. Calls are serialized as exclusive operations and run
+MCP tools are discovered when the session starts. Run `/reload` to reconnect
+and apply config or server tool-list changes without restarting. Calls are serialized as exclusive operations and run
 without a confirmation step. Subagents do not receive MCP tools.
 
 Streamable HTTP first uses the draft `2026-07-28` discovery and request-metadata
 flow, then falls back to the initialized `2025-11-25` Streamable HTTP protocol
-for compatible older servers. If a legacy server closes the discovery request
-instead of returning a JSON-RPC rejection, Harness reconnects before attempting
-legacy initialization. Both JSON and request-scoped SSE responses are accepted.
+for compatible older servers. If a legacy server closes the discovery request,
+or rejects it at the HTTP layer with a 4xx status (for example
+`400 No valid session`), instead of returning a JSON-RPC rejection, Harness
+reconnects before attempting legacy initialization. Both JSON and request-scoped SSE responses are accepted.
 The deprecated HTTP+SSE transport is not supported. ACP clients may
 declare stdio or HTTP servers; legacy SSE and MCP-over-ACP entries are rejected
 before any connection is attempted.
