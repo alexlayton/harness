@@ -134,7 +134,9 @@ impl Provider for OpenAiCodexProvider {
         PROVIDER_NAME
     }
     async fn stream(&self, request: &CompletionRequest) -> Result<EventStream, LlmError> {
-        if !CODEX_MODELS.iter().any(|model| model.id == request.model) {
+        if !CODEX_MODELS.iter().any(|model| model.id == request.model)
+            && crate::catalog::remote_model(crate::catalog::OPENAI_CODEX, &request.model).is_none()
+        {
             return Err(LlmError::Parse(format!(
                 "OpenAI Codex model `{}` is not in the supported model catalog",
                 request.model
@@ -160,14 +162,18 @@ impl Provider for OpenAiCodexProvider {
         }
     }
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        Ok(CODEX_MODELS
+        let builtin = CODEX_MODELS
             .iter()
             .map(|model| ModelInfo {
                 id: model.id.into(),
                 name: Some(model.name.into()),
                 context_length: Some(model.context_length),
             })
-            .collect())
+            .collect();
+        Ok(crate::catalog::merge_models(
+            builtin,
+            &crate::catalog::remote_models(crate::catalog::OPENAI_CODEX),
+        ))
     }
 
     async fn subscription_usage(&self) -> Result<Option<SubscriptionUsage>, LlmError> {

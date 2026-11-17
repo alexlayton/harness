@@ -1,3 +1,4 @@
+pub mod catalog;
 pub mod dialects;
 pub mod error;
 pub mod http;

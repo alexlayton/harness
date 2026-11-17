@@ -63,6 +63,19 @@ pub(crate) fn subscription_model(id: &str) -> Option<&'static SubscriptionModel>
     SUBSCRIPTION_MODELS.iter().find(|model| model.id == id)
 }
 
+/// Thinking capabilities for a model id: the built-in table first, then the
+/// cached models.dev catalogue for ids released after this build. Remote
+/// models with effort options use adaptive thinking; `max` is accepted only
+/// when the catalogue lists it.
+pub(crate) fn model_traits(id: &str) -> Option<(bool, bool)> {
+    if let Some(model) = subscription_model(id) {
+        return Some((model.adaptive_thinking, model.max_effort));
+    }
+    let remote = crate::catalog::remote_model(crate::catalog::ANTHROPIC_SUBSCRIPTION, id)?;
+    let adaptive = !remote.efforts.is_empty() && !remote.budget_tokens;
+    Some((adaptive, remote.efforts.iter().any(|e| e == "max")))
+}
+
 /// Separate provider identity keeps existing Anthropic routes unchanged.
 #[derive(Clone)]
 pub struct AnthropicSubscriptionProvider {
@@ -141,17 +154,21 @@ impl Provider for AnthropicSubscriptionProvider {
         "anthropic-claude"
     }
     async fn list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
-        Ok(SUBSCRIPTION_MODELS
+        let builtin = SUBSCRIPTION_MODELS
             .iter()
             .map(|model| ModelInfo {
                 id: model.id.into(),
                 name: Some(model.id.into()),
                 context_length: model.context_length,
             })
-            .collect())
+            .collect();
+        Ok(crate::catalog::merge_models(
+            builtin,
+            &crate::catalog::remote_models(crate::catalog::ANTHROPIC_SUBSCRIPTION),
+        ))
     }
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        if subscription_model(&req.model).is_none() {
+        if model_traits(&req.model).is_none() {
             return Err(LlmError::Parse(
                 "unsupported Anthropic subscription model (see list_models)".into(),
             ));

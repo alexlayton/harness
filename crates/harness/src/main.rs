@@ -251,6 +251,9 @@ async fn run_application(
     herdr_tui_worktree: Option<herdr_tui::WorktreeResume>,
 ) -> Result<ExitCode> {
     apply_global_resume_to_prompt(&mut cli)?;
+    // Fire-and-forget: refreshes the cached models.dev catalogue when stale.
+    // New models show up on a later lookup; startup never waits on it.
+    llm::catalog::spawn_refresh();
     let prompt_args = match &cli.command {
         Some(Command::Prompt(args)) => Some(args),
         _ => None,
