@@ -110,7 +110,7 @@ fn headers(thinking: bool, agent: bool) -> HeaderMap {
         ("anthropic-dangerous-direct-browser-access", "true"),
         (
             "user-agent",
-            "claude-cli/2.1.280 (external, claude-desktop)",
+            "claude-cli/2.1.290 (external, claude-desktop)",
         ),
         ("x-app", "cli"),
         ("x-stainless-lang", "js"),

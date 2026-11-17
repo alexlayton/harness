@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 
 pub(crate) const TAG: &str = "anthropic-subscription";
-pub(crate) const VERSION: &str = "2.1.280";
+pub(crate) const VERSION: &str = "2.1.290";
 const SEED: u64 = 0x4d659218e32a3268;
 
 #[cfg(test)]
