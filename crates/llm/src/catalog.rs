@@ -28,6 +28,8 @@ pub const MODELS_DEV_URL: &str = "https://models.dev/api.json";
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Catalogue key for the Claude subscription provider.
 pub const ANTHROPIC_SUBSCRIPTION: &str = "anthropic-claude";
+/// Catalogue key for the GitHub Copilot provider.
+pub const GITHUB_COPILOT: &str = crate::providers::github_copilot::PROVIDER_NAME;
 /// Catalogue key for the ChatGPT Codex subscription provider.
 pub const OPENAI_CODEX: &str = crate::providers::openai_codex::PROVIDER_NAME;
 
@@ -35,7 +37,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// The whole models.dev document is larger than typical metadata bodies.
 const MAX_CATALOGUE_BYTES: usize = 64 * 1024 * 1024;
 const CACHE_FILE_NAME: &str = "models.json";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 /// Claude models released before this predate the subscription catalogue
 /// (and the built-in table already covers everything after it that matters).
 const CLAUDE_MIN_RELEASE: &str = "2025-09-01";
@@ -70,6 +72,17 @@ pub struct RemoteModel {
     /// Whether the model accepts an explicit thinking token budget.
     #[serde(default)]
     pub budget_tokens: bool,
+    /// Maximum output tokens (`limit.output`).
+    #[serde(default)]
+    pub max_output: Option<u64>,
+    /// Whether the model supports reasoning at all.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Wire protocol hint from models.dev's `provider.npm`: `"anthropic"`
+    /// (Messages), `"responses"` (OpenAI Responses), or `None` (chat
+    /// completions, models.dev's default for OpenAI-compatible models).
+    #[serde(default)]
+    pub dialect: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -100,6 +113,14 @@ struct WireModel {
     reasoning_options: Vec<WireReasoningOption>,
     #[serde(default)]
     limit: Option<WireLimit>,
+    #[serde(default)]
+    provider: Option<WireProvider>,
+}
+
+#[derive(Deserialize)]
+struct WireProvider {
+    #[serde(default)]
+    npm: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +135,8 @@ struct WireReasoningOption {
 struct WireLimit {
     #[serde(default)]
     context: Option<u64>,
+    #[serde(default)]
+    output: Option<u64>,
 }
 
 impl WireModel {
@@ -128,12 +151,20 @@ impl WireModel {
             .reasoning_options
             .iter()
             .any(|option| option.kind == "budget_tokens");
+        let dialect = match self.provider.and_then(|provider| provider.npm).as_deref() {
+            Some("@ai-sdk/anthropic") => Some("anthropic".to_owned()),
+            Some("@ai-sdk/openai") => Some("responses".to_owned()),
+            _ => None,
+        };
         RemoteModel {
             id: id.to_owned(),
             name: self.name,
-            context_length: self.limit.and_then(|limit| limit.context),
+            context_length: self.limit.as_ref().and_then(|limit| limit.context),
             efforts,
             budget_tokens,
+            max_output: self.limit.and_then(|limit| limit.output),
+            reasoning: self.reasoning,
+            dialect,
         }
     }
 
@@ -178,6 +209,13 @@ fn is_codex(id: &str, model: &WireModel) -> bool {
         && !CODEX_EXCLUDED.iter().any(|excluded| id.contains(excluded))
 }
 
+/// Copilot serves chat models behind one token; keep anything that can call
+/// tools and is not an image/embedding/realtime model. The account's own
+/// model list still decides what is actually offered.
+fn is_copilot(_id: &str, model: &WireModel) -> bool {
+    model.kind.is_none() && model.tool_call
+}
+
 type Filter = fn(&str, &WireModel) -> bool;
 
 /// Extract the subscription-relevant models from a models.dev `api.json`
@@ -187,9 +225,10 @@ type Filter = fn(&str, &WireModel) -> bool;
 pub(crate) fn parse_models_dev(body: &str) -> Result<BTreeMap<String, Vec<RemoteModel>>, LlmError> {
     let root: BTreeMap<String, Value> = serde_json::from_str(body)
         .map_err(|error| LlmError::Parse(format!("models.dev catalogue: {error}")))?;
-    let sources: [(&str, &str, Filter); 2] = [
+    let sources: [(&str, &str, Filter); 3] = [
         ("anthropic", ANTHROPIC_SUBSCRIPTION, is_claude_subscription),
         ("openai", OPENAI_CODEX, is_codex),
+        ("github-copilot", GITHUB_COPILOT, is_copilot),
     ];
     let mut out = BTreeMap::new();
     for (source, provider, filter) in sources {
@@ -440,6 +479,15 @@ mod tests {
         "gpt-4o": {"tool_call": true, "release_date": "2024-05-13"},
         "o3": {"tool_call": true, "reasoning": true, "release_date": "2026-04-16"}
       }},
+      "github-copilot": {"models": {
+        "claude-fable-5.2": {"tool_call": true, "reasoning": true, "release_date": "2026-11-09",
+          "limit": {"context": 1000000, "output": 128000},
+          "provider": {"npm": "@ai-sdk/anthropic"}},
+        "gpt-6.1-sol": {"tool_call": true, "reasoning": true, "release_date": "2026-09-29",
+          "provider": {"npm": "@ai-sdk/openai"}},
+        "kimi-k3": {"tool_call": true, "reasoning": true, "release_date": "2026-07-16"},
+        "text-embedding": {"type": "embedding", "tool_call": true}
+      }},
       "other": {"weird": true}
     }"#;
 
@@ -458,6 +506,28 @@ mod tests {
         assert!(parsed[ANTHROPIC_SUBSCRIPTION][1].budget_tokens);
         let codex: Vec<_> = parsed[OPENAI_CODEX].iter().map(|m| m.id.as_str()).collect();
         assert_eq!(codex, ["gpt-6.1-sol"]);
+    }
+
+    #[test]
+    fn copilot_models_carry_dialect_and_limits() {
+        let parsed = parse_models_dev(FIXTURE).unwrap();
+        let copilot = &parsed[GITHUB_COPILOT];
+        let dialect = |id: &str| {
+            copilot
+                .iter()
+                .find(|m| m.id == id)
+                .map(|m| (m.dialect.clone(), m.max_output))
+        };
+        assert_eq!(copilot.len(), 3);
+        assert_eq!(
+            dialect("claude-fable-5.2"),
+            Some((Some("anthropic".into()), Some(128_000)))
+        );
+        assert_eq!(
+            dialect("gpt-6.1-sol"),
+            Some((Some("responses".into()), None))
+        );
+        assert_eq!(dialect("kimi-k3"), Some((None, None)));
     }
 
     #[test]
@@ -495,6 +565,9 @@ mod tests {
             context_length: Some(context),
             efforts: vec![],
             budget_tokens: false,
+            max_output: None,
+            reasoning: false,
+            dialect: None,
         };
         let merged = merge_models(builtin, &[remote("new", 9), remote("a", 5), remote("b", 7)]);
         let ids: Vec<_> = merged.iter().map(|m| m.id.as_str()).collect();

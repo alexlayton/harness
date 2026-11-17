@@ -375,8 +375,49 @@ pub fn model_metadata(model: &str) -> Option<&'static CopilotModel> {
     COPILOT_MODELS.iter().find(|entry| entry.id == model)
 }
 
+/// Routing facts needed to send a request, from the static table or, for ids
+/// newer than this build, the cached models.dev catalogue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelRoute {
+    pub dialect: Dialect,
+    pub context_length: u64,
+    pub reasoning_supported: bool,
+    pub max_tokens: u32,
+}
+
+/// Fallback limits when models.dev omits them.
+const REMOTE_DEFAULT_CONTEXT: u64 = 128_000;
+const REMOTE_DEFAULT_MAX_TOKENS: u32 = 32_000;
+
+/// Resolve routing for a model id. The static table is authoritative; the
+/// cached catalogue only supplies ids it does not know.
+pub fn route_for_model(model: &str) -> Option<ModelRoute> {
+    if let Some(entry) = model_metadata(model) {
+        return Some(ModelRoute {
+            dialect: entry.dialect,
+            context_length: entry.context_length,
+            reasoning_supported: entry.reasoning_supported,
+            max_tokens: entry.max_tokens,
+        });
+    }
+    let remote = crate::catalog::remote_model(crate::catalog::GITHUB_COPILOT, model)?;
+    Some(ModelRoute {
+        dialect: match remote.dialect.as_deref() {
+            Some("anthropic") => Dialect::AnthropicMessages,
+            Some("responses") => Dialect::OpenAiResponses,
+            _ => Dialect::OpenAiChatCompletions,
+        },
+        context_length: remote.context_length.unwrap_or(REMOTE_DEFAULT_CONTEXT),
+        reasoning_supported: remote.reasoning,
+        max_tokens: remote
+            .max_output
+            .and_then(|tokens| u32::try_from(tokens).ok())
+            .unwrap_or(REMOTE_DEFAULT_MAX_TOKENS),
+    })
+}
+
 pub fn dialect_for_model(model: &str) -> Option<Dialect> {
-    model_metadata(model).map(|entry| entry.dialect)
+    route_for_model(model).map(|route| route.dialect)
 }
 
 /// Merge a dynamic account allow-list with static routing metadata.  This
@@ -390,7 +431,7 @@ where
         .into_iter()
         .map(|id| id.as_ref().to_owned())
         .collect::<HashSet<_>>();
-    COPILOT_MODELS
+    let mut models: Vec<ModelInfo> = COPILOT_MODELS
         .iter()
         .filter(|model| available.contains(model.id))
         .map(|model| ModelInfo {
@@ -398,7 +439,18 @@ where
             name: Some(model.name.into()),
             context_length: Some(model.context_length),
         })
-        .collect()
+        .collect();
+    // Account-available ids newer than the static table, newest first.
+    let newer = crate::catalog::remote_models(crate::catalog::GITHUB_COPILOT)
+        .into_iter()
+        .filter(|remote| available.contains(&remote.id) && model_metadata(&remote.id).is_none())
+        .map(|remote| ModelInfo {
+            name: remote.name.clone().or_else(|| Some(remote.id.clone())),
+            id: remote.id,
+            context_length: remote.context_length,
+        });
+    models.splice(0..0, newer);
+    models
 }
 
 /// Pick a sensible default model for a signed-in account: the first entry,
@@ -414,7 +466,7 @@ pub fn default_model_for(sku: Option<&str>, available_ids: &[String]) -> Option<
     }
     available_ids
         .iter()
-        .find(|&id| model_metadata(id).is_some())
+        .find(|&id| route_for_model(id).is_some())
         .cloned()
 }
 
@@ -548,7 +600,7 @@ impl GithubCopilotProvider {
     async fn stream_with(
         &self,
         req: &CompletionRequest,
-        model: &'static CopilotModel,
+        model: ModelRoute,
         credential: auth::CopilotCredential,
     ) -> Result<EventStream, LlmError> {
         let sku = auth::sku_from_proxy_token(&credential.access).map(str::to_owned);
@@ -606,7 +658,7 @@ impl Provider for GithubCopilotProvider {
     }
 
     async fn stream(&self, req: &CompletionRequest) -> Result<EventStream, LlmError> {
-        let model = model_metadata(&req.model).ok_or_else(|| {
+        let model = route_for_model(&req.model).ok_or_else(|| {
             LlmError::Parse(format!(
                 "GitHub Copilot model `{}` is not in the supported model catalog",
                 req.model
