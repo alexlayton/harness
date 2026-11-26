@@ -18,6 +18,18 @@ while read -r _local_ref local_sha _remote_ref _remote_sha; do
 done
 [ "$only_deletes" -eq 1 ] && exit 0
 
+# The Python bindings need >= 3.10 (abi3-py310); macOS's /usr/bin/python3 is
+# older, so prefer a newer interpreter on PATH unless the caller chose one.
+if [ -z "${PYO3_PYTHON:-}" ]; then
+    for py in python3.14 python3.13 python3.12 python3.11 python3.10; do
+        if command -v "$py" >/dev/null 2>&1; then
+            PYO3_PYTHON="$(command -v "$py")"
+            export PYO3_PYTHON
+            break
+        fi
+    done
+fi
+
 echo "pre-push: cargo fmt" >&2
 cargo fmt --all --check
 echo "pre-push: cargo clippy" >&2
