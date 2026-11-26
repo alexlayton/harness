@@ -63,15 +63,15 @@ fn latest_opus_models_use_adaptive_max_effort() {
 fn billing_matches_upstream_utf16_vectors() {
     // Generated with /root/code/pi-sub-anthropic/fingerprint.ts createClaudeBillingHeader.
     for (text, suffix) in [
-        ("", "d7b"),
-        ("hello world", "e80"),
-        ("abcd😀x🚀abcdefghijklmnop", "98f"),
-        ("é漢字abc🙂defghijklmnopqrstuvwxyz", "10a"),
+        ("", "a4b"),
+        ("hello world", "c21"),
+        ("abcd😀x🚀abcdefghijklmnop", "d7a"),
+        ("é漢字abc🙂defghijklmnopqrstuvwxyz", "a68"),
     ] {
         assert_eq!(
             billing(text),
             format!(
-                "x-anthropic-billing-header: cc_version=2.1.280.{suffix}; cc_entrypoint=claude-desktop; cch=00000;"
+                "x-anthropic-billing-header: cc_version=2.1.290.{suffix}; cc_entrypoint=claude-desktop; cch=00000;"
             )
         );
     }
