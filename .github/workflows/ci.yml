@@ -2,8 +2,16 @@ name: CI
 
 on:
   pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
+
+# Cancel superseded runs on the same ref so a burst of pushes only pays for
+# the latest one. Never cancel main: every commit there should get a result.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

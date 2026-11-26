@@ -51,6 +51,31 @@ edition 2024).
   `HARNESS_STATE_DIR`, `HARNESS_LOG` (file-only tracing). Use them to avoid
   touching real `~/.config/harness` and `~/.harness/sessions`.
 
+## Git workflow
+
+Solo project, so PRs are for risk, not for human review.
+
+- **Push straight to `main`** for small fixes, single-crate features, docs,
+  release bumps, and anything easy to revert. Do this from a clean `main`
+  with conventional commits.
+- **Open a PR** for: session JSONL format or agent-loop changes (sessions are
+  append-only, so a bad format can't be reverted out of users' history),
+  `.github/workflows/*` changes, multi-crate or large (~500+ line) changes,
+  or when you want the Codex review or macOS CI before merging.
+- **Squash-merge PRs** (the only merge style enabled; branches auto-delete).
+  The PR title must be a conventional commit.
+- **Pre-push hook**: enable once per clone with
+  `git config core.hooksPath scripts/hooks`. It runs fmt, clippy
+  (`-D warnings`) and tests, replacing the pre-merge CI run. Bypass only in
+  emergencies with `--no-verify`.
+- **`main` ruleset** blocks force-push, deletion and merge commits. There are
+  no required checks or required PRs, deliberately, so direct pushes work.
+- **CI** runs on PRs and on `main`, skips docs-only changes, and cancels
+  superseded runs on non-main refs. Releases re-run all checks before
+  building, so a broken `main` can't ship.
+- Agents: don't open a PR unless the change matches the PR criteria above or
+  you're asked to.
+
 ## Repository notes
 
 - Untracked scratch files at the root (`todo.md`, `fixes.md`, `inline-ui.md`,
